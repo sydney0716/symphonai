@@ -13,3 +13,8 @@ build/
 
 # macOS
 .DS_Store
+
+# Secrets -- never commit real API keys
+.env
+.env.*
+!.env.example
