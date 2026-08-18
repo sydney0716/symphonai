@@ -2,3 +2,7 @@
 .orchestra/worktrees/
 .orchestra/runs/
 .orchestra/tasks/
+
+# Python
+__pycache__/
+*.pyc
