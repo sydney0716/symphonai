@@ -1,10 +1,11 @@
 {
   "mcpServers": {
-    "codex": {
+    "orchestra": {
       "type": "stdio",
-      "command": "codex",
+      "command": ".venv/bin/python",
       "args": [
-        "mcp-server"
+        "-m",
+        "orchestra_mcp.server"
       ],
       "env": {}
     }

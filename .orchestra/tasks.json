@@ -374,7 +374,12 @@
       "title": "Integrate approved worktree outputs into main working tree",
       "status": "COMPLETE",
       "worker": "claude",
-      "depends_on": ["smoke-1", "doc-1", "parallel-1", "parallel-2"],
+      "depends_on": [
+        "smoke-1",
+        "doc-1",
+        "parallel-1",
+        "parallel-2"
+      ],
       "scope": [
         "docs/orchestra-smoke.md",
         "docs/orchestra-task-state.md",
@@ -414,6 +419,43 @@
         },
         "executed_by": "supervisor"
       }
+    },
+    {
+      "id": "py-clean-1",
+      "title": "Add Python local artifact ignore rules to .gitignore",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        ".gitignore",
+        ".orchestra/tasks.json"
+      ],
+      "acceptance_criteria": [
+        ".gitignore contains the existing Orchestra runtime rules",
+        ".gitignore contains Python cache/env/build artifact rules (.venv/, *.egg-info/, dist/, build/)",
+        ".gitignore has a trailing newline",
+        "orchestra_mcp.egg-info/ no longer appears in git status --porcelain --untracked-files=all",
+        "Only .gitignore and .orchestra/tasks.json are modified by this cleanup"
+      ],
+      "validation_commands": [
+        "git diff --check -- .gitignore .orchestra/tasks.json",
+        "git status --porcelain --untracked-files=all"
+      ],
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "git diff --check -- .gitignore .orchestra/tasks.json",
+          "status": "passed",
+          "exit_code": 0,
+          "summary": "no whitespace/diff errors",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git status --porcelain --untracked-files=all",
+          "status": "passed",
+          "summary": "only .gitignore and .orchestra/tasks.json modified by this task; orchestra_mcp.egg-info/ no longer listed; .mcp.json shown as modified but that change predates this task and was not touched by it",
+          "executed_by": "supervisor"
+        }
+      ]
     }
   ],
   "workers": [
