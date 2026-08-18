@@ -1,7 +1,454 @@
 {
   "version": 1,
-  "active_epic": null,
-  "tasks": [],
-  "workers": [],
+  "active_epic": "orchestra-smoke-test",
+  "tasks": [
+    {
+      "id": "smoke-1",
+      "title": "Create docs/orchestra-smoke.md",
+      "status": "COMPLETE",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "docs/orchestra-smoke.md"
+      ],
+      "worktree": ".orchestra/worktrees/smoke-1-docs",
+      "branch": "orchestra/smoke-1-docs",
+      "acceptance_criteria": [
+        "docs/orchestra-smoke.md exists and is non-empty",
+        "Content briefly explains this repository's Orchestra workflow (orchestrator + Codex workers, worktrees, tasks.json, review before merge)",
+        "No files outside docs/orchestra-smoke.md are modified"
+      ],
+      "validation_commands": [
+        "git -C .orchestra/worktrees/smoke-1-docs diff --check",
+        "git -C .orchestra/worktrees/smoke-1-docs status --porcelain"
+      ],
+      "thread_id": "01a00fe8-1955-7d02-9da3-20de93e566d7",
+      "followups": [
+        {
+          "id": "smoke-1-followup-1",
+          "instruction": "Add a 'What this smoke test validates' section to docs/orchestra-smoke.md",
+          "method": "codex-reply",
+          "thread_id": "01a00fe8-1955-7d02-9da3-20de93e566d7",
+          "status": "COMPLETE",
+          "changed_files": [
+            "docs/orchestra-smoke.md"
+          ],
+          "validation_results": {
+            "git status --porcelain": "?? docs/orchestra-smoke.md (untracked, no commit)",
+            "git diff --check": "passed, no output"
+          }
+        }
+      ]
+    },
+    {
+      "id": "doc-1",
+      "title": "Populate .orchestra/README.md",
+      "status": "COMPLETE",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        ".orchestra/README.md"
+      ],
+      "worktree": ".orchestra/worktrees/doc-1-readme",
+      "branch": "orchestra/doc-1-readme",
+      "preflight_checks": {
+        "git ls-files -- .orchestra/README.md": "tracked (.orchestra/README.md)",
+        "git check-ignore -v .orchestra/README.md": "not ignored (no output)"
+      },
+      "acceptance_criteria": [
+        ".orchestra/README.md is non-empty and accurately describes the directory's purpose and subdirectories (tasks.json, tasks/, runs/, worktrees/)",
+        "No other files are created or modified",
+        "Passes git diff --check"
+      ],
+      "validation_commands": [
+        "test -s .orchestra/worktrees/doc-1-readme/.orchestra/README.md",
+        "git -C .orchestra/worktrees/doc-1-readme status --porcelain --untracked-files=all",
+        "git -C .orchestra/worktrees/doc-1-readme add -N .orchestra/README.md",
+        "git -C .orchestra/worktrees/doc-1-readme diff --check"
+      ],
+      "validation_results": {
+        "test -s .../.orchestra/README.md": "passed (non-empty)",
+        "git status --porcelain --untracked-files=all": "M .orchestra/README.md (only file changed)",
+        "git add -N .orchestra/README.md": "failed inside Codex sandbox (index outside writable sandbox); re-run by orchestrator outside sandbox: passed",
+        "git diff --check": "passed, no output"
+      },
+      "thread_id": "01a0100d-accb-7712-b029-e9f9dde063e7",
+      "followups": [
+        {
+          "id": "doc-1-followup-1",
+          "instruction": "Add a 'Validation Notes' section to .orchestra/README.md explaining that some validation commands may fail inside a worker sandbox and should be re-run by the supervisor",
+          "method": "codex-reply",
+          "thread_id": "01a0100d-accb-7712-b029-e9f9dde063e7",
+          "status": "COMPLETE",
+          "changed_files": [
+            ".orchestra/README.md"
+          ],
+          "validation_results": [
+            {
+              "command": "test -s .orchestra/worktrees/doc-1-readme/.orchestra/README.md",
+              "result": "passed (non-empty)",
+              "executed_by": "codex_worker"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/doc-1-readme status --porcelain --untracked-files=all",
+              "result": "passed; only .orchestra/README.md modified",
+              "executed_by": "codex_worker"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/doc-1-readme diff --check",
+              "result": "passed, no output",
+              "executed_by": "codex_worker"
+            },
+            {
+              "command": "test -s .orchestra/worktrees/doc-1-readme/.orchestra/README.md",
+              "result": "passed (non-empty)",
+              "executed_by": "supervisor"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/doc-1-readme status --porcelain --untracked-files=all",
+              "result": "passed; ' M .orchestra/README.md' only",
+              "executed_by": "supervisor"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/doc-1-readme diff --check",
+              "result": "passed, exit 0, no output",
+              "executed_by": "supervisor"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "chore-1",
+      "title": "Track root .gitignore for Orchestra runtime artifacts",
+      "status": "COMPLETE",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        ".gitignore",
+        ".orchestra/tasks.json"
+      ],
+      "forbidden_scope": [
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".claude/skills/orchestra/SKILL.md"
+      ],
+      "note": "Implemented directly by Claude (no Codex worker) per user instruction: trivial config/state cleanup.",
+      "acceptance_criteria": [
+        ".gitignore exists and contains only the expected Orchestra runtime ignore rules",
+        ".gitignore ends with a trailing newline",
+        ".orchestra/README.md and .orchestra/tasks.json are not ignored",
+        ".orchestra/worktrees/, .orchestra/runs/, and .orchestra/tasks/ are ignored",
+        "No files outside .gitignore and .orchestra/tasks.json are modified by this task"
+      ],
+      "validation_commands": [
+        "git diff --check -- .gitignore .orchestra/tasks.json",
+        "git check-ignore -v .orchestra/worktrees/example || true",
+        "git check-ignore -v .orchestra/runs/example || true",
+        "git check-ignore -v .orchestra/tasks/example || true",
+        "git check-ignore -v .orchestra/README.md || true",
+        "git check-ignore -v .orchestra/tasks.json || true",
+        "git status --porcelain --untracked-files=all"
+      ],
+      "validation_results": {
+        "git diff --check -- .gitignore .orchestra/tasks.json": "passed, exit 0, no output",
+        "git check-ignore -v .orchestra/worktrees/example": ".gitignore:2:.orchestra/worktrees/ -> ignored",
+        "git check-ignore -v .orchestra/runs/example": ".gitignore:3:.orchestra/runs/ -> ignored",
+        "git check-ignore -v .orchestra/tasks/example": ".gitignore:4:.orchestra/tasks/ -> ignored",
+        "git check-ignore -v .orchestra/README.md": "no output -> not ignored",
+        "git check-ignore -v .orchestra/tasks.json": "no output -> not ignored",
+        "git status --porcelain --untracked-files=all": "M .orchestra/tasks.json, ?? .gitignore (only expected files touched)"
+      }
+    },
+    {
+      "id": "parallel-1",
+      "title": "Create docs/orchestra-task-state.md",
+      "status": "COMPLETE",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "docs/orchestra-task-state.md"
+      ],
+      "worktree": ".orchestra/worktrees/parallel-1-task-state",
+      "branch": "orchestra/parallel-1-task-state",
+      "acceptance_criteria": [
+        "docs/orchestra-task-state.md exists, is non-empty, and accurately describes how .orchestra/tasks.json stores epics, tasks, workers, followups, validation results, and task status",
+        "No files outside docs/orchestra-task-state.md are created or modified",
+        "Passes git diff --check"
+      ],
+      "validation_commands": [
+        "test -s .orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
+        "git -C .orchestra/worktrees/parallel-1-task-state add -N docs/orchestra-task-state.md",
+        "git -C .orchestra/worktrees/parallel-1-task-state diff --check",
+        "git -C .orchestra/worktrees/parallel-1-task-state status --porcelain --untracked-files=all"
+      ],
+      "thread_id": "01a01356-b83e-7390-af47-7b3eaf9a07a7",
+      "validation_results": [
+        {
+          "command": "test -s .orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
+          "result": "passed (non-empty)",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-1-task-state add -N docs/orchestra-task-state.md",
+          "result": "failed inside Codex sandbox (index outside writable sandbox)",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-1-task-state diff --check",
+          "result": "passed, no output",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-1-task-state status --porcelain --untracked-files=all",
+          "result": "?? docs/orchestra-task-state.md",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "test -s .orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
+          "result": "passed (non-empty)",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-1-task-state add -N docs/orchestra-task-state.md",
+          "result": "passed",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-1-task-state diff --check",
+          "result": "passed, exit 0, no output",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-1-task-state status --porcelain --untracked-files=all",
+          "result": "A  docs/orchestra-task-state.md (only file changed)",
+          "executed_by": "supervisor"
+        }
+      ],
+      "followups": [
+        {
+          "id": "parallel-1-followup-1",
+          "instruction": "Remove/rewrite wording claiming .orchestra/tasks.json is 'currently' empty (stale worktree checkout artifact); describe the schema conceptually instead, including provider, executed_by, followups, and canonical thread_id (not threadId) naming",
+          "method": "codex-reply",
+          "thread_id": "01a01356-b83e-7390-af47-7b3eaf9a07a7",
+          "status": "COMPLETE",
+          "changed_files": [
+            "docs/orchestra-task-state.md"
+          ],
+          "validation_results": [
+            {
+              "command": "test -s .orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
+              "result": "passed (non-empty)",
+              "executed_by": "codex_worker"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/parallel-1-task-state status --porcelain --untracked-files=all",
+              "result": "A docs/orchestra-task-state.md",
+              "executed_by": "codex_worker"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/parallel-1-task-state diff --check",
+              "result": "passed, no output",
+              "executed_by": "codex_worker"
+            },
+            {
+              "command": "test -s .orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
+              "result": "passed (non-empty)",
+              "executed_by": "supervisor"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/parallel-1-task-state status --porcelain --untracked-files=all",
+              "result": "A docs/orchestra-task-state.md (only file changed)",
+              "executed_by": "supervisor"
+            },
+            {
+              "command": "git -C .orchestra/worktrees/parallel-1-task-state diff --check",
+              "result": "passed, exit 0, no output",
+              "executed_by": "supervisor"
+            }
+          ],
+          "review_notes": "Confirmed no 'currently empty/null' language remains; schema described conceptually with provider, executed_by, followups, and thread_id (snake_case) called out as canonical. .orchestra/tasks.json was not modified by the worker."
+        }
+      ]
+    },
+    {
+      "id": "parallel-2",
+      "title": "Create docs/orchestra-worktrees.md",
+      "status": "COMPLETE",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "docs/orchestra-worktrees.md"
+      ],
+      "worktree": ".orchestra/worktrees/parallel-2-worktrees",
+      "branch": "orchestra/parallel-2-worktrees",
+      "acceptance_criteria": [
+        "docs/orchestra-worktrees.md exists, is non-empty, and accurately explains why Orchestra uses isolated Git worktrees for Codex workers and why merge requires human approval",
+        "No files outside docs/orchestra-worktrees.md are created or modified",
+        "Passes git diff --check"
+      ],
+      "validation_commands": [
+        "test -s .orchestra/worktrees/parallel-2-worktrees/docs/orchestra-worktrees.md",
+        "git -C .orchestra/worktrees/parallel-2-worktrees add -N docs/orchestra-worktrees.md",
+        "git -C .orchestra/worktrees/parallel-2-worktrees diff --check",
+        "git -C .orchestra/worktrees/parallel-2-worktrees status --porcelain --untracked-files=all"
+      ],
+      "thread_id": "01a0135a-1eff-76c3-9d6b-09dc21719566",
+      "validation_results": [
+        {
+          "command": "test -s .orchestra/worktrees/parallel-2-worktrees/docs/orchestra-worktrees.md",
+          "result": "passed (non-empty)",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-2-worktrees add -N docs/orchestra-worktrees.md",
+          "result": "failed inside Codex sandbox (index outside writable sandbox)",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-2-worktrees diff --check",
+          "result": "passed, no output",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-2-worktrees status --porcelain --untracked-files=all",
+          "result": "?? docs/orchestra-worktrees.md",
+          "executed_by": "codex_worker"
+        },
+        {
+          "command": "test -s .orchestra/worktrees/parallel-2-worktrees/docs/orchestra-worktrees.md",
+          "result": "passed (non-empty)",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-2-worktrees add -N docs/orchestra-worktrees.md",
+          "result": "passed",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-2-worktrees diff --check",
+          "result": "passed, exit 0, no output",
+          "executed_by": "supervisor"
+        },
+        {
+          "command": "git -C .orchestra/worktrees/parallel-2-worktrees status --porcelain --untracked-files=all",
+          "result": "A  docs/orchestra-worktrees.md (only file changed)",
+          "executed_by": "supervisor"
+        }
+      ]
+    },
+    {
+      "id": "rule-1",
+      "title": "Add Context Snapshot Rule to .claude/skills/orchestra/SKILL.md",
+      "status": "COMPLETE",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        ".claude/skills/orchestra/SKILL.md",
+        ".orchestra/tasks.json"
+      ],
+      "forbidden_scope": [
+        "CLAUDE.md",
+        "AGENTS.md",
+        "source code"
+      ],
+      "note": "Implemented directly by Claude (no Codex worker) per user instruction: small orchestration-rule update. Motivated by the parallel-1 correction, where a Codex worker's worktree contained a stale, pre-uncommitted-edits snapshot of .orchestra/tasks.json.",
+      "acceptance_criteria": [
+        "SKILL.md contains the Context Snapshot Rule",
+        "The rule clearly explains why worker worktrees may have stale .orchestra/tasks.json state",
+        "No files outside .claude/skills/orchestra/SKILL.md and .orchestra/tasks.json are modified",
+        ".orchestra/tasks.json records the rule-1 task",
+        "git diff --check -- .claude/skills/orchestra/SKILL.md .orchestra/tasks.json passes"
+      ],
+      "validation_commands": [
+        "git diff --check -- .claude/skills/orchestra/SKILL.md .orchestra/tasks.json",
+        "git status --porcelain --untracked-files=all"
+      ],
+      "validation_results": {
+        "git diff --check -- .claude/skills/orchestra/SKILL.md .orchestra/tasks.json": "passed, exit 0, no output",
+        "git status --porcelain --untracked-files=all": " M .claude/skills/orchestra/SKILL.md,  M .orchestra/tasks.json (only allowed-scope files touched; untracked .gitignore predates this task)"
+      }
+    },
+    {
+      "id": "integration-1",
+      "title": "Integrate approved worktree outputs into main working tree",
+      "status": "COMPLETE",
+      "worker": "claude",
+      "depends_on": ["smoke-1", "doc-1", "parallel-1", "parallel-2"],
+      "scope": [
+        "docs/orchestra-smoke.md",
+        "docs/orchestra-task-state.md",
+        "docs/orchestra-worktrees.md",
+        ".orchestra/README.md"
+      ],
+      "forbidden_scope": [
+        ".orchestra/tasks.json (must not be overwritten by any worktree copy; only appended to directly by the supervisor)",
+        "any file not produced by smoke-1, doc-1, parallel-1, or parallel-2"
+      ],
+      "note": "No Codex worker, no git merge. Plain file copies from reviewed worktrees into the main working tree, per user-approved integration review plan. All source worktrees were at the same base commit (c9e5a9d) as main with no divergence, so no conflict resolution was needed.",
+      "sources": {
+        "docs/orchestra-smoke.md": ".orchestra/worktrees/smoke-1-docs/docs/orchestra-smoke.md",
+        "docs/orchestra-task-state.md": ".orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
+        "docs/orchestra-worktrees.md": ".orchestra/worktrees/parallel-2-worktrees/docs/orchestra-worktrees.md",
+        ".orchestra/README.md": ".orchestra/worktrees/doc-1-readme/.orchestra/README.md"
+      },
+      "acceptance_criteria": [
+        "All four approved files exist in the main working tree and are non-empty",
+        ".orchestra/tasks.json in main is preserved (not overwritten by any stale worktree copy)",
+        "git diff --check passes",
+        "git status --porcelain --untracked-files=all shows only expected changes"
+      ],
+      "validation_commands": [
+        "git diff --check",
+        "git status --porcelain --untracked-files=all",
+        "test -s docs/orchestra-smoke.md && test -s docs/orchestra-task-state.md && test -s docs/orchestra-worktrees.md && test -s .orchestra/README.md"
+      ],
+      "validation_results": {
+        "git diff --check": "passed, exit 0, no output",
+        "git status --porcelain --untracked-files=all": "M .claude/skills/orchestra/SKILL.md, M .orchestra/README.md, M .orchestra/tasks.json, ?? .gitignore, ?? docs/orchestra-smoke.md, ?? docs/orchestra-task-state.md, ?? docs/orchestra-worktrees.md",
+        "existence/non-empty checks": {
+          "docs/orchestra-smoke.md": "2328 bytes, OK",
+          "docs/orchestra-task-state.md": "2132 bytes, OK",
+          "docs/orchestra-worktrees.md": "1572 bytes, OK",
+          ".orchestra/README.md": "1384 bytes, OK"
+        },
+        "executed_by": "supervisor"
+      }
+    }
+  ],
+  "workers": [
+    {
+      "task_id": "smoke-1",
+      "worker": "codex",
+      "thread_id": "01a00fe8-1955-7d02-9da3-20de93e566d7",
+      "worktree": ".orchestra/worktrees/smoke-1-docs",
+      "branch": "orchestra/smoke-1-docs",
+      "status": "COMPLETE"
+    },
+    {
+      "task_id": "doc-1",
+      "worker": "codex",
+      "thread_id": "01a0100d-accb-7712-b029-e9f9dde063e7",
+      "worktree": ".orchestra/worktrees/doc-1-readme",
+      "branch": "orchestra/doc-1-readme",
+      "status": "COMPLETE"
+    },
+    {
+      "task_id": "parallel-1",
+      "worker": "codex",
+      "thread_id": "01a01356-b83e-7390-af47-7b3eaf9a07a7",
+      "worktree": ".orchestra/worktrees/parallel-1-task-state",
+      "branch": "orchestra/parallel-1-task-state",
+      "status": "COMPLETE"
+    },
+    {
+      "task_id": "parallel-2",
+      "worker": "codex",
+      "thread_id": "01a0135a-1eff-76c3-9d6b-09dc21719566",
+      "worktree": ".orchestra/worktrees/parallel-2-worktrees",
+      "branch": "orchestra/parallel-2-worktrees",
+      "status": "COMPLETE"
+    }
+  ],
   "runs": []
 }

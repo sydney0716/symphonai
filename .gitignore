@@ -1,0 +1,4 @@
+# Orchestra runtime artifacts
+.orchestra/worktrees/
+.orchestra/runs/
+.orchestra/tasks/

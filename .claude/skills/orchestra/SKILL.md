@@ -158,6 +158,16 @@ Use this structure when dispatching a Codex worker:
 
     - list unresolved issues, or say `None`
 
+## Context Snapshot Rule
+
+Do not rely on worker worktrees to contain the supervisor's latest uncommitted `.orchestra/tasks.json` state.
+
+A worker's worktree is checked out from a specific commit. It does not see the orchestrator's in-progress, uncommitted edits to `.orchestra/tasks.json` — including task records, schema changes, or orchestration history created after that commit. A worker that reads `.orchestra/tasks.json` from its own worktree can therefore describe stale or empty state as if it were current.
+
+When a worker needs current task state, schema, or orchestration history, include a concise context snapshot in the worker prompt.
+
+Codex workers must treat the supervisor-provided task brief as the source of truth for orchestration state, not whatever `.orchestra/tasks.json` looks like inside their own worktree.
+
 ### 7. Review
 
 When a worker completes:
