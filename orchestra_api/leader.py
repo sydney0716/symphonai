@@ -26,6 +26,7 @@ from orchestra_api.models import Message, Role, ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.runner import standard_tool_registry
+from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tools.base import LocalTool
 
 DISPATCH_TOOL_NAME = "dispatch_subagent"
@@ -153,6 +154,14 @@ class DispatchSubagentTool(LocalTool):
     def description(self) -> str:
         return _DISPATCH_DESCRIPTION
 
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": _DISPATCH_PROPERTIES,
+            "required": _DISPATCH_REQUIRED,
+        }
+
     def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
         subagent_name = tool_call.arguments.get("subagent_name")
         task = tool_call.arguments.get("task")
@@ -175,12 +184,14 @@ class DispatchSubagentTool(LocalTool):
                     ),
                 )
             _report(self._on_status, subagent_name, STATUS_PENDING)
+            subagent_tools = standard_tool_registry()
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=self._subagent_provider,
-                    tools=standard_tool_registry(),
+                    tools=subagent_tools,
                     policy=self._subagent_policy,
                     max_turns=self._subagent_max_turns,
+                    tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.name),
                 )
             )
             self.pool[subagent_name] = record

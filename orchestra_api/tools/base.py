@@ -29,6 +29,15 @@ class LocalTool(ABC):
     def description(self) -> str:
         """Short, human/model-readable description of what this tool does."""
 
+    @property
+    @abstractmethod
+    def parameters(self) -> dict:
+        """JSON-Schema-shaped {"type": "object", "properties": {...}, "required": [...]}
+        describing this tool's arguments, in a vendor-neutral shape. Used by
+        `orchestra_api.tool_schema` to build a provider-specific tool
+        definition so a real model is actually shown this tool exists.
+        """
+
     @abstractmethod
     def execute(self, tool_call: ToolCall, policy: "PermissionPolicy") -> ToolResult:
         """Run this tool for `tool_call`, gated by `policy`."""

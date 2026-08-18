@@ -10,15 +10,24 @@ Verifies:
     forbidden-pattern path (.env), a `..` path-traversal attempt, run_shell
     denied by default, and an always-deny command (rm) denied even when
     explicitly allowlisted
+  - regression check: runner.run_task() with a real OpenAIProvider actually
+    includes schemas for all four standard tools in its outgoing request
+    (via mocked urllib.request.urlopen) -- guards against ApiAgent/runner
+    silently never telling a real model any tool exists
 
-No network calls anywhere in this script -- FakeModelProvider is the only
-ModelProvider used.
+No real network call is ever made in this script. FakeModelProvider is
+used for every check except the one regression check above, which uses a
+real OpenAIProvider purely to exercise its real request-building code
+against a mocked HTTP layer.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
+import unittest.mock as mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +36,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
+from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider  # noqa: E402
 from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
 
 
@@ -133,6 +143,44 @@ def main() -> None:
         if r.ok or not (root / "existing.txt").exists():
             fail("run_shell must deny 'rm' even when explicitly allowlisted")
         ok("deny: run_shell always-deny command ('rm') overrides an explicit allowlist")
+
+        # -- regression: a real provider's run_task() request must include
+        # schemas for all four standard tools --
+        os.environ[API_KEY_ENV_VAR] = "sk-openai-fake-test-key-do-not-use"
+        captured: dict = {}
+
+        class _FakeHttpResponse:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "_FakeHttpResponse":
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        def _fake_urlopen(request, timeout=None):  # noqa: ANN001
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            payload = json.dumps(
+                {
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {},
+                }
+            ).encode("utf-8")
+            return _FakeHttpResponse(payload)
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            run_task(OpenAIProvider(), policy, "hello")
+        del os.environ[API_KEY_ENV_VAR]
+
+        sent_tool_names = {t["function"]["name"] for t in captured.get("body", {}).get("tools", [])}
+        expected_tool_names = {"read_file", "write_file", "list_files", "run_shell"}
+        if sent_tool_names != expected_tool_names:
+            fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
+        ok("real provider's run_task() request includes all four standard tool schemas")
 
         print("\nAll smoke checks passed.")
 

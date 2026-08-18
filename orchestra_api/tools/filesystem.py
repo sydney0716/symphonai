@@ -25,6 +25,19 @@ class ReadFileTool(LocalTool):
     def description(self) -> str:
         return "Read the full contents of a text file inside the allowed scope."
 
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to read, relative to the allowed root.",
+                },
+            },
+            "required": ["path"],
+        }
+
     def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
         path = tool_call.arguments.get("path")
         if not path:
@@ -65,6 +78,23 @@ class WriteFileTool(LocalTool):
     def description(self) -> str:
         return "Write text content to a file inside the explicit allowed write scope."
 
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write, relative to the allowed root.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full text content to write to the file.",
+                },
+            },
+            "required": ["path", "content"],
+        }
+
     def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
         path = tool_call.arguments.get("path")
         content = tool_call.arguments.get("content")
@@ -100,6 +130,19 @@ class ListFilesTool(LocalTool):
     @property
     def description(self) -> str:
         return "List entries in a directory inside the allowed scope."
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to list, relative to the allowed root. Defaults to '.' if omitted.",
+                },
+            },
+            "required": [],
+        }
 
     def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
         path = tool_call.arguments.get("path", ".")

@@ -17,6 +17,9 @@ Verifies:
     actually includes the dispatch_subagent tool definition in its
     outgoing request body (via mocked urllib.request.urlopen) -- guards
     against ApiAgent silently never telling a real model any tool exists
+  - regression check: a real subagent's own outgoing request (behind a
+    real leader dispatching to it) includes schemas for all four standard
+    tools (read_file/write_file/list_files/run_shell)
 
 No real network call is ever made in this script. FakeModelProvider is
 used for every check except the one regression check above, which uses a
@@ -241,6 +244,66 @@ def main() -> None:
         if not sent_tools or sent_tools[0].get("name") != "dispatch_subagent":
             fail(f"expected outgoing request to include the dispatch_subagent tool, got tools={sent_tools!r}")
         ok("real leader provider's outgoing request includes the dispatch_subagent tool definition")
+
+        # -- regression: a real SUBAGENT's outgoing request must include
+        # schemas for all four standard tools (read_file/write_file/
+        # list_files/run_shell), not just the leader's own tool --
+        os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
+        subagent_requests: list[dict] = []
+        call_count = [0]
+
+        def _fake_urlopen_dispatch(request, timeout=None):  # noqa: ANN001
+            call_count[0] += 1
+            body = json.loads(request.data.decode("utf-8"))
+            if call_count[0] == 1:
+                # leader's turn: decide to dispatch to a subagent
+                payload = {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "c1",
+                            "name": "dispatch_subagent",
+                            "input": {"subagent_name": "researcher", "task": "read a.txt"},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "tool_use",
+                }
+            elif call_count[0] == 2:
+                # the subagent's own turn -- this is the request we care about
+                subagent_requests.append(body)
+                payload = {
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "end_turn",
+                }
+            else:
+                # leader's final answer
+                payload = {
+                    "content": [{"type": "text", "text": "final answer"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "end_turn",
+                }
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        dispatch_leader = Leader(
+            LeaderConfig(
+                leader_provider=AnthropicProvider(),
+                subagent_provider=AnthropicProvider(),
+                repo_root=str(root),
+            )
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen_dispatch):
+            dispatch_leader.run("please read a.txt via researcher")
+        del os.environ[API_KEY_ENV_VAR]
+
+        if not subagent_requests:
+            fail("expected the subagent's own request to have been captured")
+        sent_tool_names = {t.get("name") for t in subagent_requests[0].get("tools", [])}
+        expected_tool_names = {"read_file", "write_file", "list_files", "run_shell"}
+        if sent_tool_names != expected_tool_names:
+            fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
+        ok("real subagent's outgoing request includes all four standard tool schemas")
 
         print("\nAll smoke checks passed.")
 

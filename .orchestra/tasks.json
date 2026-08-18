@@ -1689,6 +1689,165 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v5-tool-schema-module",
+      "title": "Add LocalTool.parameters and tool_schema module",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/tools/base.py",
+        "orchestra_api/tool_schema.py"
+      ],
+      "acceptance_criteria": [
+        "LocalTool gains an abstract parameters property returning a JSON-Schema-shaped {type,properties,required} dict describing the tool's arguments",
+        "to_provider_tool_schema(tool, provider_name) formats any LocalTool into OpenAI's {type:function,function:{...}} shape or Anthropic's {name,description,input_schema} shape, mirroring dispatch_subagent_tool_schema's existing shapes exactly",
+        "tool_registry_schemas(tools, provider_name) maps a dict[str, LocalTool] into a list of provider-shaped schemas",
+        "dispatch_subagent_tool_schema in leader.py is left untouched, not refactored to use the new module",
+        "No network or subprocess calls in either module"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.tool_schema\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.tool_schema\"",
+          "status": "passed",
+          "summary": "Both modules import cleanly, no network/subprocess imports. LocalTool now has an abstract parameters property (existing concrete tool subclasses will fail to instantiate until api-v5-tool-parameters lands -- expected, not yet run against the full smoke suite). Verified to_provider_tool_schema() produces the exact openai/{type:function,function:{...}}, anthropic/{name,description,input_schema}, and fallback shapes for a stub LocalTool, and tool_registry_schemas() maps a registry correctly. Confirmed via git diff that leader.py (and dispatch_subagent_tool_schema within it) is completely untouched by this task.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v5-tool-parameters",
+      "title": "Add parameters to the four standard tools",
+      "worker": "claude",
+      "depends_on": [
+        "api-v5-tool-schema-module"
+      ],
+      "scope": [
+        "orchestra_api/tools/filesystem.py",
+        "orchestra_api/tools/shell.py"
+      ],
+      "acceptance_criteria": [
+        "ReadFileTool, WriteFileTool, ListFilesTool, and RunShellTool each implement parameters",
+        "Each tool's declared parameters match exactly the argument keys its execute() actually reads via tool_call.arguments.get(...) (path, content, argv)",
+        "RunShellTool's argv parameter is documented as an array of strings, never a shell string"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.tools.filesystem, orchestra_api.tools.shell\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.tools.filesystem, orchestra_api.tools.shell\"",
+          "status": "passed",
+          "summary": "Imports cleanly. All four tools (ReadFileTool, WriteFileTool, ListFilesTool, RunShellTool) now instantiate successfully as concrete classes (LocalTool's abstract parameters is satisfied). Verified each tool's declared parameters keys exactly match what its execute() reads via tool_call.arguments.get(...): read_file requires path; write_file requires path+content; list_files has optional path (required=[]); run_shell requires argv, typed as an array of strings (never a shell string, matching the docstring). Verified to_provider_tool_schema() round-trips all four correctly for both openai and anthropic shapes.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v5-wire-subagent-schemas",
+      "title": "Wire tool_schemas into subagent and run_task ApiAgents",
+      "worker": "claude",
+      "depends_on": [
+        "api-v5-tool-parameters"
+      ],
+      "scope": [
+        "orchestra_api/leader.py",
+        "orchestra_api/runner.py"
+      ],
+      "acceptance_criteria": [
+        "DispatchSubagentTool implements parameters (reusing its existing schema constants) so it satisfies the now-abstract LocalTool contract",
+        "A new subagent's ApiAgent is constructed with tool_schemas built from its own standard_tool_registry() via tool_registry_schemas(), keyed to the subagent provider's name",
+        "runner.run_task() builds its ApiAgent the same way -- tool_schemas from standard_tool_registry() via tool_registry_schemas()",
+        "The leader's own dispatch_subagent tool_schemas wiring (added in the prior fix) is unchanged"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.leader, orchestra_api.runner\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.leader, orchestra_api.runner\"",
+          "status": "passed",
+          "summary": "Imports cleanly. DispatchSubagentTool now instantiates (parameters implemented, reusing existing _DISPATCH_PROPERTIES/_DISPATCH_REQUIRED). Both existing smoke suites (smoke_api_agent.py, smoke_leader.py) pass again now that all LocalTool subclasses are concrete. Direct end-to-end verification with mocked urlopen: a real AnthropicProvider subagent's own outgoing request (captured as the 2nd HTTP call in a leader->dispatch->subagent flow) now includes tool definitions for exactly {read_file, write_file, list_files, run_shell}; a real OpenAIProvider run via runner.run_task() likewise includes all 4 in OpenAI's tool_calls shape. The leader's own dispatch_subagent tool_schemas wiring is untouched (still uses dispatch_subagent_tool_schema()).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v5-schema-regression-tests",
+      "title": "Add regression checks for subagent/run_task tool schemas",
+      "worker": "claude",
+      "depends_on": [
+        "api-v5-wire-subagent-schemas"
+      ],
+      "scope": [
+        "scripts/smoke_api_agent.py",
+        "scripts/smoke_leader.py"
+      ],
+      "acceptance_criteria": [
+        "smoke_api_agent.py gains a mocked-HTTP check (real AnthropicProvider or OpenAIProvider) proving runner.run_task()'s outgoing request includes schemas for read_file/write_file/list_files/run_shell",
+        "smoke_leader.py gains a mocked-HTTP check proving a dispatched subagent's outgoing request (real provider) includes the same four tool schemas",
+        "No real network call is made in either check -- mocked urllib.request.urlopen only",
+        "All existing checks in both scripts still pass"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_api_agent.py",
+          "status": "passed",
+          "summary": "All 10 checks pass, exit 0, including the new regression check: a real OpenAIProvider run via run_task() (mocked urlopen) sends a request whose tools field contains exactly {read_file, write_file, list_files, run_shell}.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "All 9 smoke_leader.py checks pass, exit 0, including the new regression check: a real leader (AnthropicProvider) dispatching to a subagent (mocked 3-call HTTP sequence: leader dispatches, subagent's own turn, leader final answer) produces a captured subagent request whose tools field contains exactly {read_file, write_file, list_files, run_shell}. smoke_api_agent.py's 10 checks (including its own run_task() regression check) also still pass. No real network calls in either script.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v5-schema-docs",
+      "title": "Document the tool-schema fix and update the known-gap note",
+      "worker": "claude",
+      "depends_on": [
+        "api-v5-tool-schema-module",
+        "api-v5-tool-parameters",
+        "api-v5-wire-subagent-schemas",
+        "api-v5-schema-regression-tests"
+      ],
+      "scope": [
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "Documents LocalTool.parameters and orchestra_api/tool_schema.py",
+        "States a real subagent (and runner.run_task()) can now actually call read_file/write_file/list_files/run_shell, closing the gap flagged in the prior fix's commit",
+        "Does not overclaim: notes this covers the four existing standard tools by hand-written parameters, not an automatic schema-from-type-hints generator for arbitrary future tools"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review + grep checks on docs/orchestra-api-runtime.md",
+          "status": "passed",
+          "summary": "Added a new \"Tool schemas\" section documenting LocalTool.parameters and orchestra_api/tool_schema.py, states plainly that a real subagent and runner.run_task() can now call read_file/write_file/list_files/run_shell, and explicitly avoids overclaiming: notes this is hand-written parameters for five known tools, not an automatic schema-from-type-hints generator for arbitrary future ones. Updated three previously-stale passages that described the gap as still-open (ApiAgent's tool_schemas note, the Leader section's dispatch_subagent_tool_schema bullet, the Non-goals tool-schema-translator bullet) to instead point at the new section. Updated the Leader validation bullet and runner.py section to reflect the new regression checks and wiring. Full doc read cleanly; whole package still compiles and both smoke suites (10 + 9 checks) still pass.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [

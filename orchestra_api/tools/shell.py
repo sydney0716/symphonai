@@ -28,6 +28,23 @@ class RunShellTool(LocalTool):
     def description(self) -> str:
         return "Run an allowlisted shell command (argv list) and return its output."
 
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Command and arguments as a list of strings, e.g. "
+                        "['git', 'status']. Never a single shell string."
+                    ),
+                },
+            },
+            "required": ["argv"],
+        }
+
     def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
         argv = tool_call.arguments.get("argv")
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
