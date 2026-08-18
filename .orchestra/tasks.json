@@ -1535,6 +1535,127 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v4-leader-status-and-chat",
+      "title": "Add status callback and Leader.chat() multi-turn",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/leader.py"
+      ],
+      "acceptance_criteria": [
+        "An optional on_status callback, default None, fires (label, status) with label 'leader' or a subagent_name and status in {pending, working, done, failed}",
+        "Leader.run()/chat() fire ('leader','working') then ('leader','done') around the underlying ApiAgent.run() call",
+        "DispatchSubagentTool.execute() fires (name,'pending') on first creation, (name,'working') right before the subagent's ApiAgent.run(), then (name,'done') or (name,'failed') based on the resulting ToolResult.ok",
+        "Leader.chat(message) maintains its own running message list across calls -- a second chat() call sees the first exchange in its context, unlike run() which starts fresh each time",
+        "All existing Leader/DispatchSubagentTool behavior (create/reuse/isolate/max_subagents/max_turns) is unchanged when on_status is not supplied"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.leader\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.leader\"",
+          "status": "passed",
+          "summary": "Imports cleanly, no network/subprocess imports. Verified status callback fires exact expected sequence [('leader','working'),('researcher','pending'),('researcher','working'),('researcher','done'),('leader','done')] for a run that dispatches one new subagent; reusing an existing name fires only working/done (no repeated pending). Verified chat() persists conversation across calls (2nd call's leader_messages includes both exchanges, 4 messages total, first exchange's content confirmed present) and fires leader working/done per call. Verified on_status=None (default) works with no behavior change. Reran the original scripts/smoke_leader.py unmodified -- all 5 prior checks (create/reuse/isolate/max_subagents/full run) still pass, confirming the additions are backward compatible. Note: ToolResult.ok for a dispatch now reflects whether the subagent reached a final answer (stopped_reason=='final_response') rather than being unconditionally True, which the done/failed status is derived from -- this doesn't affect any existing test since all existing scripted subagents give a final answer on their first turn.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v4-smoke-leader-chat",
+      "title": "Extend leader smoke test for status callback and chat()",
+      "worker": "claude",
+      "depends_on": [
+        "api-v4-leader-status-and-chat"
+      ],
+      "scope": [
+        "scripts/smoke_leader.py"
+      ],
+      "acceptance_criteria": [
+        "Uses FakeModelProvider only; no network calls",
+        "Asserts the on_status callback receives the expected ordered sequence of (label, status) events for a run that dispatches one subagent",
+        "Asserts a second Leader.chat() call's leader_messages include the first call's exchange (conversation persists across calls)",
+        "Existing checks (create/reuse/isolate/max_subagents/full run) still pass"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "All 7 checks passed, exit 0: the original 5 (full run, create, reuse, isolate, max_subagents) plus 2 new ones -- on_status fires the exact expected [('leader','working'),('researcher','pending'),('researcher','working'),('researcher','done'),('leader','done')] sequence, and Leader.chat() persists conversation across two calls (2->4 messages, first exchange's content confirmed present in second call's context). FakeModelProvider only, no network calls.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v4-cli",
+      "title": "Add terminal chat CLI",
+      "worker": "claude",
+      "depends_on": [
+        "api-v4-leader-status-and-chat",
+        "api-v4-smoke-leader-chat"
+      ],
+      "scope": [
+        "scripts/chat.py"
+      ],
+      "acceptance_criteria": [
+        "Lets the user pick leader provider+model and subagent provider+model at startup (fake/openai/anthropic), checking is_configured() for real providers the same way live_test_provider.py does",
+        "Prints a one-time cost/network warning at startup if a real provider was chosen, not per message",
+        "Prints simple status lines (e.g. '[leader] working', '[researcher] done') live via the on_status callback as the leader/subagents run",
+        "Loops: read user input, call leader.chat(), print the leader's final answer, repeat until the user quits",
+        "Plain stdout/print()/input() only -- no new dependency, no raw terminal mode, no TUI framework"
+      ],
+      "validation_commands": [
+        "python3 -c \"import ast; ast.parse(open('scripts/chat.py').read())\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import ast; ast.parse(open('scripts/chat.py').read())\"",
+          "status": "passed",
+          "summary": "Syntax check passes. Beyond the required check, ran three scripted end-to-end sessions with mock.patch('builtins.input', ...): (1) fake-only leader+subagent, one chat turn ('hello'), status lines '[leader] working'/'[leader] done' printed correctly, exits cleanly on 'exit'; (2) an invalid provider name is rejected with a retry prompt rather than crashing; (3) selecting a real provider (openai, unconfigured) triggers the is_configured() warning and the one-time cost/network confirmation prompt, and declining it ('n') aborts cleanly before any network code path is reached. No real network call was made in any of these. No new dependency, no raw terminal mode -- only stdlib input()/print().",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v4-cli-docs",
+      "title": "Document status callback, chat(), and the CLI",
+      "worker": "claude",
+      "depends_on": [
+        "api-v4-leader-status-and-chat",
+        "api-v4-smoke-leader-chat",
+        "api-v4-cli"
+      ],
+      "scope": [
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "Documents the on_status callback's (label, status) contract and the pending/working/done/failed states",
+        "Documents Leader.chat() vs Leader.run() (persistent vs one-shot)",
+        "Documents scripts/chat.py and how to run it",
+        "Revises the old 'No UI' non-goal to state a terminal CLI is now in scope, while GUI/web/app-shell UI remains out of scope"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review + grep checks on docs/orchestra-api-runtime.md",
+          "status": "passed",
+          "summary": "Docs now cover on_status's (label,status) contract and the pending/working/done/failed states with the exact event ordering, Leader.chat() vs Leader.run() (persistent vs one-shot), and a new \"Terminal chat CLI\" section documenting scripts/chat.py's flow and how to run it. The \"No UI\" non-goal is revised to state a terminal CLI is now in scope while GUI/web/app-shell UI remains out of scope. Verified via grep and a full text read.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [

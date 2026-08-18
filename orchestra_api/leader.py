@@ -19,6 +19,7 @@ Subagent pool state lives only in memory for the duration of one
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from orchestra_api.models import Message, Role, ToolCall, ToolResult
@@ -30,6 +31,21 @@ from orchestra_api.tools.base import LocalTool
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
 DEFAULT_SUBAGENT_MAX_TURNS = 5
+
+# Coarse status states reported via on_status(label, status). Deliberately
+# not a fine-grained event stream (no message content, no per-turn detail)
+# -- just "is this agent pending, working, done, or failed."
+STATUS_PENDING = "pending"
+STATUS_WORKING = "working"
+STATUS_DONE = "done"
+STATUS_FAILED = "failed"
+
+StatusCallback = Callable[[str, str], None]
+
+
+def _report(on_status: StatusCallback | None, label: str, status: str) -> None:
+    if on_status is not None:
+        on_status(label, status)
 
 _DISPATCH_DESCRIPTION = (
     "Dispatch a task to a named subagent. If subagent_name has not been "
@@ -120,11 +136,13 @@ class DispatchSubagentTool(LocalTool):
         *,
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
+        on_status: StatusCallback | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
+        self._on_status = on_status
         self.pool: dict[str, SubagentRecord] = {}
 
     @property
@@ -156,6 +174,7 @@ class DispatchSubagentTool(LocalTool):
                         f"cannot create new subagent {subagent_name!r}"
                     ),
                 )
+            _report(self._on_status, subagent_name, STATUS_PENDING)
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=self._subagent_provider,
@@ -167,14 +186,19 @@ class DispatchSubagentTool(LocalTool):
             self.pool[subagent_name] = record
 
         record.messages.append(Message(role=Role.USER, content=task))
+        _report(self._on_status, subagent_name, STATUS_WORKING)
         run_result = record.agent.run(record.messages)
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
 
+        succeeded = run_result.stopped_reason == "final_response"
+        _report(self._on_status, subagent_name, STATUS_DONE if succeeded else STATUS_FAILED)
+
         return ToolResult(
             tool_call_id=tool_call.id,
-            ok=True,
+            ok=succeeded,
             content=run_result.final_response.message.content,
+            error=None if succeeded else "subagent reached max_turns without a final answer",
         )
 
 
@@ -192,6 +216,7 @@ class LeaderConfig:
     max_leader_turns: int = DEFAULT_MAX_TURNS
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    on_status: StatusCallback | None = None
 
 
 @dataclass
@@ -205,7 +230,13 @@ class LeaderRunResult:
 
 
 class Leader:
-    """Digests a user goal, dispatching/reusing named subagents as needed."""
+    """Digests a user goal, dispatching/reusing named subagents as needed.
+
+    `run()` is one-shot: each call starts a fresh conversation. `chat()` is
+    the multi-turn version: it keeps its own running message list across
+    calls, so a later `chat()` call sees everything said in earlier ones.
+    Use `run()` for a single task; use `chat()` for an interactive session.
+    """
 
     def __init__(self, config: LeaderConfig) -> None:
         self._config = config
@@ -215,6 +246,7 @@ class Leader:
             subagent_policy=subagent_policy,
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
+            on_status=config.on_status,
         )
         leader_policy = PermissionPolicy(repo_root=config.repo_root)
         self._agent = ApiAgent(
@@ -223,21 +255,40 @@ class Leader:
             policy=leader_policy,
             max_turns=config.max_leader_turns,
         )
+        self._chat_messages: list[Message] = []
 
     @property
     def subagents(self) -> dict[str, SubagentRecord]:
         return self._dispatch_tool.pool
 
-    def run(self, goal: str, *, system_prompt: str | None = None) -> LeaderRunResult:
-        messages: list[Message] = []
-        if system_prompt:
-            messages.append(Message(role=Role.SYSTEM, content=system_prompt))
-        messages.append(Message(role=Role.USER, content=goal))
-
+    def _run_messages(self, messages: list[Message]) -> LeaderRunResult:
+        _report(self._config.on_status, "leader", STATUS_WORKING)
         result = self._agent.run(messages)
+        _report(self._config.on_status, "leader", STATUS_DONE)
         return LeaderRunResult(
             final_answer=result.final_response.message.content,
             leader_messages=result.messages,
             stopped_reason=result.stopped_reason,
             subagents=self._dispatch_tool.pool,
         )
+
+    def run(self, goal: str, *, system_prompt: str | None = None) -> LeaderRunResult:
+        """Run a single, one-shot task. Each call starts a fresh conversation."""
+        messages: list[Message] = []
+        if system_prompt:
+            messages.append(Message(role=Role.SYSTEM, content=system_prompt))
+        messages.append(Message(role=Role.USER, content=goal))
+        return self._run_messages(messages)
+
+    def chat(self, message: str) -> LeaderRunResult:
+        """Continue an ongoing conversation with the leader.
+
+        Unlike `run()`, this keeps its own running message history across
+        calls -- a later `chat()` call includes everything said in earlier
+        ones, so the leader (and its view of already-dispatched subagents)
+        has full context of the conversation so far.
+        """
+        self._chat_messages.append(Message(role=Role.USER, content=message))
+        result = self._run_messages(self._chat_messages)
+        self._chat_messages = result.leader_messages
+        return result

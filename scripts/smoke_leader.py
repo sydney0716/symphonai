@@ -9,6 +9,10 @@ Verifies:
     message history grows across calls)
   - a different subagent_name creates an isolated second pool entry
   - max_subagents is enforced once the limit is reached
+  - the on_status callback fires the expected ordered sequence of
+    (label, status) events for a run that dispatches one subagent
+  - Leader.chat() persists conversation across calls -- a second chat()
+    call's leader_messages include the first call's exchange
 
 No network calls anywhere in this script -- FakeModelProvider is the only
 ModelProvider used, for both the leader and every subagent.
@@ -121,6 +125,67 @@ def main() -> None:
         if r4.ok or len(tool.pool) != 2:
             fail("expected max_subagents to be enforced once the limit is reached")
         ok("max_subagents is enforced")
+
+        # -- on_status callback fires the expected ordered sequence --
+        events: list[tuple[str, str]] = []
+        status_subagent_provider = FakeModelProvider(
+            responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="the sky is blue"))]
+        )
+        status_leader_provider = FakeModelProvider(
+            responses=[
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                id="lc1",
+                                name="dispatch_subagent",
+                                arguments={"subagent_name": "researcher", "task": "why blue?"},
+                            )
+                        ],
+                    )
+                ),
+                ModelResponse(message=Message(role=Role.ASSISTANT, content="Answer: blue.")),
+            ]
+        )
+        status_config = LeaderConfig(
+            leader_provider=status_leader_provider,
+            subagent_provider=status_subagent_provider,
+            repo_root=str(root),
+            on_status=lambda label, status: events.append((label, status)),
+        )
+        Leader(status_config).run("why is the sky blue?")
+        expected_events = [
+            ("leader", "working"),
+            ("researcher", "pending"),
+            ("researcher", "working"),
+            ("researcher", "done"),
+            ("leader", "done"),
+        ]
+        if events != expected_events:
+            fail(f"expected status event sequence {expected_events}, got {events}")
+        ok(f"on_status fires the expected sequence: {events}")
+
+        # -- Leader.chat() persists conversation across calls --
+        chat_provider = FakeModelProvider(
+            responses=[
+                ModelResponse(message=Message(role=Role.ASSISTANT, content="hi there")),
+                ModelResponse(message=Message(role=Role.ASSISTANT, content="yes, I remember you said hello")),
+            ]
+        )
+        chat_leader = Leader(
+            LeaderConfig(leader_provider=chat_provider, subagent_provider=FakeModelProvider(), repo_root=str(root))
+        )
+        first = chat_leader.chat("hello")
+        if len(first.leader_messages) != 2:
+            fail(f"expected 2 messages after first chat() call, got {len(first.leader_messages)}")
+        second = chat_leader.chat("do you remember what I said?")
+        if len(second.leader_messages) != 4:
+            fail(f"expected 4 messages after second chat() call (history carried forward), got {len(second.leader_messages)}")
+        contents = [m.content for m in second.leader_messages]
+        if "hello" not in contents:
+            fail("expected the first call's user message to still be present in the second call's context")
+        ok("Leader.chat() persists conversation across calls")
 
         print("\nAll smoke checks passed.")
 
