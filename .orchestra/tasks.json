@@ -456,6 +456,310 @@
           "executed_by": "supervisor"
         }
       ]
+    },
+    {
+      "id": "agents-v2-models",
+      "title": "Define orchestra_agents dataclasses (models.py)",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_agents/__init__.py",
+        "orchestra_agents/models.py"
+      ],
+      "acceptance_criteria": [
+        "AgentProfile, AgentTask, AgentRunResult, AgentEvent, ProviderCapability, and ValidationResult are defined as dataclasses",
+        "AgentRunResult and AgentEvent use session_id, never thread_id",
+        "orchestra_agents/__init__.py exports the public dataclasses"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_agents.models\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_agents.models\"",
+          "status": "passed",
+          "summary": "Module imports cleanly; all 7 dataclasses/enum instantiate as expected; AgentEvent/AgentRunResult confirmed to use session_id, not thread_id.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-base",
+      "title": "Define SubagentProvider contract (base.py)",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-models"
+      ],
+      "scope": [
+        "orchestra_agents/base.py"
+      ],
+      "acceptance_criteria": [
+        "SubagentProvider is an abstract base with spawn(task: AgentTask) -> AgentRunResult and resume(session_id: str, follow_up: str) -> AgentRunResult",
+        "No vendor-specific naming such as thread_id anywhere in base.py",
+        "No subprocess or network calls in this module"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_agents.base\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_agents.base\"",
+          "status": "passed",
+          "summary": "Imports cleanly; SubagentProvider is abstract (name/spawn/resume all abstract); spawn(task: AgentTask) -> AgentRunResult, resume(session_id: str, follow_up: str) -> AgentRunResult; confirmed no thread_id string in file and no subprocess/network imports.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-fake-adapter",
+      "title": "Implement deterministic FakeProvider",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-base"
+      ],
+      "scope": [
+        "orchestra_agents/adapters/__init__.py",
+        "orchestra_agents/adapters/fake.py"
+      ],
+      "acceptance_criteria": [
+        "FakeProvider implements SubagentProvider fully",
+        "spawn/resume are deterministic given the same input, no randomness or wall-clock dependence in outputs",
+        "No subprocess, network, or filesystem calls"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_agents.adapters.fake\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_agents.adapters.fake\"",
+          "status": "passed",
+          "summary": "Imports cleanly. Verified determinism (two fresh FakeProvider instances given identical AgentTask produce equal AgentRunResult), resume() extends session history correctly, and resume() on an unknown session_id returns ok=False with an error instead of raising. No subprocess/network/filesystem calls in the module.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-registry",
+      "title": "Implement provider registry",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-fake-adapter"
+      ],
+      "scope": [
+        "orchestra_agents/registry.py"
+      ],
+      "acceptance_criteria": [
+        "register_provider/get_provider style functions exist",
+        "FakeProvider can be registered and retrieved by name",
+        "No import-time side effects that call external commands"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_agents.registry\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_agents.registry\"",
+          "status": "passed",
+          "summary": "Imports cleanly with no side effects (registry starts empty). Verified register_provider/get_provider/list_providers round-trip with FakeProvider, duplicate-registration raises ValueError, and lookup of an unregistered name raises KeyError.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-probes",
+      "title": "Define static CLI capability probe specs",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-models"
+      ],
+      "scope": [
+        "orchestra_agents/probes.py"
+      ],
+      "acceptance_criteria": [
+        "Declarative ProviderCapability-shaped candidate specs exist for claude, codex, and gemini",
+        "Each entry is explicitly labeled as candidate flags, not confirmed runtime facts, sourced from documented CLI help/references",
+        "Module docstring/comments state local behavior must be verified by scripts/probe_cli_agents.py and no adapter should rely on these specs without a probe result",
+        "Importing this module executes no subprocess"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_agents.probes\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_agents.probes\"",
+          "status": "passed",
+          "summary": "Imports cleanly (data only, no subprocess). CLAUDE_PROBE/CODEX_PROBE/GEMINI_PROBE all defined with candidate flag tuples per five categories; as_capabilities() confirmed to always emit confirmed=False. Module docstring and every spec's notes field explicitly flag these as unverified candidates requiring scripts/probe_cli_agents.py.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-probe-script",
+      "title": "Add dry-run CLI probe script",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-probes"
+      ],
+      "scope": [
+        "scripts/probe_cli_agents.py"
+      ],
+      "acceptance_criteria": [
+        "Default run only checks binary presence via shutil.which and prints candidate flags from probes.py; executes no agent CLI",
+        "--live flag gates any subprocess execution, limited to --version/--help only, never a real agent task",
+        "No destructive commands in either mode"
+      ],
+      "validation_commands": [
+        "python3 scripts/probe_cli_agents.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/probe_cli_agents.py",
+          "status": "passed",
+          "summary": "Dry-run executed cleanly for all three CLIs (claude and gemini found on PATH, codex not found). No subprocess was invoked in default mode -- report_spec() returns before run_live_flag_check() unless --live is passed. --live path (not exercised in this validation, per approved scope of only running the dry-run command) is code-reviewed to call subprocess.run only for version/help flag candidates, never a task prompt.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-smoke-script",
+      "title": "Add FakeProvider smoke test script",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-fake-adapter",
+        "agents-v2-registry"
+      ],
+      "scope": [
+        "scripts/smoke_agent_adapter.py"
+      ],
+      "acceptance_criteria": [
+        "Exercises FakeProvider.spawn and .resume through the SubagentProvider contract and registry",
+        "Asserts AgentRunResult/AgentEvent shape",
+        "No external commands or network calls"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_agent_adapter.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_agent_adapter.py",
+          "status": "passed",
+          "summary": "All 5 smoke checks passed: registry round-trip, spawn() produces session_id + MESSAGE/DONE events, resume() extends the same session's event history, and resume() on an unknown session_id fails gracefully rather than raising.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-config-example",
+      "title": "Add example agents config",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-registry",
+        "agents-v2-probes"
+      ],
+      "scope": [
+        "configs/agents.example.yaml"
+      ],
+      "acceptance_criteria": [
+        "Example YAML lists agent profiles including a working fake entry and commented-out placeholders for claude/codex/gemini",
+        "File is documentation/config only, not loaded by any script yet"
+      ],
+      "validation_commands": [
+        "python3 -c \"import pathlib; pathlib.Path('configs/agents.example.yaml').read_text()\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import pathlib; pathlib.Path('configs/agents.example.yaml').read_text()\"",
+          "status": "passed",
+          "summary": "File reads cleanly as text (approved validation command). Also confirmed no literal tabs and consistent 2-space indentation by hand since PyYAML isn't installed in this venv (not installed, per the no-new-dependencies convention). Contains one active `fake-default` entry using the real FakeProvider, plus three commented-out placeholder entries (claude/codex/gemini) whose cli flag lists are explicitly labeled as candidates from orchestra_agents.probes.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "agents-v2-docs",
+      "title": "Document the SubagentProvider contract and adapter plan",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-models",
+        "agents-v2-base",
+        "agents-v2-fake-adapter",
+        "agents-v2-registry",
+        "agents-v2-probes",
+        "agents-v2-probe-script",
+        "agents-v2-smoke-script",
+        "agents-v2-config-example"
+      ],
+      "scope": [
+        "docs/orchestra-agent-adapters.md"
+      ],
+      "acceptance_criteria": [
+        "Explains the contract, models, registry, and probe script, including the session_id vs thread_id distinction",
+        "States jarmuine/claude-code was used only as architectural reference for tool contract, permission interceptor, query loop, coordinator, and task/state model, with no code copied",
+        "States current non-goals: no real claude/codex/gemini adapters yet, no live API calls, no Codex worker dispatch used for this feature"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review of docs/orchestra-agent-adapters.md",
+          "status": "passed",
+          "summary": "Doc covers the contract, all 6 data model types, registry, probes.py (with explicit candidate/unconfirmed framing), probe script's dry-run vs --live scoping, FakeProvider, smoke script, example config, the session_id/thread_id distinction, the jarmuine/claude-code reference-only statement across all 5 named areas, and an explicit non-goals section (no real adapters, no live calls, no Codex dispatch, no manual tasks.json edits).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "macos-ignore-1",
+      "title": "Ignore macOS Finder artifacts",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        ".gitignore",
+        ".orchestra/tasks.json"
+      ],
+      "acceptance_criteria": [
+        ".DS_Store is ignored",
+        "Existing Orchestra and Python ignore rules remain unchanged",
+        "No .DS_Store files appear in git status --porcelain --untracked-files=all",
+        "Only .gitignore and .orchestra/tasks.json are modified by this housekeeping task"
+      ],
+      "validation_commands": [
+        "git diff --check -- .gitignore .orchestra/tasks.json",
+        "git status --porcelain --untracked-files=all"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "git diff --check -- .gitignore .orchestra/tasks.json",
+          "status": "passed",
+          "summary": "Exit 0, no whitespace-error output.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "git status --porcelain --untracked-files=all",
+          "status": "passed",
+          "summary": "Only .gitignore and .orchestra/tasks.json show as modified (M). No .DS_Store entries appear anywhere in the output; git check-ignore -v confirmed all three prior .DS_Store paths (.DS_Store, .claude/.DS_Store, .orchestra/.DS_Store) now match the new .gitignore:15 rule. The remaining ?? entries are the untouched, already-untracked files from the prior agents-v2 task.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
