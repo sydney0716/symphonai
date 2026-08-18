@@ -762,6 +762,438 @@
       ]
     },
     {
+      "id": "agents-v2-live-probe",
+      "title": "Confirm local CLI capability flags",
+      "worker": "claude",
+      "depends_on": [
+        "agents-v2-probe-script"
+      ],
+      "scope": [
+        ".orchestra/tasks.json"
+      ],
+      "acceptance_criteria": [
+        "python scripts/probe_cli_agents.py --live is run and its output captured",
+        "Only --version/--help candidates are executed, no real agent task/prompt is sent to any CLI",
+        "Results recorded via Orchestra MCP validation records",
+        "Report identifies which binaries were found, which version/help checks passed, which providers are locally probeable, whether codex is reachable via Claude Code MCP despite being absent from PATH, and a recommendation for which real adapter to build first"
+      ],
+      "validation_commands": [
+        "python scripts/probe_cli_agents.py --live"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python scripts/probe_cli_agents.py --live",
+          "status": "passed",
+          "summary": "claude: binary found at /opt/homebrew/bin/claude, --version OK (2.1.224 (Claude Code)), --help OK. gemini: binary found at ~/.nvm/.../bin/gemini, --version OK (0.39.1), --help OK. codex: NOT FOUND on PATH, live check skipped (script correctly refused to run anything). No prompt/task was sent to any CLI -- only --version/--help were executed, matching the script's --live scope. Separately confirmed via read-only inspection of ~/.claude.json (not via calling codex) that a project-scoped Codex MCP server (command: /Applications/ChatGPT.app/Contents/Resources/codex mcp-server) is registered for the /Users/hoyoungchung/orchestra project, so codex is reachable via Claude Code MCP tooling in a session opened there, independent of shell PATH.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-models",
+      "title": "Define orchestra_api dataclasses (models.py)",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/__init__.py",
+        "orchestra_api/models.py"
+      ],
+      "acceptance_criteria": [
+        "ModelRequest, ModelResponse, ToolCall, ToolResult, Message, Usage are defined as dataclasses",
+        "No network or subprocess calls in this module",
+        "__init__.py exports the public dataclasses"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.models\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.models\"",
+          "status": "passed",
+          "summary": "Imports cleanly; ModelRequest/ModelResponse/ToolCall/ToolResult/Message/Usage (plus Role enum) all instantiate and compose as expected; ModelResponse.has_tool_calls and Usage.total_tokens verified. __init__.py exports all six.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-provider-base",
+      "title": "Define ModelProvider interface",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-models"
+      ],
+      "scope": [
+        "orchestra_api/providers/__init__.py",
+        "orchestra_api/providers/base.py"
+      ],
+      "acceptance_criteria": [
+        "ModelProvider is an abstract base with a create_response(request: ModelRequest) -> ModelResponse method and a name property",
+        "No network or subprocess calls in this module"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.base\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.base\"",
+          "status": "passed",
+          "summary": "Imports cleanly; ModelProvider is abstract (name and create_response both abstract); create_response(request: ModelRequest) -> ModelResponse. No network/subprocess imports in the module.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-fake-provider",
+      "title": "Implement FakeModelProvider",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-provider-base"
+      ],
+      "scope": [
+        "orchestra_api/providers/fake.py"
+      ],
+      "acceptance_criteria": [
+        "FakeModelProvider implements ModelProvider fully and deterministically",
+        "No network or subprocess calls",
+        "Supports configuring a scripted sequence of responses (including tool calls) so the agent loop can be exercised deterministically"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.fake\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.fake\"",
+          "status": "passed",
+          "summary": "Imports cleanly, no network/subprocess. Verified: scripted sequence returned in order (including a tool-call turn), overrun repeats the last response, and two fresh instances given the same script produce identical results (deterministic).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-placeholder-providers",
+      "title": "Add interface-conforming placeholder providers",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-provider-base"
+      ],
+      "scope": [
+        "orchestra_api/providers/openai_provider.py",
+        "orchestra_api/providers/anthropic_provider.py",
+        "orchestra_api/providers/gemini_provider.py",
+        "orchestra_api/providers/openai_compatible.py"
+      ],
+      "acceptance_criteria": [
+        "OpenAIProvider, AnthropicProvider, GeminiProvider, OpenAICompatibleProvider each implement ModelProvider's shape (class def, config fields, provider name, env var name(s), base_url/model fields where appropriate)",
+        "Each has an is_configured()-style helper that only checks whether the expected env var name is set, never reads or logs its value",
+        "create_response on each raises NotImplementedError with a message pointing to docs/orchestra-api-runtime.md",
+        "No urllib/requests/http/socket imports, no network calls, no new dependencies, importing each module makes no network or subprocess call"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.openai_provider, orchestra_api.providers.anthropic_provider, orchestra_api.providers.gemini_provider, orchestra_api.providers.openai_compatible\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.openai_provider, orchestra_api.providers.anthropic_provider, orchestra_api.providers.gemini_provider, orchestra_api.providers.openai_compatible\"",
+          "status": "passed",
+          "summary": "All four import cleanly. Verified per-provider: name property, is_configured() correctly reflects the corresponding env var's presence/absence (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, and a caller-supplied var for OpenAICompatibleProvider) without ever reading/logging its value, and create_response() raises NotImplementedError referencing docs/orchestra-api-runtime.md on every provider. grep confirmed zero urllib/requests/http/socket/httpx/aiohttp imports across all four files.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-tools-base",
+      "title": "Define LocalTool contract",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-models"
+      ],
+      "scope": [
+        "orchestra_api/tools/__init__.py",
+        "orchestra_api/tools/base.py"
+      ],
+      "acceptance_criteria": [
+        "LocalTool is an abstract base with name, description, and execute(tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult",
+        "No network or subprocess calls in this module"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.tools.base\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.tools.base\"",
+          "status": "passed",
+          "summary": "Imports cleanly with no runtime dependency on orchestra_api.permissions (PermissionPolicy is a TYPE_CHECKING-only import, matching this task's declared depends_on of just api-v1-models). LocalTool is abstract (name/description/execute all abstract); execute(tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult confirmed via signature inspection. No network/subprocess imports.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-permissions",
+      "title": "Implement deny-by-default PermissionPolicy",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/permissions.py"
+      ],
+      "acceptance_criteria": [
+        "PermissionPolicy resolves repo_root/worktree and rejects any path escaping it via .. or symlinks by resolving before containment checks",
+        "read_file/list_files allowed only inside repo_root minus forbidden patterns; write_file additionally requires the resolved path to be inside an explicit allowed write scope, empty by default",
+        "Forbidden path patterns include at least: .env, .env.*, .git/, .ssh/, *.pem, *.key, id_rsa, id_ed25519, .venv/, __pycache__/, *.egg-info/, node_modules/, dist/, build/",
+        "run_shell is denied unless shell_enabled=True and the command's argv matches an explicit allowlist, which is empty by default",
+        "An always-deny set (rm, mv, chmod, chown, sudo, curl, wget, ssh, scp, git push, git merge, git commit, open, osascript) is enforced ahead of and regardless of the allowlist",
+        "Commands are represented as argv lists, never shell strings; nothing in this module calls subprocess with shell=True or at all"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.permissions\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.permissions\"",
+          "status": "passed",
+          "summary": "Imports cleanly. Exercised in a real temp dir: read/list allowed inside repo_root; both a `..` traversal and a symlink pointing outside repo_root are denied (resolve-before-check catches both); all 6 representative forbidden patterns denied (.env, .git/config, id_rsa, a.pem, __pycache__/x.pyc, pkg.egg-info/PKG-INFO); write allowed only inside the explicit allowed_write_scope subdir, denied elsewhere in repo_root and denied on a forbidden-pattern path. Shell: denied by default, denied when enabled but not allowlisted, allowed when enabled+allowlisted, and 5 always-deny commands (rm, git commit, sudo, curl, git push) denied even when explicitly present in the allowlist. grep confirmed zero subprocess usage in the module (docstring mention only).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-tools-filesystem",
+      "title": "Implement filesystem local tools",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-tools-base",
+        "api-v1-permissions"
+      ],
+      "scope": [
+        "orchestra_api/tools/filesystem.py"
+      ],
+      "acceptance_criteria": [
+        "ReadFileTool, WriteFileTool, and ListFilesTool each implement LocalTool",
+        "Every filesystem access goes through PermissionPolicy's path check before touching disk",
+        "A denied path returns a ToolResult with ok=False and a clear reason instead of raising or performing the disk access"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.tools.filesystem\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.tools.filesystem\"",
+          "status": "passed",
+          "summary": "Imports cleanly. Exercised in a temp dir: read_file succeeds on an allowed path and returns exact content; denied on a forbidden pattern (.env) and on a .. traversal attempt, both returning ok=False with a reason instead of raising or touching disk. write_file succeeds inside the allowed write scope (file verified on disk) and is denied (file confirmed NOT created) when allowed_write_scope is empty. list_files returns the directory's entries. Missing required tool_call argument returns a clear ok=False error instead of a KeyError.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-tools-shell",
+      "title": "Implement run_shell local tool",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-tools-base",
+        "api-v1-permissions"
+      ],
+      "scope": [
+        "orchestra_api/tools/shell.py"
+      ],
+      "acceptance_criteria": [
+        "RunShellTool implements LocalTool",
+        "Commands are argv lists; subprocess.run is called with shell=False only",
+        "A denied command (not enabled, not allowlisted, or matching the always-deny set) returns ToolResult ok=False without ever calling subprocess.run",
+        "A timeout is enforced on any command that does run"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.tools.shell\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.tools.shell\"",
+          "status": "passed",
+          "summary": "Imports cleanly. Verified via mock.patch('subprocess.run', side_effect=AssertionError) that subprocess.run is never invoked on two deny paths: shell disabled by default, and an always-deny command (rm) present in an explicit allowlist. Verified an allowed command (echo, enabled+allowlisted) actually runs and returns its real stdout. Verified a 0.2s timeout on `sleep 3` is enforced and returns ok=False. grep confirms the only shell= usage in the file is the literal shell=False call. Invalid argv shape (a string instead of a list) is rejected before any policy check.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-agent-loop",
+      "title": "Implement ApiAgent loop",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-provider-base",
+        "api-v1-tools-base",
+        "api-v1-permissions",
+        "api-v1-models"
+      ],
+      "scope": [
+        "orchestra_api/agent_loop.py"
+      ],
+      "acceptance_criteria": [
+        "ApiAgent calls provider.create_response, and when the response contains one or more ToolCalls, executes each via a tool registry gated by PermissionPolicy, appends the ToolResult(s) as messages, and continues",
+        "Loop terminates on a final (non-tool-call) response or when max_turns is reached, whichever first, without raising on max_turns",
+        "No network or subprocess calls in this module itself (those live in providers/tools)"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.agent_loop\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.agent_loop\"",
+          "status": "passed",
+          "summary": "Imports cleanly, no network/subprocess imports. Exercised with FakeModelProvider + a stub LocalTool: (1) a tool-call turn followed by a final turn stops with stopped_reason='final_response', turns_used=2, and the ToolResult is correctly appended as a tool-role Message; (2) an unknown tool name returns ok=False with a clear error instead of raising; (3) a provider that never returns a final answer stops cleanly at stopped_reason='max_turns' after exactly max_turns turns, no exception; (4) max_turns=0 is rejected eagerly at construction with ValueError.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-runner",
+      "title": "Implement runner wiring",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-agent-loop",
+        "api-v1-tools-filesystem",
+        "api-v1-tools-shell"
+      ],
+      "scope": [
+        "orchestra_api/runner.py"
+      ],
+      "acceptance_criteria": [
+        "A function/entry point wires a given ModelProvider + PermissionPolicy + the standard tool registry (read_file, write_file, list_files, run_shell) into an ApiAgent and runs a task to completion",
+        "No UI code",
+        "No network or subprocess calls in this module itself"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.runner\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.runner\"",
+          "status": "passed",
+          "summary": "Imports cleanly. standard_tool_registry() returns exactly {read_file, write_file, list_files, run_shell}. run_task() end-to-end with FakeModelProvider: a tool-call turn correctly invokes the real ReadFileTool against a temp dir, its ToolResult flows back into the conversation, the run stops at the final answer, and system_prompt is placed as the first message. No UI code, no network/subprocess imports in this module itself (only imported from tools/providers).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-config-example",
+      "title": "Add example API agents config",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-fake-provider",
+        "api-v1-placeholder-providers"
+      ],
+      "scope": [
+        "configs/api-agents.example.yaml"
+      ],
+      "acceptance_criteria": [
+        "Lists a working fake profile plus placeholder profiles for openai/anthropic/gemini/qwen(openai-compatible)",
+        "References only environment variable NAMES for API keys, never a key value, with an explicit comment stating keys must never be placed in this file",
+        "File is documentation/config only, not loaded by any script yet"
+      ],
+      "validation_commands": [
+        "python3 -c \"import pathlib; pathlib.Path('configs/api-agents.example.yaml').read_text()\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import pathlib; pathlib.Path('configs/api-agents.example.yaml').read_text()\"",
+          "status": "passed",
+          "summary": "File reads cleanly as text. Contains one working fake-default entry plus four placeholder entries (openai/anthropic/gemini/qwen-via-openai_compatible), each referencing only an api_key_env_var NAME (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, QWEN_API_KEY), never a value. A regex scan for key-shaped strings (sk-..., AIza...) found nothing. Header comment explicitly states keys must never be placed in this file.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-smoke-script",
+      "title": "Add FakeModelProvider agent smoke test",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-runner"
+      ],
+      "scope": [
+        "scripts/smoke_api_agent.py"
+      ],
+      "acceptance_criteria": [
+        "Uses FakeModelProvider only; makes no network calls",
+        "Exercises a full ApiAgent run inside a temp directory: a tool-call turn followed by a final-answer turn",
+        "Proves the deny path works: write outside allowed scope denied, a forbidden-pattern path (e.g. .env) denied, a .. path-traversal attempt denied, run_shell denied by default, and an always-deny command (e.g. rm) denied even when explicitly allowlisted",
+        "Proves the allow path works: read/list/write succeed inside a temp dir that is both repo_root and the explicit allowed write scope"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_api_agent.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_api_agent.py",
+          "status": "passed",
+          "summary": "All 9 checks passed, exit 0: full ApiAgent run via FakeModelProvider (tool-call turn then final answer); allow path for read_file/list_files/write_file inside repo_root+allowed_write_scope; deny path for write outside allowed scope (file confirmed not created), .env forbidden pattern, .. traversal, run_shell disabled by default, and 'rm' denied even when explicitly allowlisted (file confirmed NOT deleted). grep confirmed no network-related imports and no reference to the openai/anthropic/gemini/openai_compatible placeholder modules anywhere in the script.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v1-docs",
+      "title": "Document the API agent runtime",
+      "worker": "claude",
+      "depends_on": [
+        "api-v1-models",
+        "api-v1-provider-base",
+        "api-v1-fake-provider",
+        "api-v1-placeholder-providers",
+        "api-v1-tools-base",
+        "api-v1-permissions",
+        "api-v1-tools-filesystem",
+        "api-v1-tools-shell",
+        "api-v1-agent-loop",
+        "api-v1-runner",
+        "api-v1-config-example",
+        "api-v1-smoke-script"
+      ],
+      "scope": [
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "Explains the ModelProvider interface, data model, agent loop, local tools, and the deny-by-default PermissionPolicy",
+        "States jarmuine/claude-code was used only as architectural reference for tool contract, permission gate, agent loop, and session state, with no code copied",
+        "States that only FakeModelProvider is a working provider in this pass; OpenAI/Anthropic/Gemini/OpenAICompatible are interface-conforming placeholders whose create_response raises NotImplementedError, with real HTTP implementation explicitly deferred to a later task",
+        "States explicitly that API keys come only from environment variables and are never stored in config files",
+        "States non-goals: no UI, no real network calls, no CLI adapters implemented in this pass, no commit"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review of docs/orchestra-api-runtime.md",
+          "status": "passed",
+          "summary": "Doc covers the data model, ModelProvider interface, FakeModelProvider, the four placeholder providers (explicit NotImplementedError + is_configured() behavior + real-HTTP-deferred statement), local tools, the full deny-by-default PermissionPolicy (path resolution, forbidden patterns, shell allow/deny/always-deny), the ApiAgent loop and max_turns behavior, runner.py, the example config's env-var-only key handling, the jarmuine/claude-code reference-only statement across all 4 named areas (tool contract, permission gate, agent loop, session state), and an explicit non-goals section (no UI, no real network calls, no CLI adapters this pass, no live probes, no commit).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
       "id": "orchestra-default-claude-md",
       "title": "Make Orchestra defaults explicit in CLAUDE.md",
       "worker": "claude",
