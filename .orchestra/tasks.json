@@ -1317,6 +1317,132 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v2-anthropic-provider",
+      "title": "Implement real AnthropicProvider.create_response",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/providers/base.py",
+        "orchestra_api/providers/anthropic_provider.py"
+      ],
+      "acceptance_criteria": [
+        "base.py gains a shared ProviderError exception usable by any real provider",
+        "AnthropicProvider.create_response() builds a real request to api.anthropic.com/v1/messages via urllib.request: system messages concatenated into the system field, user/assistant/tool Messages mapped into Anthropic's alternating user/assistant content-block shape (tool_use for outgoing assistant tool calls, tool_result for incoming ToolResults)",
+        "Response parsing maps Anthropic's content blocks (text + tool_use) back into Message/ToolCall, and usage/stop_reason into Usage/ModelResponse.stop_reason",
+        "HTTP errors (non-2xx) and network/timeout errors are caught and re-raised as ProviderError with a clear message that never includes the API key or request headers",
+        "The API key is read from ANTHROPIC_API_KEY only at call time via os.environ, never logged, never included in an exception message",
+        "DEFAULT_MODEL is claude-haiku-4-5-20251001",
+        "No real network call happens anywhere in this repo's own validation of this task"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.anthropic_provider\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.anthropic_provider\"",
+          "status": "passed",
+          "summary": "Imports cleanly, stdlib-only (no requests/new deps). Added ProviderError to base.py. Validated entirely via mock.patch('urllib.request.urlopen', ...), never touching the real network: request building (correct URL, x-api-key/anthropic-version headers, system field extracted from SYSTEM messages, user/assistant/tool-role Messages correctly mapped to Anthropic's alternating user/assistant + tool_use/tool_result content-block shape, tools passed through), response parsing (text+tool_use content blocks -> Message/ToolCall, usage -> Usage, stop_reason), HTTPError and URLError both re-raised as ProviderError with no API key or headers in the message (explicitly asserted the fake key string does not appear in either error message), and a missing-API-key call raises ProviderError before urlopen is ever invoked (call_count==0). DEFAULT_MODEL confirmed as claude-haiku-4-5-20251001.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v2-openai-provider",
+      "title": "Implement real OpenAIProvider.create_response",
+      "worker": "claude",
+      "depends_on": [
+        "api-v2-anthropic-provider"
+      ],
+      "scope": [
+        "orchestra_api/providers/openai_provider.py"
+      ],
+      "acceptance_criteria": [
+        "OpenAIProvider.create_response() builds a real request to api.openai.com/v1/chat/completions via urllib.request: Messages mapped into OpenAI's role-based shape, outgoing assistant tool_calls JSON-encoded per OpenAI's function-call wire format",
+        "Response parsing maps choices[0].message (content + tool_calls, with each tool call's arguments JSON-decoded back into a dict) into Message/ToolCall, and usage/finish_reason into Usage/ModelResponse.stop_reason",
+        "HTTP errors and network/timeout errors are caught and re-raised as the shared ProviderError from base.py, never leaking the API key or headers",
+        "The API key is read from OPENAI_API_KEY only at call time, never logged",
+        "DEFAULT_MODEL is gpt-5.4-mini",
+        "No real network call happens anywhere in this repo's own validation of this task"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.openai_provider\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.openai_provider\"",
+          "status": "passed",
+          "summary": "Imports cleanly, stdlib-only. Validated entirely via mocked urllib.request.urlopen: request building (correct URL, Bearer auth header, system/user/assistant/tool Messages mapped to OpenAI's role-based shape, outgoing tool_calls JSON-encoded, tools passed through), response parsing (content + tool_calls with JSON-decoded arguments -> Message/ToolCall, prompt/completion tokens -> Usage, finish_reason -> stop_reason), HTTPError/URLError re-raised as ProviderError with the fake key confirmed absent from both messages, malformed tool-call arguments JSON raises a clear ProviderError instead of crashing, and a missing API key raises ProviderError before urlopen is ever called (call_count==0). DEFAULT_MODEL confirmed as gpt-5.4-mini.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v2-live-test-script",
+      "title": "Add gated live-test script for real providers",
+      "worker": "claude",
+      "depends_on": [
+        "api-v2-anthropic-provider",
+        "api-v2-openai-provider"
+      ],
+      "scope": [
+        "scripts/live_test_provider.py"
+      ],
+      "acceptance_criteria": [
+        "Default run is dry-run only: reports is_configured() for both providers and prints what a call would send, without ever calling urllib/network",
+        "Making a real call requires both --live and an explicit --provider {openai,anthropic} flag",
+        "Prints a cost/network warning before making a real call under --live",
+        "scripts/smoke_api_agent.py is not modified and stays FakeModelProvider-only"
+      ],
+      "validation_commands": [
+        "python3 scripts/live_test_provider.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/live_test_provider.py",
+          "status": "passed",
+          "summary": "Default dry-run reports is_configured() (both False, no key set) and model for each provider, no network call made, exit 0. `--live` without `--provider` fails cleanly with exit 2 before touching any provider. `--live --provider` path was not exercised (no API keys set, and this task's own validation must never make a real call). Confirmed via `git diff --stat -- scripts/smoke_api_agent.py` that it remains untouched.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v2-docs-and-config",
+      "title": "Document real providers and update example config",
+      "worker": "claude",
+      "depends_on": [
+        "api-v2-anthropic-provider",
+        "api-v2-openai-provider",
+        "api-v2-live-test-script"
+      ],
+      "scope": [
+        "docs/orchestra-api-runtime.md",
+        "configs/api-agents.example.yaml"
+      ],
+      "acceptance_criteria": [
+        "Docs describe the real Anthropic/OpenAI request+response mapping and the ProviderError contract",
+        "Docs explicitly flag the known gap that ModelRequest.tools is passed through in each vendor's native tool schema with no shared translator yet",
+        "Docs explain live_test_provider.py's dry-run-by-default gating",
+        "configs/api-agents.example.yaml's openai-default/anthropic-default entries no longer say create_response is unimplemented, and reflect the gpt-5.4-mini / claude-haiku-4-5-20251001 defaults"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review + grep checks on docs/orchestra-api-runtime.md and configs/api-agents.example.yaml",
+          "status": "passed",
+          "summary": "Docs now document the real Anthropic/OpenAI request+response mapping in detail, the ProviderError contract, the tools-passthrough known gap, and live_test_provider.py's dry-run gating; Non-goals rewritten to state no real network call has been made by Claude (all validation was mocked) rather than the now-inaccurate blanket \"no real network calls\". Config file's openai-default/anthropic-default entries no longer say unimplemented/placeholder (verified per-profile via script), now show gpt-5.4-mini / claude-haiku-4-5-20251001 as models; gemini-default/qwen-default still correctly say placeholder/not implemented. No key-shaped strings found in the config.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [

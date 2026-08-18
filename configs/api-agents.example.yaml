@@ -8,11 +8,10 @@
 # here, at call time -- never from a config value. See
 # docs/orchestra-api-runtime.md.
 #
-# Only `fake-default` is usable today, via
-# orchestra_api.providers.fake.FakeModelProvider. The openai/anthropic/
-# gemini/qwen entries are interface-conforming placeholders: their
-# create_response() raises NotImplementedError. Real HTTP request/response
-# handling for them is a later task.
+# `fake-default`, `openai-default`, and `anthropic-default` are usable
+# today. `gemini-default` and `qwen-default` remain interface-conforming
+# placeholders: their create_response() raises NotImplementedError. Real
+# HTTP request/response handling for those two is a later task.
 
 agents:
   - name: fake-default
@@ -22,20 +21,21 @@ agents:
       tests. No network calls, no API key needed.
 
   - name: openai-default
-    provider: openai              # placeholder only -- see docs/orchestra-api-runtime.md
+    provider: openai
     description: >-
-      Placeholder profile for the OpenAI API. create_response() is not
-      implemented yet.
-    model: gpt-4o-mini
+      Real OpenAI Chat Completions provider. model is set to a cheap tier
+      deliberately -- verify it still matches your account's pricing/
+      allowance before relying on it.
+    model: gpt-5.4-mini
     base_url: https://api.openai.com/v1
     api_key_env_var: OPENAI_API_KEY   # name only; the key itself lives in your shell/secret store
 
   - name: anthropic-default
-    provider: anthropic           # placeholder only -- see docs/orchestra-api-runtime.md
+    provider: anthropic
     description: >-
-      Placeholder profile for the Anthropic Claude API. create_response()
-      is not implemented yet.
-    model: claude-sonnet-4-5
+      Real Anthropic Messages provider. model is set to the cheap Haiku
+      tier deliberately for low-cost testing.
+    model: claude-haiku-4-5-20251001
     base_url: https://api.anthropic.com/v1
     api_key_env_var: ANTHROPIC_API_KEY   # name only; the key itself lives in your shell/secret store
 

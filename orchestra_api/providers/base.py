@@ -1,9 +1,9 @@
 """The ModelProvider contract every API-key backed agent backend implements.
 
-Implementations live under `orchestra_api.providers`. `FakeModelProvider` is
-the only fully working one so far; `OpenAIProvider`, `AnthropicProvider`,
-`GeminiProvider`, and `OpenAICompatibleProvider` are interface-conforming
-placeholders whose `create_response` raises `NotImplementedError` -- see
+Implementations live under `orchestra_api.providers`. `FakeModelProvider`,
+`AnthropicProvider`, and `OpenAIProvider` are fully working; `GeminiProvider`
+and `OpenAICompatibleProvider` remain interface-conforming placeholders
+whose `create_response` raises `NotImplementedError` -- see
 `docs/orchestra-api-runtime.md`.
 """
 
@@ -12,6 +12,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from orchestra_api.models import ModelRequest, ModelResponse
+
+
+class ProviderError(Exception):
+    """Raised by a real ModelProvider when a call to its vendor API fails.
+
+    Covers both HTTP-level failures (non-2xx responses) and transport-level
+    failures (network errors, timeouts). The message must never include the
+    API key or any request header -- only vendor-safe diagnostic text.
+    """
 
 
 class ModelProvider(ABC):
