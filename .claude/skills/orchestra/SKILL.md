@@ -1,19 +1,27 @@
 ---
 name: orchestra
-description: Use Claude as the main orchestrator and delegate implementation tasks to Codex workers through MCP.
+description: Use Claude as the main orchestrator for Orchestra-mode work. Direct Claude implementation is the default; dispatching an external subagent (Codex MCP, Gemini CLI, OpenCode CLI, or a future API-key worker) always requires asking the user first.
 ---
 
 # Orchestra Skill
 
-Use this skill when the user asks to run a multi-agent coding workflow, delegate work to Codex, or implement a feature through Orchestra.
+Use this skill when the user asks to run the Orchestra workflow, or invokes `/orchestra` or `/orchestra-do`.
 
 ## Objective
 
 You are the main orchestrator.
 
-Codex MCP workers are implementation agents.
+Direct Claude implementation is the default execution mode for small and
+medium tasks. Being in Orchestra mode is not by itself a reason to reach
+for an external subagent — dispatching one (Codex MCP, Gemini CLI,
+OpenCode CLI, or a future API-key based worker; see `orchestra_api/`)
+always requires asking the user first and getting an explicit go-ahead
+for that specific task. There is no default delegation.
 
-Do not start coding directly unless the change is trivial and the user explicitly asks you to do it yourself.
+All task/worker/run state changes go through the Orchestra MCP tools
+(`task_create`, `task_update`, `worker_register`, `worker_update`,
+`validation_record`, `run_record`, `worktree_create`, `state_validate`).
+Never edit `.orchestra/tasks.json` by hand.
 
 ## Workflow
 
@@ -41,22 +49,31 @@ Inspect only the files needed to understand:
 
 Avoid broad exploration.
 
-### 3. Create Task Graph
+### 3. Scope the Work
 
-Create tasks with:
+- **Small, well-scoped change to one or two files**: skip straight to
+  Direct Implementation (step 5) below. No task graph ceremony needed —
+  just do it and report what changed.
+- **Non-trivial work** (spans multiple files/modules, introduces a new
+  abstraction, or requires a design judgment call): propose a task graph
+  and wait for the user's approval before creating any tasks or editing
+  files.
+
+### 4. Create Task Graph (non-trivial work, after approval)
+
+Propose tasks with:
 
 - `id`;
 - `title`;
-- `status`;
-- `worker`;
+- `worker` (use `"claude"` for direct implementation, or the worker's
+  provider name once a dispatch is approved);
 - `depends_on`;
 - `scope`;
-- `worktree`;
-- `branch`;
 - `acceptance_criteria`;
 - `validation_commands`.
 
-Update `.orchestra/tasks.json`.
+Once approved, create them via the Orchestra MCP `task_create` tool — not
+by editing `.orchestra/tasks.json`.
 
 Use this task status set only:
 
@@ -70,13 +87,41 @@ Use this task status set only:
 - FAILED
 - CANCELLED
 
-### 4. Create Worktrees
+### 5. Direct Implementation (the default path)
 
-For each implementation task, create a branch and worktree.
+For each task (or for the whole small change, if step 3 skipped the task
+graph):
 
-Use this command pattern:
+1. Mark it `RUNNING` via `task_update` (skip if no task record exists for
+   a small change).
+2. Implement the change yourself.
+3. Run the real validation commands against what you actually built —
+   don't just assert success.
+4. Record the outcome via `validation_record`, then mark the task
+   `COMPLETE` via `task_update`.
 
-    git worktree add .orchestra/worktrees/<task-id>-<name> -b orchestra/<task-id>-<name>
+No worker entry in `workers[]` and no worktree are needed for this path —
+`workers[]` is reserved for actually-spawned external subagents, and a
+worktree is for isolating a dispatched worker's edits, not solo direct
+work.
+
+### 6. Dispatching a Worker (only after explicit approval)
+
+Before doing any of this, ask the user and get explicit approval to
+dispatch a worker for this specific task. Do not treat a prior approval
+for a different task as blanket permission.
+
+Once approved:
+
+#### Create a Worktree
+
+For a task being implemented by a dispatched worker, create an isolated
+worktree.
+
+Use this naming convention:
+
+- branch: `orchestra/<task-id>-<short-name>`
+- worktree: `.orchestra/worktrees/<task-id>-<short-name>`
 
 If the worktree already exists, inspect it before reusing it.
 
@@ -84,11 +129,13 @@ Do not allow two workers to edit the same worktree.
 
 Do not parallelize tasks that may modify the same shared files.
 
-If multiple tasks need the same shared interface, create an interface task first.
+If multiple tasks need the same shared interface, create an interface
+task first.
 
-### 5. Dispatch Codex Workers
+#### Dispatch the Worker
 
-Use the Codex MCP `codex` tool for new workers.
+Use the approved subagent's tool (e.g. the Codex MCP `codex` tool) for
+the new worker.
 
 Each worker prompt must include:
 
@@ -102,17 +149,19 @@ Each worker prompt must include:
 - validation commands;
 - required final report format.
 
-After each Codex MCP call, extract the returned `threadId` and save it in `.orchestra/tasks.json`.
+After the call, extract the returned thread/session id and register the
+worker via the Orchestra MCP `worker_register` tool — not by editing
+`.orchestra/tasks.json`.
 
-### 6. Worker Prompt Template
+#### Worker Prompt Template
 
-Use this structure when dispatching a Codex worker:
+Use this structure when dispatching a worker:
 
     TASK ID:
     <task-id>
 
     ROLE:
-    You are a Codex implementation worker in an Orchestra workflow.
+    You are an implementation worker in an Orchestra workflow.
 
     WORKTREE:
     <relative-or-absolute-worktree-path>
@@ -121,7 +170,7 @@ Use this structure when dispatching a Codex worker:
     <specific implementation goal>
 
     ALLOWED SCOPE:
-    - <files/directories Codex may edit>
+    - <files/directories the worker may edit>
 
     FORBIDDEN SCOPE:
     - .orchestra/**
@@ -160,17 +209,26 @@ Use this structure when dispatching a Codex worker:
 
 ## Context Snapshot Rule
 
-Do not rely on worker worktrees to contain the supervisor's latest uncommitted `.orchestra/tasks.json` state.
+Do not rely on a worker's worktree to contain the supervisor's latest
+uncommitted `.orchestra/tasks.json` state.
 
-A worker's worktree is checked out from a specific commit. It does not see the orchestrator's in-progress, uncommitted edits to `.orchestra/tasks.json` — including task records, schema changes, or orchestration history created after that commit. A worker that reads `.orchestra/tasks.json` from its own worktree can therefore describe stale or empty state as if it were current.
+A worker's worktree is checked out from a specific commit. It does not
+see the orchestrator's in-progress, uncommitted edits to
+`.orchestra/tasks.json` — including task records, schema changes, or
+orchestration history created after that commit. A worker that reads
+`.orchestra/tasks.json` from its own worktree can therefore describe
+stale or empty state as if it were current.
 
-When a worker needs current task state, schema, or orchestration history, include a concise context snapshot in the worker prompt.
+When a worker needs current task state, schema, or orchestration
+history, include a concise context snapshot in the worker prompt.
 
-Codex workers must treat the supervisor-provided task brief as the source of truth for orchestration state, not whatever `.orchestra/tasks.json` looks like inside their own worktree.
+A dispatched worker must treat the supervisor-provided task brief as the
+source of truth for orchestration state, not whatever
+`.orchestra/tasks.json` looks like inside its own worktree.
 
 ### 7. Review
 
-When a worker completes:
+When a dispatched worker completes:
 
 1. inspect its final report;
 2. inspect the Git diff in its worktree;
@@ -178,15 +236,17 @@ When a worker completes:
 4. run validation commands if appropriate;
 5. compare the result with acceptance criteria.
 
-If the task fails, use `codex-reply` with the stored `threadId`.
+If the task fails, send a corrective instruction on the same worker
+thread (e.g. `codex-reply` for a Codex worker).
 
-If the task passes, mark it as `COMPLETE` in `.orchestra/tasks.json`.
+If the task passes, mark it `COMPLETE` via the Orchestra MCP
+`task_update` tool.
 
 ### 8. Retry Policy
 
-Use the same Codex worker thread for corrections whenever possible.
+Use the same worker thread for corrections whenever possible.
 
-Retry with `codex-reply` when:
+Retry on the same thread when:
 
 - implementation is incomplete;
 - validation failed;
@@ -202,16 +262,15 @@ Create a new worker only when:
 
 ### 9. Finish
 
-Do not merge automatically.
+Ask for explicit user approval before running `git commit`. Ask for
+explicit user approval before merging — never merge automatically.
 
 Return:
 
 - task summary;
-- branches and worktrees;
+- branches and worktrees (if any were created);
 - changed files;
 - validation results;
 - failed or blocked tasks;
 - remaining risks;
-- recommended merge order.
-
-Ask for explicit user approval before merging.
+- commit/merge recommendation.

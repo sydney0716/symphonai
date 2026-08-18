@@ -760,6 +760,131 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "orchestra-default-claude-md",
+      "title": "Make Orchestra defaults explicit in CLAUDE.md",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "CLAUDE.md"
+      ],
+      "acceptance_criteria": [
+        "States that all task/state updates go through Orchestra MCP tools and .orchestra/tasks.json is never hand-edited",
+        "States a task graph must be proposed and approved before non-trivial work begins",
+        "States that dispatching any subagent (Codex MCP, Gemini CLI, OpenCode CLI, future API workers) requires asking the user first, replacing the old delegate-by-default framing",
+        "States direct Claude implementation is the default execution mode for small/medium tasks",
+        "States workers[] is reserved for spawned external subagents only, not for tasks Claude implements directly",
+        "States worktrees are for external/parallel subagent dispatch, not required for solo direct implementation",
+        "States commits require explicit user approval before running",
+        "Does not remove the human-approval-before-merge rule already present"
+      ],
+      "validation_commands": [
+        "grep -q 'Orchestra MCP' CLAUDE.md",
+        "grep -qi 'ask' CLAUDE.md"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "grep -q 'Orchestra MCP' CLAUDE.md; grep -qi 'ask' CLAUDE.md",
+          "status": "passed",
+          "summary": "Both grep checks pass. Rewrote Orchestra Mode with a \"Default Execution Model\" section covering all 8 acceptance criteria: Orchestra MCP only for state, no manual tasks.json edits, task-graph-then-approval for non-trivial work, ask-before-dispatch for any subagent, direct-Claude-default, workers[] reserved for actual dispatches, worktrees for external/parallel work only, ask-before-commit, and merge approval retained (now paired with commit approval in Human Approval). Confirmed via grep that the old unconditional 'Do not perform large implementation work yourself' / 'Delegate to Codex workers:' language is gone.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "orchestra-default-skill",
+      "title": "Rewrite orchestra SKILL.md to ask-before-dispatch default",
+      "worker": "claude",
+      "depends_on": [
+        "orchestra-default-claude-md"
+      ],
+      "scope": [
+        ".claude/skills/orchestra/SKILL.md"
+      ],
+      "acceptance_criteria": [
+        "Objective section no longer says Codex is the default implementer with direct coding only for trivial changes; states direct Claude implementation is the default, subagent dispatch requires asking first",
+        "Adds an explicit 'propose task graph, wait for approval' step before task creation for non-trivial work, using Orchestra MCP tools rather than manual JSON edits throughout",
+        "The existing worktree/Codex worker dispatch procedure is preserved but reframed as the path taken only after the user approves dispatching a worker",
+        "Adds an ask-before-commit step to the Finish section alongside the existing ask-before-merge rule",
+        "Retains the Context Snapshot Rule and retry policy content since they remain useful whenever a worker actually is dispatched"
+      ],
+      "validation_commands": [
+        "grep -q 'ask' .claude/skills/orchestra/SKILL.md",
+        "grep -q 'Orchestra MCP' .claude/skills/orchestra/SKILL.md"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "grep -q 'ask' .claude/skills/orchestra/SKILL.md; grep -q 'Orchestra MCP' .claude/skills/orchestra/SKILL.md",
+          "status": "passed",
+          "summary": "Both grep checks pass. Objective section rewritten: direct Claude implementation stated as default, subagent dispatch requires asking first. Added step 3 (Scope the Work) distinguishing small changes from non-trivial work needing a proposed+approved task graph, and step 5 (Direct Implementation) as the default path with no worker/worktree needed. Steps 6-8 preserve the full worktree/worker-dispatch/prompt-template/context-snapshot/retry-policy content, reframed under 'only after explicit approval'. Finish section now asks before commit in addition to the pre-existing ask-before-merge. Confirmed via grep that the old 'Codex MCP workers are implementation agents' / 'Do not start coding directly unless...' language is gone.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "orchestra-default-command",
+      "title": "Align existing /orchestra command with new defaults",
+      "worker": "claude",
+      "depends_on": [
+        "orchestra-default-claude-md",
+        "orchestra-default-skill"
+      ],
+      "scope": [
+        ".claude/commands/orchestra.md"
+      ],
+      "acceptance_criteria": [
+        "No longer contains an unconditional 'Delegate implementation to Codex through the Codex MCP tools' step",
+        "References CLAUDE.md Orchestra Mode and SKILL.md as the source of truth, consistent with the updated versions",
+        "States that dispatching a worker and committing both require asking the user first"
+      ],
+      "validation_commands": [
+        "grep -q 'ask' .claude/commands/orchestra.md"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "grep -q 'ask' .claude/commands/orchestra.md",
+          "status": "passed",
+          "summary": "Passes. Rewrote the 9-step instruction list: removed the unconditional 'Delegate implementation to Codex through the Codex MCP tools' step, replaced with direct-implementation-default + ask-before-dispatch + task-graph-for-non-trivial-work steps, switched to Orchestra MCP tools language for state (no more 'Persist task state in .orchestra/tasks.json' by hand), and added ask-before-commit alongside the existing ask-before-merge. Still references CLAUDE.md Orchestra Mode and SKILL.md as the source of truth.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "orchestra-do-command",
+      "title": "Add short-form /orchestra-do command",
+      "worker": "claude",
+      "depends_on": [
+        "orchestra-default-claude-md",
+        "orchestra-default-skill"
+      ],
+      "scope": [
+        ".claude/commands/orchestra-do.md"
+      ],
+      "acceptance_criteria": [
+        "New command takes $ARGUMENTS as the goal and invokes Orchestra mode under the new defaults with no additional control-prompt boilerplate required from the user",
+        "References CLAUDE.md Orchestra Mode and SKILL.md as the workflow definition",
+        "Is short enough that a one-line goal is sufficient to invoke it"
+      ],
+      "validation_commands": [
+        "test -f .claude/commands/orchestra-do.md"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "test -f .claude/commands/orchestra-do.md",
+          "status": "passed",
+          "summary": "File exists, 11 lines. Takes $ARGUMENTS as the goal, references CLAUDE.md Orchestra Mode and SKILL.md as the workflow definition, and states no further control prompt is needed since the defaults now live in those two files. Short enough that a one-line goal is sufficient.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
