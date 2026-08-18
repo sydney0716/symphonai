@@ -58,3 +58,15 @@ agents:
     model: qwen-placeholder
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key_env_var: QWEN_API_KEY   # name only; the key itself lives in your shell/secret store
+
+# Leader/subagent selection for orchestra_api.leader.Leader.
+#
+# This is always a user choice, referencing profile names from `agents:`
+# above -- never something a model decides at runtime. One shared
+# subagent provider for now (every subagent in a run uses the same
+# profile); a per-role roster is explicitly deferred, not built here.
+#
+# Not loaded by any script yet -- this block shows the intended shape for
+# a future config loader, same as the rest of this file.
+leader: anthropic-default
+subagent: openai-default

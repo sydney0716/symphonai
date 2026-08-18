@@ -1443,6 +1443,98 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v3-leader",
+      "title": "Implement Leader/DispatchSubagentTool",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/leader.py"
+      ],
+      "acceptance_criteria": [
+        "LeaderConfig fixes leader_provider and subagent_provider explicitly -- neither is ever chosen by a model",
+        "DispatchSubagentTool creates a new named subagent (its own ApiAgent backed by the shared subagent provider + standard_tool_registry + a deny-by-default PermissionPolicy) on first use of a name, and reuses the same subagent (continuing its message history) on subsequent uses of that name",
+        "max_subagents is enforced: creating a distinct new name beyond the limit returns ok=False instead of raising or silently ignoring the limit",
+        "Leader is itself an ApiAgent whose only tool is dispatch_subagent",
+        "dispatch_subagent_tool_schema() returns the tool definition in OpenAI's {type:function,...} shape and Anthropic's {name,input_schema} shape",
+        "LeaderRunResult exposes final_answer, leader_messages, stopped_reason, and the subagents pool",
+        "No network or subprocess calls in this module itself"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.leader\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.leader\"",
+          "status": "passed",
+          "summary": "Imports cleanly, no network/subprocess imports. Validated DispatchSubagentTool directly: schema shapes correct for openai/anthropic, first dispatch creates a subagent, second dispatch with the same name reuses the identical SubagentRecord object with growing message history, a different name creates an isolated second entry, max_subagents is enforced (rejects a 3rd distinct name with ok=False, pool stays at 2), missing arguments handled gracefully. Validated full Leader.run() end-to-end with FakeModelProvider for both leader and subagent: dispatch-then-final-answer completes with stopped_reason='final_response', subagents pool populated; leader.subagents property mirrors result.subagents; max_leader_turns cutoff returns stopped_reason='max_turns' without raising when the leader never stops dispatching.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v3-smoke-leader",
+      "title": "Add FakeModelProvider leader/subagent smoke test",
+      "worker": "claude",
+      "depends_on": [
+        "api-v3-leader"
+      ],
+      "scope": [
+        "scripts/smoke_leader.py"
+      ],
+      "acceptance_criteria": [
+        "Uses FakeModelProvider only for both leader and subagent; no network calls",
+        "Proves dispatch-with-a-new-name creates a subagent and dispatch-with-the-same-name reuses it (same object identity, message history grows across both calls)",
+        "Proves a different subagent_name creates an isolated second entry in the pool",
+        "Proves max_subagents is enforced once the limit is reached",
+        "Exercises a full Leader.run(): a dispatch_subagent tool-call turn followed by a final answer, stopped_reason == 'final_response'"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "All 5 checks passed, exit 0: full Leader.run() (dispatch tool-call turn then final answer, stopped_reason='final_response'), dispatch-with-new-name creates a subagent, dispatch-with-same-name reuses it (same object identity, message history grows from 2 to 4+ entries), a different name creates an isolated second pool entry, and max_subagents=2 is enforced (3rd distinct name rejected, pool stays at 2). FakeModelProvider used for both leader and every subagent; no network calls.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v3-leader-docs-and-config",
+      "title": "Document the Leader and add config selection example",
+      "worker": "claude",
+      "depends_on": [
+        "api-v3-leader",
+        "api-v3-smoke-leader"
+      ],
+      "scope": [
+        "docs/orchestra-api-runtime.md",
+        "configs/api-agents.example.yaml"
+      ],
+      "acceptance_criteria": [
+        "Docs explain the leader/dispatch_subagent/reuse mechanism, the deny-by-default subagent policy default, and the max_subagents/subagent max_turns guardrails",
+        "Docs state this is a narrow, tool-specific schema helper, not the general cross-vendor tool-schema translator, and that non-goal remains open",
+        "Docs state subagent pool state is in-memory only for the duration of one Leader.run() call -- no cross-run persistence",
+        "configs/api-agents.example.yaml gains a leader:/subagent: selection example referencing existing profile names, with a comment that this is user-selected, never model-chosen"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review + grep checks on docs/orchestra-api-runtime.md and configs/api-agents.example.yaml",
+          "status": "passed",
+          "summary": "New \"Leader\" doc section covers the dispatch/reuse mechanism, deny-by-default subagent PermissionPolicy, max_subagents/subagent_max_turns guardrails, and explicitly states dispatch_subagent_tool_schema() is a narrow per-tool schema, not the general cross-vendor translator (that gap stays open), plus that the subagent pool is in-memory only for one Leader.run() call. Verified all key phrases present via grep. configs/api-agents.example.yaml gained a leader:/subagent: block referencing anthropic-default/openai-default profile names, with a comment stating this is always a user choice, never model-decided, and documents the one-shared-subagent-provider (no per-role roster) design decision.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
