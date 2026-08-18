@@ -39,6 +39,7 @@ class ApiAgent:
         tools: dict[str, LocalTool],
         policy: PermissionPolicy,
         max_turns: int = DEFAULT_MAX_TURNS,
+        tool_schemas: list[dict] | None = None,
     ) -> None:
         if max_turns < 1:
             raise ValueError(f"max_turns must be >= 1, got {max_turns}")
@@ -46,12 +47,17 @@ class ApiAgent:
         self._tools = tools
         self._policy = policy
         self._max_turns = max_turns
+        # Schemas actually sent to the model so it knows these tools exist.
+        # `tools` above is only the *execution* registry, keyed by name --
+        # without this, a real provider is never told any tool exists and
+        # can never call one, even if `tools` would happily execute it.
+        self._tool_schemas = tool_schemas or []
 
     def run(self, messages: list[Message], *, model: str | None = None) -> AgentRunResult:
         conversation = list(messages)
         response: ModelResponse | None = None
         for turn in range(1, self._max_turns + 1):
-            request = ModelRequest(messages=list(conversation), model=model)
+            request = ModelRequest(messages=list(conversation), model=model, tools=self._tool_schemas)
             response = self._provider.create_response(request)
             conversation.append(response.message)
             if not response.has_tool_calls:

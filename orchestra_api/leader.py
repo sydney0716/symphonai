@@ -254,6 +254,7 @@ class Leader:
             tools={DISPATCH_TOOL_NAME: self._dispatch_tool},
             policy=leader_policy,
             max_turns=config.max_leader_turns,
+            tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.name)],
         )
         self._chat_messages: list[Message] = []
 

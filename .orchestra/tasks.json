@@ -1656,6 +1656,39 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v4-fix-tool-schema-wiring",
+      "title": "Fix: ApiAgent never sent tool schemas to the model",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/agent_loop.py",
+        "orchestra_api/leader.py",
+        "scripts/smoke_leader.py",
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "ApiAgent accepts an optional tool_schemas: list[dict] | None and includes it as ModelRequest.tools on every request it sends, defaulting to [] when not supplied (no behavior change for existing FakeModelProvider-based tests)",
+        "Leader's own ApiAgent is constructed with tool_schemas=[dispatch_subagent_tool_schema(leader_provider.name)] so a real leader model is actually shown the dispatch_subagent tool",
+        "A regression test using mock.patch('urllib.request.urlopen', ...) with a real AnthropicProvider as leader_provider asserts the outgoing request body's tools field contains the dispatch_subagent definition",
+        "Docs document tool_schemas on ApiAgent and explicitly flag that subagents' standard_tool_registry() tools still have no schemas wired up -- a real subagent still cannot call read_file/write_file/list_files/run_shell yet, same root cause, not fixed by this task",
+        "All existing smoke tests (smoke_api_agent.py, smoke_leader.py) still pass unmodified in behavior"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_leader.py",
+        "python3 scripts/smoke_api_agent.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_leader.py; python3 scripts/smoke_api_agent.py",
+          "status": "passed",
+          "summary": "Root cause confirmed and fixed: ApiAgent.run() built ModelRequest without ever setting tools=, so no provider was ever shown any tool schema regardless of its execution registry. Added optional tool_schemas param to ApiAgent, now included in every outgoing request. Leader now passes dispatch_subagent_tool_schema(leader_provider.name) into its own ApiAgent. New regression check in smoke_leader.py (8th check) uses mock.patch('urllib.request.urlopen') with a REAL AnthropicProvider as leader_provider and asserts the outgoing request body's tools field actually contains the dispatch_subagent definition -- this is the exact check that would have caught the original bug. All 8 smoke_leader.py checks and all smoke_api_agent.py checks pass; whole package compiles clean. Docs updated with a tool_schemas section and an explicit, prominent flag that subagents' own tools (read_file/write_file/list_files/run_shell) still have no schemas wired up -- a real subagent still cannot call its own tools, same root cause, not fixed by this task.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [

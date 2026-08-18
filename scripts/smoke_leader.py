@@ -13,15 +13,24 @@ Verifies:
     (label, status) events for a run that dispatches one subagent
   - Leader.chat() persists conversation across calls -- a second chat()
     call's leader_messages include the first call's exchange
+  - regression check: a real AnthropicProvider used as leader_provider
+    actually includes the dispatch_subagent tool definition in its
+    outgoing request body (via mocked urllib.request.urlopen) -- guards
+    against ApiAgent silently never telling a real model any tool exists
 
-No network calls anywhere in this script -- FakeModelProvider is the only
-ModelProvider used, for both the leader and every subagent.
+No real network call is ever made in this script. FakeModelProvider is
+used for every check except the one regression check above, which uses a
+real AnthropicProvider purely to exercise its real request-building code
+against a mocked HTTP layer.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
+import unittest.mock as mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +39,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig  # noqa: E402
 from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
+from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 
 
@@ -186,6 +196,51 @@ def main() -> None:
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
         ok("Leader.chat() persists conversation across calls")
+
+        # -- regression: a real leader provider's outgoing request must
+        # actually include the dispatch_subagent tool definition --
+        os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
+        captured: dict = {}
+
+        class _FakeHttpResponse:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "_FakeHttpResponse":
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        def _fake_urlopen(request, timeout=None):  # noqa: ANN001
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            payload = json.dumps(
+                {
+                    "content": [{"type": "text", "text": "no tool needed"}],
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                    "stop_reason": "end_turn",
+                }
+            ).encode("utf-8")
+            return _FakeHttpResponse(payload)
+
+        real_leader = Leader(
+            LeaderConfig(
+                leader_provider=AnthropicProvider(),
+                subagent_provider=AnthropicProvider(),
+                repo_root=str(root),
+            )
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            real_leader.run("hello")
+        del os.environ[API_KEY_ENV_VAR]
+
+        sent_tools = captured.get("body", {}).get("tools")
+        if not sent_tools or sent_tools[0].get("name") != "dispatch_subagent":
+            fail(f"expected outgoing request to include the dispatch_subagent tool, got tools={sent_tools!r}")
+        ok("real leader provider's outgoing request includes the dispatch_subagent tool definition")
 
         print("\nAll smoke checks passed.")
 
