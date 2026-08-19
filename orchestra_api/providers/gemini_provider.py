@@ -11,10 +11,10 @@ other two, so this module does more translation than
 - Tool calls are `functionCall` parts and tool results are
   `functionResponse` parts carried on a **user**-role message; Gemini has
   no dedicated tool role.
-- **Gemini function calls carry no id.** They are matched by function
-  *name*. We synthesize a stable id on the way in so the rest of
-  `orchestra_api` (which keys tool results by `tool_call_id`) works
-  unchanged, and resolve the name back from that id on the way out.
+- Gemini function calls now usually carry an id. Responses that omit one
+  still get a synthesized fallback id so the rest of `orchestra_api`
+  (which keys tool results by `tool_call_id`) works unchanged, and we
+  resolve the function name back from that id on the way out.
 - Tool parameter schemas must be sanitized into Gemini's restricted JSON
   Schema dialect first -- see `orchestra_api.gemini_schema`.
 
@@ -44,7 +44,7 @@ DEFAULT_MODEL = "gemini-flash-latest"
 
 
 def _synthesize_tool_call_id(name: str, index: int) -> str:
-    """Build a stable id for a Gemini functionCall, which ships without one."""
+    """Build a stable fallback id for Gemini functionCalls that omit one."""
     return f"gemini-{index}-{name}"
 
 
@@ -95,7 +95,12 @@ def _build_contents(messages: list[Message]) -> list[dict[str, Any]]:
         if message.content:
             parts.append({"text": message.content})
         for tool_call in message.tool_calls:
-            parts.append({"functionCall": {"name": tool_call.name, "args": tool_call.arguments}})
+            function_call = {"name": tool_call.name, "args": tool_call.arguments}
+            part = {"functionCall": function_call}
+            if "thoughtSignature" in tool_call.provider_metadata:
+                function_call["id"] = tool_call.id
+                part["thoughtSignature"] = tool_call.provider_metadata["thoughtSignature"]
+            parts.append(part)
         if not parts:
             continue
         contents.append({"role": "model" if message.role == Role.ASSISTANT else "user", "parts": parts})
@@ -167,11 +172,15 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
         function_call = part.get("functionCall")
         if isinstance(function_call, dict) and function_call.get("name"):
             name = function_call["name"]
+            provider_metadata = {}
+            if "thoughtSignature" in part:
+                provider_metadata["thoughtSignature"] = part["thoughtSignature"]
             tool_calls.append(
                 ToolCall(
-                    id=_synthesize_tool_call_id(name, index),
+                    id=function_call.get("id") or _synthesize_tool_call_id(name, index),
                     name=name,
                     arguments=function_call.get("args") or {},
+                    provider_metadata=provider_metadata,
                 )
             )
 
