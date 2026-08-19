@@ -1848,6 +1848,35 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "docs-external-references",
+      "title": "Reference doc: what to use from opencodex and claude-code",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "docs/orchestra-external-references.md"
+      ],
+      "acceptance_criteria": [
+        "States the differing legal status of the two sources clearly and up front: opencodex is MIT (code reusable with attribution), jarmuine/claude-code is unlicensed leaked proprietary source (architecture ideas only, no code)",
+        "Organizes opencodex findings into concretely usable items, mapped to real file paths in that repo, with the Gemini tool-schema sanitization gotchas captured in actionable detail",
+        "Organizes claude-code findings as architecture concepts only (coordinator, compaction, permission modes, state/migrations), with no code and no verbatim reproduction",
+        "Maps each external concept to our actual project state: already-adopted, applicable-next, or not-applicable-with-reason",
+        "Ends with a ranked list of concrete next actions grounded in the current codebase"
+      ],
+      "validation_commands": [
+        "python3 -c \"import pathlib; pathlib.Path('docs/orchestra-external-references.md').read_text()\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import pathlib; pathlib.Path('docs/orchestra-external-references.md').read_text()\"",
+          "status": "passed",
+          "summary": "218-line doc reads cleanly. Opens with an explicit license-status table distinguishing opencodex (MIT, code reusable with attribution) from jarmuine/claude-code (no license, leaked proprietary, architecture concepts only). opencodex section maps 8 real adapter file paths to our needs and captures the Gemini tool-schema constraints and tool-call-ID collision hazard as actionable bullets. claude-code section is concepts only (coordinator/teams, compaction, permission modes, migrations, resume) with zero code. A status table maps 15 concepts to done/partial/not-started/rejected against the real codebase, followed by 4 ranked next actions. grep confirms zero fenced code blocks -- nothing reproduced verbatim from either source.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
