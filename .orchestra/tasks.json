@@ -2132,6 +2132,61 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v8-gemini-thought-signature",
+      "title": "Round-trip Gemini thoughtSignature so multi-turn tool calls work",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/models.py",
+        "orchestra_api/providers/gemini_provider.py",
+        "scripts/smoke_api_agent.py",
+        "scripts/smoke_leader.py",
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "ToolCall (orchestra_api/models.py) gains `provider_metadata: dict[str, Any] = field(default_factory=dict)` as its last field, documented as opaque vendor passthrough data that must be stored and returned verbatim, never inspected, parsed, transformed, or concatenated. Existing positional construction of ToolCall(id, name, arguments) must keep working unchanged.",
+        "gemini_provider.py `_parse_response` captures `thoughtSignature` from the PART (it is a sibling key of `functionCall`, NOT nested inside it) and stores it as provider_metadata={'thoughtSignature': <value>} on the ToolCall; when absent, provider_metadata stays an empty dict.",
+        "gemini_provider.py `_parse_response` prefers the real id the API now returns (`function_call.get('id')`, e.g. 'call_142486') and falls back to _synthesize_tool_call_id(name, index) only when the API sends none. The synthesizer function is KEPT as that fallback, not deleted.",
+        "gemini_provider.py `_build_contents` re-emits the signature on the model-role functionCall part when present, producing {'functionCall': {...}, 'thoughtSignature': <value>} -- the signature is a sibling of functionCall, not inside it. Parts without a stored signature are emitted exactly as before.",
+        "The signature value is passed through byte-identically: never re-encoded, truncated, normalized, concatenated, or logged.",
+        "A new mocked-HTTP regression check (mock.patch('urllib.request.urlopen'), no real network call) covers a TWO-TURN sequence: turn 1 returns a functionCall part carrying a thoughtSignature, the agent loop executes the tool, and the check asserts the SECOND outgoing request body contains that exact signature echoed on the model-role part alongside the functionCall. This check must fail if the echo is removed -- verify that by temporarily reverting the _build_contents change and confirming the check goes red, then restore it.",
+        "Existing single-turn Gemini regression checks continue to pass unchanged.",
+        "Stale comment fixed: _synthesize_tool_call_id's docstring and the module docstring both claim Gemini function calls carry no id. That is no longer true -- the API returns one. Reword to say ids are now returned but synthesis remains a fallback for responses that omit one.",
+        "Stale header fixed: orchestra_api/models.py's module docstring still says only FakeModelProvider works and that OpenAI/Anthropic/Gemini/OpenAI-compatible are interface-conforming placeholders. All four are real now.",
+        "docs/orchestra-api-runtime.md documents thought signatures: what they are (encrypted representation of the model's reasoning state), that this runtime is stateless (rebuilds contents[] every call, never sets store/previous_interaction_id) and therefore MUST resend them unchanged, that they attach to the reasoning step that produced the call hence sibling-of-functionCall placement, and that omitting them fails the SECOND turn with HTTP 400 INVALID_ARGUMENT while the first turn succeeds -- which is why mocked single-turn tests missed it.",
+        "Whole package imports cleanly; both smoke suites pass with zero regressions."
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.models, orchestra_api.providers.gemini_provider\"",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "codex",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v8-thought-signature",
+      "branch": "orchestra/api-v8-thought-signature",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_api_agent.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: 12 checks pass, exit 0, including the new two-turn Gemini thoughtSignature echo check. Claude also independently verified the check has teeth rather than trusting Codex's report: deleting the _build_contents echo line makes it fail with 'FAIL: expected exact Gemini thoughtSignature on second request', and restoring it passes again.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "LIVE: run_task() against the real Gemini API (multi-turn tool loop)",
+          "status": "passed",
+          "summary": "Definitive proof, run by Claude with the user's real GEMINI_API_KEY (Codex had no key and was barred from network). This exact call previously died on turn 2 with HTTP 400 INVALID_ARGUMENT 'Function call is missing a thought_signature'. It now completes: 3 sequential live tool round-trips (list_files, read_file notes.txt, read_file other.txt), each carrying a real API id (call_109411/call_196217/call_135391) and a distinct thoughtSignature echoed back correctly, ending with the correct final answer 'The project codename is Vermilion.' stopped_reason=final_response, 7 messages. One intervening attempt hit a transient HTTP 503 high-demand error, which is server-side load unrelated to this change and succeeded on retry.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: all 11 checks pass, exit 0. No regressions from the ToolCall.provider_metadata field addition -- existing positional ToolCall(id, name, arguments) construction throughout the codebase still works since the new field is last and defaults to an empty dict.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
@@ -2174,6 +2229,14 @@
       "thread_id": "01a017cf-387c-72b3-9f69-32750ab243e2",
       "status": "COMPLETE",
       "worktree": ".orchestra/worktrees/api-v7-wire-format-fix"
+    },
+    {
+      "id": "codex-api-v8-thought-signature",
+      "provider": "codex",
+      "task_id": "api-v8-gemini-thought-signature",
+      "thread_id": "01a0182d-72f9-7140-a83d-79e3fa5b6e0d",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v8-thought-signature"
     }
   ],
   "runs": []

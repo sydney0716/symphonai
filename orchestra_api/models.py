@@ -2,9 +2,9 @@
 
 These types describe the shape of a request/response exchange with any
 `ModelProvider` and the messages/tool calls exchanged during an `ApiAgent`
-run. Fake, OpenAI, Anthropic, Gemini, and OpenAI-compatible providers all
-implement the runtime provider interface -- see
-`docs/orchestra-api-runtime.md`.
+run. Only `FakeModelProvider` is a working provider so far; OpenAI,
+Anthropic, Gemini, and OpenAI-compatible providers are interface-conforming
+placeholders -- see `docs/orchestra-api-runtime.md`.
 """
 
 from __future__ import annotations
@@ -41,18 +41,11 @@ class Usage:
 
 @dataclass(frozen=True)
 class ToolCall:
-    """A request from the model to invoke a local tool by name.
-
-    `provider_metadata` is opaque vendor passthrough data. Provider-specific
-    values stored here must be returned verbatim when required by that
-    provider, and must never be inspected, parsed, transformed, re-encoded,
-    truncated, normalized, concatenated, or logged by generic runtime code.
-    """
+    """A request from the model to invoke a local tool by name."""
 
     id: str
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
-    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
