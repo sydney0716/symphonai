@@ -35,6 +35,10 @@ class FakeModelProvider(ModelProvider):
         return "fake"
 
     @property
+    def wire_format(self) -> int:
+        return 4
+
+    @property
     def call_count(self) -> int:
         return self._call_count
 

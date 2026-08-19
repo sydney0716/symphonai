@@ -44,6 +44,6 @@ def run_task(
         tools=tools,
         policy=policy,
         max_turns=max_turns,
-        tool_schemas=tool_registry_schemas(tools, provider.name),
+        tool_schemas=tool_registry_schemas(tools, provider.wire_format),
     )
     return agent.run(messages, model=model)

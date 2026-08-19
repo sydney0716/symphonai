@@ -5,11 +5,11 @@ into and out of OpenAI's Chat Completions wire format
 (https://platform.openai.com/docs/api-reference/chat), using only the
 standard library (`urllib.request`) -- no new dependency.
 
-Known gap: `ModelRequest.tools` is passed through unmodified into the
-request's `tools` field, so callers must already supply tool definitions in
-OpenAI's native `{"type": "function", "function": {...}}` shape. There is
-no shared, vendor-agnostic tool-schema translator yet -- see
-`docs/orchestra-api-runtime.md`.
+`ModelRequest.tools` is passed through unmodified into the request's
+`tools` field, so callers must already supply tool definitions in
+OpenAI's native `{"type": "function", "function": {...}}` shape. The
+standard runtime call sites prepare that shape via
+`orchestra_api.tool_schema`.
 """
 
 from __future__ import annotations
@@ -115,6 +115,10 @@ class OpenAIProvider(ModelProvider):
     @property
     def name(self) -> str:
         return "openai"
+
+    @property
+    def wire_format(self) -> int:
+        return 1
 
     @staticmethod
     def is_configured() -> bool:

@@ -2,10 +2,10 @@
 
 `LocalTool.parameters` gives every tool a vendor-neutral JSON-Schema-shaped
 description of its own arguments. `to_provider_tool_schema()` formats that,
-plus a tool's `name`/`description`, into a specific provider's native tool
-definition shape -- the same OpenAI/Anthropic shapes already hand-written
-for the one-off `dispatch_subagent_tool_schema()` in `orchestra_api.leader`,
-generalized to work for any `LocalTool`.
+plus a tool's `name`/`description`, into a provider wire format -- the same
+OpenAI/Anthropic shapes already hand-written for the one-off
+`dispatch_subagent_tool_schema()` in `orchestra_api.leader`, plus Gemini's
+function-declaration schema.
 
 `dispatch_subagent_tool_schema()` is deliberately left as-is, not
 refactored to call into this module -- it's already tested and working,
@@ -18,12 +18,13 @@ subprocess, no I/O.
 
 from __future__ import annotations
 
+from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.tools.base import LocalTool
 
 
-def to_provider_tool_schema(tool: LocalTool, provider_name: str) -> dict:
-    """Format one LocalTool into a specific provider's native tool-definition shape."""
-    if provider_name == "openai":
+def to_provider_tool_schema(tool: LocalTool, wire_format: int) -> dict:
+    """Format one LocalTool into a provider's native tool-definition shape."""
+    if wire_format == 1:
         return {
             "type": "function",
             "function": {
@@ -32,14 +33,19 @@ def to_provider_tool_schema(tool: LocalTool, provider_name: str) -> dict:
                 "parameters": tool.parameters,
             },
         }
-    if provider_name == "anthropic":
+    if wire_format == 2:
         return {
             "name": tool.name,
             "description": tool.description,
             "input_schema": tool.parameters,
         }
-    # Fake and any other provider: content doesn't matter for a real call,
-    # but keep it self-describing for debugging.
+    if wire_format == 3:
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": sanitize_for_gemini(tool.parameters),
+        }
+    # Other/unclassified providers: keep schemas self-describing for debugging.
     return {
         "name": tool.name,
         "description": tool.description,
@@ -47,6 +53,6 @@ def to_provider_tool_schema(tool: LocalTool, provider_name: str) -> dict:
     }
 
 
-def tool_registry_schemas(tools: dict[str, LocalTool], provider_name: str) -> list[dict]:
+def tool_registry_schemas(tools: dict[str, LocalTool], wire_format: int) -> list[dict]:
     """Format a whole tool registry into a list of provider-shaped schemas."""
-    return [to_provider_tool_schema(tool, provider_name) for tool in tools.values()]
+    return [to_provider_tool_schema(tool, wire_format) for tool in tools.values()]
