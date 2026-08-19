@@ -8,10 +8,18 @@
 # here, at call time -- never from a config value. See
 # docs/orchestra-api-runtime.md.
 #
-# `fake-default`, `openai-default`, and `anthropic-default` are usable
-# today. `gemini-default` and `qwen-default` remain interface-conforming
-# placeholders: their create_response() raises NotImplementedError. Real
-# HTTP request/response handling for those two is a later task.
+# All profiles below are usable: there are three real wire formats --
+# Anthropic messages, OpenAI chat-completions, and Gemini generateContent
+# -- and every other vendor here speaks the OpenAI-compatible one, so it
+# is configuration rather than new provider code.
+#
+# Catalog-backed profiles (grok/kimi/qwen/...) use UNVERIFIED presets from
+# orchestra_api/provider_catalog.py: base URLs and model names were not
+# probed against a live account and vendors change both. Check the
+# vendor's current docs before relying on one. Note also that
+# "OpenAI-compatible" is a de facto standard -- tool-calling support in
+# particular varies, so an endpoint can connect and still never invoke a
+# tool.
 
 agents:
   - name: fake-default
@@ -40,24 +48,49 @@ agents:
     api_key_env_var: ANTHROPIC_API_KEY   # name only; the key itself lives in your shell/secret store
 
   - name: gemini-default
-    provider: gemini               # placeholder only -- see docs/orchestra-api-runtime.md
+    provider: gemini
     description: >-
-      Placeholder profile for the Gemini API. create_response() is not
-      implemented yet.
+      Real Gemini provider. Gemini is the one vendor here with its own
+      wire format (contents/parts, functionCall/functionResponse) AND a
+      restricted JSON Schema dialect, so its tool schemas are rewritten by
+      orchestra_api/gemini_schema.py before being sent.
     model: gemini-2.0-flash
     base_url: https://generativelanguage.googleapis.com/v1beta
-    api_key_env_var: GEMINI_API_KEY   # name only; the key itself lives in your shell/secret store
+    api_key_env_var: GEMINI_API_KEY   # name only; sent as the x-goog-api-key header, never in the URL
+
+  # --- OpenAI-compatible endpoints, from orchestra_api/provider_catalog.py ---
+  # These are all the same OpenAICompatibleProvider with different config.
+  # Catalog keys available: grok, kimi, deepseek, qwen, ollama, openrouter,
+  # groq, together. All presets are UNVERIFIED -- check vendor docs.
 
   - name: qwen-default
-    provider: openai_compatible    # placeholder only -- see docs/orchestra-api-runtime.md
+    provider: openai_compatible
+    catalog_key: qwen
     description: >-
-      Placeholder profile for a Qwen (or other OpenAI-compatible) endpoint.
-      create_response() is not implemented yet. base_url and
-      api_key_env_var are caller-supplied since this covers many different
-      hosted/self-hosted endpoints, not just one vendor.
-    model: qwen-placeholder
+      Alibaba Qwen via DashScope's OpenAI-compatible mode. base_url and
+      api_key_env_var are caller-supplied since this provider covers many
+      different hosted/self-hosted endpoints, not just one vendor.
+    model: qwen-plus
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env_var: QWEN_API_KEY   # name only; the key itself lives in your shell/secret store
+    api_key_env_var: DASHSCOPE_API_KEY   # name only; the key itself lives in your shell/secret store
+
+  - name: grok-default
+    provider: openai_compatible
+    catalog_key: grok
+    description: xAI Grok via its OpenAI-compatible surface. Unverified preset.
+    model: grok-4
+    base_url: https://api.x.ai/v1
+    api_key_env_var: XAI_API_KEY   # name only; the key itself lives in your shell/secret store
+
+  - name: kimi-default
+    provider: openai_compatible
+    catalog_key: kimi
+    description: >-
+      Moonshot Kimi. Unverified preset -- there is also an international
+      endpoint, so check which one your key is issued for.
+    model: moonshot-v1-8k
+    base_url: https://api.moonshot.cn/v1
+    api_key_env_var: MOONSHOT_API_KEY   # name only; the key itself lives in your shell/secret store
 
 # Leader/subagent selection for orchestra_api.leader.Leader.
 #

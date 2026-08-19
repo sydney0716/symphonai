@@ -36,6 +36,10 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
+from orchestra_api.providers.gemini_provider import (  # noqa: E402
+    API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
+)
+from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
 from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider  # noqa: E402
 from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
 
@@ -181,6 +185,43 @@ def main() -> None:
         if sent_tool_names != expected_tool_names:
             fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
         ok("real provider's run_task() request includes all four standard tool schemas")
+
+        # -- regression: a real GeminiProvider request must carry the four
+        # tools as sanitized tools[].functionDeclarations, not raw schemas --
+        os.environ[GEMINI_API_KEY_ENV_VAR] = "AIza-fake-test-key-do-not-use"
+        gemini_captured: dict = {}
+
+        def _fake_gemini_urlopen(request, timeout=None):  # noqa: ANN001
+            gemini_captured["url"] = request.full_url
+            gemini_captured["body"] = json.loads(request.data.decode("utf-8"))
+            payload = json.dumps(
+                {
+                    "candidates": [
+                        {"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+                    ],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+                }
+            ).encode("utf-8")
+            return _FakeHttpResponse(payload)
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_urlopen):
+            run_task(GeminiProvider(), policy, "hello")
+        del os.environ[GEMINI_API_KEY_ENV_VAR]
+
+        if "AIza-fake-test-key-do-not-use" in gemini_captured.get("url", ""):
+            fail("Gemini API key must never appear in the request URL")
+        declarations = (gemini_captured.get("body", {}).get("tools") or [{}])[0].get(
+            "functionDeclarations", []
+        )
+        gemini_tool_names = {d.get("name") for d in declarations}
+        if gemini_tool_names != expected_tool_names:
+            fail(f"expected Gemini request to declare {expected_tool_names}, got {gemini_tool_names!r}")
+        argv_schema = next(
+            (d["parameters"] for d in declarations if d["name"] == "run_shell"), {}
+        )
+        if argv_schema.get("type") != "object" or "argv" not in argv_schema.get("properties", {}):
+            fail(f"expected run_shell's Gemini parameters to survive sanitization, got {argv_schema!r}")
+        ok("real Gemini request carries sanitized tools[].functionDeclarations, key not in URL")
 
         print("\nAll smoke checks passed.")
 

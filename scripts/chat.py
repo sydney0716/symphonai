@@ -24,27 +24,40 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from orchestra_api.leader import Leader, LeaderConfig  # noqa: E402
+from orchestra_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
 from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
 from orchestra_api.providers.base import ModelProvider  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
+from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
 from orchestra_api.providers.openai_provider import OpenAIProvider  # noqa: E402
 
-PROVIDER_CHOICES = {
+# Providers with their own wire format and a dedicated implementation.
+NATIVE_PROVIDERS = {
     "fake": FakeModelProvider,
     "openai": OpenAIProvider,
     "anthropic": AnthropicProvider,
+    "gemini": GeminiProvider,
 }
+
+# Everything else is an OpenAI-compatible endpoint from the catalog, which
+# is configuration rather than new provider code. Catalog entries are
+# unverified -- see orchestra_api/provider_catalog.py.
+ALL_CHOICES = list(NATIVE_PROVIDERS) + catalog_keys()
 
 
 def _prompt_choice(label: str) -> str:
-    options = ", ".join(PROVIDER_CHOICES)
+    native = ", ".join(NATIVE_PROVIDERS)
+    compatible = ", ".join(catalog_keys())
+    print(f"{label} provider:")
+    print(f"  native:            {native}")
+    print(f"  openai-compatible: {compatible}  (unverified presets)")
     while True:
-        raw = input(f"{label} provider [{options}] (default: fake): ").strip().lower()
+        raw = input(f"{label} provider (default: fake): ").strip().lower()
         if not raw:
             return "fake"
-        if raw in PROVIDER_CHOICES:
+        if raw in ALL_CHOICES:
             return raw
-        print(f"  unknown provider {raw!r}, choose one of: {options}")
+        print(f"  unknown provider {raw!r}, choose one of: {', '.join(ALL_CHOICES)}")
 
 
 def _prompt_model(provider_name: str, default_model: str) -> str:
@@ -53,19 +66,28 @@ def _prompt_model(provider_name: str, default_model: str) -> str:
 
 
 def _build_provider(provider_name: str) -> ModelProvider:
-    cls = PROVIDER_CHOICES[provider_name]
-    if cls is FakeModelProvider:
-        # Fake always gives the same canned reply -- useful for checking the
-        # CLI's plumbing (selection, status lines, loop), not a real chat.
-        return FakeModelProvider()
+    if provider_name in NATIVE_PROVIDERS:
+        cls = NATIVE_PROVIDERS[provider_name]
+        if cls is FakeModelProvider:
+            # Fake always gives the same canned reply -- useful for checking
+            # the CLI's plumbing (selection, status lines, loop), not a real
+            # chat.
+            return FakeModelProvider()
+        if not cls.is_configured():
+            print(f"  WARNING: {provider_name} is not configured (its API key env var is not set).")
+            print("  Calls to it will fail with a clear error until you export the key.")
+        model = _prompt_model(provider_name, cls().model)
+        return cls(model=model)
 
-    if not cls.is_configured():
-        print(f"  WARNING: {provider_name} is not configured (its API key env var is not set).")
+    # Catalog (OpenAI-compatible) entry.
+    probe = build_catalog_provider(provider_name)
+    if not probe.is_configured():
+        print(f"  WARNING: {provider_name} is not configured ({probe.api_key_env_var} is not set).")
         print("  Calls to it will fail with a clear error until you export the key.")
-
-    default_model = cls().model
-    model = _prompt_model(provider_name, default_model)
-    return cls(model=model)
+    print(f"  note: {provider_name} is an unverified catalog preset ({probe.base_url}).")
+    print("  Check the vendor's current docs if calls fail; tool-calling support varies.")
+    model = _prompt_model(provider_name, probe.model)
+    return build_catalog_provider(provider_name, model=model)
 
 
 def _print_status(label: str, status: str) -> None:

@@ -1877,6 +1877,199 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v6-gemini-schema",
+      "title": "Implement Gemini JSON Schema sanitizer",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/gemini_schema.py"
+      ],
+      "acceptance_criteria": [
+        "sanitize_for_gemini(schema) strips keywords outside Gemini's supported subset (type/nullable/description/format/enum/required/properties/items/anyOf)",
+        "type arrays containing null become a single type plus nullable=True",
+        "Local $ref pointers are inlined with a depth cap and circular refs abort safely rather than looping",
+        "Root-level anyOf/oneOf is not emitted; root is always type object",
+        "A node budget and depth limit bound the work so a pathological schema cannot hang",
+        "A degenerate/uncollapsible union returns an empty schema rather than invalid output",
+        "Pure function, no network/subprocess/IO"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.gemini_schema\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.gemini_schema\"",
+          "status": "passed",
+          "summary": "Imports cleanly, pure functions, no network/subprocess/IO. 11 behavioral checks pass: unsupported keywords (additionalProperties, $schema, minLength, default) stripped while allowed ones survive; type:[\"string\",\"null\"] becomes type:string + nullable:true; local $ref inlined; a circular $ref returns {} instead of looping; root-level anyOf is forced to type:object; a same-type union merges its enums; a heterogeneous union degrades to {}; array items handled; 200-deep nesting bounded by MAX_DEPTH without hanging or raising; None/{} input yields a valid empty object schema. Node budget verified to genuinely engage: on a 5000-property schema exactly 1023 props are fully sanitized (MAX_NODES 1024 minus the root) and the remaining 3977 degrade to permissive {} without further recursion -- bounded work, still-valid output.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v6-gemini-provider",
+      "title": "Implement real GeminiProvider",
+      "worker": "claude",
+      "depends_on": [
+        "api-v6-gemini-schema"
+      ],
+      "scope": [
+        "orchestra_api/providers/gemini_provider.py"
+      ],
+      "acceptance_criteria": [
+        "create_response() POSTs to {base_url}/models/{model}:generateContent via urllib.request with the key in the x-goog-api-key header, never in the URL query string",
+        "Messages map to Gemini's contents/parts shape: SYSTEM into system_instruction, USER->user, ASSISTANT->model, tool results as a user-role functionResponse part",
+        "Assistant tool calls map to functionCall parts; incoming functionCall parts map back to ToolCall with a synthesized stable id, since Gemini function calls carry no id",
+        "Sending a tool result resolves the function name by looking up the originating ToolCall id from earlier in the conversation",
+        "Tool schemas are passed through sanitize_for_gemini and wrapped as tools[].functionDeclarations",
+        "usageMetadata and finishReason map to Usage and stop_reason; HTTP/network errors raise ProviderError without leaking the API key",
+        "No real network call in this task's validation"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.gemini_provider\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.gemini_provider\"",
+          "status": "passed",
+          "summary": "Imports cleanly, stdlib-only. 8 checks via mocked urlopen, no real network call: POSTs to {base_url}/models/{model}:generateContent with the key in the x-goog-api-key header and explicitly asserted NOT present in the URL; SYSTEM messages hoisted into system_instruction; contents/parts mapping correct including ASSISTANT->model role and a tool result emitted as a user-role functionResponse whose function name was correctly resolved back from the originating ToolCall id; all four standard tool schemas wrapped as tools[0].functionDeclarations with parameters passed through sanitize_for_gemini (run_shell's argv correctly survives as type array); response parsing yields text + a ToolCall with a synthesized id (gemini-1-write_file) since Gemini ships no call id, plus usageMetadata->Usage and finishReason->stop_reason; HTTPError becomes ProviderError with the fake key asserted absent from the message; a no-candidates response (safety block) raises ProviderError with promptFeedback rather than IndexError; a missing API key raises ProviderError before urlopen is ever called (call_count==0).",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v6-openai-compatible",
+      "title": "Implement real OpenAICompatibleProvider",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/providers/openai_compatible.py"
+      ],
+      "acceptance_criteria": [
+        "create_response() reuses openai_provider's existing module-level _build_request_body/_parse_response rather than duplicating or refactoring them",
+        "base_url and api_key_env_var remain caller-supplied; the key is read from the environment at call time only",
+        "HTTP/network errors raise ProviderError without leaking the key",
+        "Docstring notes that OpenAI-compatibility is a de facto standard and tool-calling support varies by endpoint"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.providers.openai_compatible\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.providers.openai_compatible\"",
+          "status": "passed",
+          "summary": "Imports cleanly. Verified with a Grok-shaped instance via mocked urlopen: POSTs to {base_url}/chat/completions with Bearer auth and the caller-supplied model; response parses correctly. HTTPError becomes a ProviderError labelled with the provider_label ('grok') and the fake key asserted absent. Missing env var raises ProviderError before urlopen is called (call_count==0) and flips is_configured() to False. Confirmed by identity check (oc._build_request_body is op._build_request_body) that request building and response parsing are the exact same function objects imported from openai_provider -- reused, not duplicated, so the two cannot drift. Docstring states OpenAI-compatibility is a de facto standard and that tool-calling support varies by endpoint.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v6-provider-catalog",
+      "title": "Add catalog of OpenAI-compatible endpoint presets",
+      "worker": "claude",
+      "depends_on": [
+        "api-v6-openai-compatible"
+      ],
+      "scope": [
+        "orchestra_api/provider_catalog.py"
+      ],
+      "acceptance_criteria": [
+        "Presets for grok/kimi/deepseek/qwen/ollama/openrouter/groq/together, each carrying label, base_url, api_key_env_var, and a default model",
+        "Every entry is explicitly marked as unverified candidate configuration that must be checked against current vendor docs, mirroring the framing used in orchestra_agents/probes.py",
+        "A helper builds a configured OpenAICompatibleProvider from a catalog key",
+        "Module notes that tool-calling support varies across compatible endpoints",
+        "Data only; importing performs no network call"
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.provider_catalog\""
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.provider_catalog\"",
+          "status": "passed",
+          "summary": "Imports cleanly, data only, reload under a urlopen-raising patch confirms no network on import. All 8 required presets present (grok/kimi/deepseek/qwen/ollama/openrouter/groq/together), each with a valid-scheme base_url, uppercase env var name, default model and label. build_catalog_provider() returns a correctly configured OpenAICompatibleProvider, honours a model override, raises KeyError listing known keys on an unknown one, and its is_configured() correctly tracks the entry's own env var. Module docstring states in bold that every entry is UNVERIFIED candidate configuration to be checked against current vendor docs (explicitly mirroring the orchestra_agents/probes.py framing) and that tool-calling support varies across compatible endpoints -- an endpoint may connect and still never invoke a tool.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v6-wire-catalog",
+      "title": "Wire gemini and catalog providers into scripts and config",
+      "worker": "claude",
+      "depends_on": [
+        "api-v6-gemini-provider",
+        "api-v6-provider-catalog"
+      ],
+      "scope": [
+        "scripts/chat.py",
+        "scripts/live_test_provider.py",
+        "configs/api-agents.example.yaml",
+        "scripts/smoke_api_agent.py"
+      ],
+      "acceptance_criteria": [
+        "chat.py's provider picker offers fake/openai/anthropic/gemini plus catalog keys, and builds the right provider for each",
+        "live_test_provider.py can dry-run and (with --live --provider) target gemini and catalog entries",
+        "configs/api-agents.example.yaml documents gemini as implemented and lists catalog-based profiles",
+        "A regression check confirms a GeminiProvider request body carries sanitized tools[].functionDeclarations",
+        "No real network call in validation"
+      ],
+      "validation_commands": [
+        "python3 scripts/live_test_provider.py",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "python3 scripts/live_test_provider.py; python3 scripts/smoke_api_agent.py; python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "All three pass. live_test_provider.py dry-run now lists 11 providers split into native (openai/anthropic/gemini) and openai-compatible presets, showing each preset's base_url with a verify-against-vendor-docs note; --live without --provider still fails cleanly listing all valid choices; stale 'openai,anthropic' help strings fixed. smoke_api_agent.py grew an 11th check: a real GeminiProvider run via run_task() (mocked urlopen) carries all four tools as sanitized tools[0].functionDeclarations with run_shell's argv surviving sanitization, and asserts the API key does not appear in the request URL. smoke_leader.py unchanged and still passing (9 checks). chat.py's picker offers native + catalog keys and builds the right provider for each -- verified by a scripted session selecting gemini as leader and grok as subagent, which printed the unconfigured warnings and the unverified-preset note, then aborted cleanly at the cost confirmation without any network call. configs/api-agents.example.yaml rewritten: gemini documented as real with its schema-sanitization note, catalog-backed grok/kimi/qwen profiles added, all marked unverified with the tool-calling-varies caveat. Whole package compiles.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v6-docs",
+      "title": "Document the three wire formats, sanitizer, and catalog",
+      "worker": "claude",
+      "depends_on": [
+        "api-v6-gemini-schema",
+        "api-v6-gemini-provider",
+        "api-v6-openai-compatible",
+        "api-v6-provider-catalog",
+        "api-v6-wire-catalog"
+      ],
+      "scope": [
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "Explains the three-wire-format model: Anthropic messages, OpenAI chat-completions (plus all compatible vendors), Gemini generateContent",
+        "Documents gemini_schema.py's constraints and why Gemini needs a sanitizer the other two do not",
+        "Documents the catalog, stating entries are unverified and tool-calling support varies by endpoint",
+        "Updates the placeholder-providers section since Gemini and OpenAICompatible are now implemented",
+        "Does not claim any catalog endpoint has been live-tested"
+      ],
+      "validation_commands": [],
+      "provider": "claude",
+      "status": "COMPLETE",
+      "validation_results": [
+        {
+          "command": "manual review + grep checks on docs/orchestra-api-runtime.md",
+          "status": "passed",
+          "summary": "Rewrote the providers section around the three-wire-format model (Anthropic messages, OpenAI chat-completions + all compatible vendors, Gemini generateContent), added a full gemini_schema.py section documenting all constraints with attribution to opencodex, added a Provider catalog section stating no entry has been live-tested, clarified the two-step tool_schema.py -> gemini_provider.py sanitization flow, and updated four previously-stale passages (Live-test script provider list, Example config profile list, Non-goals 'still placeholders' bullet now retired with an explicit note, Non-goals real-network-call bullet extended to cover Gemini/OpenAICompatible/catalog). grep confirms the only remaining 'placeholder' match is the deliberate retirement note. Full doc reads cleanly; whole package compiles; both smoke suites (11 + 9 checks) and live_test_provider.py dry-run all still pass.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [

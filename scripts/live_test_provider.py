@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Manual live-test script for the real OpenAI/Anthropic providers.
+"""Manual live-test script for the real API providers.
 
 Default run is dry-run only: it reports whether each provider is
 configured (its env var is set) and what it would send, without ever
 calling `urllib` or touching the network.
 
 Making one real call requires BOTH `--live` and an explicit
-`--provider {openai,anthropic}`. It prints a cost/network warning first.
+`--provider` naming a native provider (openai/anthropic/gemini) or an
+OpenAI-compatible catalog preset. It prints a cost/network warning first.
 
 This script is never run automatically as part of validation --
 `scripts/smoke_api_agent.py` (FakeModelProvider-only) is the automated
@@ -23,39 +24,52 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from orchestra_api.models import Message, ModelRequest, Role  # noqa: E402
+from orchestra_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
 from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
-from orchestra_api.providers.base import ProviderError  # noqa: E402
+from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
+from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
 from orchestra_api.providers.openai_provider import OpenAIProvider  # noqa: E402
 
-PROVIDERS = {
+# Providers with their own wire format and a dedicated implementation.
+NATIVE_PROVIDERS = {
     "openai": OpenAIProvider,
     "anthropic": AnthropicProvider,
+    "gemini": GeminiProvider,
 }
 
+ALL_PROVIDERS = list(NATIVE_PROVIDERS) + catalog_keys()
+
 DEFAULT_PROMPT = "Reply with exactly one word: pong"
+
+
+def _build(provider_name: str) -> ModelProvider:
+    if provider_name in NATIVE_PROVIDERS:
+        return NATIVE_PROVIDERS[provider_name]()
+    return build_catalog_provider(provider_name)
 
 
 def report_configuration() -> None:
     print("Orchestra API live-test (dry-run unless --live is passed)")
     print()
-    for name, cls in PROVIDERS.items():
-        provider = cls()
-        print(f"== {name} ==")
-        print(f"  configured: {cls.is_configured()} (env var checked, value never read/printed)")
+    for name in ALL_PROVIDERS:
+        provider = _build(name)
+        kind = "native" if name in NATIVE_PROVIDERS else "openai-compatible (unverified preset)"
+        print(f"== {name} == [{kind}]")
+        print(f"  configured: {provider.is_configured()} (env var checked, value never read/printed)")
         print(f"  model: {provider.model}")
+        if name not in NATIVE_PROVIDERS:
+            print(f"  base_url: {provider.base_url}  (verify against current vendor docs)")
         print(f"  would send: 1 user message -> {provider.name}.create_response()")
     print()
     print("Dry run only: no network call was made.")
-    print("Pass --live --provider {openai,anthropic} to make one real call.")
+    print(f"Pass --live --provider {{{','.join(ALL_PROVIDERS)}}} to make one real call.")
 
 
 def run_live(provider_name: str, prompt: str) -> int:
-    cls = PROVIDERS[provider_name]
-    if not cls.is_configured():
+    provider = _build(provider_name)
+    if not provider.is_configured():
         print(f"FAIL: {provider_name} is not configured (its API key env var is not set)")
         return 1
-
-    provider = cls()
     print(f"WARNING: about to make a REAL network call to {provider_name} ({provider.model}).")
     print("This will consume real API quota/credits on your account.")
     print(f"Prompt: {prompt!r}")
@@ -83,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--provider",
-        choices=sorted(PROVIDERS),
+        choices=sorted(ALL_PROVIDERS),
         default=None,
         help="Which provider to call under --live.",
     )
@@ -99,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.provider is None:
-        print("FAIL: --live requires --provider {openai,anthropic}")
+        print(f"FAIL: --live requires --provider, one of: {', '.join(sorted(ALL_PROVIDERS))}")
         return 2
 
     return run_live(args.provider, args.prompt)
