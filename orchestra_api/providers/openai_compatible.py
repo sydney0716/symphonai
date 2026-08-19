@@ -54,10 +54,6 @@ class OpenAICompatibleProvider(ModelProvider):
     def name(self) -> str:
         return self.provider_label
 
-    @property
-    def wire_format(self) -> int:
-        return 1
-
     def is_configured(self) -> bool:
         """Whether this instance's configured env var is set and non-empty."""
         return bool(os.environ.get(self.api_key_env_var, "").strip())

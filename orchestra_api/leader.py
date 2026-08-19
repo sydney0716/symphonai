@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
-from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.models import Message, Role, ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
@@ -73,48 +72,42 @@ _DISPATCH_PROPERTIES = {
 _DISPATCH_REQUIRED = ["subagent_name", "task"]
 
 
-def _dispatch_parameters_schema() -> dict:
-    return {
-        "type": "object",
-        "properties": _DISPATCH_PROPERTIES,
-        "required": _DISPATCH_REQUIRED,
-    }
-
-
-def dispatch_subagent_tool_schema(wire_format: int) -> dict:
+def dispatch_subagent_tool_schema(provider_name: str) -> dict:
     """Build the dispatch_subagent tool definition in one provider's native shape.
 
     This is deliberately narrow -- a hand-written schema for this one tool,
-    kept separate from the general LocalTool schema formatter in
-    orchestra_api.tool_schema.
+    not a general cross-vendor tool-schema translator (that remains an open
+    gap; see docs/orchestra-api-runtime.md).
     """
-    parameters = _dispatch_parameters_schema()
-    if wire_format == 1:
+    if provider_name == "openai":
         return {
             "type": "function",
             "function": {
                 "name": DISPATCH_TOOL_NAME,
                 "description": _DISPATCH_DESCRIPTION,
-                "parameters": parameters,
+                "parameters": {
+                    "type": "object",
+                    "properties": _DISPATCH_PROPERTIES,
+                    "required": _DISPATCH_REQUIRED,
+                },
             },
         }
-    if wire_format == 2:
+    if provider_name == "anthropic":
         return {
             "name": DISPATCH_TOOL_NAME,
             "description": _DISPATCH_DESCRIPTION,
-            "input_schema": parameters,
+            "input_schema": {
+                "type": "object",
+                "properties": _DISPATCH_PROPERTIES,
+                "required": _DISPATCH_REQUIRED,
+            },
         }
-    if wire_format == 3:
-        return {
-            "name": DISPATCH_TOOL_NAME,
-            "description": _DISPATCH_DESCRIPTION,
-            "parameters": sanitize_for_gemini(parameters),
-        }
-    # Other/unclassified providers: keep schemas self-describing for debugging.
+    # Fake and any other provider: content doesn't matter for a real call,
+    # but keep it self-describing for debugging.
     return {
         "name": DISPATCH_TOOL_NAME,
         "description": _DISPATCH_DESCRIPTION,
-        "parameters": parameters,
+        "properties": _DISPATCH_PROPERTIES,
     }
 
 
@@ -198,7 +191,7 @@ class DispatchSubagentTool(LocalTool):
                     tools=subagent_tools,
                     policy=self._subagent_policy,
                     max_turns=self._subagent_max_turns,
-                    tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
+                    tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.name),
                 )
             )
             self.pool[subagent_name] = record
@@ -272,7 +265,7 @@ class Leader:
             tools={DISPATCH_TOOL_NAME: self._dispatch_tool},
             policy=leader_policy,
             max_turns=config.max_leader_turns,
-            tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.wire_format)],
+            tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.name)],
         )
         self._chat_messages: list[Message] = []
 

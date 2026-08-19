@@ -5,11 +5,11 @@ into and out of Anthropic's Messages API wire format
 (https://docs.anthropic.com/en/api/messages), using only the standard
 library (`urllib.request`) -- no new dependency.
 
-`ModelRequest.tools` is passed through unmodified into the request's
-`tools` field, so callers must already supply tool definitions in
-Anthropic's native `{"name", "description", "input_schema"}` shape. The
-standard runtime call sites prepare that shape via
-`orchestra_api.tool_schema`.
+Known gap: `ModelRequest.tools` is passed through unmodified into the
+request's `tools` field, so callers must already supply tool definitions in
+Anthropic's native `{"name", "description", "input_schema"}` shape. There
+is no shared, vendor-agnostic tool-schema translator yet -- see
+`docs/orchestra-api-runtime.md`.
 """
 
 from __future__ import annotations
@@ -120,10 +120,6 @@ class AnthropicProvider(ModelProvider):
     @property
     def name(self) -> str:
         return "anthropic"
-
-    @property
-    def wire_format(self) -> int:
-        return 2
 
     @staticmethod
     def is_configured() -> bool:

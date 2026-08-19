@@ -2070,6 +2070,68 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v7-wire-format",
+      "title": "Fix tool-schema shaping to use provider wire format, not provider.name label",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/providers/base.py",
+        "orchestra_api/providers/fake.py",
+        "orchestra_api/providers/anthropic_provider.py",
+        "orchestra_api/providers/openai_provider.py",
+        "orchestra_api/providers/openai_compatible.py",
+        "orchestra_api/providers/gemini_provider.py",
+        "orchestra_api/tool_schema.py",
+        "orchestra_api/leader.py",
+        "orchestra_api/runner.py",
+        "scripts/smoke_api_agent.py",
+        "scripts/smoke_leader.py",
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "ModelProvider (orchestra_api/providers/base.py) gains a new abstract int property `wire_format`, documented as: 1=openai wire format, 2=anthropic wire format, 3=gemini wire format, 4=other/unclassified (fake and any future/unknown provider). `name` is unchanged and stays the existing display/config-selection label -- wire_format is a separate, new concept, not a replacement for name.",
+        "Each concrete provider sets wire_format: OpenAIProvider=1, AnthropicProvider=2, GeminiProvider=3, OpenAICompatibleProvider=1 (it reuses openai_provider's request/response code verbatim regardless of its own provider_label, so it is wire-format 1), FakeModelProvider=4.",
+        "orchestra_api/tool_schema.py's to_provider_tool_schema and tool_registry_schemas take a `wire_format: int` parameter (renamed from `provider_name: str`) and branch on 1/2/else-4, plus a new branch for 3 (gemini) producing Gemini's own {name, description, parameters} function-declaration shape, where parameters = orchestra_api.gemini_schema.sanitize_for_gemini(tool.parameters).",
+        "orchestra_api/leader.py's dispatch_subagent_tool_schema takes `wire_format: int` (renamed from `provider_name: str`) with the same four branches (1 openai, 2 anthropic, 3 gemini via sanitize_for_gemini, else 4 fallback). The fallback (4) shape must wrap _DISPATCH_PROPERTIES as a full JSON Schema object ({'type': 'object', 'properties': _DISPATCH_PROPERTIES, 'required': _DISPATCH_REQUIRED}) instead of the bare properties dict -- the old fallback shape was not a valid schema node on its own.",
+        "The word 'fake' is removed as a named special case anywhere it appears in these branch functions/comments -- fake and any other unclassified provider both simply fall into the else/4 branch, described as 'other', not called out as a fake-specific case.",
+        "All call sites are updated to pass .wire_format instead of .name: orchestra_api/runner.py's tool_registry_schemas(tools, provider.name) call, and both orchestra_api/leader.py internal call sites (tool_registry_schemas(subagent_tools, self._subagent_provider.name) and dispatch_subagent_tool_schema(config.leader_provider.name)).",
+        "provider.name is left completely unchanged everywhere else it is used for display or config-selection purposes.",
+        "New regression checks added to scripts/smoke_api_agent.py and/or scripts/smoke_leader.py (mocked urllib.request.urlopen only, no real network calls) proving: (a) a real GeminiProvider leader's outgoing dispatch_subagent tool schema now carries a well-formed non-empty parameters object after sanitize_for_gemini (it must NOT degrade to an empty/degenerate schema the way the old fallback shape did), and (b) a real OpenAICompatibleProvider's outgoing subagent tool schemas and leader dispatch_subagent tool schema are both in OpenAI's {'type': 'function', 'function': {...}} shape.",
+        "docs/orchestra-api-runtime.md updated to document the wire_format concept and this fix, following the existing pattern used for the prior tool-schema-wiring fix note in that file.",
+        "No behavior change for FakeModelProvider, OpenAIProvider, or AnthropicProvider's existing tool schemas -- only new/corrected behavior for GeminiProvider and OpenAICompatibleProvider.",
+        "Whole orchestra_api package still imports cleanly and all pre-existing checks in both smoke scripts still pass -- zero regressions."
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.tool_schema, orchestra_api.leader, orchestra_api.runner\"",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "codex",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v7-wire-format-fix",
+      "branch": "orchestra/api-v7-wire-format-fix",
+      "validation_results": [
+        {
+          "command": "python3 -c \"import orchestra_api.tool_schema, orchestra_api.leader, orchestra_api.runner\"",
+          "status": "passed",
+          "summary": "Imports cleanly, exit 0, no output.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_api_agent.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude (not just trusted from Codex's report): all 11 checks pass, exit 0, including the pre-existing \"real Gemini request carries sanitized tools[].functionDeclarations\" check.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: all 11 checks pass, exit 0, including the two new regression checks -- a real GeminiProvider leader's dispatch_subagent declaration now carries non-empty sanitized parameters (type=object, correct properties/required, previously would have degraded to an empty schema via the old fallback shape), and a real OpenAICompatibleProvider leader+subagent pair (labeled 'grok'/'kimi') both send OpenAI-shaped {type:function, function:{...}} tool schemas despite non-'openai' provider.name labels.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
@@ -2104,6 +2166,14 @@
       "worktree": ".orchestra/worktrees/parallel-2-worktrees",
       "branch": "orchestra/parallel-2-worktrees",
       "status": "COMPLETE"
+    },
+    {
+      "id": "codex-api-v7-wire-format",
+      "provider": "codex",
+      "task_id": "api-v7-wire-format",
+      "thread_id": "01a017cf-387c-72b3-9f69-32750ab243e2",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v7-wire-format-fix"
     }
   ],
   "runs": []

@@ -201,10 +201,6 @@ class GeminiProvider(ModelProvider):
     def name(self) -> str:
         return "gemini"
 
-    @property
-    def wire_format(self) -> int:
-        return 3
-
     @staticmethod
     def is_configured() -> bool:
         """Whether GEMINI_API_KEY is set and non-empty. Never reads/logs its value."""

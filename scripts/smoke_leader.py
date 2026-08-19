@@ -20,15 +20,11 @@ Verifies:
   - regression check: a real subagent's own outgoing request (behind a
     real leader dispatching to it) includes schemas for all four standard
     tools (read_file/write_file/list_files/run_shell)
-  - regression check: a real GeminiProvider leader's outgoing
-    dispatch_subagent tool declaration carries a non-empty sanitized
-    parameters object
-  - regression check: a real OpenAICompatibleProvider leader and its real
-    OpenAICompatibleProvider subagent both send OpenAI-shaped tool schemas
 
 No real network call is ever made in this script. FakeModelProvider is
-used for every check except the real-provider regression checks, which
-exercise request-building code against a mocked HTTP layer.
+used for every check except the one regression check above, which uses a
+real AnthropicProvider purely to exercise its real request-building code
+against a mocked HTTP layer.
 """
 
 from __future__ import annotations
@@ -48,13 +44,6 @@ from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa:
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
-from orchestra_api.providers.gemini_provider import (  # noqa: E402
-    API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
-)
-from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
-from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider  # noqa: E402
-
-OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "ORCHESTRA_OPENAI_COMPATIBLE_SMOKE_KEY"
 
 
 def fail(msg: str) -> None:
@@ -315,151 +304,6 @@ def main() -> None:
         if sent_tool_names != expected_tool_names:
             fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
         ok("real subagent's outgoing request includes all four standard tool schemas")
-
-        # -- regression: a real GeminiProvider leader must send
-        # dispatch_subagent as a Gemini function declaration with sanitized,
-        # non-empty parameters --
-        os.environ[GEMINI_API_KEY_ENV_VAR] = "AIza-fake-test-key-do-not-use"
-        gemini_leader_captured: dict = {}
-
-        def _fake_gemini_urlopen(request, timeout=None):  # noqa: ANN001
-            gemini_leader_captured["body"] = json.loads(request.data.decode("utf-8"))
-            payload = {
-                "candidates": [
-                    {"content": {"role": "model", "parts": [{"text": "no dispatch"}]}, "finishReason": "STOP"}
-                ],
-                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
-            }
-            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
-
-        gemini_leader = Leader(
-            LeaderConfig(
-                leader_provider=GeminiProvider(),
-                subagent_provider=FakeModelProvider(),
-                repo_root=str(root),
-            )
-        )
-        with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_urlopen):
-            gemini_leader.run("hello")
-        del os.environ[GEMINI_API_KEY_ENV_VAR]
-
-        declarations = (gemini_leader_captured.get("body", {}).get("tools") or [{}])[0].get(
-            "functionDeclarations", []
-        )
-        dispatch_declaration = next(
-            (d for d in declarations if d.get("name") == "dispatch_subagent"), None
-        )
-        if dispatch_declaration is None:
-            fail(f"expected Gemini leader request to declare dispatch_subagent, got {declarations!r}")
-        parameters = dispatch_declaration.get("parameters")
-        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
-        if (
-            not isinstance(parameters, dict)
-            or parameters.get("type") != "object"
-            or set(properties) != {"subagent_name", "task"}
-            or parameters.get("required") != ["subagent_name", "task"]
-        ):
-            fail(f"expected non-empty sanitized Gemini dispatch parameters, got {parameters!r}")
-        ok("real Gemini leader request carries non-empty sanitized dispatch_subagent parameters")
-
-        # -- regression: OpenAI-compatible providers must use OpenAI tool
-        # schema shape even when their provider labels are vendor names --
-        os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR] = "sk-compatible-fake-test-key-do-not-use"
-        compatible_leader_requests: list[dict] = []
-        compatible_subagent_requests: list[dict] = []
-        compatible_call_count = [0]
-
-        def _fake_openai_compatible_urlopen(request, timeout=None):  # noqa: ANN001
-            compatible_call_count[0] += 1
-            body = json.loads(request.data.decode("utf-8"))
-            if compatible_call_count[0] == 1:
-                compatible_leader_requests.append(body)
-                payload = {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "c1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "dispatch_subagent",
-                                            "arguments": json.dumps(
-                                                {"subagent_name": "researcher", "task": "read a.txt"}
-                                            ),
-                                        },
-                                    }
-                                ],
-                            },
-                            "finish_reason": "tool_calls",
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                }
-            elif compatible_call_count[0] == 2:
-                compatible_subagent_requests.append(body)
-                payload = {
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                }
-            else:
-                payload = {
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "final answer"}, "finish_reason": "stop"}
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                }
-            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
-
-        compatible_leader = Leader(
-            LeaderConfig(
-                leader_provider=OpenAICompatibleProvider(
-                    api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
-                    base_url="https://example.invalid/v1",
-                    model="compatible-leader-test",
-                    provider_label="grok",
-                ),
-                subagent_provider=OpenAICompatibleProvider(
-                    api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
-                    base_url="https://example.invalid/v1",
-                    model="compatible-subagent-test",
-                    provider_label="kimi",
-                ),
-                repo_root=str(root),
-            )
-        )
-        with mock.patch("urllib.request.urlopen", side_effect=_fake_openai_compatible_urlopen):
-            compatible_leader.run("please read a.txt via researcher")
-        del os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR]
-
-        if not compatible_leader_requests:
-            fail("expected the OpenAI-compatible leader request to have been captured")
-        leader_tools = compatible_leader_requests[0].get("tools", [])
-        leader_dispatch_tool = leader_tools[0] if leader_tools else {}
-        leader_function = leader_dispatch_tool.get("function")
-        if (
-            leader_dispatch_tool.get("type") != "function"
-            or not isinstance(leader_function, dict)
-            or leader_function.get("name") != "dispatch_subagent"
-            or leader_function.get("parameters", {}).get("type") != "object"
-        ):
-            fail(f"expected OpenAI-shaped leader dispatch tool, got {leader_dispatch_tool!r}")
-
-        if not compatible_subagent_requests:
-            fail("expected the OpenAI-compatible subagent request to have been captured")
-        subagent_tools = compatible_subagent_requests[0].get("tools", [])
-        subagent_tool_names = {
-            t.get("function", {}).get("name")
-            for t in subagent_tools
-            if t.get("type") == "function" and isinstance(t.get("function"), dict)
-        }
-        if subagent_tool_names != expected_tool_names or len(subagent_tool_names) != len(subagent_tools):
-            fail(f"expected OpenAI-shaped subagent tools for {expected_tool_names}, got {subagent_tools!r}")
-        ok("real OpenAI-compatible leader and subagent requests use OpenAI tool schema shape")
 
         print("\nAll smoke checks passed.")
 

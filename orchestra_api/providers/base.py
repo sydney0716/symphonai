@@ -1,9 +1,10 @@
 """The ModelProvider contract every API-key backed agent backend implements.
 
-Implementations live under `orchestra_api.providers`: `FakeModelProvider`,
-`OpenAIProvider`, `AnthropicProvider`, `GeminiProvider`, and
-`OpenAICompatibleProvider`. See `docs/orchestra-api-runtime.md` for the
-wire-format split each one uses.
+Implementations live under `orchestra_api.providers`. `FakeModelProvider`,
+`AnthropicProvider`, and `OpenAIProvider` are fully working; `GeminiProvider`
+and `OpenAICompatibleProvider` remain interface-conforming placeholders
+whose `create_response` raises `NotImplementedError` -- see
+`docs/orchestra-api-runtime.md`.
 """
 
 from __future__ import annotations
@@ -29,11 +30,6 @@ class ModelProvider(ABC):
     @abstractmethod
     def name(self) -> str:
         """Stable identifier for this provider, e.g. "fake", "openai"."""
-
-    @property
-    @abstractmethod
-    def wire_format(self) -> int:
-        """1=openai wire format, 2=anthropic wire format, 3=gemini wire format, 4=other/unclassified."""
 
     @abstractmethod
     def create_response(self, request: ModelRequest) -> ModelResponse:
