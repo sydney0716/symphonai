@@ -14,11 +14,14 @@ Verifies:
     includes schemas for all four standard tools in its outgoing request
     (via mocked urllib.request.urlopen) -- guards against ApiAgent/runner
     silently never telling a real model any tool exists
+  - regression check: a real GeminiProvider round-trips a functionCall
+    thoughtSignature across a two-turn tool call loop (via mocked
+    urllib.request.urlopen), because Gemini rejects the second stateless
+    request when that signature is omitted
 
 No real network call is ever made in this script. FakeModelProvider is
-used for every check except the one regression check above, which uses a
-real OpenAIProvider purely to exercise its real request-building code
-against a mocked HTTP layer.
+used for every check except the real-provider regression checks above,
+which exercise real request-building code against a mocked HTTP layer.
 """
 
 from __future__ import annotations
@@ -222,6 +225,90 @@ def main() -> None:
         if argv_schema.get("type") != "object" or "argv" not in argv_schema.get("properties", {}):
             fail(f"expected run_shell's Gemini parameters to survive sanitization, got {argv_schema!r}")
         ok("real Gemini request carries sanitized tools[].functionDeclarations, key not in URL")
+
+        # -- regression: Gemini thinking tool calls carry a thoughtSignature
+        # sibling on the functionCall part, and stateless follow-up requests
+        # must echo it byte-identically on the model-role tool-call turn.
+        os.environ[GEMINI_API_KEY_ENV_VAR] = "AIza-fake-test-key-do-not-use"
+        thought_signature = (
+            "EqsCCqgCARFNMg8IpGYi0elDNnCgmlGxXzZYE3vHXw+E9+uwvV9azoV1Tyk"
+            "GZZz4WVUAmOcSJuP27nhJ"
+        )
+        gemini_two_turn_requests: list[dict] = []
+        gemini_two_turn_call_count = [0]
+
+        def _fake_gemini_two_turn_urlopen(request, timeout=None):  # noqa: ANN001
+            gemini_two_turn_call_count[0] += 1
+            gemini_two_turn_requests.append(json.loads(request.data.decode("utf-8")))
+            if gemini_two_turn_call_count[0] == 1:
+                payload = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "functionCall": {
+                                            "name": "read_file",
+                                            "args": {"path": "existing.txt"},
+                                            "id": "call_142486",
+                                        },
+                                        "thoughtSignature": thought_signature,
+                                    }
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+                }
+            elif gemini_two_turn_call_count[0] == 2:
+                payload = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "read complete"}],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+                }
+            else:
+                raise AssertionError("expected exactly two Gemini HTTP calls")
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_two_turn_urlopen):
+            gemini_two_turn_result = run_task(GeminiProvider(), policy, "read existing.txt")
+        del os.environ[GEMINI_API_KEY_ENV_VAR]
+
+        if gemini_two_turn_result.stopped_reason != "final_response":
+            fail(
+                "expected Gemini two-turn run to stop on final_response, "
+                f"got {gemini_two_turn_result.stopped_reason!r}"
+            )
+        if gemini_two_turn_call_count[0] != 2:
+            fail(f"expected exactly two Gemini HTTP calls, got {gemini_two_turn_call_count[0]}")
+        second_gemini_body = gemini_two_turn_requests[1]
+        echoed_function_call_parts = [
+            part
+            for content in second_gemini_body.get("contents", [])
+            if content.get("role") == "model"
+            for part in content.get("parts", [])
+            if part.get("functionCall", {}).get("name") == "read_file"
+        ]
+        if len(echoed_function_call_parts) != 1:
+            fail(
+                "expected the second Gemini request to echo one model-role "
+                f"read_file functionCall part, got {echoed_function_call_parts!r}"
+            )
+        echoed_part = echoed_function_call_parts[0]
+        if echoed_part.get("thoughtSignature") != thought_signature:
+            fail("expected exact Gemini thoughtSignature on second request")
+        if echoed_part.get("functionCall", {}).get("id") != "call_142486":
+            fail(f"expected real Gemini functionCall id to round-trip, got {echoed_part!r}")
+        ok("real Gemini two-turn tool loop echoes thoughtSignature on the second request")
 
         print("\nAll smoke checks passed.")
 
