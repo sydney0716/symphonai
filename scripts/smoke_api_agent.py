@@ -200,9 +200,13 @@ def main() -> None:
 
         with mock.patch("urllib.request.urlopen", side_effect=_fake_openai_models_urlopen):
             openai_models = list_models(OpenAIProvider())
+            openai_models_all = list_models(OpenAIProvider(), include_all=True)
         del os.environ[API_KEY_ENV_VAR]
-        if openai_models != ["gpt-list-a", "text-embedding-list-b"]:
-            fail(f"expected unfiltered OpenAI model ids, got {openai_models!r}")
+        # Default drops the embedding model; include_all keeps the raw listing.
+        if openai_models != ["gpt-list-a"]:
+            fail(f"expected the embedding model filtered out by default, got {openai_models!r}")
+        if openai_models_all != ["gpt-list-a", "text-embedding-list-b"]:
+            fail(f"expected include_all=True to return the raw listing, got {openai_models_all!r}")
         ok("model_discovery lists OpenAI wire models unfiltered, key only in Authorization header")
 
         anthropic_model_key = "anthropic-model-list-key-do-not-use"
@@ -268,6 +272,74 @@ def main() -> None:
         if gemini_models != ["gemini-generate-a", "gemini-generate-c"]:
             fail(f"expected Gemini generateContent ids with models/ stripped, got {gemini_models!r}")
         ok("model_discovery filters Gemini to generateContent models and strips models/ prefix")
+
+        # -- the coding-model filter: non-text modalities out, coding models in --
+        from datetime import date, timedelta
+
+        from orchestra_api.model_discovery import is_probably_text_model
+
+        must_keep = [
+            "gpt-5-codex",            # "codex" must NOT be treated as non-text
+            "gpt-5.1-codex-mini",
+            "gpt-4o-search-preview",  # search variants are ordinary chat models
+            "gemini-omni-flash-preview",
+            "claude-opus-5",
+            "gemini-3.5-flash-lite",
+            "brand-new-model-9",      # unknown families must survive the filter
+        ]
+        must_drop = [
+            "tts-1-hd",
+            "whisper-1",
+            "text-embedding-3-large",
+            "omni-moderation-latest",
+            "gpt-realtime",
+            "gpt-4o-transcribe",
+            "dall-e-3",
+            "gemini-2.5-flash-preview-tts",
+            "gemini-3-pro-image",
+            "lyria-3-pro-preview",
+            "nano-banana-pro-preview",
+            "gemini-robotics-er-2-preview",
+            "babbage-002",
+            "davinci-002",
+        ]
+        for model_id in must_keep:
+            if not is_probably_text_model(model_id):
+                fail(f"{model_id!r} is a text/coding model but the filter dropped it")
+        for model_id in must_drop:
+            if is_probably_text_model(model_id):
+                fail(f"{model_id!r} is not a text model but the filter kept it")
+        ok("model_discovery text-model filter keeps codex/search/unknown, drops tts/image/audio/embedding")
+
+        # -- OpenAI shutdown_date: past retires the model, future keeps it --
+        past = (date.today() - timedelta(days=1)).isoformat()
+        future = (date.today() + timedelta(days=365)).isoformat()
+
+        def _fake_openai_models_shutdown_urlopen(request, timeout=None):  # noqa: ANN001
+            payload = {
+                "data": [
+                    {"id": "gpt-live-model", "shutdown_date": future},
+                    {"id": "gpt-retired-model", "shutdown_date": past},
+                    {"id": "gpt-no-date-model"},
+                    {"id": "gpt-bad-date-model", "shutdown_date": "not-a-date"},
+                ]
+            }
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        os.environ[API_KEY_ENV_VAR] = "sk-openai-fake-test-key-do-not-use"
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_openai_models_shutdown_urlopen):
+            live_models = list_models(OpenAIProvider())
+            all_models = list_models(OpenAIProvider(), include_all=True)
+        del os.environ[API_KEY_ENV_VAR]
+
+        if "gpt-retired-model" in live_models:
+            fail(f"expected a past shutdown_date to retire the model, got {live_models!r}")
+        for expected in ("gpt-live-model", "gpt-no-date-model", "gpt-bad-date-model"):
+            if expected not in live_models:
+                fail(f"expected {expected!r} to survive shutdown_date filtering, got {live_models!r}")
+        if "gpt-retired-model" not in all_models:
+            fail(f"include_all=True must bypass shutdown filtering, got {all_models!r}")
+        ok("model_discovery drops models whose shutdown_date has passed, include_all bypasses it")
 
         def _fake_urlopen(request, timeout=None):  # noqa: ANN001
             captured["body"] = json.loads(request.data.decode("utf-8"))

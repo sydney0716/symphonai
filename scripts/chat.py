@@ -77,6 +77,7 @@ def _prompt_model_free_text(provider_name: str, default_model: str) -> str:
 def _prompt_model(provider: ModelProvider, default_model: str) -> str:
     try:
         models = list_models(provider)
+        hidden = len(list_models(provider, include_all=True)) - len(models)
     except ProviderError as exc:
         print(f"  Could not list {provider.name} models: {exc}. Enter a model name manually.")
         return _prompt_model_free_text(provider.name, default_model)
@@ -85,14 +86,27 @@ def _prompt_model(provider: ModelProvider, default_model: str) -> str:
         print(f"  Could not list {provider.name} models: provider returned no models. Enter a model name manually.")
         return _prompt_model_free_text(provider.name, default_model)
 
-    print(f"{provider.name} models:")
-    for index, model in enumerate(models, start=1):
-        print(f"  {index}. {model}")
-
+    showing_all = False
     while True:
+        print(f"{provider.name} models:")
+        for index, model in enumerate(models, start=1):
+            print(f"  {index}. {model}")
+        if hidden > 0 and not showing_all:
+            # The filter is a name-based heuristic, so always say what it hid
+            # and offer a way past it -- a misjudged model must stay reachable.
+            print(f"  ({hidden} non-text or retired models hidden -- type 'all' to show them)")
+
         raw = input(f"{provider.name} model number or name (default: {default_model}): ").strip()
         if not raw:
             return default_model
+        if raw.lower() == "all" and not showing_all:
+            try:
+                models = list_models(provider, include_all=True)
+            except ProviderError as exc:
+                print(f"  Could not list all {provider.name} models: {exc}.")
+                continue
+            showing_all = True
+            continue
         if raw.isdigit():
             index = int(raw)
             if 1 <= index <= len(models):
