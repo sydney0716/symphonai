@@ -2187,6 +2187,63 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v9-model-picker",
+      "title": "Numbered provider picker, drop fake, and live model listing in chat.py",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/model_discovery.py",
+        "scripts/chat.py",
+        "scripts/smoke_api_agent.py",
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "New module orchestra_api/model_discovery.py exposes list_models(provider) -> list[str], returning the model ids a provider's API currently offers. It dispatches on provider.wire_format (1=OpenAI, 2=Anthropic, 3=Gemini) and raises ProviderError on failure, same contract as create_response. Standard library urllib only, no new dependency.",
+        "wire_format 1 (OpenAI + OpenAI-compatible): GET {base_url}/models with 'Authorization: Bearer <key>'; ids come from data[].id.",
+        "wire_format 2 (Anthropic): GET {base_url}/models with 'x-api-key: <key>' AND 'anthropic-version: 2023-06-01' (the version header is required); ids come from data[].id.",
+        "wire_format 3 (Gemini): GET {base_url}/models?pageSize=200 with 'x-goog-api-key: <key>'; ids come from models[].name with the leading 'models/' prefix stripped, filtered to entries whose supportedGenerationMethods contains 'generateContent' -- this is authoritative capability metadata and MUST be used.",
+        "The API key is read fresh from os.environ at call time, sent only as a header, never in the URL query string, never logged, and never included in a ProviderError message.",
+        "chat.py's provider picker accepts a NUMBER as input. Options are numbered starting at 1 and the number is what the user types; the full name must also still be accepted for convenience.",
+        "The 'fake' option is REMOVED from chat.py's provider picker and from its numbering entirely. FakeModelProvider itself must NOT be deleted from the codebase -- it stays for automated tests; only the interactive chat option goes away. Since no free option remains, the picker must have no silent default: an empty input re-prompts rather than selecting something that costs money.",
+        "chat.py's model selection lists EVERY model returned by list_models() for the chosen provider, numbered, and the user picks by number. Do not filter or hide any model for OpenAI/Anthropic; for Gemini use the generateContent filter from the criterion above. Typing a raw model name must still be accepted.",
+        "Model listing degrades gracefully: if the provider is not configured, or list_models() raises ProviderError, or the list is empty, chat.py prints a clear one-line reason and falls back to free-text model entry with the provider's default. It must NEVER crash or hang the picker, and must not print the API key.",
+        "Catalog/OpenAI-compatible presets (grok, kimi, ...) keep working in the picker; they are wire_format 1, so listing is attempted the same way and simply falls back when unconfigured.",
+        "chat.py's existing cost/network confirmation prompt before real calls is preserved unchanged.",
+        "A new check in scripts/smoke_api_agent.py covers list_models() for all three wire formats against mocked urllib.request.urlopen (no real network): asserts the correct URL, the correct auth header name, that anthropic-version is sent for wire_format 2, that the Gemini generateContent filter excludes non-generateContent entries and strips the 'models/' prefix, and that the key never appears in the request URL.",
+        "docs/orchestra-api-runtime.md documents model_discovery.py and the reworked picker, including why the OpenAI list is shown unfiltered (its /v1/models returns no capability metadata, so any filter would be a guess that silently hides new model families) while Gemini can be filtered authoritatively.",
+        "Whole package imports cleanly; both smoke suites pass with zero regressions."
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.model_discovery, orchestra_api.providers.base\"",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "codex",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v9-model-picker",
+      "branch": "orchestra/api-v9-model-picker",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_api_agent.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: 15 checks pass (was 12), including three new model_discovery checks covering all wire formats -- OpenAI unfiltered with key only in the Authorization header, Anthropic with both x-api-key and anthropic-version, and Gemini filtered to generateContent with the models/ prefix stripped. Claude independently teeth-checked the Gemini one rather than trusting the report: deleting the generateContent filter makes it fail, correctly leaking an embedding model into the list, and restoring it passes.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "LIVE: list_models() + interactive chat.py picker against all three real APIs",
+          "status": "passed",
+          "summary": "Definitive verification by Claude with the user's real keys (Codex had none and was barred from network). list_models() returned 124 OpenAI, 10 Anthropic, and 37 generateContent-filtered Gemini models -- each count matching Claude's independent raw-HTTP probes exactly. An unconfigured catalog preset (grok) degraded cleanly to ProviderError 'XAI_API_KEY is not set' rather than crashing. All three user requirements confirmed live in the interactive picker: (1) numeric input works -- entering 2/1/3/2 produced 'Chatting with leader=anthropic (claude-opus-5), subagent=gemini (gemini-2.5-pro)'; (2) the fake option is gone, numbering now starts at openai=1, and FakeModelProvider remains in the codebase for tests; (3) every model is listed and numbered, all 10 for Anthropic. Also verified empty input re-prompts instead of silently defaulting to something that costs money, full provider names are still accepted, and no API key appeared anywhere in the output.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: all 11 checks pass, exit 0. No regressions -- removing fake from the chat.py picker did not affect FakeModelProvider, which the leader suite still uses throughout.",
+          "executed_by": "claude"
+        }
+      ]
     }
   ],
   "workers": [
@@ -2237,6 +2294,14 @@
       "thread_id": "01a0182d-72f9-7140-a83d-79e3fa5b6e0d",
       "status": "COMPLETE",
       "worktree": ".orchestra/worktrees/api-v8-thought-signature"
+    },
+    {
+      "id": "codex-api-v9-model-picker",
+      "provider": "codex",
+      "task_id": "api-v9-model-picker",
+      "thread_id": "01a018fc-8df4-7142-8b9a-e9432d992c9e",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v9-model-picker"
     }
   ],
   "runs": []
