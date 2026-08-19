@@ -14,6 +14,9 @@ Verifies:
     includes schemas for all four standard tools in its outgoing request
     (via mocked urllib.request.urlopen) -- guards against ApiAgent/runner
     silently never telling a real model any tool exists
+  - regression check: model discovery lists OpenAI, Anthropic, and Gemini
+    models via mocked urllib.request.urlopen, with the correct listing URL,
+    auth header, Anthropic version header, and Gemini generateContent filter
   - regression check: a real GeminiProvider round-trips a functionCall
     thoughtSignature across a two-turn tool call loop (via mocked
     urllib.request.urlopen), because Gemini rejects the second stateless
@@ -36,8 +39,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from orchestra_api.model_discovery import list_models  # noqa: E402
 from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
+from orchestra_api.providers.anthropic_provider import (  # noqa: E402
+    ANTHROPIC_VERSION,
+    API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR,
+)
+from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 from orchestra_api.providers.gemini_provider import (  # noqa: E402
     API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
@@ -153,7 +162,6 @@ def main() -> None:
 
         # -- regression: a real provider's run_task() request must include
         # schemas for all four standard tools --
-        os.environ[API_KEY_ENV_VAR] = "sk-openai-fake-test-key-do-not-use"
         captured: dict = {}
 
         class _FakeHttpResponse:
@@ -169,6 +177,98 @@ def main() -> None:
             def __exit__(self, *exc: object) -> bool:
                 return False
 
+        def _headers(request) -> dict[str, str]:  # noqa: ANN001
+            return {name.lower(): value for name, value in request.header_items()}
+
+        # -- regression: model discovery uses each provider's listing
+        # endpoint, sends keys only as headers, and parses the documented ids.
+        openai_model_key = "sk-openai-model-list-key-do-not-use"
+        os.environ[API_KEY_ENV_VAR] = openai_model_key
+
+        def _fake_openai_models_urlopen(request, timeout=None):  # noqa: ANN001
+            if request.get_method() != "GET":
+                fail(f"expected OpenAI model listing to use GET, got {request.get_method()!r}")
+            if request.full_url != "https://api.openai.com/v1/models":
+                fail(f"expected OpenAI model listing URL, got {request.full_url!r}")
+            if openai_model_key in request.full_url:
+                fail("OpenAI model listing key must never appear in the request URL")
+            headers = _headers(request)
+            if headers.get("authorization") != f"Bearer {openai_model_key}":
+                fail(f"expected OpenAI Authorization bearer header, got {request.header_items()!r}")
+            payload = {"data": [{"id": "gpt-list-a"}, {"id": "text-embedding-list-b"}]}
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_openai_models_urlopen):
+            openai_models = list_models(OpenAIProvider())
+        del os.environ[API_KEY_ENV_VAR]
+        if openai_models != ["gpt-list-a", "text-embedding-list-b"]:
+            fail(f"expected unfiltered OpenAI model ids, got {openai_models!r}")
+        ok("model_discovery lists OpenAI wire models unfiltered, key only in Authorization header")
+
+        anthropic_model_key = "anthropic-model-list-key-do-not-use"
+        os.environ[ANTHROPIC_API_KEY_ENV_VAR] = anthropic_model_key
+
+        def _fake_anthropic_models_urlopen(request, timeout=None):  # noqa: ANN001
+            if request.get_method() != "GET":
+                fail(f"expected Anthropic model listing to use GET, got {request.get_method()!r}")
+            if request.full_url != "https://api.anthropic.com/v1/models":
+                fail(f"expected Anthropic model listing URL, got {request.full_url!r}")
+            if anthropic_model_key in request.full_url:
+                fail("Anthropic model listing key must never appear in the request URL")
+            headers = _headers(request)
+            if headers.get("x-api-key") != anthropic_model_key:
+                fail(f"expected Anthropic x-api-key header, got {request.header_items()!r}")
+            if headers.get("anthropic-version") != ANTHROPIC_VERSION:
+                fail(f"expected Anthropic version header, got {request.header_items()!r}")
+            payload = {"data": [{"id": "claude-list-a"}, {"id": "claude-list-b"}]}
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_anthropic_models_urlopen):
+            anthropic_models = list_models(AnthropicProvider())
+        del os.environ[ANTHROPIC_API_KEY_ENV_VAR]
+        if anthropic_models != ["claude-list-a", "claude-list-b"]:
+            fail(f"expected unfiltered Anthropic model ids, got {anthropic_models!r}")
+        ok("model_discovery lists Anthropic models with x-api-key and anthropic-version headers")
+
+        gemini_model_key = "gemini-model-list-key-do-not-use"
+        os.environ[GEMINI_API_KEY_ENV_VAR] = gemini_model_key
+
+        def _fake_gemini_models_urlopen(request, timeout=None):  # noqa: ANN001
+            if request.get_method() != "GET":
+                fail(f"expected Gemini model listing to use GET, got {request.get_method()!r}")
+            expected_url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200"
+            if request.full_url != expected_url:
+                fail(f"expected Gemini model listing URL {expected_url!r}, got {request.full_url!r}")
+            if gemini_model_key in request.full_url:
+                fail("Gemini model listing key must never appear in the request URL")
+            headers = _headers(request)
+            if headers.get("x-goog-api-key") != gemini_model_key:
+                fail(f"expected Gemini x-goog-api-key header, got {request.header_items()!r}")
+            payload = {
+                "models": [
+                    {
+                        "name": "models/gemini-generate-a",
+                        "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    },
+                    {
+                        "name": "models/gemini-embed-b",
+                        "supportedGenerationMethods": ["embedContent"],
+                    },
+                    {
+                        "name": "gemini-generate-c",
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                ]
+            }
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_models_urlopen):
+            gemini_models = list_models(GeminiProvider())
+        del os.environ[GEMINI_API_KEY_ENV_VAR]
+        if gemini_models != ["gemini-generate-a", "gemini-generate-c"]:
+            fail(f"expected Gemini generateContent ids with models/ stripped, got {gemini_models!r}")
+        ok("model_discovery filters Gemini to generateContent models and strips models/ prefix")
+
         def _fake_urlopen(request, timeout=None):  # noqa: ANN001
             captured["body"] = json.loads(request.data.decode("utf-8"))
             payload = json.dumps(
@@ -179,6 +279,7 @@ def main() -> None:
             ).encode("utf-8")
             return _FakeHttpResponse(payload)
 
+        os.environ[API_KEY_ENV_VAR] = "sk-openai-fake-test-key-do-not-use"
         with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
             run_task(OpenAIProvider(), policy, "hello")
         del os.environ[API_KEY_ENV_VAR]
