@@ -36,7 +36,11 @@ from orchestra_api.providers.base import ModelProvider, ProviderError
 
 API_KEY_ENV_VAR = "GEMINI_API_KEY"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_MODEL = "gemini-2.0-flash"
+# A rolling alias, not a pinned version, and deliberately so: the previous
+# default (`gemini-2.0-flash`) was retired server-side and every call with it
+# began failing with HTTP 404. An alias cannot rot that way. Pin an explicit
+# version via `model=` when reproducibility matters more than staying current.
+DEFAULT_MODEL = "gemini-flash-latest"
 
 
 def _synthesize_tool_call_id(name: str, index: int) -> str:

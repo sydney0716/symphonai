@@ -42,10 +42,19 @@ ALL_PROVIDERS = list(NATIVE_PROVIDERS) + catalog_keys()
 DEFAULT_PROMPT = "Reply with exactly one word: pong"
 
 
-def _build(provider_name: str) -> ModelProvider:
+def _build(provider_name: str, model: str | None = None) -> ModelProvider:
+    """Build a provider, optionally overriding its default model.
+
+    A model is just a string passed through to the vendor -- no provider
+    branches on it, and every model within one vendor shares that vendor's
+    wire format. So overriding it here is always safe: `claude-sonnet-5`
+    and `claude-haiku-4-5-...` produce byte-identical request *shapes*,
+    differing only in the `model` field.
+    """
     if provider_name in NATIVE_PROVIDERS:
-        return NATIVE_PROVIDERS[provider_name]()
-    return build_catalog_provider(provider_name)
+        cls = NATIVE_PROVIDERS[provider_name]
+        return cls(model=model) if model else cls()
+    return build_catalog_provider(provider_name, model=model)
 
 
 def report_configuration() -> None:
@@ -65,8 +74,8 @@ def report_configuration() -> None:
     print(f"Pass --live --provider {{{','.join(ALL_PROVIDERS)}}} to make one real call.")
 
 
-def run_live(provider_name: str, prompt: str) -> int:
-    provider = _build(provider_name)
+def run_live(provider_name: str, prompt: str, model: str | None = None) -> int:
+    provider = _build(provider_name, model)
     if not provider.is_configured():
         print(f"FAIL: {provider_name} is not configured (its API key env var is not set)")
         return 1
@@ -106,6 +115,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_PROMPT,
         help="Prompt to send under --live (default: a short, cheap test prompt).",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Override the provider's default model (e.g. claude-sonnet-5, "
+            "gemini-3.7-flash). Any model offered by that provider works -- all "
+            "models within one provider share its wire format. Defaults are only "
+            "a starting point and can be retired by the vendor at any time."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.live:
@@ -116,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: --live requires --provider, one of: {', '.join(sorted(ALL_PROVIDERS))}")
         return 2
 
-    return run_live(args.provider, args.prompt)
+    return run_live(args.provider, args.prompt, args.model)
 
 
 if __name__ == "__main__":
