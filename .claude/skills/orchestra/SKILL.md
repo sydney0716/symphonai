@@ -1,6 +1,6 @@
 ---
 name: orchestra
-description: Use Claude as the main orchestrator for Orchestra-mode work. Direct Claude implementation is the default; dispatching an external subagent (Codex MCP, Gemini CLI, OpenCode CLI, or a future API-key worker) always requires asking the user first.
+description: Use Claude as the main orchestrator for Orchestra-mode work. Any subagent dispatch should be Codex MCP if possible; other workers (Gemini CLI, OpenCode CLI, a future API-key worker) are fallbacks only. Dispatching still requires asking the user first, every time.
 ---
 
 # Orchestra Skill
@@ -11,12 +11,21 @@ Use this skill when the user asks to run the Orchestra workflow, or invokes `/or
 
 You are the main orchestrator.
 
-Direct Claude implementation is the default execution mode for small and
-medium tasks. Being in Orchestra mode is not by itself a reason to reach
-for an external subagent — dispatching one (Codex MCP, Gemini CLI,
-OpenCode CLI, or a future API-key based worker; see `orchestra_api/`)
-always requires asking the user first and getting an explicit go-ahead
-for that specific task. There is no default delegation.
+Any subagent dispatch should be Codex MCP (`mcp__codex__codex` /
+`mcp__codex__codex-reply`) if possible. Gemini CLI, OpenCode CLI, and
+future API-key based workers (see `orchestra_api/`) are fallbacks only —
+reach for one of those solely when Codex genuinely cannot do the task
+(not installed/configured, or the user names a different tool
+explicitly), not as an equally-weighted alternative.
+
+For non-trivial work, propose dispatching each task to Codex rather than
+implementing it yourself. Small, well-scoped changes to one or two files
+can still be implemented directly — that doesn't need the dispatch
+ceremony.
+
+Proposing Codex as the default answer does not remove the confirmation
+step: still ask the user and get an explicit go-ahead for that specific
+task before registering a worker or spawning anything.
 
 All task/worker/run state changes go through the Orchestra MCP tools
 (`task_create`, `task_update`, `worker_register`, `worker_update`,
@@ -56,8 +65,8 @@ Avoid broad exploration.
   just do it and report what changed.
 - **Non-trivial work** (spans multiple files/modules, introduces a new
   abstraction, or requires a design judgment call): propose a task graph
-  and wait for the user's approval before creating any tasks or editing
-  files.
+  — with each task proposed as a Codex dispatch — and wait for the user's
+  approval before creating any tasks or editing files.
 
 ### 4. Create Task Graph (non-trivial work, after approval)
 
@@ -65,8 +74,8 @@ Propose tasks with:
 
 - `id`;
 - `title`;
-- `worker` (use `"claude"` for direct implementation, or the worker's
-  provider name once a dispatch is approved);
+- `worker` (use `"codex"` for the default dispatch path, or `"claude"`
+  for a small change implemented directly);
 - `depends_on`;
 - `scope`;
 - `acceptance_criteria`;
@@ -87,10 +96,13 @@ Use this task status set only:
 - FAILED
 - CANCELLED
 
-### 5. Direct Implementation (the default path)
+### 5. Direct Implementation (small, one-or-two-file changes only)
 
-For each task (or for the whole small change, if step 3 skipped the task
-graph):
+This path is the exception, not the default — use it only for the small,
+well-scoped changes identified in step 3. Non-trivial work goes to Codex
+via step 6.
+
+For the small change (or for a task, if one was recorded):
 
 1. Mark it `RUNNING` via `task_update` (skip if no task record exists for
    a small change).
@@ -105,7 +117,11 @@ No worker entry in `workers[]` and no worktree are needed for this path —
 worktree is for isolating a dispatched worker's edits, not solo direct
 work.
 
-### 6. Dispatching a Worker (only after explicit approval)
+### 6. Dispatch to Codex (the default path for non-trivial work)
+
+This is the normal procedure for non-trivial work, not a fallback.
+Dispatch to Codex MCP unless Codex genuinely cannot do the task, or the
+user named a different tool.
 
 Before doing any of this, ask the user and get explicit approval to
 dispatch a worker for this specific task. Do not treat a prior approval
@@ -134,8 +150,8 @@ task first.
 
 #### Dispatch the Worker
 
-Use the approved subagent's tool (e.g. the Codex MCP `codex` tool) for
-the new worker.
+Use the Codex MCP `codex` tool for the new worker (or the approved
+fallback tool, if the user named one).
 
 Each worker prompt must include:
 
