@@ -210,6 +210,80 @@ def worker_register(state: dict, worker: dict) -> dict:
     return record
 
 
+def worker_delete(state: dict, worker_id: str, *, force: bool = False) -> dict:
+    """Remove a workers[] entry by id and return the removed record.
+
+    Exists so stale worker records can be retired through the tools rather
+    than by hand-editing the state file. Deliberately id-based and one at a
+    time: there is no bulk or predicate delete, since losing worker records
+    silently would make orchestration history untrustworthy.
+
+    Refuses by default when a task still points at this worker's thread,
+    because deleting it would leave that task's `thread_id` dangling and
+    make `state_validate` fail -- the tool must not be able to write state
+    it knows is invalid. Clear the task's `thread_id` first, or pass
+    `force=True` to accept the inconsistency deliberately.
+    """
+    workers = state.get("workers", [])
+    if not isinstance(workers, list):
+        raise StateError("'workers' is not a list; refusing to delete from malformed state")
+    idx = _find_index(workers, "id", worker_id)
+    if idx is None:
+        raise StateError(f"worker {worker_id!r} does not exist; nothing to delete")
+
+    record = workers[idx]
+    task_id = record.get("task_id")
+    if not force and task_id:
+        others = [
+            w
+            for i, w in enumerate(workers)
+            if i != idx and isinstance(w, dict) and w.get("task_id") == task_id
+        ]
+        if not others:
+            for task in state.get("tasks", []):
+                if isinstance(task, dict) and task.get("id") == task_id and task.get("thread_id"):
+                    raise StateError(
+                        f"worker {worker_id!r} is the only worker for task {task_id!r}, "
+                        f"which still has a thread_id; deleting it would leave that "
+                        f"reference dangling. Clear the task's thread_id first, or pass "
+                        f"force=True."
+                    )
+    return workers.pop(idx)
+
+
+def worker_delete_malformed(state: dict) -> list[dict]:
+    """Remove workers[] entries that lack the required fields, returning them.
+
+    Legacy records predating the canonical worker schema (for example ones
+    keyed on 'worker' instead of 'id') cannot be addressed by
+    `worker_delete`, which needs an id. This is the one escape hatch for
+    them, and it only ever removes records that are already invalid -- a
+    well-formed record is never touched.
+    """
+    workers = state.get("workers", [])
+    # Fail closed on structural invalidity. If `workers` were a mapping we
+    # would otherwise iterate its KEYS, judge each string "malformed",
+    # report them as removed, and replace the whole mapping with [] --
+    # silently destroying every record. Refusing is always recoverable;
+    # deleting is not.
+    if not isinstance(workers, list):
+        raise StateError(
+            f"'workers' must be a list to prune malformed records, got {type(workers).__name__}"
+        )
+    if not all(isinstance(w, dict) for w in workers):
+        raise StateError("'workers' contains non-dict entries; refusing to prune malformed records")
+
+    removed: list[dict] = []
+    kept: list[dict] = []
+    for worker in workers:
+        if all(field in worker for field in schema.REQUIRED_WORKER_FIELDS):
+            kept.append(worker)
+        else:
+            removed.append(worker)
+    state["workers"] = kept
+    return removed
+
+
 def worker_update(state: dict, worker_id: str, updates: dict) -> dict:
     workers = state.get("workers", [])
     idx = _find_index(workers, "id", worker_id)
@@ -392,6 +466,21 @@ def state_validate(state: dict) -> dict:
         elif tid not in task_id_set:
             errors.append(f"worker {_worker_identity(w)!r} references unknown task_id {tid!r}")
     add_check("worker_task_id_references_existing_task", errors)
+
+    # 8. records conform to the canonical schema.
+    #
+    # schema.validate_task_record / validate_worker_record existed but were
+    # never called from anywhere, so a worker record missing its required
+    # 'id' and 'provider' could sit in state while state_validate still
+    # reported ok. The checks above are deliberately legacy-tolerant
+    # (_worker_identity falls back to task_id); this one is strict, so the
+    # two together distinguish "identifiable" from "actually conformant".
+    errors = []
+    for t in tasks:
+        errors.extend(schema.validate_task_record(t))
+    for w in workers:
+        errors.extend(schema.validate_worker_record(w))
+    add_check("records_match_canonical_schema", errors)
 
     overall_ok = all(c["ok"] for c in checks)
     return {"ok": overall_ok, "checks": checks}

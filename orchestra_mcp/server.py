@@ -119,6 +119,41 @@ def worker_register(
 
 
 @app.tool()
+def worker_delete(
+    id: str | None = None,
+    malformed: bool = False,
+    force: bool = False,
+    state_path: str | None = None,
+    repo_root: str | None = None,
+) -> dict:
+    """Remove workers[] entries so stale agents can be retired via the tools.
+
+    Pass `id` to delete one worker, or `malformed=True` to drop legacy
+    records that lack the required schema fields and so have no id to
+    address them by. The two are mutually exclusive -- passing both is an
+    error rather than a silent bulk delete.
+
+    Deleting a worker whose task still carries a `thread_id` is refused,
+    since it would leave that reference dangling; pass `force=True` to
+    accept that deliberately.
+    """
+    if malformed and id:
+        raise ValueError(
+            "worker_delete takes either 'id' or malformed=True, not both -- "
+            "passing both would silently ignore 'id' and bulk-delete instead"
+        )
+    data, path = _load(state_path, repo_root)
+    if malformed:
+        removed = state.worker_delete_malformed(data)
+    elif id:
+        removed = [state.worker_delete(data, id, force=force)]
+    else:
+        raise ValueError("worker_delete requires either 'id' or malformed=True")
+    state.atomic_write_state(path, data)
+    return {"removed": removed, "remaining": len(data.get("workers", []))}
+
+
+@app.tool()
 def worker_update(
     id: str,
     updates: dict,
