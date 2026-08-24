@@ -16,6 +16,7 @@ from __future__ import annotations
 import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Literal
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     ".env",
@@ -70,6 +71,21 @@ class PermissionDecision:
         return cls(allowed=False, reason=reason)
 
 
+PermissionMode = Literal["auto", "prompt"]
+
+
+@dataclass(frozen=True)
+class ToolApprovalRequest:
+    """A side-effectful tool action that needs an interactive decision."""
+
+    operation: str
+    target: str
+    details: str = ""
+
+
+ApprovalCallback = Callable[[ToolApprovalRequest], PermissionDecision | bool]
+
+
 @dataclass
 class PermissionPolicy:
     """Deny-by-default policy for filesystem and shell access.
@@ -79,6 +95,10 @@ class PermissionPolicy:
     empty by default so nothing is writable until explicitly configured.
     `shell_enabled` and `shell_allowlist` gate `run_shell`; a command must
     pass both, and `ALWAYS_DENY_COMMANDS` overrides either.
+
+    `mode="auto"` is the default and uses only the static deny-by-default
+    rules above. `mode="prompt"` keeps the root/forbidden/always-deny checks,
+    but asks `approval_callback` before allowing write_file or run_shell.
     """
 
     repo_root: Path
@@ -87,10 +107,14 @@ class PermissionPolicy:
     shell_enabled: bool = False
     shell_allowlist: list[tuple[str, ...]] = field(default_factory=list)
     shell_timeout_seconds: float = 10.0
+    mode: PermissionMode = "auto"
+    approval_callback: ApprovalCallback | None = None
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
         self.allowed_write_scope = [Path(p).resolve() for p in self.allowed_write_scope]
+        if self.mode not in ("auto", "prompt"):
+            raise ValueError(f"unknown permission mode {self.mode!r}; expected 'auto' or 'prompt'")
 
     # -- path checks ------------------------------------------------------
 
@@ -141,6 +165,12 @@ class PermissionPolicy:
             return read_decision
         resolved = self._resolve_within_root(path)
         assert resolved is not None  # check_read already validated this
+        if self.mode == "prompt":
+            return self._ask_approval(
+                operation="write_file",
+                target=str(path),
+                details=f"write inside repo root: {resolved}",
+            )
         for allowed_root in self.allowed_write_scope:
             if resolved == allowed_root or allowed_root in resolved.parents:
                 return PermissionDecision.allow()
@@ -159,6 +189,12 @@ class PermissionPolicy:
                 return PermissionDecision.deny(
                     f"command matches always-deny rule: {' '.join(denied_prefix)!r}"
                 )
+        if self.mode == "prompt":
+            return self._ask_approval(
+                operation="run_shell",
+                target=" ".join(argv),
+                details=f"run in repo root: {self.repo_root}",
+            )
         if not self.shell_enabled:
             return PermissionDecision.deny("run_shell is disabled by this policy")
         for allowed_prefix in self.shell_allowlist:
@@ -166,4 +202,33 @@ class PermissionPolicy:
                 return PermissionDecision.allow()
         return PermissionDecision.deny(
             f"command does not match the shell allowlist: {list(argv)}"
+        )
+
+    def _ask_approval(
+        self,
+        *,
+        operation: str,
+        target: str,
+        details: str = "",
+    ) -> PermissionDecision:
+        if self.approval_callback is None:
+            return PermissionDecision.deny(
+                f"{operation} requires approval, but no approval callback is configured"
+            )
+        try:
+            decision = self.approval_callback(
+                ToolApprovalRequest(operation=operation, target=target, details=details)
+            )
+        except Exception as exc:  # noqa: BLE001
+            return PermissionDecision.deny(
+                f"approval callback failed ({type(exc).__name__}): {exc}"
+            )
+        if isinstance(decision, PermissionDecision):
+            return decision
+        if decision is True:
+            return PermissionDecision.allow()
+        if decision is False:
+            return PermissionDecision.deny(f"{operation} denied by user")
+        return PermissionDecision.deny(
+            f"approval callback returned an invalid decision for {operation}"
         )

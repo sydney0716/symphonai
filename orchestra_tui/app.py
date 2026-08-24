@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import os
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.screen import Screen
+from textual.widgets import Button, Footer, Input, RichLog, Static
 
+from orchestra_api.compaction import ContextCompactionError, describe_compaction
 from orchestra_api.leader import Leader, LeaderConfig, LeaderRunResult
+from orchestra_api.permissions import PermissionDecision, PermissionMode, ToolApprovalRequest
 from orchestra_api.providers.base import ModelProvider, ProviderError
+from orchestra_tui.commands import (
+    ParsedSlashCommand,
+    help_text,
+    parse_slash_command,
+    unknown_command_text,
+)
 from orchestra_tui.picker import (
     ProviderConfirmationScreen,
     ProviderPickerResult,
@@ -25,6 +37,44 @@ STATUS_STYLES = {
     "done": "green",
     "failed": "bold red",
 }
+
+
+@dataclass(eq=False)
+class _PendingApproval:
+    request: ToolApprovalRequest
+    event: threading.Event
+    decision: PermissionDecision | None = None
+
+
+class ToolApprovalScreen(Screen[bool]):
+    """Approve or deny one side-effectful local tool call."""
+
+    BINDINGS = [("escape", "cancel", "Deny"), ("ctrl+c", "cancel", "Deny")]
+
+    def __init__(self, request: ToolApprovalRequest) -> None:
+        super().__init__()
+        self._request = request
+
+    def compose(self) -> ComposeResult:
+        yield Static("Tool approval", id="approval-title")
+        yield Static(f"Operation: {self._request.operation}", id="approval-operation")
+        yield Static(f"Target: {self._request.target}", id="approval-target")
+        yield Static(self._request.details, id="approval-details")
+        yield Button("Approve", id="approval-approve", variant="primary")
+        yield Button("Deny", id="approval-deny", variant="error")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#approval-deny", Button).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "approval-approve":
+            self.dismiss(True)
+        elif event.button.id == "approval-deny":
+            self.dismiss(False)
 
 
 class OrchestraTuiApp(App[None]):
@@ -63,12 +113,12 @@ class OrchestraTuiApp(App[None]):
         color: $text-muted;
     }
 
-    ProviderPickerScreen, ProviderConfirmationScreen {
+    ProviderPickerScreen, ProviderConfirmationScreen, ToolApprovalScreen {
         layout: vertical;
         padding: 1 2;
     }
 
-    #picker-title, #confirm-title {
+    #picker-title, #confirm-title, #approval-title {
         height: 1;
         content-align: center middle;
         text-style: bold;
@@ -76,7 +126,8 @@ class OrchestraTuiApp(App[None]):
     }
 
     #picker-help, #picker-error, #confirm-warning,
-    #confirm-leader, #confirm-subagent {
+    #confirm-leader, #confirm-subagent, #approval-operation,
+    #approval-target, #approval-details {
         height: auto;
         min-height: 1;
     }
@@ -101,7 +152,8 @@ class OrchestraTuiApp(App[None]):
         color: $text-muted;
     }
 
-    #start-chat, #quit-picker, #confirm-continue, #confirm-cancel {
+    #start-chat, #quit-picker, #confirm-continue, #confirm-cancel,
+    #approval-approve, #approval-deny {
         width: 100%;
         margin-top: 1;
     }
@@ -123,6 +175,9 @@ class OrchestraTuiApp(App[None]):
         max_subagents: int | None = None,
         subagent_max_turns: int | None = None,
         confirm_real_providers: bool = True,
+        permission_mode: PermissionMode | None = None,
+        chat_token_budget: int | None = None,
+        chat_recent_turns: int | None = None,
     ) -> None:
         super().__init__()
         self._repo_root = str(repo_root)
@@ -130,12 +185,17 @@ class OrchestraTuiApp(App[None]):
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
         self._confirm_real_providers = confirm_real_providers
+        self._permission_mode = self._resolve_permission_mode(permission_mode)
+        self._chat_token_budget = chat_token_budget
+        self._chat_recent_turns = chat_recent_turns
         self._confirmed_real_providers = False
         self._leader_provider: ModelProvider | None = None
         self._subagent_provider: ModelProvider | None = None
         self._leader: Leader | None = None
         self._turn_in_flight = False
         self._agent_status: dict[str, str] = {}
+        self._approval_lock = threading.Lock()
+        self._pending_approvals: list[_PendingApproval] = []
         self.chat_entries: list[tuple[str, str]] = []
         self.status_entries: list[tuple[str, str]] = []
         self.visible_status_text = "No agent activity yet."
@@ -174,6 +234,10 @@ class OrchestraTuiApp(App[None]):
         event.input.value = ""
         if not prompt:
             return
+        command = parse_slash_command(prompt)
+        if command is not None:
+            self._handle_slash_command(command)
+            return
         if self._leader is None:
             self._set_turn_status("Select providers first")
             return
@@ -196,12 +260,24 @@ class OrchestraTuiApp(App[None]):
         except RuntimeError:
             return
 
+    def _resolve_permission_mode(self, permission_mode: PermissionMode | None) -> PermissionMode:
+        raw_mode = permission_mode or os.environ.get("ORCHESTRA_TUI_PERMISSION_MODE", "auto")
+        mode = raw_mode.strip().lower()
+        if mode not in ("auto", "prompt"):
+            raise ValueError(
+                f"unknown permission mode {raw_mode!r}; expected 'auto' or 'prompt'"
+            )
+        return mode  # type: ignore[return-value]
+
     def _append_chat_line(self, label: str, message: str, style: str) -> None:
         self.chat_entries.append((label, message))
         line = Text()
         line.append(f"{label}> ", style=style)
         line.append(message)
         self.query_one("#chat-log", RichLog).write(line)
+
+    def _append_system_line(self, message: str) -> None:
+        self._append_chat_line("system", message, "dim")
 
     def _append_error_line(self, message: str) -> None:
         self.chat_entries.append(("error", message))
@@ -245,9 +321,59 @@ class OrchestraTuiApp(App[None]):
             config_kwargs["max_subagents"] = self._max_subagents
         if self._subagent_max_turns is not None:
             config_kwargs["subagent_max_turns"] = self._subagent_max_turns
+        config_kwargs["permission_mode"] = self._permission_mode
+        config_kwargs["approval_callback"] = self._approval_from_worker
+        if self._chat_token_budget is not None:
+            config_kwargs["chat_token_budget"] = self._chat_token_budget
+        if self._chat_recent_turns is not None:
+            config_kwargs["chat_recent_turns"] = self._chat_recent_turns
         self._leader_provider = leader_provider
         self._subagent_provider = subagent_provider
         self._leader = Leader(LeaderConfig(**config_kwargs))
+
+    def _handle_slash_command(self, command: ParsedSlashCommand) -> None:
+        if not command.known:
+            self._append_error_line(unknown_command_text(command))
+            return
+        if command.name == "help":
+            self._append_system_line(help_text())
+            return
+        if command.name == "model":
+            if self._turn_in_flight:
+                self._append_error_line("Cannot change models while the leader is working.")
+                return
+            self._confirmed_real_providers = False
+            self._set_waiting_for_setup("Select providers first")
+            self._open_picker()
+            return
+        if command.name == "clear":
+            self._clear_chat()
+            return
+        if command.name == "compact":
+            self._compact_chat()
+            return
+        if command.name == "exit":
+            self.action_quit()
+            return
+        self._append_error_line(unknown_command_text(command))
+
+    def _clear_chat(self) -> None:
+        self.chat_entries.clear()
+        self.query_one("#chat-log", RichLog).clear()
+        if self._leader is not None:
+            self._leader.clear_chat()
+        self._set_turn_status("Chat cleared")
+
+    def _compact_chat(self) -> None:
+        if self._leader is None:
+            self._append_error_line("Select providers before compacting the conversation.")
+            return
+        try:
+            result = self._leader.compact_chat()
+        except ContextCompactionError as exc:
+            self._append_error_line(f"Context compaction error: {exc}")
+            return
+        self._append_system_line(describe_compaction(result))
 
     def _open_picker(self) -> None:
         self.push_screen(ProviderPickerScreen(), self._picker_finished)
@@ -292,6 +418,78 @@ class OrchestraTuiApp(App[None]):
         self._confirmed_real_providers = True
         self._set_ready()
 
+    def _approval_from_worker(self, request: ToolApprovalRequest) -> PermissionDecision:
+        waiter = _PendingApproval(request=request, event=threading.Event())
+        with self._approval_lock:
+            self._pending_approvals.append(waiter)
+        try:
+            self.call_from_thread(self._open_tool_approval, waiter)
+        except RuntimeError:
+            self._resolve_approval(
+                waiter,
+                PermissionDecision.deny(
+                    f"{request.operation} approval cancelled because the TUI is not running"
+                ),
+            )
+        while not waiter.event.wait(0.1):
+            if not self.is_running:
+                self._resolve_approval(
+                    waiter,
+                    PermissionDecision.deny(
+                        f"{request.operation} approval cancelled because the TUI is shutting down"
+                    ),
+                )
+                break
+        if waiter.decision is None:
+            return PermissionDecision.deny(f"{request.operation} approval did not complete")
+        return waiter.decision
+
+    def _open_tool_approval(self, waiter: _PendingApproval) -> None:
+        if not self.is_running:
+            self._resolve_approval(
+                waiter,
+                PermissionDecision.deny(
+                    f"{waiter.request.operation} approval cancelled because the TUI is not running"
+                ),
+            )
+            return
+        self.push_screen(
+            ToolApprovalScreen(waiter.request),
+            lambda accepted: self._approval_finished(waiter, accepted),
+        )
+
+    def _approval_finished(self, waiter: _PendingApproval, accepted: bool | None) -> None:
+        if accepted:
+            decision = PermissionDecision.allow()
+        else:
+            decision = PermissionDecision.deny(f"{waiter.request.operation} denied by user")
+        self._resolve_approval(waiter, decision)
+
+    def _resolve_approval(self, waiter: _PendingApproval, decision: PermissionDecision) -> None:
+        with self._approval_lock:
+            if waiter.decision is not None:
+                return
+            waiter.decision = decision
+            if waiter in self._pending_approvals:
+                self._pending_approvals.remove(waiter)
+            waiter.event.set()
+
+    def _cancel_pending_approvals(self, reason: str) -> None:
+        with self._approval_lock:
+            pending = list(self._pending_approvals)
+        for waiter in pending:
+            self._resolve_approval(
+                waiter,
+                PermissionDecision.deny(f"{waiter.request.operation} approval cancelled: {reason}"),
+            )
+
+    def action_quit(self) -> None:
+        self._cancel_pending_approvals("application is quitting")
+        self.exit()
+
+    def on_unmount(self) -> None:
+        self._cancel_pending_approvals("application is shutting down")
+
     def _set_turn_status(self, message: str) -> None:
         self.query_one("#turn-status", Static).update(message)
 
@@ -332,6 +530,8 @@ class OrchestraTuiApp(App[None]):
             if self._leader is None:
                 raise ProviderError("leader is not configured")
             result = self._leader.chat(prompt)
+        except ContextCompactionError as exc:
+            self._call_ui_from_worker(self._finish_turn_error, f"Context compaction error: {exc}")
         except ProviderError as exc:
             self._call_ui_from_worker(self._finish_turn_error, f"Provider error: {exc}")
         except Exception as exc:  # noqa: BLE001
