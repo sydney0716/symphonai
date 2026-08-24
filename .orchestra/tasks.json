@@ -2329,7 +2329,29 @@
         "python3 scripts/smoke_api_agent.py"
       ],
       "provider": "codex",
-      "status": "CREATED"
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v10-picker-screen",
+      "branch": "orchestra/api-v10-picker-screen",
+      "validation_results": [
+        {
+          "command": ".venv/bin/python scripts/smoke_tui.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: 9 headless checks pass, up from 6. The three new ones cover picker selection handing provider/model pairs to the app, listing failures offering seeded manual entry while keeping the app usable, and the include_all toggle exposing unfiltered models. All six pre-existing shell checks still pass.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "LIVE: driving the picker screen against real provider APIs",
+          "status": "passed",
+          "summary": "Definitive verification by Claude with the user's real keys (Codex had none and was barred from network). Picker mounts as the first screen and offers openai/anthropic/gemini plus the eight catalog presets with 'fake' correctly absent. Selecting gemini live-listed 23 real filtered models in about 1.0s without freezing the UI, containing no tts/image/lyria/robotics entries. Toggling include_all reloaded live from 23 to 37 with the non-text models correctly reappearing, confirming it calls the shared list_models() rather than reimplementing filtering. Selecting the unconfigured 'grok' preset degraded gracefully to manual entry seeded with its catalog default 'grok-4.5', with the app still running and no API key displayed. Note for the record: an initial check of the include_all toggle appeared to return an empty list, but that was a race in Claude's own test harness observing the transient cleared state mid-reload, not a defect -- re-tested waiting for a settled list, it is correct.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_api_agent.py; python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: 17 and 11 checks respectively, zero regressions. Scope verified clean -- only the five allowed files changed, with orchestra_api and pyproject.toml untouched. Threading verified by inspection: list_models() runs under @work(thread=True, group=\"model-discovery\") with call_from_thread marshalling, and the implementation additionally guards against stale responses with a generation counter when the user switches providers mid-load.",
+          "executed_by": "claude"
+        }
+      ]
     },
     {
       "id": "api-v10-harness",
@@ -2428,6 +2450,14 @@
       "thread_id": "01a03271-dc2c-78e2-b344-a3798caac584",
       "status": "COMPLETE",
       "worktree": ".orchestra/worktrees/api-v10-tui-shell"
+    },
+    {
+      "id": "codex-api-v10-picker-screen",
+      "provider": "codex",
+      "task_id": "api-v10-picker-screen",
+      "thread_id": "01a03283-92a3-7100-ada9-7885e6aa1f40",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v10-picker-screen"
     }
   ],
   "runs": []
