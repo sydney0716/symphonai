@@ -22,7 +22,6 @@
         "git -C .orchestra/worktrees/smoke-1-docs diff --check",
         "git -C .orchestra/worktrees/smoke-1-docs status --porcelain"
       ],
-      "thread_id": "01a00fe8-1955-7d02-9da3-20de93e566d7",
       "followups": [
         {
           "id": "smoke-1-followup-1",
@@ -72,7 +71,6 @@
         "git add -N .orchestra/README.md": "failed inside Codex sandbox (index outside writable sandbox); re-run by orchestrator outside sandbox: passed",
         "git diff --check": "passed, no output"
       },
-      "thread_id": "01a0100d-accb-7712-b029-e9f9dde063e7",
       "followups": [
         {
           "id": "doc-1-followup-1",
@@ -182,7 +180,6 @@
         "git -C .orchestra/worktrees/parallel-1-task-state diff --check",
         "git -C .orchestra/worktrees/parallel-1-task-state status --porcelain --untracked-files=all"
       ],
-      "thread_id": "01a01356-b83e-7390-af47-7b3eaf9a07a7",
       "validation_results": [
         {
           "command": "test -s .orchestra/worktrees/parallel-1-task-state/docs/orchestra-task-state.md",
@@ -293,7 +290,6 @@
         "git -C .orchestra/worktrees/parallel-2-worktrees diff --check",
         "git -C .orchestra/worktrees/parallel-2-worktrees status --porcelain --untracked-files=all"
       ],
-      "thread_id": "01a0135a-1eff-76c3-9d6b-09dc21719566",
       "validation_results": [
         {
           "command": "test -s .orchestra/worktrees/parallel-2-worktrees/docs/orchestra-worktrees.md",
@@ -2432,88 +2428,58 @@
       ],
       "provider": "codex",
       "status": "CREATED"
+    },
+    {
+      "id": "role-agents",
+      "title": "Standing role agents (backend, frontend, researcher, reviewer)",
+      "worker": "claude",
+      "depends_on": [],
+      "scope": [
+        ".orchestra/tasks.json"
+      ],
+      "acceptance_criteria": [
+        "Anchor task holding the four persistent Codex role agents so their thread_ids survive across sessions. Each role is reused via mcp__codex__codex-reply with its stored thread_id rather than re-spawned with a fresh mcp__codex__codex call.",
+        "backend owns orchestra_api/**, scripts/smoke_api_agent.py, scripts/smoke_leader.py, scripts/live_test_provider.py, scripts/chat.py, docs/orchestra-api-runtime.md",
+        "frontend owns orchestra_tui/**, scripts/tui.py, scripts/smoke_tui.py, docs/orchestra-tui.md",
+        "researcher is read-only with no worktree; studies the reference checkouts under /Users/hoyoungchung/Coding/ref and reports mechanisms in its own words",
+        "reviewer is read-only with no worktree; reviews diffs cold, deliberately without the task brief, so it is not anchored on what was asked for",
+        "All four run on gpt-5.6-sol at high reasoning effort; the model must be passed explicitly on every call since the Codex config default is otherwise inherited"
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_orchestra_mcp.py"
+      ],
+      "provider": "claude",
+      "status": "COMPLETE"
     }
   ],
   "workers": [
     {
-      "task_id": "smoke-1",
-      "worker": "codex",
-      "thread_id": "01a00fe8-1955-7d02-9da3-20de93e566d7",
-      "worktree": ".orchestra/worktrees/smoke-1-docs",
-      "branch": "orchestra/smoke-1-docs",
-      "status": "COMPLETE"
-    },
-    {
-      "task_id": "doc-1",
-      "worker": "codex",
-      "thread_id": "01a0100d-accb-7712-b029-e9f9dde063e7",
-      "worktree": ".orchestra/worktrees/doc-1-readme",
-      "branch": "orchestra/doc-1-readme",
-      "status": "COMPLETE"
-    },
-    {
-      "task_id": "parallel-1",
-      "worker": "codex",
-      "thread_id": "01a01356-b83e-7390-af47-7b3eaf9a07a7",
-      "worktree": ".orchestra/worktrees/parallel-1-task-state",
-      "branch": "orchestra/parallel-1-task-state",
-      "status": "COMPLETE"
-    },
-    {
-      "task_id": "parallel-2",
-      "worker": "codex",
-      "thread_id": "01a0135a-1eff-76c3-9d6b-09dc21719566",
-      "worktree": ".orchestra/worktrees/parallel-2-worktrees",
-      "branch": "orchestra/parallel-2-worktrees",
-      "status": "COMPLETE"
-    },
-    {
-      "id": "codex-api-v7-wire-format",
+      "id": "codex-backend",
       "provider": "codex",
-      "task_id": "api-v7-wire-format",
-      "thread_id": "01a017cf-387c-72b3-9f69-32750ab243e2",
-      "status": "COMPLETE",
-      "worktree": ".orchestra/worktrees/api-v7-wire-format-fix"
+      "task_id": "role-agents",
+      "thread_id": "01a032b9-580f-7a82-a89c-37cd4cc853a8",
+      "status": "READY"
     },
     {
-      "id": "codex-api-v8-thought-signature",
+      "id": "codex-frontend",
       "provider": "codex",
-      "task_id": "api-v8-gemini-thought-signature",
-      "thread_id": "01a0182d-72f9-7140-a83d-79e3fa5b6e0d",
-      "status": "COMPLETE",
-      "worktree": ".orchestra/worktrees/api-v8-thought-signature"
+      "task_id": "role-agents",
+      "thread_id": "01a032bc-8067-7fa1-a7f4-bd652b508a7f",
+      "status": "READY"
     },
     {
-      "id": "codex-api-v9-model-picker",
+      "id": "codex-researcher",
       "provider": "codex",
-      "task_id": "api-v9-model-picker",
-      "thread_id": "01a018fc-8df4-7142-8b9a-e9432d992c9e",
-      "status": "COMPLETE",
-      "worktree": ".orchestra/worktrees/api-v9-model-picker"
+      "task_id": "role-agents",
+      "thread_id": "01a032bf-9aab-7a31-89af-b488f7143111",
+      "status": "READY"
     },
     {
-      "id": "codex-api-v10-tui-shell",
+      "id": "codex-reviewer",
       "provider": "codex",
-      "task_id": "api-v10-tui-shell",
-      "thread_id": "01a03271-dc2c-78e2-b344-a3798caac584",
-      "status": "COMPLETE",
-      "worktree": ".orchestra/worktrees/api-v10-tui-shell"
-    },
-    {
-      "id": "codex-api-v10-picker-screen",
-      "provider": "codex",
-      "task_id": "api-v10-picker-screen",
-      "thread_id": "01a03283-92a3-7100-ada9-7885e6aa1f40",
-      "status": "COMPLETE",
-      "worktree": ".orchestra/worktrees/api-v10-picker-screen"
-    },
-    {
-      "id": "codex-api-v10-harness",
-      "provider": "codex",
-      "task_id": "api-v10-harness",
-      "thread_id": "01a0329c-0bcd-7941-9b1a-17664693d2ed",
-      "status": "COMPLETE",
-      "worktree": ".orchestra/worktrees/api-v10-harness"
+      "task_id": "role-agents",
+      "thread_id": "01a032c4-1558-7b22-80f4-8e144f4b807f",
+      "status": "READY"
     }
   ],
   "runs": []
