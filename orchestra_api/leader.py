@@ -22,9 +22,16 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
+from orchestra_api.compaction import (
+    DEFAULT_CONTEXT_TOKEN_BUDGET,
+    DEFAULT_RECENT_TURNS,
+    CompactionResult,
+    ContextCompactionError,
+    compact_messages_for_budget,
+)
 from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.models import Message, Role, ToolCall, ToolResult
-from orchestra_api.permissions import PermissionPolicy
+from orchestra_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.runner import standard_tool_registry
 from orchestra_api.tool_schema import tool_registry_schemas
@@ -235,6 +242,10 @@ class LeaderConfig:
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
     on_status: StatusCallback | None = None
+    permission_mode: PermissionMode = "auto"
+    approval_callback: ApprovalCallback | None = None
+    chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
+    chat_recent_turns: int = DEFAULT_RECENT_TURNS
 
 
 @dataclass
@@ -258,7 +269,11 @@ class Leader:
 
     def __init__(self, config: LeaderConfig) -> None:
         self._config = config
-        subagent_policy = PermissionPolicy(repo_root=config.repo_root)
+        subagent_policy = PermissionPolicy(
+            repo_root=config.repo_root,
+            mode=config.permission_mode,
+            approval_callback=config.approval_callback,
+        )
         self._dispatch_tool = DispatchSubagentTool(
             subagent_provider=config.subagent_provider,
             subagent_policy=subagent_policy,
@@ -266,7 +281,11 @@ class Leader:
             subagent_max_turns=config.subagent_max_turns,
             on_status=config.on_status,
         )
-        leader_policy = PermissionPolicy(repo_root=config.repo_root)
+        leader_policy = PermissionPolicy(
+            repo_root=config.repo_root,
+            mode=config.permission_mode,
+            approval_callback=config.approval_callback,
+        )
         self._agent = ApiAgent(
             provider=config.leader_provider,
             tools={DISPATCH_TOOL_NAME: self._dispatch_tool},
@@ -299,6 +318,22 @@ class Leader:
         messages.append(Message(role=Role.USER, content=goal))
         return self._run_messages(messages)
 
+    def clear_chat(self) -> None:
+        """Clear the persisted multi-turn chat state."""
+
+        self._chat_messages.clear()
+
+    def compact_chat(self) -> CompactionResult:
+        """Apply context compaction to the persisted multi-turn chat state."""
+
+        result = compact_messages_for_budget(
+            self._chat_messages,
+            budget=self._config.chat_token_budget,
+            recent_turns=self._config.chat_recent_turns,
+        )
+        self._chat_messages = result.messages
+        return result
+
     def chat(self, message: str) -> LeaderRunResult:
         """Continue an ongoing conversation with the leader.
 
@@ -308,6 +343,13 @@ class Leader:
         has full context of the conversation so far.
         """
         self._chat_messages.append(Message(role=Role.USER, content=message))
+        self.compact_chat()
         result = self._run_messages(self._chat_messages)
         self._chat_messages = result.leader_messages
+        try:
+            self.compact_chat()
+        except ContextCompactionError:
+            # The next user turn will fail before the provider call with the
+            # same actionable error. Keep the just-returned answer available.
+            self._chat_messages = result.leader_messages
         return result

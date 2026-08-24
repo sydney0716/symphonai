@@ -21,6 +21,9 @@ Verifies:
     thoughtSignature across a two-turn tool call loop (via mocked
     urllib.request.urlopen), because Gemini rejects the second stateless
     request when that signature is omitted
+  - context compaction stays pure and deterministic: under budget is
+    untouched, over budget preserves required context, and impossible
+    budgets fail clearly before any provider call
 
 No real network call is ever made in this script. FakeModelProvider is
 used for every check except the real-provider regression checks above,
@@ -39,6 +42,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from orchestra_api.compaction import ContextCompactionError, compact_messages_for_budget  # noqa: E402
 from orchestra_api.model_discovery import list_models  # noqa: E402
 from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
@@ -482,6 +486,61 @@ def main() -> None:
         if echoed_part.get("functionCall", {}).get("id") != "call_142486":
             fail(f"expected real Gemini functionCall id to round-trip, got {echoed_part!r}")
         ok("real Gemini two-turn tool loop echoes thoughtSignature on the second request")
+
+        # -- context compaction: under budget leaves messages untouched --
+        compact_under_messages = [
+            Message(role=Role.SYSTEM, content="stay concise"),
+            Message(role=Role.USER, content="first goal"),
+            Message(role=Role.ASSISTANT, content="short answer"),
+        ]
+        compact_under = compact_messages_for_budget(compact_under_messages, budget=1_000)
+        if compact_under.changed or compact_under.messages != compact_under_messages:
+            fail(f"under-budget compaction should leave messages untouched, got {compact_under}")
+        ok("context compaction leaves under-budget conversations untouched")
+
+        # -- context compaction: over budget drops old middle while staying coherent --
+        compact_over_messages = [
+            Message(role=Role.SYSTEM, content="system prompt must stay"),
+            Message(role=Role.USER, content="earliest user goal must stay"),
+            Message(role=Role.ASSISTANT, content="old assistant detail " * 120),
+            Message(role=Role.USER, content="old follow-up " * 120),
+            Message(role=Role.ASSISTANT, content="old tool analysis " * 120),
+            Message(role=Role.USER, content="latest user request must stay"),
+        ]
+        compact_over = compact_messages_for_budget(
+            compact_over_messages,
+            budget=140,
+            recent_turns=1,
+        )
+        compacted_contents = [message.content for message in compact_over.messages]
+        if not compact_over.changed or compact_over.dropped_messages < 1:
+            fail(f"expected over-budget conversation to compact, got {compact_over}")
+        if compact_over.after_tokens > compact_over.budget:
+            fail(f"compacted conversation still exceeds budget: {compact_over}")
+        if "system prompt must stay" not in compacted_contents:
+            fail("compaction did not preserve the system prompt")
+        if "earliest user goal must stay" not in compacted_contents:
+            fail("compaction did not preserve the earliest user goal")
+        if "latest user request must stay" not in compacted_contents:
+            fail("compaction did not preserve the latest user turn")
+        if not any("Earlier conversation compacted" in content for content in compacted_contents):
+            fail(f"compaction did not insert a useful summary: {compacted_contents!r}")
+        ok("context compaction preserves system, earliest goal, and recent turns under budget")
+
+        # -- context compaction: impossible budget raises a clear local error --
+        impossible_messages = [
+            Message(role=Role.SYSTEM, content="system prompt"),
+            Message(role=Role.USER, content="x" * 4_000),
+        ]
+        try:
+            compact_messages_for_budget(impossible_messages, budget=100, recent_turns=1)
+        except ContextCompactionError as exc:
+            message = str(exc)
+            if "Increase the budget" not in message or "recent_turns" not in message:
+                fail(f"compaction error was not actionable: {message!r}")
+        else:
+            fail("expected impossible compaction to raise ContextCompactionError")
+        ok("context compaction raises a clear error when preserved context cannot fit")
 
         print("\nAll smoke checks passed.")
 
