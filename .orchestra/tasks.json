@@ -2244,6 +2244,124 @@
           "executed_by": "claude"
         }
       ]
+    },
+    {
+      "id": "api-v10-tui-shell",
+      "title": "Textual TUI shell running the Leader in a background worker",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_tui/__init__.py",
+        "orchestra_tui/app.py",
+        "scripts/tui.py",
+        "scripts/smoke_tui.py",
+        "pyproject.toml",
+        "docs/orchestra-tui.md"
+      ],
+      "acceptance_criteria": [
+        "New package orchestra_tui/ containing a Textual App that provides: a scrollable chat log, a text input for the user's message, a subagent status panel, and a status/footer bar. Layout must be responsive and must not crash at small terminal sizes.",
+        "CRITICAL THREADING CONSTRAINT: Leader.run()/Leader.chat() are BLOCKING synchronous calls and Textual's event loop is async. The leader MUST run off the UI thread (Textual @work(thread=True) worker or equivalent). The UI must stay responsive and redraw while a turn is in flight. Never call Leader.chat() directly on the event loop.",
+        "Leader's existing on_status callback (agent_name, 'pending'|'working'|'done') is wired into the subagent panel so subagent activity appears live during a turn. Because on_status fires on the worker thread, updates MUST be marshalled back to the UI thread safely (app.call_from_thread or post_message) -- never mutate widgets directly from the worker.",
+        "A ProviderError or any unexpected exception raised inside the worker is caught and rendered as a visible error line in the chat log. The app must NOT crash, hang, or leave the input disabled -- the user can type again after a failed turn.",
+        "The input is disabled (or visibly busy) while a turn is in flight and re-enabled afterwards, so a second turn cannot be submitted concurrently into the same Leader.",
+        "pyproject.toml gains textual as an OPTIONAL extra, e.g. [project.optional-dependencies] tui = [\"textual>=8,<9\"], installable via pip install -e \".[tui]\". The core runtime's existing dependency list (only mcp) must NOT gain textual -- orchestra_api must keep importing with textual absent.",
+        "orchestra_api must not import orchestra_tui anywhere; the dependency direction is one-way (TUI depends on runtime, never the reverse).",
+        "scripts/tui.py is a thin launcher that constructs the Leader and runs the app. It must print a clear, actionable message rather than a traceback if textual is not installed.",
+        "For this task the provider/model selection may be minimal (accept them from CLI args or environment, or use provider defaults) -- the full picker screen is a separate follow-up task and must NOT be built here.",
+        "NEW scripts/smoke_tui.py exercises the app HEADLESSLY via Textual's App.run_test() with a FakeModelProvider leader and subagent -- no real network. It must assert at minimum: the app mounts, submitting a message produces an assistant reply in the chat log, on_status events reach the subagent panel, and a provider error surfaces as a visible error line without crashing the app. It must exit non-zero on failure and be safe to run in CI (no TTY required).",
+        "docs/orchestra-tui.md documents the architecture: the blocking-leader/async-UI threading model and why the worker is required, how on_status is marshalled, how to install the extra and launch it, and what is deliberately deferred to the follow-up tasks.",
+        "Existing suites still pass untouched: python3 scripts/smoke_api_agent.py and python3 scripts/smoke_leader.py. orchestra_api must still import cleanly in an environment without textual."
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.leader, orchestra_api.runner\"",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py",
+        ".venv/bin/python scripts/smoke_tui.py"
+      ],
+      "provider": "codex",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v10-tui-shell",
+      "branch": "orchestra/api-v10-tui-shell",
+      "validation_results": [
+        {
+          "command": ".venv/bin/python scripts/smoke_tui.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: 6 headless run_test() checks pass -- app mounts, submitting a message produces an assistant reply, on_status events reach the subagent panel, input re-enables after a successful turn, provider errors render visibly and leave the app usable, and the app mounts at a small terminal size. No TTY and no network required.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "LIVE: TUI driving a real Anthropic leader + subagent through run_test()",
+          "status": "passed",
+          "summary": "Definitive verification by Claude with the user's real keys (Codex had none and was barred from network). A real Anthropic leader dispatched a real Anthropic subagent named 'reader' which read a file and reported back, with the leader answering correctly. Critically this exercised the threading model against genuine multi-second HTTP latency: the turn was observed in-flight while the UI remained responsive (inflight_seen=True), the input was disabled during the turn and correctly re-enabled afterwards, and the full live on_status sequence arrived in the panel in order -- leader/working, reader/pending, reader/working, reader/done, leader/done -- proving worker-thread events marshal safely to the UI thread. A separate live attempt on Gemini hit a transient HTTP 503 and incidentally proved the error path: the failure rendered as a visible error line, the app did not crash, and the input was left usable.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "python3 scripts/smoke_api_agent.py; python3 scripts/smoke_leader.py; python3 -c \"import orchestra_api\"",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: both existing suites pass with zero regressions. Dependency isolation verified concretely -- pyproject's core dependencies list still contains only mcp, textual is confined to the new [project.optional-dependencies] tui extra, orchestra_api imports cleanly under the textual-less system python3, grep confirms orchestra_api never imports orchestra_tui, and scripts/tui.py under textual-less python3 prints an actionable install message rather than a traceback.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v10-picker-screen",
+      "title": "Provider/model selection as a Textual screen",
+      "worker": "codex",
+      "depends_on": [
+        "api-v10-tui-shell"
+      ],
+      "scope": [
+        "orchestra_tui/picker.py",
+        "orchestra_tui/app.py",
+        "scripts/smoke_tui.py",
+        "docs/orchestra-tui.md"
+      ],
+      "acceptance_criteria": [
+        "A Textual screen selects leader provider+model and subagent provider+model before the chat starts, replacing the minimal arg/default selection from the shell task.",
+        "Reuses orchestra_api.model_discovery.list_models() including the text/coding filter, and offers a toggle for include_all=True rather than reimplementing any filtering.",
+        "Model listing happens OFF the UI thread -- it is a blocking HTTP call, same constraint as the leader.",
+        "Unconfigured providers and ProviderError during listing degrade gracefully to manual model entry with the provider's default; never crash or hang, never display the API key.",
+        "The fake provider is not offered, matching scripts/chat.py; a cost/network confirmation is shown before any real provider is used.",
+        "Headless run_test() coverage in scripts/smoke_tui.py for selection and for the listing-failure fallback, with no real network."
+      ],
+      "validation_commands": [
+        ".venv/bin/python scripts/smoke_tui.py",
+        "python3 scripts/smoke_api_agent.py"
+      ],
+      "provider": "codex",
+      "status": "CREATED"
+    },
+    {
+      "id": "api-v10-harness",
+      "title": "Slash commands, permission modes, and context compaction",
+      "worker": "codex",
+      "depends_on": [
+        "api-v10-tui-shell"
+      ],
+      "scope": [
+        "orchestra_tui/commands.py",
+        "orchestra_tui/app.py",
+        "orchestra_api/compaction.py",
+        "orchestra_api/permissions.py",
+        "scripts/smoke_tui.py",
+        "scripts/smoke_api_agent.py",
+        "docs/orchestra-tui.md"
+      ],
+      "acceptance_criteria": [
+        "Slash commands in the TUI input: /help, /model, /clear, /compact, /exit. Unknown commands produce a helpful message, not an error.",
+        "Permission modes re-implemented from the architecture concept (NOT copied from any source): at minimum an auto mode using the existing deny-by-default PermissionPolicy, and a prompt mode that surfaces a tool-approval dialog in the TUI before a side-effectful tool runs.",
+        "Context compaction: Leader.chat() currently grows its message list without bound. Add a token-budget estimate before sending and either compact older turns or fail with a clear, actionable message rather than an opaque provider 400.",
+        "/compact triggers compaction manually and reports what was dropped or summarized.",
+        "All new logic is re-implemented from architecture concepts only. Do NOT copy code or verbatim text from /Users/hoyoungchung/Coding/ref/Claude-code -- it is an unlicensed leaked proprietary snapshot. MIT-licensed langchain-ai/openwiki may be drawn from with attribution.",
+        "Headless run_test() coverage for each slash command and for the tool-approval dialog; mocked-HTTP coverage for compaction. No real network."
+      ],
+      "validation_commands": [
+        ".venv/bin/python scripts/smoke_tui.py",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "codex",
+      "status": "CREATED"
     }
   ],
   "workers": [
@@ -2302,6 +2420,14 @@
       "thread_id": "01a018fc-8df4-7142-8b9a-e9432d992c9e",
       "status": "COMPLETE",
       "worktree": ".orchestra/worktrees/api-v9-model-picker"
+    },
+    {
+      "id": "codex-api-v10-tui-shell",
+      "provider": "codex",
+      "task_id": "api-v10-tui-shell",
+      "thread_id": "01a03271-dc2c-78e2-b344-a3798caac584",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v10-tui-shell"
     }
   ],
   "runs": []

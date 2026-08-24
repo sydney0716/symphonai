@@ -36,11 +36,18 @@ from orchestra_api.providers.base import ModelProvider, ProviderError
 
 API_KEY_ENV_VAR = "GEMINI_API_KEY"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-# A rolling alias, not a pinned version, and deliberately so: the previous
+# A rolling alias, not a pinned version, and deliberately so: an earlier
 # default (`gemini-2.0-flash`) was retired server-side and every call with it
 # began failing with HTTP 404. An alias cannot rot that way. Pin an explicit
 # version via `model=` when reproducibility matters more than staying current.
-DEFAULT_MODEL = "gemini-flash-latest"
+#
+# The *lite* alias specifically, because a default should be the cheapest
+# thing that actually works. Verified live that flash-lite still drives a
+# full multi-turn tool loop (list_files -> read_file -> answer), which is the
+# capability this runtime's subagents depend on -- a cheaper model would not
+# be worth much if it could not call tools. Step up to `gemini-flash-latest`
+# or a pro model via `model=` when a task needs more capability.
+DEFAULT_MODEL = "gemini-flash-lite-latest"
 
 
 def _synthesize_tool_call_id(name: str, index: int) -> str:
