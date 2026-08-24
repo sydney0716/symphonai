@@ -363,8 +363,9 @@ class OrchestraTuiApp(App[None]):
         self.query_one("#chat-log", RichLog).clear()
         cleared_subagents = 0
         if self._leader is not None:
-            cleared_subagents = self._leader.clear_subagents()
-            self._leader.clear_chat()
+            # clear_chat() clears the pool too and reports the count, so
+            # calling clear_subagents() as well would clear it twice.
+            cleared_subagents = self._leader.clear_chat()
         noun = "subagent" if cleared_subagents == 1 else "subagents"
         message = f"Chat cleared; {cleared_subagents} {noun} cleared."
         self._append_system_line(message)

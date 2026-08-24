@@ -331,11 +331,16 @@ class Leader:
         messages.append(Message(role=Role.USER, content=goal))
         return self._run_messages(messages)
 
-    def clear_chat(self) -> None:
-        """Clear the persisted multi-turn chat state and subagent pool."""
+    def clear_chat(self) -> int:
+        """Clear the persisted chat state and subagent pool.
+
+        Returns how many subagents were cleared, so a caller that wants to
+        report it does not have to call `clear_subagents()` separately and
+        thereby clear the pool twice.
+        """
 
         self._chat_messages.clear()
-        self.clear_subagents()
+        return self.clear_subagents()
 
     def clear_subagents(self) -> int:
         """Clear all dispatched subagents and return how many were removed."""
