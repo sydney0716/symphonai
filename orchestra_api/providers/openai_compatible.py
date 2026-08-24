@@ -26,7 +26,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from orchestra_api.models import ModelRequest, ModelResponse
-from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
+from orchestra_api.providers.base import ModelProvider, ProviderError
 from orchestra_api.providers.openai_provider import _build_request_body, _parse_response
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
@@ -68,8 +68,7 @@ class OpenAICompatibleProvider(ModelProvider):
         if not api_key:
             raise ProviderError(f"{self.api_key_env_var} is not set")
 
-        model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model)
+        body = _build_request_body(request, self.model)
         http_request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(body).encode("utf-8"),
@@ -86,6 +85,6 @@ class OpenAICompatibleProvider(ModelProvider):
             api_key=api_key,
             operation=f"{self.provider_label} API",
         )
-        data = parse_json_object(raw, f"{self.provider_label} API")
+        data = json.loads(raw.decode("utf-8"))
 
         return _parse_response(data)

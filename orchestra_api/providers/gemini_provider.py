@@ -31,7 +31,7 @@ from typing import Any
 
 from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
-from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
+from orchestra_api.providers.base import ModelProvider, ProviderError
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
 API_KEY_ENV_VAR = "GEMINI_API_KEY"
@@ -236,10 +236,9 @@ class GeminiProvider(ModelProvider):
         if not api_key:
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
-        model = request.model if request.model is not None else self.model
         body = _build_request_body(request)
         http_request = urllib.request.Request(
-            f"{self.base_url}/models/{model}:generateContent",
+            f"{self.base_url}/models/{self.model}:generateContent",
             data=json.dumps(body).encode("utf-8"),
             method="POST",
             headers={
@@ -254,6 +253,6 @@ class GeminiProvider(ModelProvider):
             api_key=api_key,
             operation="Gemini API",
         )
-        data = parse_json_object(raw, "Gemini API")
+        data = json.loads(raw.decode("utf-8"))
 
         return _parse_response(data)
