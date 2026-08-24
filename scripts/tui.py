@@ -26,11 +26,10 @@ NATIVE_PROVIDERS = {
 OFFLINE_PROVIDER = "fake"
 
 
-def _default_provider(role: str) -> str:
+def _default_provider(role: str) -> str | None:
     return (
         os.environ.get(f"ORCHESTRA_TUI_{role.upper()}_PROVIDER")
         or os.environ.get("ORCHESTRA_TUI_PROVIDER")
-        or OFFLINE_PROVIDER
     )
 
 
@@ -49,6 +48,12 @@ def _build_provider(provider_name: str, model: str | None) -> ModelProvider:
         return build_catalog_provider(name, model=model)
     choices = [OFFLINE_PROVIDER, *NATIVE_PROVIDERS, *catalog_keys()]
     raise ValueError(f"unknown provider {provider_name!r}; choose one of: {', '.join(choices)}")
+
+
+def _is_fully_specified(provider_name: str | None, model: str | None) -> bool:
+    if not provider_name:
+        return False
+    return provider_name.strip().lower() == OFFLINE_PROVIDER or bool(model and model.strip())
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -78,22 +83,32 @@ def _load_app_class():
 
 def main() -> int:
     args = _parser().parse_args()
-    try:
-        leader_provider = _build_provider(args.leader_provider, args.leader_model)
-        subagent_provider = _build_provider(args.subagent_provider, args.subagent_model)
-    except ValueError as exc:
-        print(exc, file=sys.stderr)
-        return 2
-
     app_class = _load_app_class()
     if app_class is None:
         return 1
 
-    app = app_class(
-        leader_provider=leader_provider,
-        subagent_provider=subagent_provider,
-        repo_root=args.repo_root,
+    skip_picker = _is_fully_specified(args.leader_provider, args.leader_model) and _is_fully_specified(
+        args.subagent_provider,
+        args.subagent_model,
     )
+    if skip_picker:
+        try:
+            leader_provider = _build_provider(args.leader_provider, args.leader_model)
+            subagent_provider = _build_provider(args.subagent_provider, args.subagent_model)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        app = app_class(
+            leader_provider=leader_provider,
+            subagent_provider=subagent_provider,
+            repo_root=args.repo_root,
+            confirm_real_providers=True,
+        )
+    else:
+        app = app_class(
+            repo_root=args.repo_root,
+            confirm_real_providers=True,
+        )
     app.run()
     return 0
 
