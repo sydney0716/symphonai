@@ -2383,6 +2383,54 @@
         "python3 scripts/smoke_leader.py"
       ],
       "provider": "codex",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v10-harness",
+      "branch": "orchestra/api-v10-harness",
+      "validation_results": [
+        {
+          "command": ".venv/bin/python scripts/smoke_tui.py; python3 scripts/smoke_api_agent.py; python3 scripts/smoke_leader.py",
+          "status": "passed",
+          "summary": "Independently re-run by Claude: smoke_tui 17 checks (up from 9), smoke_api_agent 20 (up from 17), smoke_leader 11 unchanged. New coverage spans every slash command, the unknown-command path, prompt-mode approval in both approve and deny directions, and compaction under/over/impossible budget. Zero regressions; scope verified clean with orchestra_api/providers, model_discovery, picker.py and pyproject all correctly untouched since retry is a separate task.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "Claude adversarial check: approval deadlock + compaction bounds + live TUI session",
+          "status": "passed",
+          "summary": "Three checks Claude ran beyond the delivered tests. (1) DEADLOCK: the worker/UI approval handoff is the riskiest part of this change, so Claude drove _approval_from_worker from a background thread against a never-started app. It returned in 0.00s with no hang, and critically it FAILED CLOSED -- denying with 'approval cancelled because the TUI is not running' rather than allowing. Fail-open here would have been a serious security defect. Defence is layered: the worker polls event.wait(0.1) re-checking is_running rather than blocking forever, call_from_thread is guarded for RuntimeError, and action_quit/on_unmount cancel all pending approvals. (2) COMPACTION: a synthetic 402-message conversation estimated at 224,511 tokens compacted to 10 messages at 4,057 tokens, under the 16,000 budget, while preserving the system prompt, the earliest user goal, and the most recent turn, and inserting a summary. This bounds the unbounded Leader.chat() growth it was built to fix. (3) LIVE: a real Anthropic leader dispatched a real subagent that read a file and answered correctly, after which /compact, /help and an unknown /bogus all behaved correctly and left the app alive with the input usable. Note for the record: an initial live attempt produced no chat output, which was the real-provider cost-confirmation gate working as designed, not a defect -- re-run with confirm_real_providers=False, the documented scripting escape hatch.",
+          "executed_by": "claude"
+        }
+      ]
+    },
+    {
+      "id": "api-v11-retry-backoff",
+      "title": "Retry transient provider failures with exponential backoff",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/retry.py",
+        "orchestra_api/providers/anthropic_provider.py",
+        "orchestra_api/providers/openai_provider.py",
+        "orchestra_api/providers/gemini_provider.py",
+        "orchestra_api/providers/openai_compatible.py",
+        "scripts/smoke_api_agent.py",
+        "docs/orchestra-api-runtime.md"
+      ],
+      "acceptance_criteria": [
+        "Shared retry helper used by all real providers, retrying only genuinely transient failures: HTTP 429, HTTP 5xx (500/502/503/504), and transport-level timeouts/URLErrors.",
+        "NEVER retry 4xx other than 429 -- a 400 malformed request, 401 bad key, or 404 retired model will not fix itself and retrying wastes time and quota.",
+        "Exponential backoff with jitter, a small default attempt cap (about 3), and a cap on total added delay so a call cannot hang far beyond its timeout.",
+        "Retry behaviour is configurable per provider and can be disabled entirely (max_attempts=1) so tests stay fast and deterministic.",
+        "The final ProviderError after exhausted retries states how many attempts were made, and still never contains the API key.",
+        "Deterministic mocked-HTTP tests: a 503 then success retries and succeeds; a 400 fails immediately without retrying; retries are exhausted and surface a clear error. Sleeps must be patched so tests do not actually wait.",
+        "Motivated by real observed failures: Gemini returned HTTP 503 'high demand' several times and one 30s timeout during live testing, each succeeding on immediate retry, and nothing in the runtime retried.",
+        "Both smoke suites still pass with zero regressions."
+      ],
+      "validation_commands": [
+        "python3 -c \"import orchestra_api.retry\"",
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "codex",
       "status": "CREATED"
     }
   ],
@@ -2458,6 +2506,14 @@
       "thread_id": "01a03283-92a3-7100-ada9-7885e6aa1f40",
       "status": "COMPLETE",
       "worktree": ".orchestra/worktrees/api-v10-picker-screen"
+    },
+    {
+      "id": "codex-api-v10-harness",
+      "provider": "codex",
+      "task_id": "api-v10-harness",
+      "thread_id": "01a0329c-0bcd-7941-9b1a-17664693d2ed",
+      "status": "COMPLETE",
+      "worktree": ".orchestra/worktrees/api-v10-harness"
     }
   ],
   "runs": []

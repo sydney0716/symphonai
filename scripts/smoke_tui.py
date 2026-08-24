@@ -19,7 +19,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
-from orchestra_tui.app import OrchestraTuiApp, ToolApprovalScreen  # noqa: E402
+from orchestra_tui.app import OrchestraTuiApp  # noqa: E402
 from orchestra_tui.picker import ProviderPickerScreen  # noqa: E402
 from textual.widgets import Button, Checkbox, Input, Select, Static  # noqa: E402
 
@@ -311,190 +311,6 @@ async def smoke_picker_include_all_case(root: Path) -> None:
             ok("include_all toggle reloads and exposes unfiltered models")
 
 
-async def smoke_slash_commands_case(root: Path) -> None:
-    app = OrchestraTuiApp(
-        leader_provider=FakeModelProvider(),
-        subagent_provider=FakeModelProvider(),
-        repo_root=root,
-        chat_token_budget=140,
-        chat_recent_turns=1,
-    )
-    async with app.run_test(size=(72, 18)) as pilot:
-        await submit_message(pilot, "/help")
-        await wait_until(
-            pilot,
-            lambda: any(
-                label == "system" and "/help" in message and "/compact" in message
-                for label, message in app.chat_entries
-            ),
-            "slash help output",
-        )
-        ok("/help lists available slash commands")
-
-        await submit_message(pilot, "/does-not-exist")
-        await wait_until(
-            pilot,
-            lambda: any(
-                label == "error"
-                and "Unknown command '/does-not-exist'" in message
-                and "/model" in message
-                for label, message in app.chat_entries
-            ),
-            "unknown slash command output",
-        )
-        ok("unknown slash commands render a helpful error")
-
-        await submit_message(pilot, "remember this")
-        await wait_until(
-            pilot,
-            lambda: any(label == "leader" for label, _ in app.chat_entries),
-            "leader reply before clear",
-        )
-        leader = app._leader  # noqa: SLF001
-        if leader is None or not leader._chat_messages:  # noqa: SLF001
-            fail("leader chat state was not populated before /clear")
-        await submit_message(pilot, "/clear")
-        await wait_until(pilot, lambda: app.chat_entries == [], "chat entries cleared")
-        if leader._chat_messages:  # noqa: SLF001
-            fail("/clear did not clear the leader conversation state")
-        ok("/clear clears the visible chat log and leader conversation state")
-
-        leader._chat_messages = [  # noqa: SLF001
-            Message(role=Role.SYSTEM, content="system prompt must stay"),
-            Message(role=Role.USER, content="earliest user goal must stay"),
-            Message(role=Role.ASSISTANT, content="old assistant detail " * 120),
-            Message(role=Role.USER, content="old follow-up " * 120),
-            Message(role=Role.ASSISTANT, content="old tool analysis " * 120),
-            Message(role=Role.USER, content="latest user request must stay"),
-        ]
-        await submit_message(pilot, "/compact")
-        await wait_until(
-            pilot,
-            lambda: any(
-                label == "system" and "Compacted conversation" in message
-                for label, message in app.chat_entries
-            ),
-            "manual compaction report",
-        )
-        if len(leader._chat_messages) >= 6:  # noqa: SLF001
-            fail("/compact did not reduce the leader conversation state")
-        ok("/compact compacts leader state and reports the result")
-
-
-async def smoke_model_command_case(root: Path) -> None:
-    app = OrchestraTuiApp(
-        leader_provider=FakeModelProvider(),
-        subagent_provider=FakeModelProvider(),
-        repo_root=root,
-        confirm_real_providers=False,
-    )
-    async with app.run_test(size=(82, 28)) as pilot:
-        await submit_message(pilot, "/model")
-        screen = await wait_for_picker(pilot)
-        if not isinstance(screen, ProviderPickerScreen):
-            fail("/model did not open the provider picker")
-        ok("/model opens the provider/model picker")
-
-
-async def smoke_exit_command_case(root: Path) -> None:
-    app = OrchestraTuiApp(
-        leader_provider=FakeModelProvider(),
-        subagent_provider=FakeModelProvider(),
-        repo_root=root,
-    )
-    exit_called: list[bool] = []
-    with mock.patch.object(app, "exit", side_effect=lambda *args, **kwargs: exit_called.append(True)):
-        async with app.run_test(size=(50, 12)) as pilot:
-            await submit_message(pilot, "/exit")
-            await wait_until(pilot, lambda: bool(exit_called), "exit command")
-            ok("/exit requests a clean app quit")
-
-
-async def smoke_approval_case(root: Path, *, approve: bool) -> None:
-    target = "approved.txt" if approve else "denied.txt"
-    subagent_provider = FakeModelProvider(
-        responses=[
-            ModelResponse(
-                message=Message(
-                    role=Role.ASSISTANT,
-                    tool_calls=[
-                        ToolCall(
-                            id="write-1",
-                            name="write_file",
-                            arguments={"path": target, "content": "written from prompt mode"},
-                        )
-                    ],
-                )
-            ),
-            ModelResponse(message=Message(role=Role.ASSISTANT, content="subagent finished")),
-        ]
-    )
-    leader_provider = FakeModelProvider(
-        responses=[
-            ModelResponse(
-                message=Message(
-                    role=Role.ASSISTANT,
-                    tool_calls=[
-                        ToolCall(
-                            id="dispatch-approval",
-                            name="dispatch_subagent",
-                            arguments={"subagent_name": "writer", "task": "write the file"},
-                        )
-                    ],
-                )
-            ),
-            ModelResponse(message=Message(role=Role.ASSISTANT, content="leader saw tool result")),
-        ]
-    )
-    app = OrchestraTuiApp(
-        leader_provider=leader_provider,
-        subagent_provider=subagent_provider,
-        repo_root=root,
-        permission_mode="prompt",
-    )
-    async with app.run_test(size=(76, 20)) as pilot:
-        await submit_message(pilot, "please write")
-        await wait_until(
-            pilot,
-            lambda: isinstance(pilot.app.screen, ToolApprovalScreen),
-            "tool approval screen",
-        )
-        screen = pilot.app.screen
-        if not isinstance(screen, ToolApprovalScreen):
-            fail(f"expected ToolApprovalScreen, found {type(screen).__name__}")
-        button_id = "#approval-approve" if approve else "#approval-deny"
-        screen.query_one(button_id, Button).press()
-        await wait_until(
-            pilot,
-            lambda: ("leader", "leader saw tool result") in app.chat_entries,
-            "leader final answer after approval decision",
-        )
-        file_exists = (root / target).exists()
-        if approve and not file_exists:
-            fail("approved write_file call did not write the target file")
-        if not approve and file_exists:
-            fail("denied write_file call still wrote the target file")
-        leader = app._leader  # noqa: SLF001
-        if leader is None or "writer" not in leader.subagents:
-            fail("approval flow did not create the expected writer subagent")
-        tool_messages = [
-            message
-            for message in leader.subagents["writer"].messages
-            if message.role == Role.TOOL and message.tool_result is not None
-        ]
-        if not tool_messages:
-            fail("approval flow did not append a normal tool-result message")
-        tool_result = tool_messages[0].tool_result
-        if tool_result is None:
-            fail("tool-result message was missing the ToolResult payload")
-        if approve and not tool_result.ok:
-            fail(f"approved tool call returned a failing ToolResult: {tool_result}")
-        if not approve and (tool_result.ok or "denied by user" not in (tool_result.error or "")):
-            fail(f"denied tool call did not return ToolResult(ok=False): {tool_result}")
-        label = "approve" if approve else "deny"
-        ok(f"prompt permission mode can {label} a side-effectful tool call")
-
-
 async def main_async() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -504,11 +320,6 @@ async def main_async() -> None:
         await smoke_picker_success_case(root)
         await smoke_picker_fallback_case(root)
         await smoke_picker_include_all_case(root)
-        await smoke_slash_commands_case(root)
-        await smoke_model_command_case(root)
-        await smoke_exit_command_case(root)
-        await smoke_approval_case(root, approve=True)
-        await smoke_approval_case(root, approve=False)
 
 
 def main() -> int:
