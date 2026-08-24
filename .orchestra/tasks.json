@@ -2427,7 +2427,29 @@
         "python3 scripts/smoke_leader.py"
       ],
       "provider": "codex",
-      "status": "CREATED"
+      "status": "REVIEW",
+      "worktree": ".orchestra/worktrees/be",
+      "branch": "orchestra/be",
+      "validation_results": [
+        {
+          "command": "python3 scripts/smoke_api_agent.py; python3 scripts/smoke_leader.py; python3 -c \"import orchestra_api.retry\"",
+          "status": "passed",
+          "summary": "Independently re-run by Claude. Five new retry checks pass: 503-then-success retries, HTTP 400 fails after exactly one attempt, exhausted retries report the attempt count, numeric Retry-After is honoured, and API keys in vendor error bodies are redacted. The whole suite runs in 0.076s, which confirms sleep is genuinely patched rather than merely claimed. smoke_leader unchanged and green. Scope clean: retry.py plus the four providers, model_discovery, the smoke script and the doc -- nothing outside the brief.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "Claude adversarial teeth-check + live run against real Gemini and Anthropic",
+          "status": "passed",
+          "summary": "Claude broke each guard to confirm the tests can actually fail rather than trusting the report. Forcing every HTTP status to be retryable turned the suite red with 'HTTP 400 must make exactly one attempt, got 3'. Disabling redact_secret turned it red with the real key visible in the message, proving that check genuinely inspects the error text. Both restored and green. Delegation verified structurally: all four providers reference the shared retry boundary and model_discovery imports read_with_retry rather than keeping a private copy, so the key-redaction gap is closed in one place instead of four. Live run against real APIs succeeded on both -- gemini completed a multi-turn tool loop in 3.0s and anthropic in 2.1s, both answering correctly. Worth noting the live run did not itself trigger a retry, since Gemini happened not to throw a 503 this time; the retry paths are proven by the deterministic mocked tests rather than by this run.",
+          "executed_by": "claude"
+        },
+        {
+          "command": "Cold review by codex-reviewer, corrections by codex-backend, re-verified by Claude",
+          "status": "passed",
+          "summary": "The reviewer role justified itself on its second outing. Reading the diff cold, it found five defects the implementer, the supervisor, and a green test suite had all missed. Most serious: the vendor error body was truncated to 500 bytes BEFORE redaction, so an API key straddling that boundary left its prefix exposed -- and the existing redaction test could not catch it because it placed a short key early in a short body. Also found: the total time budget counted only sleeps, so defaults allowed roughly 106s despite a 30s timeout; retry classification was simultaneously too broad (permanent TLS failures, 501/505/511) and too narrow (IncompleteRead never retried); Retry-After handled only delta-seconds, so an RFC-legal HTTP-date fell back to a ~0.5s retry against an explicit instruction to wait; and no test raised TimeoutError or URLError despite a timeout succeeding on retry being the literal motivation for the work. Backend fixed all five on its own thread. Claude then re-verified rather than trusting the report: the suite grew from 25 to 35 checks, and reverting redact-then-truncate reproduces the leak exactly, failing with the key prefix 'BOUNDARY_S' visible in the message. Note one deliberate semantic change: timeout_seconds is now an overall deadline covering request time plus backoff, not a per-attempt timeout.",
+          "executed_by": "claude"
+        }
+      ]
     },
     {
       "id": "role-agents",
@@ -2456,9 +2478,10 @@
     {
       "id": "codex-backend",
       "provider": "codex",
-      "task_id": "role-agents",
-      "thread_id": "01a032b9-580f-7a82-a89c-37cd4cc853a8",
-      "status": "READY"
+      "task_id": "api-v11-retry-backoff",
+      "thread_id": "01a032d2-8059-7512-bc5e-4946a799aaec",
+      "status": "REVIEW",
+      "worktree": ".orchestra/worktrees/be"
     },
     {
       "id": "codex-frontend",
