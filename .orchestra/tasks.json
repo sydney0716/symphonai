@@ -2427,7 +2427,7 @@
         "python3 scripts/smoke_leader.py"
       ],
       "provider": "codex",
-      "status": "REVIEW",
+      "status": "COMPLETE",
       "worktree": ".orchestra/worktrees/be",
       "branch": "orchestra/be",
       "validation_results": [
@@ -2472,16 +2472,106 @@
       ],
       "provider": "claude",
       "status": "COMPLETE"
+    },
+    {
+      "id": "fix-agent-lifecycle-status",
+      "title": "Leader never reports failed/max_turns; status panel sticks on working",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/leader.py",
+        "orchestra_tui/app.py"
+      ],
+      "acceptance_criteria": [
+        "Backend: Leader._run_messages() emits a terminal 'failed' status on exception and distinguishes max_turns from a real completion, instead of always reporting 'done'.",
+        "Frontend: the subagent status panel renders those terminal states, so a failed turn no longer leaves the leader stuck displaying 'working'.",
+        "TWO HALVES OF ONE BUG, found independently by the backend and frontend role agents. The panel was never broken -- backend simply never emitted a terminal status for the failure case, so the UI had nothing to render. Needs both sides, and is the natural candidate for a parallel frontend/backend dispatch since the worktrees are disjoint."
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_leader.py",
+        ".venv/bin/python scripts/smoke_tui.py"
+      ],
+      "provider": "codex",
+      "status": "CREATED"
+    },
+    {
+      "id": "fix-subagent-pool-not-cleared",
+      "title": "Subagent pool is never cleared, so stale subagents resume across runs",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/leader.py",
+        "orchestra_tui/app.py"
+      ],
+      "acceptance_criteria": [
+        "Leader.run() documents one-shot subagent state but never clears the dispatch pool, so separate run() calls silently reuse stale subagent conversations and burn the cumulative max_subagents limit.",
+        "clear_chat() has the same gap, and the TUI's /clear clears the visible log and leader messages but not the pool -- so a later dispatch reusing an old subagent name silently resumes a conversation the user believes they cleared.",
+        "Backend clears the pool where the contract says state is one-shot and exposes a way for the UI to clear it; frontend wires /clear to that.",
+        "Found independently by both the backend and frontend role agents, which is strong corroboration."
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_leader.py",
+        ".venv/bin/python scripts/smoke_tui.py"
+      ],
+      "provider": "codex",
+      "status": "CREATED"
+    },
+    {
+      "id": "fix-backend-sharp-edges",
+      "title": "run_task(model=) silently ignored; invalid JSON escapes as JSONDecodeError",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_api/runner.py",
+        "orchestra_api/agent_loop.py",
+        "orchestra_api/providers/",
+        "scripts/smoke_api_agent.py"
+      ],
+      "acceptance_criteria": [
+        "run_task(model=...) reaches ModelRequest.model but every real provider ignores it and uses self.model instead, so the parameter is silently a no-op. Either honour it or remove it -- a parameter that looks like it works but does nothing is worse than no parameter.",
+        "A successful HTTP 200 carrying invalid or non-object JSON can escape as JSONDecodeError or AttributeError instead of the documented ProviderError, breaking the contract that every provider failure surfaces as ProviderError.",
+        "Both found by the backend role agent during domain orientation."
+      ],
+      "validation_commands": [
+        "python3 scripts/smoke_api_agent.py",
+        "python3 scripts/smoke_leader.py"
+      ],
+      "provider": "codex",
+      "status": "CREATED"
+    },
+    {
+      "id": "fix-tui-ux-gaps",
+      "title": "Cost confirmation fires after billing; /model cancel exits the app",
+      "worker": "codex",
+      "depends_on": [],
+      "scope": [
+        "orchestra_tui/app.py",
+        "orchestra_tui/picker.py",
+        "scripts/smoke_tui.py"
+      ],
+      "acceptance_criteria": [
+        "The real-provider cost confirmation is shown AFTER model discovery has already made a billable request to that provider, which defeats the point of asking first. Move the confirmation ahead of discovery.",
+        "Cancelling the picker or the confirmation reached via /model exits the whole application instead of returning to the existing chat session, so a misclick destroys the conversation.",
+        "/model opens a blank picker rather than preselecting the current providers and models.",
+        "Switching models keeps the old transcript and status panel visible, implying context the new Leader does not actually have.",
+        "The fixed-height status panel cannot display the leader plus the maximum five subagents.",
+        "All found by the frontend role agent during domain orientation."
+      ],
+      "validation_commands": [
+        ".venv/bin/python scripts/smoke_tui.py"
+      ],
+      "provider": "codex",
+      "status": "CREATED"
     }
   ],
   "workers": [
     {
       "id": "codex-backend",
       "provider": "codex",
-      "task_id": "api-v11-retry-backoff",
+      "task_id": "role-agents",
       "thread_id": "01a032d2-8059-7512-bc5e-4946a799aaec",
-      "status": "REVIEW",
-      "worktree": ".orchestra/worktrees/be"
+      "status": "READY",
+      "worktree": null
     },
     {
       "id": "codex-frontend",
