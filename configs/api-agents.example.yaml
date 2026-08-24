@@ -55,7 +55,7 @@ agents:
       restricted JSON Schema dialect, so its tool schemas are rewritten by
       orchestra_api/gemini_schema.py before being sent.
     # Pinned on purpose: the provider's own default is the rolling
-    # `gemini-flash-lite-latest` alias, but a config file is where you want an
+    # `gemini-flash-latest` alias, but a config file is where you want an
     # explicit, reproducible version. Verify it is still served before relying
     # on it -- Google retires models, and a retired one fails with HTTP 404.
     model: gemini-3.7-flash
