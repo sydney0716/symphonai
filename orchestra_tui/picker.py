@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -99,12 +100,30 @@ class ProviderPickerScreen(Screen[ProviderPickerResult | None]):
 
     BINDINGS = [("escape", "quit", "Quit")]
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        leader_provider: ModelProvider | None = None,
+        subagent_provider: ModelProvider | None = None,
+        confirm_real_providers: bool = False,
+        on_real_providers_confirmed: Callable[[], None] | None = None,
+        cancel_label: str = "Quit",
+    ) -> None:
         super().__init__()
         self._roles: dict[RoleName, _RoleState] = {
             "leader": _RoleState(),
             "subagent": _RoleState(),
         }
+        self._initial_providers = {
+            "leader": leader_provider,
+            "subagent": subagent_provider,
+        }
+        self._confirm_before_discovery = confirm_real_providers
+        self._discovery_confirmed = not confirm_real_providers
+        self._on_real_providers_confirmed = on_real_providers_confirmed
+        self._awaiting_confirmation = False
+        self._pending_provider_changes: dict[RoleName, str] = {}
+        self._cancel_label = cancel_label
 
     def compose(self) -> ComposeResult:
         yield Static("Orchestra provider setup", id="picker-title")
@@ -116,7 +135,7 @@ class ProviderPickerScreen(Screen[ProviderPickerResult | None]):
         yield from self._compose_role("subagent", "Subagent")
         yield Static("", id="picker-error")
         yield Button("Start chat", id="start-chat", variant="primary", disabled=True)
-        yield Button("Quit", id="quit-picker")
+        yield Button(self._cancel_label, id="quit-picker")
         yield Footer()
 
     def _compose_role(self, role: RoleName, label: str) -> ComposeResult:
@@ -147,6 +166,9 @@ class ProviderPickerScreen(Screen[ProviderPickerResult | None]):
         yield Static(f"Select a {label.lower()} provider.", id=f"{role}-model-status")
 
     def on_mount(self) -> None:
+        for role, provider in self._initial_providers.items():
+            if provider is not None and provider.name in PICKER_PROVIDER_CHOICES:
+                self.query_one(f"#{role}-provider", Select).value = provider.name
         self.query_one("#leader-provider", Select).focus()
 
     def action_quit(self) -> None:
@@ -208,7 +230,45 @@ class ProviderPickerScreen(Screen[ProviderPickerResult | None]):
     def _provider_changed(self, role: RoleName, provider_name: str) -> None:
         self._roles[role].provider_name = provider_name
         self.query_one(f"#{role}-include-all", Checkbox).disabled = False
+        if self._confirm_before_discovery and not self._discovery_confirmed:
+            self._pending_provider_changes[role] = provider_name
+            if not self._awaiting_confirmation:
+                self._open_discovery_confirmation(role, provider_name)
+            return
         self._start_model_load(role, provider_name)
+
+    def _open_discovery_confirmation(self, role: RoleName, provider_name: str) -> None:
+        try:
+            candidate = build_picker_provider(provider_name)
+        except ValueError as exc:
+            self._set_role_error(role, _one_line(exc))
+            return
+        providers = dict(self._initial_providers)
+        providers[role] = candidate
+        self._awaiting_confirmation = True
+        self.app.push_screen(
+            ProviderConfirmationScreen(
+                leader_provider=providers["leader"],
+                subagent_provider=providers["subagent"],
+                before_discovery=True,
+            ),
+            self._discovery_confirmation_finished,
+        )
+
+    def _discovery_confirmation_finished(self, accepted: bool | None) -> None:
+        self._awaiting_confirmation = False
+        if not accepted:
+            self.dismiss(None)
+            return
+        self._discovery_confirmed = True
+        if self._on_real_providers_confirmed is not None:
+            self._on_real_providers_confirmed()
+        pending = list(self._pending_provider_changes.items())
+        self._pending_provider_changes.clear()
+        for role, provider_name in pending:
+            selected = self.query_one(f"#{role}-provider", Select).value
+            if selected == provider_name:
+                self._start_model_load(role, provider_name)
 
     def _start_model_load(self, role: RoleName, provider_name: str) -> None:
         state = self._roles[role]
@@ -220,7 +280,13 @@ class ProviderPickerScreen(Screen[ProviderPickerResult | None]):
 
         state.provider_name = provider_name
         state.default_model = _default_model(provider)
-        state.selected_model = state.default_model
+        initial_provider = self._initial_providers[role]
+        initial_model = (
+            _default_model(initial_provider)
+            if initial_provider is not None and initial_provider.name == provider_name
+            else ""
+        )
+        state.selected_model = initial_model or state.default_model
         state.loading = True
         state.models = []
         state.include_all = self.query_one(f"#{role}-include-all", Checkbox).value
@@ -232,7 +298,7 @@ class ProviderPickerScreen(Screen[ProviderPickerResult | None]):
         model_select.disabled = True
         model_input = self.query_one(f"#{role}-manual-model", Input)
         model_input.disabled = False
-        model_input.value = state.default_model
+        model_input.value = state.selected_model
         filter_text = "all models" if state.include_all else "text/coding models"
         self._set_role_status(role, f"Loading {provider.name} {filter_text}...")
         self._set_picker_error("")
@@ -404,19 +470,37 @@ class ProviderConfirmationScreen(Screen[bool]):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, *, leader_provider: ModelProvider, subagent_provider: ModelProvider) -> None:
+    def __init__(
+        self,
+        *,
+        leader_provider: ModelProvider | None,
+        subagent_provider: ModelProvider | None,
+        before_discovery: bool = False,
+    ) -> None:
         super().__init__()
         self._leader_provider = leader_provider
         self._subagent_provider = subagent_provider
+        self._before_discovery = before_discovery
 
     def compose(self) -> ComposeResult:
         yield Static("Real provider confirmation", id="confirm-title")
         yield Static(
-            "WARNING: real providers can make network calls and consume API quota/credits.",
+            "WARNING: real providers can make network calls and consume API quota/credits."
+            + (
+                " Model discovery will make a provider request after you continue."
+                if self._before_discovery
+                else ""
+            ),
             id="confirm-warning",
         )
-        yield Static(f"Leader: {provider_summary(self._leader_provider)}", id="confirm-leader")
-        yield Static(f"Subagents: {provider_summary(self._subagent_provider)}", id="confirm-subagent")
+        leader_summary = (
+            provider_summary(self._leader_provider) if self._leader_provider else "Not selected"
+        )
+        subagent_summary = (
+            provider_summary(self._subagent_provider) if self._subagent_provider else "Not selected"
+        )
+        yield Static(f"Leader: {leader_summary}", id="confirm-leader")
+        yield Static(f"Subagents: {subagent_summary}", id="confirm-subagent")
         yield Button("Continue", id="confirm-continue", variant="warning")
         yield Button("Cancel", id="confirm-cancel")
         yield Footer()
