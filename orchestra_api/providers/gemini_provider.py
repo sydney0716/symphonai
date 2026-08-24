@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +32,7 @@ from typing import Any
 from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
 from orchestra_api.providers.base import ModelProvider, ProviderError
+from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
 API_KEY_ENV_VAR = "GEMINI_API_KEY"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -216,6 +216,7 @@ class GeminiProvider(ModelProvider):
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
     timeout_seconds: float = 30.0
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
     @property
     def name(self) -> str:
@@ -245,15 +246,13 @@ class GeminiProvider(ModelProvider):
                 "content-type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(http_request, timeout=self.timeout_seconds) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise ProviderError(f"Gemini API returned HTTP {exc.code}: {detail}") from None
-        except urllib.error.URLError as exc:
-            raise ProviderError(f"Gemini API request failed: {exc.reason}") from None
-        except TimeoutError:
-            raise ProviderError(f"Gemini API request timed out after {self.timeout_seconds}s") from None
+        raw = read_with_retry(
+            http_request,
+            timeout=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            api_key=api_key,
+            operation="Gemini API",
+        )
+        data = json.loads(raw.decode("utf-8"))
 
         return _parse_response(data)

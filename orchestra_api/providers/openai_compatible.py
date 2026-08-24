@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
 from orchestra_api.models import ModelRequest, ModelResponse
 from orchestra_api.providers.base import ModelProvider, ProviderError
 from orchestra_api.providers.openai_provider import _build_request_body, _parse_response
+from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
 DEFAULT_MODEL = "openai-compatible-placeholder"
 
@@ -49,6 +49,7 @@ class OpenAICompatibleProvider(ModelProvider):
     model: str = DEFAULT_MODEL
     provider_label: str = "openai-compatible"
     timeout_seconds: float = 30.0
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
     @property
     def name(self) -> str:
@@ -77,17 +78,13 @@ class OpenAICompatibleProvider(ModelProvider):
                 "content-type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(http_request, timeout=self.timeout_seconds) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise ProviderError(f"{self.provider_label} API returned HTTP {exc.code}: {detail}") from None
-        except urllib.error.URLError as exc:
-            raise ProviderError(f"{self.provider_label} API request failed: {exc.reason}") from None
-        except TimeoutError:
-            raise ProviderError(
-                f"{self.provider_label} API request timed out after {self.timeout_seconds}s"
-            ) from None
+        raw = read_with_retry(
+            http_request,
+            timeout=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            api_key=api_key,
+            operation=f"{self.provider_label} API",
+        )
+        data = json.loads(raw.decode("utf-8"))
 
         return _parse_response(data)

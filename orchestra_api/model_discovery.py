@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from datetime import date
 from typing import Any
@@ -22,6 +21,7 @@ from orchestra_api.providers.anthropic_provider import (
 from orchestra_api.providers.base import ModelProvider, ProviderError
 from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
 from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_API_KEY_ENV_VAR
+from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
 
 # Substrings marking a model as something other than a text-generating LLM.
@@ -207,17 +207,13 @@ def _get_json(
 ) -> dict[str, Any]:
     http_request = urllib.request.Request(url, method="GET", headers=headers)
     timeout = getattr(provider, "timeout_seconds", 30.0)
-    try:
-        with urllib.request.urlopen(http_request, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = _redact_key(exc.read().decode("utf-8", errors="replace")[:500], api_key)
-        raise ProviderError(f"{provider.name} model listing returned HTTP {exc.code}: {detail}") from None
-    except urllib.error.URLError as exc:
-        reason = _redact_key(str(exc.reason), api_key)
-        raise ProviderError(f"{provider.name} model listing request failed: {reason}") from None
-    except TimeoutError:
-        raise ProviderError(f"{provider.name} model listing timed out after {timeout}s") from None
+    raw = read_with_retry(
+        http_request,
+        timeout=timeout,
+        max_attempts=getattr(provider, "max_attempts", DEFAULT_MAX_ATTEMPTS),
+        api_key=api_key,
+        operation=f"{provider.name} model listing",
+    ).decode("utf-8")
 
     try:
         data = json.loads(raw)
@@ -226,9 +222,3 @@ def _get_json(
     if not isinstance(data, dict):
         raise ProviderError(f"{provider.name} model listing returned a non-object JSON response")
     return data
-
-
-def _redact_key(text: str, api_key: str) -> str:
-    if api_key:
-        return text.replace(api_key, "[redacted]")
-    return text
