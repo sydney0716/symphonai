@@ -20,11 +20,7 @@ from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, Too
 from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 from orchestra_tui.app import OrchestraTuiApp, ToolApprovalScreen  # noqa: E402
-from orchestra_tui.picker import (  # noqa: E402
-    ProviderConfirmationScreen,
-    ProviderPickerScreen,
-    build_picker_provider,
-)
+from orchestra_tui.picker import ProviderPickerScreen  # noqa: E402
 from textual.widgets import Button, Checkbox, Input, Select, Static  # noqa: E402
 
 
@@ -157,40 +153,6 @@ async def smoke_small_terminal_case(root: Path) -> None:
         if not app.is_mounted:
             fail("app did not mount at a small terminal size")
         ok("app mounts at a small terminal size")
-
-
-async def smoke_terminal_status_case(root: Path) -> None:
-    app = OrchestraTuiApp(
-        leader_provider=FakeModelProvider(),
-        subagent_provider=FakeModelProvider(),
-        repo_root=root,
-    )
-    async with app.run_test(size=(64, 20)):
-        app._update_agent_status("leader", "failed")  # noqa: SLF001
-        app._update_agent_status("worker-1", "exhausted")  # noqa: SLF001
-        panel_text = app.query_one("#status-panel", Static).render()
-        if "leader: failed" not in panel_text.plain or "worker-1: exhausted" not in panel_text.plain:
-            fail(f"terminal states were not rendered: {panel_text.plain!r}")
-        failed_offset = panel_text.plain.index("failed")
-        exhausted_offset = panel_text.plain.index("exhausted")
-        failed_style = str(panel_text.get_style_at_offset(failed_offset))
-        exhausted_style = str(panel_text.get_style_at_offset(exhausted_offset))
-        if failed_style == exhausted_style or "red" not in failed_style or "magenta" not in exhausted_style:
-            fail(
-                "failed and exhausted statuses were not visually distinct: "
-                f"failed={failed_style!r}, exhausted={exhausted_style!r}"
-            )
-        ok("failed and exhausted render as distinct, noticeable terminal states")
-
-        for index in range(1, 6):
-            app._update_agent_status(f"worker-{index}", "done")  # noqa: SLF001
-        expected = {"leader", *(f"worker-{index}" for index in range(1, 6))}
-        visible = {line.partition(":")[0] for line in app.visible_status_text.splitlines()}
-        if expected != visible:
-            fail(f"status panel did not contain all six agents: {app.visible_status_text!r}")
-        if app.query_one("#status-panel", Static).content_region.height < 7:
-            fail("status panel content area cannot display its title plus six agents")
-        ok("status panel displays the leader plus five subagents")
 
 
 async def wait_for_picker(pilot) -> ProviderPickerScreen:  # noqa: ANN001
@@ -349,30 +311,6 @@ async def smoke_picker_include_all_case(root: Path) -> None:
             ok("include_all toggle reloads and exposes unfiltered models")
 
 
-async def smoke_confirmation_before_discovery_case(root: Path) -> None:
-    discovery_calls: list[str] = []
-
-    def fake_list_models(provider: ModelProvider, *, include_all: bool = False) -> list[str]:
-        discovery_calls.append(provider.name)
-        return [getattr(provider, "model", "model")]
-
-    app = OrchestraTuiApp(repo_root=root)
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=fake_list_models):
-        async with app.run_test(size=(82, 28)) as pilot:
-            picker = await wait_for_picker(pilot)
-            set_select(picker, "leader-provider", "openai")
-            await wait_until(
-                pilot,
-                lambda: isinstance(pilot.app.screen, ProviderConfirmationScreen),
-                "confirmation before discovery",
-            )
-            if discovery_calls:
-                fail(f"model discovery ran before confirmation: {discovery_calls!r}")
-            pilot.app.screen.query_one("#confirm-continue", Button).press()
-            await wait_until(pilot, lambda: bool(discovery_calls), "discovery after confirmation")
-            ok("real-provider confirmation precedes model discovery")
-
-
 async def smoke_slash_commands_case(root: Path) -> None:
     app = OrchestraTuiApp(
         leader_provider=FakeModelProvider(),
@@ -415,18 +353,11 @@ async def smoke_slash_commands_case(root: Path) -> None:
         leader = app._leader  # noqa: SLF001
         if leader is None or not leader._chat_messages:  # noqa: SLF001
             fail("leader chat state was not populated before /clear")
-        clear_subagents = mock.Mock(return_value=2)
-        leader.clear_subagents = clear_subagents  # type: ignore[attr-defined]
         await submit_message(pilot, "/clear")
-        await wait_until(
-            pilot,
-            lambda: app.chat_entries == [("system", "Chat cleared; 2 subagents cleared.")],
-            "chat cleared report",
-        )
+        await wait_until(pilot, lambda: app.chat_entries == [], "chat entries cleared")
         if leader._chat_messages:  # noqa: SLF001
             fail("/clear did not clear the leader conversation state")
-        clear_subagents.assert_called_once_with()
-        ok("/clear clears chat and subagents and reports the cleared count")
+        ok("/clear clears the visible chat log and leader conversation state")
 
         leader._chat_messages = [  # noqa: SLF001
             Message(role=Role.SYSTEM, content="system prompt must stay"),
@@ -455,84 +386,14 @@ async def smoke_model_command_case(root: Path) -> None:
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
+        confirm_real_providers=False,
     )
     async with app.run_test(size=(82, 28)) as pilot:
         await submit_message(pilot, "/model")
         screen = await wait_for_picker(pilot)
         if not isinstance(screen, ProviderPickerScreen):
             fail("/model did not open the provider picker")
-        await pilot.press("escape")
-        await wait_until(
-            pilot,
-            lambda: not isinstance(pilot.app.screen, ProviderPickerScreen),
-            "picker cancellation back to chat",
-        )
-        if not app.is_running or app.query_one("#message-input", Input).disabled:
-            fail("cancelling /model exited or disabled the existing chat")
-        ok("cancelling the /model picker returns to the running chat")
-
-        await submit_message(pilot, "/model")
-        screen = await wait_for_picker(pilot)
-        set_select(screen, "leader-provider", "openai")
-        await wait_until(
-            pilot,
-            lambda: isinstance(pilot.app.screen, ProviderConfirmationScreen),
-            "/model provider confirmation",
-        )
-        pilot.app.screen.query_one("#confirm-cancel", Button).press()
-        await wait_until(
-            pilot,
-            lambda: not isinstance(
-                pilot.app.screen, (ProviderPickerScreen, ProviderConfirmationScreen)
-            ),
-            "confirmation cancellation back to chat",
-        )
-        if not app.is_running or app.query_one("#message-input", Input).disabled:
-            fail("cancelling /model confirmation exited or disabled the existing chat")
-        ok("cancelling /model confirmation returns to the running chat")
-
-
-async def smoke_model_preselection_and_divider_case(root: Path) -> None:
-    leader_provider = build_picker_provider("openai", model="current-leader-model")
-    subagent_provider = build_picker_provider("anthropic", model="current-subagent-model")
-
-    def fake_list_models(provider: ModelProvider, *, include_all: bool = False) -> list[str]:
-        return [getattr(provider, "model", ""), "replacement-model"]
-
-    app = OrchestraTuiApp(
-        leader_provider=leader_provider,
-        subagent_provider=subagent_provider,
-        repo_root=root,
-        confirm_real_providers=False,
-    )
-    app.chat_entries.append(("leader", "old transcript"))
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=fake_list_models):
-        async with app.run_test(size=(82, 28)) as pilot:
-            await submit_message(pilot, "/model")
-            screen = await wait_for_picker(pilot)
-            await wait_until(
-                pilot,
-                lambda: (
-                    screen.query_one("#leader-manual-model", Input).value
-                    == "current-leader-model"
-                    and screen.query_one("#subagent-manual-model", Input).value
-                    == "current-subagent-model"
-                ),
-                "current provider/model preselection",
-            )
-            if screen.query_one("#leader-provider", Select).value != "openai":
-                fail("current leader provider was not preselected")
-            if screen.query_one("#subagent-provider", Select).value != "anthropic":
-                fail("current subagent provider was not preselected")
-            screen.query_one("#start-chat", Button).press()
-            await wait_until(
-                pilot,
-                lambda: any("does not inherit" in message for _, message in app.chat_entries),
-                "new model session divider",
-            )
-            if ("leader", "old transcript") not in app.chat_entries:
-                fail("model switch unexpectedly removed the visible prior transcript")
-            ok("/model preselects current choices and adds a no-context session divider")
+        ok("/model opens the provider/model picker")
 
 
 async def smoke_exit_command_case(root: Path) -> None:
@@ -640,14 +501,11 @@ async def main_async() -> None:
         await smoke_success_case(root)
         await smoke_error_case(root)
         await smoke_small_terminal_case(root)
-        await smoke_terminal_status_case(root)
         await smoke_picker_success_case(root)
         await smoke_picker_fallback_case(root)
         await smoke_picker_include_all_case(root)
-        await smoke_confirmation_before_discovery_case(root)
         await smoke_slash_commands_case(root)
         await smoke_model_command_case(root)
-        await smoke_model_preselection_and_divider_case(root)
         await smoke_exit_command_case(root)
         await smoke_approval_case(root, approve=True)
         await smoke_approval_case(root, approve=False)

@@ -14,6 +14,8 @@ Verifies:
     includes schemas for all four standard tools in its outgoing request
     (via mocked urllib.request.urlopen) -- guards against ApiAgent/runner
     silently never telling a real model any tool exists
+  - request-level model overrides reach real-provider wire requests, and
+    malformed/non-object HTTP 200 JSON raises ProviderError
   - regression check: model discovery lists OpenAI, Anthropic, and Gemini
     models via mocked urllib.request.urlopen, with the correct listing URL,
     auth header, Anthropic version header, and Gemini generateContent filter
@@ -726,14 +728,72 @@ def main() -> None:
 
         os.environ[API_KEY_ENV_VAR] = "sk-openai-fake-test-key-do-not-use"
         with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
-            run_task(OpenAIProvider(), policy, "hello")
+            run_task(
+                OpenAIProvider(model="constructor-default-model"),
+                policy,
+                "hello",
+                model="request-override-model",
+            )
         del os.environ[API_KEY_ENV_VAR]
 
         sent_tool_names = {t["function"]["name"] for t in captured.get("body", {}).get("tools", [])}
         expected_tool_names = {"read_file", "write_file", "list_files", "run_shell"}
         if sent_tool_names != expected_tool_names:
             fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
+        if captured.get("body", {}).get("model") != "request-override-model":
+            fail(f"run_task(model=...) did not reach the wire: {captured.get('body')!r}")
         ok("real provider's run_task() request includes all four standard tool schemas")
+        ok("run_task(model=...) overrides the provider's default model on the wire")
+
+        # Anthropic and OpenAI-compatible providers use the same request-level
+        # override contract (Gemini is checked on its URL below).
+        anthropic_override_body: dict = {}
+
+        def _fake_anthropic_override_urlopen(request, timeout=None):  # noqa: ANN001
+            anthropic_override_body.update(json.loads(request.data.decode("utf-8")))
+            payload = {
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {},
+                "stop_reason": "end_turn",
+            }
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "anthropic-override-key"}):
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_anthropic_override_urlopen):
+                AnthropicProvider(model="anthropic-constructor-default").create_response(
+                    ModelRequest(
+                        messages=basic_request.messages,
+                        model="anthropic-wire-override",
+                    )
+                )
+        if anthropic_override_body.get("model") != "anthropic-wire-override":
+            fail(f"Anthropic request model override did not reach body: {anthropic_override_body!r}")
+
+        compatible_override_env = "ORCHESTRA_MODEL_OVERRIDE_TEST_KEY"
+        compatible_override_body: dict = {}
+
+        def _fake_compatible_override_urlopen(request, timeout=None):  # noqa: ANN001
+            compatible_override_body.update(json.loads(request.data.decode("utf-8")))
+            return _openai_success("ok")
+
+        with mock.patch.dict(os.environ, {compatible_override_env: "compatible-override-key"}):
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_compatible_override_urlopen):
+                OpenAICompatibleProvider(
+                    api_key_env_var=compatible_override_env,
+                    base_url="https://mock.invalid/v1",
+                    model="compatible-constructor-default",
+                ).create_response(
+                    ModelRequest(
+                        messages=basic_request.messages,
+                        model="compatible-wire-override",
+                    )
+                )
+        if compatible_override_body.get("model") != "compatible-wire-override":
+            fail(
+                "OpenAI-compatible request model override did not reach body: "
+                f"{compatible_override_body!r}"
+            )
+        ok("Anthropic and OpenAI-compatible request model overrides reach the wire")
 
         # -- regression: a real GeminiProvider request must carry the four
         # tools as sanitized tools[].functionDeclarations, not raw schemas --
@@ -754,11 +814,13 @@ def main() -> None:
             return _FakeHttpResponse(payload)
 
         with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_urlopen):
-            run_task(GeminiProvider(), policy, "hello")
+            run_task(GeminiProvider(model="gemini-constructor-default"), policy, "hello", model="gemini-wire-override")
         del os.environ[GEMINI_API_KEY_ENV_VAR]
 
         if "AIza-fake-test-key-do-not-use" in gemini_captured.get("url", ""):
             fail("Gemini API key must never appear in the request URL")
+        if "/models/gemini-wire-override:generateContent" not in gemini_captured.get("url", ""):
+            fail(f"Gemini request model override did not reach URL: {gemini_captured.get('url')!r}")
         declarations = (gemini_captured.get("body", {}).get("tools") or [{}])[0].get(
             "functionDeclarations", []
         )
@@ -771,6 +833,52 @@ def main() -> None:
         if argv_schema.get("type") != "object" or "argv" not in argv_schema.get("properties", {}):
             fail(f"expected run_shell's Gemini parameters to survive sanitization, got {argv_schema!r}")
         ok("real Gemini request carries sanitized tools[].functionDeclarations, key not in URL")
+
+        # -- every real provider normalizes malformed or non-object HTTP 200
+        # JSON into ProviderError rather than leaking decoder/parser errors. --
+        malformed_compatible_env = "ORCHESTRA_MALFORMED_JSON_TEST_KEY"
+        malformed_providers = [
+            (OpenAIProvider(max_attempts=1), API_KEY_ENV_VAR, "openai-malformed-key"),
+            (
+                AnthropicProvider(max_attempts=1),
+                ANTHROPIC_API_KEY_ENV_VAR,
+                "anthropic-malformed-key",
+            ),
+            (GeminiProvider(max_attempts=1), GEMINI_API_KEY_ENV_VAR, "gemini-malformed-key"),
+            (
+                OpenAICompatibleProvider(
+                    api_key_env_var=malformed_compatible_env,
+                    base_url="https://mock.invalid/v1",
+                    max_attempts=1,
+                ),
+                malformed_compatible_env,
+                "compatible-malformed-key",
+            ),
+        ]
+        for malformed_provider, malformed_env, malformed_key in malformed_providers:
+            for malformed_body, expected_error_text in (
+                (b"not valid json", "invalid JSON"),
+                (b"[]", "non-object JSON"),
+            ):
+                with mock.patch.dict(os.environ, {malformed_env: malformed_key}):
+                    with mock.patch(
+                        "urllib.request.urlopen",
+                        return_value=_FakeHttpResponse(malformed_body),
+                    ):
+                        try:
+                            malformed_provider.create_response(basic_request)
+                        except ProviderError as exc:
+                            if expected_error_text not in str(exc):
+                                fail(
+                                    f"expected {expected_error_text!r} from "
+                                    f"{malformed_provider.name}, got {exc!r}"
+                                )
+                        else:
+                            fail(
+                                f"expected {malformed_provider.name} malformed HTTP 200 "
+                                "response to raise ProviderError"
+                            )
+        ok("all real providers normalize malformed/non-object HTTP 200 JSON to ProviderError")
 
         # -- regression: Gemini thinking tool calls carry a thoughtSignature
         # sibling on the functionCall part, and stateless follow-up requests

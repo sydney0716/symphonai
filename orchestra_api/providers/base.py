@@ -8,7 +8,9 @@ wire-format split each one uses.
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
+from typing import Any
 
 from orchestra_api.models import ModelRequest, ModelResponse
 
@@ -20,6 +22,23 @@ class ProviderError(Exception):
     failures (network errors, timeouts). The message must never include the
     API key or any request header -- only vendor-safe diagnostic text.
     """
+
+
+def parse_json_object(raw: bytes, operation: str) -> dict[str, Any]:
+    """Decode a successful vendor response as a JSON object.
+
+    Real providers expose malformed response bodies through ProviderError,
+    never through JSONDecodeError, UnicodeDecodeError, or an object-only
+    parser's AttributeError.
+    """
+    try:
+        text = raw.decode("utf-8")
+        data = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProviderError(f"{operation} returned invalid JSON: {exc}") from None
+    if not isinstance(data, dict):
+        raise ProviderError(f"{operation} returned non-object JSON")
+    return data
 
 
 class ModelProvider(ABC):

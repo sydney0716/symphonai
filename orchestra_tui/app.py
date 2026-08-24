@@ -36,7 +36,6 @@ STATUS_STYLES = {
     "working": "bold blue",
     "done": "green",
     "failed": "bold red",
-    "exhausted": "bold magenta",
 }
 
 
@@ -95,7 +94,7 @@ class OrchestraTuiApp(App[None]):
     }
 
     #status-panel {
-        height: 9;
+        height: 6;
         min-height: 3;
         min-width: 1;
         border: solid $accent;
@@ -345,7 +344,7 @@ class OrchestraTuiApp(App[None]):
                 return
             self._confirmed_real_providers = False
             self._set_waiting_for_setup("Select providers first")
-            self._open_picker(is_model_change=True)
+            self._open_picker()
             return
         if command.name == "clear":
             self._clear_chat()
@@ -361,14 +360,9 @@ class OrchestraTuiApp(App[None]):
     def _clear_chat(self) -> None:
         self.chat_entries.clear()
         self.query_one("#chat-log", RichLog).clear()
-        cleared_subagents = 0
         if self._leader is not None:
-            cleared_subagents = self._leader.clear_subagents()
             self._leader.clear_chat()
-        noun = "subagent" if cleared_subagents == 1 else "subagents"
-        message = f"Chat cleared; {cleared_subagents} {noun} cleared."
-        self._append_system_line(message)
-        self._set_turn_status(message)
+        self._set_turn_status("Chat cleared")
 
     def _compact_chat(self) -> None:
         if self._leader is None:
@@ -381,39 +375,14 @@ class OrchestraTuiApp(App[None]):
             return
         self._append_system_line(describe_compaction(result))
 
-    def _open_picker(self, *, is_model_change: bool = False) -> None:
-        self.push_screen(
-            ProviderPickerScreen(
-                leader_provider=self._leader_provider,
-                subagent_provider=self._subagent_provider,
-                confirm_real_providers=(
-                    self._confirm_real_providers and not self._confirmed_real_providers
-                ),
-                on_real_providers_confirmed=self._mark_real_providers_confirmed,
-                cancel_label="Cancel" if is_model_change else "Quit",
-            ),
-            lambda result: self._picker_finished(result, is_model_change=is_model_change),
-        )
+    def _open_picker(self) -> None:
+        self.push_screen(ProviderPickerScreen(), self._picker_finished)
 
-    def _picker_finished(
-        self,
-        result: ProviderPickerResult | None,
-        *,
-        is_model_change: bool,
-    ) -> None:
+    def _picker_finished(self, result: ProviderPickerResult | None) -> None:
         if result is None:
-            if is_model_change:
-                self._set_ready()
-            else:
-                self.exit()
+            self.exit()
             return
         self._configure_leader(result.leader_provider, result.subagent_provider)
-        if is_model_change:
-            self._agent_status.clear()
-            self._render_status_panel()
-            self._append_system_line(
-                "--- New model session: the new leader does not inherit the transcript above. ---"
-            )
         self._set_turn_status(
             "Selected "
             f"leader={provider_summary(result.leader_provider)}, "
@@ -423,9 +392,6 @@ class OrchestraTuiApp(App[None]):
             self._open_confirmation()
         else:
             self._set_ready()
-
-    def _mark_real_providers_confirmed(self) -> None:
-        self._confirmed_real_providers = True
 
     def _should_confirm_real_providers(self) -> bool:
         if not self._confirm_real_providers or self._confirmed_real_providers:

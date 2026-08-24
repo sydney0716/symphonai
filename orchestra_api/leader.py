@@ -43,11 +43,12 @@ DEFAULT_SUBAGENT_MAX_TURNS = 5
 
 # Coarse status states reported via on_status(label, status). Deliberately
 # not a fine-grained event stream (no message content, no per-turn detail)
-# -- just "is this agent pending, working, done, or failed."
+# -- just "is this agent pending, working, done, failed, or exhausted."
 STATUS_PENDING = "pending"
 STATUS_WORKING = "working"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
+STATUS_EXHAUSTED = "exhausted"
 
 StatusCallback = Callable[[str, str], None]
 
@@ -212,12 +213,16 @@ class DispatchSubagentTool(LocalTool):
 
         record.messages.append(Message(role=Role.USER, content=task))
         _report(self._on_status, subagent_name, STATUS_WORKING)
-        run_result = record.agent.run(record.messages)
+        try:
+            run_result = record.agent.run(record.messages)
+        except Exception:
+            _report(self._on_status, subagent_name, STATUS_FAILED)
+            raise
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
 
         succeeded = run_result.stopped_reason == "final_response"
-        _report(self._on_status, subagent_name, STATUS_DONE if succeeded else STATUS_FAILED)
+        _report(self._on_status, subagent_name, STATUS_DONE if succeeded else STATUS_EXHAUSTED)
 
         return ToolResult(
             tool_call_id=tool_call.id,
@@ -301,8 +306,15 @@ class Leader:
 
     def _run_messages(self, messages: list[Message]) -> LeaderRunResult:
         _report(self._config.on_status, "leader", STATUS_WORKING)
-        result = self._agent.run(messages)
-        _report(self._config.on_status, "leader", STATUS_DONE)
+        try:
+            result = self._agent.run(messages)
+        except Exception:
+            _report(self._config.on_status, "leader", STATUS_FAILED)
+            raise
+        terminal_status = (
+            STATUS_DONE if result.stopped_reason == "final_response" else STATUS_EXHAUSTED
+        )
+        _report(self._config.on_status, "leader", terminal_status)
         return LeaderRunResult(
             final_answer=result.final_response.message.content,
             leader_messages=result.messages,
@@ -312,6 +324,7 @@ class Leader:
 
     def run(self, goal: str, *, system_prompt: str | None = None) -> LeaderRunResult:
         """Run a single, one-shot task. Each call starts a fresh conversation."""
+        self.clear_subagents()
         messages: list[Message] = []
         if system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=system_prompt))
@@ -319,9 +332,17 @@ class Leader:
         return self._run_messages(messages)
 
     def clear_chat(self) -> None:
-        """Clear the persisted multi-turn chat state."""
+        """Clear the persisted multi-turn chat state and subagent pool."""
 
         self._chat_messages.clear()
+        self.clear_subagents()
+
+    def clear_subagents(self) -> int:
+        """Clear all dispatched subagents and return how many were removed."""
+
+        count = len(self._dispatch_tool.pool)
+        self._dispatch_tool.pool.clear()
+        return count
 
     def compact_chat(self) -> CompactionResult:
         """Apply context compaction to the persisted multi-turn chat state."""

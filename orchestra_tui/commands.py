@@ -30,7 +30,7 @@ class ParsedSlashCommand:
 COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("help", "List available slash commands."),
     SlashCommand("model", "Open the provider/model picker."),
-    SlashCommand("clear", "Clear the chat, leader conversation, and subagent pool."),
+    SlashCommand("clear", "Clear the visible chat log and leader conversation state."),
     SlashCommand("compact", "Compact the leader conversation state now."),
     SlashCommand("exit", "Quit the TUI."),
 )
