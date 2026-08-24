@@ -2492,7 +2492,7 @@
         ".venv/bin/python scripts/smoke_tui.py"
       ],
       "provider": "codex",
-      "status": "CREATED"
+      "status": "COMPLETE"
     },
     {
       "id": "fix-subagent-pool-not-cleared",
@@ -2514,7 +2514,7 @@
         ".venv/bin/python scripts/smoke_tui.py"
       ],
       "provider": "codex",
-      "status": "CREATED"
+      "status": "COMPLETE"
     },
     {
       "id": "fix-backend-sharp-edges",
@@ -2537,7 +2537,7 @@
         "python3 scripts/smoke_leader.py"
       ],
       "provider": "codex",
-      "status": "CREATED"
+      "status": "COMPLETE"
     },
     {
       "id": "fix-tui-ux-gaps",
@@ -2561,7 +2561,7 @@
         ".venv/bin/python scripts/smoke_tui.py"
       ],
       "provider": "codex",
-      "status": "CREATED"
+      "status": "COMPLETE"
     }
   ],
   "workers": [
