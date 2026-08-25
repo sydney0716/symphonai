@@ -7,6 +7,7 @@ or performing the disk access.
 
 from __future__ import annotations
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
@@ -38,7 +39,14 @@ class ReadFileTool(LocalTool):
             "required": ["path"],
         }
 
-    def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         path = tool_call.arguments.get("path")
         if not path:
             return ToolResult(
@@ -95,7 +103,14 @@ class WriteFileTool(LocalTool):
             "required": ["path", "content"],
         }
 
-    def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         path = tool_call.arguments.get("path")
         content = tool_call.arguments.get("content")
         if not path:
@@ -144,7 +159,14 @@ class ListFilesTool(LocalTool):
             "required": [],
         }
 
-    def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         path = tool_call.arguments.get("path", ".")
         decision = policy.check_list(path)
         if not decision.allowed:

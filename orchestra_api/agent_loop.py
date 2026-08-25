@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.identity import AgentRef, RunRef, new_agent_ref, new_run_ref, new_turn_ref
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolResult
 from orchestra_api.permissions import PermissionPolicy
@@ -28,7 +29,7 @@ class AgentRunResult:
     final_response: ModelResponse
     messages: list[Message]
     turns_used: int
-    stopped_reason: str  # "final_response" or "max_turns"
+    stopped_reason: str  # "final_response", "max_turns", or "cancelled"
     run: RunRef
     agent: AgentRef
 
@@ -69,41 +70,62 @@ class ApiAgent:
         *,
         model: str | None = None,
         parent_run_id: str | None = None,
+        cancel: CancellationToken | None = None,
     ) -> AgentRunResult:
         run_ref = new_run_ref(self._agent_ref.agent_id, parent_run_id)
         conversation = list(messages)
         response: ModelResponse | None = None
         for turn in range(1, self._max_turns + 1):
             turn_ref = new_turn_ref(run_ref.run_id, turn)
-            request = ModelRequest(messages=list(conversation), model=model, tools=self._tool_schemas)
-            response = self._provider.create_response(request)
-            # Stamp once and reuse, so the message in `conversation` and the
-            # one returned in `final_response` carry the same turn identity.
-            response = replace(
-                response, message=replace(response.message, turn_id=turn_ref.turn_id)
-            )
-            conversation.append(response.message)
-            if not response.has_tool_calls:
+            try:
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                request = ModelRequest(
+                    messages=list(conversation), model=model, tools=self._tool_schemas
+                )
+                if cancel is None:
+                    response = self._provider.create_response(request)
+                else:
+                    response = self._provider.create_response(request, cancel=cancel)
+                # Stamp once and reuse, so the message in `conversation` and
+                # `final_response` carry the same turn identity.
+                response = replace(
+                    response, message=replace(response.message, turn_id=turn_ref.turn_id)
+                )
+                conversation.append(response.message)
+                if not response.has_tool_calls:
+                    return AgentRunResult(
+                        final_response=response,
+                        messages=conversation,
+                        turns_used=turn,
+                        stopped_reason="final_response",
+                        run=run_ref,
+                        agent=self._agent_ref,
+                    )
+                for tool_call in response.message.tool_calls:
+                    tool = self._tools.get(tool_call.name)
+                    if tool is None:
+                        result = ToolResult(
+                            tool_call_id=tool_call.id,
+                            ok=False,
+                            error=f"unknown tool: {tool_call.name!r}",
+                        )
+                    else:
+                        result = tool.execute(tool_call, self._policy, cancel=cancel)
+                    conversation.append(
+                        Message(role=Role.TOOL, tool_result=result, turn_id=turn_ref.turn_id)
+                    )
+            except OperationCancelled:
+                cancelled_response = response or ModelResponse(
+                    message=Message(role=Role.ASSISTANT), stop_reason="cancelled"
+                )
                 return AgentRunResult(
-                    final_response=response,
+                    final_response=cancelled_response,
                     messages=conversation,
                     turns_used=turn,
-                    stopped_reason="final_response",
+                    stopped_reason="cancelled",
                     run=run_ref,
                     agent=self._agent_ref,
-                )
-            for tool_call in response.message.tool_calls:
-                tool = self._tools.get(tool_call.name)
-                if tool is None:
-                    result = ToolResult(
-                        tool_call_id=tool_call.id,
-                        ok=False,
-                        error=f"unknown tool: {tool_call.name!r}",
-                    )
-                else:
-                    result = tool.execute(tool_call, self._policy)
-                conversation.append(
-                    Message(role=Role.TOOL, tool_result=result, turn_id=turn_ref.turn_id)
                 )
         assert response is not None  # loop runs at least once since max_turns >= 1
         return AgentRunResult(

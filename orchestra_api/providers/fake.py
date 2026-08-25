@@ -8,6 +8,7 @@ can be exercised end-to-end without any real model or network access.
 
 from __future__ import annotations
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role
 from orchestra_api.providers.base import ModelProvider
 
@@ -42,7 +43,11 @@ class FakeModelProvider(ModelProvider):
     def call_count(self) -> int:
         return self._call_count
 
-    def create_response(self, request: ModelRequest) -> ModelResponse:
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         index = min(self._call_count, len(self._responses) - 1)
         self._call_count += 1
         return self._responses[index]

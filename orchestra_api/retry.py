@@ -12,6 +12,7 @@ import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
+from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.providers.base import ProviderError
 
 DEFAULT_MAX_ATTEMPTS = 3
@@ -45,6 +46,7 @@ def read_with_retry(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     api_key: str,
     operation: str,
+    cancel: CancellationToken | None = None,
 ) -> bytes:
     """Open ``request`` and return its body, retrying transient failures.
 
@@ -60,6 +62,8 @@ def read_with_retry(
     deadline = time.monotonic() + timeout
 
     for attempt in range(1, max_attempts + 1):
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProviderError(
@@ -76,6 +80,7 @@ def read_with_retry(
                 max_attempts=max_attempts,
                 deadline=deadline,
                 retry_after=exc.headers.get("Retry-After") if exc.headers else None,
+                cancel=cancel,
             ):
                 continue
             raise ProviderError(
@@ -89,6 +94,7 @@ def read_with_retry(
                 max_attempts=max_attempts,
                 deadline=deadline,
                 retry_after=None,
+                cancel=cancel,
             ):
                 continue
             raise ProviderError(
@@ -100,6 +106,7 @@ def read_with_retry(
                 max_attempts=max_attempts,
                 deadline=deadline,
                 retry_after=None,
+                cancel=cancel,
             ):
                 continue
             raise ProviderError(
@@ -113,6 +120,7 @@ def read_with_retry(
                 max_attempts=max_attempts,
                 deadline=deadline,
                 retry_after=None,
+                cancel=cancel,
             ):
                 continue
             raise ProviderError(
@@ -125,6 +133,7 @@ def read_with_retry(
                 max_attempts=max_attempts,
                 deadline=deadline,
                 retry_after=None,
+                cancel=cancel,
             ):
                 continue
             raise ProviderError(
@@ -165,6 +174,7 @@ def _wait_before_retry(
     max_attempts: int,
     deadline: float,
     retry_after: str | None,
+    cancel: CancellationToken | None = None,
 ) -> bool:
     if attempt >= max_attempts:
         return False
@@ -179,7 +189,10 @@ def _wait_before_retry(
     if delay >= remaining:
         return False
     if delay > 0:
-        time.sleep(delay)
+        if cancel is None:
+            time.sleep(delay)
+        elif cancel.wait(delay):
+            raise OperationCancelled
     return time.monotonic() < deadline
 
 

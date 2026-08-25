@@ -20,6 +20,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage, wire_tool_call_ids
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
@@ -137,7 +138,9 @@ class AnthropicProvider(ModelProvider):
         """Whether ANTHROPIC_API_KEY is set and non-empty. Never reads/logs its value."""
         return bool(os.environ.get(API_KEY_ENV_VAR, "").strip())
 
-    def create_response(self, request: ModelRequest) -> ModelResponse:
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
         api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
         if not api_key:
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
@@ -160,6 +163,7 @@ class AnthropicProvider(ModelProvider):
             max_attempts=self.max_attempts,
             api_key=api_key,
             operation="Anthropic API",
+            cancel=cancel,
         )
         data = parse_json_object(raw, "Anthropic API")
 

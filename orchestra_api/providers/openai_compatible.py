@@ -25,6 +25,7 @@ import os
 import urllib.request
 from dataclasses import dataclass
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import ModelRequest, ModelResponse
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.providers.openai_provider import _build_request_body, _parse_response
@@ -63,7 +64,9 @@ class OpenAICompatibleProvider(ModelProvider):
         """Whether this instance's configured env var is set and non-empty."""
         return bool(os.environ.get(self.api_key_env_var, "").strip())
 
-    def create_response(self, request: ModelRequest) -> ModelResponse:
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
         api_key = os.environ.get(self.api_key_env_var, "").strip()
         if not api_key:
             raise ProviderError(f"{self.api_key_env_var} is not set")
@@ -85,6 +88,7 @@ class OpenAICompatibleProvider(ModelProvider):
             max_attempts=self.max_attempts,
             api_key=api_key,
             operation=f"{self.provider_label} API",
+            cancel=cancel,
         )
         data = parse_json_object(raw, f"{self.provider_label} API")
 

@@ -12,6 +12,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import ModelRequest, ModelResponse
 
 
@@ -55,5 +56,7 @@ class ModelProvider(ABC):
         """1=openai wire format, 2=anthropic wire format, 3=gemini wire format, 4=other/unclassified."""
 
     @abstractmethod
-    def create_response(self, request: ModelRequest) -> ModelResponse:
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
         """Given the conversation so far, return the model's next turn."""

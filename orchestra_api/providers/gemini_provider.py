@@ -29,6 +29,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.identity import new_id
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
@@ -240,7 +241,9 @@ class GeminiProvider(ModelProvider):
         """Whether GEMINI_API_KEY is set and non-empty. Never reads/logs its value."""
         return bool(os.environ.get(API_KEY_ENV_VAR, "").strip())
 
-    def create_response(self, request: ModelRequest) -> ModelResponse:
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
         api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
         if not api_key:
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
@@ -262,6 +265,7 @@ class GeminiProvider(ModelProvider):
             max_attempts=self.max_attempts,
             api_key=api_key,
             operation="Gemini API",
+            cancel=cancel,
         )
         data = parse_json_object(raw, "Gemini API")
 

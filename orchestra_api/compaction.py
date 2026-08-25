@@ -6,6 +6,7 @@ import json
 import math
 from dataclasses import dataclass
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import Message, Role, ToolCall, ToolResult
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 16_000
@@ -79,6 +80,7 @@ def compact_messages_for_budget(
     *,
     budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
     recent_turns: int = DEFAULT_RECENT_TURNS,
+    cancel: CancellationToken | None = None,
 ) -> CompactionResult:
     """Compact a conversation if its estimated token cost exceeds `budget`.
 
@@ -93,6 +95,8 @@ def compact_messages_for_budget(
         raise ValueError(f"budget must be >= 1, got {budget}")
     if recent_turns < 1:
         raise ValueError(f"recent_turns must be >= 1, got {recent_turns}")
+    if cancel is not None:
+        cancel.raise_if_cancelled()
 
     original = list(messages)
     before_tokens = estimate_messages_tokens(original)

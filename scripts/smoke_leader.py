@@ -46,8 +46,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig  # noqa: E402
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall  # noqa: E402
+from orchestra_api.cancellation import CancellationToken, OperationCancelled  # noqa: E402
+from orchestra_api.leader import (  # noqa: E402
+    STATUS_DONE,
+    STATUS_EXHAUSTED,
+    STATUS_FAILED,
+    DispatchSubagentTool,
+    Leader,
+    LeaderConfig,
+)
+from orchestra_api.models import Message, ModelResponse, Role, ToolCall, ToolResult  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
@@ -56,6 +64,7 @@ from orchestra_api.providers.gemini_provider import (  # noqa: E402
 )
 from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
 from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider  # noqa: E402
+from orchestra_api.tools.base import LocalTool  # noqa: E402
 
 OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "ORCHESTRA_OPENAI_COMPATIBLE_SMOKE_KEY"
 
@@ -67,6 +76,30 @@ def fail(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(f"OK:   {msg}")
+
+
+class _CancellingSubagentTool(LocalTool):
+    @property
+    def name(self) -> str:
+        return "cancel_work"
+
+    @property
+    def description(self) -> str:
+        return "Cancel the active subagent turn."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        assert cancel is not None
+        cancel.cancel()
+        raise OperationCancelled
 
 
 def main() -> None:
@@ -124,6 +157,92 @@ def main() -> None:
         if not result.run.run_id.startswith("run_"):
             fail(f"run identity prefix is invalid: {result.run.run_id!r}")
         ok(f"Leader.run() dispatched a subagent and reached a final answer: {result.final_answer!r}")
+
+        cancellation_events: list[tuple[str, str]] = []
+        cancellation_token = CancellationToken()
+        cancellation_subagent_provider = FakeModelProvider(
+            responses=[
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[ToolCall(id="cancel-sub", name="cancel_work")],
+                    )
+                )
+            ]
+        )
+        cancellation_leader_provider = FakeModelProvider(
+            responses=[
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                id="cancel-dispatch",
+                                name="dispatch_subagent",
+                                arguments={
+                                    "subagent_name": "cancellable",
+                                    "task": "start cancellable work",
+                                },
+                            )
+                        ],
+                    )
+                )
+            ]
+        )
+        cancellation_leader = Leader(
+            LeaderConfig(
+                leader_provider=cancellation_leader_provider,
+                subagent_provider=cancellation_subagent_provider,
+                repo_root=str(root),
+                on_status=lambda label, status: cancellation_events.append((label, status)),
+            )
+        )
+        cancelling_tool = _CancellingSubagentTool()
+        with mock.patch(
+            "orchestra_api.leader.standard_tool_registry",
+            return_value={cancelling_tool.name: cancelling_tool},
+        ):
+            cancellation_result = cancellation_leader.run(
+                "delegate cancellable work", cancel=cancellation_token
+            )
+        if cancellation_result.stopped_reason != "cancelled":
+            fail(f"leader did not carry subagent cancellation through: {cancellation_result!r}")
+        if any(
+            label == "cancellable" and status == STATUS_FAILED
+            for label, status in cancellation_events
+        ):
+            fail(f"cancelled subagent was reported as failed: {cancellation_events!r}")
+        # A cancelled subagent must get no terminal status at all. Reporting it
+        # as EXHAUSTED would claim it hit max_turns, which it did not.
+        terminal = {STATUS_DONE, STATUS_EXHAUSTED, STATUS_FAILED}
+        if any(
+            label == "cancellable" and status in terminal
+            for label, status in cancellation_events
+        ):
+            fail(f"cancelled subagent got a terminal status: {cancellation_events!r}")
+        ok("leader cancellation reaches subagents without reporting failure")
+
+        # -- chat() reports cancellation the same way run() does --
+        chat_cancel_token = CancellationToken()
+        chat_cancel_token.cancel()
+        chat_cancel_leader = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(
+                    responses=[
+                        ModelResponse(message=Message(role=Role.ASSISTANT, content="unused"))
+                    ]
+                ),
+                subagent_provider=FakeModelProvider(),
+                repo_root=root,
+            )
+        )
+        try:
+            chat_cancelled = chat_cancel_leader.chat("do work", cancel=chat_cancel_token)
+        except OperationCancelled:
+            fail("Leader.chat() raised OperationCancelled; run() returns a cancelled result")
+        if chat_cancelled.stopped_reason != "cancelled":
+            fail(f"Leader.chat() did not report cancellation: {chat_cancelled!r}")
+        ok("Leader.chat() reports cancellation as a result, matching Leader.run()")
 
         # -- create / reuse / isolate / max_subagents, exercised directly on the tool --
         policy = PermissionPolicy(repo_root=root)

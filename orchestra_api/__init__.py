@@ -5,6 +5,7 @@ See `docs/orchestra-api-runtime.md` for the full design writeup.
 
 from __future__ import annotations
 
+from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.identity import (
     SCHEMA_VERSION,
     AgentRef,
@@ -30,10 +31,12 @@ from orchestra_api.models import (
 
 __all__ = [
     "AgentRef",
+    "CancellationToken",
     "ContentBlock",
     "Message",
     "ModelRequest",
     "ModelResponse",
+    "OperationCancelled",
     "Role",
     "RunRef",
     "SCHEMA_VERSION",

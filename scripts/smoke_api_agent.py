@@ -42,8 +42,11 @@ import io
 import json
 import os
 import ssl
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest.mock as mock
 import urllib.error
 from datetime import date, datetime, timedelta, timezone
@@ -53,6 +56,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from orchestra_api.agent_loop import ApiAgent  # noqa: E402
+from orchestra_api.cancellation import CancellationToken, OperationCancelled  # noqa: E402
 from orchestra_api.compaction import ContextCompactionError, compact_messages_for_budget  # noqa: E402
 from orchestra_api.model_discovery import list_models  # noqa: E402
 from orchestra_api.models import (  # noqa: E402
@@ -85,7 +90,10 @@ from orchestra_api.providers.openai_provider import (  # noqa: E402
     _build_request_body as _build_openai_body,
 )
 from orchestra_api.providers.openai_provider import _parse_response as _parse_openai_response  # noqa: E402
+from orchestra_api.retry import read_with_retry  # noqa: E402
 from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
+from orchestra_api.tools.base import LocalTool  # noqa: E402
+from orchestra_api.tools.shell import MAX_OUTPUT_CHARS, RunShellTool  # noqa: E402
 
 
 def fail(msg: str) -> None:
@@ -95,6 +103,30 @@ def fail(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(f"OK:   {msg}")
+
+
+class _CancellingTool(LocalTool):
+    @property
+    def name(self) -> str:
+        return "cancel_work"
+
+    @property
+    def description(self) -> str:
+        return "Cancel the active test turn."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        assert cancel is not None
+        cancel.cancel()
+        raise OperationCancelled
 
 
 def main() -> None:
@@ -242,6 +274,49 @@ def main() -> None:
         # repo_root and allowed write scope are the same temp dir here.
         policy = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
 
+        pre_cancel = CancellationToken()
+        pre_cancel.cancel()
+        pre_cancel_provider = FakeModelProvider()
+        pre_cancel_result = ApiAgent(pre_cancel_provider, {}, policy).run(
+            [Message(role=Role.USER, content="stop")], cancel=pre_cancel
+        )
+        if pre_cancel_result.stopped_reason != "cancelled":
+            fail(f"pre-cancelled run did not return cancelled: {pre_cancel_result!r}")
+        if pre_cancel_provider.call_count != 0:
+            fail(f"pre-cancelled run called its provider {pre_cancel_provider.call_count} times")
+        ok("pre-cancelled ApiAgent run stops before calling the provider")
+
+        during_tool_token = CancellationToken()
+        cancelling_call = ModelResponse(
+            message=Message(
+                role=Role.ASSISTANT,
+                tool_calls=[ToolCall(id="cancel-1", name="cancel_work")],
+            )
+        )
+        during_tool_result = ApiAgent(
+            FakeModelProvider(responses=[cancelling_call]),
+            {"cancel_work": _CancellingTool()},
+            policy,
+        ).run([Message(role=Role.USER, content="cancel in tool")], cancel=during_tool_token)
+        if during_tool_result.stopped_reason != "cancelled":
+            fail(f"tool cancellation escaped the agent boundary: {during_tool_result!r}")
+        if not any(message.role == Role.ASSISTANT for message in during_tool_result.messages):
+            fail(f"tool cancellation discarded the assistant message: {during_tool_result!r}")
+        ok("tool cancellation returns a partial cancelled agent result")
+
+        compact_cancel = CancellationToken()
+        compact_cancel.cancel()
+        try:
+            compact_messages_for_budget(
+                [Message(role=Role.USER, content="cancel compaction")],
+                cancel=compact_cancel,
+            )
+        except OperationCancelled:
+            pass
+        else:
+            fail("pre-cancelled compaction did not raise OperationCancelled")
+        ok("compaction checks cancellation at entry")
+
         # -- full agent run: tool-call turn (read_file) then final answer --
         tool_turn = ModelResponse(
             message=Message(
@@ -358,6 +433,169 @@ def main() -> None:
 
             def __exit__(self, *exc: object) -> bool:
                 return False
+
+        retry_request = urllib.request.Request("https://mock.invalid/test")
+        backoff_token = CancellationToken()
+        timer = threading.Timer(0.02, backoff_token.cancel)
+        retryable_error = urllib.error.HTTPError(
+            retry_request.full_url,
+            503,
+            "unavailable",
+            {},
+            io.BytesIO(b"retry later"),
+        )
+        started = time.monotonic()
+        timer.start()
+        try:
+            with mock.patch("urllib.request.urlopen", side_effect=retryable_error):
+                with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                    try:
+                        read_with_retry(
+                            retry_request,
+                            timeout=2.0,
+                            api_key="test-key",
+                            operation="cancel test",
+                            cancel=backoff_token,
+                        )
+                    except OperationCancelled as exc:
+                        if isinstance(exc, ProviderError):
+                            fail("OperationCancelled was wrapped as ProviderError")
+                    else:
+                        fail("interruptible retry backoff did not raise OperationCancelled")
+                    if sleep_mock.called:
+                        fail("cancellable retry backoff called time.sleep")
+        finally:
+            timer.cancel()
+            timer.join()
+        if time.monotonic() - started >= 0.3:
+            fail("retry backoff cancellation did not wake promptly")
+        ok("retry backoff wakes promptly without wrapping cancellation as ProviderError")
+
+        retryable_then_success = urllib.error.HTTPError(
+            retry_request.full_url,
+            503,
+            "unavailable",
+            {},
+            io.BytesIO(b"retry later"),
+        )
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[retryable_then_success, _FakeHttpResponse(b"ok")],
+        ):
+            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+                    raw = read_with_retry(
+                        retry_request,
+                        timeout=2.0,
+                        api_key="test-key",
+                        operation="none token test",
+                        cancel=None,
+                    )
+        if raw != b"ok":
+            fail(f"cancel=None retry returned unexpected payload: {raw!r}")
+        sleep_mock.assert_called_once_with(0.5)
+        ok("cancel=None keeps the existing time.sleep retry path")
+
+        shell_token = CancellationToken()
+        shell_policy = PermissionPolicy(
+            repo_root=root,
+            shell_enabled=True,
+            shell_allowlist=[(sys.executable,)],
+        )
+        real_popen = subprocess.Popen
+        children: list[subprocess.Popen] = []
+
+        def _capturing_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        shell_timer = threading.Timer(0.05, shell_token.cancel)
+        shell_started = time.monotonic()
+        shell_timer.start()
+        try:
+            with mock.patch(
+                "orchestra_api.tools.shell.subprocess.Popen",
+                side_effect=_capturing_popen,
+            ):
+                try:
+                    RunShellTool().execute(
+                        ToolCall(
+                            id="cancel-shell",
+                            name="run_shell",
+                            arguments={
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    "import time; time.sleep(30)",
+                                ]
+                            },
+                        ),
+                        shell_policy,
+                        cancel=shell_token,
+                    )
+                except OperationCancelled:
+                    pass
+                else:
+                    fail("cancelled run_shell returned a ToolResult")
+        finally:
+            shell_timer.cancel()
+            shell_timer.join()
+        if time.monotonic() - shell_started >= 1.0:
+            fail("cancelled run_shell did not return promptly")
+        if len(children) != 1 or children[0].poll() is None:
+            fail(f"cancelled run_shell left its child running: {children!r}")
+        ok("cancelled run_shell kills and reaps its child process")
+
+        # -- run_shell behaviour unchanged by the subprocess.run -> Popen rewrite.
+        # These are the paths the rewrite could silently break; none of them were
+        # covered before, so a regression would have shipped green.
+        shell_tool = RunShellTool()
+
+        def _shell(argv: list[str], policy: PermissionPolicy = shell_policy) -> ToolResult:
+            return shell_tool.execute(
+                ToolCall(id="shell-behaviour", name="run_shell", arguments={"argv": argv}),
+                policy,
+            )
+
+        success = _shell([sys.executable, "-c", "print('to stdout')"])
+        if not success.ok or success.content != "to stdout\n" or success.error is not None:
+            fail(f"run_shell success path changed: {success!r}")
+
+        merged = _shell(
+            [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"]
+        )
+        if "out" not in merged.content or "err" not in merged.content:
+            fail(f"run_shell no longer merges stdout and stderr: {merged!r}")
+
+        failing = _shell([sys.executable, "-c", "print('partial'); raise SystemExit(7)"])
+        if failing.ok or failing.error != "exit code 7" or "partial" not in failing.content:
+            fail(f"run_shell nonzero-exit path changed: {failing!r}")
+
+        oversized = _shell(
+            [sys.executable, "-c", f"print('x' * {MAX_OUTPUT_CHARS + 500})"]
+        )
+        if not oversized.content.endswith("\n...(truncated)"):
+            fail("run_shell no longer appends the truncation suffix")
+        if len(oversized.content) != MAX_OUTPUT_CHARS + len("\n...(truncated)"):
+            fail(f"run_shell truncated to the wrong length: {len(oversized.content)}")
+
+        timing_out = shell_tool.execute(
+            ToolCall(
+                id="shell-timeout",
+                name="run_shell",
+                arguments={"argv": [sys.executable, "-c", "import time; time.sleep(30)"]},
+            ),
+            PermissionPolicy(
+                repo_root=root,
+                shell_enabled=True,
+                shell_allowlist=[(sys.executable,)],
+                shell_timeout_seconds=0.3,
+            ),
+        )
+        if timing_out.ok or not (timing_out.error or "").startswith("error running command:"):
+            fail(f"run_shell timeout path changed: {timing_out!r}")
+        ok("run_shell success, stderr, exit-code, truncation, and timeout paths unchanged")
 
         def _headers(request) -> dict[str, str]:  # noqa: ANN001
             return {name.lower(): value for name, value in request.header_items()}

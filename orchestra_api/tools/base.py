@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from orchestra_api.models import ToolCall, ToolResult
 
 if TYPE_CHECKING:
+    from orchestra_api.cancellation import CancellationToken
     from orchestra_api.permissions import PermissionPolicy
 
 
@@ -39,5 +40,10 @@ class LocalTool(ABC):
         """
 
     @abstractmethod
-    def execute(self, tool_call: ToolCall, policy: "PermissionPolicy") -> ToolResult:
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: "PermissionPolicy",
+        cancel: "CancellationToken | None" = None,
+    ) -> ToolResult:
         """Run this tool for `tool_call`, gated by `policy`."""

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
+from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.compaction import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
     DEFAULT_RECENT_TURNS,
@@ -181,7 +182,14 @@ class DispatchSubagentTool(LocalTool):
             "required": _DISPATCH_REQUIRED,
         }
 
-    def execute(self, tool_call: ToolCall, policy: PermissionPolicy) -> ToolResult:
+    def execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         subagent_name = tool_call.arguments.get("subagent_name")
         task = tool_call.arguments.get("task")
         if not subagent_name or not task:
@@ -221,7 +229,9 @@ class DispatchSubagentTool(LocalTool):
         record.messages.append(Message(role=Role.USER, content=task))
         _report(self._on_status, subagent_name, STATUS_WORKING)
         try:
-            run_result = record.agent.run(record.messages)
+            run_result = record.agent.run(record.messages, cancel=cancel)
+        except OperationCancelled:
+            raise
         except Exception:
             _report(self._on_status, subagent_name, STATUS_FAILED)
             raise
@@ -229,13 +239,22 @@ class DispatchSubagentTool(LocalTool):
         record.turns_used += run_result.turns_used
 
         succeeded = run_result.stopped_reason == "final_response"
-        _report(self._on_status, subagent_name, STATUS_DONE if succeeded else STATUS_EXHAUSTED)
+        if run_result.stopped_reason != "cancelled":
+            _report(self._on_status, subagent_name, STATUS_DONE if succeeded else STATUS_EXHAUSTED)
 
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,
             content=run_result.final_response.message.text,
-            error=None if succeeded else "subagent reached max_turns without a final answer",
+            error=(
+                None
+                if succeeded
+                else (
+                    "subagent was cancelled"
+                    if run_result.stopped_reason == "cancelled"
+                    else "subagent reached max_turns without a final answer"
+                )
+            ),
         )
 
 
@@ -316,17 +335,22 @@ class Leader:
     def subagents(self) -> dict[str, SubagentRecord]:
         return self._dispatch_tool.pool
 
-    def _run_messages(self, messages: list[Message]) -> LeaderRunResult:
+    def _run_messages(
+        self, messages: list[Message], *, cancel: CancellationToken | None = None
+    ) -> LeaderRunResult:
         _report(self._config.on_status, "leader", STATUS_WORKING)
         try:
-            result = self._agent.run(messages)
+            result = self._agent.run(messages, cancel=cancel)
+        except OperationCancelled:
+            raise
         except Exception:
             _report(self._config.on_status, "leader", STATUS_FAILED)
             raise
-        terminal_status = (
-            STATUS_DONE if result.stopped_reason == "final_response" else STATUS_EXHAUSTED
-        )
-        _report(self._config.on_status, "leader", terminal_status)
+        if result.stopped_reason != "cancelled":
+            terminal_status = (
+                STATUS_DONE if result.stopped_reason == "final_response" else STATUS_EXHAUSTED
+            )
+            _report(self._config.on_status, "leader", terminal_status)
         return LeaderRunResult(
             final_answer=result.final_response.message.text,
             leader_messages=result.messages,
@@ -336,14 +360,20 @@ class Leader:
             agent=result.agent,
         )
 
-    def run(self, goal: str, *, system_prompt: str | None = None) -> LeaderRunResult:
+    def run(
+        self,
+        goal: str,
+        *,
+        system_prompt: str | None = None,
+        cancel: CancellationToken | None = None,
+    ) -> LeaderRunResult:
         """Run a single, one-shot task. Each call starts a fresh conversation."""
         self.clear_subagents()
         messages: list[Message] = []
         if system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=system_prompt))
         messages.append(Message(role=Role.USER, content=goal))
-        return self._run_messages(messages)
+        return self._run_messages(messages, cancel=cancel)
 
     def clear_chat(self) -> int:
         """Clear the persisted chat state and subagent pool.
@@ -363,18 +393,21 @@ class Leader:
         self._dispatch_tool.pool.clear()
         return count
 
-    def compact_chat(self) -> CompactionResult:
+    def compact_chat(self, *, cancel: CancellationToken | None = None) -> CompactionResult:
         """Apply context compaction to the persisted multi-turn chat state."""
 
         result = compact_messages_for_budget(
             self._chat_messages,
             budget=self._config.chat_token_budget,
             recent_turns=self._config.chat_recent_turns,
+            cancel=cancel,
         )
         self._chat_messages = result.messages
         return result
 
-    def chat(self, message: str) -> LeaderRunResult:
+    def chat(
+        self, message: str, *, cancel: CancellationToken | None = None
+    ) -> LeaderRunResult:
         """Continue an ongoing conversation with the leader.
 
         Unlike `run()`, this keeps its own running message history across
@@ -383,13 +416,19 @@ class Leader:
         has full context of the conversation so far.
         """
         self._chat_messages.append(Message(role=Role.USER, content=message))
-        self.compact_chat()
-        result = self._run_messages(self._chat_messages)
+        try:
+            self.compact_chat(cancel=cancel)
+        except OperationCancelled:
+            # Fall through: _run_messages returns a cancelled LeaderRunResult,
+            # so chat() and run() report cancellation the same way rather than
+            # one returning a result and the other raising.
+            pass
+        result = self._run_messages(self._chat_messages, cancel=cancel)
         self._chat_messages = result.leader_messages
         try:
-            self.compact_chat()
-        except ContextCompactionError:
-            # The next user turn will fail before the provider call with the
-            # same actionable error. Keep the just-returned answer available.
+            self.compact_chat(cancel=cancel)
+        except (ContextCompactionError, OperationCancelled):
+            # Keep the just-returned answer available when post-run cleanup
+            # cannot complete or the turn was cancelled.
             self._chat_messages = result.leader_messages
         return result
