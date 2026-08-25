@@ -59,6 +59,17 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestra_api.agent_loop import ApiAgent  # noqa: E402
 from orchestra_api.cancellation import CancellationToken, OperationCancelled  # noqa: E402
 from orchestra_api.compaction import ContextCompactionError, compact_messages_for_budget  # noqa: E402
+from orchestra_api.events import (  # noqa: E402
+    CollectingSink,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    ToolCallFinished,
+    ToolCallStarted,
+    TurnFinished,
+    TurnStarted,
+)
+from orchestra_api.identity import TurnRef  # noqa: E402
 from orchestra_api.model_discovery import list_models  # noqa: E402
 from orchestra_api.models import (  # noqa: E402
     Message,
@@ -76,7 +87,7 @@ from orchestra_api.providers.anthropic_provider import (  # noqa: E402
 )
 from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
 from orchestra_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body  # noqa: E402
-from orchestra_api.providers.base import ProviderError  # noqa: E402
+from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 from orchestra_api.providers.gemini_provider import (  # noqa: E402
     API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
@@ -127,6 +138,21 @@ class _CancellingTool(LocalTool):
         assert cancel is not None
         cancel.cancel()
         raise OperationCancelled
+
+
+class _RaisingProvider(ModelProvider):
+    @property
+    def name(self) -> str:
+        return "raising"
+
+    @property
+    def wire_format(self) -> int:
+        return 4
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        raise ProviderError("event test failure")
 
 
 def main() -> None:
@@ -274,16 +300,184 @@ def main() -> None:
         # repo_root and allowed write scope are the same temp dir here.
         policy = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
 
+        final_events = CollectingSink()
+        final_event_result = ApiAgent(
+            FakeModelProvider(
+                responses=[ModelResponse(Message(Role.ASSISTANT, "event answer"))]
+            ),
+            {},
+            policy,
+            events=final_events,
+        ).run([Message(Role.USER, "event test")])
+        if len(final_events.of_type(RunStarted)) != 1:
+            fail(f"final run did not emit one RunStarted: {final_events.events!r}")
+        final_terminals = final_events.of_type(RunFinished) + final_events.of_type(RunFailed)
+        if len(final_terminals) != 1 or final_terminals[0].stopped_reason != "final_response":
+            fail(f"final run terminal events are invalid: {final_events.events!r}")
+        if any(
+            event.agent_id != final_event_result.agent.agent_id
+            or event.run_id != final_event_result.run.run_id
+            for event in final_events.events
+        ):
+            fail(f"event identity does not match the agent result: {final_events.events!r}")
+        turn_ids = {
+            message.turn_id
+            for message in final_event_result.messages
+            if message.turn_id is not None
+        }
+        if any(
+            event.turn_id is not None and event.turn_id not in turn_ids
+            for event in final_events.events
+        ):
+            fail(f"event turn identity does not match the transcript: {final_events.events!r}")
+        if len(final_events.of_type(TurnStarted)) != 1 or len(final_events.of_type(TurnFinished)) != 1:
+            fail(f"completed final turn was not bracketed: {final_events.events!r}")
+        ok("final ApiAgent events have one terminal and canonical run/turn identity")
+
+        tool_events = CollectingSink()
+        tool_event_result = ApiAgent(
+            FakeModelProvider(
+                responses=[
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="event-read",
+                                    name="read_file",
+                                    arguments={"path": "existing.txt"},
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(Message(Role.ASSISTANT, "done")),
+                ]
+            ),
+            standard_tool_registry(),
+            policy,
+            events=tool_events,
+        ).run([Message(Role.USER, "read")])
+        tool_started = tool_events.of_type(ToolCallStarted)
+        tool_finished = tool_events.of_type(ToolCallFinished)
+        if (
+            len(tool_started) != 1
+            or len(tool_finished) != 1
+            or tool_started[0].tool_call_id != "event-read"
+            or tool_finished[0].tool_call_id != "event-read"
+            or not tool_finished[0].ok
+        ):
+            fail(f"successful tool events did not bracket execution: {tool_events.events!r}")
+        if tool_event_result.stopped_reason != "final_response":
+            fail(f"event-producing tool run changed its result: {tool_event_result!r}")
+
+        unknown_events = CollectingSink()
+        unknown_result = ApiAgent(
+            FakeModelProvider(
+                responses=[
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[ToolCall(id="event-unknown", name="missing")],
+                        )
+                    )
+                ]
+            ),
+            {},
+            policy,
+            max_turns=1,
+            events=unknown_events,
+        ).run([Message(Role.USER, "unknown")])
+        unknown_finished = unknown_events.of_type(ToolCallFinished)
+        if len(unknown_finished) != 1 or unknown_finished[0].ok:
+            fail(f"unknown-tool completion event was not ok=False: {unknown_events.events!r}")
+        unknown_terminals = unknown_events.of_type(RunFinished) + unknown_events.of_type(RunFailed)
+        if (
+            unknown_result.stopped_reason != "max_turns"
+            or len(unknown_terminals) != 1
+            or unknown_terminals[0].stopped_reason != "max_turns"
+        ):
+            fail(f"max-turn event terminal is invalid: {unknown_events.events!r}")
+        ok("tool events bracket success and unknown-tool execution")
+
+        failed_events = CollectingSink()
+        try:
+            ApiAgent(_RaisingProvider(), {}, policy, events=failed_events).run(
+                [Message(Role.USER, "fail")]
+            )
+        except ProviderError:
+            pass
+        else:
+            fail("raising provider did not propagate ProviderError")
+        failed_terminals = failed_events.of_type(RunFinished) + failed_events.of_type(RunFailed)
+        if len(failed_events.of_type(RunStarted)) != 1 or len(failed_terminals) != 1:
+            fail(f"failed run terminal cardinality is invalid: {failed_events.events!r}")
+        if not isinstance(failed_terminals[0], RunFailed):
+            fail(f"raising provider did not emit RunFailed: {failed_events.events!r}")
+        ok("raising provider emits exactly one RunFailed")
+
+        def _broken_sink(event) -> None:  # noqa: ANN001
+            raise RuntimeError("broken observer")
+
+        broken_sink_result = ApiAgent(
+            FakeModelProvider(
+                responses=[ModelResponse(Message(Role.ASSISTANT, "still works"))]
+            ),
+            {},
+            policy,
+            events=_broken_sink,
+        ).run([Message(Role.USER, "ignore observer")])
+        if broken_sink_result.stopped_reason != "final_response":
+            fail(f"raising event sink broke the run: {broken_sink_result!r}")
+
+        def _cancelling_sink(event) -> None:  # noqa: ANN001
+            raise OperationCancelled
+
+        sink_cancel_result = ApiAgent(
+            FakeModelProvider(), {}, policy, events=_cancelling_sink
+        ).run([Message(Role.USER, "cancel from sink")])
+        if sink_cancel_result.stopped_reason != "cancelled":
+            fail(f"OperationCancelled from sink was swallowed: {sink_cancel_result!r}")
+        ok("broken sinks are isolated while sink cancellation stops the run")
+
+        inert_response = ModelResponse(Message(Role.ASSISTANT, "same result"))
+
+        def _fixed_turn(run_id: str, index: int) -> TurnRef:
+            return TurnRef(turn_id=f"turn_fixed_{index}", run_id=run_id, index=index)
+
+        with mock.patch("orchestra_api.agent_loop.new_turn_ref", side_effect=_fixed_turn):
+            without_events = ApiAgent(
+                FakeModelProvider([inert_response]), {}, policy
+            ).run([Message(Role.USER, "same input")])
+            with_events = ApiAgent(
+                FakeModelProvider([inert_response]), {}, policy, events=CollectingSink()
+            ).run([Message(Role.USER, "same input")])
+        if (
+            without_events.messages != with_events.messages
+            or without_events.stopped_reason != with_events.stopped_reason
+        ):
+            fail("collecting events changed the agent result")
+        ok("dropping the event stream does not change agent results")
+
         pre_cancel = CancellationToken()
+        pre_cancel_events = CollectingSink()
         pre_cancel.cancel()
         pre_cancel_provider = FakeModelProvider()
         pre_cancel_result = ApiAgent(pre_cancel_provider, {}, policy).run(
-            [Message(role=Role.USER, content="stop")], cancel=pre_cancel
+            [Message(role=Role.USER, content="stop")],
+            cancel=pre_cancel,
+            events=pre_cancel_events,
         )
         if pre_cancel_result.stopped_reason != "cancelled":
             fail(f"pre-cancelled run did not return cancelled: {pre_cancel_result!r}")
         if pre_cancel_provider.call_count != 0:
             fail(f"pre-cancelled run called its provider {pre_cancel_provider.call_count} times")
+        pre_cancel_terminals = pre_cancel_events.of_type(RunFinished) + pre_cancel_events.of_type(RunFailed)
+        if (
+            len(pre_cancel_events.of_type(RunStarted)) != 1
+            or len(pre_cancel_terminals) != 1
+            or pre_cancel_terminals[0].stopped_reason != "cancelled"
+        ):
+            fail(f"cancelled run terminal cardinality is invalid: {pre_cancel_events.events!r}")
         ok("pre-cancelled ApiAgent run stops before calling the provider")
 
         during_tool_token = CancellationToken()

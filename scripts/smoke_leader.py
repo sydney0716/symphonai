@@ -47,6 +47,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from orchestra_api.cancellation import CancellationToken, OperationCancelled  # noqa: E402
+from orchestra_api.events import (  # noqa: E402
+    CollectingSink,
+    CompactionApplied,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    SubagentSpawned,
+)
 from orchestra_api.leader import (  # noqa: E402
     STATUS_DONE,
     STATUS_EXHAUSTED,
@@ -132,7 +140,13 @@ def main() -> None:
                 ModelResponse(message=Message(role=Role.ASSISTANT, content="Answer: the sky is blue.")),
             ]
         )
-        config = LeaderConfig(leader_provider=leader_provider, subagent_provider=subagent_provider, repo_root=str(root))
+        identity_events = CollectingSink()
+        config = LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=subagent_provider,
+            repo_root=str(root),
+            events=identity_events,
+        )
         leader = Leader(config)
         result = leader.run("why is the sky blue?")
 
@@ -156,9 +170,98 @@ def main() -> None:
             fail(f"agent identity prefixes are invalid: {agent_ids!r}")
         if not result.run.run_id.startswith("run_"):
             fail(f"run identity prefix is invalid: {result.run.run_id!r}")
+        spawned = identity_events.of_type(SubagentSpawned)
+        if len(spawned) != 2:
+            fail(f"expected two SubagentSpawned events, got {identity_events.events!r}")
+        if any(
+            event.agent_id != result.agent.agent_id
+            or event.run_id != result.run.run_id
+            or event.subagent_agent_id not in {ref.agent_id for ref in subagent_refs}
+            for event in spawned
+        ):
+            fail(f"subagent spawn identity is incorrect: {spawned!r}")
+        started_pairs = {
+            (event.agent_id, event.run_id)
+            for event in identity_events.of_type(RunStarted)
+        }
+        expected_agent_ids = {result.agent.agent_id, *(ref.agent_id for ref in subagent_refs)}
+        if {agent_id for agent_id, _ in started_pairs} != expected_agent_ids:
+            fail(f"run events do not identify leader and subagents: {identity_events.events!r}")
+        terminal_pairs = [
+            (event.agent_id, event.run_id)
+            for event in identity_events.events
+            if isinstance(event, (RunFinished, RunFailed))
+        ]
+        if any(terminal_pairs.count(pair) != 1 for pair in started_pairs):
+            fail(f"leader/subagent terminal event cardinality is invalid: {identity_events.events!r}")
+        if any(
+            (event.agent_id, event.run_id) not in started_pairs
+            for event in identity_events.events
+            if not isinstance(event, SubagentSpawned)
+        ):
+            fail(f"event run identity has no matching RunStarted: {identity_events.events!r}")
+        allowed_turns = {
+            result.agent.agent_id: {
+                message.turn_id
+                for message in result.leader_messages
+                if message.turn_id is not None
+            }
+        }
+        allowed_turns.update(
+            {
+                record.agent_ref.agent_id: {
+                    message.turn_id
+                    for message in record.messages
+                    if message.turn_id is not None
+                }
+                for record in result.subagents.values()
+            }
+        )
+        if any(
+            event.turn_id is not None
+            and event.turn_id not in allowed_turns.get(event.agent_id, set())
+            for event in identity_events.events
+        ):
+            fail(f"event turn identity has no matching message: {identity_events.events!r}")
         ok(f"Leader.run() dispatched a subagent and reached a final answer: {result.final_answer!r}")
 
+        compaction_events = CollectingSink()
+        compaction_leader = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(
+                    [ModelResponse(Message(Role.ASSISTANT, "seeded"))]
+                ),
+                subagent_provider=FakeModelProvider(),
+                repo_root=str(root),
+                chat_token_budget=140,
+                chat_recent_turns=1,
+                events=compaction_events,
+            )
+        )
+        seed_result = compaction_leader.run("seed")
+        compaction_leader._chat_messages = [
+            Message(Role.SYSTEM, "system prompt must stay"),
+            Message(Role.USER, "earliest user goal must stay"),
+            Message(Role.ASSISTANT, "old assistant detail " * 120),
+            Message(Role.USER, "old follow-up " * 120),
+            Message(Role.ASSISTANT, "old analysis " * 120),
+            Message(Role.USER, "latest request must stay"),
+        ]
+        compacted = compaction_leader.compact_chat()
+        compaction_applied = compaction_events.of_type(CompactionApplied)
+        if not compacted.changed or len(compaction_applied) != 1:
+            fail(f"changed compaction did not emit once: {compaction_events.events!r}")
+        if (
+            compaction_applied[0].agent_id != seed_result.agent.agent_id
+            or compaction_applied[0].run_id != seed_result.run.run_id
+            or compaction_applied[0].before_tokens != compacted.before_tokens
+            or compaction_applied[0].after_tokens != compacted.after_tokens
+        ):
+            fail(f"compaction event payload is incorrect: {compaction_applied[0]!r}")
+        ok("leader compaction emits canonical token and identity data")
+
         cancellation_events: list[tuple[str, str]] = []
+        cancellation_typed_events = CollectingSink()
         cancellation_token = CancellationToken()
         cancellation_subagent_provider = FakeModelProvider(
             responses=[
@@ -195,6 +298,7 @@ def main() -> None:
                 subagent_provider=cancellation_subagent_provider,
                 repo_root=str(root),
                 on_status=lambda label, status: cancellation_events.append((label, status)),
+                events=cancellation_typed_events,
             )
         )
         cancelling_tool = _CancellingSubagentTool()
@@ -220,6 +324,30 @@ def main() -> None:
             for label, status in cancellation_events
         ):
             fail(f"cancelled subagent got a terminal status: {cancellation_events!r}")
+        expected_cancellation_events = [
+            ("leader", "working"),
+            ("cancellable", "pending"),
+            ("cancellable", "working"),
+        ]
+        if cancellation_events != expected_cancellation_events:
+            fail(
+                f"expected cancelled status sequence {expected_cancellation_events!r}, "
+                f"got {cancellation_events!r}"
+            )
+        cancelled_ref = cancellation_result.subagents["cancellable"].agent_ref
+        cancelled_run_events = [
+            event
+            for event in cancellation_typed_events.of_type(RunFinished)
+            if event.agent_id == cancelled_ref.agent_id
+        ]
+        if (
+            len(cancelled_run_events) != 1
+            or cancelled_run_events[0].stopped_reason != "cancelled"
+        ):
+            fail(
+                "cancelled subagent did not emit one cancelled RunFinished: "
+                f"{cancellation_typed_events.events!r}"
+            )
         ok("leader cancellation reaches subagents without reporting failure")
 
         # -- chat() reports cancellation the same way run() does --
@@ -330,6 +458,28 @@ def main() -> None:
         if events != expected_events:
             fail(f"expected status event sequence {expected_events}, got {events}")
         ok(f"on_status fires the expected sequence: {events}")
+
+        # A raising on_status must not fail the run. Before the event channel
+        # it did, because _report called the callback directly; it is now
+        # reached through emit(), which swallows consumer exceptions.
+        def _raising_status(label: str, status: str) -> None:
+            raise RuntimeError("status consumer is broken")
+
+        raising_result = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(
+                    responses=[
+                        ModelResponse(message=Message(role=Role.ASSISTANT, content="answer"))
+                    ]
+                ),
+                subagent_provider=FakeModelProvider(),
+                repo_root=root,
+                on_status=_raising_status,
+            )
+        ).run("goal")
+        if raising_result.stopped_reason != "final_response":
+            fail(f"a raising on_status broke the run: {raising_result!r}")
+        ok("a raising on_status callback cannot fail the run")
 
         # -- a leader provider exception emits failed before propagating. --
         failed_leader_events: list[tuple[str, str]] = []

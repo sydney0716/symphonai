@@ -31,6 +31,17 @@ from orchestra_api.compaction import (
     compact_messages_for_budget,
 )
 from orchestra_api.gemini_schema import sanitize_for_gemini
+from orchestra_api.events import (
+    CompactionApplied,
+    Event,
+    EventSink,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    SubagentSpawned,
+    ToolCallStarted,
+    emit,
+)
 from orchestra_api.identity import AgentRef, RunRef, new_agent_ref
 from orchestra_api.models import Message, Role, ToolCall, ToolResult
 from orchestra_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
@@ -58,6 +69,53 @@ StatusCallback = Callable[[str, str], None]
 def _report(on_status: StatusCallback | None, label: str, status: str) -> None:
     if on_status is not None:
         on_status(label, status)
+
+
+class _LeaderEventSink:
+    """Fan out typed events, then adapt them to the legacy status callback.
+
+    Note one deliberate change this adapter makes to the legacy contract: an
+    `on_status` callback that raises used to propagate and fail the run,
+    because `_report` called it directly. It is now reached through an
+    `EventSink`, so `events.emit` swallows the exception and the run
+    completes. A broken status display must not fail the task. The trade is
+    that a bug in a consumer's callback is now silent rather than loud.
+    """
+
+    def __init__(
+        self, events: EventSink | None, on_status: StatusCallback | None
+    ) -> None:
+        self._events = events
+        self._on_status = on_status
+        self._dispatch_tool: DispatchSubagentTool | None = None
+
+    def bind_dispatch_tool(self, dispatch_tool: DispatchSubagentTool) -> None:
+        self._dispatch_tool = dispatch_tool
+
+    def __call__(self, event: Event) -> None:
+        if (
+            isinstance(event, ToolCallStarted)
+            and event.tool_name == DISPATCH_TOOL_NAME
+            and self._dispatch_tool is not None
+        ):
+            self._dispatch_tool._set_event_context(
+                agent_id=event.agent_id,
+                run_id=event.run_id,
+                turn_id=event.turn_id,
+            )
+
+        emit(self._events, event)
+        if isinstance(event, SubagentSpawned):
+            _report(self._on_status, event.subagent_name, STATUS_PENDING)
+        elif isinstance(event, RunStarted):
+            _report(self._on_status, event.agent_name, STATUS_WORKING)
+        elif isinstance(event, RunFinished):
+            if event.stopped_reason == "final_response":
+                _report(self._on_status, event.agent_name, STATUS_DONE)
+            elif event.stopped_reason == "max_turns":
+                _report(self._on_status, event.agent_name, STATUS_EXHAUSTED)
+        elif isinstance(event, RunFailed):
+            _report(self._on_status, event.agent_name, STATUS_FAILED)
 
 _DISPATCH_DESCRIPTION = (
     "Dispatch a task to a named subagent. If subagent_name has not been "
@@ -157,6 +215,7 @@ class DispatchSubagentTool(LocalTool):
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
         on_status: StatusCallback | None = None,
         parent_agent_id: str | None = None,
+        events: EventSink | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
@@ -164,7 +223,23 @@ class DispatchSubagentTool(LocalTool):
         self._subagent_max_turns = subagent_max_turns
         self._on_status = on_status
         self._parent_agent_id = parent_agent_id
+        if events is None and on_status is not None:
+            standalone_events = _LeaderEventSink(None, on_status)
+            standalone_events.bind_dispatch_tool(self)
+            self._events: EventSink | None = standalone_events
+        else:
+            self._events = events
+        self._event_agent_id = parent_agent_id or ""
+        self._event_run_id = ""
+        self._event_turn_id: str | None = None
         self.pool: dict[str, SubagentRecord] = {}
+
+    def _set_event_context(
+        self, *, agent_id: str, run_id: str, turn_id: str | None
+    ) -> None:
+        self._event_agent_id = agent_id
+        self._event_run_id = run_id
+        self._event_turn_id = turn_id
 
     @property
     def name(self) -> str:
@@ -210,9 +285,18 @@ class DispatchSubagentTool(LocalTool):
                         f"cannot create new subagent {subagent_name!r}"
                     ),
                 )
-            _report(self._on_status, subagent_name, STATUS_PENDING)
             subagent_tools = standard_tool_registry()
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
+            emit(
+                self._events,
+                SubagentSpawned(
+                    agent_id=self._event_agent_id,
+                    run_id=self._event_run_id,
+                    turn_id=self._event_turn_id,
+                    subagent_name=subagent_name,
+                    subagent_agent_id=agent_ref.agent_id,
+                ),
+            )
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=self._subagent_provider,
@@ -221,27 +305,23 @@ class DispatchSubagentTool(LocalTool):
                     max_turns=self._subagent_max_turns,
                     tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
                     agent_ref=agent_ref,
+                    events=self._events,
                 ),
                 agent_ref=agent_ref,
             )
             self.pool[subagent_name] = record
 
         record.messages.append(Message(role=Role.USER, content=task))
-        _report(self._on_status, subagent_name, STATUS_WORKING)
         try:
             run_result = record.agent.run(record.messages, cancel=cancel)
         except OperationCancelled:
             raise
         except Exception:
-            _report(self._on_status, subagent_name, STATUS_FAILED)
             raise
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
 
         succeeded = run_result.stopped_reason == "final_response"
-        if run_result.stopped_reason != "cancelled":
-            _report(self._on_status, subagent_name, STATUS_DONE if succeeded else STATUS_EXHAUSTED)
-
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,
@@ -277,6 +357,7 @@ class LeaderConfig:
     approval_callback: ApprovalCallback | None = None
     chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
     chat_recent_turns: int = DEFAULT_RECENT_TURNS
+    events: EventSink | None = None
 
 
 @dataclass
@@ -303,6 +384,8 @@ class Leader:
     def __init__(self, config: LeaderConfig) -> None:
         self._config = config
         self._agent_ref = new_agent_ref("leader")
+        self._event_sink = _LeaderEventSink(config.events, config.on_status)
+        self._last_run_id: str | None = None
         subagent_policy = PermissionPolicy(
             repo_root=config.repo_root,
             mode=config.permission_mode,
@@ -315,7 +398,9 @@ class Leader:
             subagent_max_turns=config.subagent_max_turns,
             on_status=config.on_status,
             parent_agent_id=self._agent_ref.agent_id,
+            events=self._event_sink,
         )
+        self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_policy = PermissionPolicy(
             repo_root=config.repo_root,
             mode=config.permission_mode,
@@ -328,6 +413,7 @@ class Leader:
             max_turns=config.max_leader_turns,
             tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.wire_format)],
             agent_ref=self._agent_ref,
+            events=self._event_sink,
         )
         self._chat_messages: list[Message] = []
 
@@ -338,19 +424,13 @@ class Leader:
     def _run_messages(
         self, messages: list[Message], *, cancel: CancellationToken | None = None
     ) -> LeaderRunResult:
-        _report(self._config.on_status, "leader", STATUS_WORKING)
         try:
             result = self._agent.run(messages, cancel=cancel)
         except OperationCancelled:
             raise
         except Exception:
-            _report(self._config.on_status, "leader", STATUS_FAILED)
             raise
-        if result.stopped_reason != "cancelled":
-            terminal_status = (
-                STATUS_DONE if result.stopped_reason == "final_response" else STATUS_EXHAUSTED
-            )
-            _report(self._config.on_status, "leader", terminal_status)
+        self._last_run_id = result.run.run_id
         return LeaderRunResult(
             final_answer=result.final_response.message.text,
             leader_messages=result.messages,
@@ -403,6 +483,17 @@ class Leader:
             cancel=cancel,
         )
         self._chat_messages = result.messages
+        if result.changed:
+            emit(
+                self._event_sink,
+                CompactionApplied(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=self._last_run_id or "",
+                    before_tokens=result.before_tokens,
+                    after_tokens=result.after_tokens,
+                    dropped_messages=result.dropped_messages,
+                ),
+            )
         return result
 
     def chat(

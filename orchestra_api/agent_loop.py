@@ -13,6 +13,17 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
+from orchestra_api.events import (
+    EventSink,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    ToolCallFinished,
+    ToolCallStarted,
+    TurnFinished,
+    TurnStarted,
+    emit,
+)
 from orchestra_api.identity import AgentRef, RunRef, new_agent_ref, new_run_ref, new_turn_ref
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolResult
 from orchestra_api.permissions import PermissionPolicy
@@ -46,6 +57,7 @@ class ApiAgent:
         tool_schemas: list[dict] | None = None,
         *,
         agent_ref: AgentRef | None = None,
+        events: EventSink | None = None,
     ) -> None:
         if max_turns < 1:
             raise ValueError(f"max_turns must be >= 1, got {max_turns}")
@@ -54,6 +66,7 @@ class ApiAgent:
         self._policy = policy
         self._max_turns = max_turns
         self._agent_ref = agent_ref or new_agent_ref("agent")
+        self._events = events
         # Schemas actually sent to the model so it knows these tools exist.
         # `tools` above is only the *execution* registry, keyed by name --
         # without this, a real provider is never told any tool exists and
@@ -71,13 +84,33 @@ class ApiAgent:
         model: str | None = None,
         parent_run_id: str | None = None,
         cancel: CancellationToken | None = None,
+        events: EventSink | None = None,
     ) -> AgentRunResult:
         run_ref = new_run_ref(self._agent_ref.agent_id, parent_run_id)
+        event_sink = events if events is not None else self._events
         conversation = list(messages)
         response: ModelResponse | None = None
-        for turn in range(1, self._max_turns + 1):
-            turn_ref = new_turn_ref(run_ref.run_id, turn)
-            try:
+        turn = 0
+        try:
+            emit(
+                event_sink,
+                RunStarted(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    agent_name=self._agent_ref.name,
+                ),
+            )
+            for turn in range(1, self._max_turns + 1):
+                turn_ref = new_turn_ref(run_ref.run_id, turn)
+                emit(
+                    event_sink,
+                    TurnStarted(
+                        agent_id=self._agent_ref.agent_id,
+                        run_id=run_ref.run_id,
+                        turn_id=turn_ref.turn_id,
+                        index=turn,
+                    ),
+                )
                 if cancel is not None:
                     cancel.raise_if_cancelled()
                 request = ModelRequest(
@@ -94,7 +127,16 @@ class ApiAgent:
                 )
                 conversation.append(response.message)
                 if not response.has_tool_calls:
-                    return AgentRunResult(
+                    emit(
+                        event_sink,
+                        TurnFinished(
+                            agent_id=self._agent_ref.agent_id,
+                            run_id=run_ref.run_id,
+                            turn_id=turn_ref.turn_id,
+                            index=turn,
+                        ),
+                    )
+                    result = AgentRunResult(
                         final_response=response,
                         messages=conversation,
                         turns_used=turn,
@@ -102,37 +144,111 @@ class ApiAgent:
                         run=run_ref,
                         agent=self._agent_ref,
                     )
+                    emit(
+                        event_sink,
+                        RunFinished(
+                            agent_id=self._agent_ref.agent_id,
+                            run_id=run_ref.run_id,
+                            agent_name=self._agent_ref.name,
+                            stopped_reason="final_response",
+                        ),
+                    )
+                    return result
                 for tool_call in response.message.tool_calls:
+                    emit(
+                        event_sink,
+                        ToolCallStarted(
+                            agent_id=self._agent_ref.agent_id,
+                            run_id=run_ref.run_id,
+                            turn_id=turn_ref.turn_id,
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                        ),
+                    )
                     tool = self._tools.get(tool_call.name)
                     if tool is None:
-                        result = ToolResult(
+                        tool_result = ToolResult(
                             tool_call_id=tool_call.id,
                             ok=False,
                             error=f"unknown tool: {tool_call.name!r}",
                         )
                     else:
-                        result = tool.execute(tool_call, self._policy, cancel=cancel)
+                        tool_result = tool.execute(tool_call, self._policy, cancel=cancel)
                     conversation.append(
-                        Message(role=Role.TOOL, tool_result=result, turn_id=turn_ref.turn_id)
+                        Message(role=Role.TOOL, tool_result=tool_result, turn_id=turn_ref.turn_id)
                     )
+                    emit(
+                        event_sink,
+                        ToolCallFinished(
+                            agent_id=self._agent_ref.agent_id,
+                            run_id=run_ref.run_id,
+                            turn_id=turn_ref.turn_id,
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                            ok=tool_result.ok,
+                        ),
+                    )
+                emit(
+                    event_sink,
+                    TurnFinished(
+                        agent_id=self._agent_ref.agent_id,
+                        run_id=run_ref.run_id,
+                        turn_id=turn_ref.turn_id,
+                        index=turn,
+                    ),
+                )
+            assert response is not None
+            result = AgentRunResult(
+                final_response=response,
+                messages=conversation,
+                turns_used=self._max_turns,
+                stopped_reason="max_turns",
+                run=run_ref,
+                agent=self._agent_ref,
+            )
+            emit(
+                event_sink,
+                RunFinished(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    agent_name=self._agent_ref.name,
+                    stopped_reason="max_turns",
+                ),
+            )
+            return result
+        except OperationCancelled:
+            cancelled_response = response or ModelResponse(
+                message=Message(role=Role.ASSISTANT), stop_reason="cancelled"
+            )
+            result = AgentRunResult(
+                final_response=cancelled_response,
+                messages=conversation,
+                turns_used=max(turn, 1),
+                stopped_reason="cancelled",
+                run=run_ref,
+                agent=self._agent_ref,
+            )
+            try:
+                emit(
+                    event_sink,
+                    RunFinished(
+                        agent_id=self._agent_ref.agent_id,
+                        run_id=run_ref.run_id,
+                        agent_name=self._agent_ref.name,
+                        stopped_reason="cancelled",
+                    ),
+                )
             except OperationCancelled:
-                cancelled_response = response or ModelResponse(
-                    message=Message(role=Role.ASSISTANT), stop_reason="cancelled"
-                )
-                return AgentRunResult(
-                    final_response=cancelled_response,
-                    messages=conversation,
-                    turns_used=turn,
-                    stopped_reason="cancelled",
-                    run=run_ref,
-                    agent=self._agent_ref,
-                )
-        assert response is not None  # loop runs at least once since max_turns >= 1
-        return AgentRunResult(
-            final_response=response,
-            messages=conversation,
-            turns_used=self._max_turns,
-            stopped_reason="max_turns",
-            run=run_ref,
-            agent=self._agent_ref,
-        )
+                pass
+            return result
+        except Exception as exc:
+            emit(
+                event_sink,
+                RunFailed(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    agent_name=self._agent_ref.name,
+                    error=str(exc),
+                ),
+            )
+            raise
