@@ -20,7 +20,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
+from orchestra_api.identity import new_id
+from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage, wire_tool_call_ids
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
@@ -36,20 +37,20 @@ _ROLE_TO_OPENAI = {
 }
 
 
-def _to_openai_message(message: Message) -> dict[str, Any]:
+def _to_openai_message(message: Message, id_map: dict[str, str]) -> dict[str, Any]:
     if message.role == Role.TOOL:
         result = message.tool_result
         assert result is not None, "tool-role Message must carry a tool_result"
         return {
             "role": "tool",
-            "tool_call_id": result.tool_call_id,
+            "tool_call_id": id_map.get(result.tool_call_id, result.tool_call_id),
             "content": result.content if result.ok else (result.error or ""),
         }
-    out: dict[str, Any] = {"role": _ROLE_TO_OPENAI[message.role], "content": message.content or None}
+    out: dict[str, Any] = {"role": _ROLE_TO_OPENAI[message.role], "content": message.text or None}
     if message.role == Role.ASSISTANT and message.tool_calls:
         out["tool_calls"] = [
             {
-                "id": tc.id,
+                "id": tc.vendor_id or tc.id,
                 "type": "function",
                 "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
             }
@@ -59,9 +60,10 @@ def _to_openai_message(message: Message) -> dict[str, Any]:
 
 
 def _build_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
+    id_map = wire_tool_call_ids(request.messages)
     body: dict[str, Any] = {
         "model": model,
-        "messages": [_to_openai_message(m) for m in request.messages],
+        "messages": [_to_openai_message(m, id_map) for m in request.messages],
     }
     if request.tools:
         body["tools"] = request.tools
@@ -72,6 +74,15 @@ def _build_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
     return body
 
 
+def _synthesize_tool_call_id() -> str:
+    """Build a fallback canonical id for tool calls that arrive without one.
+
+    Must not be position-based: the same index in a later turn would reuse
+    the id, leaving two distinct calls sharing a `tool_call_id`.
+    """
+    return new_id("call")
+
+
 def _parse_response(data: dict[str, Any]) -> ModelResponse:
     choices = data.get("choices") or []
     if not choices:
@@ -80,12 +91,21 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     tool_calls: list[ToolCall] = []
     for tc in message_raw.get("tool_calls") or []:
         function = tc.get("function", {})
+        name = function.get("name", "")
+        vendor_id = tc.get("id") or None
         raw_args = function.get("arguments", "{}")
         try:
             arguments = json.loads(raw_args) if raw_args else {}
         except json.JSONDecodeError as exc:
             raise ProviderError(f"OpenAI tool call arguments were not valid JSON: {exc}") from None
-        tool_calls.append(ToolCall(id=tc.get("id", ""), name=function.get("name", ""), arguments=arguments))
+        tool_calls.append(
+            ToolCall(
+                id=vendor_id or _synthesize_tool_call_id(),
+                name=name,
+                arguments=arguments,
+                vendor_id=vendor_id,
+            )
+        )
 
     usage_raw = data.get("usage", {})
     message = Message(role=Role.ASSISTANT, content=message_raw.get("content") or "", tool_calls=tool_calls)

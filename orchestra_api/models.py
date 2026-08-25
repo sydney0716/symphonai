@@ -9,9 +9,44 @@ implement the runtime provider interface -- see
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from orchestra_api.identity import SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class TextBlock:
+    """A run of plain text in a message."""
+
+    text: str
+    schema_version: int = SCHEMA_VERSION
+
+
+# The union of message content block types. Phase 02 extends this with
+# image and document blocks; nothing outside models.py may assume the
+# union has exactly one member.
+ContentBlock = TextBlock
+
+# Accepted at construction time and normalized by Message.__post_init__.
+ContentInput = str | ContentBlock | Sequence[str | ContentBlock] | None
+
+
+def _normalize_content(value: ContentInput) -> tuple[ContentBlock, ...]:
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        return (TextBlock(text=value),)
+    if isinstance(value, TextBlock):
+        return (value,)
+    if isinstance(value, Sequence):
+        blocks: list[ContentBlock] = []
+        for item in value:
+            blocks.extend(_normalize_content(item))
+        return tuple(blocks)
+    raise TypeError(f"unsupported message content type: {type(value).__name__}")
 
 
 class Role(str, Enum):
@@ -53,6 +88,8 @@ class ToolCall:
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+    vendor_id: str | None = None
+    schema_version: int = SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -67,6 +104,7 @@ class ToolResult:
     ok: bool
     content: str = ""
     error: str | None = None
+    schema_version: int = SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -79,9 +117,33 @@ class Message:
     """
 
     role: Role
-    content: str = ""
+    content: ContentInput = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_result: ToolResult | None = None
+    turn_id: str | None = None
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "content", _normalize_content(self.content))
+
+    @property
+    def text(self) -> str:
+        """All text blocks concatenated. The str view every caller wants."""
+        return "".join(block.text for block in self.content if isinstance(block, TextBlock))
+
+
+def wire_tool_call_ids(messages: Sequence[Message]) -> dict[str, str]:
+    """Map canonical ToolCall.id to the id to send back on the wire.
+
+    Providers echoing a tool result must send the id the vendor gave them,
+    not our canonical one. Falls back to the canonical id when the vendor
+    supplied none.
+    """
+    return {
+        tool_call.id: tool_call.vendor_id or tool_call.id
+        for message in messages
+        for tool_call in message.tool_calls
+    }
 
 
 @dataclass(frozen=True)

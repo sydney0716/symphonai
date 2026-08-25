@@ -20,7 +20,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
+from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage, wire_tool_call_ids
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
@@ -31,7 +31,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
 
 
-def _to_anthropic_content(message: Message) -> list[dict[str, Any]] | str:
+def _to_anthropic_content(message: Message, id_map: dict[str, str]) -> list[dict[str, Any]] | str:
     """Build the `content` value for one outgoing Anthropic message."""
     if message.role == Role.TOOL:
         result = message.tool_result
@@ -39,21 +39,21 @@ def _to_anthropic_content(message: Message) -> list[dict[str, Any]] | str:
         return [
             {
                 "type": "tool_result",
-                "tool_use_id": result.tool_call_id,
+                "tool_use_id": id_map.get(result.tool_call_id, result.tool_call_id),
                 "content": result.content if result.ok else (result.error or ""),
                 "is_error": not result.ok,
             }
         ]
     if message.role == Role.ASSISTANT and message.tool_calls:
         blocks: list[dict[str, Any]] = []
-        if message.content:
-            blocks.append({"type": "text", "text": message.content})
+        if message.text:
+            blocks.append({"type": "text", "text": message.text})
         for tool_call in message.tool_calls:
             blocks.append(
-                {"type": "tool_use", "id": tool_call.id, "name": tool_call.name, "input": tool_call.arguments}
+                {"type": "tool_use", "id": tool_call.vendor_id or tool_call.id, "name": tool_call.name, "input": tool_call.arguments}
             )
         return blocks
-    return message.content
+    return message.text
 
 
 def _to_anthropic_role(role: Role) -> str:
@@ -63,13 +63,14 @@ def _to_anthropic_role(role: Role) -> str:
 
 
 def _build_request_body(request: ModelRequest, model: str, default_max_tokens: int) -> dict[str, Any]:
-    system_parts = [m.content for m in request.messages if m.role == Role.SYSTEM and m.content]
+    id_map = wire_tool_call_ids(request.messages)
+    system_parts = [m.text for m in request.messages if m.role == Role.SYSTEM and m.text]
     non_system = [m for m in request.messages if m.role != Role.SYSTEM]
     body: dict[str, Any] = {
         "model": model,
         "max_tokens": request.max_tokens or default_max_tokens,
         "messages": [
-            {"role": _to_anthropic_role(m.role), "content": _to_anthropic_content(m)} for m in non_system
+            {"role": _to_anthropic_role(m.role), "content": _to_anthropic_content(m, id_map)} for m in non_system
         ],
     }
     if system_parts:
@@ -89,7 +90,12 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             text_parts.append(block.get("text", ""))
         elif block.get("type") == "tool_use":
             tool_calls.append(
-                ToolCall(id=block["id"], name=block["name"], arguments=block.get("input", {}))
+                ToolCall(
+                    id=block["id"],
+                    name=block["name"],
+                    arguments=block.get("input", {}),
+                    vendor_id=block["id"],
+                )
             )
     usage_raw = data.get("usage", {})
     message = Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls)

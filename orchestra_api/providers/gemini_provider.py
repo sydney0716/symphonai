@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from orchestra_api.gemini_schema import sanitize_for_gemini
+from orchestra_api.identity import new_id
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
@@ -50,9 +51,15 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-flash-lite-latest"
 
 
-def _synthesize_tool_call_id(name: str, index: int) -> str:
-    """Build a stable fallback id for Gemini functionCalls that omit one."""
-    return f"gemini-{index}-{name}"
+def _synthesize_tool_call_id() -> str:
+    """Build a fallback canonical id for Gemini functionCalls that omit one.
+
+    Position-based ids (`gemini-{index}-{name}`) collided across turns: the
+    same function at the same part index in a later turn produced the same
+    id, so two distinct calls in one conversation shared a `tool_call_id`.
+    A fresh id per call keeps `ToolResult.tool_call_id` unambiguous.
+    """
+    return new_id("call")
 
 
 def _tool_call_names(messages: list[Message]) -> dict[str, str]:
@@ -99,13 +106,13 @@ def _build_contents(messages: list[Message]) -> list[dict[str, Any]]:
             continue
 
         parts: list[dict[str, Any]] = []
-        if message.content:
-            parts.append({"text": message.content})
+        if message.text:
+            parts.append({"text": message.text})
         for tool_call in message.tool_calls:
             function_call = {"name": tool_call.name, "args": tool_call.arguments}
             part = {"functionCall": function_call}
             if "thoughtSignature" in tool_call.provider_metadata:
-                function_call["id"] = tool_call.id
+                function_call["id"] = tool_call.vendor_id or tool_call.id
                 part["thoughtSignature"] = tool_call.provider_metadata["thoughtSignature"]
             parts.append(part)
         if not parts:
@@ -143,7 +150,7 @@ def _build_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _build_request_body(request: ModelRequest) -> dict[str, Any]:
     body: dict[str, Any] = {"contents": _build_contents(request.messages)}
 
-    system_parts = [m.content for m in request.messages if m.role == Role.SYSTEM and m.content]
+    system_parts = [m.text for m in request.messages if m.role == Role.SYSTEM and m.text]
     if system_parts:
         body["system_instruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
 
@@ -173,7 +180,7 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     candidate = candidates[0]
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    for index, part in enumerate(candidate.get("content", {}).get("parts", []) or []):
+    for part in candidate.get("content", {}).get("parts", []) or []:
         if "text" in part:
             text_parts.append(part["text"] or "")
         function_call = part.get("functionCall")
@@ -182,12 +189,14 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             provider_metadata = {}
             if "thoughtSignature" in part:
                 provider_metadata["thoughtSignature"] = part["thoughtSignature"]
+            vendor_id = function_call.get("id") or None
             tool_calls.append(
                 ToolCall(
-                    id=function_call.get("id") or _synthesize_tool_call_id(name, index),
+                    id=vendor_id or _synthesize_tool_call_id(),
                     name=name,
                     arguments=function_call.get("args") or {},
                     provider_metadata=provider_metadata,
+                    vendor_id=vendor_id,
                 )
             )
 

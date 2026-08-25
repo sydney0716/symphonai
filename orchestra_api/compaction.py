@@ -55,7 +55,7 @@ def estimate_message_tokens(message: Message) -> int:
     tokenizers, hidden protocol overhead, or vendor-specific tool-call formats.
     """
 
-    parts = [message.role.value, message.content]
+    parts = [message.role.value, message.text]
     if message.tool_calls:
         parts.extend(_tool_call_text(call) for call in message.tool_calls)
     if message.tool_result is not None:
@@ -234,7 +234,7 @@ def _summarize_dropped_messages(messages: list[Message], *, max_chars: int) -> s
 def _message_excerpts(messages: list[Message], *, limit: int) -> list[str]:
     excerpts: list[str] = []
     for message in messages:
-        snippet = _compact_whitespace(message.content)
+        snippet = _compact_whitespace(message.text)
         if not snippet and message.tool_calls:
             names = ", ".join(call.name for call in message.tool_calls)
             snippet = f"tool calls: {names}"

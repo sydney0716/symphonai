@@ -55,21 +55,36 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from orchestra_api.compaction import ContextCompactionError, compact_messages_for_budget  # noqa: E402
 from orchestra_api.model_discovery import list_models  # noqa: E402
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall  # noqa: E402
+from orchestra_api.models import (  # noqa: E402
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    TextBlock,
+    ToolCall,
+    ToolResult,
+)
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.anthropic_provider import (  # noqa: E402
     ANTHROPIC_VERSION,
     API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR,
 )
 from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
+from orchestra_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body  # noqa: E402
 from orchestra_api.providers.base import ProviderError  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 from orchestra_api.providers.gemini_provider import (  # noqa: E402
     API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
 )
 from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
+from orchestra_api.providers.gemini_provider import _build_request_body as _build_gemini_body  # noqa: E402
+from orchestra_api.providers.gemini_provider import _parse_response as _parse_gemini_response  # noqa: E402
 from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider  # noqa: E402
 from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider  # noqa: E402
+from orchestra_api.providers.openai_provider import (  # noqa: E402
+    _build_request_body as _build_openai_body,
+)
+from orchestra_api.providers.openai_provider import _parse_response as _parse_openai_response  # noqa: E402
 from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
 
 
@@ -83,6 +98,142 @@ def ok(msg: str) -> None:
 
 
 def main() -> None:
+    normalized = Message(role=Role.USER, content="hi")
+    if normalized.content != (TextBlock(text="hi"),) or normalized.text != "hi":
+        fail(f"string content was not normalized: {normalized!r}")
+    empty = Message(role=Role.USER, content="")
+    omitted = Message(role=Role.USER)
+    if empty.content != () or empty.text != "" or omitted.content != () or omitted.text != "":
+        fail(f"empty content was not normalized: empty={empty!r}, omitted={omitted!r}")
+    blocks = Message(role=Role.USER, content=[TextBlock("a"), TextBlock("b")])
+    if blocks.text != "ab":
+        fail(f"text blocks did not concatenate: {blocks!r}")
+    try:
+        Message(role=Role.USER, content=123)
+    except TypeError:
+        pass
+    else:
+        fail("unsupported message content should raise TypeError")
+    ok("Message content normalizes to immutable text blocks")
+
+    canonical_id = "canonical_internal_id"
+    vendor_id = "call_abc"
+    wire_messages = [
+        Message(role=Role.SYSTEM, content="system", turn_id="turn_internal"),
+        Message(role=Role.USER, content="question"),
+        Message(
+            role=Role.ASSISTANT,
+            content="calling",
+            tool_calls=[
+                ToolCall(
+                    id=canonical_id,
+                    vendor_id=vendor_id,
+                    name="lookup",
+                    arguments={"key": "value"},
+                    provider_metadata={"thoughtSignature": "opaque-signature"},
+                )
+            ],
+        ),
+        Message(
+            role=Role.TOOL,
+            tool_result=ToolResult(tool_call_id=canonical_id, ok=True, content="result"),
+        ),
+    ]
+    wire_request = ModelRequest(messages=wire_messages)
+    wire_bodies = [
+        _build_openai_body(wire_request, "test-model"),
+        _build_anthropic_body(wire_request, "test-model", 100),
+        _build_gemini_body(wire_request),
+    ]
+    for body in wire_bodies:
+        serialized = json.dumps(body)
+        if vendor_id not in serialized or canonical_id in serialized:
+            fail(f"provider body did not preserve the vendor id boundary: {body!r}")
+        if "turn_internal" in serialized or "schema_version" in serialized:
+            fail(f"internal record fields leaked onto the wire: {body!r}")
+
+    fallback_messages = [
+        Message(
+            role=Role.ASSISTANT,
+            tool_calls=[
+                ToolCall(
+                    id=canonical_id,
+                    name="lookup",
+                    provider_metadata={"thoughtSignature": "opaque-signature"},
+                )
+            ],
+        ),
+        Message(
+            role=Role.TOOL,
+            tool_result=ToolResult(tool_call_id=canonical_id, ok=True, content="result"),
+        ),
+    ]
+    fallback_request = ModelRequest(messages=fallback_messages)
+    fallback_bodies = [
+        _build_openai_body(fallback_request, "test-model"),
+        _build_anthropic_body(fallback_request, "test-model", 100),
+        _build_gemini_body(fallback_request),
+    ]
+    if not all(canonical_id in json.dumps(body) for body in fallback_bodies):
+        fail(f"canonical id fallback did not reach every provider wire body: {fallback_bodies!r}")
+    ok("provider request bodies keep internal fields private and echo the correct tool-call id")
+
+    missing_id_response = _parse_openai_response(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [{"function": {"name": "lookup", "arguments": "{}"}}]
+                    }
+                }
+            ]
+        }
+    )
+    missing_id_call = missing_id_response.message.tool_calls[0]
+    if not missing_id_call.id or missing_id_call.vendor_id is not None:
+        fail(f"OpenAI missing-id fallback was not canonical-only: {missing_id_call!r}")
+    ok("OpenAI tool calls missing a vendor id receive a non-empty canonical id")
+
+    # Synthesized ids must not be position-based: the same tool at the same
+    # index in a later turn would otherwise reuse the id, leaving two distinct
+    # calls in one conversation sharing a tool_call_id.
+    two_missing_ids = {
+        _parse_openai_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {"function": {"name": "lookup", "arguments": "{}"}}
+                            ]
+                        }
+                    }
+                ]
+            }
+        ).message.tool_calls[0].id
+        for _ in range(2)
+    }
+    gemini_missing_ids = {
+        _parse_gemini_response(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"functionCall": {"name": "lookup", "args": {}}}]
+                        }
+                    }
+                ]
+            }
+        ).message.tool_calls[0].id
+        for _ in range(2)
+    }
+    if len(two_missing_ids) != 2 or len(gemini_missing_ids) != 2:
+        fail(
+            "synthesized tool-call ids collided across turns: "
+            f"openai={two_missing_ids!r}, gemini={gemini_missing_ids!r}"
+        )
+    ok("synthesized tool-call ids are unique per call, not position-based")
+
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "existing.txt").write_text("hello from disk")
@@ -104,13 +255,27 @@ def main() -> None:
         result = run_task(provider, policy, "read existing.txt then finish")
         if result.stopped_reason != "final_response":
             fail(f"expected stopped_reason='final_response', got {result.stopped_reason!r}")
-        if result.final_response.message.content != "task complete":
+        if result.final_response.message.text != "task complete":
             fail("final response content mismatch")
         tool_messages = [m for m in result.messages if m.role == Role.TOOL]
         if not tool_messages or not tool_messages[0].tool_result.ok:
             fail("expected the read_file tool call to succeed")
         if tool_messages[0].tool_result.content != "hello from disk":
             fail("read_file returned unexpected content")
+        appended = [message for message in result.messages if message.role in (Role.ASSISTANT, Role.TOOL)]
+        if any(message.turn_id is None for message in appended):
+            fail(f"agent-appended messages were not stamped with turn ids: {appended!r}")
+        if appended[0].turn_id != appended[1].turn_id:
+            fail(f"assistant tool call and result must share a turn id: {appended!r}")
+        if result.run.agent_id != result.agent.agent_id:
+            fail(f"agent run owner link is inconsistent: {result!r}")
+        if result.final_response.message.turn_id != result.messages[-1].turn_id:
+            fail(
+                "final_response carries a different turn identity than the same "
+                f"message in the transcript: {result.final_response.message!r}"
+            )
+        if result.final_response.message.turn_id is None:
+            fail("final_response.message was returned without a turn id")
         ok("full ApiAgent run (tool-call turn -> final answer) via FakeModelProvider")
 
         # -- allow path: read/list/write inside repo_root + allowed_write_scope --
@@ -249,7 +414,7 @@ def main() -> None:
                 with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
                     with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
                         retry_response = GeminiProvider().create_response(basic_request)
-        if retry_response.message.content != "retry worked" or urlopen_mock.call_count != 2:
+        if retry_response.message.text != "retry worked" or urlopen_mock.call_count != 2:
             fail("expected Gemini HTTP 503 to retry once and then succeed")
         if urlopen_mock.call_args_list[0].args[0] is not urlopen_mock.call_args_list[1].args[0]:
             fail("expected retry transport to resend the same prepared Request object")
@@ -267,7 +432,7 @@ def main() -> None:
                 with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
                     with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
                         timeout_response = OpenAIProvider().create_response(basic_request)
-        if timeout_response.message.content != "timeout recovered" or urlopen_mock.call_count != 2:
+        if timeout_response.message.text != "timeout recovered" or urlopen_mock.call_count != 2:
             fail("expected TimeoutError to retry once and then succeed")
         sleep_mock.assert_called_once_with(0.5)
         ok("retry: transport TimeoutError retries and succeeds with sleep patched")
@@ -285,7 +450,7 @@ def main() -> None:
                 with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
                     with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
                         url_error_response = OpenAIProvider().create_response(basic_request)
-        if url_error_response.message.content != "URL error recovered" or urlopen_mock.call_count != 2:
+        if url_error_response.message.text != "URL error recovered" or urlopen_mock.call_count != 2:
             fail("expected transient URLError to retry once and then succeed")
         sleep_mock.assert_called_once_with(0.5)
         ok("retry: transient URLError retries and succeeds with sleep patched")
@@ -322,7 +487,7 @@ def main() -> None:
                 with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
                     with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
                         incomplete_response = OpenAIProvider().create_response(basic_request)
-        if incomplete_response.message.content != "incomplete read recovered" or urlopen_mock.call_count != 2:
+        if incomplete_response.message.text != "incomplete read recovered" or urlopen_mock.call_count != 2:
             fail("expected IncompleteRead to retry once and then succeed")
         sleep_mock.assert_called_once_with(0.5)
         ok("retry: truncated response body retries and succeeds with sleep patched")
@@ -989,7 +1154,12 @@ def main() -> None:
             budget=140,
             recent_turns=1,
         )
-        compacted_contents = [message.content for message in compact_over.messages]
+        compacted_contents = [message.text for message in compact_over.messages]
+        if not all(
+            isinstance(message, Message) and isinstance(message.content, tuple)
+            for message in compact_over.messages
+        ):
+            fail(f"compaction returned non-canonical message shapes: {compact_over.messages!r}")
         if not compact_over.changed or compact_over.dropped_messages < 1:
             fail(f"expected over-budget conversation to compact, got {compact_over}")
         if compact_over.after_tokens > compact_over.budget:

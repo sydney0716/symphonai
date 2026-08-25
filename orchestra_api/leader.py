@@ -30,6 +30,7 @@ from orchestra_api.compaction import (
     compact_messages_for_budget,
 )
 from orchestra_api.gemini_schema import sanitize_for_gemini
+from orchestra_api.identity import AgentRef, RunRef, new_agent_ref
 from orchestra_api.models import Message, Role, ToolCall, ToolResult
 from orchestra_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
@@ -131,6 +132,7 @@ class SubagentRecord:
     """One named subagent's live state within a single leader run."""
 
     agent: ApiAgent
+    agent_ref: AgentRef
     messages: list[Message] = field(default_factory=list)
     turns_used: int = 0
 
@@ -153,12 +155,14 @@ class DispatchSubagentTool(LocalTool):
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
         on_status: StatusCallback | None = None,
+        parent_agent_id: str | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
         self._on_status = on_status
+        self._parent_agent_id = parent_agent_id
         self.pool: dict[str, SubagentRecord] = {}
 
     @property
@@ -200,6 +204,7 @@ class DispatchSubagentTool(LocalTool):
                 )
             _report(self._on_status, subagent_name, STATUS_PENDING)
             subagent_tools = standard_tool_registry()
+            agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=self._subagent_provider,
@@ -207,7 +212,9 @@ class DispatchSubagentTool(LocalTool):
                     policy=self._subagent_policy,
                     max_turns=self._subagent_max_turns,
                     tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
-                )
+                    agent_ref=agent_ref,
+                ),
+                agent_ref=agent_ref,
             )
             self.pool[subagent_name] = record
 
@@ -227,7 +234,7 @@ class DispatchSubagentTool(LocalTool):
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,
-            content=run_result.final_response.message.content,
+            content=run_result.final_response.message.text,
             error=None if succeeded else "subagent reached max_turns without a final answer",
         )
 
@@ -261,6 +268,8 @@ class LeaderRunResult:
     leader_messages: list[Message]
     stopped_reason: str
     subagents: dict[str, SubagentRecord]
+    run: RunRef
+    agent: AgentRef
 
 
 class Leader:
@@ -274,6 +283,7 @@ class Leader:
 
     def __init__(self, config: LeaderConfig) -> None:
         self._config = config
+        self._agent_ref = new_agent_ref("leader")
         subagent_policy = PermissionPolicy(
             repo_root=config.repo_root,
             mode=config.permission_mode,
@@ -285,6 +295,7 @@ class Leader:
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
             on_status=config.on_status,
+            parent_agent_id=self._agent_ref.agent_id,
         )
         leader_policy = PermissionPolicy(
             repo_root=config.repo_root,
@@ -297,6 +308,7 @@ class Leader:
             policy=leader_policy,
             max_turns=config.max_leader_turns,
             tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.wire_format)],
+            agent_ref=self._agent_ref,
         )
         self._chat_messages: list[Message] = []
 
@@ -316,10 +328,12 @@ class Leader:
         )
         _report(self._config.on_status, "leader", terminal_status)
         return LeaderRunResult(
-            final_answer=result.final_response.message.content,
+            final_answer=result.final_response.message.text,
             leader_messages=result.messages,
             stopped_reason=result.stopped_reason,
             subagents=self._dispatch_tool.pool,
+            run=result.run,
+            agent=result.agent,
         )
 
     def run(self, goal: str, *, system_prompt: str | None = None) -> LeaderRunResult:

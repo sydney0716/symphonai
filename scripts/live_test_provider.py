@@ -91,7 +91,7 @@ def run_live(provider_name: str, prompt: str, model: str | None = None) -> int:
         print(f"FAIL: {exc}")
         return 1
 
-    print(f"Response: {response.message.content!r}")
+    print(f"Response: {response.message.text!r}")
     print(f"Usage: input={response.usage.input_tokens} output={response.usage.output_tokens}")
     print(f"Stop reason: {response.stop_reason}")
     return 0

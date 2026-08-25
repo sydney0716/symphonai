@@ -87,7 +87,12 @@ def main() -> None:
                                 id="lc1",
                                 name="dispatch_subagent",
                                 arguments={"subagent_name": "researcher", "task": "why is the sky blue?"},
-                            )
+                            ),
+                            ToolCall(
+                                id="lc2",
+                                name="dispatch_subagent",
+                                arguments={"subagent_name": "reviewer", "task": "check the explanation"},
+                            ),
                         ],
                     )
                 ),
@@ -100,10 +105,24 @@ def main() -> None:
 
         if result.stopped_reason != "final_response":
             fail(f"expected stopped_reason='final_response', got {result.stopped_reason!r}")
-        if "researcher" not in result.subagents:
-            fail("expected a 'researcher' subagent in the pool")
+        if set(result.subagents) != {"researcher", "reviewer"}:
+            fail(f"expected two distinct subagents in the pool, got {result.subagents!r}")
         if not result.final_answer:
             fail("expected a non-empty final answer")
+        subagent_refs = [record.agent_ref for record in result.subagents.values()]
+        if any(ref.parent_agent_id != result.agent.agent_id for ref in subagent_refs):
+            fail(f"subagent parent links do not point to the leader: {subagent_refs!r}")
+        if len({ref.agent_id for ref in subagent_refs}) != 2:
+            fail(f"distinct subagents reused an agent id: {subagent_refs!r}")
+        if result.run.agent_id != result.agent.agent_id:
+            fail(f"leader run owner link is inconsistent: {result!r}")
+        agent_ids = [result.agent.agent_id, *(ref.agent_id for ref in subagent_refs)]
+        if len(set(agent_ids)) != 3:
+            fail(f"leader and subagent ids are not unique: {agent_ids!r}")
+        if not all(agent_id.startswith("agent_") for agent_id in agent_ids):
+            fail(f"agent identity prefixes are invalid: {agent_ids!r}")
+        if not result.run.run_id.startswith("run_"):
+            fail(f"run identity prefix is invalid: {result.run.run_id!r}")
         ok(f"Leader.run() dispatched a subagent and reached a final answer: {result.final_answer!r}")
 
         # -- create / reuse / isolate / max_subagents, exercised directly on the tool --
@@ -471,7 +490,7 @@ def main() -> None:
         second = chat_leader.chat("do you remember what I said?")
         if len(second.leader_messages) != 4:
             fail(f"expected 4 messages after second chat() call (history carried forward), got {len(second.leader_messages)}")
-        contents = [m.content for m in second.leader_messages]
+        contents = [m.text for m in second.leader_messages]
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
         ok("Leader.chat() persists conversation across calls")
