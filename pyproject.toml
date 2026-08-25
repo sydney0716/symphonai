@@ -1,11 +1,11 @@
 [project]
-name = "orchestra-mcp"
+name = "orchestra"
 version = "0.1.0"
-description = "Local MCP server for managing Orchestra task/worker/run state and Git worktrees."
+description = "A customizable coding-agent runtime and terminal UI."
 requires-python = ">=3.10"
-dependencies = [
-    "mcp>=1.0,<2",
-]
+# The runtime is standard-library only. Textual is the sole dependency and it
+# is optional, so `orchestra_api` imports and runs anywhere Python does.
+dependencies = []
 
 [project.optional-dependencies]
 tui = ["textual>=8,<9"]
@@ -15,4 +15,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["orchestra_mcp*"]
+include = ["orchestra_api*", "orchestra_tui*"]

@@ -14,7 +14,7 @@ since been cross-checked against the provider registry of
 against these endpoints. Each entry's `notes` records what that
 cross-check found. Nothing here has been probed against a live account --
 no key for any of these vendors exists in this project -- so treat an
-entry the same way `orchestra_agents/probes.py` treats its CLI flags: a
+entry as a
 starting point to check against the vendor's current docs, never a fact to
 rely on. If a call fails with a 404 or an unknown-model error, suspect
 this file first.
