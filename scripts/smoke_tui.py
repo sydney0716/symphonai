@@ -10,16 +10,26 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from orchestra_api.cancellation import CancellationToken  # noqa: E402
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
+from orchestra_api.events import Event  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
-from orchestra_tui.app import OrchestraTuiApp, ToolApprovalScreen  # noqa: E402
+from orchestra_tui.app import (  # noqa: E402
+    AGENT_STATE_CANCELLED,
+    AGENT_STATE_DONE,
+    AGENT_STATE_EXHAUSTED,
+    AGENT_STATE_FAILED,
+    OrchestraTuiApp,
+    ToolApprovalScreen,
+)
 from orchestra_tui.picker import (  # noqa: E402
     ProviderConfirmationScreen,
     ProviderPickerScreen,
@@ -46,8 +56,33 @@ class FailingProvider(ModelProvider):
     def wire_format(self) -> int:
         return 4
 
-    def create_response(self, request: ModelRequest) -> ModelResponse:
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
         raise ProviderError("scripted provider failure")
+
+
+class BlockingProvider(ModelProvider):
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    @property
+    def name(self) -> str:
+        return "blocking"
+
+    @property
+    def wire_format(self) -> int:
+        return 4
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        self.started.set()
+        while not self.release.wait(0.01):
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+        return ModelResponse(message=Message(role=Role.ASSISTANT, content="released"))
 
 
 async def wait_until(pilot, predicate, label: str, timeout: float = 5.0) -> None:  # noqa: ANN001
@@ -105,19 +140,18 @@ async def smoke_success_case(root: Path) -> None:
         )
         ok("submitting a message produces an assistant reply in the chat log")
 
-        expected_events = {
+        expected_events = [
             ("leader", "working"),
             ("researcher", "pending"),
             ("researcher", "working"),
             ("researcher", "done"),
             ("leader", "done"),
-        }
-        missing = expected_events.difference(app.status_entries)
-        if missing:
-            fail(f"missing status events: {sorted(missing)!r}")
+        ]
+        if app.status_entries != expected_events:
+            fail(f"unexpected ordered status events: {app.status_entries!r}")
         if "researcher: done" not in app.visible_status_text:
             fail(f"status panel did not show researcher done state: {app.visible_status_text!r}")
-        ok("on_status events reach the subagent status panel")
+        ok("typed events reach the status panel in lifecycle order")
 
         if app.query_one("#message-input", Input).disabled:
             fail("input stayed disabled after successful turn")
@@ -147,6 +181,118 @@ async def smoke_error_case(root: Path) -> None:
         ok("provider errors render visibly and leave the app usable")
 
 
+async def smoke_stop_case(root: Path) -> None:
+    provider = BlockingProvider()
+    app = OrchestraTuiApp(
+        leader_provider=provider,
+        subagent_provider=FakeModelProvider(),
+        repo_root=root,
+        confirm_real_providers=False,
+    )
+    async with app.run_test(size=(64, 18)) as pilot:
+        await submit_message(pilot, "block until stopped")
+        await wait_until(pilot, provider.started.is_set, "blocking provider call")
+        await pilot.press("escape")
+        await wait_until(
+            pilot,
+            lambda: not app.query_one("#message-input", Input).disabled,
+            "cancelled turn completion",
+        )
+        if ("leader", AGENT_STATE_CANCELLED) not in app.status_entries:
+            fail(f"cancelled leader state was not shown: {app.status_entries!r}")
+        if ("system", "Turn stopped; answer may be incomplete.") not in app.chat_entries:
+            fail(f"cancelled turn was not reported as a deliberate stop: {app.chat_entries!r}")
+        if any(label == "error" for label, _ in app.chat_entries):
+            fail(f"cancelled turn rendered an error line: {app.chat_entries!r}")
+        if app._cancel_token is not None:  # noqa: SLF001
+            fail("cancel token was not cleared after cancellation")
+        if any(label == "leader" and not message for label, message in app.chat_entries):
+            fail(f"cancelled turn wrote an empty leader line: {app.chat_entries!r}")
+        ok("escape cancels an in-flight turn and restores the input")
+
+
+async def smoke_stop_before_worker_starts_case(root: Path) -> None:
+    """The cancel token must exist before the worker thread is scheduled.
+
+    It used to be created inside the worker, leaving a window in which the
+    turn was in flight but no token existed, so a Stop pressed in that window
+    was silently dropped. Racing that window is not reproducible, so this
+    stubs the worker out entirely and asserts the invariant directly: once
+    on_input_submitted has marked the turn in flight, a token exists.
+    """
+    app = OrchestraTuiApp(
+        leader_provider=FakeModelProvider(),
+        subagent_provider=FakeModelProvider(),
+        repo_root=root,
+        confirm_real_providers=False,
+    )
+    async with app.run_test(size=(64, 18)) as pilot:
+        started: list[str] = []
+        app._run_leader_turn = lambda prompt: started.append(prompt)  # noqa: SLF001
+        await submit_message(pilot, "stop me immediately")
+        if not started:
+            fail("the leader worker was never scheduled")
+        if not app._turn_in_flight:  # noqa: SLF001
+            fail("turn was not marked in flight after submitting")
+        if app._cancel_token is None:  # noqa: SLF001
+            fail("no cancel token existed once the turn was in flight")
+        # And Stop must act on it rather than early-returning.
+        app.action_stop_turn()
+        if not app._cancel_token.cancelled:  # noqa: SLF001
+            fail("stop did not cancel the token created before the worker started")
+        ok("a stop pressed before the worker starts still cancels the turn")
+
+
+async def smoke_unknown_event_case(root: Path) -> None:
+    """An unhandled event type must be loud to a developer, not silently dropped.
+
+    events.emit swallows sink exceptions at runtime, so this guard can only be
+    observed by calling the sink directly -- which is exactly what this does.
+    """
+    app = OrchestraTuiApp(
+        leader_provider=FakeModelProvider(),
+        subagent_provider=FakeModelProvider(),
+        repo_root=root,
+        confirm_real_providers=False,
+    )
+
+    class _UnknownEvent(Event):
+        pass
+
+    try:
+        app._events_from_worker(_UnknownEvent(agent_id="a", run_id="r"))  # noqa: SLF001
+    except TypeError:
+        ok("an unhandled event type raises rather than being silently ignored")
+    else:
+        fail("an unhandled event type was silently ignored by the TUI sink")
+
+
+async def smoke_idle_stop_case(root: Path) -> None:
+    app = OrchestraTuiApp(
+        leader_provider=FakeModelProvider(),
+        subagent_provider=FakeModelProvider(),
+        repo_root=root,
+    )
+    async with app.run_test(size=(50, 12)) as pilot:
+        before = (
+            list(app.status_entries),
+            list(app.chat_entries),
+            app.visible_status_text,
+            str(app.query_one("#turn-status", Static).content),
+        )
+        await pilot.press("escape")
+        await pilot.pause()
+        after = (
+            app.status_entries,
+            app.chat_entries,
+            app.visible_status_text,
+            str(app.query_one("#turn-status", Static).content),
+        )
+        if after != before:
+            fail(f"escape changed a ready app: before={before!r}, after={after!r}")
+        ok("escape is inert while no turn is running")
+
+
 async def smoke_small_terminal_case(root: Path) -> None:
     app = OrchestraTuiApp(
         leader_provider=FakeModelProvider(),
@@ -166,24 +312,31 @@ async def smoke_terminal_status_case(root: Path) -> None:
         repo_root=root,
     )
     async with app.run_test(size=(64, 20)):
-        app._update_agent_status("leader", "failed")  # noqa: SLF001
-        app._update_agent_status("worker-1", "exhausted")  # noqa: SLF001
+        app._update_agent_status("leader", AGENT_STATE_FAILED)  # noqa: SLF001
+        app._update_agent_status("worker-1", AGENT_STATE_EXHAUSTED)  # noqa: SLF001
+        app._update_agent_status("worker-2", AGENT_STATE_CANCELLED)  # noqa: SLF001
         panel_text = app.query_one("#status-panel", Static).render()
-        if "leader: failed" not in panel_text.plain or "worker-1: exhausted" not in panel_text.plain:
+        if not all(
+            text in panel_text.plain
+            for text in ("leader: failed", "worker-1: exhausted", "worker-2: cancelled")
+        ):
             fail(f"terminal states were not rendered: {panel_text.plain!r}")
         failed_offset = panel_text.plain.index("failed")
         exhausted_offset = panel_text.plain.index("exhausted")
+        cancelled_offset = panel_text.plain.index("cancelled")
         failed_style = str(panel_text.get_style_at_offset(failed_offset))
         exhausted_style = str(panel_text.get_style_at_offset(exhausted_offset))
-        if failed_style == exhausted_style or "red" not in failed_style or "magenta" not in exhausted_style:
+        cancelled_style = str(panel_text.get_style_at_offset(cancelled_offset))
+        if len({failed_style, exhausted_style, cancelled_style}) != 3:
             fail(
-                "failed and exhausted statuses were not visually distinct: "
-                f"failed={failed_style!r}, exhausted={exhausted_style!r}"
+                "terminal statuses were not visually distinct: "
+                f"failed={failed_style!r}, exhausted={exhausted_style!r}, "
+                f"cancelled={cancelled_style!r}"
             )
-        ok("failed and exhausted render as distinct, noticeable terminal states")
+        ok("failed, exhausted, and cancelled use distinct terminal styles")
 
         for index in range(1, 6):
-            app._update_agent_status(f"worker-{index}", "done")  # noqa: SLF001
+            app._update_agent_status(f"worker-{index}", AGENT_STATE_DONE)  # noqa: SLF001
         expected = {"leader", *(f"worker-{index}" for index in range(1, 6))}
         visible = {line.partition(":")[0] for line in app.visible_status_text.splitlines()}
         if expected != visible:
@@ -549,8 +702,15 @@ async def smoke_exit_command_case(root: Path) -> None:
             ok("/exit requests a clean app quit")
 
 
-async def smoke_approval_case(root: Path, *, approve: bool) -> None:
-    target = "approved.txt" if approve else "denied.txt"
+async def smoke_approval_case(
+    root: Path, *, approve: bool, escape: bool = False
+) -> None:
+    if approve:
+        target = "approved.txt"
+    elif escape:
+        target = "escape-denied.txt"
+    else:
+        target = "denied.txt"
     subagent_provider = FakeModelProvider(
         responses=[
             ModelResponse(
@@ -601,8 +761,11 @@ async def smoke_approval_case(root: Path, *, approve: bool) -> None:
         screen = pilot.app.screen
         if not isinstance(screen, ToolApprovalScreen):
             fail(f"expected ToolApprovalScreen, found {type(screen).__name__}")
-        button_id = "#approval-approve" if approve else "#approval-deny"
-        screen.query_one(button_id, Button).press()
+        if escape:
+            await pilot.press("escape")
+        else:
+            button_id = "#approval-approve" if approve else "#approval-deny"
+            screen.query_one(button_id, Button).press()
         await wait_until(
             pilot,
             lambda: ("leader", "leader saw tool result") in app.chat_entries,
@@ -630,6 +793,13 @@ async def smoke_approval_case(root: Path, *, approve: bool) -> None:
             fail(f"approved tool call returned a failing ToolResult: {tool_result}")
         if not approve and (tool_result.ok or "denied by user" not in (tool_result.error or "")):
             fail(f"denied tool call did not return ToolResult(ok=False): {tool_result}")
+        if escape:
+            if any(state == AGENT_STATE_CANCELLED for _, state in app.status_entries):
+                fail(f"approval escape cancelled the turn: {app.status_entries!r}")
+            if ("leader", AGENT_STATE_DONE) not in app.status_entries:
+                fail(f"approval escape did not let the turn finish: {app.status_entries!r}")
+            ok("escape on the approval screen denies the tool without cancelling the turn")
+            return
         label = "approve" if approve else "deny"
         ok(f"prompt permission mode can {label} a side-effectful tool call")
 
@@ -639,6 +809,10 @@ async def main_async() -> None:
         root = Path(tmp)
         await smoke_success_case(root)
         await smoke_error_case(root)
+        await smoke_stop_case(root)
+        await smoke_stop_before_worker_starts_case(root)
+        await smoke_unknown_event_case(root)
+        await smoke_idle_stop_case(root)
         await smoke_small_terminal_case(root)
         await smoke_terminal_status_case(root)
         await smoke_picker_success_case(root)
@@ -651,6 +825,7 @@ async def main_async() -> None:
         await smoke_exit_command_case(root)
         await smoke_approval_case(root, approve=True)
         await smoke_approval_case(root, approve=False)
+        await smoke_approval_case(root, approve=False, escape=True)
 
 
 def main() -> int:

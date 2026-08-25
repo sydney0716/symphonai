@@ -13,7 +13,20 @@ from textual.app import App, ComposeResult
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Input, RichLog, Static
 
+from orchestra_api.cancellation import CancellationToken
 from orchestra_api.compaction import ContextCompactionError, describe_compaction
+from orchestra_api.events import (
+    CompactionApplied,
+    Event,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    SubagentSpawned,
+    ToolCallFinished,
+    ToolCallStarted,
+    TurnFinished,
+    TurnStarted,
+)
 from orchestra_api.leader import Leader, LeaderConfig, LeaderRunResult
 from orchestra_api.permissions import PermissionDecision, PermissionMode, ToolApprovalRequest
 from orchestra_api.providers.base import ModelProvider, ProviderError
@@ -31,12 +44,20 @@ from orchestra_tui.picker import (
     uses_real_provider,
 )
 
+AGENT_STATE_PENDING = "pending"
+AGENT_STATE_WORKING = "working"
+AGENT_STATE_DONE = "done"
+AGENT_STATE_EXHAUSTED = "exhausted"
+AGENT_STATE_FAILED = "failed"
+AGENT_STATE_CANCELLED = "cancelled"
+
 STATUS_STYLES = {
-    "pending": "yellow",
-    "working": "bold blue",
-    "done": "green",
-    "failed": "bold red",
-    "exhausted": "bold magenta",
+    AGENT_STATE_PENDING: "yellow",
+    AGENT_STATE_WORKING: "bold blue",
+    AGENT_STATE_DONE: "green",
+    AGENT_STATE_FAILED: "bold red",
+    AGENT_STATE_EXHAUSTED: "bold magenta",
+    AGENT_STATE_CANCELLED: "bold cyan",
 }
 
 
@@ -164,7 +185,7 @@ class OrchestraTuiApp(App[None]):
     }
     """
 
-    BINDINGS = [("ctrl+c", "quit", "Quit")]
+    BINDINGS = [("ctrl+c", "quit", "Quit"), ("escape", "stop_turn", "Stop")]
 
     def __init__(
         self,
@@ -194,6 +215,7 @@ class OrchestraTuiApp(App[None]):
         self._subagent_provider: ModelProvider | None = None
         self._leader: Leader | None = None
         self._turn_in_flight = False
+        self._cancel_token: CancellationToken | None = None
         self._agent_status: dict[str, str] = {}
         self._approval_lock = threading.Lock()
         self._pending_approvals: list[_PendingApproval] = []
@@ -248,10 +270,40 @@ class OrchestraTuiApp(App[None]):
 
         self._append_chat_line("you", prompt, "bold cyan")
         self._set_busy(True)
+        # Created here, on the UI thread, rather than inside the worker: the
+        # worker may not start for some time, and a Stop pressed in that gap
+        # would find no token and be silently dropped.
+        self._cancel_token = CancellationToken()
         self._run_leader_turn(prompt)
 
-    def _status_from_worker(self, agent_name: str, state: str) -> None:
-        self._call_ui_from_worker(self._update_agent_status, agent_name, state)
+    def _events_from_worker(self, event: Event) -> None:
+        """Consume one runtime event. Called from the leader worker thread."""
+        if isinstance(event, SubagentSpawned):
+            update = (event.subagent_name, AGENT_STATE_PENDING)
+        elif isinstance(event, RunStarted):
+            update = (event.agent_name, AGENT_STATE_WORKING)
+        elif isinstance(event, RunFinished) and event.stopped_reason == "final_response":
+            update = (event.agent_name, AGENT_STATE_DONE)
+        elif isinstance(event, RunFinished) and event.stopped_reason == "max_turns":
+            update = (event.agent_name, AGENT_STATE_EXHAUSTED)
+        elif isinstance(event, RunFinished) and event.stopped_reason == "cancelled":
+            update = (event.agent_name, AGENT_STATE_CANCELLED)
+        elif isinstance(event, RunFailed):
+            update = (event.agent_name, AGENT_STATE_FAILED)
+        elif isinstance(
+            event,
+            (
+                TurnStarted,
+                TurnFinished,
+                ToolCallStarted,
+                ToolCallFinished,
+                CompactionApplied,
+            ),
+        ):
+            return
+        else:
+            raise TypeError(f"unsupported runtime event: {type(event).__name__}")
+        self._call_ui_from_worker(self._update_agent_status, *update)
 
     def _call_ui_from_worker(self, callback, *args) -> None:  # noqa: ANN001
         if not self.is_running:
@@ -314,7 +366,7 @@ class OrchestraTuiApp(App[None]):
             "leader_provider": leader_provider,
             "subagent_provider": subagent_provider,
             "repo_root": self._repo_root,
-            "on_status": self._status_from_worker,
+            "events": self._events_from_worker,
         }
         if self._max_leader_turns is not None:
             config_kwargs["max_leader_turns"] = self._max_leader_turns
@@ -522,6 +574,12 @@ class OrchestraTuiApp(App[None]):
         self._cancel_pending_approvals("application is quitting")
         self.exit()
 
+    def action_stop_turn(self) -> None:
+        if not self._turn_in_flight or self._cancel_token is None:
+            return
+        self._cancel_token.cancel()
+        self._set_turn_status("Stopping...")
+
     def on_unmount(self) -> None:
         self._cancel_pending_approvals("application is shutting down")
 
@@ -561,10 +619,11 @@ class OrchestraTuiApp(App[None]):
     def _run_leader_turn(self, prompt: str) -> None:
         # Leader.chat() is blocking and may perform HTTP requests. Keep it off
         # Textual's event loop so the UI can redraw while a turn is in flight.
+        cancel_token = self._cancel_token
         try:
             if self._leader is None:
                 raise ProviderError("leader is not configured")
-            result = self._leader.chat(prompt)
+            result = self._leader.chat(prompt, cancel=cancel_token)
         except ContextCompactionError as exc:
             self._call_ui_from_worker(self._finish_turn_error, f"Context compaction error: {exc}")
         except ProviderError as exc:
@@ -578,13 +637,18 @@ class OrchestraTuiApp(App[None]):
             self._call_ui_from_worker(self._finish_turn_success, result)
 
     def _finish_turn_success(self, result: LeaderRunResult) -> None:
-        self._append_chat_line("leader", result.final_answer, "bold green")
-        if result.stopped_reason != "final_response":
+        if result.final_answer:
+            self._append_chat_line("leader", result.final_answer, "bold green")
+        if result.stopped_reason == "cancelled":
+            self._append_system_line("Turn stopped; answer may be incomplete.")
+        elif result.stopped_reason != "final_response":
             self._append_error_line(
                 f"Stopped due to {result.stopped_reason}; answer may be incomplete."
             )
+        self._cancel_token = None
         self._set_busy(False)
 
     def _finish_turn_error(self, message: str) -> None:
         self._append_error_line(message)
+        self._cancel_token = None
         self._set_busy(False)

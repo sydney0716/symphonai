@@ -4,7 +4,7 @@
 Pick a leader provider+model and a subagent provider+model at startup
 (one shared provider for all subagents in the session), then chat with
 the leader in a loop. Simple status lines (pending/working/done) print
-live via Leader's on_status callback as the leader dispatches and
+live via the typed event channel as the leader dispatches and
 subagents work -- no message content or "thinking" is streamed, just
 coarse status.
 
@@ -22,6 +22,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from orchestra_api.events import (  # noqa: E402
+    Event,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    SubagentSpawned,
+)
 from orchestra_api.leader import Leader, LeaderConfig  # noqa: E402
 from orchestra_api.model_discovery import list_models  # noqa: E402
 from orchestra_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
@@ -131,8 +138,22 @@ def _build_provider(provider_name: str) -> ModelProvider:
     return build_catalog_provider(provider_name, model=model)
 
 
-def _print_status(label: str, status: str) -> None:
-    print(f"  [{label}] {status}")
+def _print_status(event: Event) -> None:
+    if isinstance(event, SubagentSpawned):
+        update = (event.subagent_name, "pending")
+    elif isinstance(event, RunStarted):
+        update = (event.agent_name, "working")
+    elif isinstance(event, RunFinished) and event.stopped_reason == "final_response":
+        update = (event.agent_name, "done")
+    elif isinstance(event, RunFinished) and event.stopped_reason == "max_turns":
+        update = (event.agent_name, "exhausted")
+    elif isinstance(event, RunFinished) and event.stopped_reason == "cancelled":
+        update = (event.agent_name, "cancelled")
+    elif isinstance(event, RunFailed):
+        update = (event.agent_name, "failed")
+    else:
+        return
+    print(f"  {update[0]}: {update[1]}")
 
 
 def _provider_summary(provider: ModelProvider) -> str:
@@ -164,7 +185,7 @@ def main() -> int:
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=str(REPO_ROOT),
-        on_status=_print_status,
+        events=_print_status,
     )
     leader = Leader(config)
 

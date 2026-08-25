@@ -19,8 +19,6 @@ Subagent pool state lives only in memory for the duration of one
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
-
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.compaction import (
@@ -35,9 +33,6 @@ from orchestra_api.events import (
     CompactionApplied,
     Event,
     EventSink,
-    RunFailed,
-    RunFinished,
-    RunStarted,
     SubagentSpawned,
     ToolCallStarted,
     emit,
@@ -54,39 +49,11 @@ DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
 DEFAULT_SUBAGENT_MAX_TURNS = 5
 
-# Coarse status states reported via on_status(label, status). Deliberately
-# not a fine-grained event stream (no message content, no per-turn detail)
-# -- just "is this agent pending, working, done, failed, or exhausted."
-STATUS_PENDING = "pending"
-STATUS_WORKING = "working"
-STATUS_DONE = "done"
-STATUS_FAILED = "failed"
-STATUS_EXHAUSTED = "exhausted"
-
-StatusCallback = Callable[[str, str], None]
-
-
-def _report(on_status: StatusCallback | None, label: str, status: str) -> None:
-    if on_status is not None:
-        on_status(label, status)
-
-
 class _LeaderEventSink:
-    """Fan out typed events, then adapt them to the legacy status callback.
+    """Fan out events and preserve parent identity for subagent spawning."""
 
-    Note one deliberate change this adapter makes to the legacy contract: an
-    `on_status` callback that raises used to propagate and fail the run,
-    because `_report` called it directly. It is now reached through an
-    `EventSink`, so `events.emit` swallows the exception and the run
-    completes. A broken status display must not fail the task. The trade is
-    that a bug in a consumer's callback is now silent rather than loud.
-    """
-
-    def __init__(
-        self, events: EventSink | None, on_status: StatusCallback | None
-    ) -> None:
+    def __init__(self, events: EventSink | None) -> None:
         self._events = events
-        self._on_status = on_status
         self._dispatch_tool: DispatchSubagentTool | None = None
 
     def bind_dispatch_tool(self, dispatch_tool: DispatchSubagentTool) -> None:
@@ -105,17 +72,6 @@ class _LeaderEventSink:
             )
 
         emit(self._events, event)
-        if isinstance(event, SubagentSpawned):
-            _report(self._on_status, event.subagent_name, STATUS_PENDING)
-        elif isinstance(event, RunStarted):
-            _report(self._on_status, event.agent_name, STATUS_WORKING)
-        elif isinstance(event, RunFinished):
-            if event.stopped_reason == "final_response":
-                _report(self._on_status, event.agent_name, STATUS_DONE)
-            elif event.stopped_reason == "max_turns":
-                _report(self._on_status, event.agent_name, STATUS_EXHAUSTED)
-        elif isinstance(event, RunFailed):
-            _report(self._on_status, event.agent_name, STATUS_FAILED)
 
 _DISPATCH_DESCRIPTION = (
     "Dispatch a task to a named subagent. If subagent_name has not been "
@@ -213,7 +169,6 @@ class DispatchSubagentTool(LocalTool):
         *,
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
-        on_status: StatusCallback | None = None,
         parent_agent_id: str | None = None,
         events: EventSink | None = None,
     ) -> None:
@@ -221,14 +176,8 @@ class DispatchSubagentTool(LocalTool):
         self._subagent_policy = subagent_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
-        self._on_status = on_status
         self._parent_agent_id = parent_agent_id
-        if events is None and on_status is not None:
-            standalone_events = _LeaderEventSink(None, on_status)
-            standalone_events.bind_dispatch_tool(self)
-            self._events: EventSink | None = standalone_events
-        else:
-            self._events = events
+        self._events = events
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id = ""
         self._event_turn_id: str | None = None
@@ -352,7 +301,6 @@ class LeaderConfig:
     max_leader_turns: int = DEFAULT_MAX_TURNS
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
-    on_status: StatusCallback | None = None
     permission_mode: PermissionMode = "auto"
     approval_callback: ApprovalCallback | None = None
     chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
@@ -384,7 +332,7 @@ class Leader:
     def __init__(self, config: LeaderConfig) -> None:
         self._config = config
         self._agent_ref = new_agent_ref("leader")
-        self._event_sink = _LeaderEventSink(config.events, config.on_status)
+        self._event_sink = _LeaderEventSink(config.events)
         self._last_run_id: str | None = None
         subagent_policy = PermissionPolicy(
             repo_root=config.repo_root,
@@ -396,7 +344,6 @@ class Leader:
             subagent_policy=subagent_policy,
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
-            on_status=config.on_status,
             parent_agent_id=self._agent_ref.agent_id,
             events=self._event_sink,
         )

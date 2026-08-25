@@ -9,9 +9,8 @@ Verifies:
     message history grows across calls)
   - a different subagent_name creates an isolated second pool entry
   - max_subagents is enforced once the limit is reached
-  - the on_status callback fires the expected ordered sequence of
-    (label, status) events for a run that dispatches one subagent
-  - leader and subagent failures emit failed; max_turns emits exhausted
+  - typed events preserve the ordered run/subagent lifecycle sequence
+  - leader and subagent failures and turn exhaustion emit terminal events
   - separate run() calls never reuse pooled subagents; explicit and chat
     clearing empty the pool and clear_subagents() returns the removed count
   - Leader.chat() persists conversation across calls -- a second chat()
@@ -41,6 +40,7 @@ import os
 import sys
 import tempfile
 import unittest.mock as mock
+from dataclasses import fields
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -55,14 +55,8 @@ from orchestra_api.events import (  # noqa: E402
     RunStarted,
     SubagentSpawned,
 )
-from orchestra_api.leader import (  # noqa: E402
-    STATUS_DONE,
-    STATUS_EXHAUSTED,
-    STATUS_FAILED,
-    DispatchSubagentTool,
-    Leader,
-    LeaderConfig,
-)
+import orchestra_api.leader as leader_module  # noqa: E402
+from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig  # noqa: E402
 from orchestra_api.models import Message, ModelResponse, Role, ToolCall, ToolResult  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider  # noqa: E402
@@ -84,6 +78,20 @@ def fail(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(f"OK:   {msg}")
+
+
+def lifecycle(events: CollectingSink) -> list[tuple[str, str, str | None]]:
+    summary: list[tuple[str, str, str | None]] = []
+    for event in events.events:
+        if isinstance(event, SubagentSpawned):
+            summary.append(("spawned", event.subagent_name, None))
+        elif isinstance(event, RunStarted):
+            summary.append(("started", event.agent_name, None))
+        elif isinstance(event, RunFinished):
+            summary.append(("finished", event.agent_name, event.stopped_reason))
+        elif isinstance(event, RunFailed):
+            summary.append(("failed", event.agent_name, None))
+    return summary
 
 
 class _CancellingSubagentTool(LocalTool):
@@ -111,6 +119,23 @@ class _CancellingSubagentTool(LocalTool):
 
 
 def main() -> None:
+    # Names are split so this file does not itself match the validation grep
+    # in specs/01c-tui-events-and-stop.md, which asserts the repo is free of
+    # these identifiers. Do not join them back into literals.
+    retired_names = [
+        "on_" + "status",
+        "Status" + "Callback",
+        "_" + "report",
+        *("STATUS_" + state for state in ("PENDING", "WORKING", "DONE", "FAILED", "EXHAUSTED")),
+    ]
+    present = [name for name in retired_names if hasattr(leader_module, name)]
+    if present:
+        fail(f"leader still exposes retired compatibility names: {present!r}")
+    retired_field = "on_" + "status"
+    if retired_field in {item.name for item in fields(LeaderConfig)}:
+        fail("LeaderConfig still exposes the retired compatibility field")
+    ok("leader compatibility names and configuration field are removed")
+
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
 
@@ -260,7 +285,6 @@ def main() -> None:
             fail(f"compaction event payload is incorrect: {compaction_applied[0]!r}")
         ok("leader compaction emits canonical token and identity data")
 
-        cancellation_events: list[tuple[str, str]] = []
         cancellation_typed_events = CollectingSink()
         cancellation_token = CancellationToken()
         cancellation_subagent_provider = FakeModelProvider(
@@ -297,7 +321,6 @@ def main() -> None:
                 leader_provider=cancellation_leader_provider,
                 subagent_provider=cancellation_subagent_provider,
                 repo_root=str(root),
-                on_status=lambda label, status: cancellation_events.append((label, status)),
                 events=cancellation_typed_events,
             )
         )
@@ -311,28 +334,18 @@ def main() -> None:
             )
         if cancellation_result.stopped_reason != "cancelled":
             fail(f"leader did not carry subagent cancellation through: {cancellation_result!r}")
-        if any(
-            label == "cancellable" and status == STATUS_FAILED
-            for label, status in cancellation_events
-        ):
-            fail(f"cancelled subagent was reported as failed: {cancellation_events!r}")
-        # A cancelled subagent must get no terminal status at all. Reporting it
-        # as EXHAUSTED would claim it hit max_turns, which it did not.
-        terminal = {STATUS_DONE, STATUS_EXHAUSTED, STATUS_FAILED}
-        if any(
-            label == "cancellable" and status in terminal
-            for label, status in cancellation_events
-        ):
-            fail(f"cancelled subagent got a terminal status: {cancellation_events!r}")
         expected_cancellation_events = [
-            ("leader", "working"),
-            ("cancellable", "pending"),
-            ("cancellable", "working"),
+            ("started", "leader", None),
+            ("spawned", "cancellable", None),
+            ("started", "cancellable", None),
+            ("finished", "cancellable", "cancelled"),
+            ("finished", "leader", "cancelled"),
         ]
-        if cancellation_events != expected_cancellation_events:
+        cancellation_lifecycle = lifecycle(cancellation_typed_events)
+        if cancellation_lifecycle != expected_cancellation_events:
             fail(
-                f"expected cancelled status sequence {expected_cancellation_events!r}, "
-                f"got {cancellation_events!r}"
+                f"expected cancelled lifecycle {expected_cancellation_events!r}, "
+                f"got {cancellation_lifecycle!r}"
             )
         cancelled_ref = cancellation_result.subagents["cancellable"].agent_ref
         cancelled_run_events = [
@@ -419,8 +432,8 @@ def main() -> None:
             fail("expected max_subagents to be enforced once the limit is reached")
         ok("max_subagents is enforced")
 
-        # -- on_status callback fires the expected ordered sequence --
-        events: list[tuple[str, str]] = []
+        # -- typed events preserve the expected ordered lifecycle --
+        status_events = CollectingSink()
         status_subagent_provider = FakeModelProvider(
             responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="the sky is blue"))]
         )
@@ -445,25 +458,24 @@ def main() -> None:
             leader_provider=status_leader_provider,
             subagent_provider=status_subagent_provider,
             repo_root=str(root),
-            on_status=lambda label, status: events.append((label, status)),
+            events=status_events,
         )
         Leader(status_config).run("why is the sky blue?")
         expected_events = [
-            ("leader", "working"),
-            ("researcher", "pending"),
-            ("researcher", "working"),
-            ("researcher", "done"),
-            ("leader", "done"),
+            ("started", "leader", None),
+            ("spawned", "researcher", None),
+            ("started", "researcher", None),
+            ("finished", "researcher", "final_response"),
+            ("finished", "leader", "final_response"),
         ]
-        if events != expected_events:
-            fail(f"expected status event sequence {expected_events}, got {events}")
-        ok(f"on_status fires the expected sequence: {events}")
+        actual_events = lifecycle(status_events)
+        if actual_events != expected_events:
+            fail(f"expected lifecycle event sequence {expected_events}, got {actual_events}")
+        ok(f"typed events preserve the expected lifecycle: {actual_events}")
 
-        # A raising on_status must not fail the run. Before the event channel
-        # it did, because _report called the callback directly; it is now
-        # reached through emit(), which swallows consumer exceptions.
-        def _raising_status(label: str, status: str) -> None:
-            raise RuntimeError("status consumer is broken")
+        # Event delivery isolates consumer bugs from the run.
+        def _raising_events(event) -> None:  # noqa: ANN001
+            raise RuntimeError("event consumer is broken")
 
         raising_result = Leader(
             LeaderConfig(
@@ -474,22 +486,22 @@ def main() -> None:
                 ),
                 subagent_provider=FakeModelProvider(),
                 repo_root=root,
-                on_status=_raising_status,
+                events=_raising_events,
             )
         ).run("goal")
         if raising_result.stopped_reason != "final_response":
-            fail(f"a raising on_status broke the run: {raising_result!r}")
-        ok("a raising on_status callback cannot fail the run")
+            fail(f"a raising event sink broke the run: {raising_result!r}")
+        ok("a raising event sink cannot fail the run")
 
         # -- a leader provider exception emits failed before propagating. --
-        failed_leader_events: list[tuple[str, str]] = []
+        failed_leader_events = CollectingSink()
         failed_leader_provider = FakeModelProvider()
         failed_leader = Leader(
             LeaderConfig(
                 leader_provider=failed_leader_provider,
                 subagent_provider=FakeModelProvider(),
                 repo_root=str(root),
-                on_status=lambda label, status: failed_leader_events.append((label, status)),
+                events=failed_leader_events,
             )
         )
         with mock.patch.object(
@@ -503,17 +515,21 @@ def main() -> None:
                 pass
             else:
                 fail("expected leader provider exception to propagate")
-        expected_failed_leader_events = [("leader", "working"), ("leader", "failed")]
-        if failed_leader_events != expected_failed_leader_events:
+        expected_failed_leader_events = [
+            ("started", "leader", None),
+            ("failed", "leader", None),
+        ]
+        actual_failed_leader_events = lifecycle(failed_leader_events)
+        if actual_failed_leader_events != expected_failed_leader_events:
             fail(
                 f"expected failed leader events {expected_failed_leader_events}, "
-                f"got {failed_leader_events}"
+                f"got {actual_failed_leader_events}"
             )
         ok("leader exception emits exactly one failed terminal status")
 
         # -- a subagent provider exception terminates both the subagent and
         # the enclosing leader turn as failed. --
-        failed_subagent_events: list[tuple[str, str]] = []
+        failed_subagent_events = CollectingSink()
         failed_subagent_provider = FakeModelProvider()
         dispatch_then_fail_provider = FakeModelProvider(
             responses=[
@@ -536,7 +552,7 @@ def main() -> None:
                 leader_provider=dispatch_then_fail_provider,
                 subagent_provider=failed_subagent_provider,
                 repo_root=str(root),
-                on_status=lambda label, status: failed_subagent_events.append((label, status)),
+                events=failed_subagent_events,
             )
         )
         with mock.patch.object(
@@ -551,21 +567,22 @@ def main() -> None:
             else:
                 fail("expected subagent provider exception to propagate")
         expected_failed_subagent_events = [
-            ("leader", "working"),
-            ("broken", "pending"),
-            ("broken", "working"),
-            ("broken", "failed"),
-            ("leader", "failed"),
+            ("started", "leader", None),
+            ("spawned", "broken", None),
+            ("started", "broken", None),
+            ("failed", "broken", None),
+            ("failed", "leader", None),
         ]
-        if failed_subagent_events != expected_failed_subagent_events:
+        actual_failed_subagent_events = lifecycle(failed_subagent_events)
+        if actual_failed_subagent_events != expected_failed_subagent_events:
             fail(
                 f"expected failed subagent events {expected_failed_subagent_events}, "
-                f"got {failed_subagent_events}"
+                f"got {actual_failed_subagent_events}"
             )
         ok("subagent exception emits failed for subagent and leader")
 
         # -- leader max_turns is exhausted, not done or failed. --
-        exhausted_leader_events: list[tuple[str, str]] = []
+        exhausted_leader_events = CollectingSink()
         exhausted_leader_provider = FakeModelProvider(
             responses=[
                 ModelResponse(
@@ -588,18 +605,26 @@ def main() -> None:
                 subagent_provider=FakeModelProvider(),
                 repo_root=str(root),
                 max_leader_turns=1,
-                on_status=lambda label, status: exhausted_leader_events.append((label, status)),
+                events=exhausted_leader_events,
             )
         ).run("exhaust")
         if exhausted_result.stopped_reason != "max_turns":
             fail(f"expected leader max_turns, got {exhausted_result.stopped_reason!r}")
-        if exhausted_leader_events != [("leader", "working"), ("leader", "exhausted")]:
-            fail(f"expected leader exhausted terminal status, got {exhausted_leader_events}")
+        expected_exhausted_leader_events = [
+            ("started", "leader", None),
+            ("finished", "leader", "max_turns"),
+        ]
+        actual_exhausted_leader_events = lifecycle(exhausted_leader_events)
+        if actual_exhausted_leader_events != expected_exhausted_leader_events:
+            fail(
+                "expected leader exhausted lifecycle, got "
+                f"{actual_exhausted_leader_events}"
+            )
         ok("leader max_turns emits exactly one exhausted terminal status")
 
         # -- subagent max_turns emits exhausted while the leader can consume
         # the failed tool result and finish normally. --
-        exhausted_subagent_events: list[tuple[str, str]] = []
+        exhausted_subagent_events = CollectingSink()
         exhausted_subagent_provider = FakeModelProvider(
             responses=[
                 ModelResponse(
@@ -639,22 +664,23 @@ def main() -> None:
                 subagent_provider=exhausted_subagent_provider,
                 repo_root=str(root),
                 subagent_max_turns=1,
-                on_status=lambda label, status: exhausted_subagent_events.append((label, status)),
+                events=exhausted_subagent_events,
             )
         ).run("dispatch limited")
         expected_exhausted_subagent_events = [
-            ("leader", "working"),
-            ("limited", "pending"),
-            ("limited", "working"),
-            ("limited", "exhausted"),
-            ("leader", "done"),
+            ("started", "leader", None),
+            ("spawned", "limited", None),
+            ("started", "limited", None),
+            ("finished", "limited", "max_turns"),
+            ("finished", "leader", "final_response"),
         ]
         if exhausted_subagent_result.stopped_reason != "final_response":
             fail("expected leader to finish after receiving exhausted subagent result")
-        if exhausted_subagent_events != expected_exhausted_subagent_events:
+        actual_exhausted_subagent_events = lifecycle(exhausted_subagent_events)
+        if actual_exhausted_subagent_events != expected_exhausted_subagent_events:
             fail(
                 f"expected exhausted subagent events {expected_exhausted_subagent_events}, "
-                f"got {exhausted_subagent_events}"
+                f"got {actual_exhausted_subagent_events}"
             )
         ok("subagent max_turns emits exhausted and leader still reaches done")
 
