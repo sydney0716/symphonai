@@ -1,7 +1,5 @@
-# Orchestra runtime artifacts
-.orchestra/worktrees/
-.orchestra/runs/
-.orchestra/tasks/
+# Generated reports -- rendered from docs/*.json, never edited by hand
+*.html
 
 # Python
 __pycache__/
