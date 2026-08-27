@@ -91,6 +91,10 @@ class ToolCall:
     vendor_id: str | None = None
     schema_version: int = SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("ToolCall.id must be a non-empty string")
+
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -104,6 +108,7 @@ class ToolResult:
     ok: bool
     content: str = ""
     error: str | None = None
+    cancelled: bool = False
     schema_version: int = SCHEMA_VERSION
 
 

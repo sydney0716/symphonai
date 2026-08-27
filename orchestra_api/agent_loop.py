@@ -24,7 +24,14 @@ from orchestra_api.events import (
     TurnStarted,
     emit,
 )
-from orchestra_api.identity import AgentRef, RunRef, new_agent_ref, new_run_ref, new_turn_ref
+from orchestra_api.identity import (
+    AgentRef,
+    RunRef,
+    TurnRef,
+    new_agent_ref,
+    new_run_ref,
+    new_turn_ref,
+)
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
@@ -91,6 +98,7 @@ class ApiAgent:
         conversation = list(messages)
         response: ModelResponse | None = None
         turn = 0
+        current_turn_ref: TurnRef | None = None
         try:
             emit(
                 event_sink,
@@ -102,6 +110,7 @@ class ApiAgent:
             )
             for turn in range(1, self._max_turns + 1):
                 turn_ref = new_turn_ref(run_ref.run_id, turn)
+                current_turn_ref = turn_ref
                 emit(
                     event_sink,
                     TurnStarted(
@@ -126,6 +135,8 @@ class ApiAgent:
                     response, message=replace(response.message, turn_id=turn_ref.turn_id)
                 )
                 conversation.append(response.message)
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
                 if not response.has_tool_calls:
                     emit(
                         event_sink,
@@ -217,6 +228,36 @@ class ApiAgent:
             )
             return result
         except OperationCancelled:
+            if current_turn_ref is not None:
+                assistant_index = next(
+                    (
+                        index
+                        for index in range(len(conversation) - 1, -1, -1)
+                        if conversation[index].role == Role.ASSISTANT
+                        and conversation[index].tool_calls
+                    ),
+                    None,
+                )
+                if assistant_index is not None:
+                    answered_ids = {
+                        message.tool_result.tool_call_id
+                        for message in conversation[assistant_index + 1 :]
+                        if message.tool_result is not None
+                    }
+                    for tool_call in conversation[assistant_index].tool_calls:
+                        if tool_call.id not in answered_ids:
+                            conversation.append(
+                                Message(
+                                    role=Role.TOOL,
+                                    tool_result=ToolResult(
+                                        tool_call_id=tool_call.id,
+                                        ok=False,
+                                        cancelled=True,
+                                        error="cancelled before this tool completed",
+                                    ),
+                                    turn_id=current_turn_ref.turn_id,
+                                )
+                            )
             cancelled_response = response or ModelResponse(
                 message=Message(role=Role.ASSISTANT), stop_reason="cancelled"
             )

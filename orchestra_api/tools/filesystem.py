@@ -11,6 +11,7 @@ from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
+from orchestra_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
 
 MAX_READ_BYTES = 1_000_000  # 1 MB safety cap on a single read_file call
 
@@ -39,19 +40,26 @@ class ReadFileTool(LocalTool):
             "required": ["path"],
         }
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        path = arguments.get("path")
+        return ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=(path,) if isinstance(path, str) else None,
+        )
+
+    def validate(self, arguments: dict) -> str | None:
+        if not arguments.get("path"):
+            return "missing required argument: path"
+        return None
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
-        if cancel is not None:
-            cancel.raise_if_cancelled()
         path = tool_call.arguments.get("path")
-        if not path:
-            return ToolResult(
-                tool_call_id=tool_call.id, ok=False, error="missing required argument: path"
-            )
         decision = policy.check_read(path)
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
@@ -103,24 +111,30 @@ class WriteFileTool(LocalTool):
             "required": ["path", "content"],
         }
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        path = arguments.get("path")
+        # Full replacement can discard contents that were never read.
+        return ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=(path,) if isinstance(path, str) else None,
+        )
+
+    def validate(self, arguments: dict) -> str | None:
+        if not arguments.get("path"):
+            return "missing required argument: path"
+        if arguments.get("content") is None:
+            return "missing required argument: content"
+        return None
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
-        if cancel is not None:
-            cancel.raise_if_cancelled()
         path = tool_call.arguments.get("path")
         content = tool_call.arguments.get("content")
-        if not path:
-            return ToolResult(
-                tool_call_id=tool_call.id, ok=False, error="missing required argument: path"
-            )
-        if content is None:
-            return ToolResult(
-                tool_call_id=tool_call.id, ok=False, error="missing required argument: content"
-            )
         decision = policy.check_write(path)
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
@@ -159,14 +173,21 @@ class ListFilesTool(LocalTool):
             "required": [],
         }
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        path = arguments.get("path", ".")
+        return ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=(path,) if isinstance(path, str) else None,
+            result_hint=ResultHint.FILE_LIST,
+        )
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
-        if cancel is not None:
-            cancel.raise_if_cancelled()
         path = tool_call.arguments.get("path", ".")
         decision = policy.check_list(path)
         if not decision.allowed:

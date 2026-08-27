@@ -44,6 +44,7 @@ from orchestra_api.providers.base import ModelProvider
 from orchestra_api.runner import standard_tool_registry
 from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tools.base import LocalTool
+from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
 
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
@@ -58,6 +59,7 @@ class _LeaderEventSink:
 
     def bind_dispatch_tool(self, dispatch_tool: DispatchSubagentTool) -> None:
         self._dispatch_tool = dispatch_tool
+        dispatch_tool.attach_event_sink(self)
 
     def __call__(self, event: Event) -> None:
         if (
@@ -170,18 +172,20 @@ class DispatchSubagentTool(LocalTool):
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
         parent_agent_id: str | None = None,
-        events: EventSink | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
         self._parent_agent_id = parent_agent_id
-        self._events = events
+        self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
-        self._event_run_id = ""
+        self._event_run_id: str | None = None
         self._event_turn_id: str | None = None
         self.pool: dict[str, SubagentRecord] = {}
+
+    def attach_event_sink(self, sink: EventSink) -> None:
+        self._events = sink
 
     def _set_event_context(
         self, *, agent_id: str, run_id: str, turn_id: str | None
@@ -206,22 +210,27 @@ class DispatchSubagentTool(LocalTool):
             "required": _DISPATCH_REQUIRED,
         }
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        # A dispatched child may use any of its tools, so inherit the worst case.
+        return ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=None,
+        )
+
+    def validate(self, arguments: dict) -> str | None:
+        if not arguments.get("subagent_name") or not arguments.get("task"):
+            return "missing required argument: subagent_name and/or task"
+        return None
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
-        if cancel is not None:
-            cancel.raise_if_cancelled()
         subagent_name = tool_call.arguments.get("subagent_name")
         task = tool_call.arguments.get("task")
-        if not subagent_name or not task:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error="missing required argument: subagent_name and/or task",
-            )
 
         record = self.pool.get(subagent_name)
         if record is None:
@@ -236,16 +245,19 @@ class DispatchSubagentTool(LocalTool):
                 )
             subagent_tools = standard_tool_registry()
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
-            emit(
-                self._events,
-                SubagentSpawned(
-                    agent_id=self._event_agent_id,
-                    run_id=self._event_run_id,
-                    turn_id=self._event_turn_id,
-                    subagent_name=subagent_name,
-                    subagent_agent_id=agent_ref.agent_id,
-                ),
-            )
+            if self._events is not None:
+                if self._event_run_id is None:
+                    raise RuntimeError("dispatch event context was never set")
+                emit(
+                    self._events,
+                    SubagentSpawned(
+                        agent_id=self._event_agent_id,
+                        run_id=self._event_run_id,
+                        turn_id=self._event_turn_id,
+                        subagent_name=subagent_name,
+                        subagent_agent_id=agent_ref.agent_id,
+                    ),
+                )
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=self._subagent_provider,
@@ -269,6 +281,8 @@ class DispatchSubagentTool(LocalTool):
             raise
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
+        if run_result.stopped_reason == "cancelled":
+            raise OperationCancelled
 
         succeeded = run_result.stopped_reason == "final_response"
         return ToolResult(
@@ -278,11 +292,7 @@ class DispatchSubagentTool(LocalTool):
             error=(
                 None
                 if succeeded
-                else (
-                    "subagent was cancelled"
-                    if run_result.stopped_reason == "cancelled"
-                    else "subagent reached max_turns without a final answer"
-                )
+                else "subagent reached max_turns without a final answer"
             ),
         )
 
@@ -345,7 +355,6 @@ class Leader:
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
             parent_agent_id=self._agent_ref.agent_id,
-            events=self._event_sink,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_policy = PermissionPolicy(

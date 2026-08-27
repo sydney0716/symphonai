@@ -72,7 +72,10 @@ def read_with_retry(
             )
         try:
             with urllib.request.urlopen(request, timeout=remaining) as response:
-                return response.read()
+                body = response.read()
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                return body
         except urllib.error.HTTPError as exc:
             detail = _redacted_error_detail(exc.read(), api_key)
             if _is_retryable_status(exc.code) and _wait_before_retry(

@@ -8,6 +8,8 @@ A denied command returns `ToolResult(ok=False, ...)` without ever touching
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import time
 
@@ -15,9 +17,25 @@ from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
+from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
 
 MAX_OUTPUT_CHARS = 20_000
 CANCEL_POLL_SECONDS = 0.05
+CLEANUP_TIMEOUT_SECONDS = 1.0
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    try:
+        if hasattr(os, "killpg"):
+            pgid = os.getpgid(proc.pid)
+            if pgid != os.getpgid(0):
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        else:
+            proc.kill()
+    except (OSError, ProcessLookupError, PermissionError):
+        pass
 
 
 class RunShellTool(LocalTool):
@@ -48,21 +66,32 @@ class RunShellTool(LocalTool):
             "required": ["argv"],
         }
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        # 02e replaces this conservative answer with an argv classifier.
+        return ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=None,
+        )
+
+    def validate(self, arguments: dict) -> str | None:
+        argv = arguments.get("argv")
+        if not isinstance(argv, list) or not argv or not all(
+            isinstance(argument, str) for argument in argv
+        ):
+            return (
+                "missing or invalid required argument: argv "
+                "(must be a non-empty list of strings)"
+            )
+        return None
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
-        if cancel is not None:
-            cancel.raise_if_cancelled()
         argv = tool_call.arguments.get("argv")
-        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error="missing or invalid required argument: argv (must be a non-empty list of strings)",
-            )
         decision = policy.check_shell(argv)
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
@@ -74,23 +103,27 @@ class RunShellTool(LocalTool):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
             deadline = time.monotonic() + policy.shell_timeout_seconds
             while True:
                 if cancel is not None and cancel.cancelled:
+                    _terminate_process_group(proc)
                     try:
-                        proc.kill()
-                    except ProcessLookupError:
+                        proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
                         pass
-                    proc.communicate()
                     raise OperationCancelled
                 if proc.poll() is not None:
                     stdout, stderr = proc.communicate()
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    proc.kill()
-                    proc.communicate()
+                    _terminate_process_group(proc)
+                    try:
+                        proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        pass
                     raise subprocess.TimeoutExpired(argv, policy.shell_timeout_seconds)
                 delay = min(CANCEL_POLL_SECONDS, remaining)
                 try:

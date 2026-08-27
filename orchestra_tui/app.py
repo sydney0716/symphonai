@@ -71,7 +71,11 @@ class _PendingApproval:
 class ToolApprovalScreen(Screen[bool]):
     """Approve or deny one side-effectful local tool call."""
 
-    BINDINGS = [("escape", "cancel", "Deny"), ("ctrl+c", "cancel", "Deny")]
+    BINDINGS = [
+        ("escape", "cancel", "Deny"),
+        ("ctrl+c", "cancel", "Deny"),
+        ("ctrl+x", "stop_turn", "Stop turn"),
+    ]
 
     def __init__(self, request: ToolApprovalRequest) -> None:
         super().__init__()
@@ -84,6 +88,7 @@ class ToolApprovalScreen(Screen[bool]):
         yield Static(self._request.details, id="approval-details")
         yield Button("Approve", id="approval-approve", variant="primary")
         yield Button("Deny", id="approval-deny", variant="error")
+        yield Button("Stop turn", id="approval-stop")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -92,11 +97,17 @@ class ToolApprovalScreen(Screen[bool]):
     def action_cancel(self) -> None:
         self.dismiss(False)
 
+    def action_stop_turn(self) -> None:
+        self.app.action_stop_turn()
+        self.dismiss(False)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "approval-approve":
             self.dismiss(True)
         elif event.button.id == "approval-deny":
             self.dismiss(False)
+        elif event.button.id == "approval-stop":
+            self.action_stop_turn()
 
 
 class OrchestraTuiApp(App[None]):
@@ -175,7 +186,7 @@ class OrchestraTuiApp(App[None]):
     }
 
     #start-chat, #quit-picker, #confirm-continue, #confirm-cancel,
-    #approval-approve, #approval-deny {
+    #approval-approve, #approval-deny, #approval-stop {
         width: 100%;
         margin-top: 1;
     }
@@ -216,7 +227,7 @@ class OrchestraTuiApp(App[None]):
         self._leader: Leader | None = None
         self._turn_in_flight = False
         self._cancel_token: CancellationToken | None = None
-        self._agent_status: dict[str, str] = {}
+        self._agent_status: dict[str, tuple[str, str]] = {}
         self._approval_lock = threading.Lock()
         self._pending_approvals: list[_PendingApproval] = []
         self.chat_entries: list[tuple[str, str]] = []
@@ -279,17 +290,21 @@ class OrchestraTuiApp(App[None]):
     def _events_from_worker(self, event: Event) -> None:
         """Consume one runtime event. Called from the leader worker thread."""
         if isinstance(event, SubagentSpawned):
-            update = (event.subagent_name, AGENT_STATE_PENDING)
+            update = (
+                event.subagent_agent_id,
+                event.subagent_name,
+                AGENT_STATE_PENDING,
+            )
         elif isinstance(event, RunStarted):
-            update = (event.agent_name, AGENT_STATE_WORKING)
+            update = (event.agent_id, event.agent_name, AGENT_STATE_WORKING)
         elif isinstance(event, RunFinished) and event.stopped_reason == "final_response":
-            update = (event.agent_name, AGENT_STATE_DONE)
+            update = (event.agent_id, event.agent_name, AGENT_STATE_DONE)
         elif isinstance(event, RunFinished) and event.stopped_reason == "max_turns":
-            update = (event.agent_name, AGENT_STATE_EXHAUSTED)
+            update = (event.agent_id, event.agent_name, AGENT_STATE_EXHAUSTED)
         elif isinstance(event, RunFinished) and event.stopped_reason == "cancelled":
-            update = (event.agent_name, AGENT_STATE_CANCELLED)
+            update = (event.agent_id, event.agent_name, AGENT_STATE_CANCELLED)
         elif isinstance(event, RunFailed):
-            update = (event.agent_name, AGENT_STATE_FAILED)
+            update = (event.agent_id, event.agent_name, AGENT_STATE_FAILED)
         elif isinstance(
             event,
             (
@@ -578,6 +593,7 @@ class OrchestraTuiApp(App[None]):
         if not self._turn_in_flight or self._cancel_token is None:
             return
         self._cancel_token.cancel()
+        self._cancel_pending_approvals("turn stopped by user")
         self._set_turn_status("Stopping...")
 
     def on_unmount(self) -> None:
@@ -586,9 +602,9 @@ class OrchestraTuiApp(App[None]):
     def _set_turn_status(self, message: str) -> None:
         self.query_one("#turn-status", Static).update(message)
 
-    def _update_agent_status(self, agent_name: str, state: str) -> None:
+    def _update_agent_status(self, agent_id: str, agent_name: str, state: str) -> None:
         self.status_entries.append((agent_name, state))
-        self._agent_status[agent_name] = state
+        self._agent_status[agent_id] = (agent_name, state)
         self._render_status_panel()
 
     def _render_status_panel(self) -> None:
@@ -600,15 +616,25 @@ class OrchestraTuiApp(App[None]):
             self.query_one("#status-panel", Static).update(text)
             return
 
-        labels = sorted(
+        agent_ids = sorted(
             self._agent_status,
-            key=lambda value: (value != "leader", value.lower()),
+            key=lambda value: (
+                self._agent_status[value][0] != "leader",
+                self._agent_status[value][0].lower(),
+            ),
         )
+        label_counts: dict[str, int] = {}
+        for label, _ in self._agent_status.values():
+            label_counts[label] = label_counts.get(label, 0) + 1
         visible_lines: list[str] = []
-        for label in labels:
-            state = self._agent_status[label]
-            visible_lines.append(f"{label}: {state}")
-            text.append(label, style="bold" if label == "leader" else "")
+        for agent_id in agent_ids:
+            label, state = self._agent_status[agent_id]
+            short_id = agent_id.removeprefix("agent_")[:6]
+            display_label = (
+                f"{label} ({short_id})" if label_counts[label] > 1 else label
+            )
+            visible_lines.append(f"{display_label}: {state}")
+            text.append(display_label, style="bold" if label == "leader" else "")
             text.append(": ")
             text.append(state, style=STATUS_STYLES.get(state, ""))
             text.append("\n")

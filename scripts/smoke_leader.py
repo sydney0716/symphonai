@@ -35,6 +35,7 @@ exercise request-building code against a mocked HTTP layer.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -54,10 +55,11 @@ from orchestra_api.events import (  # noqa: E402
     RunFinished,
     RunStarted,
     SubagentSpawned,
+    ToolCallStarted,
 )
 import orchestra_api.leader as leader_module  # noqa: E402
 from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig  # noqa: E402
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall, ToolResult  # noqa: E402
+from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, ToolResult  # noqa: E402
 from orchestra_api.permissions import PermissionPolicy  # noqa: E402
 from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
@@ -66,7 +68,14 @@ from orchestra_api.providers.gemini_provider import (  # noqa: E402
 )
 from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
 from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider  # noqa: E402
+from orchestra_api.providers.openai_provider import _build_request_body as _build_openai_body  # noqa: E402
 from orchestra_api.tools.base import LocalTool  # noqa: E402
+from orchestra_api.tools.metadata import (  # noqa: E402
+    InterruptBehavior,
+    ResultHint,
+    ToolEffect,
+    ToolMetadata,
+)
 
 OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "ORCHESTRA_OPENAI_COMPATIBLE_SMOKE_KEY"
 
@@ -107,7 +116,14 @@ class _CancellingSubagentTool(LocalTool):
     def parameters(self) -> dict:
         return {"type": "object", "properties": {}, "required": []}
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=None,
+        )
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
@@ -116,6 +132,37 @@ class _CancellingSubagentTool(LocalTool):
         assert cancel is not None
         cancel.cancel()
         raise OperationCancelled
+
+
+class _RecordingFakeProvider(FakeModelProvider):
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        super().__init__(responses)
+        self.requests: list[ModelRequest] = []
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        self.requests.append(request)
+        return super().create_response(request, cancel=cancel)
+
+
+def _assert_openai_tool_calls_answered(request: ModelRequest, context: str) -> None:
+    wire_messages = _build_openai_body(request, "test-model")["messages"]
+    for index, message in enumerate(wire_messages):
+        tool_calls = message.get("tool_calls", [])
+        if not tool_calls:
+            continue
+        expected_ids = [tool_call["id"] for tool_call in tool_calls]
+        actual_ids = [
+            candidate.get("tool_call_id")
+            for candidate in wire_messages[index + 1 : index + 1 + len(expected_ids)]
+            if candidate.get("role") == "tool"
+        ]
+        if actual_ids != expected_ids:
+            fail(
+                f"{context} left unanswered OpenAI tool calls: "
+                f"expected={expected_ids!r}, actual={actual_ids!r}, body={wire_messages!r}"
+            )
 
 
 def main() -> None:
@@ -205,6 +252,16 @@ def main() -> None:
             for event in spawned
         ):
             fail(f"subagent spawn identity is incorrect: {spawned!r}")
+        dispatch_starts = {
+            event.tool_call_id: event
+            for event in identity_events.of_type(ToolCallStarted)
+            if event.tool_name == "dispatch_subagent"
+        }
+        if any(
+            event.turn_id != dispatch_starts[tool_call_id].turn_id
+            for event, tool_call_id in zip(spawned, ("lc1", "lc2"), strict=True)
+        ):
+            fail(f"subagent spawn turn did not match its dispatch call: {spawned!r}")
         started_pairs = {
             (event.agent_id, event.run_id)
             for event in identity_events.of_type(RunStarted)
@@ -297,7 +354,7 @@ def main() -> None:
                 )
             ]
         )
-        cancellation_leader_provider = FakeModelProvider(
+        cancellation_leader_provider = _RecordingFakeProvider(
             responses=[
                 ModelResponse(
                     message=Message(
@@ -313,7 +370,10 @@ def main() -> None:
                             )
                         ],
                     )
-                )
+                ),
+                ModelResponse(
+                    message=Message(role=Role.ASSISTANT, content="continued safely")
+                ),
             ]
         )
         cancellation_leader = Leader(
@@ -329,7 +389,7 @@ def main() -> None:
             "orchestra_api.leader.standard_tool_registry",
             return_value={cancelling_tool.name: cancelling_tool},
         ):
-            cancellation_result = cancellation_leader.run(
+            cancellation_result = cancellation_leader.chat(
                 "delegate cancellable work", cancel=cancellation_token
             )
         if cancellation_result.stopped_reason != "cancelled":
@@ -361,7 +421,34 @@ def main() -> None:
                 "cancelled subagent did not emit one cancelled RunFinished: "
                 f"{cancellation_typed_events.events!r}"
             )
-        ok("leader cancellation reaches subagents without reporting failure")
+        leader_tool_results = [
+            message.tool_result
+            for message in cancellation_result.leader_messages
+            if message.tool_result is not None
+        ]
+        if (
+            len(leader_tool_results) != 1
+            or leader_tool_results[0].ok
+            or not leader_tool_results[0].cancelled
+        ):
+            fail(f"leader cancellation did not synthesize a cancelled tool result: {leader_tool_results!r}")
+        cancelled_record = cancellation_result.subagents["cancellable"]
+        if not any(message.role == Role.ASSISTANT for message in cancelled_record.messages):
+            fail(f"cancelled subagent lost its partial conversation: {cancelled_record.messages!r}")
+        if not any(
+            message.tool_result is not None and message.tool_result.cancelled
+            for message in cancelled_record.messages
+        ):
+            fail(f"cancelled subagent transcript was not repaired: {cancelled_record.messages!r}")
+
+        continued_result = cancellation_leader.chat("continue after cancellation")
+        if continued_result.stopped_reason != "final_response":
+            fail(f"leader could not continue after cancellation: {continued_result!r}")
+        _assert_openai_tool_calls_answered(
+            cancellation_leader_provider.requests[-1],
+            "leader chat after subagent cancellation",
+        )
+        ok("leader cancellation preserves partial work and leaves a reusable transcript")
 
         # -- chat() reports cancellation the same way run() does --
         chat_cancel_token = CancellationToken()
@@ -387,12 +474,80 @@ def main() -> None:
 
         # -- create / reuse / isolate / max_subagents, exercised directly on the tool --
         policy = PermissionPolicy(repo_root=root)
+        if "events" in inspect.signature(DispatchSubagentTool).parameters:
+            fail("DispatchSubagentTool.__init__ still exposes an unwired events argument")
+        try:
+            DispatchSubagentTool(
+                FakeModelProvider(),
+                policy,
+                **{"events": CollectingSink()},
+            )
+        except TypeError:
+            pass
+        else:
+            fail("DispatchSubagentTool accepted events without leader identity context")
+
+        standalone_tool = DispatchSubagentTool(
+            FakeModelProvider(
+                [ModelResponse(Message(Role.ASSISTANT, "standalone complete"))]
+            ),
+            policy,
+        )
+        with mock.patch("orchestra_api.leader.emit") as standalone_emit:
+            standalone_result = standalone_tool.execute(
+                ToolCall(
+                    id="standalone-dispatch",
+                    name="dispatch_subagent",
+                    arguments={"subagent_name": "standalone", "task": "work"},
+                ),
+                policy,
+            )
+        if not standalone_result.ok or standalone_emit.called:
+            fail(
+                "standalone dispatch emitted an event without leader context: "
+                f"result={standalone_result!r}, calls={standalone_emit.call_args_list!r}"
+            )
+        ok("standalone dispatch has no event sink or invalid empty-run event path")
+
         pool_provider = FakeModelProvider(
             responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="sub reply"))]
         )
         tool = DispatchSubagentTool(
             subagent_provider=pool_provider, subagent_policy=policy, max_subagents=2, subagent_max_turns=3
         )
+        dispatch_metadata = tool.metadata(
+            {"subagent_name": "worker", "task": "inspect metadata"}
+        )
+        expected_dispatch_metadata = ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=None,
+            result_hint=ResultHint.TEXT,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        )
+        if dispatch_metadata != expected_dispatch_metadata:
+            fail(
+                "dispatch_subagent metadata did not match the literal contract: "
+                f"actual={dispatch_metadata!r}, expected={expected_dispatch_metadata!r}"
+            )
+        if type(tool).execute is not LocalTool.execute:
+            fail("dispatch_subagent bypassed the base validation pipeline")
+        invalid_dispatch = tool.execute(
+            ToolCall(
+                id="invalid-dispatch",
+                name="dispatch_subagent",
+                arguments={"subagent_name": "worker"},
+            ),
+            policy,
+        )
+        if (
+            invalid_dispatch.ok
+            or invalid_dispatch.error
+            != "missing required argument: subagent_name and/or task"
+            or tool.pool
+        ):
+            fail(f"dispatch_subagent validation behavior changed: {invalid_dispatch!r}")
+        ok("dispatch_subagent declares conservative per-call metadata")
 
         r1 = tool.execute(
             ToolCall(id="c1", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": "task one"}),

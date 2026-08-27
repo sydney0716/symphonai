@@ -41,6 +41,7 @@ import http.client
 import io
 import json
 import os
+import signal
 import ssl
 import subprocess
 import sys
@@ -49,6 +50,7 @@ import threading
 import time
 import unittest.mock as mock
 import urllib.error
+from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -56,6 +58,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from orchestra_api import (  # noqa: E402
+    FAIL_CLOSED,
+    InterruptBehavior,
+    ResultHint,
+    SCHEMA_VERSION,
+    ToolEffect,
+    ToolMetadata,
+    safe_metadata,
+)
 from orchestra_api.agent_loop import ApiAgent  # noqa: E402
 from orchestra_api.cancellation import CancellationToken, OperationCancelled  # noqa: E402
 from orchestra_api.compaction import ContextCompactionError, compact_messages_for_budget  # noqa: E402
@@ -87,6 +98,7 @@ from orchestra_api.providers.anthropic_provider import (  # noqa: E402
 )
 from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
 from orchestra_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body  # noqa: E402
+from orchestra_api.providers.anthropic_provider import _parse_response as _parse_anthropic_response  # noqa: E402
 from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 from orchestra_api.providers.gemini_provider import (  # noqa: E402
@@ -103,8 +115,13 @@ from orchestra_api.providers.openai_provider import (  # noqa: E402
 from orchestra_api.providers.openai_provider import _parse_response as _parse_openai_response  # noqa: E402
 from orchestra_api.retry import read_with_retry  # noqa: E402
 from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
+from orchestra_api.tool_schema import to_provider_tool_schema  # noqa: E402
 from orchestra_api.tools.base import LocalTool  # noqa: E402
-from orchestra_api.tools.shell import MAX_OUTPUT_CHARS, RunShellTool  # noqa: E402
+from orchestra_api.tools.shell import (  # noqa: E402
+    MAX_OUTPUT_CHARS,
+    RunShellTool,
+    _terminate_process_group,
+)
 
 
 def fail(msg: str) -> None:
@@ -114,6 +131,25 @@ def fail(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(f"OK:   {msg}")
+
+
+def _assert_openai_tool_calls_answered(messages: list[Message], context: str) -> None:
+    wire_messages = _build_openai_body(ModelRequest(messages=messages), "test-model")["messages"]
+    for index, message in enumerate(wire_messages):
+        tool_calls = message.get("tool_calls", [])
+        if not tool_calls:
+            continue
+        expected_ids = [tool_call["id"] for tool_call in tool_calls]
+        actual_ids = [
+            candidate.get("tool_call_id")
+            for candidate in wire_messages[index + 1 : index + 1 + len(expected_ids)]
+            if candidate.get("role") == "tool"
+        ]
+        if actual_ids != expected_ids:
+            fail(
+                f"{context} left unanswered OpenAI tool calls: "
+                f"expected={expected_ids!r}, actual={actual_ids!r}, body={wire_messages!r}"
+            )
 
 
 class _CancellingTool(LocalTool):
@@ -129,7 +165,14 @@ class _CancellingTool(LocalTool):
     def parameters(self) -> dict:
         return {"type": "object", "properties": {}, "required": []}
 
-    def execute(
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=None,
+        )
+
+    def _execute(
         self,
         tool_call: ToolCall,
         policy: PermissionPolicy,
@@ -138,6 +181,79 @@ class _CancellingTool(LocalTool):
         assert cancel is not None
         cancel.cancel()
         raise OperationCancelled
+
+
+class _ToolContractStub(LocalTool):
+    @property
+    def name(self) -> str:
+        return "contract_stub"
+
+    @property
+    def description(self) -> str:
+        return "Exercise the LocalTool contract."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+
+class _MissingMetadataTool(_ToolContractStub):
+    def _execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        return ToolResult(tool_call_id=tool_call.id, ok=True)
+
+
+class _MissingExecuteTool(_ToolContractStub):
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=(),
+        )
+
+
+class _RaisingMetadataTool(_ToolContractStub):
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        raise self._error
+
+    def _execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        return ToolResult(tool_call_id=tool_call.id, ok=True)
+
+
+class _ValidationStageTool(_ToolContractStub):
+    def __init__(self) -> None:
+        self.executed = False
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=(),
+        )
+
+    def validate(self, arguments: dict) -> str | None:
+        return "scripted validation failure"
+
+    def _execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        self.executed = True
+        return ToolResult(tool_call_id=tool_call.id, ok=True)
 
 
 class _RaisingProvider(ModelProvider):
@@ -173,6 +289,234 @@ def main() -> None:
     else:
         fail("unsupported message content should raise TypeError")
     ok("Message content normalizes to immutable text blocks")
+
+    for incomplete_tool, missing_member in (
+        (_MissingMetadataTool, "metadata"),
+        (_MissingExecuteTool, "_execute"),
+    ):
+        try:
+            incomplete_tool()
+        except TypeError:
+            pass
+        else:
+            fail(f"LocalTool subclass missing {missing_member} was instantiable")
+    ok("LocalTool requires both metadata and _execute declarations")
+
+    metadata_tools = standard_tool_registry()
+    execute_overrides = [
+        name
+        for name, tool in metadata_tools.items()
+        if type(tool).execute is not LocalTool.execute
+    ]
+    if execute_overrides:
+        fail(f"tools override the base validation pipeline: {execute_overrides!r}")
+
+    metadata_arguments = {
+        "read_file": {"path": "sample.txt"},
+        "write_file": {"path": "sample.txt", "content": "replacement"},
+        "list_files": {"path": "sample-dir"},
+        "run_shell": {"argv": ["ls"]},
+    }
+    expected_metadata = {
+        "read_file": ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=("sample.txt",),
+            result_hint=ResultHint.TEXT,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "write_file": ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=("sample.txt",),
+            result_hint=ResultHint.TEXT,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "list_files": ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=("sample-dir",),
+            result_hint=ResultHint.FILE_LIST,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "run_shell": ToolMetadata(
+            effect=ToolEffect.DESTRUCTIVE,
+            concurrency_safe=False,
+            paths=None,
+            result_hint=ResultHint.TEXT,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+    }
+    actual_metadata = {
+        name: tool.metadata(metadata_arguments[name])
+        for name, tool in metadata_tools.items()
+    }
+    if actual_metadata != expected_metadata:
+        fail(
+            "standard tool metadata did not match the literal contract: "
+            f"actual={actual_metadata!r}, expected={expected_metadata!r}"
+        )
+    if any(item.schema_version != SCHEMA_VERSION for item in actual_metadata.values()):
+        fail(f"tool metadata schema version drifted: {actual_metadata!r}")
+
+    raw_path = "../outside.txt"
+    if metadata_tools["read_file"].metadata({"path": raw_path}).paths != (raw_path,):
+        fail("read_file metadata resolved or discarded its raw path")
+    if metadata_tools["write_file"].metadata({"path": raw_path}).paths != (raw_path,):
+        fail("write_file metadata resolved or discarded its raw path")
+    if metadata_tools["list_files"].metadata({}).paths != (".",):
+        fail("list_files metadata did not expose its default path")
+    for name in ("read_file", "write_file"):
+        if metadata_tools[name].metadata({}).paths is not None:
+            fail(f"{name} metadata treated a missing path as an empty path set")
+        if metadata_tools[name].metadata({"path": 3}).paths is not None:
+            fail(f"{name} metadata accepted a non-string path")
+    if metadata_tools["list_files"].metadata({"path": 3}).paths is not None:
+        fail("list_files metadata accepted a non-string path")
+    if metadata_tools["run_shell"].metadata({"argv": ["ls"]}).paths is not None:
+        fail("run_shell classified a path before the 02e argv classifier")
+
+    if safe_metadata(_RaisingMetadataTool(ValueError("bad metadata")), {}) is not FAIL_CLOSED:
+        fail("safe_metadata did not fail closed after a metadata exception")
+    try:
+        safe_metadata(_RaisingMetadataTool(OperationCancelled()), {})
+    except OperationCancelled:
+        pass
+    else:
+        fail("safe_metadata swallowed OperationCancelled")
+
+    for name, item in actual_metadata.items():
+        if item.concurrency_safe and item.effect != ToolEffect.READ_ONLY:
+            fail(f"concurrency-safe registry call was not read-only: {name}={item!r}")
+    if FAIL_CLOSED.concurrency_safe and FAIL_CLOSED.effect != ToolEffect.READ_ONLY:
+        fail(f"FAIL_CLOSED violated the concurrency invariant: {FAIL_CLOSED!r}")
+    if FAIL_CLOSED.schema_version != SCHEMA_VERSION:
+        fail(f"FAIL_CLOSED schema version drifted: {FAIL_CLOSED!r}")
+
+    frozen_metadata = expected_metadata["read_file"]
+    try:
+        frozen_metadata.effect = ToolEffect.DESTRUCTIVE
+    except FrozenInstanceError:
+        pass
+    else:
+        fail("ToolMetadata fields were mutable")
+    ok("tool metadata is exact, per-call, frozen, and fail-closed")
+
+    metadata_field_names = (
+        "effect",
+        "concurrency_safe",
+        "paths",
+        "result_hint",
+        "interrupt_behavior",
+        "schema_version",
+    )
+    read_parameters = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to read, relative to the allowed root.",
+            }
+        },
+        "required": ["path"],
+    }
+    read_description = "Read the full contents of a text file inside the allowed scope."
+    literal_read_schemas = {
+        1: {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": read_description,
+                "parameters": read_parameters,
+            },
+        },
+        2: {
+            "name": "read_file",
+            "description": read_description,
+            "input_schema": read_parameters,
+        },
+        3: {
+            "name": "read_file",
+            "description": read_description,
+            "parameters": read_parameters,
+        },
+        4: {
+            "name": "read_file",
+            "description": read_description,
+            "properties": read_parameters,
+        },
+    }
+    for wire_format in (1, 2, 3, 4):
+        for name, tool in metadata_tools.items():
+            schema = to_provider_tool_schema(tool, wire_format)
+            serialized = json.dumps(schema)
+            leaked = [field for field in metadata_field_names if field in serialized]
+            if leaked:
+                fail(
+                    f"metadata leaked into {name} wire format {wire_format}: "
+                    f"fields={leaked!r}, schema={schema!r}"
+                )
+        read_schema = to_provider_tool_schema(
+            metadata_tools["read_file"], wire_format
+        )
+        if read_schema != literal_read_schemas[wire_format]:
+            fail(
+                f"read_file wire format {wire_format} changed: "
+                f"actual={read_schema!r}, expected={literal_read_schemas[wire_format]!r}"
+            )
+    ok("metadata stays out of every provider tool schema")
+
+    try:
+        ToolCall(id="", name="x")
+    except ValueError as exc:
+        if str(exc) != "ToolCall.id must be a non-empty string":
+            fail(f"empty ToolCall id raised the wrong error: {exc!r}")
+    else:
+        fail("ToolCall accepted an empty canonical id")
+
+    malformed_anthropic = _parse_anthropic_response(
+        {
+            "content": [
+                {"type": "tool_use", "id": "", "name": "lookup", "input": {}}
+            ]
+        }
+    ).message.tool_calls[0]
+    if not malformed_anthropic.id or malformed_anthropic.vendor_id is not None:
+        fail(f"Anthropic missing-id fallback was not canonical-only: {malformed_anthropic!r}")
+
+    real_anthropic_id = "toolu_real_vendor_id"
+    normal_anthropic = _parse_anthropic_response(
+        {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": real_anthropic_id,
+                    "name": "lookup",
+                    "input": {"key": "value"},
+                }
+            ]
+        }
+    ).message.tool_calls[0]
+    normal_anthropic_body = _build_anthropic_body(
+        ModelRequest(
+            messages=[
+                Message(role=Role.ASSISTANT, tool_calls=[normal_anthropic]),
+                Message(
+                    role=Role.TOOL,
+                    tool_result=ToolResult(
+                        tool_call_id=normal_anthropic.id,
+                        ok=True,
+                        content="result",
+                    ),
+                ),
+            ]
+        ),
+        "test-model",
+        100,
+    )
+    if json.dumps(normal_anthropic_body).count(real_anthropic_id) != 2:
+        fail(f"Anthropic real tool-use id did not round-trip unchanged: {normal_anthropic_body!r}")
+    ok("ToolCall ids are non-empty and Anthropic ids preserve the vendor boundary")
 
     canonical_id = "canonical_internal_id"
     vendor_id = "call_abc"
@@ -285,10 +629,30 @@ def main() -> None:
         ).message.tool_calls[0].id
         for _ in range(2)
     }
-    if len(two_missing_ids) != 2 or len(gemini_missing_ids) != 2:
+    anthropic_missing_ids = {
+        _parse_anthropic_response(
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "",
+                        "name": "lookup",
+                        "input": {},
+                    }
+                ]
+            }
+        ).message.tool_calls[0].id
+        for _ in range(2)
+    }
+    if (
+        len(two_missing_ids) != 2
+        or len(gemini_missing_ids) != 2
+        or len(anthropic_missing_ids) != 2
+    ):
         fail(
             "synthesized tool-call ids collided across turns: "
-            f"openai={two_missing_ids!r}, gemini={gemini_missing_ids!r}"
+            f"openai={two_missing_ids!r}, gemini={gemini_missing_ids!r}, "
+            f"anthropic={anthropic_missing_ids!r}"
         )
     ok("synthesized tool-call ids are unique per call, not position-based")
 
@@ -484,7 +848,10 @@ def main() -> None:
         cancelling_call = ModelResponse(
             message=Message(
                 role=Role.ASSISTANT,
-                tool_calls=[ToolCall(id="cancel-1", name="cancel_work")],
+                tool_calls=[
+                    ToolCall(id="cancel-1", name="cancel_work"),
+                    ToolCall(id="cancel-2", name="cancel_work"),
+                ],
             )
         )
         during_tool_result = ApiAgent(
@@ -496,7 +863,29 @@ def main() -> None:
             fail(f"tool cancellation escaped the agent boundary: {during_tool_result!r}")
         if not any(message.role == Role.ASSISTANT for message in during_tool_result.messages):
             fail(f"tool cancellation discarded the assistant message: {during_tool_result!r}")
-        ok("tool cancellation returns a partial cancelled agent result")
+        returned_calls = [
+            tool_call
+            for message in during_tool_result.messages
+            for tool_call in message.tool_calls
+        ]
+        returned_results = {
+            message.tool_result.tool_call_id: message.tool_result
+            for message in during_tool_result.messages
+            if message.tool_result is not None
+        }
+        if {tool_call.id for tool_call in returned_calls} != set(returned_results):
+            fail(f"tool cancellation left an unanswered call: {during_tool_result.messages!r}")
+        repaired = returned_results["cancel-1"]
+        if repaired.ok or not repaired.cancelled:
+            fail(f"cancelled tool result has the wrong flags: {repaired!r}")
+        if returned_results["cancel-2"].ok or not returned_results["cancel-2"].cancelled:
+            fail(f"unstarted tool call has the wrong cancellation result: {returned_results['cancel-2']!r}")
+        next_turn_messages = [
+            *during_tool_result.messages,
+            Message(role=Role.USER, content="continue after cancellation"),
+        ]
+        _assert_openai_tool_calls_answered(next_turn_messages, "cancelled agent transcript")
+        ok("tool cancellation repairs every tool call for the next provider request")
 
         compact_cancel = CancellationToken()
         compact_cancel.cancel()
@@ -549,6 +938,93 @@ def main() -> None:
 
         # -- allow path: read/list/write inside repo_root + allowed_write_scope --
         tools = standard_tool_registry()
+
+        validation_tool = _ValidationStageTool()
+        validation_result = validation_tool.execute(
+            ToolCall(id="validation-stage", name=validation_tool.name),
+            policy,
+        )
+        if (
+            validation_result.ok
+            or validation_result.error != "scripted validation failure"
+            or validation_tool.executed
+        ):
+            fail(
+                "validation did not short-circuit before permitted work: "
+                f"result={validation_result!r}, executed={validation_tool.executed!r}"
+            )
+
+        invalid_shell = tools["run_shell"].execute(
+            ToolCall(
+                id="invalid-shell-arguments",
+                name="run_shell",
+                arguments={"argv": ["ls", 3]},
+            ),
+            policy,
+        )
+        expected_shell_error = (
+            "missing or invalid required argument: argv "
+            "(must be a non-empty list of strings)"
+        )
+        if invalid_shell.ok or invalid_shell.error != expected_shell_error:
+            fail(f"run_shell validation message changed: {invalid_shell!r}")
+
+        missing_read_path = tools["read_file"].execute(
+            ToolCall(id="missing-read-path", name="read_file"),
+            policy,
+        )
+        if missing_read_path.ok or missing_read_path.error != "missing required argument: path":
+            fail(f"read_file validation message changed: {missing_read_path!r}")
+
+        missing_write_content = tools["write_file"].execute(
+            ToolCall(
+                id="missing-write-content",
+                name="write_file",
+                arguments={"path": "missing-content.txt"},
+            ),
+            policy,
+        )
+        if (
+            missing_write_content.ok
+            or missing_write_content.error != "missing required argument: content"
+        ):
+            fail(f"write_file validation message changed: {missing_write_content!r}")
+
+        empty_write = tools["write_file"].execute(
+            ToolCall(
+                id="empty-write-content",
+                name="write_file",
+                arguments={"path": "empty-content.txt", "content": ""},
+            ),
+            policy,
+        )
+        if not empty_write.ok or (root / "empty-content.txt").read_text() != "":
+            fail(f"write_file rejected valid empty content: {empty_write!r}")
+
+        default_list = tools["list_files"].execute(
+            ToolCall(id="default-list-path", name="list_files"),
+            policy,
+        )
+        if not default_list.ok or "existing.txt" not in default_list.content:
+            fail(f"list_files no longer defaults to the repo root: {default_list!r}")
+
+        invalid_cancel = CancellationToken()
+        invalid_cancel.cancel()
+        try:
+            tools["run_shell"].execute(
+                ToolCall(
+                    id="cancel-before-validation",
+                    name="run_shell",
+                    arguments={"argv": ["ls", 3]},
+                ),
+                policy,
+                cancel=invalid_cancel,
+            )
+        except OperationCancelled:
+            pass
+        else:
+            fail("LocalTool validated invalid arguments before checking cancellation")
+        ok("base validation preserves errors, defaults, and cancellation ordering")
 
         r = tools["read_file"].execute(ToolCall(id="a1", name="read_file", arguments={"path": "existing.txt"}), policy)
         if not r.ok:
@@ -628,6 +1104,80 @@ def main() -> None:
             def __exit__(self, *exc: object) -> bool:
                 return False
 
+        delayed_token = CancellationToken()
+
+        class _DelayedCancellingResponse(_FakeHttpResponse):
+            def read(self) -> bytes:
+                time.sleep(0.01)
+                delayed_token.cancel()
+                return super().read()
+
+        delayed_payload = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "late answer"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+        ).encode("utf-8")
+        with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "delayed-cancel-test-key"}):
+            with mock.patch(
+                "urllib.request.urlopen",
+                return_value=_DelayedCancellingResponse(delayed_payload),
+            ):
+                try:
+                    OpenAIProvider().create_response(
+                        ModelRequest(messages=[Message(role=Role.USER, content="wait")]),
+                        cancel=delayed_token,
+                    )
+                except ProviderError as exc:
+                    fail(f"transport cancellation was wrapped as ProviderError: {exc!r}")
+                except OperationCancelled:
+                    pass
+                else:
+                    fail("successful HTTP body bypassed cancellation after response.read()")
+        ok("successful HTTP reads recheck cancellation without wrapping it")
+
+        late_agent_token = CancellationToken()
+
+        class _LateCancellingProvider(ModelProvider):
+            @property
+            def name(self) -> str:
+                return "late-cancelling"
+
+            @property
+            def wire_format(self) -> int:
+                return 4
+
+            def create_response(
+                self,
+                request: ModelRequest,
+                *,
+                cancel: CancellationToken | None = None,
+            ) -> ModelResponse:
+                assert cancel is not None
+                time.sleep(0.01)
+                cancel.cancel()
+                return ModelResponse(Message(Role.ASSISTANT, "late answer"))
+
+        late_agent_result = ApiAgent(
+            _LateCancellingProvider(), {}, policy
+        ).run(
+            [Message(role=Role.USER, content="wait")],
+            cancel=late_agent_token,
+        )
+        if late_agent_result.stopped_reason != "cancelled":
+            fail(f"late successful response bypassed agent cancellation: {late_agent_result!r}")
+        if not any(
+            message.role == Role.ASSISTANT and message.text == "late answer"
+            for message in late_agent_result.messages
+        ):
+            fail(f"late assistant response was not retained: {late_agent_result.messages!r}")
+        ok("ApiAgent retains a late assistant response before reporting cancellation")
+
         retry_request = urllib.request.Request("https://mock.invalid/test")
         backoff_token = CancellationToken()
         timer = threading.Timer(0.02, backoff_token.cancel)
@@ -696,6 +1246,33 @@ def main() -> None:
             shell_enabled=True,
             shell_allowlist=[(sys.executable,)],
         )
+        same_group_proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            child_pgid = os.getpgid(same_group_proc.pid)
+            current_pgid = os.getpgid(0)
+            if child_pgid != current_pgid:
+                fail(
+                    "same-group termination test did not exercise the guard: "
+                    f"child={child_pgid}, current={current_pgid}"
+                )
+            with mock.patch("orchestra_api.tools.shell.os.killpg") as killpg_mock:
+                _terminate_process_group(same_group_proc)
+            if killpg_mock.called:
+                fail("same-group termination attempted to signal orchestra's process group")
+            try:
+                same_group_proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                fail("same-group termination did not kill the child process")
+        finally:
+            if same_group_proc.poll() is None:
+                same_group_proc.kill()
+                same_group_proc.wait(timeout=1.0)
+        ok("process-group cleanup falls back to child-only kill for orchestra's group")
+
         real_popen = subprocess.Popen
         children: list[subprocess.Popen] = []
 
@@ -740,6 +1317,101 @@ def main() -> None:
         if len(children) != 1 or children[0].poll() is None:
             fail(f"cancelled run_shell left its child running: {children!r}")
         ok("cancelled run_shell kills and reaps its child process")
+
+        descendant_pid_path = root / "descendant.pid"
+        descendant_token = CancellationToken()
+        descendant_script = (
+            "import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)'], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+            "open(sys.argv[1], 'w').write(str(child.pid)); "
+            "time.sleep(30)"
+        )
+        descendant_timer = threading.Timer(0.2, descendant_token.cancel)
+        descendant_timer.start()
+        try:
+            try:
+                shell_tool_for_tree = RunShellTool()
+                shell_tool_for_tree.execute(
+                    ToolCall(
+                        id="cancel-shell-tree",
+                        name="run_shell",
+                        arguments={
+                            "argv": [
+                                sys.executable,
+                                "-c",
+                                descendant_script,
+                                str(descendant_pid_path),
+                            ]
+                        },
+                    ),
+                    shell_policy,
+                    cancel=descendant_token,
+                )
+            except OperationCancelled:
+                pass
+            else:
+                fail("cancelled process-tree command returned a ToolResult")
+        finally:
+            descendant_timer.cancel()
+            descendant_timer.join()
+        if not descendant_pid_path.exists():
+            fail("process-tree command did not record its descendant pid before cancellation")
+        descendant_pid = int(descendant_pid_path.read_text())
+        descendant_deadline = time.monotonic() + 2.0
+        descendant_alive = True
+        while time.monotonic() < descendant_deadline:
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                descendant_alive = False
+                break
+            time.sleep(0.02)
+        if descendant_alive:
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            fail(f"cancelled run_shell left descendant pid {descendant_pid} alive")
+        ok("cancelled run_shell terminates the complete child process group")
+
+        inherited_pipe_token = CancellationToken()
+        inherited_pipe_script = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)']); "
+            "time.sleep(30)"
+        )
+        inherited_pipe_timer = threading.Timer(0.2, inherited_pipe_token.cancel)
+        inherited_pipe_started = time.monotonic()
+        inherited_pipe_timer.start()
+        try:
+            try:
+                RunShellTool().execute(
+                    ToolCall(
+                        id="cancel-shell-inherited-pipe",
+                        name="run_shell",
+                        arguments={
+                            "argv": [sys.executable, "-c", inherited_pipe_script]
+                        },
+                    ),
+                    shell_policy,
+                    cancel=inherited_pipe_token,
+                )
+            except OperationCancelled:
+                pass
+            else:
+                fail("cancelled inherited-pipe command returned a ToolResult")
+        finally:
+            inherited_pipe_timer.cancel()
+            inherited_pipe_timer.join()
+        inherited_pipe_elapsed = time.monotonic() - inherited_pipe_started
+        if inherited_pipe_elapsed >= 1.5:
+            fail(
+                "cancelled run_shell blocked on an inherited pipe for "
+                f"{inherited_pipe_elapsed:.2f}s"
+            )
+        ok("cancelled run_shell cleanup stays bounded with inherited pipes")
 
         # -- run_shell behaviour unchanged by the subprocess.run -> Popen rewrite.
         # These are the paths the rewrite could silently break; none of them were

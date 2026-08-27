@@ -20,13 +20,14 @@ sys.path.insert(0, str(REPO_ROOT))
 from orchestra_api.cancellation import CancellationToken  # noqa: E402
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall  # noqa: E402
 from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
-from orchestra_api.events import Event  # noqa: E402
+from orchestra_api.events import Event, RunStarted, SubagentSpawned  # noqa: E402
 from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
 from orchestra_tui.app import (  # noqa: E402
     AGENT_STATE_CANCELLED,
     AGENT_STATE_DONE,
     AGENT_STATE_EXHAUSTED,
     AGENT_STATE_FAILED,
+    AGENT_STATE_WORKING,
     OrchestraTuiApp,
     ToolApprovalScreen,
 )
@@ -312,9 +313,9 @@ async def smoke_terminal_status_case(root: Path) -> None:
         repo_root=root,
     )
     async with app.run_test(size=(64, 20)):
-        app._update_agent_status("leader", AGENT_STATE_FAILED)  # noqa: SLF001
-        app._update_agent_status("worker-1", AGENT_STATE_EXHAUSTED)  # noqa: SLF001
-        app._update_agent_status("worker-2", AGENT_STATE_CANCELLED)  # noqa: SLF001
+        app._update_agent_status("leader-id", "leader", AGENT_STATE_FAILED)  # noqa: SLF001
+        app._update_agent_status("worker-1-id", "worker-1", AGENT_STATE_EXHAUSTED)  # noqa: SLF001
+        app._update_agent_status("worker-2-id", "worker-2", AGENT_STATE_CANCELLED)  # noqa: SLF001
         panel_text = app.query_one("#status-panel", Static).render()
         if not all(
             text in panel_text.plain
@@ -336,7 +337,9 @@ async def smoke_terminal_status_case(root: Path) -> None:
         ok("failed, exhausted, and cancelled use distinct terminal styles")
 
         for index in range(1, 6):
-            app._update_agent_status(f"worker-{index}", AGENT_STATE_DONE)  # noqa: SLF001
+            app._update_agent_status(  # noqa: SLF001
+                f"worker-{index}-id", f"worker-{index}", AGENT_STATE_DONE
+            )
         expected = {"leader", *(f"worker-{index}" for index in range(1, 6))}
         visible = {line.partition(":")[0] for line in app.visible_status_text.splitlines()}
         if expected != visible:
@@ -344,6 +347,49 @@ async def smoke_terminal_status_case(root: Path) -> None:
         if app.query_one("#status-panel", Static).content_region.height < 7:
             fail("status panel content area cannot display its title plus six agents")
         ok("status panel displays the leader plus five subagents")
+
+
+async def smoke_duplicate_agent_label_case(root: Path) -> None:
+    app = OrchestraTuiApp(
+        leader_provider=FakeModelProvider(),
+        subagent_provider=FakeModelProvider(),
+        repo_root=root,
+    )
+    async with app.run_test(size=(64, 20)):
+        app._call_ui_from_worker = lambda callback, *args: callback(*args)  # noqa: SLF001
+        app._events_from_worker(  # noqa: SLF001
+            RunStarted(
+                agent_id="agent_a3f019-leader",
+                run_id="run-status",
+                agent_name="leader",
+            )
+        )
+        app._events_from_worker(  # noqa: SLF001
+            SubagentSpawned(
+                agent_id="agent_a3f019-leader",
+                run_id="run-status",
+                subagent_name="leader",
+                subagent_agent_id="agent_b7e201-subagent",
+            )
+        )
+        if set(app._agent_status) != {  # noqa: SLF001
+            "agent_a3f019-leader",
+            "agent_b7e201-subagent",
+        }:
+            fail(f"status state was not keyed by agent id: {app._agent_status!r}")  # noqa: SLF001
+        if app._agent_status["agent_a3f019-leader"] != (  # noqa: SLF001
+            "leader",
+            AGENT_STATE_WORKING,
+        ):
+            fail(f"leader state was overwritten by a duplicate label: {app._agent_status!r}")  # noqa: SLF001
+        if app._agent_status["agent_b7e201-subagent"] != ("leader", "pending"):  # noqa: SLF001
+            fail(f"subagent state was overwritten by a duplicate label: {app._agent_status!r}")  # noqa: SLF001
+        if not all(
+            row in app.visible_status_text
+            for row in ("leader (a3f019): working", "leader (b7e201): pending")
+        ):
+            fail(f"duplicate labels were not disambiguated: {app.visible_status_text!r}")
+        ok("duplicate agent labels retain distinct id-keyed status rows")
 
 
 async def wait_for_picker(pilot) -> ProviderPickerScreen:  # noqa: ANN001
@@ -804,6 +850,86 @@ async def smoke_approval_case(
         ok(f"prompt permission mode can {label} a side-effectful tool call")
 
 
+async def smoke_approval_stop_case(root: Path) -> None:
+    target = root / "stopped-approval.txt"
+    subagent_provider = FakeModelProvider(
+        responses=[
+            ModelResponse(
+                message=Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            id="write-stop",
+                            name="write_file",
+                            arguments={"path": target.name, "content": "must not be written"},
+                        )
+                    ],
+                )
+            ),
+            ModelResponse(message=Message(role=Role.ASSISTANT, content="unused")),
+        ]
+    )
+    leader_provider = FakeModelProvider(
+        responses=[
+            ModelResponse(
+                message=Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            id="dispatch-stop-approval",
+                            name="dispatch_subagent",
+                            arguments={"subagent_name": "writer", "task": "write the file"},
+                        )
+                    ],
+                )
+            ),
+            ModelResponse(message=Message(role=Role.ASSISTANT, content="unused")),
+        ]
+    )
+    app = OrchestraTuiApp(
+        leader_provider=leader_provider,
+        subagent_provider=subagent_provider,
+        repo_root=root,
+        permission_mode="prompt",
+    )
+    async with app.run_test(size=(76, 20)) as pilot:
+        await submit_message(pilot, "stop at approval")
+        await wait_until(
+            pilot,
+            lambda: isinstance(pilot.app.screen, ToolApprovalScreen),
+            "tool approval screen before stop",
+        )
+        screen = pilot.app.screen
+        if not isinstance(screen, ToolApprovalScreen):
+            fail(f"expected ToolApprovalScreen, found {type(screen).__name__}")
+        with app._approval_lock:  # noqa: SLF001
+            pending = list(app._pending_approvals)  # noqa: SLF001
+        if len(pending) != 1:
+            fail(f"expected one pending approval, found {pending!r}")
+        waiter = pending[0]
+        screen.action_stop_turn()
+        await wait_until(pilot, waiter.event.is_set, "stopped approval decision")
+        if waiter.decision is None or waiter.decision.allowed:
+            fail(f"stopped approval did not resolve as denied: {waiter.decision!r}")
+        if "turn stopped by user" not in waiter.decision.reason:
+            fail(f"stopped approval used the wrong denial reason: {waiter.decision!r}")
+        await wait_until(
+            pilot,
+            lambda: not app.query_one("#message-input", Input).disabled,
+            "approval-stop turn completion",
+        )
+        if target.exists():
+            fail("approval-stop allowed the pending write to run")
+        if not any(state == AGENT_STATE_CANCELLED for _, state in app.status_entries):
+            fail(f"approval-stop did not report a cancelled run: {app.status_entries!r}")
+        with app._approval_lock:  # noqa: SLF001
+            if app._pending_approvals:  # noqa: SLF001
+                fail(f"approval-stop left blocked waiters: {app._pending_approvals!r}")  # noqa: SLF001
+        if ("system", "Turn stopped; answer may be incomplete.") not in app.chat_entries:
+            fail(f"approval-stop was not reported as deliberate: {app.chat_entries!r}")
+        ok("approval screen stop cancels the turn and releases its pending decision")
+
+
 async def main_async() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -815,6 +941,7 @@ async def main_async() -> None:
         await smoke_idle_stop_case(root)
         await smoke_small_terminal_case(root)
         await smoke_terminal_status_case(root)
+        await smoke_duplicate_agent_label_case(root)
         await smoke_picker_success_case(root)
         await smoke_picker_fallback_case(root)
         await smoke_picker_include_all_case(root)
@@ -826,6 +953,7 @@ async def main_async() -> None:
         await smoke_approval_case(root, approve=True)
         await smoke_approval_case(root, approve=False)
         await smoke_approval_case(root, approve=False, escape=True)
+        await smoke_approval_stop_case(root)
 
 
 def main() -> int:

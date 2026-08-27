@@ -42,6 +42,14 @@ from orchestra_api.models import (
     Usage,
     wire_tool_call_ids,
 )
+from orchestra_api.tools.metadata import (
+    FAIL_CLOSED,
+    InterruptBehavior,
+    ResultHint,
+    ToolEffect,
+    ToolMetadata,
+    safe_metadata,
+)
 
 __all__ = [
     "AgentRef",
@@ -51,10 +59,13 @@ __all__ = [
     "ContentBlock",
     "Event",
     "EventSink",
+    "FAIL_CLOSED",
+    "InterruptBehavior",
     "Message",
     "ModelRequest",
     "ModelResponse",
     "OperationCancelled",
+    "ResultHint",
     "Role",
     "RunFailed",
     "RunFinished",
@@ -66,6 +77,8 @@ __all__ = [
     "ToolCall",
     "ToolCallFinished",
     "ToolCallStarted",
+    "ToolEffect",
+    "ToolMetadata",
     "ToolResult",
     "TurnFinished",
     "TurnRef",
@@ -75,5 +88,6 @@ __all__ = [
     "new_id",
     "new_run_ref",
     "new_turn_ref",
+    "safe_metadata",
     "wire_tool_call_ids",
 ]

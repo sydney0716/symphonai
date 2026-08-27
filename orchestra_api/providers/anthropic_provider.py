@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from orchestra_api.cancellation import CancellationToken
+from orchestra_api.identity import new_id
 from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage, wire_tool_call_ids
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
@@ -30,6 +31,15 @@ DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
+
+
+def _synthesize_tool_call_id() -> str:
+    """Build a fallback canonical id for tool calls that arrive without one.
+
+    Must not be position-based: the same index in a later turn would reuse
+    the id, leaving two distinct calls sharing a `tool_call_id`.
+    """
+    return new_id("call")
 
 
 def _to_anthropic_content(message: Message, id_map: dict[str, str]) -> list[dict[str, Any]] | str:
@@ -90,12 +100,13 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
         if block.get("type") == "text":
             text_parts.append(block.get("text", ""))
         elif block.get("type") == "tool_use":
+            vendor_id = block.get("id") or None
             tool_calls.append(
                 ToolCall(
-                    id=block["id"],
+                    id=vendor_id or _synthesize_tool_call_id(),
                     name=block["name"],
                     arguments=block.get("input", {}),
-                    vendor_id=block["id"],
+                    vendor_id=vendor_id,
                 )
             )
     usage_raw = data.get("usage", {})
