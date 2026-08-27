@@ -7,17 +7,22 @@ or performing the disk access.
 
 from __future__ import annotations
 
+import itertools
+
 from orchestra_api.cancellation import CancellationToken
+from orchestra_api.compaction import estimate_text_tokens
 from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
 
 MAX_READ_BYTES = 1_000_000  # 1 MB safety cap on a single read_file call
+MAX_READ_LINES = 2_000
+MAX_READ_TOKENS = 25_000
 
 
 class ReadFileTool(LocalTool):
-    """Read the full UTF-8 text contents of a file inside the allowed scope."""
+    """Read a bounded line range from a UTF-8 file inside the allowed scope."""
 
     @property
     def name(self) -> str:
@@ -25,7 +30,7 @@ class ReadFileTool(LocalTool):
 
     @property
     def description(self) -> str:
-        return "Read the full contents of a text file inside the allowed scope."
+        return "Read a numbered line range from a text file inside the allowed scope."
 
     @property
     def parameters(self) -> dict:
@@ -35,6 +40,16 @@ class ReadFileTool(LocalTool):
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read, relative to the allowed root.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based first line to read.",
+                    "default": 1,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": f"Maximum lines to read; 0 reads to end of file. Defaults to {MAX_READ_LINES}.",
+                    "default": MAX_READ_LINES,
                 },
             },
             "required": ["path"],
@@ -51,6 +66,16 @@ class ReadFileTool(LocalTool):
     def validate(self, arguments: dict) -> str | None:
         if not arguments.get("path"):
             return "missing required argument: path"
+        offset = arguments.get("offset", 1)
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            return "offset must be an integer"
+        if offset < 1:
+            return "offset must be >= 1"
+        limit = arguments.get("limit", MAX_READ_LINES)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            return "limit must be an integer"
+        if limit < 0:
+            return "limit must be >= 0"
         return None
 
     def _execute(
@@ -66,21 +91,58 @@ class ReadFileTool(LocalTool):
         # Reuse the policy's own path resolution so this tool can never
         # disagree with the decision it was just given.
         resolved = policy._resolve_within_root(path)
+        is_unranged = "offset" not in tool_call.arguments and "limit" not in tool_call.arguments
+        if is_unranged:
+            try:
+                size = resolved.stat().st_size
+            except OSError as exc:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
+            if size > MAX_READ_BYTES:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=(
+                        f"file exceeds {MAX_READ_BYTES} byte read limit; "
+                        "read part of it with offset and limit"
+                    ),
+                )
+        offset = tool_call.arguments.get("offset", 1)
+        limit = tool_call.arguments.get("limit", MAX_READ_LINES)
+        slice_start = offset - 1
+        slice_stop = None if limit == 0 else slice_start + limit + 1
         try:
-            data = resolved.read_bytes()
+            with resolved.open("r", encoding="utf-8") as handle:
+                lines = list(itertools.islice(handle, slice_start, slice_stop))
+        except UnicodeDecodeError:
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
-        if len(data) > MAX_READ_BYTES:
+        more_follows = limit != 0 and len(lines) > limit
+        selected = lines[:limit] if more_follows else lines
+        rendered_lines = [
+            f"{lineno}\t{line.removesuffix(chr(10))}"
+            for lineno, line in enumerate(selected, start=offset)
+        ]
+        rendered = "\n".join(rendered_lines)
+        tokens = estimate_text_tokens(rendered)
+        if tokens > MAX_READ_TOKENS:
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=False,
-                error=f"file exceeds {MAX_READ_BYTES} byte read limit",
+                error=(
+                    f"selected range is about {tokens} tokens, over the "
+                    f"{MAX_READ_TOKENS} token limit; narrow it with offset and limit"
+                ),
             )
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
-        return ToolResult(tool_call_id=tool_call.id, ok=True, content=text)
+        if selected:
+            end = offset + len(selected) - 1
+            if more_follows:
+                rendered_lines.append(
+                    f"[lines {offset}-{end}; more follow, pass offset={end + 1}]"
+                )
+            elif offset > 1:
+                rendered_lines.append(f"[lines {offset}-{end}; end of file]")
+        return ToolResult(tool_call_id=tool_call.id, ok=True, content="\n".join(rendered_lines))
 
 
 class WriteFileTool(LocalTool):

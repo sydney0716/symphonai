@@ -11,7 +11,7 @@ Verifies:
     denied by default, and an always-deny command (rm) denied even when
     explicitly allowlisted
   - regression check: runner.run_task() with a real OpenAIProvider actually
-    includes schemas for all four standard tools in its outgoing request
+    includes schemas for all six standard tools in its outgoing request
     (via mocked urllib.request.urlopen) -- guards against ApiAgent/runner
     silently never telling a real model any tool exists
   - request-level model overrides reach real-provider wire requests, and
@@ -117,6 +117,7 @@ from orchestra_api.retry import read_with_retry  # noqa: E402
 from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
 from orchestra_api.tool_schema import to_provider_tool_schema  # noqa: E402
 from orchestra_api.tools.base import LocalTool  # noqa: E402
+import orchestra_api.tools.filesystem as filesystem_tools  # noqa: E402
 from orchestra_api.tools.shell import (  # noqa: E402
     MAX_OUTPUT_CHARS,
     RunShellTool,
@@ -315,6 +316,8 @@ def main() -> None:
         "read_file": {"path": "sample.txt"},
         "write_file": {"path": "sample.txt", "content": "replacement"},
         "list_files": {"path": "sample-dir"},
+        "glob": {"pattern": "**/*.py", "path": "sample-dir"},
+        "grep": {"pattern": "needle", "path": "sample-dir"},
         "run_shell": {"argv": ["ls"]},
     }
     expected_metadata = {
@@ -333,6 +336,20 @@ def main() -> None:
             interrupt_behavior=InterruptBehavior.CANCEL,
         ),
         "list_files": ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=("sample-dir",),
+            result_hint=ResultHint.FILE_LIST,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "glob": ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=("sample-dir",),
+            result_hint=ResultHint.FILE_LIST,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "grep": ToolMetadata(
             effect=ToolEffect.READ_ONLY,
             concurrency_safe=True,
             paths=("sample-dir",),
@@ -366,6 +383,13 @@ def main() -> None:
         fail("write_file metadata resolved or discarded its raw path")
     if metadata_tools["list_files"].metadata({}).paths != (".",):
         fail("list_files metadata did not expose its default path")
+    for name in ("glob", "grep"):
+        if metadata_tools[name].metadata({}).paths != (".",):
+            fail(f"{name} metadata did not expose its default path")
+        if metadata_tools[name].metadata({"path": 3}).paths is not None:
+            fail(f"{name} metadata accepted a non-string path")
+    if metadata_tools["grep"].metadata({"output_mode": "content"}).result_hint != ResultHint.TEXT:
+        fail("grep content metadata did not declare a text result")
     for name in ("read_file", "write_file"):
         if metadata_tools[name].metadata({}).paths is not None:
             fail(f"{name} metadata treated a missing path as an empty path set")
@@ -416,11 +440,24 @@ def main() -> None:
             "path": {
                 "type": "string",
                 "description": "Path to the file to read, relative to the allowed root.",
-            }
+            },
+            "offset": {
+                "type": "integer",
+                "description": "1-based first line to read.",
+                "default": 1,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum lines to read; 0 reads to end of file. Defaults to 2000.",
+                "default": 2000,
+            },
         },
         "required": ["path"],
     }
-    read_description = "Read the full contents of a text file inside the allowed scope."
+    gemini_read_parameters = json.loads(json.dumps(read_parameters))
+    gemini_read_parameters["properties"]["offset"].pop("default")
+    gemini_read_parameters["properties"]["limit"].pop("default")
+    read_description = "Read a numbered line range from a text file inside the allowed scope."
     literal_read_schemas = {
         1: {
             "type": "function",
@@ -438,7 +475,7 @@ def main() -> None:
         3: {
             "name": "read_file",
             "description": read_description,
-            "parameters": read_parameters,
+            "parameters": gemini_read_parameters,
         },
         4: {
             "name": "read_file",
@@ -656,7 +693,7 @@ def main() -> None:
         )
     ok("synthesized tool-call ids are unique per call, not position-based")
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside_tmp:
         root = Path(tmp)
         (root / "existing.txt").write_text("hello from disk")
         (root / ".env").write_text("SECRET=do-not-read-me")
@@ -918,7 +955,7 @@ def main() -> None:
         tool_messages = [m for m in result.messages if m.role == Role.TOOL]
         if not tool_messages or not tool_messages[0].tool_result.ok:
             fail("expected the read_file tool call to succeed")
-        if tool_messages[0].tool_result.content != "hello from disk":
+        if tool_messages[0].tool_result.content != "1\thello from disk":
             fail("read_file returned unexpected content")
         appended = [message for message in result.messages if message.role in (Role.ASSISTANT, Role.TOOL)]
         if any(message.turn_id is None for message in appended):
@@ -1026,6 +1063,375 @@ def main() -> None:
             fail("LocalTool validated invalid arguments before checking cancellation")
         ok("base validation preserves errors, defaults, and cancellation ordering")
 
+        # -- glob/grep fixture: ordering, permission gates, bounds, and modes --
+        search_root = root / "search-fixture"
+        nested = search_root / "nested"
+        ordered = search_root / "ordered"
+        cancel_root = search_root / "cancel"
+        nested.mkdir(parents=True)
+        ordered.mkdir()
+        cancel_root.mkdir()
+        (search_root / "top.py").write_text("needle\nother\nneedle\nneedle\n")
+        (search_root / "top.txt").write_text("ordinary text\n")
+        (nested / "a.py").write_text("first\nneedle\n")
+        (nested / "b.txt").write_text("needle\n")
+        os.utime(search_root / "top.py", (600, 600))
+        os.utime(nested / "a.py", (500, 500))
+        os.utime(nested / "b.txt", (400, 400))
+        secret_value = "SEARCH_FIXTURE_SECRET_62491"
+        (search_root / ".env").write_text(secret_value)
+        (search_root / "secret.pem").write_text(secret_value)
+        (search_root / "node_modules").mkdir()
+        (search_root / "node_modules" / "hidden.py").write_text(secret_value)
+        (search_root / "skip-binary.txt").write_bytes(b"needle\xff\xfe")
+        (search_root / "skip-large.txt").write_bytes(
+            b"needle\n" + b"x" * filesystem_tools.MAX_READ_BYTES
+        )
+        outside_file = Path(outside_tmp) / "outside.txt"
+        outside_file.write_text(f"needle {secret_value}")
+        (search_root / "escape.txt").symlink_to(outside_file)
+        outside_directory = Path(outside_tmp) / "outside-directory"
+        outside_directory.mkdir()
+        (outside_directory / "followed.py").write_text("needle")
+        (search_root / "linked-directory").symlink_to(outside_directory, target_is_directory=True)
+
+        ordered_mtimes = {
+            "newest.ord": 500,
+            "alpha.ord": 400,
+            "beta.ord": 400,
+            "older.ord": 300,
+            "statfail.ord": 200,
+        }
+        for filename, mtime in ordered_mtimes.items():
+            path = ordered / filename
+            path.write_text(filename)
+            os.utime(path, (mtime, mtime))
+
+        top_level_glob = tools["glob"].execute(
+            ToolCall(
+                id="glob-top-level",
+                name="glob",
+                arguments={"path": "search-fixture", "pattern": "*.py", "head_limit": 0},
+            ),
+            policy,
+        )
+        recursive_glob = tools["glob"].execute(
+            ToolCall(
+                id="glob-recursive",
+                name="glob",
+                arguments={"path": "search-fixture", "pattern": "**/*.py", "head_limit": 0},
+            ),
+            policy,
+        )
+        if top_level_glob.content != "search-fixture/top.py":
+            fail(f"*.py crossed directories: {top_level_glob!r}")
+        if set(recursive_glob.content.splitlines()) != {
+            "search-fixture/top.py",
+            "search-fixture/nested/a.py",
+        }:
+            fail(f"**/*.py did not cover both depths: {recursive_glob!r}")
+
+        secret_glob = tools["glob"].execute(
+            ToolCall(
+                id="glob-secrets",
+                name="glob",
+                arguments={"path": "search-fixture", "pattern": "**/*", "head_limit": 0},
+            ),
+            policy,
+        )
+        forbidden_names = (".env", "secret.pem", "node_modules", "escape.txt", "followed.py")
+        if not secret_glob.ok or any(name in secret_glob.content for name in forbidden_names):
+            fail(f"glob exposed a forbidden or escaped file: {secret_glob!r}")
+        secret_grep = tools["grep"].execute(
+            ToolCall(
+                id="grep-secrets",
+                name="grep",
+                arguments={"path": "search-fixture", "pattern": secret_value, "head_limit": 0},
+            ),
+            policy,
+        )
+        if secret_grep.content != "no matches" or secret_value in secret_grep.content:
+            fail(f"grep exposed forbidden contents: {secret_grep!r}")
+
+        for tool_name, arguments in (
+            (
+                "glob",
+                {"path": "search-fixture/ordered", "pattern": "*.ord", "head_limit": 0},
+            ),
+            (
+                "grep",
+                {"path": "search-fixture", "glob": "**/*.py", "pattern": "needle"},
+            ),
+        ):
+            with mock.patch.object(policy, "check_read", wraps=policy.check_read) as read_gate:
+                gated_result = tools[tool_name].execute(
+                    ToolCall(
+                        id=f"{tool_name}-file-gates",
+                        name=tool_name,
+                        arguments=arguments,
+                    ),
+                    policy,
+                )
+            checked_paths = {
+                Path(call.args[0]).resolve()
+                for call in read_gate.call_args_list
+                if call.args
+            }
+            result_paths = [
+                line.split(":", 1)[0]
+                for line in gated_result.content.splitlines()
+                if line and not line.startswith("[")
+            ]
+            if any((root / result_path).resolve() not in checked_paths for result_path in result_paths):
+                fail(f"{tool_name} included a file without calling check_read: {read_gate.call_args_list!r}")
+        ok("glob and grep enforce per-file gates, prune denied trees, and exclude symlink escapes")
+
+        ordered_call = {
+            "path": "search-fixture/ordered",
+            "pattern": "*.ord",
+            "head_limit": 0,
+        }
+        ordered_result = tools["glob"].execute(
+            ToolCall(id="glob-order", name="glob", arguments=ordered_call), policy
+        )
+        expected_order = [
+            "search-fixture/ordered/newest.ord",
+            "search-fixture/ordered/alpha.ord",
+            "search-fixture/ordered/beta.ord",
+            "search-fixture/ordered/older.ord",
+            "search-fixture/ordered/statfail.ord",
+        ]
+        if ordered_result.content.splitlines() != expected_order:
+            fail(f"glob mtime/path ordering changed: {ordered_result!r}")
+
+        original_stat = Path.stat
+
+        def _failing_stat(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+            if path.name == "statfail.ord":
+                raise OSError("scripted stat race")
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", _failing_stat):
+            stat_race = tools["glob"].execute(
+                ToolCall(id="glob-stat-race", name="glob", arguments=ordered_call), policy
+            )
+        if not stat_race.ok or stat_race.content.splitlines() != expected_order:
+            fail(f"glob did not tolerate a failed stat as mtime zero: {stat_race!r}")
+
+        no_cap = tools["glob"].execute(
+            ToolCall(
+                id="glob-no-cap",
+                name="glob",
+                arguments={**ordered_call, "head_limit": 10},
+            ),
+            policy,
+        )
+        capped = tools["glob"].execute(
+            ToolCall(
+                id="glob-cap",
+                name="glob",
+                arguments={**ordered_call, "head_limit": 2},
+            ),
+            policy,
+        )
+        unlimited = tools["glob"].execute(
+            ToolCall(id="glob-unlimited", name="glob", arguments=ordered_call), policy
+        )
+        notice = "[2 of 5 results; pass offset=2 for the next page]"
+        if "results; pass offset=" in no_cap.content or capped.content.splitlines()[-1] != notice:
+            fail(f"glob cap notice did not report only a real truncation: {no_cap!r}, {capped!r}")
+        if unlimited.content.splitlines() != expected_order or "results; pass offset=" in unlimited.content:
+            fail(f"glob head_limit=0 did not return all results: {unlimited!r}")
+        page = tools["glob"].execute(
+            ToolCall(
+                id="glob-page",
+                name="glob",
+                arguments={**ordered_call, "head_limit": 2, "offset": 2},
+            ),
+            policy,
+        )
+        if page.content.splitlines()[:2] != expected_order[2:4]:
+            fail(f"glob pagination changed result ordering: {page!r}")
+        ok("glob ordering, stat races, caps, unlimited results, and pagination are deterministic")
+
+        grep_files = tools["grep"].execute(
+            ToolCall(
+                id="grep-files",
+                name="grep",
+                arguments={
+                    "path": "search-fixture",
+                    "glob": "**/*.py",
+                    "pattern": "needle",
+                    "head_limit": 1,
+                },
+            ),
+            policy,
+        )
+        if grep_files.content.splitlines() != [
+            "search-fixture/top.py",
+            "[1 of 2 results; pass offset=1 for the next page]",
+        ]:
+            fail(f"grep files mode did not cap matching files: {grep_files!r}")
+        grep_content = tools["grep"].execute(
+            ToolCall(
+                id="grep-content",
+                name="grep",
+                arguments={
+                    "path": "search-fixture",
+                    "glob": "top.py",
+                    "pattern": "NEEDLE",
+                    "case_insensitive": True,
+                    "output_mode": "content",
+                    "head_limit": 2,
+                },
+            ),
+            policy,
+        )
+        if grep_content.content.splitlines() != [
+            "search-fixture/top.py:1\tneedle",
+            "search-fixture/top.py:3\tneedle",
+            "[2 of 3 results; pass offset=2 for the next page]",
+        ]:
+            fail(f"grep content mode did not cap matching lines: {grep_content!r}")
+        skipped = tools["grep"].execute(
+            ToolCall(
+                id="grep-skips",
+                name="grep",
+                arguments={
+                    "path": "search-fixture",
+                    "glob": "skip-*.txt",
+                    "pattern": "needle",
+                },
+            ),
+            policy,
+        )
+        if not skipped.ok or skipped.content != "no matches":
+            fail(f"grep did not silently skip binary and oversized files: {skipped!r}")
+        ok("grep modes count files or lines and skip unreadable text inputs")
+
+        with mock.patch.object(
+            tools["grep"], "_execute", side_effect=AssertionError("validation was bypassed")
+        ):
+            invalid_regex = tools["grep"].execute(
+                ToolCall(id="grep-invalid", name="grep", arguments={"pattern": "["}), policy
+            )
+        if invalid_regex.ok or not invalid_regex.error.startswith("invalid regular expression: "):
+            fail(f"grep invalid-regex validation changed: {invalid_regex!r}")
+
+        for index in range(70):
+            (cancel_root / f"{index:03}.cancel").write_text("needle")
+        for tool_name, arguments in (
+            ("glob", {"path": "search-fixture/cancel", "pattern": "*.cancel"}),
+            ("grep", {"path": "search-fixture/cancel", "pattern": "needle"}),
+        ):
+            cancel_token = CancellationToken()
+            real_check_read = policy.check_read
+            seen_cancel_files = [0]
+
+            def _cancel_during_gate(path):  # noqa: ANN001
+                decision = real_check_read(path)
+                if Path(path).suffix == ".cancel":
+                    seen_cancel_files[0] += 1
+                    if seen_cancel_files[0] == 1:
+                        cancel_token.cancel()
+                return decision
+
+            try:
+                with mock.patch.object(policy, "check_read", side_effect=_cancel_during_gate):
+                    tools[tool_name].execute(
+                        ToolCall(
+                            id=f"{tool_name}-cancel",
+                            name=tool_name,
+                            arguments=arguments,
+                        ),
+                        policy,
+                        cancel=cancel_token,
+                    )
+            except OperationCancelled:
+                pass
+            else:
+                fail(f"{tool_name} did not observe cancellation inside its file walk")
+        ok("glob and grep observe cancellation during a large file walk")
+
+        read_fixture = root / "read-fixture.txt"
+        read_fixture.write_text("a\nb\nc")
+        full_read = tools["read_file"].execute(
+            ToolCall(id="read-full", name="read_file", arguments={"path": "read-fixture.txt"}),
+            policy,
+        )
+        partial_read = tools["read_file"].execute(
+            ToolCall(
+                id="read-partial",
+                name="read_file",
+                arguments={"path": "read-fixture.txt", "offset": 2, "limit": 1},
+            ),
+            policy,
+        )
+        end_read = tools["read_file"].execute(
+            ToolCall(
+                id="read-end",
+                name="read_file",
+                arguments={"path": "read-fixture.txt", "offset": 3},
+            ),
+            policy,
+        )
+        if full_read.content != "1\ta\n2\tb\n3\tc":
+            fail(f"full read gained a marker or wrong line numbers: {full_read!r}")
+        if partial_read.content != "2\tb\n[lines 2-2; more follow, pass offset=3]":
+            fail(f"partial read marker changed: {partial_read!r}")
+        if end_read.content != "3\tc\n[lines 3-3; end of file]":
+            fail(f"end read marker changed: {end_read!r}")
+        (root / "trailing-newline.txt").write_text("a\nb\nc\n")
+        trailing_read = tools["read_file"].execute(
+            ToolCall(
+                id="read-trailing",
+                name="read_file",
+                arguments={"path": "trailing-newline.txt"},
+            ),
+            policy,
+        )
+        if trailing_read.content != "1\ta\n2\tb\n3\tc":
+            fail(f"trailing newline produced an empty numbered line: {trailing_read!r}")
+
+        oversized_path = root / "oversized-read.txt"
+        oversized_path.write_bytes(b"x\n" * (filesystem_tools.MAX_READ_BYTES // 2 + 1))
+        refused = tools["read_file"].execute(
+            ToolCall(id="read-byte-cap", name="read_file", arguments={"path": oversized_path.name}),
+            policy,
+        )
+        expected_byte_error = (
+            f"file exceeds {filesystem_tools.MAX_READ_BYTES} byte read limit; "
+            "read part of it with offset and limit"
+        )
+        if refused.ok or refused.error != expected_byte_error:
+            fail(f"unranged oversized read was not refused: {refused!r}")
+        ranged = tools["read_file"].execute(
+            ToolCall(
+                id="read-byte-range",
+                name="read_file",
+                arguments={"path": oversized_path.name, "offset": 2, "limit": 1},
+            ),
+            policy,
+        )
+        if not ranged.ok or not ranged.content.startswith("2\tx\n[lines 2-2; more follow"):
+            fail(f"explicit range of oversized file did not succeed: {ranged!r}")
+        (root / "token-cap.txt").write_text("abcdefghij" * 8)
+        with mock.patch.object(filesystem_tools, "MAX_READ_TOKENS", 2):
+            token_refused = tools["read_file"].execute(
+                ToolCall(
+                    id="read-token-cap",
+                    name="read_file",
+                    arguments={"path": "token-cap.txt", "offset": 1, "limit": 1},
+                ),
+                policy,
+            )
+        if token_refused.ok or token_refused.error != (
+            "selected range is about 21 tokens, over the 2 token limit; "
+            "narrow it with offset and limit"
+        ):
+            fail(f"over-token range was not refused: {token_refused!r}")
+        ok("read_file numbers ranges, marks partial views, and refuses byte/token overages")
+
         r = tools["read_file"].execute(ToolCall(id="a1", name="read_file", arguments={"path": "existing.txt"}), policy)
         if not r.ok:
             fail(f"read_file should be allowed inside repo_root: {r.error}")
@@ -1088,7 +1494,7 @@ def main() -> None:
         ok("deny: run_shell always-deny command ('rm') overrides an explicit allowlist")
 
         # -- regression: a real provider's run_task() request must include
-        # schemas for all four standard tools --
+        # schemas for all six standard tools --
         captured: dict = {}
 
         class _FakeHttpResponse:
@@ -2006,12 +2412,19 @@ def main() -> None:
         del os.environ[API_KEY_ENV_VAR]
 
         sent_tool_names = {t["function"]["name"] for t in captured.get("body", {}).get("tools", [])}
-        expected_tool_names = {"read_file", "write_file", "list_files", "run_shell"}
+        expected_tool_names = {
+            "read_file",
+            "write_file",
+            "list_files",
+            "glob",
+            "grep",
+            "run_shell",
+        }
         if sent_tool_names != expected_tool_names:
             fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
         if captured.get("body", {}).get("model") != "request-override-model":
             fail(f"run_task(model=...) did not reach the wire: {captured.get('body')!r}")
-        ok("real provider's run_task() request includes all four standard tool schemas")
+        ok("real provider's run_task() request includes all six standard tool schemas")
         ok("run_task(model=...) overrides the provider's default model on the wire")
 
         # Anthropic and OpenAI-compatible providers use the same request-level
@@ -2064,7 +2477,7 @@ def main() -> None:
             )
         ok("Anthropic and OpenAI-compatible request model overrides reach the wire")
 
-        # -- regression: a real GeminiProvider request must carry the four
+        # -- regression: a real GeminiProvider request must carry the six
         # tools as sanitized tools[].functionDeclarations, not raw schemas --
         os.environ[GEMINI_API_KEY_ENV_VAR] = "AIza-fake-test-key-do-not-use"
         gemini_captured: dict = {}

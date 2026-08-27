@@ -15,12 +15,20 @@ from orchestra_api.providers.base import ModelProvider
 from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
+from orchestra_api.tools.search import GlobTool, GrepTool
 from orchestra_api.tools.shell import RunShellTool
 
 
 def standard_tool_registry() -> dict[str, LocalTool]:
-    """The four local tools this runtime provides: read_file, write_file, list_files, run_shell."""
-    tools: list[LocalTool] = [ReadFileTool(), WriteFileTool(), ListFilesTool(), RunShellTool()]
+    """The six local tools: read_file, write_file, list_files, glob, grep, run_shell."""
+    tools: list[LocalTool] = [
+        ReadFileTool(),
+        WriteFileTool(),
+        ListFilesTool(),
+        GlobTool(),
+        GrepTool(),
+        RunShellTool(),
+    ]
     return {tool.name: tool for tool in tools}
 
 
