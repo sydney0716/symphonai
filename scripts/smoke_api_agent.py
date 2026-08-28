@@ -1252,6 +1252,16 @@ def main() -> None:
         )
         if page.content.splitlines()[:2] != expected_order[2:4]:
             fail(f"glob pagination changed result ordering: {page!r}")
+        past_glob = tools["glob"].execute(
+            ToolCall(
+                id="glob-past-end",
+                name="glob",
+                arguments={**ordered_call, "offset": 50},
+            ),
+            policy,
+        )
+        if past_glob.content != "[no results at offset 50; 5 results total]":
+            fail(f"glob past-end pagination returned an ambiguous result: {past_glob!r}")
         ok("glob ordering, stat races, caps, unlimited results, and pagination are deterministic")
 
         grep_files = tools["grep"].execute(
@@ -1307,6 +1317,41 @@ def main() -> None:
         )
         if not skipped.ok or skipped.content != "no matches":
             fail(f"grep did not silently skip binary and oversized files: {skipped!r}")
+        past_grep = tools["grep"].execute(
+            ToolCall(
+                id="grep-past-end",
+                name="grep",
+                arguments={
+                    "path": "search-fixture",
+                    "glob": "**/*.py",
+                    "pattern": "needle",
+                    "offset": 50,
+                },
+            ),
+            policy,
+        )
+        if past_grep.content != "[no results at offset 50; 2 results total]":
+            fail(f"grep past-end pagination returned an ambiguous result: {past_grep!r}")
+        empty_search = search_root / "empty"
+        empty_search.mkdir()
+        empty_glob = tools["glob"].execute(
+            ToolCall(
+                id="glob-empty-tree",
+                name="glob",
+                arguments={"path": "search-fixture/empty", "pattern": "**/*", "offset": 50},
+            ),
+            policy,
+        )
+        empty_grep = tools["grep"].execute(
+            ToolCall(
+                id="grep-empty-tree",
+                name="grep",
+                arguments={"path": "search-fixture/empty", "pattern": "needle", "offset": 50},
+            ),
+            policy,
+        )
+        if empty_glob.content != "no files matched" or empty_grep.content != "no matches":
+            fail(f"empty search messages changed: glob={empty_glob!r}, grep={empty_grep!r}")
         ok("grep modes count files or lines and skip unreadable text inputs")
 
         with mock.patch.object(
@@ -1381,6 +1426,16 @@ def main() -> None:
             fail(f"partial read marker changed: {partial_read!r}")
         if end_read.content != "3\tc\n[lines 3-3; end of file]":
             fail(f"end read marker changed: {end_read!r}")
+        past_read = tools["read_file"].execute(
+            ToolCall(
+                id="read-past-end",
+                name="read_file",
+                arguments={"path": "read-fixture.txt", "offset": 999999},
+            ),
+            policy,
+        )
+        if past_read.content != "[no lines at offset 999999; file has 3 lines]":
+            fail(f"past-end read returned an ambiguous result: {past_read!r}")
         (root / "trailing-newline.txt").write_text("a\nb\nc\n")
         trailing_read = tools["read_file"].execute(
             ToolCall(
@@ -1415,6 +1470,92 @@ def main() -> None:
         )
         if not ranged.ok or not ranged.content.startswith("2\tx\n[lines 2-2; more follow"):
             fail(f"explicit range of oversized file did not succeed: {ranged!r}")
+        (root / "lookahead-byte-cap.txt").write_text("12345\n67890\nabcde\n")
+        with mock.patch.object(filesystem_tools, "MAX_READ_BYTES", 12):
+            lookahead_allowed = tools["read_file"].execute(
+                ToolCall(
+                    id="read-lookahead-byte-cap",
+                    name="read_file",
+                    arguments={"path": "lookahead-byte-cap.txt", "limit": 2},
+                ),
+                policy,
+            )
+        if lookahead_allowed.content != (
+            "1\t12345\n2\t67890\n[lines 1-2; more follow, pass offset=3]"
+        ):
+            fail(f"read_file charged its lookahead line to the byte cap: {lookahead_allowed!r}")
+        (root / "stream-byte-cap.txt").write_text("12345\n67890\n")
+        for arguments in (
+            {"path": "stream-byte-cap.txt", "offset": 1, "limit": 0},
+            {"path": "stream-byte-cap.txt", "limit": 2000},
+        ):
+            with mock.patch.object(filesystem_tools, "MAX_READ_BYTES", 10):
+                stream_refused = tools["read_file"].execute(
+                    ToolCall(
+                        id="read-stream-byte-cap",
+                        name="read_file",
+                        arguments=arguments,
+                    ),
+                    policy,
+                )
+            if stream_refused.ok or stream_refused.error != (
+                "selected range exceeds 10 byte read limit; narrow it with offset and limit"
+            ):
+                fail(f"streamed range exceeded its byte accumulator: {stream_refused!r}")
+        (root / "single-line-byte-cap.txt").write_text("abcdefghij\n")
+        with mock.patch.object(filesystem_tools, "MAX_READ_BYTES", 4):
+            single_line_byte_refused = tools["read_file"].execute(
+                ToolCall(
+                    id="read-single-line-byte-cap",
+                    name="read_file",
+                    arguments={"path": "single-line-byte-cap.txt", "limit": 1},
+                ),
+                policy,
+            )
+        if single_line_byte_refused.ok or single_line_byte_refused.error != (
+            "line 1 is 11 characters, over the 4 byte read limit; "
+            "search the file with grep instead"
+        ):
+            fail(f"single-line byte refusal did not name grep: {single_line_byte_refused!r}")
+        (root / "later-line-byte-cap.txt").write_text("ab\nabcdefghij\n")
+        with mock.patch.object(filesystem_tools, "MAX_READ_BYTES", 4):
+            later_line_byte_refused = tools["read_file"].execute(
+                ToolCall(
+                    id="read-later-line-byte-cap",
+                    name="read_file",
+                    arguments={"path": "later-line-byte-cap.txt", "offset": 1, "limit": 2},
+                ),
+                policy,
+            )
+            narrowed_before_long_line = tools["read_file"].execute(
+                ToolCall(
+                    id="read-before-later-line-byte-cap",
+                    name="read_file",
+                    arguments={"path": "later-line-byte-cap.txt", "offset": 1, "limit": 1},
+                ),
+                policy,
+            )
+            direct_later_line_refused = tools["read_file"].execute(
+                ToolCall(
+                    id="read-direct-later-line-byte-cap",
+                    name="read_file",
+                    arguments={"path": "later-line-byte-cap.txt", "offset": 2, "limit": 1},
+                ),
+                policy,
+            )
+        if later_line_byte_refused.ok or later_line_byte_refused.error != (
+            "selected range exceeds 4 byte read limit; narrow it with offset and limit"
+        ):
+            fail(f"later-line byte refusal did not recommend narrowing: {later_line_byte_refused!r}")
+        if narrowed_before_long_line.content != (
+            "1\tab\n[lines 1-1; more follow, pass offset=2]"
+        ):
+            fail(f"later-line byte refusal named an ineffective remedy: {narrowed_before_long_line!r}")
+        if direct_later_line_refused.ok or direct_later_line_refused.error != (
+            "line 2 is 11 characters, over the 4 byte read limit; "
+            "search the file with grep instead"
+        ):
+            fail(f"direct oversized-line read did not name its absolute line: {direct_later_line_refused!r}")
         (root / "token-cap.txt").write_text("abcdefghij" * 8)
         with mock.patch.object(filesystem_tools, "MAX_READ_TOKENS", 2):
             token_refused = tools["read_file"].execute(
@@ -1426,10 +1567,25 @@ def main() -> None:
                 policy,
             )
         if token_refused.ok or token_refused.error != (
-            "selected range is about 21 tokens, over the 2 token limit; "
+            "line 1 is about 21 tokens, over the 2 token limit; "
+            "search the file with grep instead"
+        ):
+            fail(f"single-line token refusal did not name grep: {token_refused!r}")
+        (root / "many-lines-token-cap.txt").write_text("a\na\na")
+        with mock.patch.object(filesystem_tools, "MAX_READ_TOKENS", 2):
+            many_lines_refused = tools["read_file"].execute(
+                ToolCall(
+                    id="read-many-lines-token-cap",
+                    name="read_file",
+                    arguments={"path": "many-lines-token-cap.txt", "offset": 1, "limit": 3},
+                ),
+                policy,
+            )
+        if many_lines_refused.ok or many_lines_refused.error != (
+            "selected range is about 3 tokens, over the 2 token limit; "
             "narrow it with offset and limit"
         ):
-            fail(f"over-token range was not refused: {token_refused!r}")
+            fail(f"multi-line token refusal lost its narrowing remedy: {many_lines_refused!r}")
         ok("read_file numbers ranges, marks partial views, and refuses byte/token overages")
 
         r = tools["read_file"].execute(ToolCall(id="a1", name="read_file", arguments={"path": "existing.txt"}), policy)

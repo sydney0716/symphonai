@@ -109,16 +109,55 @@ class ReadFileTool(LocalTool):
         offset = tool_call.arguments.get("offset", 1)
         limit = tool_call.arguments.get("limit", MAX_READ_LINES)
         slice_start = offset - 1
-        slice_stop = None if limit == 0 else slice_start + limit + 1
+        lines: list[str] = []
+        characters_read = 0
+        last_line_seen = 0
         try:
             with resolved.open("r", encoding="utf-8") as handle:
-                lines = list(itertools.islice(handle, slice_start, slice_stop))
+                for last_line_seen, _ in enumerate(
+                    itertools.islice(handle, slice_start), start=1
+                ):
+                    pass
+                selected_lines = itertools.islice(
+                    handle, None if limit == 0 else limit + 1
+                )
+                for selection_index, line in enumerate(selected_lines):
+                    last_line_seen += 1
+                    is_lookahead = limit != 0 and selection_index == limit
+                    if not is_lookahead:
+                        characters_read += len(line)
+                        if characters_read > MAX_READ_BYTES:
+                            if selection_index == 0:
+                                return ToolResult(
+                                    tool_call_id=tool_call.id,
+                                    ok=False,
+                                    error=(
+                                        f"line {last_line_seen} is {len(line)} characters, "
+                                        f"over the {MAX_READ_BYTES} byte read limit; "
+                                        "search the file with grep instead"
+                                    ),
+                                )
+                            return ToolResult(
+                                tool_call_id=tool_call.id,
+                                ok=False,
+                                error=(
+                                    f"selected range exceeds {MAX_READ_BYTES} byte read limit; "
+                                    "narrow it with offset and limit"
+                                ),
+                            )
+                    lines.append(line)
         except UnicodeDecodeError:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
         more_follows = limit != 0 and len(lines) > limit
         selected = lines[:limit] if more_follows else lines
+        if not selected:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=True,
+                content=f"[no lines at offset {offset}; file has {last_line_seen} lines]",
+            )
         rendered_lines = [
             f"{lineno}\t{line.removesuffix(chr(10))}"
             for lineno, line in enumerate(selected, start=offset)
@@ -126,6 +165,16 @@ class ReadFileTool(LocalTool):
         rendered = "\n".join(rendered_lines)
         tokens = estimate_text_tokens(rendered)
         if tokens > MAX_READ_TOKENS:
+            first_line_tokens = estimate_text_tokens(rendered_lines[0])
+            if first_line_tokens > MAX_READ_TOKENS:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=(
+                        f"line {offset} is about {first_line_tokens} tokens, over the "
+                        f"{MAX_READ_TOKENS} token limit; search the file with grep instead"
+                    ),
+                )
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=False,
@@ -134,14 +183,13 @@ class ReadFileTool(LocalTool):
                     f"{MAX_READ_TOKENS} token limit; narrow it with offset and limit"
                 ),
             )
-        if selected:
-            end = offset + len(selected) - 1
-            if more_follows:
-                rendered_lines.append(
-                    f"[lines {offset}-{end}; more follow, pass offset={end + 1}]"
-                )
-            elif offset > 1:
-                rendered_lines.append(f"[lines {offset}-{end}; end of file]")
+        end = offset + len(selected) - 1
+        if more_follows:
+            rendered_lines.append(
+                f"[lines {offset}-{end}; more follow, pass offset={end + 1}]"
+            )
+        elif offset > 1:
+            rendered_lines.append(f"[lines {offset}-{end}; end of file]")
         return ToolResult(tool_call_id=tool_call.id, ok=True, content="\n".join(rendered_lines))
 
 

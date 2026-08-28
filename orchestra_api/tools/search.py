@@ -116,6 +116,8 @@ def _validate_search_arguments(arguments: dict) -> str | None:
 
 def _bounded_content(items: list[str], limit: int | None, offset: int) -> str:
     page, applied_limit = apply_head_limit(items, limit, offset)
+    if not page:
+        return f"[no results at offset {offset}; {len(items)} results total]"
     lines = list(page)
     if applied_limit is not None:
         lines.append(
