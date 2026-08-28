@@ -22,7 +22,19 @@ from typing import Any
 
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.identity import new_id
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage, wire_tool_call_ids
+from orchestra_api.models import (
+    DocumentBlock,
+    ImageBlock,
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    TextBlock,
+    ToolCall,
+    Usage,
+    has_attachments,
+    wire_tool_call_ids,
+)
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
@@ -42,6 +54,45 @@ def _synthesize_tool_call_id() -> str:
     return new_id("call")
 
 
+def _anthropic_blocks(message: Message) -> list[dict[str, Any]]:
+    """Message content as Anthropic content blocks, text runs merged."""
+    blocks: list[dict[str, Any]] = []
+    text_run = ""
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            text_run += block.text
+            continue
+        if text_run:
+            blocks.append({"type": "text", "text": text_run})
+            text_run = ""
+        if isinstance(block, ImageBlock):
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": block.media_type,
+                        "data": block.data,
+                    },
+                }
+            )
+        elif isinstance(block, DocumentBlock):
+            document = {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": block.media_type,
+                    "data": block.data,
+                },
+            }
+            if block.filename is not None:
+                document["title"] = block.filename
+            blocks.append(document)
+    if text_run:
+        blocks.append({"type": "text", "text": text_run})
+    return blocks
+
+
 def _to_anthropic_content(message: Message, id_map: dict[str, str]) -> list[dict[str, Any]] | str:
     """Build the `content` value for one outgoing Anthropic message."""
     if message.role == Role.TOOL:
@@ -56,15 +107,13 @@ def _to_anthropic_content(message: Message, id_map: dict[str, str]) -> list[dict
             }
         ]
     if message.role == Role.ASSISTANT and message.tool_calls:
-        blocks: list[dict[str, Any]] = []
-        if message.text:
-            blocks.append({"type": "text", "text": message.text})
+        blocks = _anthropic_blocks(message)
         for tool_call in message.tool_calls:
             blocks.append(
                 {"type": "tool_use", "id": tool_call.vendor_id or tool_call.id, "name": tool_call.name, "input": tool_call.arguments}
             )
         return blocks
-    return message.text
+    return message.text if not has_attachments(message) else _anthropic_blocks(message)
 
 
 def _to_anthropic_role(role: Role) -> str:

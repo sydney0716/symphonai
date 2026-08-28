@@ -25,10 +25,31 @@ class TextBlock:
     schema_version: int = SCHEMA_VERSION
 
 
-# The union of message content block types. Phase 02 extends this with
-# image and document blocks; nothing outside models.py may assume the
-# union has exactly one member.
-ContentBlock = TextBlock
+@dataclass(frozen=True)
+class ImageBlock:
+    """A raster image shown to the model, base64-encoded."""
+
+    data: str
+    """Standard base64 of the raw image bytes: no `data:` URI prefix, no
+    newlines. Providers add whatever framing their wire format wants."""
+    media_type: str
+    """One of `content.SUPPORTED_IMAGE_MEDIA_TYPES`."""
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class DocumentBlock:
+    """A PDF shown to the model, base64-encoded."""
+
+    data: str
+    media_type: str = "application/pdf"
+    filename: str | None = None
+    """Display name, when one is known. OpenAI's wire format requires a
+    filename; the others treat it as optional metadata."""
+    schema_version: int = SCHEMA_VERSION
+
+
+ContentBlock = TextBlock | ImageBlock | DocumentBlock
 
 # Accepted at construction time and normalized by Message.__post_init__.
 ContentInput = str | ContentBlock | Sequence[str | ContentBlock] | None
@@ -39,7 +60,7 @@ def _normalize_content(value: ContentInput) -> tuple[ContentBlock, ...]:
         return ()
     if isinstance(value, str):
         return (TextBlock(text=value),)
-    if isinstance(value, TextBlock):
+    if isinstance(value, (TextBlock, ImageBlock, DocumentBlock)):
         return (value,)
     if isinstance(value, Sequence):
         blocks: list[ContentBlock] = []
@@ -140,6 +161,15 @@ class Message:
     def text(self) -> str:
         """All text blocks concatenated. The str view every caller wants."""
         return "".join(block.text for block in self.content if isinstance(block, TextBlock))
+
+
+def has_attachments(message: Message) -> bool:
+    """True when `message.content` holds any block that is not a `TextBlock`.
+
+    Providers branch on this so that a text-only message keeps producing the
+    exact wire shape it produced before attachments existed.
+    """
+    return any(not isinstance(block, TextBlock) for block in message.content)
 
 
 def wire_tool_call_ids(messages: Sequence[Message]) -> dict[str, str]:

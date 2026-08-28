@@ -159,20 +159,11 @@ class ReadFileTool(LocalTool):
         if not selected:
             if self._ledger is not None:
                 try:
+                    recorded_full = is_unranged and not more_follows
                     self._ledger.record(
                         resolved,
-                        full=is_unranged,
-                        content=(
-                            resolved.read_text(encoding="utf-8")
-                            if is_unranged
-                            else None
-                        ),
-                    )
-                except UnicodeDecodeError:
-                    return ToolResult(
-                        tool_call_id=tool_call.id,
-                        ok=False,
-                        error="file is not valid UTF-8 text",
+                        full=recorded_full,
+                        content="".join(selected) if recorded_full else None,
                     )
                 except OSError as exc:
                     return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
@@ -215,20 +206,11 @@ class ReadFileTool(LocalTool):
             rendered_lines.append(f"[lines {offset}-{end}; end of file]")
         if self._ledger is not None:
             try:
+                recorded_full = is_unranged and not more_follows
                 self._ledger.record(
                     resolved,
-                    full=is_unranged,
-                    content=(
-                        resolved.read_text(encoding="utf-8")
-                        if is_unranged
-                        else None
-                    ),
-                )
-            except UnicodeDecodeError:
-                return ToolResult(
-                    tool_call_id=tool_call.id,
-                    ok=False,
-                    error="file is not valid UTF-8 text",
+                    full=recorded_full,
+                    content="".join(selected) if recorded_full else None,
                 )
             except OSError as exc:
                 return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))

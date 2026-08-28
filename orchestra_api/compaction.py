@@ -7,10 +7,11 @@ import math
 from dataclasses import dataclass
 
 from orchestra_api.cancellation import CancellationToken
-from orchestra_api.models import Message, Role, ToolCall, ToolResult
+from orchestra_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 16_000
 DEFAULT_RECENT_TURNS = 4
+ATTACHMENT_BYTES_PER_TOKEN = 750
 
 
 class ContextCompactionError(ValueError):
@@ -49,6 +50,19 @@ def estimate_text_tokens(text: str) -> int:
     return max(1, math.ceil(len(text) / 4))
 
 
+def estimate_attachment_tokens(block: ImageBlock | DocumentBlock) -> int:
+    """Rough token cost of one attachment, for budgeting only.
+
+    Vendors price an image from its pixel dimensions -- Anthropic bills about
+    `width * height / 750` tokens -- and we deliberately do not decode the
+    image to find them. Scaling off the decoded byte count instead lands
+    within an order of magnitude, which is all `compact_messages_for_budget`
+    needs to decide whether a conversation still fits.
+    """
+    decoded = len(block.data) * 3 // 4
+    return max(1, math.ceil(decoded / ATTACHMENT_BYTES_PER_TOKEN))
+
+
 def estimate_message_tokens(message: Message) -> int:
     """Estimate the token cost of one message.
 
@@ -61,7 +75,12 @@ def estimate_message_tokens(message: Message) -> int:
         parts.extend(_tool_call_text(call) for call in message.tool_calls)
     if message.tool_result is not None:
         parts.append(_tool_result_text(message.tool_result))
-    return 4 + estimate_text_tokens("\n".join(part for part in parts if part))
+    attachment_tokens = sum(
+        estimate_attachment_tokens(block)
+        for block in message.content
+        if isinstance(block, (ImageBlock, DocumentBlock))
+    )
+    return 4 + estimate_text_tokens("\n".join(part for part in parts if part)) + attachment_tokens
 
 
 def estimate_messages_tokens(messages: list[Message]) -> int:
@@ -245,6 +264,14 @@ def _message_excerpts(messages: list[Message], *, limit: int) -> list[str]:
         if not snippet and message.tool_result is not None:
             result = message.tool_result
             snippet = result.content or result.error or f"tool result {result.tool_call_id}"
+        if not snippet:
+            attachments = [
+                block for block in message.content if not isinstance(block, TextBlock)
+            ]
+            if attachments:
+                count = len(attachments)
+                types = ", ".join(block.media_type for block in attachments)
+                snippet = f"[{count} attachment{'' if count == 1 else 's'}: {types}]"
         if snippet:
             excerpts.append(f"{message.role.value}: {_truncate(snippet, 120)}")
         if len(excerpts) >= limit:

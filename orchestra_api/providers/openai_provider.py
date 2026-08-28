@@ -22,7 +22,19 @@ from typing import Any
 
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.identity import new_id
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage, wire_tool_call_ids
+from orchestra_api.models import (
+    DocumentBlock,
+    ImageBlock,
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    TextBlock,
+    ToolCall,
+    Usage,
+    has_attachments,
+    wire_tool_call_ids,
+)
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
@@ -38,6 +50,41 @@ _ROLE_TO_OPENAI = {
 }
 
 
+def _openai_content(message: Message) -> list[dict[str, Any]]:
+    """Message content as OpenAI content parts, text runs merged."""
+    parts: list[dict[str, Any]] = []
+    text_run = ""
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            text_run += block.text
+            continue
+        if text_run:
+            parts.append({"type": "text", "text": text_run})
+            text_run = ""
+        if isinstance(block, ImageBlock):
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{block.media_type};base64,{block.data}"
+                    },
+                }
+            )
+        elif isinstance(block, DocumentBlock):
+            parts.append(
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": block.filename or "document.pdf",
+                        "file_data": f"data:{block.media_type};base64,{block.data}",
+                    },
+                }
+            )
+    if text_run:
+        parts.append({"type": "text", "text": text_run})
+    return parts
+
+
 def _to_openai_message(message: Message, id_map: dict[str, str]) -> dict[str, Any]:
     if message.role == Role.TOOL:
         result = message.tool_result
@@ -47,7 +94,12 @@ def _to_openai_message(message: Message, id_map: dict[str, str]) -> dict[str, An
             "tool_call_id": id_map.get(result.tool_call_id, result.tool_call_id),
             "content": result.content if result.ok else (result.error or ""),
         }
-    out: dict[str, Any] = {"role": _ROLE_TO_OPENAI[message.role], "content": message.text or None}
+    content = (
+        message.text or None
+        if not has_attachments(message)
+        else _openai_content(message)
+    )
+    out: dict[str, Any] = {"role": _ROLE_TO_OPENAI[message.role], "content": content}
     if message.role == Role.ASSISTANT and message.tool_calls:
         out["tool_calls"] = [
             {

@@ -32,7 +32,18 @@ from typing import Any
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.gemini_schema import sanitize_for_gemini
 from orchestra_api.identity import new_id
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
+from orchestra_api.models import (
+    DocumentBlock,
+    ImageBlock,
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    TextBlock,
+    ToolCall,
+    Usage,
+    has_attachments,
+)
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
 
@@ -76,6 +87,31 @@ def _tool_call_names(messages: list[Message]) -> dict[str, str]:
     return names
 
 
+def _gemini_parts(message: Message) -> list[dict[str, Any]]:
+    """Message content as Gemini parts, text runs merged."""
+    parts: list[dict[str, Any]] = []
+    text_run = ""
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            text_run += block.text
+            continue
+        if text_run:
+            parts.append({"text": text_run})
+            text_run = ""
+        if isinstance(block, (ImageBlock, DocumentBlock)):
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": block.media_type,
+                        "data": block.data,
+                    }
+                }
+            )
+    if text_run:
+        parts.append({"text": text_run})
+    return parts
+
+
 def _build_contents(messages: list[Message]) -> list[dict[str, Any]]:
     names = _tool_call_names(messages)
     contents: list[dict[str, Any]] = []
@@ -107,7 +143,9 @@ def _build_contents(messages: list[Message]) -> list[dict[str, Any]]:
             continue
 
         parts: list[dict[str, Any]] = []
-        if message.text:
+        if has_attachments(message):
+            parts.extend(_gemini_parts(message))
+        elif message.text:
             parts.append({"text": message.text})
         for tool_call in message.tool_calls:
             function_call = {"name": tool_call.name, "args": tool_call.arguments}
