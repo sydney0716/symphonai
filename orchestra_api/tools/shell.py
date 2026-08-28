@@ -18,8 +18,8 @@ from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
+from orchestra_api.tools.shell_classify import classify
 
-MAX_OUTPUT_CHARS = 20_000
 CANCEL_POLL_SECONDS = 0.05
 CLEANUP_TIMEOUT_SECONDS = 1.0
 
@@ -67,10 +67,17 @@ class RunShellTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        # 02e replaces this conservative answer with an argv classifier.
+        argv = arguments.get("argv")
+        entry = classify(argv) if isinstance(argv, list) else None
+        if entry is None:
+            return ToolMetadata(
+                effect=ToolEffect.DESTRUCTIVE,
+                concurrency_safe=False,
+                paths=None,
+            )
         return ToolMetadata(
-            effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=False,
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=entry.concurrency_safe,
             paths=None,
         )
 
@@ -134,8 +141,12 @@ class RunShellTool(LocalTool):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=f"error running command: {exc}")
         output = (stdout or "") + (stderr or "")
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + "\n...(truncated)"
+        limit = policy.shell_output_limit_chars
+        if len(output) > limit:
+            output = (
+                output[:limit]
+                + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
+            )
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=proc.returncode == 0,

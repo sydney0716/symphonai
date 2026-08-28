@@ -33,6 +33,7 @@ from orchestra_api.models import (
     ToolCall,
     Usage,
     has_attachments,
+    reject_system_attachments,
     wire_tool_call_ids,
 )
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
@@ -123,6 +124,7 @@ def _to_anthropic_role(role: Role) -> str:
 
 
 def _build_request_body(request: ModelRequest, model: str, default_max_tokens: int) -> dict[str, Any]:
+    reject_system_attachments(request.messages)
     id_map = wire_tool_call_ids(request.messages)
     system_parts = [m.text for m in request.messages if m.role == Role.SYSTEM and m.text]
     non_system = [m for m in request.messages if m.role != Role.SYSTEM]

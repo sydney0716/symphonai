@@ -18,6 +18,7 @@ Subagent pool state lives only in memory for the duration of one
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
@@ -171,12 +172,16 @@ class DispatchSubagentTool(LocalTool):
         *,
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
+        subagent_tool_names: Sequence[str] | None = None,
         parent_agent_id: str | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
+        self._subagent_tool_names = (
+            None if subagent_tool_names is None else tuple(subagent_tool_names)
+        )
         self._parent_agent_id = parent_agent_id
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
@@ -243,7 +248,7 @@ class DispatchSubagentTool(LocalTool):
                         f"cannot create new subagent {subagent_name!r}"
                     ),
                 )
-            subagent_tools = standard_tool_registry()
+            subagent_tools = standard_tool_registry(self._subagent_tool_names)
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
             if self._events is not None:
                 if self._event_run_id is None:
@@ -311,6 +316,7 @@ class LeaderConfig:
     max_leader_turns: int = DEFAULT_MAX_TURNS
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    subagent_tool_names: Sequence[str] | None = None
     permission_mode: PermissionMode = "auto"
     approval_callback: ApprovalCallback | None = None
     chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
@@ -354,6 +360,7 @@ class Leader:
             subagent_policy=subagent_policy,
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
+            subagent_tool_names=config.subagent_tool_names,
             parent_agent_id=self._agent_ref.agent_id,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)

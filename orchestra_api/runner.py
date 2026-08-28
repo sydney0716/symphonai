@@ -7,6 +7,8 @@ script, or a future CLI) to run one agent task.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import Message, Role
@@ -21,10 +23,31 @@ from orchestra_api.tools.search import GlobTool, GrepTool
 from orchestra_api.tools.shell import RunShellTool
 
 
-def standard_tool_registry() -> dict[str, LocalTool]:
+def standard_tool_registry(
+    names: Sequence[str] | None = None,
+) -> dict[str, LocalTool]:
     """The eight local tools: read_file, write_file, edit_file,
     multi_edit_file, list_files, glob, grep, and run_shell.
     """
+    if names is not None:
+        if not names:
+            raise ValueError("names must not be empty; omit it for the full registry")
+        known_names = {
+            "read_file",
+            "write_file",
+            "edit_file",
+            "multi_edit_file",
+            "list_files",
+            "glob",
+            "grep",
+            "run_shell",
+        }
+        for name in names:
+            if name not in known_names:
+                raise ValueError(f"unknown tool name: {name!r}")
+        requested_names = set(names)
+    else:
+        requested_names = None
     ledger = ReadLedger()
     tools: list[LocalTool] = [
         ReadFileTool(ledger),
@@ -36,7 +59,11 @@ def standard_tool_registry() -> dict[str, LocalTool]:
         GrepTool(),
         RunShellTool(),
     ]
-    return {tool.name: tool for tool in tools}
+    return {
+        tool.name: tool
+        for tool in tools
+        if requested_names is None or tool.name in requested_names
+    }
 
 
 def run_task(

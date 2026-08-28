@@ -33,6 +33,7 @@ from orchestra_api.models import (
     ToolCall,
     Usage,
     has_attachments,
+    reject_system_attachments,
     wire_tool_call_ids,
 )
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
@@ -113,6 +114,7 @@ def _to_openai_message(message: Message, id_map: dict[str, str]) -> dict[str, An
 
 
 def _build_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
+    reject_system_attachments(request.messages)
     id_map = wire_tool_call_ids(request.messages)
     body: dict[str, Any] = {
         "model": model,

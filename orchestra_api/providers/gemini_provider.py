@@ -43,6 +43,7 @@ from orchestra_api.models import (
     ToolCall,
     Usage,
     has_attachments,
+    reject_system_attachments,
 )
 from orchestra_api.providers.base import ModelProvider, ProviderError, parse_json_object
 from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
@@ -187,6 +188,7 @@ def _build_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _build_request_body(request: ModelRequest) -> dict[str, Any]:
+    reject_system_attachments(request.messages)
     body: dict[str, Any] = {"contents": _build_contents(request.messages)}
 
     system_parts = [m.text for m in request.messages if m.role == Role.SYSTEM and m.text]

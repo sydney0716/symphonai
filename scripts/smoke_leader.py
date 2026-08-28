@@ -1058,6 +1058,73 @@ def main() -> None:
             fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
         ok("real subagent's outgoing request includes all eight standard tool schemas")
 
+        # -- a caller-fixed narrowed registry must narrow both execution and wire schemas --
+        os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
+        narrowed_subagent_requests: list[dict] = []
+        narrowed_call_count = [0]
+
+        def _fake_urlopen_narrowed_dispatch(request, timeout=None):  # noqa: ANN001
+            narrowed_call_count[0] += 1
+            body = json.loads(request.data.decode("utf-8"))
+            if narrowed_call_count[0] == 1:
+                payload = {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "narrow-c1",
+                            "name": "dispatch_subagent",
+                            "input": {
+                                "subagent_name": "reader",
+                                "task": "inspect a.txt",
+                            },
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "tool_use",
+                }
+            elif narrowed_call_count[0] == 2:
+                narrowed_subagent_requests.append(body)
+                payload = {
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "end_turn",
+                }
+            else:
+                payload = {
+                    "content": [{"type": "text", "text": "final answer"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "end_turn",
+                }
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        narrowed_leader = Leader(
+            LeaderConfig(
+                leader_provider=AnthropicProvider(),
+                subagent_provider=AnthropicProvider(),
+                repo_root=str(root),
+                subagent_tool_names=["read_file", "glob", "grep"],
+            )
+        )
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=_fake_urlopen_narrowed_dispatch
+        ):
+            narrowed_leader.run("delegate read-only inspection")
+        del os.environ[API_KEY_ENV_VAR]
+
+        if not narrowed_subagent_requests:
+            fail("expected the narrowed subagent request to be captured")
+        narrowed_tool_names = {
+            tool.get("name")
+            for tool in narrowed_subagent_requests[0].get("tools", [])
+        }
+        expected_narrowed_names = {"read_file", "glob", "grep"}
+        if narrowed_tool_names != expected_narrowed_names or "run_shell" in narrowed_tool_names:
+            fail(
+                "narrowed subagent schemas exceeded the caller-fixed set: "
+                f"expected={expected_narrowed_names!r}, actual={narrowed_tool_names!r}"
+            )
+        ok("caller-fixed subagent tool subsets narrow real provider schemas")
+
         # -- regression: a real GeminiProvider leader must send
         # dispatch_subagent as a Gemini function declaration with sanitized,
         # non-empty parameters --

@@ -172,6 +172,24 @@ def has_attachments(message: Message) -> bool:
     return any(not isinstance(block, TextBlock) for block in message.content)
 
 
+def reject_system_attachments(messages: Sequence[Message]) -> None:
+    """Raise if a system-role message carries a non-text block.
+
+    No vendor accepts an image or document in the system prompt. Two of the
+    three wire builders hoist system content with `.text` and would drop it
+    without a word; the third would send it. Failing loudly at build time is
+    the only one of the three behaviours a caller can act on.
+    """
+    if any(
+        message.role == Role.SYSTEM and has_attachments(message)
+        for message in messages
+    ):
+        raise ValueError(
+            "system-role messages cannot carry attachments; put the "
+            "image or document on a user message"
+        )
+
+
 def wire_tool_call_ids(messages: Sequence[Message]) -> dict[str, str]:
     """Map canonical ToolCall.id to the id to send back on the wire.
 

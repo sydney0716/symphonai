@@ -104,8 +104,14 @@ from orchestra_api.models import (  # noqa: E402
     ToolCall,
     ToolResult,
     has_attachments,
+    reject_system_attachments,
 )
-from orchestra_api.permissions import PermissionPolicy  # noqa: E402
+from orchestra_api.permissions import (  # noqa: E402
+    DEFAULT_SHELL_OUTPUT_CHARS,
+    MAX_SHELL_OUTPUT_CHARS,
+    MIN_SHELL_OUTPUT_CHARS,
+    PermissionPolicy,
+)
 from orchestra_api.providers.anthropic_provider import (  # noqa: E402
     ANTHROPIC_VERSION,
     API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR,
@@ -132,8 +138,8 @@ from orchestra_api.runner import run_task, standard_tool_registry  # noqa: E402
 from orchestra_api.tool_schema import to_provider_tool_schema  # noqa: E402
 from orchestra_api.tools.base import LocalTool  # noqa: E402
 import orchestra_api.tools.filesystem as filesystem_tools  # noqa: E402
+from orchestra_api.tools.shell_classify import classify  # noqa: E402
 from orchestra_api.tools.shell import (  # noqa: E402
-    MAX_OUTPUT_CHARS,
     RunShellTool,
     _terminate_process_group,
 )
@@ -379,6 +385,41 @@ def main() -> None:
     ):
         fail(f"path attachment construction changed: pdf={path_pdf!r}, png={path_png!r}")
     ok("attachment construction detects, bounds, and base64-encodes supported media")
+
+    system_attachment_error = (
+        "system-role messages cannot carry attachments; put the "
+        "image or document on a user message"
+    )
+    text_system_messages = [Message(Role.SYSTEM, "instructions")]
+    if reject_system_attachments(text_system_messages) is not None:
+        fail("text-only system message was rejected")
+    system_attachment_messages = [Message(Role.SYSTEM, image_block)]
+    try:
+        reject_system_attachments(system_attachment_messages)
+    except ValueError as exc:
+        if str(exc) != system_attachment_error:
+            fail(f"system attachment refusal changed: {exc!r}")
+    else:
+        fail("reject_system_attachments accepted a system image")
+    system_attachment_request = ModelRequest(messages=system_attachment_messages)
+    attachment_builders = {
+        "OpenAI": lambda: _build_openai_body(
+            system_attachment_request, "test-model"
+        ),
+        "Anthropic": lambda: _build_anthropic_body(
+            system_attachment_request, "test-model", 100
+        ),
+        "Gemini": lambda: _build_gemini_body(system_attachment_request),
+    }
+    for provider_name, build in attachment_builders.items():
+        try:
+            build()
+        except ValueError as exc:
+            if str(exc) != system_attachment_error:
+                fail(f"{provider_name} system attachment refusal changed: {exc!r}")
+        else:
+            fail(f"{provider_name} accepted a system-role attachment")
+    ok("system-role attachments fail consistently with a reachable remedy")
 
     anthropic_image_content = _build_anthropic_body(
         ModelRequest(messages=[Message(Role.USER, [TextBlock("look"), image_block])]),
@@ -627,8 +668,8 @@ def main() -> None:
             interrupt_behavior=InterruptBehavior.CANCEL,
         ),
         "run_shell": ToolMetadata(
-            effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=False,
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
             paths=None,
             result_hint=ResultHint.TEXT,
             interrupt_behavior=InterruptBehavior.CANCEL,
@@ -645,6 +686,112 @@ def main() -> None:
         )
     if any(item.schema_version != SCHEMA_VERSION for item in actual_metadata.values()):
         fail(f"tool metadata schema version drifted: {actual_metadata!r}")
+
+    git_status_entry = classify(["git", "status"])
+    ls_entry = classify(["ls", "-la"])
+    if git_status_entry is None or git_status_entry.concurrency_safe:
+        fail(f"git status classification changed: {git_status_entry!r}")
+    if ls_entry is None or not ls_entry.concurrency_safe:
+        fail(f"ls classification changed: {ls_entry!r}")
+    for unsafe_argv in (["make"], ["ls", "--color=always"], []):
+        if classify(unsafe_argv) is not None:
+            fail(f"unsafe argv was classified read-only: {unsafe_argv!r}")
+    if classify(["git", "log", "--max-count=3", "main"]) is None:
+        fail("git log rejected a safe equals-form flag or operand")
+    if classify(["cat", "--", "-weird-name"]) is None:
+        fail("cat rejected a post-double-dash operand")
+
+    read_only_git_metadata = ToolMetadata(
+        effect=ToolEffect.READ_ONLY,
+        concurrency_safe=False,
+        paths=None,
+    )
+    read_only_parallel_metadata = ToolMetadata(
+        effect=ToolEffect.READ_ONLY,
+        concurrency_safe=True,
+        paths=None,
+    )
+    destructive_shell_metadata = ToolMetadata(
+        effect=ToolEffect.DESTRUCTIVE,
+        concurrency_safe=False,
+        paths=None,
+    )
+    shell_metadata = metadata_tools["run_shell"]
+    if shell_metadata.metadata({"argv": ["git", "diff"]}) != read_only_git_metadata:
+        fail("git diff metadata changed from the literal read-only serial contract")
+    if shell_metadata.metadata({"argv": ["ls"]}) != read_only_parallel_metadata:
+        fail("ls metadata changed from the literal read-only parallel contract")
+    for unsafe_arguments in (
+        {"argv": ["rm", "-rf", "/"]},
+        {"argv": ["make"]},
+        {},
+        {"argv": "ls"},
+        {"argv": [3]},
+    ):
+        actual = shell_metadata.metadata(unsafe_arguments)
+        if actual != destructive_shell_metadata:
+            fail(
+                "unsafe or malformed shell metadata did not fail closed: "
+                f"arguments={unsafe_arguments!r}, metadata={actual!r}"
+            )
+    disabled_ls = metadata_tools["run_shell"].execute(
+        ToolCall(
+            id="classified-but-disabled",
+            name="run_shell",
+            arguments={"argv": ["ls"]},
+        ),
+        PermissionPolicy(repo_root=REPO_ROOT),
+    )
+    if disabled_ls.ok or disabled_ls.error != "run_shell is disabled by this policy":
+        fail(f"read-only classification granted shell permission: {disabled_ls!r}")
+
+    clamped_low = PermissionPolicy(repo_root=REPO_ROOT, shell_output_limit_chars=10)
+    clamped_high = PermissionPolicy(
+        repo_root=REPO_ROOT, shell_output_limit_chars=10_000_000
+    )
+    kept_limit = PermissionPolicy(repo_root=REPO_ROOT, shell_output_limit_chars=12_345)
+    if (
+        clamped_low.shell_output_limit_chars != MIN_SHELL_OUTPUT_CHARS
+        or clamped_high.shell_output_limit_chars != MAX_SHELL_OUTPUT_CHARS
+        or kept_limit.shell_output_limit_chars != 12_345
+    ):
+        fail(
+            "shell output policy limits did not clamp or preserve correctly: "
+            f"low={clamped_low.shell_output_limit_chars}, "
+            f"high={clamped_high.shell_output_limit_chars}, "
+            f"kept={kept_limit.shell_output_limit_chars}"
+        )
+
+    expected_full_order = [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "multi_edit_file",
+        "list_files",
+        "glob",
+        "grep",
+        "run_shell",
+    ]
+    if list(metadata_tools) != expected_full_order:
+        fail(f"full standard registry order changed: {list(metadata_tools)!r}")
+    narrowed_tools = standard_tool_registry(["grep", "read_file"])
+    if list(narrowed_tools) != ["read_file", "grep"]:
+        fail(f"narrowed registry lost canonical ordering: {list(narrowed_tools)!r}")
+    try:
+        standard_tool_registry(["read_fil"])
+    except ValueError as exc:
+        if str(exc) != "unknown tool name: 'read_fil'":
+            fail(f"unknown registry name error changed: {exc!r}")
+    else:
+        fail("unknown registry tool name was accepted")
+    try:
+        standard_tool_registry([])
+    except ValueError as exc:
+        if str(exc) != "names must not be empty; omit it for the full registry":
+            fail(f"empty registry name error changed: {exc!r}")
+    else:
+        fail("empty narrowed registry was accepted")
+    ok("shell classification, policy bounds, and registry subsets are exact")
 
     raw_path = "../outside.txt"
     if metadata_tools["read_file"].metadata({"path": raw_path}).paths != (raw_path,):
@@ -668,7 +815,7 @@ def main() -> None:
     if metadata_tools["list_files"].metadata({"path": 3}).paths is not None:
         fail("list_files metadata accepted a non-string path")
     if metadata_tools["run_shell"].metadata({"argv": ["ls"]}).paths is not None:
-        fail("run_shell classified a path before the 02e argv classifier")
+        fail("run_shell inferred paths from ambiguous argv operands")
 
     if safe_metadata(_RaisingMetadataTool(ValueError("bad metadata")), {}) is not FAIL_CLOSED:
         fail("safe_metadata did not fail closed after a metadata exception")
@@ -2347,6 +2494,33 @@ def main() -> None:
         )
         if isolated_edit.ok or isolated_edit.error != not_read_error:
             fail(f"read ledger leaked between registries: {isolated_edit!r}")
+        narrowed_names = ["read_file", "write_file", "edit_file"]
+        first_narrowed_registry = standard_tool_registry(narrowed_names)
+        second_narrowed_registry = standard_tool_registry(narrowed_names)
+        narrowed_isolated_path = root / "narrowed-isolated-ledger.txt"
+        narrowed_isolated_path.write_text("before\n")
+        first_narrowed_registry["read_file"].execute(
+            ToolCall(
+                id="narrowed-isolated-read",
+                name="read_file",
+                arguments={"path": narrowed_isolated_path.name},
+            ),
+            policy,
+        )
+        narrowed_isolated_edit = second_narrowed_registry["edit_file"].execute(
+            ToolCall(
+                id="narrowed-isolated-edit",
+                name="edit_file",
+                arguments={
+                    "path": narrowed_isolated_path.name,
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            ),
+            policy,
+        )
+        if narrowed_isolated_edit.ok or narrowed_isolated_edit.error != not_read_error:
+            fail(f"read ledger leaked between narrowed registries: {narrowed_isolated_edit!r}")
         if ToolResult(tool_call_id="payload-default", ok=True).payload is not None:
             fail("existing ToolResult callers gained a non-empty payload")
         ok("edit tools enforce fresh reads, apply atomically, and return structured diffs")
@@ -2764,12 +2938,57 @@ def main() -> None:
             fail(f"run_shell nonzero-exit path changed: {failing!r}")
 
         oversized = _shell(
-            [sys.executable, "-c", f"print('x' * {MAX_OUTPUT_CHARS + 500})"]
+            [
+                sys.executable,
+                "-c",
+                f"print('x' * {DEFAULT_SHELL_OUTPUT_CHARS + 500})",
+            ]
         )
-        if not oversized.content.endswith("\n...(truncated)"):
-            fail("run_shell no longer appends the truncation suffix")
-        if len(oversized.content) != MAX_OUTPUT_CHARS + len("\n...(truncated)"):
+        oversized_original_length = DEFAULT_SHELL_OUTPUT_CHARS + 501
+        oversized_notice = (
+            f"\n[output truncated: {oversized_original_length} chars, over the "
+            f"{DEFAULT_SHELL_OUTPUT_CHARS} char limit]"
+        )
+        if not oversized.content.endswith(oversized_notice):
+            fail(f"run_shell truncation notice changed: {oversized.content[-120:]!r}")
+        if len(oversized.content) != DEFAULT_SHELL_OUTPUT_CHARS + len(oversized_notice):
             fail(f"run_shell truncated to the wrong length: {len(oversized.content)}")
+
+        variable_argv = [sys.executable, "-c", "print('y' * 2500)"]
+        small_output_policy = PermissionPolicy(
+            repo_root=root,
+            shell_enabled=True,
+            shell_allowlist=[(sys.executable,)],
+            shell_output_limit_chars=1_000,
+        )
+        large_output_policy = PermissionPolicy(
+            repo_root=root,
+            shell_enabled=True,
+            shell_allowlist=[(sys.executable,)],
+            shell_output_limit_chars=2_000,
+        )
+        small_output = _shell(variable_argv, small_output_policy)
+        large_output = _shell(variable_argv, large_output_policy)
+        variable_original_length = 2_501
+        small_notice = (
+            f"\n[output truncated: {variable_original_length} chars, over the "
+            "1000 char limit]"
+        )
+        large_notice = (
+            f"\n[output truncated: {variable_original_length} chars, over the "
+            "2000 char limit]"
+        )
+        if (
+            len(small_output.content) != 1_000 + len(small_notice)
+            or not small_output.content.endswith(small_notice)
+            or len(large_output.content) != 2_000 + len(large_notice)
+            or not large_output.content.endswith(large_notice)
+            or len(small_output.content) == len(large_output.content)
+        ):
+            fail(
+                "run_shell did not read its output bound from each policy: "
+                f"small={len(small_output.content)}, large={len(large_output.content)}"
+            )
 
         timing_out = shell_tool.execute(
             ToolCall(

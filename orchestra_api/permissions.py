@@ -34,6 +34,9 @@ DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     "dist/",
     "build/",
 )
+DEFAULT_SHELL_OUTPUT_CHARS = 20_000
+MIN_SHELL_OUTPUT_CHARS = 1_000
+MAX_SHELL_OUTPUT_CHARS = 200_000
 
 # Argv prefixes that are always denied, regardless of shell_enabled or
 # shell_allowlist. Checked before, and independent of, the allowlist.
@@ -107,12 +110,17 @@ class PermissionPolicy:
     shell_enabled: bool = False
     shell_allowlist: list[tuple[str, ...]] = field(default_factory=list)
     shell_timeout_seconds: float = 10.0
+    shell_output_limit_chars: int = DEFAULT_SHELL_OUTPUT_CHARS
     mode: PermissionMode = "auto"
     approval_callback: ApprovalCallback | None = None
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
         self.allowed_write_scope = [Path(p).resolve() for p in self.allowed_write_scope]
+        self.shell_output_limit_chars = max(
+            MIN_SHELL_OUTPUT_CHARS,
+            min(MAX_SHELL_OUTPUT_CHARS, int(self.shell_output_limit_chars)),
+        )
         if self.mode not in ("auto", "prompt"):
             raise ValueError(f"unknown permission mode {self.mode!r}; expected 'auto' or 'prompt'")
 
