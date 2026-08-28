@@ -20,8 +20,8 @@ Verifies:
     outgoing request body (via mocked urllib.request.urlopen) -- guards
     against ApiAgent silently never telling a real model any tool exists
   - regression check: a real subagent's own outgoing request (behind a
-    real leader dispatching to it) includes schemas for all six standard
-    tools (read_file/write_file/list_files/glob/grep/run_shell)
+    real leader dispatching to it) includes schemas for all eight standard
+    tools (read_file/write_file/edit_file/multi_edit_file/list_files/glob/grep/run_shell)
   - regression check: a real GeminiProvider leader's outgoing
     dispatch_subagent tool declaration carries a non-empty sanitized
     parameters object
@@ -991,8 +991,7 @@ def main() -> None:
         ok("real leader provider's outgoing request includes the dispatch_subagent tool definition")
 
         # -- regression: a real SUBAGENT's outgoing request must include
-        # schemas for all six standard tools (read_file/write_file/
-        # list_files/glob/grep/run_shell), not just the leader's own tool --
+        # schemas for all eight standard tools, not just the leader's own tool --
         os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
         subagent_requests: list[dict] = []
         call_count = [0]
@@ -1048,6 +1047,8 @@ def main() -> None:
         expected_tool_names = {
             "read_file",
             "write_file",
+            "edit_file",
+            "multi_edit_file",
             "list_files",
             "glob",
             "grep",
@@ -1055,7 +1056,7 @@ def main() -> None:
         }
         if sent_tool_names != expected_tool_names:
             fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
-        ok("real subagent's outgoing request includes all six standard tool schemas")
+        ok("real subagent's outgoing request includes all eight standard tool schemas")
 
         # -- regression: a real GeminiProvider leader must send
         # dispatch_subagent as a Gemini function declaration with sanitized,

@@ -14,16 +14,23 @@ from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tools.base import LocalTool
+from orchestra_api.tools.edit import EditFileTool, MultiEditFileTool
 from orchestra_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
+from orchestra_api.tools.read_ledger import ReadLedger
 from orchestra_api.tools.search import GlobTool, GrepTool
 from orchestra_api.tools.shell import RunShellTool
 
 
 def standard_tool_registry() -> dict[str, LocalTool]:
-    """The six local tools: read_file, write_file, list_files, glob, grep, run_shell."""
+    """The eight local tools: read_file, write_file, edit_file,
+    multi_edit_file, list_files, glob, grep, and run_shell.
+    """
+    ledger = ReadLedger()
     tools: list[LocalTool] = [
-        ReadFileTool(),
-        WriteFileTool(),
+        ReadFileTool(ledger),
+        WriteFileTool(ledger),
+        EditFileTool(ledger),
+        MultiEditFileTool(ledger),
         ListFilesTool(),
         GlobTool(),
         GrepTool(),

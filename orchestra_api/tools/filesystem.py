@@ -15,6 +15,7 @@ from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
+from orchestra_api.tools.read_ledger import ReadLedger
 
 MAX_READ_BYTES = 1_000_000  # 1 MB safety cap on a single read_file call
 MAX_READ_LINES = 2_000
@@ -23,6 +24,9 @@ MAX_READ_TOKENS = 25_000
 
 class ReadFileTool(LocalTool):
     """Read a bounded line range from a UTF-8 file inside the allowed scope."""
+
+    def __init__(self, ledger: ReadLedger | None = None) -> None:
+        self._ledger = ledger
 
     @property
     def name(self) -> str:
@@ -153,6 +157,25 @@ class ReadFileTool(LocalTool):
         more_follows = limit != 0 and len(lines) > limit
         selected = lines[:limit] if more_follows else lines
         if not selected:
+            if self._ledger is not None:
+                try:
+                    self._ledger.record(
+                        resolved,
+                        full=is_unranged,
+                        content=(
+                            resolved.read_text(encoding="utf-8")
+                            if is_unranged
+                            else None
+                        ),
+                    )
+                except UnicodeDecodeError:
+                    return ToolResult(
+                        tool_call_id=tool_call.id,
+                        ok=False,
+                        error="file is not valid UTF-8 text",
+                    )
+                except OSError as exc:
+                    return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=True,
@@ -190,11 +213,33 @@ class ReadFileTool(LocalTool):
             )
         elif offset > 1:
             rendered_lines.append(f"[lines {offset}-{end}; end of file]")
+        if self._ledger is not None:
+            try:
+                self._ledger.record(
+                    resolved,
+                    full=is_unranged,
+                    content=(
+                        resolved.read_text(encoding="utf-8")
+                        if is_unranged
+                        else None
+                    ),
+                )
+            except UnicodeDecodeError:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error="file is not valid UTF-8 text",
+                )
+            except OSError as exc:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
         return ToolResult(tool_call_id=tool_call.id, ok=True, content="\n".join(rendered_lines))
 
 
 class WriteFileTool(LocalTool):
     """Write UTF-8 text content to a file inside the explicit allowed write scope."""
+
+    def __init__(self, ledger: ReadLedger) -> None:
+        self._ledger = ledger
 
     @property
     def name(self) -> str:
@@ -202,7 +247,10 @@ class WriteFileTool(LocalTool):
 
     @property
     def description(self) -> str:
-        return "Write text content to a file inside the explicit allowed write scope."
+        return (
+            "Create a new file, or fully replace one that has been read; "
+            "prefer edit_file for changes to an existing file."
+        )
 
     @property
     def parameters(self) -> dict:
@@ -250,8 +298,13 @@ class WriteFileTool(LocalTool):
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         resolved = policy._resolve_within_root(path)
         try:
+            if resolved.exists():
+                stale_error = self._ledger.check(resolved)
+                if stale_error is not None:
+                    return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(content, encoding="utf-8")
+            self._ledger.record(resolved, full=True, content=content)
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
         return ToolResult(

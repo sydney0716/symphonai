@@ -109,6 +109,11 @@ class ToolResult:
     content: str = ""
     error: str | None = None
     cancelled: bool = False
+    payload: dict | None = None
+    """Structured result for callers that can use one, JSON-shaped and
+    JSON-serializable. `content` stays the human- and model-readable form; a
+    consumer that does not understand `payload` loses nothing. `ToolMetadata.
+    result_hint` names which shape to expect."""
     schema_version: int = SCHEMA_VERSION
 
 

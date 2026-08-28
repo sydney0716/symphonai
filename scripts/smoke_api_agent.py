@@ -11,7 +11,7 @@ Verifies:
     denied by default, and an always-deny command (rm) denied even when
     explicitly allowlisted
   - regression check: runner.run_task() with a real OpenAIProvider actually
-    includes schemas for all six standard tools in its outgoing request
+    includes schemas for all eight standard tools in its outgoing request
     (via mocked urllib.request.urlopen) -- guards against ApiAgent/runner
     silently never telling a real model any tool exists
   - request-level model overrides reach real-provider wire requests, and
@@ -315,6 +315,15 @@ def main() -> None:
     metadata_arguments = {
         "read_file": {"path": "sample.txt"},
         "write_file": {"path": "sample.txt", "content": "replacement"},
+        "edit_file": {
+            "path": "sample.txt",
+            "old_string": "before",
+            "new_string": "after",
+        },
+        "multi_edit_file": {
+            "path": "sample.txt",
+            "edits": [{"old_string": "before", "new_string": "after"}],
+        },
         "list_files": {"path": "sample-dir"},
         "glob": {"pattern": "**/*.py", "path": "sample-dir"},
         "grep": {"pattern": "needle", "path": "sample-dir"},
@@ -333,6 +342,20 @@ def main() -> None:
             concurrency_safe=False,
             paths=("sample.txt",),
             result_hint=ResultHint.TEXT,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "edit_file": ToolMetadata(
+            effect=ToolEffect.MUTATING,
+            concurrency_safe=False,
+            paths=("sample.txt",),
+            result_hint=ResultHint.DIFF,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        "multi_edit_file": ToolMetadata(
+            effect=ToolEffect.MUTATING,
+            concurrency_safe=False,
+            paths=("sample.txt",),
+            result_hint=ResultHint.DIFF,
             interrupt_behavior=InterruptBehavior.CANCEL,
         ),
         "list_files": ToolMetadata(
@@ -390,7 +413,7 @@ def main() -> None:
             fail(f"{name} metadata accepted a non-string path")
     if metadata_tools["grep"].metadata({"output_mode": "content"}).result_hint != ResultHint.TEXT:
         fail("grep content metadata did not declare a text result")
-    for name in ("read_file", "write_file"):
+    for name in ("read_file", "write_file", "edit_file", "multi_edit_file"):
         if metadata_tools[name].metadata({}).paths is not None:
             fail(f"{name} metadata treated a missing path as an empty path set")
         if metadata_tools[name].metadata({"path": 3}).paths is not None:
@@ -1588,6 +1611,397 @@ def main() -> None:
             fail(f"multi-line token refusal lost its narrowing remedy: {many_lines_refused!r}")
         ok("read_file numbers ranges, marks partial views, and refuses byte/token overages")
 
+        # -- targeted edits, read-before-write staleness, and structured diffs --
+        not_read_path = root / "edit-not-read.txt"
+        not_read_path.write_text("before\n")
+        not_read = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-not-read",
+                name="edit_file",
+                arguments={
+                    "path": not_read_path.name,
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            ),
+            policy,
+        )
+        not_read_error = "file has not been read yet; read it with read_file before editing it"
+        if not_read.ok or not_read.error != not_read_error:
+            fail(f"edit_file no-read refusal changed: {not_read!r}")
+
+        stale_path = root / "edit-stale.txt"
+        stale_path.write_text("before\n")
+        tools["read_file"].execute(
+            ToolCall(id="read-stale", name="read_file", arguments={"path": stale_path.name}),
+            policy,
+        )
+        stale_stat = stale_path.stat()
+        stale_path.write_text("outside change\n")
+        os.utime(
+            stale_path,
+            ns=(stale_stat.st_atime_ns, stale_stat.st_mtime_ns + 1_000_000_000),
+        )
+        stale = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-stale",
+                name="edit_file",
+                arguments={
+                    "path": stale_path.name,
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            ),
+            policy,
+        )
+        stale_error = "file has changed since it was read; read it again before editing it"
+        if stale.ok or stale.error != stale_error:
+            fail(f"edit_file stale refusal changed: {stale!r}")
+
+        same_content_path = root / "edit-same-content.txt"
+        same_content_path.write_text("before\n")
+        tools["read_file"].execute(
+            ToolCall(
+                id="read-same-content",
+                name="read_file",
+                arguments={"path": same_content_path.name},
+            ),
+            policy,
+        )
+        same_stat = same_content_path.stat()
+        same_content_path.write_text("before\n")
+        os.utime(
+            same_content_path,
+            ns=(same_stat.st_atime_ns, same_stat.st_mtime_ns + 1_000_000_000),
+        )
+        same_content = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-same-content",
+                name="edit_file",
+                arguments={
+                    "path": same_content_path.name,
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            ),
+            policy,
+        )
+        if not same_content.ok or same_content_path.read_text() != "after\n":
+            fail(f"identical-content mtime bump was treated as stale: {same_content!r}")
+
+        ranged_path = root / "edit-ranged-stale.txt"
+        ranged_path.write_text("before\nafter\n")
+        tools["read_file"].execute(
+            ToolCall(
+                id="read-ranged-stale",
+                name="read_file",
+                arguments={"path": ranged_path.name, "limit": 1},
+            ),
+            policy,
+        )
+        ranged_stat = ranged_path.stat()
+        ranged_path.write_text("before\nafter\n")
+        os.utime(
+            ranged_path,
+            ns=(ranged_stat.st_atime_ns, ranged_stat.st_mtime_ns + 1_000_000_000),
+        )
+        ranged_stale = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-ranged-stale",
+                name="edit_file",
+                arguments={
+                    "path": ranged_path.name,
+                    "old_string": "before",
+                    "new_string": "changed",
+                },
+            ),
+            policy,
+        )
+        if ranged_stale.ok or ranged_stale.error != stale_error:
+            fail(f"ranged read incorrectly proved unchanged content: {ranged_stale!r}")
+
+        match_path = root / "edit-matches.txt"
+        match_path.write_text("one one\n")
+        tools["read_file"].execute(
+            ToolCall(id="read-matches", name="read_file", arguments={"path": match_path.name}),
+            policy,
+        )
+        missing_match = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-zero-match",
+                name="edit_file",
+                arguments={
+                    "path": match_path.name,
+                    "old_string": "absent",
+                    "new_string": "new",
+                },
+            ),
+            policy,
+        )
+        if missing_match.ok or missing_match.error != "old_string not found in edit-matches.txt":
+            fail(f"zero-match error changed: {missing_match!r}")
+        multi_match = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-multi-match",
+                name="edit_file",
+                arguments={
+                    "path": match_path.name,
+                    "old_string": "one",
+                    "new_string": "two",
+                },
+            ),
+            policy,
+        )
+        expected_multi_match = (
+            "old_string matches 2 times in edit-matches.txt; set replace_all=true to "
+            "change every match, or add surrounding context to identify one"
+        )
+        if multi_match.ok or multi_match.error != expected_multi_match:
+            fail(f"multi-match error changed: {multi_match!r}")
+        replace_all = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-replace-all",
+                name="edit_file",
+                arguments={
+                    "path": match_path.name,
+                    "old_string": "one",
+                    "new_string": "two",
+                    "replace_all": True,
+                },
+            ),
+            policy,
+        )
+        if not replace_all.ok or match_path.read_text() != "two two\n":
+            fail(f"replace_all did not replace every occurrence: {replace_all!r}")
+
+        one_match_path = root / "edit-one-match.txt"
+        one_match_path.write_text("before keep\n")
+        tools["read_file"].execute(
+            ToolCall(id="read-one-match", name="read_file", arguments={"path": one_match_path.name}),
+            policy,
+        )
+        one_match = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-one-match",
+                name="edit_file",
+                arguments={
+                    "path": one_match_path.name,
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            ),
+            policy,
+        )
+        if not one_match.ok or one_match_path.read_text() != "after keep\n":
+            fail(f"default single replacement changed: {one_match!r}")
+
+        batch_path = root / "multi-edit.txt"
+        batch_path.write_text("alpha beta gamma\n")
+        tools["read_file"].execute(
+            ToolCall(id="read-multi-edit", name="read_file", arguments={"path": batch_path.name}),
+            policy,
+        )
+        ordered_batch = tools["multi_edit_file"].execute(
+            ToolCall(
+                id="multi-edit-ordered",
+                name="multi_edit_file",
+                arguments={
+                    "path": batch_path.name,
+                    "edits": [
+                        {"old_string": "alpha", "new_string": "delta"},
+                        {"old_string": "delta beta", "new_string": "joined"},
+                    ],
+                },
+            ),
+            policy,
+        )
+        if not ordered_batch.ok or batch_path.read_text() != "joined gamma\n":
+            fail(f"multi_edit_file did not apply edits in order: {ordered_batch!r}")
+        if (
+            ordered_batch.payload is None
+            or ordered_batch.payload["kind"] != "file_diff"
+            or ordered_batch.payload["path"] != "multi-edit.txt"
+            or json.loads(json.dumps(ordered_batch.payload)) != ordered_batch.payload
+            or not ordered_batch.content.startswith("--- multi-edit.txt\n+++ multi-edit.txt\n")
+        ):
+            fail(f"multi_edit_file did not return a structured unified diff: {ordered_batch!r}")
+        before_failed_batch = batch_path.read_text()
+        failed_batch = tools["multi_edit_file"].execute(
+            ToolCall(
+                id="multi-edit-atomic",
+                name="multi_edit_file",
+                arguments={
+                    "path": batch_path.name,
+                    "edits": [
+                        {"old_string": "joined", "new_string": "changed"},
+                        {"old_string": "absent", "new_string": "never"},
+                    ],
+                },
+            ),
+            policy,
+        )
+        if failed_batch.ok or failed_batch.error != "edit 2: old_string not found in multi-edit.txt":
+            fail(f"multi_edit_file failure message changed: {failed_batch!r}")
+        if batch_path.read_text() != before_failed_batch:
+            fail("multi_edit_file wrote a partial batch")
+
+        consecutive_second = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-consecutive",
+                name="edit_file",
+                arguments={
+                    "path": batch_path.name,
+                    "old_string": "joined",
+                    "new_string": "final",
+                },
+            ),
+            policy,
+        )
+        if not consecutive_second.ok or batch_path.read_text() != "final gamma\n":
+            fail(f"writer did not refresh the ledger after its own write: {consecutive_second!r}")
+
+        diff_path = root / "structured-diff.txt"
+        diff_path.write_text("alpha\nkeep\nomega\n")
+        tools["read_file"].execute(
+            ToolCall(id="read-diff", name="read_file", arguments={"path": diff_path.name}),
+            policy,
+        )
+        diff_result = tools["edit_file"].execute(
+            ToolCall(
+                id="edit-diff",
+                name="edit_file",
+                arguments={
+                    "path": diff_path.name,
+                    "old_string": "keep",
+                    "new_string": "changed",
+                },
+            ),
+            policy,
+        )
+        expected_diff = (
+            "--- structured-diff.txt\n+++ structured-diff.txt\n@@ -1,3 +1,3 @@\n"
+            " alpha\n-keep\n+changed\n omega"
+        )
+        if diff_result.content != expected_diff:
+            fail(f"unified diff rendering changed: {diff_result!r}")
+        expected_payload = {
+            "kind": "file_diff",
+            "path": "structured-diff.txt",
+            "lines_added": 1,
+            "lines_removed": 1,
+            "truncated": False,
+            "hunks": [
+                {
+                    "old_start": 1,
+                    "old_lines": 3,
+                    "new_start": 1,
+                    "new_lines": 3,
+                    "lines": [
+                        {"op": "context", "text": "alpha"},
+                        {"op": "remove", "text": "keep"},
+                        {"op": "add", "text": "changed"},
+                        {"op": "context", "text": "omega"},
+                    ],
+                }
+            ],
+        }
+        if diff_result.payload != expected_payload:
+            fail(f"structured diff payload changed: {diff_result.payload!r}")
+        if json.loads(json.dumps(diff_result.payload)) != diff_result.payload:
+            fail(f"structured diff payload was not JSON-stable: {diff_result.payload!r}")
+        diff_ops = {
+            line["op"]
+            for hunk in diff_result.payload["hunks"]
+            for line in hunk["lines"]
+        }
+        if diff_ops != {"context", "add", "remove"}:
+            fail(f"structured diff line operations changed: {diff_ops!r}")
+
+        truncated_path = root / "truncated-diff.txt"
+        truncated_path.write_text("a long original line\n")
+        tools["read_file"].execute(
+            ToolCall(
+                id="read-truncated-diff",
+                name="read_file",
+                arguments={"path": truncated_path.name},
+            ),
+            policy,
+        )
+        with mock.patch.object(filesystem_tools, "MAX_READ_BYTES", 10):
+            truncated_diff = tools["edit_file"].execute(
+                ToolCall(
+                    id="edit-truncated-diff",
+                    name="edit_file",
+                    arguments={
+                        "path": truncated_path.name,
+                        "old_string": "a long original line",
+                        "new_string": "a substantially different line",
+                    },
+                ),
+                policy,
+            )
+        expected_omitted = (
+            "[diff omitted: 1 lines added, 1 removed, over the 10 byte diff limit]"
+        )
+        if (
+            not truncated_diff.ok
+            or truncated_diff.content != expected_omitted
+            or truncated_diff.payload["hunks"] != []
+            or truncated_diff.payload["truncated"] is not True
+        ):
+            fail(f"oversized diff was not safely omitted: {truncated_diff!r}")
+
+        write_created = tools["write_file"].execute(
+            ToolCall(
+                id="write-create-unread",
+                name="write_file",
+                arguments={"path": "write-created.txt", "content": "created"},
+            ),
+            policy,
+        )
+        if not write_created.ok or (root / "write-created.txt").read_text() != "created":
+            fail(f"write_file did not create an unread path: {write_created!r}")
+        write_unread_path = root / "write-unread-existing.txt"
+        write_unread_path.write_text("original")
+        write_unread = tools["write_file"].execute(
+            ToolCall(
+                id="write-unread-existing",
+                name="write_file",
+                arguments={"path": write_unread_path.name, "content": "replacement"},
+            ),
+            policy,
+        )
+        if write_unread.ok or write_unread.error != not_read_error:
+            fail(f"write_file overwrote an unread existing file: {write_unread!r}")
+        if write_unread_path.read_text() != "original":
+            fail("write_file changed an unread existing file despite refusing it")
+
+        first_registry = standard_tool_registry()
+        second_registry = standard_tool_registry()
+        isolated_path = root / "isolated-ledger.txt"
+        isolated_path.write_text("before\n")
+        first_registry["read_file"].execute(
+            ToolCall(id="isolated-read", name="read_file", arguments={"path": isolated_path.name}),
+            policy,
+        )
+        isolated_edit = second_registry["edit_file"].execute(
+            ToolCall(
+                id="isolated-edit",
+                name="edit_file",
+                arguments={
+                    "path": isolated_path.name,
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            ),
+            policy,
+        )
+        if isolated_edit.ok or isolated_edit.error != not_read_error:
+            fail(f"read ledger leaked between registries: {isolated_edit!r}")
+        if ToolResult(tool_call_id="payload-default", ok=True).payload is not None:
+            fail("existing ToolResult callers gained a non-empty payload")
+        ok("edit tools enforce fresh reads, apply atomically, and return structured diffs")
+
         r = tools["read_file"].execute(ToolCall(id="a1", name="read_file", arguments={"path": "existing.txt"}), policy)
         if not r.ok:
             fail(f"read_file should be allowed inside repo_root: {r.error}")
@@ -1650,7 +2064,7 @@ def main() -> None:
         ok("deny: run_shell always-deny command ('rm') overrides an explicit allowlist")
 
         # -- regression: a real provider's run_task() request must include
-        # schemas for all six standard tools --
+        # schemas for all eight standard tools --
         captured: dict = {}
 
         class _FakeHttpResponse:
@@ -2571,6 +2985,8 @@ def main() -> None:
         expected_tool_names = {
             "read_file",
             "write_file",
+            "edit_file",
+            "multi_edit_file",
             "list_files",
             "glob",
             "grep",
@@ -2580,7 +2996,7 @@ def main() -> None:
             fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
         if captured.get("body", {}).get("model") != "request-override-model":
             fail(f"run_task(model=...) did not reach the wire: {captured.get('body')!r}")
-        ok("real provider's run_task() request includes all six standard tool schemas")
+        ok("real provider's run_task() request includes all eight standard tool schemas")
         ok("run_task(model=...) overrides the provider's default model on the wire")
 
         # Anthropic and OpenAI-compatible providers use the same request-level
@@ -2633,7 +3049,7 @@ def main() -> None:
             )
         ok("Anthropic and OpenAI-compatible request model overrides reach the wire")
 
-        # -- regression: a real GeminiProvider request must carry the six
+        # -- regression: a real GeminiProvider request must carry the eight
         # tools as sanitized tools[].functionDeclarations, not raw schemas --
         os.environ[GEMINI_API_KEY_ENV_VAR] = "AIza-fake-test-key-do-not-use"
         gemini_captured: dict = {}
