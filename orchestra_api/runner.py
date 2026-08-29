@@ -28,26 +28,10 @@ def standard_tool_registry(
 ) -> dict[str, LocalTool]:
     """The eight local tools: read_file, write_file, edit_file,
     multi_edit_file, list_files, glob, grep, and run_shell.
+
+    `names` selects a subset, returned in canonical registry order, and an
+    unknown or empty sequence raises `ValueError`.
     """
-    if names is not None:
-        if not names:
-            raise ValueError("names must not be empty; omit it for the full registry")
-        known_names = {
-            "read_file",
-            "write_file",
-            "edit_file",
-            "multi_edit_file",
-            "list_files",
-            "glob",
-            "grep",
-            "run_shell",
-        }
-        for name in names:
-            if name not in known_names:
-                raise ValueError(f"unknown tool name: {name!r}")
-        requested_names = set(names)
-    else:
-        requested_names = None
     ledger = ReadLedger()
     tools: list[LocalTool] = [
         ReadFileTool(ledger),
@@ -59,6 +43,16 @@ def standard_tool_registry(
         GrepTool(),
         RunShellTool(),
     ]
+    if names is not None:
+        if not names:
+            raise ValueError("names must not be empty; omit it for the full registry")
+        known_names = {tool.name for tool in tools}
+        for name in names:
+            if name not in known_names:
+                raise ValueError(f"unknown tool name: {name!r}")
+        requested_names = set(names)
+    else:
+        requested_names = None
     return {
         tool.name: tool
         for tool in tools
