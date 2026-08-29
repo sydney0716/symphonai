@@ -16,3 +16,5 @@ build/
 .env
 .env.*
 !.env.example
+
+ref/
