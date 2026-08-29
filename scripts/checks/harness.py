@@ -57,6 +57,11 @@ def run(selector: str | None = None) -> int:
     if not selected:
         print(f"no check matches {selector!r}")
         return 1
+    if any(name.startswith("selfcheck.") for name in REGISTRY) and not all(
+        name.startswith("selfcheck.") for name, _ in selected
+    ):
+        print("refusing to mix selfcheck fixtures with real checks")
+        return 1
 
     global _CURRENT_LABELS
     passed = 0
