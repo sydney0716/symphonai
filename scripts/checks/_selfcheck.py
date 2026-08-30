@@ -188,12 +188,22 @@ def main() -> None:
         "leader.subagent_tool_subsets",
         "leader.gemini_dispatch_schema",
         "leader.openai_compatible_tool_schemas",
+        "scheduler.partition_barriers",
+        "scheduler.metadata_fail_closed",
+        "scheduler.classification",
+        "scheduler.parallel_reads",
+        "scheduler.result_order",
+        "scheduler.event_order",
+        "scheduler.singleton_compatibility",
+        "scheduler.exception_isolation",
+        "scheduler.cancellation_repair",
+        "scheduler.ledger_locking",
     ]
     full_run = invoke_check()
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "113 passed, 0 failed, 113 selected of 113 registered",
+        == "123 passed, 0 failed, 123 selected of 123 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -214,7 +224,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 113 registered",
+            == "1 passed, 0 failed, 1 selected of 123 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -230,7 +240,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 113 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 123 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

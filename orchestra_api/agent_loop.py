@@ -10,6 +10,7 @@ and never raises just because `max_turns` was hit.
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
@@ -32,9 +33,17 @@ from orchestra_api.identity import (
     new_run_ref,
     new_turn_ref,
 )
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolResult
+from orchestra_api.models import (
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    ToolCall,
+    ToolResult,
+)
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
+from orchestra_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from orchestra_api.tools.base import LocalTool
 
 DEFAULT_MAX_TURNS = 10
@@ -83,6 +92,29 @@ class ApiAgent:
     @property
     def agent_ref(self) -> AgentRef:
         return self._agent_ref
+
+    def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        cancel: CancellationToken | None,
+    ) -> ToolResult:
+        tool = self._tools.get(tool_call.name)
+        if tool is None:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"unknown tool: {tool_call.name!r}",
+            )
+        try:
+            return tool.execute(tool_call, self._policy, cancel=cancel)
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     def run(
         self,
@@ -165,40 +197,83 @@ class ApiAgent:
                         ),
                     )
                     return result
-                for tool_call in response.message.tool_calls:
-                    emit(
-                        event_sink,
-                        ToolCallStarted(
-                            agent_id=self._agent_ref.agent_id,
-                            run_id=run_ref.run_id,
-                            turn_id=turn_ref.turn_id,
-                            tool_name=tool_call.name,
-                            tool_call_id=tool_call.id,
-                        ),
-                    )
-                    tool = self._tools.get(tool_call.name)
-                    if tool is None:
-                        tool_result = ToolResult(
-                            tool_call_id=tool_call.id,
-                            ok=False,
-                            error=f"unknown tool: {tool_call.name!r}",
+                batches = partition_tool_calls(
+                    response.message.tool_calls, self._tools
+                )
+                for batch in batches:
+                    for tool_call in batch:
+                        emit(
+                            event_sink,
+                            ToolCallStarted(
+                                agent_id=self._agent_ref.agent_id,
+                                run_id=run_ref.run_id,
+                                turn_id=turn_ref.turn_id,
+                                tool_name=tool_call.name,
+                                tool_call_id=tool_call.id,
+                            ),
                         )
+
+                    cancelled = False
+                    results: dict[int, ToolResult] = {}
+                    if len(batch) == 1:
+                        tool_call = batch[0]
+                        tool = self._tools.get(tool_call.name)
+                        if tool is None:
+                            results[0] = ToolResult(
+                                tool_call_id=tool_call.id,
+                                ok=False,
+                                error=f"unknown tool: {tool_call.name!r}",
+                            )
+                        else:
+                            results[0] = tool.execute(
+                                tool_call, self._policy, cancel=cancel
+                            )
                     else:
-                        tool_result = tool.execute(tool_call, self._policy, cancel=cancel)
-                    conversation.append(
-                        Message(role=Role.TOOL, tool_result=tool_result, turn_id=turn_ref.turn_id)
-                    )
-                    emit(
-                        event_sink,
-                        ToolCallFinished(
-                            agent_id=self._agent_ref.agent_id,
-                            run_id=run_ref.run_id,
-                            turn_id=turn_ref.turn_id,
-                            tool_name=tool_call.name,
-                            tool_call_id=tool_call.id,
-                            ok=tool_result.ok,
-                        ),
-                    )
+                        executor = ThreadPoolExecutor(
+                            max_workers=min(len(batch), MAX_TOOL_CONCURRENCY)
+                        )
+                        futures = {
+                            executor.submit(self._execute_tool_call, tool_call, cancel): index
+                            for index, tool_call in enumerate(batch)
+                        }
+                        try:
+                            for future in as_completed(futures):
+                                index = futures[future]
+                                try:
+                                    results[index] = future.result()
+                                except OperationCancelled:
+                                    cancelled = True
+                                    for pending in futures:
+                                        pending.cancel()
+                                except CancelledError:
+                                    pass
+                        finally:
+                            executor.shutdown(wait=True, cancel_futures=cancelled)
+
+                    for index, tool_call in enumerate(batch):
+                        tool_result = results.get(index)
+                        if tool_result is None:
+                            continue
+                        conversation.append(
+                            Message(
+                                role=Role.TOOL,
+                                tool_result=tool_result,
+                                turn_id=turn_ref.turn_id,
+                            )
+                        )
+                        emit(
+                            event_sink,
+                            ToolCallFinished(
+                                agent_id=self._agent_ref.agent_id,
+                                run_id=run_ref.run_id,
+                                turn_id=turn_ref.turn_id,
+                                tool_name=tool_call.name,
+                                tool_call_id=tool_call.id,
+                                ok=tool_result.ok,
+                            ),
+                        )
+                    if cancelled:
+                        raise OperationCancelled
                 emit(
                     event_sink,
                     TurnFinished(
