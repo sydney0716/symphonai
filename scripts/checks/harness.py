@@ -2,8 +2,24 @@
 
 from __future__ import annotations
 
+import sys
+
+
+sys.dont_write_bytecode = True
+
+import atexit
+import shutil
 from collections.abc import Callable
+from pathlib import Path
 from typing import NoReturn
+
+
+def _remove_check_bytecode() -> None:
+    # A direct submodule import starts loading the package before this flag runs.
+    shutil.rmtree(Path(__file__).parent / "__pycache__", ignore_errors=True)
+
+
+atexit.register(_remove_check_bytecode)
 
 
 class CheckFailed(Exception):

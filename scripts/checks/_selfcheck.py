@@ -120,12 +120,58 @@ def main() -> None:
         "compaction.under_budget_unchanged",
         "compaction.preserves_required_context",
         "compaction.impossible_budget_fails",
+        "events.final_identity",
+        "events.tool_bracketing",
+        "events.provider_failure",
+        "events.sink_isolation",
+        "events.stream_optional",
+        "cancel.pre_cancelled_agent",
+        "cancel.tool_repair",
+        "cancel.http_read_recheck",
+        "cancel.late_response_retained",
+        "agent.full_run",
+        "agent.base_validation",
+        "search.permission_gates",
+        "search.ordering_and_pagination",
+        "search.grep_modes",
+        "search.cancellation",
+        "read_file.ranges_and_limits",
+        "edit.not_read_refused",
+        "edit.stale_refused",
+        "edit.same_content_allowed",
+        "edit.ranged_read_stale",
+        "edit.long_unranged_stale",
+        "edit.single_open",
+        "edit.match_count",
+        "edit.one_match",
+        "edit.multi_edit_sequence",
+        "edit.structured_diff",
+        "edit.truncated_diff",
+        "edit.write_unread_existing",
+        "edit.isolated_ledger",
+        "edit.narrowed_isolated_ledger",
+        "permissions.read_inside_root",
+        "permissions.list_inside_root",
+        "permissions.write_inside_scope",
+        "permissions.write_outside_scope_denied",
+        "permissions.forbidden_read_denied",
+        "permissions.traversal_denied",
+        "permissions.shell_disabled",
+        "permissions.shell_always_denied",
+        "shell.process_group_fallback",
+        "shell.cancellation_reaps_child",
+        "shell.cancellation_kills_group",
+        "shell.cancellation_bounded",
+        "shell.execution_paths",
+        "providers_live.openai_tools_and_model_override",
+        "providers_live.gemini_tools_and_model_override",
+        "providers_live.gemini_thought_signature",
     ]
     full_run = invoke_check()
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "45 passed, 0 failed, 45 selected of 45 registered",
+        == "91 passed, 0 failed, 91 selected of 91 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -145,7 +191,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "4 passed, 0 failed, 4 selected of 45 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 91 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
@@ -155,6 +201,13 @@ def main() -> None:
                 "shell.metadata_contract",
                 "shell.metadata_fails_closed",
                 "shell.permission_not_granted",
+                "permissions.shell_disabled",
+                "permissions.shell_always_denied",
+                "shell.process_group_fallback",
+                "shell.cancellation_reaps_child",
+                "shell.cancellation_kills_group",
+                "shell.cancellation_bounded",
+                "shell.execution_paths",
             ],
             f"unexpected selected checks: {selected.stdout!r}",
         )

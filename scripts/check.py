@@ -20,6 +20,15 @@ from scripts.checks import retry  # noqa: E402, F401
 from scripts.checks import model_discovery  # noqa: E402, F401
 from scripts.checks import providers  # noqa: E402, F401
 from scripts.checks import compaction  # noqa: E402, F401
+from scripts.checks import agent_events  # noqa: E402, F401
+from scripts.checks import agent_cancel  # noqa: E402, F401
+from scripts.checks import agent_run  # noqa: E402, F401
+from scripts.checks import search  # noqa: E402, F401
+from scripts.checks import read_file  # noqa: E402, F401
+from scripts.checks import edit  # noqa: E402, F401
+from scripts.checks import permissions  # noqa: E402, F401
+from scripts.checks import shell  # noqa: E402, F401
+from scripts.checks import providers_live  # noqa: E402, F401
 from scripts.checks.harness import names, run  # noqa: E402
 
 
