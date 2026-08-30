@@ -10,8 +10,8 @@ Making one real call requires BOTH `--live` and an explicit
 OpenAI-compatible catalog preset. It prints a cost/network warning first.
 
 This script is never run automatically as part of validation --
-`scripts/smoke_api_agent.py` (FakeModelProvider-only) is the automated
-test, and stays untouched by this one.
+`scripts/check.py` runs the automated offline provider checks, and stays
+untouched by this one.
 """
 
 from __future__ import annotations

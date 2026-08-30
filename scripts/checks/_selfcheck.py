@@ -166,18 +166,57 @@ def main() -> None:
         "providers_live.openai_tools_and_model_override",
         "providers_live.gemini_tools_and_model_override",
         "providers_live.gemini_thought_signature",
+        "leader.compatibility_names_removed",
+        "leader.run_dispatches_subagent",
+        "leader.compaction_identity",
+        "leader.cancellation_transcript",
+        "leader.chat_cancellation",
+        "leader.standalone_dispatch",
+        "leader.dispatch_metadata",
+        "leader.dispatch_pool",
+        "leader.typed_event_lifecycle",
+        "leader.event_sink_isolation",
+        "leader.leader_failure_events",
+        "leader.subagent_failure_events",
+        "leader.leader_max_turns",
+        "leader.subagent_max_turns",
+        "leader.fresh_run_subagents",
+        "leader.pool_reset",
+        "leader.chat_history",
+        "leader.anthropic_leader_tool_schema",
+        "leader.anthropic_subagent_tool_schemas",
+        "leader.subagent_tool_subsets",
+        "leader.gemini_dispatch_schema",
+        "leader.openai_compatible_tool_schemas",
     ]
     full_run = invoke_check()
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "91 passed, 0 failed, 91 selected of 91 registered",
+        == "113 passed, 0 failed, 113 selected of 113 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
     listed = invoke_check("--list")
     require(listed.returncode == 0, f"list failed: {listed.stderr!r}")
     require(listed.stdout.splitlines() == expected_names, f"unexpected list: {listed.stdout!r}")
+
+    for name in expected_names:
+        selected_alone = invoke_check("--only", name)
+        require(
+            selected_alone.returncode == 0,
+            f"standalone check {name!r} failed: {selected_alone.stdout!r}",
+        )
+        selected_alone_lines = selected_alone.stdout.splitlines()
+        require(
+            selected_alone_lines[0] == f"PASS  {name}",
+            f"standalone check selected the wrong name: {selected_alone.stdout!r}",
+        )
+        require(
+            selected_alone_lines[-1]
+            == "1 passed, 0 failed, 1 selected of 113 registered",
+            f"standalone check selected more than one entry: {selected_alone.stdout!r}",
+        )
 
     listed_retry = invoke_check("--list", "--only", "retry")
     require(listed_retry.returncode == 0, f"filtered list failed: {listed_retry.stderr!r}")
@@ -191,7 +230,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 91 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 113 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
@@ -241,6 +280,24 @@ def main() -> None:
     )
 
     bytecode_cache = Path(__file__).parent / "__pycache__"
+    shutil.rmtree(bytecode_cache, ignore_errors=True)
+    direct_import = subprocess.run(
+        [sys.executable, "-c", "from scripts.checks import leader"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    require(
+        direct_import.returncode == 0,
+        f"direct leader import failed: {direct_import.stderr!r}",
+    )
+    cached_modules = list(bytecode_cache.glob("*.pyc"))
+    require(
+        all(path.name.startswith("__init__.cpython-") for path in cached_modules),
+        f"direct leader import cached check modules: {cached_modules!r}",
+    )
+
     shutil.rmtree(bytecode_cache, ignore_errors=True)
     bytecode_run = invoke_check("--only", "content.message_normalization")
     require(bytecode_run.returncode == 0, f"bytecode check run failed: {bytecode_run.stdout!r}")

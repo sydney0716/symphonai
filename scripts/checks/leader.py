@@ -1,54 +1,15 @@
-#!/usr/bin/env python3
-"""Smoke test for the Leader / DispatchSubagentTool, using FakeModelProvider only.
-
-Verifies:
-  - a full Leader.run(): a dispatch_subagent tool-call turn followed by a
-    final answer, stopped_reason == "final_response"
-  - dispatch with a new subagent_name creates a subagent
-  - dispatch with the same subagent_name reuses it (same object identity,
-    message history grows across calls)
-  - a different subagent_name creates an isolated second pool entry
-  - max_subagents is enforced once the limit is reached
-  - typed events preserve the ordered run/subagent lifecycle sequence
-  - leader and subagent failures and turn exhaustion emit terminal events
-  - separate run() calls never reuse pooled subagents; explicit and chat
-    clearing empty the pool and clear_subagents() returns the removed count
-  - Leader.chat() persists conversation across calls -- a second chat()
-    call's leader_messages include the first call's exchange
-  - regression check: a real AnthropicProvider used as leader_provider
-    actually includes the dispatch_subagent tool definition in its
-    outgoing request body (via mocked urllib.request.urlopen) -- guards
-    against ApiAgent silently never telling a real model any tool exists
-  - regression check: a real subagent's own outgoing request (behind a
-    real leader dispatching to it) includes schemas for all eight standard
-    tools (read_file/write_file/edit_file/multi_edit_file/list_files/glob/grep/run_shell)
-  - regression check: a real GeminiProvider leader's outgoing
-    dispatch_subagent tool declaration carries a non-empty sanitized
-    parameters object
-  - regression check: a real OpenAICompatibleProvider leader and its real
-    OpenAICompatibleProvider subagent both send OpenAI-shaped tool schemas
-
-No real network call is ever made in this script. FakeModelProvider is
-used for every check except the real-provider regression checks, which
-exercise request-building code against a mocked HTTP layer.
-"""
+"""Registered checks for Leader and DispatchSubagentTool behavior."""
 
 from __future__ import annotations
 
 import inspect
 import json
 import os
-import sys
-import tempfile
 import unittest.mock as mock
 from dataclasses import fields
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-from orchestra_api.cancellation import CancellationToken, OperationCancelled  # noqa: E402
-from orchestra_api.events import (  # noqa: E402
+from orchestra_api.cancellation import CancellationToken, OperationCancelled
+from orchestra_api.events import (
     CollectingSink,
     CompactionApplied,
     RunFailed,
@@ -57,36 +18,40 @@ from orchestra_api.events import (  # noqa: E402
     SubagentSpawned,
     ToolCallStarted,
 )
-import orchestra_api.leader as leader_module  # noqa: E402
-from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig  # noqa: E402
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, ToolResult  # noqa: E402
-from orchestra_api.permissions import PermissionPolicy  # noqa: E402
-from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider  # noqa: E402
-from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
-from orchestra_api.providers.gemini_provider import (  # noqa: E402
+import orchestra_api.leader as leader_module
+from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig
+from orchestra_api.models import (
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    ToolCall,
+    ToolResult,
+)
+from orchestra_api.permissions import PermissionPolicy
+from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider
+from orchestra_api.providers.fake import FakeModelProvider
+from orchestra_api.providers.gemini_provider import (
     API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
 )
-from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
-from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider  # noqa: E402
-from orchestra_api.providers.openai_provider import _build_request_body as _build_openai_body  # noqa: E402
-from orchestra_api.tools.base import LocalTool  # noqa: E402
-from orchestra_api.tools.metadata import (  # noqa: E402
+from orchestra_api.providers.gemini_provider import GeminiProvider
+from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider
+from orchestra_api.providers.openai_provider import (
+    _build_request_body as _build_openai_body,
+)
+from orchestra_api.tools.base import LocalTool
+from orchestra_api.tools.metadata import (
     InterruptBehavior,
     ResultHint,
     ToolEffect,
     ToolMetadata,
 )
 
+from scripts.checks.harness import check, fail
+from scripts.checks.workspace import workspace
+
+
 OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "ORCHESTRA_OPENAI_COMPATIBLE_SMOKE_KEY"
-
-
-def fail(msg: str) -> None:
-    print(f"FAIL: {msg}")
-    sys.exit(1)
-
-
-def ok(msg: str) -> None:
-    print(f"OK:   {msg}")
 
 
 def lifecycle(events: CollectingSink) -> list[tuple[str, str, str | None]]:
@@ -165,7 +130,22 @@ def _assert_openai_tool_calls_answered(request: ModelRequest, context: str) -> N
             )
 
 
-def main() -> None:
+class _FakeHttpResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeHttpResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+@check("leader.compatibility_names_removed")
+def check_compatibility_names_removed() -> None:
     # Names are split so this file does not itself match the validation grep
     # in specs/01c-tui-events-and-stop.md, which asserts the repo is free of
     # these identifiers. Do not join them back into literals.
@@ -181,11 +161,12 @@ def main() -> None:
     retired_field = "on_" + "status"
     if retired_field in {item.name for item in fields(LeaderConfig)}:
         fail("LeaderConfig still exposes the retired compatibility field")
-    ok("leader compatibility names and configuration field are removed")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
 
+@check("leader.run_dispatches_subagent")
+def check_run_dispatches_subagent() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- full Leader.run(): dispatch then final answer --
         subagent_provider = FakeModelProvider(
             responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="the sky is blue"))]
@@ -305,8 +286,12 @@ def main() -> None:
             for event in identity_events.events
         ):
             fail(f"event turn identity has no matching message: {identity_events.events!r}")
-        ok(f"Leader.run() dispatched a subagent and reached a final answer: {result.final_answer!r}")
 
+
+@check("leader.compaction_identity")
+def check_compaction_identity() -> None:
+    with workspace() as ws:
+        root = ws.root
         compaction_events = CollectingSink()
         compaction_leader = Leader(
             LeaderConfig(
@@ -340,8 +325,12 @@ def main() -> None:
             or compaction_applied[0].after_tokens != compacted.after_tokens
         ):
             fail(f"compaction event payload is incorrect: {compaction_applied[0]!r}")
-        ok("leader compaction emits canonical token and identity data")
 
+
+@check("leader.cancellation_transcript")
+def check_cancellation_transcript() -> None:
+    with workspace() as ws:
+        root = ws.root
         cancellation_typed_events = CollectingSink()
         cancellation_token = CancellationToken()
         cancellation_subagent_provider = FakeModelProvider(
@@ -448,8 +437,12 @@ def main() -> None:
             cancellation_leader_provider.requests[-1],
             "leader chat after subagent cancellation",
         )
-        ok("leader cancellation preserves partial work and leaves a reusable transcript")
 
+
+@check("leader.chat_cancellation")
+def check_chat_cancellation() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- chat() reports cancellation the same way run() does --
         chat_cancel_token = CancellationToken()
         chat_cancel_token.cancel()
@@ -470,10 +463,14 @@ def main() -> None:
             fail("Leader.chat() raised OperationCancelled; run() returns a cancelled result")
         if chat_cancelled.stopped_reason != "cancelled":
             fail(f"Leader.chat() did not report cancellation: {chat_cancelled!r}")
-        ok("Leader.chat() reports cancellation as a result, matching Leader.run()")
 
+
+@check("leader.standalone_dispatch")
+def check_standalone_dispatch() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- create / reuse / isolate / max_subagents, exercised directly on the tool --
-        policy = PermissionPolicy(repo_root=root)
+        policy = ws.policy
         if "events" in inspect.signature(DispatchSubagentTool).parameters:
             fail("DispatchSubagentTool.__init__ still exposes an unwired events argument")
         try:
@@ -507,8 +504,13 @@ def main() -> None:
                 "standalone dispatch emitted an event without leader context: "
                 f"result={standalone_result!r}, calls={standalone_emit.call_args_list!r}"
             )
-        ok("standalone dispatch has no event sink or invalid empty-run event path")
 
+
+@check("leader.dispatch_metadata")
+def check_dispatch_metadata() -> None:
+    with workspace() as ws:
+        root = ws.root
+        policy = ws.policy
         pool_provider = FakeModelProvider(
             responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="sub reply"))]
         )
@@ -547,8 +549,19 @@ def main() -> None:
             or tool.pool
         ):
             fail(f"dispatch_subagent validation behavior changed: {invalid_dispatch!r}")
-        ok("dispatch_subagent declares conservative per-call metadata")
 
+
+@check("leader.dispatch_pool")
+def check_dispatch_pool() -> None:
+    with workspace() as ws:
+        root = ws.root
+        policy = ws.policy
+        pool_provider = FakeModelProvider(
+            responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="sub reply"))]
+        )
+        tool = DispatchSubagentTool(
+            subagent_provider=pool_provider, subagent_policy=policy, max_subagents=2, subagent_max_turns=3
+        )
         r1 = tool.execute(
             ToolCall(id="c1", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": "task one"}),
             policy,
@@ -558,7 +571,6 @@ def main() -> None:
         worker_record = tool.pool.get("worker")
         if worker_record is None:
             fail("expected a 'worker' entry in the pool after first dispatch")
-        ok("dispatch with a new name creates a subagent")
 
         r2 = tool.execute(
             ToolCall(id="c2", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": "task two"}),
@@ -570,7 +582,6 @@ def main() -> None:
             fail("expected reuse to keep the same SubagentRecord object identity")
         if len(worker_record.messages) < 4:
             fail(f"expected message history to grow across both calls, got {len(worker_record.messages)}")
-        ok("dispatch with the same name reuses the subagent (same identity, growing history)")
 
         r3 = tool.execute(
             ToolCall(id="c3", name="dispatch_subagent", arguments={"subagent_name": "helper", "task": "task three"}),
@@ -578,15 +589,18 @@ def main() -> None:
         )
         if not r3.ok or tool.pool.get("helper") is worker_record:
             fail("expected a different name to create an isolated second subagent")
-        ok("a different name creates an isolated second pool entry")
 
         r4 = tool.execute(
             ToolCall(id="c4", name="dispatch_subagent", arguments={"subagent_name": "third", "task": "x"}), policy
         )
         if r4.ok or len(tool.pool) != 2:
             fail("expected max_subagents to be enforced once the limit is reached")
-        ok("max_subagents is enforced")
 
+
+@check("leader.typed_event_lifecycle")
+def check_typed_event_lifecycle() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- typed events preserve the expected ordered lifecycle --
         status_events = CollectingSink()
         status_subagent_provider = FakeModelProvider(
@@ -626,9 +640,12 @@ def main() -> None:
         actual_events = lifecycle(status_events)
         if actual_events != expected_events:
             fail(f"expected lifecycle event sequence {expected_events}, got {actual_events}")
-        ok(f"typed events preserve the expected lifecycle: {actual_events}")
 
-        # Event delivery isolates consumer bugs from the run.
+
+@check("leader.event_sink_isolation")
+def check_event_sink_isolation() -> None:
+    with workspace() as ws:
+        root = ws.root
         def _raising_events(event) -> None:  # noqa: ANN001
             raise RuntimeError("event consumer is broken")
 
@@ -646,9 +663,12 @@ def main() -> None:
         ).run("goal")
         if raising_result.stopped_reason != "final_response":
             fail(f"a raising event sink broke the run: {raising_result!r}")
-        ok("a raising event sink cannot fail the run")
 
-        # -- a leader provider exception emits failed before propagating. --
+
+@check("leader.leader_failure_events")
+def check_leader_failure_events() -> None:
+    with workspace() as ws:
+        root = ws.root
         failed_leader_events = CollectingSink()
         failed_leader_provider = FakeModelProvider()
         failed_leader = Leader(
@@ -680,8 +700,12 @@ def main() -> None:
                 f"expected failed leader events {expected_failed_leader_events}, "
                 f"got {actual_failed_leader_events}"
             )
-        ok("leader exception emits exactly one failed terminal status")
 
+
+@check("leader.subagent_failure_events")
+def check_subagent_failure_events() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- a subagent provider exception terminates both the subagent and
         # the enclosing leader turn as failed. --
         failed_subagent_events = CollectingSink()
@@ -734,9 +758,12 @@ def main() -> None:
                 f"expected failed subagent events {expected_failed_subagent_events}, "
                 f"got {actual_failed_subagent_events}"
             )
-        ok("subagent exception emits failed for subagent and leader")
 
-        # -- leader max_turns is exhausted, not done or failed. --
+
+@check("leader.leader_max_turns")
+def check_leader_max_turns() -> None:
+    with workspace() as ws:
+        root = ws.root
         exhausted_leader_events = CollectingSink()
         exhausted_leader_provider = FakeModelProvider(
             responses=[
@@ -775,8 +802,12 @@ def main() -> None:
                 "expected leader exhausted lifecycle, got "
                 f"{actual_exhausted_leader_events}"
             )
-        ok("leader max_turns emits exactly one exhausted terminal status")
 
+
+@check("leader.subagent_max_turns")
+def check_subagent_max_turns() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- subagent max_turns emits exhausted while the leader can consume
         # the failed tool result and finish normally. --
         exhausted_subagent_events = CollectingSink()
@@ -837,8 +868,12 @@ def main() -> None:
                 f"expected exhausted subagent events {expected_exhausted_subagent_events}, "
                 f"got {actual_exhausted_subagent_events}"
             )
-        ok("subagent max_turns emits exhausted and leader still reaches done")
 
+
+@check("leader.fresh_run_subagents")
+def check_fresh_run_subagents() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- run() is one-shot: clear the previous pool at entry, even when
         # the same subagent name is dispatched again. --
         pool_reset_leader_provider = FakeModelProvider(
@@ -904,7 +939,72 @@ def main() -> None:
         second_worker = pool_reset_leader.subagents.get("worker")
         if second_worker is None or second_worker is first_worker:
             fail("run() reused a stale subagent from the previous one-shot run")
-        ok("separate run() calls create fresh subagents")
+
+
+@check("leader.pool_reset")
+def check_pool_reset() -> None:
+    with workspace() as ws:
+        root = ws.root
+        # -- run() is one-shot: clear the previous pool at entry, even when
+        # the same subagent name is dispatched again. --
+        pool_reset_leader_provider = FakeModelProvider(
+            responses=[
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                id="pool-first",
+                                name="dispatch_subagent",
+                                arguments={"subagent_name": "worker", "task": "first"},
+                            )
+                        ],
+                    )
+                ),
+                ModelResponse(message=Message(role=Role.ASSISTANT, content="first done")),
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                id="pool-second",
+                                name="dispatch_subagent",
+                                arguments={"subagent_name": "worker", "task": "second"},
+                            )
+                        ],
+                    )
+                ),
+                ModelResponse(message=Message(role=Role.ASSISTANT, content="second done")),
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                id="pool-third",
+                                name="dispatch_subagent",
+                                arguments={"subagent_name": "worker", "task": "third"},
+                            )
+                        ],
+                    )
+                ),
+                ModelResponse(message=Message(role=Role.ASSISTANT, content="third done")),
+            ]
+        )
+        pool_reset_leader = Leader(
+            LeaderConfig(
+                leader_provider=pool_reset_leader_provider,
+                subagent_provider=FakeModelProvider(
+                    responses=[
+                        ModelResponse(message=Message(role=Role.ASSISTANT, content="fresh reply"))
+                    ]
+                ),
+                repo_root=str(root),
+                max_subagents=1,
+            )
+        )
+
+        pool_reset_leader.run("first run")
+        pool_reset_leader.run("second run")
 
         cleared_count = pool_reset_leader.clear_subagents()
         if cleared_count != 1 or pool_reset_leader.subagents:
@@ -914,7 +1014,6 @@ def main() -> None:
             )
         if pool_reset_leader.clear_subagents() != 0:
             fail("clear_subagents() should return zero for an already-empty pool")
-        ok("clear_subagents() returns the number removed and empties the pool")
 
         pool_reset_leader.run("third run")
         if len(pool_reset_leader.subagents) != 1:
@@ -922,8 +1021,12 @@ def main() -> None:
         pool_reset_leader.clear_chat()
         if pool_reset_leader.subagents:
             fail("clear_chat() did not clear the subagent pool")
-        ok("clear_chat() clears the subagent pool")
 
+
+@check("leader.chat_history")
+def check_chat_history() -> None:
+    with workspace() as ws:
+        root = ws.root
         # -- Leader.chat() persists conversation across calls --
         chat_provider = FakeModelProvider(
             responses=[
@@ -943,335 +1046,369 @@ def main() -> None:
         contents = [m.text for m in second.leader_messages]
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
-        ok("Leader.chat() persists conversation across calls")
 
-        # -- regression: a real leader provider's outgoing request must
-        # actually include the dispatch_subagent tool definition --
-        os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
-        captured: dict = {}
 
-        class _FakeHttpResponse:
-            def __init__(self, body: bytes) -> None:
-                self._body = body
+@check("leader.anthropic_leader_tool_schema")
+def check_anthropic_leader_tool_schema() -> None:
+    with workspace() as ws:
+        root = ws.root
+        previous_api_key = os.environ.get(API_KEY_ENV_VAR)
+        try:
+            os.environ[API_KEY_ENV_VAR] = 'sk-ant-fake-test-key-do-not-use'
+            # -- regression: a real leader provider's outgoing request must
+            # actually include the dispatch_subagent tool definition --
+            captured: dict = {}
+            def _fake_urlopen(request, timeout=None):  # noqa: ANN001
+                captured["body"] = json.loads(request.data.decode("utf-8"))
+                payload = json.dumps(
+                    {
+                        "content": [{"type": "text", "text": "no tool needed"}],
+                        "usage": {"input_tokens": 5, "output_tokens": 3},
+                        "stop_reason": "end_turn",
+                    }
+                ).encode("utf-8")
+                return _FakeHttpResponse(payload)
 
-            def read(self) -> bytes:
-                return self._body
-
-            def __enter__(self) -> "_FakeHttpResponse":
-                return self
-
-            def __exit__(self, *exc: object) -> bool:
-                return False
-
-        def _fake_urlopen(request, timeout=None):  # noqa: ANN001
-            captured["body"] = json.loads(request.data.decode("utf-8"))
-            payload = json.dumps(
-                {
-                    "content": [{"type": "text", "text": "no tool needed"}],
-                    "usage": {"input_tokens": 5, "output_tokens": 3},
-                    "stop_reason": "end_turn",
-                }
-            ).encode("utf-8")
-            return _FakeHttpResponse(payload)
-
-        real_leader = Leader(
-            LeaderConfig(
-                leader_provider=AnthropicProvider(),
-                subagent_provider=AnthropicProvider(),
-                repo_root=str(root),
+            real_leader = Leader(
+                LeaderConfig(
+                    leader_provider=AnthropicProvider(),
+                    subagent_provider=AnthropicProvider(),
+                    repo_root=str(root),
+                )
             )
-        )
-        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
-            real_leader.run("hello")
-        del os.environ[API_KEY_ENV_VAR]
-
-        sent_tools = captured.get("body", {}).get("tools")
-        if not sent_tools or sent_tools[0].get("name") != "dispatch_subagent":
-            fail(f"expected outgoing request to include the dispatch_subagent tool, got tools={sent_tools!r}")
-        ok("real leader provider's outgoing request includes the dispatch_subagent tool definition")
-
-        # -- regression: a real SUBAGENT's outgoing request must include
-        # schemas for all eight standard tools, not just the leader's own tool --
-        os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
-        subagent_requests: list[dict] = []
-        call_count = [0]
-
-        def _fake_urlopen_dispatch(request, timeout=None):  # noqa: ANN001
-            call_count[0] += 1
-            body = json.loads(request.data.decode("utf-8"))
-            if call_count[0] == 1:
-                # leader's turn: decide to dispatch to a subagent
-                payload = {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "c1",
-                            "name": "dispatch_subagent",
-                            "input": {"subagent_name": "researcher", "task": "read a.txt"},
-                        }
-                    ],
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "stop_reason": "tool_use",
-                }
-            elif call_count[0] == 2:
-                # the subagent's own turn -- this is the request we care about
-                subagent_requests.append(body)
-                payload = {
-                    "content": [{"type": "text", "text": "done"}],
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "stop_reason": "end_turn",
-                }
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+                real_leader.run("hello")
+            sent_tools = captured.get("body", {}).get("tools")
+            if not sent_tools or sent_tools[0].get("name") != "dispatch_subagent":
+                fail(f"expected outgoing request to include the dispatch_subagent tool, got tools={sent_tools!r}")
+        finally:
+            if previous_api_key is None:
+                os.environ.pop(API_KEY_ENV_VAR, None)
             else:
-                # leader's final answer
-                payload = {
-                    "content": [{"type": "text", "text": "final answer"}],
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "stop_reason": "end_turn",
-                }
-            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+                os.environ[API_KEY_ENV_VAR] = previous_api_key
 
-        dispatch_leader = Leader(
-            LeaderConfig(
-                leader_provider=AnthropicProvider(),
-                subagent_provider=AnthropicProvider(),
-                repo_root=str(root),
+
+@check("leader.anthropic_subagent_tool_schemas")
+def check_anthropic_subagent_tool_schemas() -> None:
+    with workspace() as ws:
+        root = ws.root
+        previous_api_key = os.environ.get(API_KEY_ENV_VAR)
+        try:
+            os.environ[API_KEY_ENV_VAR] = 'sk-ant-fake-test-key-do-not-use'
+            # -- regression: a real SUBAGENT's outgoing request must include
+            # schemas for all eight standard tools, not just the leader's own tool --
+            subagent_requests: list[dict] = []
+            call_count = [0]
+
+            def _fake_urlopen_dispatch(request, timeout=None):  # noqa: ANN001
+                call_count[0] += 1
+                body = json.loads(request.data.decode("utf-8"))
+                if call_count[0] == 1:
+                    # leader's turn: decide to dispatch to a subagent
+                    payload = {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "c1",
+                                "name": "dispatch_subagent",
+                                "input": {"subagent_name": "researcher", "task": "read a.txt"},
+                            }
+                        ],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "stop_reason": "tool_use",
+                    }
+                elif call_count[0] == 2:
+                    # the subagent's own turn -- this is the request we care about
+                    subagent_requests.append(body)
+                    payload = {
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "stop_reason": "end_turn",
+                    }
+                else:
+                    # leader's final answer
+                    payload = {
+                        "content": [{"type": "text", "text": "final answer"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "stop_reason": "end_turn",
+                    }
+                return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+            dispatch_leader = Leader(
+                LeaderConfig(
+                    leader_provider=AnthropicProvider(),
+                    subagent_provider=AnthropicProvider(),
+                    repo_root=str(root),
+                )
             )
-        )
-        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen_dispatch):
-            dispatch_leader.run("please read a.txt via researcher")
-        del os.environ[API_KEY_ENV_VAR]
-
-        if not subagent_requests:
-            fail("expected the subagent's own request to have been captured")
-        sent_tool_names = {t.get("name") for t in subagent_requests[0].get("tools", [])}
-        expected_tool_names = {
-            "read_file",
-            "write_file",
-            "edit_file",
-            "multi_edit_file",
-            "list_files",
-            "glob",
-            "grep",
-            "run_shell",
-        }
-        if sent_tool_names != expected_tool_names:
-            fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
-        ok("real subagent's outgoing request includes all eight standard tool schemas")
-
-        # -- a caller-fixed narrowed registry must narrow both execution and wire schemas --
-        os.environ[API_KEY_ENV_VAR] = "sk-ant-fake-test-key-do-not-use"
-        narrowed_subagent_requests: list[dict] = []
-        narrowed_call_count = [0]
-
-        def _fake_urlopen_narrowed_dispatch(request, timeout=None):  # noqa: ANN001
-            narrowed_call_count[0] += 1
-            body = json.loads(request.data.decode("utf-8"))
-            if narrowed_call_count[0] == 1:
-                payload = {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "narrow-c1",
-                            "name": "dispatch_subagent",
-                            "input": {
-                                "subagent_name": "reader",
-                                "task": "inspect a.txt",
-                            },
-                        }
-                    ],
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "stop_reason": "tool_use",
-                }
-            elif narrowed_call_count[0] == 2:
-                narrowed_subagent_requests.append(body)
-                payload = {
-                    "content": [{"type": "text", "text": "done"}],
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "stop_reason": "end_turn",
-                }
-            else:
-                payload = {
-                    "content": [{"type": "text", "text": "final answer"}],
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "stop_reason": "end_turn",
-                }
-            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
-
-        narrowed_leader = Leader(
-            LeaderConfig(
-                leader_provider=AnthropicProvider(),
-                subagent_provider=AnthropicProvider(),
-                repo_root=str(root),
-                subagent_tool_names=["read_file", "glob", "grep"],
-            )
-        )
-        with mock.patch(
-            "urllib.request.urlopen", side_effect=_fake_urlopen_narrowed_dispatch
-        ):
-            narrowed_leader.run("delegate read-only inspection")
-        del os.environ[API_KEY_ENV_VAR]
-
-        if not narrowed_subagent_requests:
-            fail("expected the narrowed subagent request to be captured")
-        narrowed_tool_names = {
-            tool.get("name")
-            for tool in narrowed_subagent_requests[0].get("tools", [])
-        }
-        expected_narrowed_names = {"read_file", "glob", "grep"}
-        if narrowed_tool_names != expected_narrowed_names or "run_shell" in narrowed_tool_names:
-            fail(
-                "narrowed subagent schemas exceeded the caller-fixed set: "
-                f"expected={expected_narrowed_names!r}, actual={narrowed_tool_names!r}"
-            )
-        ok("caller-fixed subagent tool subsets narrow real provider schemas")
-
-        # -- regression: a real GeminiProvider leader must send
-        # dispatch_subagent as a Gemini function declaration with sanitized,
-        # non-empty parameters --
-        os.environ[GEMINI_API_KEY_ENV_VAR] = "AIza-fake-test-key-do-not-use"
-        gemini_leader_captured: dict = {}
-
-        def _fake_gemini_urlopen(request, timeout=None):  # noqa: ANN001
-            gemini_leader_captured["body"] = json.loads(request.data.decode("utf-8"))
-            payload = {
-                "candidates": [
-                    {"content": {"role": "model", "parts": [{"text": "no dispatch"}]}, "finishReason": "STOP"}
-                ],
-                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen_dispatch):
+                dispatch_leader.run("please read a.txt via researcher")
+            if not subagent_requests:
+                fail("expected the subagent's own request to have been captured")
+            sent_tool_names = {t.get("name") for t in subagent_requests[0].get("tools", [])}
+            expected_tool_names = {
+                "read_file",
+                "write_file",
+                "edit_file",
+                "multi_edit_file",
+                "list_files",
+                "glob",
+                "grep",
+                "run_shell",
             }
-            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
-
-        gemini_leader = Leader(
-            LeaderConfig(
-                leader_provider=GeminiProvider(),
-                subagent_provider=FakeModelProvider(),
-                repo_root=str(root),
-            )
-        )
-        with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_urlopen):
-            gemini_leader.run("hello")
-        del os.environ[GEMINI_API_KEY_ENV_VAR]
-
-        declarations = (gemini_leader_captured.get("body", {}).get("tools") or [{}])[0].get(
-            "functionDeclarations", []
-        )
-        dispatch_declaration = next(
-            (d for d in declarations if d.get("name") == "dispatch_subagent"), None
-        )
-        if dispatch_declaration is None:
-            fail(f"expected Gemini leader request to declare dispatch_subagent, got {declarations!r}")
-        parameters = dispatch_declaration.get("parameters")
-        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
-        if (
-            not isinstance(parameters, dict)
-            or parameters.get("type") != "object"
-            or set(properties) != {"subagent_name", "task"}
-            or parameters.get("required") != ["subagent_name", "task"]
-        ):
-            fail(f"expected non-empty sanitized Gemini dispatch parameters, got {parameters!r}")
-        ok("real Gemini leader request carries non-empty sanitized dispatch_subagent parameters")
-
-        # -- regression: OpenAI-compatible providers must use OpenAI tool
-        # schema shape even when their provider labels are vendor names --
-        os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR] = "sk-compatible-fake-test-key-do-not-use"
-        compatible_leader_requests: list[dict] = []
-        compatible_subagent_requests: list[dict] = []
-        compatible_call_count = [0]
-
-        def _fake_openai_compatible_urlopen(request, timeout=None):  # noqa: ANN001
-            compatible_call_count[0] += 1
-            body = json.loads(request.data.decode("utf-8"))
-            if compatible_call_count[0] == 1:
-                compatible_leader_requests.append(body)
-                payload = {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "c1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "dispatch_subagent",
-                                            "arguments": json.dumps(
-                                                {"subagent_name": "researcher", "task": "read a.txt"}
-                                            ),
-                                        },
-                                    }
-                                ],
-                            },
-                            "finish_reason": "tool_calls",
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                }
-            elif compatible_call_count[0] == 2:
-                compatible_subagent_requests.append(body)
-                payload = {
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                }
+            if sent_tool_names != expected_tool_names:
+                fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
+        finally:
+            if previous_api_key is None:
+                os.environ.pop(API_KEY_ENV_VAR, None)
             else:
-                payload = {
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "final answer"}, "finish_reason": "stop"}
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                }
-            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+                os.environ[API_KEY_ENV_VAR] = previous_api_key
 
-        compatible_leader = Leader(
-            LeaderConfig(
-                leader_provider=OpenAICompatibleProvider(
-                    api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
-                    base_url="https://example.invalid/v1",
-                    model="compatible-leader-test",
-                    provider_label="grok",
-                ),
-                subagent_provider=OpenAICompatibleProvider(
-                    api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
-                    base_url="https://example.invalid/v1",
-                    model="compatible-subagent-test",
-                    provider_label="kimi",
-                ),
-                repo_root=str(root),
+
+@check("leader.subagent_tool_subsets")
+def check_subagent_tool_subsets() -> None:
+    with workspace() as ws:
+        root = ws.root
+        previous_api_key = os.environ.get(API_KEY_ENV_VAR)
+        try:
+            os.environ[API_KEY_ENV_VAR] = 'sk-ant-fake-test-key-do-not-use'
+            # -- a caller-fixed narrowed registry must narrow both execution and wire schemas --
+            narrowed_subagent_requests: list[dict] = []
+            narrowed_call_count = [0]
+
+            def _fake_urlopen_narrowed_dispatch(request, timeout=None):  # noqa: ANN001
+                narrowed_call_count[0] += 1
+                body = json.loads(request.data.decode("utf-8"))
+                if narrowed_call_count[0] == 1:
+                    payload = {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "narrow-c1",
+                                "name": "dispatch_subagent",
+                                "input": {
+                                    "subagent_name": "reader",
+                                    "task": "inspect a.txt",
+                                },
+                            }
+                        ],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "stop_reason": "tool_use",
+                    }
+                elif narrowed_call_count[0] == 2:
+                    narrowed_subagent_requests.append(body)
+                    payload = {
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "stop_reason": "end_turn",
+                    }
+                else:
+                    payload = {
+                        "content": [{"type": "text", "text": "final answer"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "stop_reason": "end_turn",
+                    }
+                return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+            narrowed_leader = Leader(
+                LeaderConfig(
+                    leader_provider=AnthropicProvider(),
+                    subagent_provider=AnthropicProvider(),
+                    repo_root=str(root),
+                    subagent_tool_names=["read_file", "glob", "grep"],
+                )
             )
-        )
-        with mock.patch("urllib.request.urlopen", side_effect=_fake_openai_compatible_urlopen):
-            compatible_leader.run("please read a.txt via researcher")
-        del os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR]
-
-        if not compatible_leader_requests:
-            fail("expected the OpenAI-compatible leader request to have been captured")
-        leader_tools = compatible_leader_requests[0].get("tools", [])
-        leader_dispatch_tool = leader_tools[0] if leader_tools else {}
-        leader_function = leader_dispatch_tool.get("function")
-        if (
-            leader_dispatch_tool.get("type") != "function"
-            or not isinstance(leader_function, dict)
-            or leader_function.get("name") != "dispatch_subagent"
-            or leader_function.get("parameters", {}).get("type") != "object"
-        ):
-            fail(f"expected OpenAI-shaped leader dispatch tool, got {leader_dispatch_tool!r}")
-
-        if not compatible_subagent_requests:
-            fail("expected the OpenAI-compatible subagent request to have been captured")
-        subagent_tools = compatible_subagent_requests[0].get("tools", [])
-        subagent_tool_names = {
-            t.get("function", {}).get("name")
-            for t in subagent_tools
-            if t.get("type") == "function" and isinstance(t.get("function"), dict)
-        }
-        if subagent_tool_names != expected_tool_names or len(subagent_tool_names) != len(subagent_tools):
-            fail(f"expected OpenAI-shaped subagent tools for {expected_tool_names}, got {subagent_tools!r}")
-        ok("real OpenAI-compatible leader and subagent requests use OpenAI tool schema shape")
-
-        print("\nAll smoke checks passed.")
+            with mock.patch(
+                "urllib.request.urlopen", side_effect=_fake_urlopen_narrowed_dispatch
+            ):
+                narrowed_leader.run("delegate read-only inspection")
+            if not narrowed_subagent_requests:
+                fail("expected the narrowed subagent request to be captured")
+            narrowed_tool_names = {
+                tool.get("name")
+                for tool in narrowed_subagent_requests[0].get("tools", [])
+            }
+            expected_narrowed_names = {"read_file", "glob", "grep"}
+            if narrowed_tool_names != expected_narrowed_names or "run_shell" in narrowed_tool_names:
+                fail(
+                    "narrowed subagent schemas exceeded the caller-fixed set: "
+                    f"expected={expected_narrowed_names!r}, actual={narrowed_tool_names!r}"
+                )
+        finally:
+            if previous_api_key is None:
+                os.environ.pop(API_KEY_ENV_VAR, None)
+            else:
+                os.environ[API_KEY_ENV_VAR] = previous_api_key
 
 
-if __name__ == "__main__":
-    main()
+@check("leader.gemini_dispatch_schema")
+def check_gemini_dispatch_schema() -> None:
+    with workspace() as ws:
+        root = ws.root
+        previous_api_key = os.environ.get(GEMINI_API_KEY_ENV_VAR)
+        try:
+            os.environ[GEMINI_API_KEY_ENV_VAR] = 'AIza-fake-test-key-do-not-use'
+            # -- regression: a real GeminiProvider leader must send
+            # dispatch_subagent as a Gemini function declaration with sanitized,
+            # non-empty parameters --
+            gemini_leader_captured: dict = {}
+
+            def _fake_gemini_urlopen(request, timeout=None):  # noqa: ANN001
+                gemini_leader_captured["body"] = json.loads(request.data.decode("utf-8"))
+                payload = {
+                    "candidates": [
+                        {"content": {"role": "model", "parts": [{"text": "no dispatch"}]}, "finishReason": "STOP"}
+                    ],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+                }
+                return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+            gemini_leader = Leader(
+                LeaderConfig(
+                    leader_provider=GeminiProvider(),
+                    subagent_provider=FakeModelProvider(),
+                    repo_root=str(root),
+                )
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_urlopen):
+                gemini_leader.run("hello")
+            declarations = (gemini_leader_captured.get("body", {}).get("tools") or [{}])[0].get(
+                "functionDeclarations", []
+            )
+            dispatch_declaration = next(
+                (d for d in declarations if d.get("name") == "dispatch_subagent"), None
+            )
+            if dispatch_declaration is None:
+                fail(f"expected Gemini leader request to declare dispatch_subagent, got {declarations!r}")
+            parameters = dispatch_declaration.get("parameters")
+            properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+            if (
+                not isinstance(parameters, dict)
+                or parameters.get("type") != "object"
+                or set(properties) != {"subagent_name", "task"}
+                or parameters.get("required") != ["subagent_name", "task"]
+            ):
+                fail(f"expected non-empty sanitized Gemini dispatch parameters, got {parameters!r}")
+        finally:
+            if previous_api_key is None:
+                os.environ.pop(GEMINI_API_KEY_ENV_VAR, None)
+            else:
+                os.environ[GEMINI_API_KEY_ENV_VAR] = previous_api_key
+
+
+@check("leader.openai_compatible_tool_schemas")
+def check_openai_compatible_tool_schemas() -> None:
+    with workspace() as ws:
+        root = ws.root
+        previous_api_key = os.environ.get(OPENAI_COMPATIBLE_API_KEY_ENV_VAR)
+        try:
+            os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR] = 'sk-compatible-fake-test-key-do-not-use'
+            # -- regression: OpenAI-compatible providers must use OpenAI tool
+            # schema shape even when their provider labels are vendor names --
+            expected_tool_names = {
+                "read_file",
+                "write_file",
+                "edit_file",
+                "multi_edit_file",
+                "list_files",
+                "glob",
+                "grep",
+                "run_shell",
+            }
+            compatible_leader_requests: list[dict] = []
+            compatible_subagent_requests: list[dict] = []
+            compatible_call_count = [0]
+
+            def _fake_openai_compatible_urlopen(request, timeout=None):  # noqa: ANN001
+                compatible_call_count[0] += 1
+                body = json.loads(request.data.decode("utf-8"))
+                if compatible_call_count[0] == 1:
+                    compatible_leader_requests.append(body)
+                    payload = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "c1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "dispatch_subagent",
+                                                "arguments": json.dumps(
+                                                    {"subagent_name": "researcher", "task": "read a.txt"}
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }
+                elif compatible_call_count[0] == 2:
+                    compatible_subagent_requests.append(body)
+                    payload = {
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }
+                else:
+                    payload = {
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "final answer"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }
+                return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+            compatible_leader = Leader(
+                LeaderConfig(
+                    leader_provider=OpenAICompatibleProvider(
+                        api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
+                        base_url="https://example.invalid/v1",
+                        model="compatible-leader-test",
+                        provider_label="grok",
+                    ),
+                    subagent_provider=OpenAICompatibleProvider(
+                        api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
+                        base_url="https://example.invalid/v1",
+                        model="compatible-subagent-test",
+                        provider_label="kimi",
+                    ),
+                    repo_root=str(root),
+                )
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_openai_compatible_urlopen):
+                compatible_leader.run("please read a.txt via researcher")
+            if not compatible_leader_requests:
+                fail("expected the OpenAI-compatible leader request to have been captured")
+            leader_tools = compatible_leader_requests[0].get("tools", [])
+            leader_dispatch_tool = leader_tools[0] if leader_tools else {}
+            leader_function = leader_dispatch_tool.get("function")
+            if (
+                leader_dispatch_tool.get("type") != "function"
+                or not isinstance(leader_function, dict)
+                or leader_function.get("name") != "dispatch_subagent"
+                or leader_function.get("parameters", {}).get("type") != "object"
+            ):
+                fail(f"expected OpenAI-shaped leader dispatch tool, got {leader_dispatch_tool!r}")
+
+            if not compatible_subagent_requests:
+                fail("expected the OpenAI-compatible subagent request to have been captured")
+            subagent_tools = compatible_subagent_requests[0].get("tools", [])
+            subagent_tool_names = {
+                t.get("function", {}).get("name")
+                for t in subagent_tools
+                if t.get("type") == "function" and isinstance(t.get("function"), dict)
+            }
+            if subagent_tool_names != expected_tool_names or len(subagent_tool_names) != len(subagent_tools):
+                fail(f"expected OpenAI-shaped subagent tools for {expected_tool_names}, got {subagent_tools!r}")
+        finally:
+            if previous_api_key is None:
+                os.environ.pop(OPENAI_COMPATIBLE_API_KEY_ENV_VAR, None)
+            else:
+                os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR] = previous_api_key

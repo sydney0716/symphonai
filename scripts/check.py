@@ -29,6 +29,7 @@ from scripts.checks import edit  # noqa: E402, F401
 from scripts.checks import permissions  # noqa: E402, F401
 from scripts.checks import shell  # noqa: E402, F401
 from scripts.checks import providers_live  # noqa: E402, F401
+from scripts.checks import leader  # noqa: E402, F401
 from scripts.checks.harness import names, run  # noqa: E402
 
 
