@@ -158,6 +158,10 @@ def main() -> None:
         "permissions.traversal_denied",
         "permissions.shell_disabled",
         "permissions.shell_always_denied",
+        "permissions.typed_reasons",
+        "permissions.named_modes_and_equality",
+        "permissions.accept_edits",
+        "permissions.approval_serialization",
         "shell.process_group_fallback",
         "shell.cancellation_reaps_child",
         "shell.cancellation_kills_group",
@@ -198,12 +202,15 @@ def main() -> None:
         "scheduler.exception_isolation",
         "scheduler.cancellation_repair",
         "scheduler.ledger_locking",
+        "plan.path_decisions",
+        "plan.command_decisions",
+        "plan.real_tools",
     ]
     full_run = invoke_check()
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "123 passed, 0 failed, 123 selected of 123 registered",
+        == "130 passed, 0 failed, 130 selected of 130 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -224,7 +231,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 123 registered",
+            == "1 passed, 0 failed, 1 selected of 130 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -240,7 +247,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 123 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 130 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

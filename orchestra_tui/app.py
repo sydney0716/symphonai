@@ -28,7 +28,12 @@ from orchestra_api.events import (
     TurnStarted,
 )
 from orchestra_api.leader import Leader, LeaderConfig, LeaderRunResult
-from orchestra_api.permissions import PermissionDecision, PermissionMode, ToolApprovalRequest
+from orchestra_api.permissions import (
+    DenialReason,
+    PermissionDecision,
+    PermissionMode,
+    ToolApprovalRequest,
+)
 from orchestra_api.providers.base import ModelProvider, ProviderError
 from orchestra_tui.commands import (
     ParsedSlashCommand,
@@ -530,7 +535,8 @@ class OrchestraTuiApp(App[None]):
             self._resolve_approval(
                 waiter,
                 PermissionDecision.deny(
-                    f"{request.operation} approval cancelled because the TUI is not running"
+                    f"{request.operation} approval cancelled because the TUI is not running",
+                    denial=DenialReason.APPROVAL_FAILED,
                 ),
             )
         while not waiter.event.wait(0.1):
@@ -538,12 +544,16 @@ class OrchestraTuiApp(App[None]):
                 self._resolve_approval(
                     waiter,
                     PermissionDecision.deny(
-                        f"{request.operation} approval cancelled because the TUI is shutting down"
+                        f"{request.operation} approval cancelled because the TUI is shutting down",
+                        denial=DenialReason.APPROVAL_FAILED,
                     ),
                 )
                 break
         if waiter.decision is None:
-            return PermissionDecision.deny(f"{request.operation} approval did not complete")
+            return PermissionDecision.deny(
+                f"{request.operation} approval did not complete",
+                denial=DenialReason.APPROVAL_FAILED,
+            )
         return waiter.decision
 
     def _open_tool_approval(self, waiter: _PendingApproval) -> None:
@@ -551,7 +561,8 @@ class OrchestraTuiApp(App[None]):
             self._resolve_approval(
                 waiter,
                 PermissionDecision.deny(
-                    f"{waiter.request.operation} approval cancelled because the TUI is not running"
+                    f"{waiter.request.operation} approval cancelled because the TUI is not running",
+                    denial=DenialReason.APPROVAL_FAILED,
                 ),
             )
             return
@@ -564,7 +575,10 @@ class OrchestraTuiApp(App[None]):
         if accepted:
             decision = PermissionDecision.allow()
         else:
-            decision = PermissionDecision.deny(f"{waiter.request.operation} denied by user")
+            decision = PermissionDecision.deny(
+                f"{waiter.request.operation} denied by user",
+                denial=DenialReason.DENIED_BY_USER,
+            )
         self._resolve_approval(waiter, decision)
 
     def _resolve_approval(self, waiter: _PendingApproval, decision: PermissionDecision) -> None:
@@ -582,7 +596,10 @@ class OrchestraTuiApp(App[None]):
         for waiter in pending:
             self._resolve_approval(
                 waiter,
-                PermissionDecision.deny(f"{waiter.request.operation} approval cancelled: {reason}"),
+                PermissionDecision.deny(
+                    f"{waiter.request.operation} approval cancelled: {reason}",
+                    denial=DenialReason.APPROVAL_FAILED,
+                ),
             )
 
     def action_quit(self) -> None:
