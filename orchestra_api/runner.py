@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
 from orchestra_api.cancellation import CancellationToken
+from orchestra_api.instructions import load_instructions
 from orchestra_api.models import Message, Role
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
@@ -25,6 +26,8 @@ from orchestra_api.tools.shell import RunShellTool
 
 def standard_tool_registry(
     names: Sequence[str] | None = None,
+    *,
+    ledger: ReadLedger | None = None,
 ) -> dict[str, LocalTool]:
     """The eight local tools: read_file, write_file, edit_file,
     multi_edit_file, list_files, glob, grep, and run_shell.
@@ -32,7 +35,8 @@ def standard_tool_registry(
     `names` selects a subset, returned in canonical registry order, and an
     unknown or empty sequence raises `ValueError`.
     """
-    ledger = ReadLedger()
+    if ledger is None:
+        ledger = ReadLedger()
     tools: list[LocalTool] = [
         ReadFileTool(ledger),
         WriteFileTool(ledger),
@@ -69,14 +73,27 @@ def run_task(
     max_turns: int = DEFAULT_MAX_TURNS,
     model: str | None = None,
     cancel: CancellationToken | None = None,
+    include_instructions: bool = False,
 ) -> AgentRunResult:
-    """Run a single task to completion using the standard tool registry."""
+    """Run a single task to completion using the standard tool registry.
+
+    Automatic instructions intentionally omit directory scope.
+    """
+    ledger: ReadLedger | None = None
+    instruction_text = ""
+    if include_instructions:
+        ledger = ReadLedger()
+        instruction_text = load_instructions(policy, ledger=ledger).render()
+
     messages: list[Message] = []
-    if system_prompt:
-        messages.append(Message(role=Role.SYSTEM, content=system_prompt))
+    combined_system_prompt = "\n\n".join(
+        part for part in (instruction_text, system_prompt) if part
+    )
+    if combined_system_prompt:
+        messages.append(Message(role=Role.SYSTEM, content=combined_system_prompt))
     messages.append(Message(role=Role.USER, content=prompt))
 
-    tools = standard_tool_registry()
+    tools = standard_tool_registry(ledger=ledger)
     agent = ApiAgent(
         provider=provider,
         tools=tools,

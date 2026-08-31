@@ -150,6 +150,22 @@ def main() -> None:
         "ledger.oversize_unranged_still_refused",
         "ledger.messages_unchanged",
         "ledger.lock_scope",
+        "instructions.scope_order",
+        "instructions.outside_working_dir",
+        "instructions.include_provenance",
+        "instructions.depth_cap",
+        "instructions.cycle_detection",
+        "instructions.forbidden_include",
+        "instructions.processing_and_size_warning",
+        "instructions.ledger_partial_view",
+        "instructions.run_task_wiring",
+        "instructions.directive_boundaries",
+        "instructions.fence_run_length",
+        "instructions.user_scope_include",
+        "instructions.user_scope_guards",
+        "instructions.user_scope_relative_denylist",
+        "instructions.tab_indented_content",
+        "instructions.symlinked_user_home",
         "edit.not_read_refused",
         "edit.stale_refused",
         "edit.same_content_allowed",
@@ -224,7 +240,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "144 passed, 0 failed, 144 selected of 144 registered",
+        == "160 passed, 0 failed, 160 selected of 160 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -245,7 +261,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 144 registered",
+            == "1 passed, 0 failed, 1 selected of 160 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -261,7 +277,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 144 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 160 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
