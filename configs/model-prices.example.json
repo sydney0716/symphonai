@@ -1,0 +1,9 @@
+{
+  "_comment": "No real prices are shipped. A price copied into this repo is stale the day a vendor changes it, and a stale number presented as fact is worse than no number. The example file documents the shape; point load_price_table at your own file.",
+  "version": 1,
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "models": {
+    "example-model-name": {"input": "0.00", "output": "0.00"}
+  }
+}

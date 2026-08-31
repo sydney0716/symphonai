@@ -11,9 +11,10 @@ and never raises just because `max_turns` was hit.
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
+from orchestra_api.cost import UsageTotals
 from orchestra_api.events import (
     EventSink,
     RunFailed,
@@ -60,6 +61,7 @@ class AgentRunResult:
     stopped_reason: str  # "final_response", "max_turns", or "cancelled"
     run: RunRef
     agent: AgentRef
+    usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
 
 
 class ApiAgent:
@@ -132,6 +134,12 @@ class ApiAgent:
         event_sink = events if events is not None else self._events
         conversation = list(messages)
         response: ModelResponse | None = None
+        usage_by_model: dict[str, UsageTotals] = {}
+        requested_model = (
+            model
+            if model is not None
+            else getattr(self._provider, "model", None) or "unknown"
+        )
         turn = 0
         current_turn_ref: TurnRef | None = None
         try:
@@ -164,6 +172,10 @@ class ApiAgent:
                     response = self._provider.create_response(request)
                 else:
                     response = self._provider.create_response(request, cancel=cancel)
+                usage = UsageTotals.from_usage(response.usage)
+                usage_by_model[requested_model] = usage_by_model.get(
+                    requested_model, UsageTotals()
+                ).merged(usage)
                 # Stamp once and reuse, so the message in `conversation` and
                 # `final_response` carry the same turn identity.
                 response = replace(
@@ -189,6 +201,7 @@ class ApiAgent:
                         stopped_reason="final_response",
                         run=run_ref,
                         agent=self._agent_ref,
+                        usage_by_model=usage_by_model,
                     )
                     emit(
                         event_sink,
@@ -300,6 +313,7 @@ class ApiAgent:
                 stopped_reason="max_turns",
                 run=run_ref,
                 agent=self._agent_ref,
+                usage_by_model=usage_by_model,
             )
             emit(
                 event_sink,
@@ -352,6 +366,7 @@ class ApiAgent:
                 stopped_reason="cancelled",
                 run=run_ref,
                 agent=self._agent_ref,
+                usage_by_model=usage_by_model,
             )
             try:
                 emit(

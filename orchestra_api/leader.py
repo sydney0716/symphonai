@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
+from orchestra_api.cost import UsageTotals
 from orchestra_api.compaction import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
     DEFAULT_RECENT_TURNS,
@@ -153,6 +154,7 @@ class SubagentRecord:
     agent_ref: AgentRef
     messages: list[Message] = field(default_factory=list)
     turns_used: int = 0
+    usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
 
 
 class DispatchSubagentTool(LocalTool):
@@ -286,6 +288,10 @@ class DispatchSubagentTool(LocalTool):
             raise
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
+        for model, usage in run_result.usage_by_model.items():
+            record.usage_by_model[model] = record.usage_by_model.get(
+                model, UsageTotals()
+            ).merged(usage)
         if run_result.stopped_reason == "cancelled":
             raise OperationCancelled
 
@@ -334,6 +340,7 @@ class LeaderRunResult:
     subagents: dict[str, SubagentRecord]
     run: RunRef
     agent: AgentRef
+    usage_by_agent: dict[str, dict[str, UsageTotals]]
 
 
 class Leader:
@@ -394,6 +401,13 @@ class Leader:
         except Exception:
             raise
         self._last_run_id = result.run.run_id
+        usage_by_agent = {result.agent.agent_id: dict(result.usage_by_model)}
+        usage_by_agent.update(
+            {
+                record.agent_ref.agent_id: dict(record.usage_by_model)
+                for record in self._dispatch_tool.pool.values()
+            }
+        )
         return LeaderRunResult(
             final_answer=result.final_response.message.text,
             leader_messages=result.messages,
@@ -401,6 +415,7 @@ class Leader:
             subagents=self._dispatch_tool.pool,
             run=result.run,
             agent=result.agent,
+            usage_by_agent=usage_by_agent,
         )
 
     def run(
