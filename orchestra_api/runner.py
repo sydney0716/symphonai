@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
+from orchestra_api.budgets import RunBudget
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.instructions import load_instructions
 from orchestra_api.models import Message, Role
@@ -79,6 +80,7 @@ def run_task(
     cancel: CancellationToken | None = None,
     include_instructions: bool = False,
     offload_tool_results: bool = False,
+    budget: RunBudget | None = None,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -107,5 +109,6 @@ def run_task(
         max_turns=max_turns,
         tool_schemas=tool_registry_schemas(tools, provider.wire_format),
         result_store=result_store,
+        budget=budget,
     )
     return agent.run(messages, model=model, cancel=cancel)

@@ -156,6 +156,16 @@ def main() -> None:
         "cost.price_table_rejects_malformed",
         "cost.unknown_model_costs_nothing_known",
         "cost.leader_usage_per_agent",
+        "budget.rejects_invalid_construction",
+        "budget.none_is_todays_behaviour",
+        "budget.wall_time_stops_before_provider_call",
+        "budget.token_and_cost_stops",
+        "budget.reason_precedence",
+        "budget.stop_is_normal_and_reported",
+        "budget.cancellation_wins",
+        "budget.stop_answers_every_tool_call",
+        "budget.subagents_have_their_own",
+        "budget.run_task_forwards",
         "events.final_identity",
         "events.tool_bracketing",
         "events.provider_failure",
@@ -277,7 +287,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "197 passed, 0 failed, 197 selected of 197 registered",
+        == "207 passed, 0 failed, 207 selected of 207 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -298,7 +308,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 197 registered",
+            == "1 passed, 0 failed, 1 selected of 207 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -314,7 +324,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 197 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 207 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

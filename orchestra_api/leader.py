@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
+from orchestra_api.budgets import RunBudget
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.cost import UsageTotals
 from orchestra_api.compaction import (
@@ -176,6 +177,7 @@ class DispatchSubagentTool(LocalTool):
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
         subagent_tool_names: Sequence[str] | None = None,
         parent_agent_id: str | None = None,
+        subagent_budget: RunBudget | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
@@ -185,6 +187,9 @@ class DispatchSubagentTool(LocalTool):
             None if subagent_tool_names is None else tuple(subagent_tool_names)
         )
         self._parent_agent_id = parent_agent_id
+        # Every child receives the same immutable limits but tracks its own
+        # spend; sharing drawdown needs phase 07's cross-agent coordination.
+        self._subagent_budget = subagent_budget
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id: str | None = None
@@ -274,6 +279,7 @@ class DispatchSubagentTool(LocalTool):
                     tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
                     agent_ref=agent_ref,
                     events=self._events,
+                    budget=self._subagent_budget,
                 ),
                 agent_ref=agent_ref,
             )
@@ -314,6 +320,9 @@ class LeaderConfig:
 
     The leader never picks its own or its subagents' provider/model --
     both are fixed here by the caller, once, before the run starts.
+    Each subagent independently accounts against ``subagent_budget``; there is
+    no shared drawdown because coordinating that across agents belongs to
+    phase 07.
     """
 
     leader_provider: ModelProvider
@@ -322,6 +331,7 @@ class LeaderConfig:
     max_leader_turns: int = DEFAULT_MAX_TURNS
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    subagent_budget: RunBudget | None = None
     subagent_tool_names: Sequence[str] | None = None
     permission_mode: PermissionMode = "auto"
     approval_callback: ApprovalCallback | None = None
@@ -369,6 +379,7 @@ class Leader:
             subagent_max_turns=config.subagent_max_turns,
             subagent_tool_names=config.subagent_tool_names,
             parent_agent_id=self._agent_ref.agent_id,
+            subagent_budget=config.subagent_budget,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_policy = PermissionPolicy(

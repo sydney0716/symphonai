@@ -10,9 +10,11 @@ and never raises just because `max_turns` was hit.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 
+from orchestra_api.budgets import BudgetState, RunBudget, DEFAULT_MAX_TURNS
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.cost import UsageTotals
 from orchestra_api.events import (
@@ -48,7 +50,8 @@ from orchestra_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from orchestra_api.tool_results import ToolResultStore, offload_tool_result
 from orchestra_api.tools.base import LocalTool
 
-DEFAULT_MAX_TURNS = 10
+# Re-exported: DEFAULT_MAX_TURNS lives in budgets.py because RunBudget defaults
+# to it, and budgets.py cannot import this module without a cycle.
 
 
 @dataclass
@@ -58,7 +61,9 @@ class AgentRunResult:
     final_response: ModelResponse
     messages: list[Message]
     turns_used: int
-    stopped_reason: str  # "final_response", "max_turns", or "cancelled"
+    # "final_response", "max_turns", "cancelled", "budget_wall_time",
+    # "budget_tokens", or "budget_cost"
+    stopped_reason: str
     run: RunRef
     agent: AgentRef
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
@@ -78,13 +83,16 @@ class ApiAgent:
         result_store: ToolResultStore | None = None,
         agent_ref: AgentRef | None = None,
         events: EventSink | None = None,
+        budget: RunBudget | None = None,
     ) -> None:
-        if max_turns < 1:
-            raise ValueError(f"max_turns must be >= 1, got {max_turns}")
+        effective_max_turns = budget.max_turns if budget is not None else max_turns
+        if effective_max_turns < 1:
+            raise ValueError(f"max_turns must be >= 1, got {effective_max_turns}")
         self._provider = provider
         self._tools = tools
         self._policy = policy
-        self._max_turns = max_turns
+        self._max_turns = effective_max_turns
+        self._budget = budget
         self._result_store = result_store
         self._agent_ref = agent_ref or new_agent_ref("agent")
         self._events = events
@@ -135,13 +143,49 @@ class ApiAgent:
         conversation = list(messages)
         response: ModelResponse | None = None
         usage_by_model: dict[str, UsageTotals] = {}
+        budget_state = (
+            BudgetState(time.monotonic(), usage_by_model)
+            if self._budget is not None
+            else None
+        )
         requested_model = (
             model
             if model is not None
             else getattr(self._provider, "model", None) or "unknown"
         )
         turn = 0
+        provider_calls = 0
         current_turn_ref: TurnRef | None = None
+
+        def finish_for_budget(stopped_reason: str) -> AgentRunResult:
+            final_response = response or ModelResponse(
+                message=Message(role=Role.ASSISTANT), stop_reason=stopped_reason
+            )
+            result = AgentRunResult(
+                final_response=final_response,
+                messages=conversation,
+                turns_used=provider_calls,
+                stopped_reason=stopped_reason,
+                run=run_ref,
+                agent=self._agent_ref,
+                usage_by_model=usage_by_model,
+            )
+            emit(
+                event_sink,
+                RunFinished(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    agent_name=self._agent_ref.name,
+                    stopped_reason=stopped_reason,
+                ),
+            )
+            return result
+
+        def exceeded_budget() -> str | None:
+            if budget_state is None or self._budget is None:
+                return None
+            return budget_state.exceeded(self._budget)
+
         try:
             emit(
                 event_sink,
@@ -165,6 +209,9 @@ class ApiAgent:
                 )
                 if cancel is not None:
                     cancel.raise_if_cancelled()
+                budget_reason = exceeded_budget()
+                if budget_reason is not None:
+                    return finish_for_budget(budget_reason)
                 request = ModelRequest(
                     messages=list(conversation), model=model, tools=self._tool_schemas
                 )
@@ -172,6 +219,7 @@ class ApiAgent:
                     response = self._provider.create_response(request)
                 else:
                     response = self._provider.create_response(request, cancel=cancel)
+                provider_calls += 1
                 usage = UsageTotals.from_usage(response.usage)
                 usage_by_model[requested_model] = usage_by_model.get(
                     requested_model, UsageTotals()
@@ -296,6 +344,16 @@ class ApiAgent:
                         )
                     if cancelled:
                         raise OperationCancelled
+                # Checked once every batch of this turn has been answered, not
+                # between batches: a stop with a tool call still outstanding
+                # would return a conversation no provider will accept, and
+                # unlike the cancellation path below there is nothing here to
+                # repair it.
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                budget_reason = exceeded_budget()
+                if budget_reason is not None:
+                    return finish_for_budget(budget_reason)
                 emit(
                     event_sink,
                     TurnFinished(
