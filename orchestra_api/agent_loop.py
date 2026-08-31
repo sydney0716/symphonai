@@ -44,6 +44,7 @@ from orchestra_api.models import (
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
+from orchestra_api.tool_results import ToolResultStore, offload_tool_result
 from orchestra_api.tools.base import LocalTool
 
 DEFAULT_MAX_TURNS = 10
@@ -72,6 +73,7 @@ class ApiAgent:
         max_turns: int = DEFAULT_MAX_TURNS,
         tool_schemas: list[dict] | None = None,
         *,
+        result_store: ToolResultStore | None = None,
         agent_ref: AgentRef | None = None,
         events: EventSink | None = None,
     ) -> None:
@@ -81,6 +83,7 @@ class ApiAgent:
         self._tools = tools
         self._policy = policy
         self._max_turns = max_turns
+        self._result_store = result_store
         self._agent_ref = agent_ref or new_agent_ref("agent")
         self._events = events
         # Schemas actually sent to the model so it knows these tools exist.
@@ -254,6 +257,12 @@ class ApiAgent:
                         tool_result = results.get(index)
                         if tool_result is None:
                             continue
+                        if self._result_store is not None:
+                            tool_result = offload_tool_result(
+                                tool_result,
+                                tool_name=tool_call.name,
+                                store=self._result_store,
+                            )
                         conversation.append(
                             Message(
                                 role=Role.TOOL,

@@ -131,6 +131,18 @@ def main() -> None:
         "context.empty_instruction_set",
         "context.split_covers_rendered_text",
         "context.tool_message_without_result",
+        "results.threshold_and_preview",
+        "results.preserves_other_fields",
+        "results.failures_not_offloaded",
+        "results.content_addressing",
+        "results.slice_and_limits",
+        "results.missing_id",
+        "results.tool_metadata",
+        "results.concurrent_stores",
+        "results.bounds",
+        "results.agent_loop_offload",
+        "results.registry_opt_in",
+        "results.context_report_counts_preview",
         "events.final_identity",
         "events.tool_bracketing",
         "events.provider_failure",
@@ -252,7 +264,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "172 passed, 0 failed, 172 selected of 172 registered",
+        == "184 passed, 0 failed, 184 selected of 184 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -273,7 +285,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 172 registered",
+            == "1 passed, 0 failed, 1 selected of 184 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -289,7 +301,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 172 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 184 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

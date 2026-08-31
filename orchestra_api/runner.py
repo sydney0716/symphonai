@@ -16,21 +16,23 @@ from orchestra_api.models import Message, Role
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.tool_schema import tool_registry_schemas
+from orchestra_api.tool_results import ToolResultStore
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.edit import EditFileTool, MultiEditFileTool
 from orchestra_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
 from orchestra_api.tools.read_ledger import ReadLedger
 from orchestra_api.tools.search import GlobTool, GrepTool
 from orchestra_api.tools.shell import RunShellTool
+from orchestra_api.tools.stored_result import ReadToolResultTool
 
 
 def standard_tool_registry(
     names: Sequence[str] | None = None,
     *,
     ledger: ReadLedger | None = None,
+    result_store: ToolResultStore | None = None,
 ) -> dict[str, LocalTool]:
-    """The eight local tools: read_file, write_file, edit_file,
-    multi_edit_file, list_files, glob, grep, and run_shell.
+    """The eight standard tools, plus read_tool_result when a store is supplied.
 
     `names` selects a subset, returned in canonical registry order, and an
     unknown or empty sequence raises `ValueError`.
@@ -47,6 +49,8 @@ def standard_tool_registry(
         GrepTool(),
         RunShellTool(),
     ]
+    if result_store is not None:
+        tools.append(ReadToolResultTool(result_store))
     if names is not None:
         if not names:
             raise ValueError("names must not be empty; omit it for the full registry")
@@ -74,6 +78,7 @@ def run_task(
     model: str | None = None,
     cancel: CancellationToken | None = None,
     include_instructions: bool = False,
+    offload_tool_results: bool = False,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -93,12 +98,14 @@ def run_task(
         messages.append(Message(role=Role.SYSTEM, content=combined_system_prompt))
     messages.append(Message(role=Role.USER, content=prompt))
 
-    tools = standard_tool_registry(ledger=ledger)
+    result_store = ToolResultStore() if offload_tool_results else None
+    tools = standard_tool_registry(ledger=ledger, result_store=result_store)
     agent = ApiAgent(
         provider=provider,
         tools=tools,
         policy=policy,
         max_turns=max_turns,
         tool_schemas=tool_registry_schemas(tools, provider.wire_format),
+        result_store=result_store,
     )
     return agent.run(messages, model=model, cancel=cancel)

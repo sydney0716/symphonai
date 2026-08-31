@@ -118,6 +118,17 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class OffloadedResult:
+    """Where a tool result's full text went when it was too large to inline."""
+
+    id: str
+    characters: int
+    preview_characters: int
+    tool_name: str
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
 class ToolResult:
     """The outcome of executing a `ToolCall` against a `LocalTool`.
 
@@ -135,6 +146,7 @@ class ToolResult:
     JSON-serializable. `content` stays the human- and model-readable form; a
     consumer that does not understand `payload` loses nothing. `ToolMetadata.
     result_hint` names which shape to expect."""
+    offloaded: OffloadedResult | None = None
     schema_version: int = SCHEMA_VERSION
 
 
