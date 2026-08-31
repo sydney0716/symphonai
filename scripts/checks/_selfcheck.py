@@ -120,6 +120,12 @@ def main() -> None:
         "compaction.under_budget_unchanged",
         "compaction.preserves_required_context",
         "compaction.impossible_budget_fails",
+        "compaction.microcompaction_clears_re_derivable",
+        "compaction.microcompaction_spares_mutations",
+        "compaction.microcompaction_preserves_handles",
+        "compaction.microcompaction_is_idempotent",
+        "compaction.compaction_prefers_clearing",
+        "compaction.compaction_clears_then_drops",
         "context.reconciles_unsplit",
         "context.splits_instructions",
         "context.tool_provenance",
@@ -264,7 +270,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "184 passed, 0 failed, 184 selected of 184 registered",
+        == "190 passed, 0 failed, 190 selected of 190 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -285,7 +291,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 184 registered",
+            == "1 passed, 0 failed, 1 selected of 190 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -301,7 +307,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 184 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 190 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

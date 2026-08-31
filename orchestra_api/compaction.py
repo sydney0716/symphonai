@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
@@ -12,6 +12,17 @@ from orchestra_api.models import DocumentBlock, ImageBlock, Message, Role, TextB
 DEFAULT_CONTEXT_TOKEN_BUDGET = 16_000
 DEFAULT_RECENT_TURNS = 4
 ATTACHMENT_BYTES_PER_TOKEN = 750
+COMPACTABLE_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "list_files",
+        "glob",
+        "grep",
+        "run_shell",
+        "read_tool_result",
+    }
+)
+CLEARED_CONTENT_MARKER = "[old tool result content cleared]"
 
 
 class ContextCompactionError(ValueError):
@@ -29,11 +40,25 @@ class CompactionResult:
     changed: bool
     dropped_messages: int = 0
     summary_messages: int = 0
+    cleared_tool_results: int = 0
     recent_turns: int = DEFAULT_RECENT_TURNS
 
     @property
     def reclaimed_tokens(self) -> int:
         return max(0, self.before_tokens - self.after_tokens)
+
+
+@dataclass(frozen=True)
+class MicrocompactionResult:
+    """Result of clearing old, re-derivable tool-result content."""
+
+    messages: list[Message]
+    before_tokens: int
+    after_tokens: int
+    budget: int
+    changed: bool
+    cleared_tool_results: int = 0
+    recent_turns: int = DEFAULT_RECENT_TURNS
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -94,6 +119,87 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
     return sum(estimate_message_tokens(message) for message in messages)
 
 
+def microcompact_messages(
+    messages: list[Message],
+    *,
+    budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+    recent_turns: int = DEFAULT_RECENT_TURNS,
+    cancel: CancellationToken | None = None,
+) -> MicrocompactionResult:
+    """Clear old re-derivable tool results until the conversation fits."""
+
+    if budget < 1:
+        raise ValueError(f"budget must be >= 1, got {budget}")
+    if recent_turns < 1:
+        raise ValueError(f"recent_turns must be >= 1, got {recent_turns}")
+    if cancel is not None:
+        cancel.raise_if_cancelled()
+
+    original = list(messages)
+    before_tokens = estimate_messages_tokens(original)
+    if before_tokens <= budget:
+        return MicrocompactionResult(
+            messages=original,
+            before_tokens=before_tokens,
+            after_tokens=before_tokens,
+            budget=budget,
+            changed=False,
+            recent_turns=recent_turns,
+        )
+
+    recent_start = _recent_window_start(original, recent_turns)
+    tool_names: dict[str, str] = {}
+    clearable_indices: list[int] = []
+    for index, message in enumerate(original):
+        if message.role == Role.ASSISTANT:
+            for tool_call in message.tool_calls:
+                tool_names[tool_call.id] = tool_call.name
+        if index >= recent_start or message.role != Role.TOOL:
+            continue
+        tool_result = message.tool_result
+        if (
+            tool_result is not None
+            and tool_names.get(tool_result.tool_call_id) in COMPACTABLE_TOOL_NAMES
+            and tool_result.content
+            and not _is_cleared_tool_result_content(tool_result.content)
+        ):
+            clearable_indices.append(index)
+
+    compacted = list(original)
+    after_tokens = before_tokens
+    cleared_tool_results = 0
+    for index in clearable_indices:
+        message = compacted[index]
+        tool_result = message.tool_result
+        assert tool_result is not None
+        cleared_result = replace(
+            tool_result,
+            content=_cleared_tool_result_content(tool_result),
+        )
+        cleared_message = replace(message, tool_result=cleared_result)
+        # The total is a plain sum over messages, so subtracting one message's
+        # change is exactly a re-estimate of the whole conversation -- and stays
+        # linear in the number cleared instead of re-walking every message each
+        # time.
+        after_tokens -= estimate_message_tokens(message) - estimate_message_tokens(
+            cleared_message
+        )
+        compacted[index] = cleared_message
+        cleared_tool_results += 1
+        if after_tokens <= budget:
+            break
+
+    return MicrocompactionResult(
+        messages=compacted,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        budget=budget,
+        changed=cleared_tool_results > 0,
+        cleared_tool_results=cleared_tool_results,
+        recent_turns=recent_turns,
+    )
+
+
 def compact_messages_for_budget(
     messages: list[Message],
     *,
@@ -129,19 +235,41 @@ def compact_messages_for_budget(
             recent_turns=recent_turns,
         )
 
-    recent_start = _recent_window_start(original, recent_turns)
-    prefix_indices = _preserved_prefix_indices(original, recent_start)
-    recent_indices = set(range(recent_start, len(original)))
+    microcompacted = microcompact_messages(
+        original,
+        budget=budget,
+        recent_turns=recent_turns,
+        cancel=cancel,
+    )
+    if microcompacted.after_tokens <= budget:
+        return CompactionResult(
+            messages=microcompacted.messages,
+            before_tokens=before_tokens,
+            after_tokens=microcompacted.after_tokens,
+            budget=budget,
+            changed=True,
+            cleared_tool_results=microcompacted.cleared_tool_results,
+            recent_turns=recent_turns,
+        )
+
+    working = microcompacted.messages
+    recent_start = _recent_window_start(working, recent_turns)
+    prefix_indices = _preserved_prefix_indices(working, recent_start)
+    recent_indices = set(range(recent_start, len(working)))
     dropped_indices = [
         index
-        for index in range(len(original))
+        for index in range(len(working))
         if index not in prefix_indices and index not in recent_indices
     ]
     if not dropped_indices:
         raise _impossible_error(before_tokens, budget, recent_turns)
 
-    prefix = [original[index] for index in sorted(prefix_indices)]
-    recent = [original[index] for index in range(recent_start, len(original))]
+    prefix = [working[index] for index in sorted(prefix_indices)]
+    recent = [working[index] for index in range(recent_start, len(working))]
+    # Summarize from the *uncleared* messages. Clearing preserves list
+    # positions, so the indices still line up, and the summary is the only
+    # surviving trace of what was dropped -- excerpting a clearing marker
+    # would spend that trace describing bookkeeping instead of content.
     dropped = [original[index] for index in dropped_indices]
 
     for max_summary_chars in (800, 320, 120, 0):
@@ -169,6 +297,7 @@ def compact_messages_for_budget(
                 changed=True,
                 dropped_messages=len(dropped),
                 summary_messages=summary_messages,
+                cleared_tool_results=microcompacted.cleared_tool_results,
                 recent_turns=recent_turns,
             )
 
@@ -183,14 +312,23 @@ def describe_compaction(result: CompactionResult) -> str:
             "No compaction needed: "
             f"estimated {result.before_tokens} tokens within budget {result.budget}."
         )
-    summary_part = (
-        f"inserted {result.summary_messages} summary message"
-        if result.summary_messages
-        else "no summary fit"
+    if result.cleared_tool_results and not result.dropped_messages:
+        summary_part = "no summary needed"
+    else:
+        summary_part = (
+            f"inserted {result.summary_messages} summary message"
+            if result.summary_messages
+            else "no summary fit"
+        )
+    cleared_part = (
+        f"cleared {result.cleared_tool_results} old tool "
+        f"result{'s' if result.cleared_tool_results != 1 else ''}, "
+        if result.cleared_tool_results
+        else ""
     )
     return (
         "Compacted conversation: "
-        f"dropped {result.dropped_messages} older messages, {summary_part}, "
+        f"{cleared_part}dropped {result.dropped_messages} older messages, {summary_part}, "
         f"reclaimed about {result.reclaimed_tokens} tokens "
         f"({result.before_tokens} -> {result.after_tokens}; budget {result.budget})."
     )
@@ -211,6 +349,22 @@ def _tool_result_text(tool_result: ToolResult) -> str:
     if tool_result.error:
         fields.append(tool_result.error)
     return " ".join(fields)
+
+
+def _cleared_tool_result_content(tool_result: ToolResult) -> str:
+    if tool_result.offloaded is None:
+        return CLEARED_CONTENT_MARKER
+    offloaded = tool_result.offloaded
+    return (
+        "[old tool result content cleared; read_tool_result id "
+        f'"{offloaded.id}" still holds {offloaded.characters} characters]'
+    )
+
+
+def _is_cleared_tool_result_content(content: str) -> bool:
+    return content == CLEARED_CONTENT_MARKER or content.startswith(
+        CLEARED_CONTENT_MARKER[:-1] + ";"
+    )
 
 
 def _recent_window_start(messages: list[Message], recent_turns: int) -> int:
@@ -263,7 +417,10 @@ def _message_excerpts(messages: list[Message], *, limit: int) -> list[str]:
             snippet = f"tool calls: {names}"
         if not snippet and message.tool_result is not None:
             result = message.tool_result
-            snippet = result.content or result.error or f"tool result {result.tool_call_id}"
+            content = (
+                "" if _is_cleared_tool_result_content(result.content) else result.content
+            )
+            snippet = content or result.error or f"tool result {result.tool_call_id}"
         if not snippet:
             attachments = [
                 block for block in message.content if not isinstance(block, TextBlock)
