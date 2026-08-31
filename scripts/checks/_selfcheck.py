@@ -120,6 +120,17 @@ def main() -> None:
         "compaction.under_budget_unchanged",
         "compaction.preserves_required_context",
         "compaction.impossible_budget_fails",
+        "context.reconciles_unsplit",
+        "context.splits_instructions",
+        "context.tool_provenance",
+        "context.orphan_tool_warning",
+        "context.mismatched_instructions",
+        "context.subtotals_and_budget",
+        "context.assistant_attachments_and_immutability",
+        "context.render_plain_text",
+        "context.empty_instruction_set",
+        "context.split_covers_rendered_text",
+        "context.tool_message_without_result",
         "events.final_identity",
         "events.tool_bracketing",
         "events.provider_failure",
@@ -166,6 +177,7 @@ def main() -> None:
         "instructions.user_scope_relative_denylist",
         "instructions.tab_indented_content",
         "instructions.symlinked_user_home",
+        "instructions.whitespace_only_entry",
         "edit.not_read_refused",
         "edit.stale_refused",
         "edit.same_content_allowed",
@@ -240,7 +252,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "160 passed, 0 failed, 160 selected of 160 registered",
+        == "172 passed, 0 failed, 172 selected of 172 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -261,7 +273,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 160 registered",
+            == "1 passed, 0 failed, 1 selected of 172 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -277,7 +289,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 160 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 172 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

@@ -440,3 +440,28 @@ def check_symlinked_user_home() -> None:
             fail(f"symlinked user include provenance was wrong: {child!r}")
         if loaded.warnings:
             fail(f"symlinked user_home produced warnings: {loaded.warnings!r}")
+
+
+@check("instructions.whitespace_only_entry")
+def check_whitespace_only_entry() -> None:
+    with workspace() as ws:
+        user_home = ws.root / "user-home"
+        user_home.mkdir()
+        (user_home / "CLAUDE.md").write_text("user rule")
+        (ws.root / "CLAUDE.md").write_text("   \n ")
+        (ws.root / "AGENTS.md").write_text("project rule")
+        loaded = load_instructions(ws.policy, user_home=user_home)
+
+    whitespace_entry = loaded.entries[1]
+    project_entry = loaded.entries[2]
+    user_block = loaded.render_entry(loaded.entries[0])
+    project_block = loaded.render_entry(project_entry)
+    rendered = loaded.render()
+    if loaded.render_entry(whitespace_entry) != "":
+        fail(f"whitespace-only entry rendered a block: {whitespace_entry!r}")
+    if "# instructions: project CLAUDE.md" in rendered:
+        fail(f"whitespace-only instruction header survived: {rendered!r}")
+    if not project_block or project_block != "# instructions: project AGENTS.md\nproject rule":
+        fail(f"non-empty project block changed: {project_block!r}")
+    if rendered != f"{user_block}\n\n{project_block}":
+        fail(f"surrounding entries were not joined by one blank line: {rendered!r}")

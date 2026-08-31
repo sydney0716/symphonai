@@ -42,7 +42,7 @@ class InstructionSet:
     warnings: tuple[str, ...]
     _repo_root: Path | None = field(default=None, repr=False, compare=False)
 
-    def _display_path(self, path: Path) -> str:
+    def display_path(self, path: Path) -> str:
         if self._repo_root is not None:
             try:
                 return str(path.relative_to(self._repo_root))
@@ -50,21 +50,28 @@ class InstructionSet:
                 pass
         return str(path)
 
+    def render_entry(self, entry: LoadedInstruction) -> str:
+        """Render one entry's block exactly as `render()` includes it.
+
+        Returns "" for an entry that contributes nothing, so callers that
+        attribute cost per entry skip precisely what `render()` skips.
+        """
+
+        if not entry.text.strip():
+            return ""
+        provenance = entry.scope.value
+        if entry.path is not None:
+            path = self.display_path(entry.path)
+            if entry.parent is None:
+                provenance = f"{provenance} {path}"
+            else:
+                parent = self.display_path(entry.parent)
+                provenance = f"{provenance} {parent} -> {path}"
+        return f"# instructions: {provenance}\n{entry.text}"
+
     def render(self) -> str:
-        rendered: list[str] = []
-        for entry in self.entries:
-            if not entry.text:
-                continue
-            provenance = entry.scope.value
-            if entry.path is not None:
-                path = self._display_path(entry.path)
-                if entry.parent is None:
-                    provenance = f"{provenance} {path}"
-                else:
-                    parent = self._display_path(entry.parent)
-                    provenance = f"{provenance} {parent} -> {path}"
-            rendered.append(f"# instructions: {provenance}\n{entry.text}")
-        return "\n\n".join(rendered)
+        rendered = (self.render_entry(entry) for entry in self.entries)
+        return "\n\n".join(block for block in rendered if block)
 
 
 def _strip_frontmatter(text: str) -> str:
