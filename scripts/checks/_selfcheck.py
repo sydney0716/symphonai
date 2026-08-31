@@ -136,6 +136,20 @@ def main() -> None:
         "search.grep_modes",
         "search.cancellation",
         "read_file.ranges_and_limits",
+        "ledger.entry_lru_bound",
+        "ledger.content_lru_bound",
+        "ledger.evicted_content_unchanged",
+        "ledger.evicted_content_mtime_bump",
+        "ledger.dropped_record_refused",
+        "ledger.check_refreshes_recency",
+        "ledger.recorded_ranges",
+        "ledger.partial_view_refused",
+        "ledger.cached_output_identical",
+        "ledger.mtime_change_rereads",
+        "ledger.range_change_rereads",
+        "ledger.oversize_unranged_still_refused",
+        "ledger.messages_unchanged",
+        "ledger.lock_scope",
         "edit.not_read_refused",
         "edit.stale_refused",
         "edit.same_content_allowed",
@@ -210,7 +224,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "130 passed, 0 failed, 130 selected of 130 registered",
+        == "144 passed, 0 failed, 144 selected of 144 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -231,7 +245,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 130 registered",
+            == "1 passed, 0 failed, 1 selected of 144 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -247,7 +261,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 130 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 144 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

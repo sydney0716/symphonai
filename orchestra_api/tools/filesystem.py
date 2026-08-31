@@ -15,11 +15,71 @@ from orchestra_api.models import ToolCall, ToolResult
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
-from orchestra_api.tools.read_ledger import ReadLedger
+from orchestra_api.tools.read_ledger import DEFAULT_READ_LIMIT, ReadLedger
 
 MAX_READ_BYTES = 1_000_000  # 1 MB safety cap on a single read_file call
-MAX_READ_LINES = 2_000
+MAX_READ_LINES = DEFAULT_READ_LIMIT
 MAX_READ_TOKENS = 25_000
+
+
+def _lines_from_cached_content(content: str) -> list[str]:
+    """Rebuild iterator lines without treating other Unicode separators as newlines."""
+    if not content:
+        return []
+    parts = content.split("\n")
+    lines = [f"{part}\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def _render_read_result(
+    tool_call_id: str,
+    *,
+    offset: int,
+    selected: list[str],
+    more_follows: bool,
+    last_line_seen: int,
+) -> ToolResult:
+    if not selected:
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            ok=True,
+            content=f"[no lines at offset {offset}; file has {last_line_seen} lines]",
+        )
+    rendered_lines = [
+        f"{lineno}\t{line.removesuffix(chr(10))}"
+        for lineno, line in enumerate(selected, start=offset)
+    ]
+    rendered = "\n".join(rendered_lines)
+    tokens = estimate_text_tokens(rendered)
+    if tokens > MAX_READ_TOKENS:
+        first_line_tokens = estimate_text_tokens(rendered_lines[0])
+        if first_line_tokens > MAX_READ_TOKENS:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                ok=False,
+                error=(
+                    f"line {offset} is about {first_line_tokens} tokens, over the "
+                    f"{MAX_READ_TOKENS} token limit; search the file with grep instead"
+                ),
+            )
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            ok=False,
+            error=(
+                f"selected range is about {tokens} tokens, over the "
+                f"{MAX_READ_TOKENS} token limit; narrow it with offset and limit"
+            ),
+        )
+    end = offset + len(selected) - 1
+    if more_follows:
+        rendered_lines.append(
+            f"[lines {offset}-{end}; more follow, pass offset={end + 1}]"
+        )
+    elif offset > 1:
+        rendered_lines.append(f"[lines {offset}-{end}; end of file]")
+    return ToolResult(tool_call_id=tool_call_id, ok=True, content="\n".join(rendered_lines))
 
 
 class ReadFileTool(LocalTool):
@@ -96,6 +156,8 @@ class ReadFileTool(LocalTool):
         # disagree with the decision it was just given.
         resolved = policy._resolve_within_root(path)
         is_unranged = "offset" not in tool_call.arguments and "limit" not in tool_call.arguments
+        offset = tool_call.arguments.get("offset", 1)
+        limit = tool_call.arguments.get("limit", MAX_READ_LINES)
         if is_unranged:
             try:
                 size = resolved.stat().st_size
@@ -110,8 +172,23 @@ class ReadFileTool(LocalTool):
                         "read part of it with offset and limit"
                     ),
                 )
-        offset = tool_call.arguments.get("offset", 1)
-        limit = tool_call.arguments.get("limit", MAX_READ_LINES)
+        if self._ledger is not None:
+            try:
+                cached = self._ledger.cached_record(
+                    resolved,
+                    offset=offset,
+                    limit=limit,
+                )
+            except OSError as exc:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
+            if cached is not None:
+                return _render_read_result(
+                    tool_call.id,
+                    offset=offset,
+                    selected=_lines_from_cached_content(cached.content),
+                    more_follows=cached.more_follows,
+                    last_line_seen=cached.last_line_seen,
+                )
         slice_start = offset - 1
         lines: list[str] = []
         characters_read = 0
@@ -156,65 +233,31 @@ class ReadFileTool(LocalTool):
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
         more_follows = limit != 0 and len(lines) > limit
         selected = lines[:limit] if more_follows else lines
-        if not selected:
-            if self._ledger is not None:
-                try:
-                    recorded_full = is_unranged and not more_follows
-                    self._ledger.record(
-                        resolved,
-                        full=recorded_full,
-                        content="".join(selected) if recorded_full else None,
-                    )
-                except OSError as exc:
-                    return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=True,
-                content=f"[no lines at offset {offset}; file has {last_line_seen} lines]",
-            )
-        rendered_lines = [
-            f"{lineno}\t{line.removesuffix(chr(10))}"
-            for lineno, line in enumerate(selected, start=offset)
-        ]
-        rendered = "\n".join(rendered_lines)
-        tokens = estimate_text_tokens(rendered)
-        if tokens > MAX_READ_TOKENS:
-            first_line_tokens = estimate_text_tokens(rendered_lines[0])
-            if first_line_tokens > MAX_READ_TOKENS:
-                return ToolResult(
-                    tool_call_id=tool_call.id,
-                    ok=False,
-                    error=(
-                        f"line {offset} is about {first_line_tokens} tokens, over the "
-                        f"{MAX_READ_TOKENS} token limit; search the file with grep instead"
-                    ),
-                )
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error=(
-                    f"selected range is about {tokens} tokens, over the "
-                    f"{MAX_READ_TOKENS} token limit; narrow it with offset and limit"
-                ),
-            )
-        end = offset + len(selected) - 1
-        if more_follows:
-            rendered_lines.append(
-                f"[lines {offset}-{end}; more follow, pass offset={end + 1}]"
-            )
-        elif offset > 1:
-            rendered_lines.append(f"[lines {offset}-{end}; end of file]")
+        result = _render_read_result(
+            tool_call.id,
+            offset=offset,
+            selected=selected,
+            more_follows=more_follows,
+            last_line_seen=last_line_seen,
+        )
+        if not result.ok:
+            return result
         if self._ledger is not None:
             try:
                 recorded_full = is_unranged and not more_follows
+                content = "".join(selected)
                 self._ledger.record(
                     resolved,
                     full=recorded_full,
-                    content="".join(selected) if recorded_full else None,
+                    content=content,
+                    offset=offset,
+                    limit=limit,
+                    more_follows=more_follows,
+                    last_line_seen=last_line_seen,
                 )
             except OSError as exc:
                 return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
-        return ToolResult(tool_call_id=tool_call.id, ok=True, content="\n".join(rendered_lines))
+        return result
 
 
 class WriteFileTool(LocalTool):

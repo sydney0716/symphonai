@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import unittest.mock as mock
 from collections import Counter
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from orchestra_api.providers.fake import FakeModelProvider
 from orchestra_api.scheduler import partition_tool_calls
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
+import orchestra_api.tools.read_ledger as read_ledger
 from orchestra_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -162,9 +164,14 @@ class _CoordinatedLedger:
         self._ledger = ReadLedger()
         self._record_barrier = threading.Barrier(2)
 
-    def record(self, resolved, *, full: bool, content: str | None) -> None:
+    def record(self, resolved, *, full: bool, content: str | None, **bounds) -> None:
         self._record_barrier.wait(timeout=1)
-        self._ledger.record(resolved, full=full, content=content)
+        self._ledger.record(resolved, full=full, content=content, **bounds)
+
+    def cached_record(self, resolved, *, offset: int, limit: int):
+        # Never serve a cached range: the barrier above is what proves the two
+        # reads ran in parallel, and a cache hit would skip it.
+        return None
 
     def check(self, resolved) -> str | None:
         return self._ledger.check(resolved)
@@ -569,7 +576,9 @@ def check_ledger_locking() -> None:
     ):
         fail(f"ReadLedger docstring does not explain its lock: {ReadLedger.__doc__!r}")
 
-    with workspace() as ws:
+    with workspace() as ws, mock.patch.object(
+        read_ledger, "MAX_LEDGER_ENTRIES", 500
+    ):
         ledger = ReadLedger()
         paths = []
         for index in range(200):
