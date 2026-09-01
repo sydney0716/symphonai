@@ -17,6 +17,7 @@ from scripts.checks import models_and_content  # noqa: E402, F401
 from scripts.checks import tool_metadata  # noqa: E402, F401
 from scripts.checks import tool_call_ids  # noqa: E402, F401
 from scripts.checks import retry  # noqa: E402, F401
+from scripts.checks import circuit_breaker  # noqa: E402, F401
 from scripts.checks import model_discovery  # noqa: E402, F401
 from scripts.checks import providers  # noqa: E402, F401
 from scripts.checks import compaction  # noqa: E402, F401

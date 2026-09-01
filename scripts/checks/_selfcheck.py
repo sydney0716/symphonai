@@ -115,6 +115,13 @@ def main() -> None:
         "retry.call_class_defaults_foreground",
         "retry.providers_forward_call_class",
         "retry.leader_subagents_are_background",
+        "breaker.opens_on_consecutive_failures",
+        "breaker.success_resets",
+        "breaker.concurrent_failures_counted",
+        "breaker.leader_stops_automatic_compaction",
+        "breaker.manual_compaction_still_runs",
+        "breaker.subagent_refused_after_repeated_failure",
+        "breaker.stopped_repairs_reported",
         "discovery.openai_models",
         "discovery.anthropic_models",
         "discovery.gemini_models",
@@ -293,7 +300,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "213 passed, 0 failed, 213 selected of 213 registered",
+        == "220 passed, 0 failed, 220 selected of 220 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -314,7 +321,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 213 registered",
+            == "1 passed, 0 failed, 1 selected of 220 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -325,12 +332,22 @@ def main() -> None:
         f"unexpected filtered list: {listed_retry.stdout!r}",
     )
 
+    listed_breakers = invoke_check("--list", "--only", "breaker")
+    require(
+        listed_breakers.returncode == 0,
+        f"filtered breaker list failed: {listed_breakers.stderr!r}",
+    )
+    require(
+        listed_breakers.stdout.splitlines() == expected_names[40:47],
+        f"unexpected filtered breaker list: {listed_breakers.stdout!r}",
+    )
+
     for selector in ("shell", "SHELL"):
         selected = invoke_check("--only", selector)
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 213 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 220 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

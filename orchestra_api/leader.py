@@ -24,6 +24,10 @@ from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from orchestra_api.budgets import RunBudget
 from orchestra_api.call_class import CallClass
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
+from orchestra_api.circuit_breaker import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    ConsecutiveFailureBreaker,
+)
 from orchestra_api.cost import UsageTotals
 from orchestra_api.compaction import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
@@ -154,6 +158,7 @@ class SubagentRecord:
 
     agent: ApiAgent
     agent_ref: AgentRef
+    breaker: ConsecutiveFailureBreaker
     messages: list[Message] = field(default_factory=list)
     turns_used: int = 0
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
@@ -179,6 +184,7 @@ class DispatchSubagentTool(LocalTool):
         subagent_tool_names: Sequence[str] | None = None,
         parent_agent_id: str | None = None,
         subagent_budget: RunBudget | None = None,
+        max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
@@ -191,6 +197,7 @@ class DispatchSubagentTool(LocalTool):
         # Every child receives the same immutable limits but tracks its own
         # spend; sharing drawdown needs phase 07's cross-agent coordination.
         self._subagent_budget = subagent_budget
+        self._max_consecutive_subagent_failures = max_consecutive_subagent_failures
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id: str | None = None
@@ -284,8 +291,23 @@ class DispatchSubagentTool(LocalTool):
                     call_class=CallClass.BACKGROUND,
                 ),
                 agent_ref=agent_ref,
+                breaker=ConsecutiveFailureBreaker(
+                    f"subagent {subagent_name}",
+                    max_consecutive_failures=self._max_consecutive_subagent_failures,
+                ),
             )
             self.pool[subagent_name] = record
+
+        if record.breaker.is_open:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=(
+                    f"subagent {subagent_name!r} failed "
+                    f"{record.breaker.consecutive_failures} times in a row; "
+                    "not dispatching again this run"
+                ),
+            )
 
         record.messages.append(Message(role=Role.USER, content=task))
         try:
@@ -304,15 +326,24 @@ class DispatchSubagentTool(LocalTool):
             raise OperationCancelled
 
         succeeded = run_result.stopped_reason == "final_response"
+        if succeeded:
+            record.breaker.record_success()
+        else:
+            record.breaker.record_failure()
+        if succeeded:
+            error = None
+        elif run_result.stopped_reason == "max_turns":
+            error = "subagent reached max_turns without a final answer"
+        else:
+            error = (
+                f"subagent stopped because {run_result.stopped_reason} "
+                "before a final answer"
+            )
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,
             content=run_result.final_response.message.text,
-            error=(
-                None
-                if succeeded
-                else "subagent reached max_turns without a final answer"
-            ),
+            error=error,
         )
 
 
@@ -340,6 +371,8 @@ class LeaderConfig:
     chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
     chat_recent_turns: int = DEFAULT_RECENT_TURNS
     events: EventSink | None = None
+    max_consecutive_compaction_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
+    max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
 
 
 @dataclass
@@ -353,6 +386,7 @@ class LeaderRunResult:
     run: RunRef
     agent: AgentRef
     usage_by_agent: dict[str, dict[str, UsageTotals]]
+    stopped_repairs: tuple[str, ...] = ()
 
 
 class Leader:
@@ -382,6 +416,9 @@ class Leader:
             subagent_tool_names=config.subagent_tool_names,
             parent_agent_id=self._agent_ref.agent_id,
             subagent_budget=config.subagent_budget,
+            max_consecutive_subagent_failures=(
+                config.max_consecutive_subagent_failures
+            ),
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_policy = PermissionPolicy(
@@ -400,10 +437,21 @@ class Leader:
             call_class=CallClass.FOREGROUND,
         )
         self._chat_messages: list[Message] = []
+        self._automatic_compaction_breaker = ConsecutiveFailureBreaker(
+            "automatic compaction",
+            max_consecutive_failures=config.max_consecutive_compaction_failures,
+        )
 
     @property
     def subagents(self) -> dict[str, SubagentRecord]:
         return self._dispatch_tool.pool
+
+    def _stopped_repairs(self) -> tuple[str, ...]:
+        breakers = [
+            self._automatic_compaction_breaker,
+            *(record.breaker for record in self._dispatch_tool.pool.values()),
+        ]
+        return tuple(sorted(breaker.name for breaker in breakers if breaker.is_open))
 
     def _run_messages(
         self, messages: list[Message], *, cancel: CancellationToken | None = None
@@ -430,6 +478,7 @@ class Leader:
             run=result.run,
             agent=result.agent,
             usage_by_agent=usage_by_agent,
+            stopped_repairs=self._stopped_repairs(),
         )
 
     def run(
@@ -456,6 +505,7 @@ class Leader:
         """
 
         self._chat_messages.clear()
+        self._automatic_compaction_breaker.reset()
         return self.clear_subagents()
 
     def clear_subagents(self) -> int:
@@ -475,6 +525,7 @@ class Leader:
             cancel=cancel,
         )
         self._chat_messages = result.messages
+        self._automatic_compaction_breaker.record_success()
         if result.changed:
             emit(
                 self._event_sink,
@@ -488,6 +539,19 @@ class Leader:
             )
         return result
 
+    def _automatic_compact_chat(
+        self, *, cancel: CancellationToken | None = None
+    ) -> None:
+        if self._automatic_compaction_breaker.is_open:
+            return
+        try:
+            self.compact_chat(cancel=cancel)
+        except ContextCompactionError:
+            self._automatic_compaction_breaker.record_failure()
+        except OperationCancelled:
+            # Cancellation is a caller decision, not a failed repair attempt.
+            pass
+
     def chat(
         self, message: str, *, cancel: CancellationToken | None = None
     ) -> LeaderRunResult:
@@ -499,19 +563,9 @@ class Leader:
         has full context of the conversation so far.
         """
         self._chat_messages.append(Message(role=Role.USER, content=message))
-        try:
-            self.compact_chat(cancel=cancel)
-        except OperationCancelled:
-            # Fall through: _run_messages returns a cancelled LeaderRunResult,
-            # so chat() and run() report cancellation the same way rather than
-            # one returning a result and the other raising.
-            pass
+        self._automatic_compact_chat(cancel=cancel)
         result = self._run_messages(self._chat_messages, cancel=cancel)
         self._chat_messages = result.leader_messages
-        try:
-            self.compact_chat(cancel=cancel)
-        except (ContextCompactionError, OperationCancelled):
-            # Keep the just-returned answer available when post-run cleanup
-            # cannot complete or the turn was cancelled.
-            self._chat_messages = result.leader_messages
+        self._automatic_compact_chat(cancel=cancel)
+        result.stopped_repairs = self._stopped_repairs()
         return result
