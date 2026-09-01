@@ -48,6 +48,8 @@ from orchestra_api.models import (
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
+from orchestra_api.serialization import message_to_json
+from orchestra_api.session import TranscriptWriter
 from orchestra_api.tool_results import ToolResultStore, offload_tool_result
 from orchestra_api.tools.base import LocalTool
 
@@ -86,6 +88,7 @@ class ApiAgent:
         events: EventSink | None = None,
         budget: RunBudget | None = None,
         call_class: CallClass = CallClass.FOREGROUND,
+        transcript: TranscriptWriter | None = None,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns < 1:
@@ -99,6 +102,7 @@ class ApiAgent:
         self._result_store = result_store
         self._agent_ref = agent_ref or new_agent_ref("agent")
         self._events = events
+        self._transcript = transcript
         # Schemas actually sent to the model so it knows these tools exist.
         # `tools` above is only the *execution* registry, keyed by name --
         # without this, a real provider is never told any tool exists and
@@ -160,6 +164,18 @@ class ApiAgent:
         provider_calls = 0
         current_turn_ref: TurnRef | None = None
 
+        def append_record(
+            record_type: str, *, turn_id: str | None, data: dict
+        ) -> None:
+            if self._transcript is not None:
+                self._transcript.append(
+                    record_type,
+                    run_id=run_ref.run_id,
+                    agent_id=self._agent_ref.agent_id,
+                    turn_id=turn_id,
+                    data=data,
+                )
+
         def finish_for_budget(stopped_reason: str) -> AgentRunResult:
             final_response = response or ModelResponse(
                 message=Message(role=Role.ASSISTANT), stop_reason=stopped_reason
@@ -182,6 +198,11 @@ class ApiAgent:
                     stopped_reason=stopped_reason,
                 ),
             )
+            append_record(
+                "run_finished",
+                turn_id=None,
+                data={"stopped_reason": stopped_reason, "turns_used": provider_calls},
+            )
             return result
 
         def exceeded_budget() -> str | None:
@@ -190,6 +211,15 @@ class ApiAgent:
             return budget_state.exceeded(self._budget)
 
         try:
+            append_record(
+                "run_started",
+                turn_id=None,
+                data={
+                    "agent_name": self._agent_ref.name,
+                    "parent_run_id": parent_run_id,
+                    "model": requested_model,
+                },
+            )
             emit(
                 event_sink,
                 RunStarted(
@@ -201,6 +231,9 @@ class ApiAgent:
             for turn in range(1, self._max_turns + 1):
                 turn_ref = new_turn_ref(run_ref.run_id, turn)
                 current_turn_ref = turn_ref
+                append_record(
+                    "turn_started", turn_id=turn_ref.turn_id, data={"index": turn}
+                )
                 emit(
                     event_sink,
                     TurnStarted(
@@ -221,6 +254,15 @@ class ApiAgent:
                     tools=self._tool_schemas,
                     call_class=self._call_class,
                 )
+                append_record(
+                    "request",
+                    turn_id=turn_ref.turn_id,
+                    data={
+                        "model": model,
+                        "message_count": len(request.messages),
+                        "tool_names": sorted(self._tools),
+                    },
+                )
                 if cancel is None:
                     response = self._provider.create_response(request)
                 else:
@@ -236,9 +278,17 @@ class ApiAgent:
                     response, message=replace(response.message, turn_id=turn_ref.turn_id)
                 )
                 conversation.append(response.message)
+                append_record(
+                    "message",
+                    turn_id=turn_ref.turn_id,
+                    data=message_to_json(response.message),
+                )
                 if cancel is not None:
                     cancel.raise_if_cancelled()
                 if not response.has_tool_calls:
+                    append_record(
+                        "turn_finished", turn_id=turn_ref.turn_id, data={"index": turn}
+                    )
                     emit(
                         event_sink,
                         TurnFinished(
@@ -266,12 +316,25 @@ class ApiAgent:
                             stopped_reason="final_response",
                         ),
                     )
+                    append_record(
+                        "run_finished",
+                        turn_id=None,
+                        data={"stopped_reason": "final_response", "turns_used": turn},
+                    )
                     return result
                 batches = partition_tool_calls(
                     response.message.tool_calls, self._tools
                 )
                 for batch in batches:
                     for tool_call in batch:
+                        append_record(
+                            "tool_started",
+                            turn_id=turn_ref.turn_id,
+                            data={
+                                "tool_call_id": tool_call.id,
+                                "tool_name": tool_call.name,
+                            },
+                        )
                         emit(
                             event_sink,
                             ToolCallStarted(
@@ -330,12 +393,16 @@ class ApiAgent:
                                 tool_name=tool_call.name,
                                 store=self._result_store,
                             )
-                        conversation.append(
-                            Message(
-                                role=Role.TOOL,
-                                tool_result=tool_result,
-                                turn_id=turn_ref.turn_id,
-                            )
+                        tool_message = Message(
+                            role=Role.TOOL,
+                            tool_result=tool_result,
+                            turn_id=turn_ref.turn_id,
+                        )
+                        conversation.append(tool_message)
+                        append_record(
+                            "message",
+                            turn_id=turn_ref.turn_id,
+                            data=message_to_json(tool_message),
                         )
                         emit(
                             event_sink,
@@ -347,6 +414,21 @@ class ApiAgent:
                                 tool_call_id=tool_call.id,
                                 ok=tool_result.ok,
                             ),
+                        )
+                        append_record(
+                            "tool_result",
+                            turn_id=turn_ref.turn_id,
+                            data={
+                                "tool_call_id": tool_call.id,
+                                "tool_name": tool_call.name,
+                                "ok": tool_result.ok,
+                                "cancelled": tool_result.cancelled,
+                                "offloaded_id": (
+                                    None
+                                    if tool_result.offloaded is None
+                                    else tool_result.offloaded.id
+                                ),
+                            },
                         )
                     if cancelled:
                         raise OperationCancelled
@@ -360,6 +442,9 @@ class ApiAgent:
                 budget_reason = exceeded_budget()
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)
+                append_record(
+                    "turn_finished", turn_id=turn_ref.turn_id, data={"index": turn}
+                )
                 emit(
                     event_sink,
                     TurnFinished(
@@ -388,8 +473,14 @@ class ApiAgent:
                     stopped_reason="max_turns",
                 ),
             )
+            append_record(
+                "run_finished",
+                turn_id=None,
+                data={"stopped_reason": "max_turns", "turns_used": self._max_turns},
+            )
             return result
         except OperationCancelled:
+            repaired_tool_call_ids: list[str] = []
             if current_turn_ref is not None:
                 assistant_index = next(
                     (
@@ -408,18 +499,30 @@ class ApiAgent:
                     }
                     for tool_call in conversation[assistant_index].tool_calls:
                         if tool_call.id not in answered_ids:
-                            conversation.append(
-                                Message(
-                                    role=Role.TOOL,
-                                    tool_result=ToolResult(
-                                        tool_call_id=tool_call.id,
-                                        ok=False,
-                                        cancelled=True,
-                                        error="cancelled before this tool completed",
-                                    ),
-                                    turn_id=current_turn_ref.turn_id,
-                                )
+                            repaired_message = Message(
+                                role=Role.TOOL,
+                                tool_result=ToolResult(
+                                    tool_call_id=tool_call.id,
+                                    ok=False,
+                                    cancelled=True,
+                                    error="cancelled before this tool completed",
+                                ),
+                                turn_id=current_turn_ref.turn_id,
                             )
+                            conversation.append(repaired_message)
+                            repaired_tool_call_ids.append(tool_call.id)
+                            append_record(
+                                "message",
+                                turn_id=current_turn_ref.turn_id,
+                                data=message_to_json(repaired_message),
+                            )
+            append_record(
+                "cancellation",
+                turn_id=(
+                    None if current_turn_ref is None else current_turn_ref.turn_id
+                ),
+                data={"repaired_tool_call_ids": repaired_tool_call_ids},
+            )
             cancelled_response = response or ModelResponse(
                 message=Message(role=Role.ASSISTANT), stop_reason="cancelled"
             )
@@ -444,8 +547,16 @@ class ApiAgent:
                 )
             except OperationCancelled:
                 pass
+            append_record(
+                "run_finished",
+                turn_id=None,
+                data={"stopped_reason": "cancelled", "turns_used": max(turn, 1)},
+            )
             return result
         except Exception as exc:
+            append_record(
+                "run_failed", turn_id=None, data={"error": str(exc)}
+            )
             emit(
                 event_sink,
                 RunFailed(

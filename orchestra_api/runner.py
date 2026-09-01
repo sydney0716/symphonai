@@ -13,9 +13,11 @@ from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
 from orchestra_api.budgets import RunBudget
 from orchestra_api.cancellation import CancellationToken
 from orchestra_api.instructions import load_instructions
+from orchestra_api.identity import new_agent_ref
 from orchestra_api.models import Message, Role
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
+from orchestra_api.session import SessionStore
 from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tool_results import ToolResultStore
 from orchestra_api.tools.base import LocalTool
@@ -89,6 +91,7 @@ def run_task(
     offload_tool_results: bool = False,
     budget: RunBudget | None = None,
     search_backend: SearchBackend | None = None,
+    session: SessionStore | None = None,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -114,6 +117,7 @@ def run_task(
         result_store=result_store,
         search_backend=search_backend,
     )
+    agent_ref = new_agent_ref("agent")
     agent = ApiAgent(
         provider=provider,
         tools=tools,
@@ -122,5 +126,11 @@ def run_task(
         tool_schemas=tool_registry_schemas(tools, provider.wire_format),
         result_store=result_store,
         budget=budget,
+        agent_ref=agent_ref,
+        transcript=(
+            None
+            if session is None
+            else session.writer_for(agent_ref.agent_id, is_root=True)
+        ),
     )
     return agent.run(messages, model=model, cancel=cancel)

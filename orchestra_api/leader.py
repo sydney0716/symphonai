@@ -50,6 +50,7 @@ from orchestra_api.models import Message, Role, ToolCall, ToolResult
 from orchestra_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.runner import standard_tool_registry
+from orchestra_api.session import SessionStore
 from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
@@ -185,6 +186,7 @@ class DispatchSubagentTool(LocalTool):
         parent_agent_id: str | None = None,
         subagent_budget: RunBudget | None = None,
         max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        session: SessionStore | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._subagent_policy = subagent_policy
@@ -198,6 +200,7 @@ class DispatchSubagentTool(LocalTool):
         # spend; sharing drawdown needs phase 07's cross-agent coordination.
         self._subagent_budget = subagent_budget
         self._max_consecutive_subagent_failures = max_consecutive_subagent_failures
+        self._session = session
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id: str | None = None
@@ -289,6 +292,11 @@ class DispatchSubagentTool(LocalTool):
                     events=self._events,
                     budget=self._subagent_budget,
                     call_class=CallClass.BACKGROUND,
+                    transcript=(
+                        None
+                        if self._session is None
+                        else self._session.writer_for(agent_ref.agent_id)
+                    ),
                 ),
                 agent_ref=agent_ref,
                 breaker=ConsecutiveFailureBreaker(
@@ -398,8 +406,9 @@ class Leader:
     Use `run()` for a single task; use `chat()` for an interactive session.
     """
 
-    def __init__(self, config: LeaderConfig) -> None:
+    def __init__(self, config: LeaderConfig, session: SessionStore | None = None) -> None:
         self._config = config
+        self._session = session
         self._agent_ref = new_agent_ref("leader")
         self._event_sink = _LeaderEventSink(config.events)
         self._last_run_id: str | None = None
@@ -419,6 +428,7 @@ class Leader:
             max_consecutive_subagent_failures=(
                 config.max_consecutive_subagent_failures
             ),
+            session=session,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_policy = PermissionPolicy(
@@ -435,6 +445,11 @@ class Leader:
             agent_ref=self._agent_ref,
             events=self._event_sink,
             call_class=CallClass.FOREGROUND,
+            transcript=(
+                None
+                if session is None
+                else session.writer_for(self._agent_ref.agent_id, is_root=True)
+            ),
         )
         self._chat_messages: list[Message] = []
         self._automatic_compaction_breaker = ConsecutiveFailureBreaker(
@@ -527,6 +542,20 @@ class Leader:
         self._chat_messages = result.messages
         self._automatic_compaction_breaker.record_success()
         if result.changed:
+            if self._session is not None:
+                self._session.writer_for(
+                    self._agent_ref.agent_id, is_root=True
+                ).append(
+                    "compaction",
+                    run_id=self._last_run_id or self._session.run_id,
+                    agent_id=self._agent_ref.agent_id,
+                    turn_id=None,
+                    data={
+                        "before_tokens": result.before_tokens,
+                        "after_tokens": result.after_tokens,
+                        "dropped_messages": result.dropped_messages,
+                    },
+                )
             emit(
                 self._event_sink,
                 CompactionApplied(

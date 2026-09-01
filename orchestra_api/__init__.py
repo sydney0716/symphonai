@@ -74,6 +74,23 @@ from orchestra_api.web_search import (
     search_endpoints,
 )
 from orchestra_api.tools.web_search import WebSearchTool
+from orchestra_api.serialization import (
+    content_blocks_from_json,
+    content_blocks_to_json,
+    message_from_json,
+    message_to_json,
+    tool_call_from_json,
+    tool_call_to_json,
+    tool_result_from_json,
+    tool_result_to_json,
+)
+from orchestra_api.session import (
+    SessionStore,
+    TranscriptError,
+    TranscriptWriter,
+    default_sessions_root,
+    read_records,
+)
 
 __all__ = [
     "AgentRef",
@@ -104,6 +121,7 @@ __all__ = [
     "SearchBackendError",
     "SearchEndpoint",
     "SearchHit",
+    "SessionStore",
     "SubagentSpawned",
     "TextBlock",
     "ToolCall",
@@ -112,6 +130,8 @@ __all__ = [
     "ToolEffect",
     "ToolMetadata",
     "ToolResult",
+    "TranscriptError",
+    "TranscriptWriter",
     "TurnFinished",
     "TurnRef",
     "TurnStarted",
@@ -125,6 +145,11 @@ __all__ = [
     "HttpJsonSearchBackend",
     "MIN_SEARCH_LIMIT",
     "fetch_url",
+    "content_blocks_from_json",
+    "content_blocks_to_json",
+    "default_sessions_root",
+    "message_from_json",
+    "message_to_json",
     "new_agent_ref",
     "new_id",
     "new_run_ref",
@@ -133,5 +158,10 @@ __all__ = [
     "search_endpoint",
     "search_endpoints",
     "safe_metadata",
+    "read_records",
     "wire_tool_call_ids",
+    "tool_call_from_json",
+    "tool_call_to_json",
+    "tool_result_from_json",
+    "tool_result_to_json",
 ]

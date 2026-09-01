@@ -162,6 +162,22 @@ def main() -> None:
         "results.agent_loop_offload",
         "results.registry_opt_in",
         "results.context_report_counts_preview",
+        "serialization.message_round_trip",
+        "serialization.tool_result_round_trip",
+        "serialization.provider_metadata_verbatim",
+        "serialization.unknown_kind_rejected",
+        "session.no_transcript_no_files",
+        "session.record_sequence",
+        "session.tool_records",
+        "session.cancellation_record",
+        "session.failure_record",
+        "session.truncated_tail_recovers",
+        "session.corrupt_middle_raises",
+        "session.subagent_transcript_separate",
+        "session.meta_atomic_replace",
+        "session.request_record_has_no_secret",
+        "session.directory_outside_repo_root",
+        "session.sessions_root_env_override",
         "cost.usage_totals_merge",
         "cost.run_accumulates_usage",
         "cost.cancelled_run_reports_usage",
@@ -327,7 +343,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "247 passed, 0 failed, 247 selected of 247 registered",
+        == "263 passed, 0 failed, 263 selected of 263 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -375,7 +391,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 247 registered"
+                "of 263 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -402,7 +418,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 247 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 263 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
