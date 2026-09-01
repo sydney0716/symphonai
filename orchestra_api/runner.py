@@ -17,7 +17,7 @@ from orchestra_api.identity import new_agent_ref
 from orchestra_api.models import Message, Role
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
-from orchestra_api.session import SessionStore
+from orchestra_api.session import SessionStore, resume_run
 from orchestra_api.tool_schema import tool_registry_schemas
 from orchestra_api.tool_results import ToolResultStore
 from orchestra_api.tools.base import LocalTool
@@ -134,3 +134,37 @@ def run_task(
         ),
     )
     return agent.run(messages, model=model, cancel=cancel)
+
+
+def resume_task(
+    provider: ModelProvider,
+    policy: PermissionPolicy,
+    prompt: str,
+    *,
+    store: SessionStore,
+    new_store: SessionStore,
+    model: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    cancel: CancellationToken | None = None,
+) -> AgentRunResult:
+    """Continue a persisted conversation as a new descendant run."""
+
+    messages, parent_run_id = resume_run(store)
+    messages.append(Message(role=Role.USER, content=prompt))
+    tools = standard_tool_registry()
+    agent_ref = new_agent_ref("agent")
+    agent = ApiAgent(
+        provider=provider,
+        tools=tools,
+        policy=policy,
+        max_turns=max_turns,
+        tool_schemas=tool_registry_schemas(tools, provider.wire_format),
+        agent_ref=agent_ref,
+        transcript=new_store.writer_for(agent_ref.agent_id, is_root=True),
+    )
+    return agent.run(
+        messages,
+        model=model,
+        parent_run_id=parent_run_id,
+        cancel=cancel,
+    )

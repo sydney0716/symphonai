@@ -85,12 +85,18 @@ from orchestra_api.serialization import (
     tool_result_to_json,
 )
 from orchestra_api.session import (
+    LoadedRun,
+    SessionError,
     SessionStore,
     TranscriptError,
     TranscriptWriter,
     default_sessions_root,
+    fork_run,
+    load_run,
     read_records,
+    resume_run,
 )
+from orchestra_api.runner import resume_task
 
 __all__ = [
     "AgentRef",
@@ -106,6 +112,7 @@ __all__ = [
     "MAX_FETCH_BYTES",
     "MAX_REDIRECTS",
     "MAX_SEARCH_LIMIT",
+    "LoadedRun",
     "Message",
     "ModelRequest",
     "ModelResponse",
@@ -121,6 +128,7 @@ __all__ = [
     "SearchBackendError",
     "SearchEndpoint",
     "SearchHit",
+    "SessionError",
     "SessionStore",
     "SubagentSpawned",
     "TextBlock",
@@ -148,6 +156,8 @@ __all__ = [
     "content_blocks_from_json",
     "content_blocks_to_json",
     "default_sessions_root",
+    "fork_run",
+    "load_run",
     "message_from_json",
     "message_to_json",
     "new_agent_ref",
@@ -159,6 +169,8 @@ __all__ = [
     "search_endpoints",
     "safe_metadata",
     "read_records",
+    "resume_run",
+    "resume_task",
     "wire_tool_call_ids",
     "tool_call_from_json",
     "tool_call_to_json",

@@ -12,19 +12,34 @@ from pathlib import Path
 
 from orchestra_api.agent_loop import ApiAgent
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.identity import new_agent_ref
+from orchestra_api.identity import SCHEMA_VERSION, new_agent_ref, new_id
 from orchestra_api.leader import Leader, LeaderConfig
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, ToolResult
+from orchestra_api.models import (
+    DocumentBlock,
+    ImageBlock,
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    TextBlock,
+    ToolCall,
+    ToolResult,
+)
 from orchestra_api.permissions import PermissionPolicy
 from orchestra_api.providers.base import ModelProvider
 from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import run_task
+from orchestra_api.runner import resume_task, run_task, standard_tool_registry
+from orchestra_api.serialization import message_to_json
 from orchestra_api.session import (
+    SessionError,
     SessionStore,
     TranscriptError,
     TranscriptWriter,
     default_sessions_root,
+    fork_run,
+    load_run,
     read_records,
+    resume_run,
 )
 from orchestra_api.tools.base import LocalTool
 from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
@@ -90,6 +105,21 @@ class _FailingProvider(ModelProvider):
         cancel: CancellationToken | None = None,
     ) -> ModelResponse:
         raise RuntimeError("scripted provider failure")
+
+
+class _RecordingProvider(FakeModelProvider):
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        super().__init__(responses)
+        self.requests: list[ModelRequest] = []
+
+    def create_response(
+        self,
+        request: ModelRequest,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> ModelResponse:
+        self.requests.append(request)
+        return super().create_response(request, cancel=cancel)
 
 
 @check("session.no_transcript_no_files")
@@ -442,3 +472,415 @@ def check_sessions_root_env_override() -> None:
                 "sessions-root override was ignored or created as a read side effect: "
                 f"resolved={resolved!r}"
             )
+
+
+def _seed_persisted_messages(
+    sessions_root: Path,
+    name: str,
+    messages: list[Message],
+) -> tuple[SessionStore, str]:
+    store = SessionStore(sessions_root, name)
+    agent_id = f"agent-{name}"
+    writer = store.writer_for(agent_id, is_root=True)
+    writer.append(
+        "run_started",
+        run_id=f"run-{name}",
+        agent_id=agent_id,
+        turn_id=None,
+        data={"agent_name": name, "parent_run_id": None, "model": "fake"},
+    )
+    for message in messages:
+        writer.append(
+            "message",
+            run_id=f"run-{name}",
+            agent_id=agent_id,
+            turn_id=message.turn_id,
+            data=message_to_json(message),
+        )
+    writer.append(
+        "run_finished",
+        run_id=f"run-{name}",
+        agent_id=agent_id,
+        turn_id=None,
+        data={"stopped_reason": "final_response", "turns_used": 1},
+    )
+    store.close()
+    return store, agent_id
+
+
+@check("session.load_round_trip")
+def check_load_round_trip() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        (repo / "note.txt").write_text("persist me")
+        store = SessionStore(root / "sessions", "load-round-trip")
+        agent_ref = new_agent_ref("load-check")
+        tool_call = ToolCall(
+            id="load-tool-call",
+            name="read_file",
+            arguments={"path": "note.txt"},
+            provider_metadata={"thoughtSignature": {"nested": [1, {"two": 2}]}},
+            vendor_id="vendor-load-tool-call",
+        )
+        provider = FakeModelProvider(
+            [
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        content=(
+                            TextBlock("inspect"),
+                            ImageBlock(data="aW1hZ2U=", media_type="image/png"),
+                            DocumentBlock(data="cGRm", filename="note.pdf"),
+                        ),
+                        tool_calls=[tool_call],
+                    )
+                ),
+                _final_response("loaded"),
+            ]
+        )
+        tools = standard_tool_registry(["read_file"])
+        result = ApiAgent(
+            provider,
+            tools,
+            PermissionPolicy(repo_root=repo),
+            agent_ref=agent_ref,
+            transcript=store.writer_for(agent_ref.agent_id, is_root=True),
+        ).run([])
+        loaded = load_run(store)
+        records, _ = read_records(store.directory / "run.jsonl")
+        expected_record_ids = [
+            record["record_id"]
+            for record in records
+            if record["type"] == "message"
+        ]
+        if loaded.messages != result.messages:
+            fail(
+                "persisted messages did not round-trip into the run conversation: "
+                f"loaded={loaded.messages!r}, result={result.messages!r}"
+            )
+        if loaded.record_ids != expected_record_ids or len(loaded.record_ids) != len(loaded.messages):
+            fail(f"message record ids are not aligned: {loaded!r}")
+        store.close()
+
+
+@check("session.load_ignores_unknown_record_type")
+def check_load_ignores_unknown_record_type() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        store, _ = _seed_persisted_messages(
+            Path(temporary) / "sessions",
+            "unknown-type",
+            [Message(role=Role.ASSISTANT, content="known", turn_id="turn-known")],
+        )
+        path = store.directory / "run.jsonl"
+        future_record = {
+            "schema_version": SCHEMA_VERSION,
+            "record_id": new_id("rec"),
+            "ts": "2000-01-01T00:00:00.000Z",
+            "type": "future_thing",
+            "run_id": "run-unknown-type",
+            "agent_id": "agent-unknown-type",
+            "turn_id": None,
+            "data": {"future": True},
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(future_record) + "\n")
+        loaded = load_run(store)
+        if [message.text for message in loaded.messages] != ["known"]:
+            fail(f"unknown record type changed the loaded conversation: {loaded!r}")
+
+
+def _resume_source_messages() -> list[Message]:
+    return [
+        Message(role=Role.SYSTEM, content="one system", turn_id="turn-system"),
+        Message(role=Role.USER, content="old question", turn_id="turn-user"),
+        Message(role=Role.ASSISTANT, content="old answer", turn_id="turn-answer"),
+    ]
+
+
+@check("session.resume_continues_conversation")
+def check_resume_continues_conversation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        source, _ = _seed_persisted_messages(
+            root / "sessions", "resume-source", _resume_source_messages()
+        )
+        destination = SessionStore(root / "sessions", "resume-destination")
+        provider = _RecordingProvider([_final_response("new answer")])
+        resume_task(
+            provider,
+            PermissionPolicy(repo_root=repo),
+            "new question",
+            store=source,
+            new_store=destination,
+        )
+        expected = [
+            *_resume_source_messages(),
+            Message(role=Role.USER, content="new question"),
+        ]
+        if provider.requests[0].messages != expected:
+            fail(f"resume request did not continue the loaded conversation: {provider.requests[0]!r}")
+        if sum(message.role == Role.SYSTEM for message in provider.requests[0].messages) != 1:
+            fail("resume duplicated the persisted system message")
+        destination.close()
+
+
+@check("session.resume_is_a_new_run")
+def check_resume_is_a_new_run() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        source, _ = _seed_persisted_messages(
+            root / "sessions", "new-run-source", _resume_source_messages()
+        )
+        original_path = source.directory / "run.jsonl"
+        original_bytes = original_path.read_bytes()
+        loaded = load_run(source)
+        destination = SessionStore(root / "sessions", "new-run-destination")
+        result = resume_task(
+            FakeModelProvider([_final_response("continued")]),
+            PermissionPolicy(repo_root=repo),
+            "continue",
+            store=source,
+            new_store=destination,
+        )
+        destination_records, _ = read_records(destination.directory / "run.jsonl")
+        started = destination_records[0]
+        if (
+            result.run.run_id == loaded.run_id
+            or result.run.parent_run_id != loaded.run_id
+            or started["data"]["parent_run_id"] != loaded.run_id
+            or source.directory == destination.directory
+            or not (destination.directory / "run.jsonl").is_file()
+        ):
+            fail(
+                "resume did not create a distinct descendant run: "
+                f"result={result!r}, started={started!r}"
+            )
+        if original_path.read_bytes() != original_bytes:
+            fail("resume appended to the original transcript")
+        destination.close()
+
+
+@check("session.fork_prefix_only")
+def check_fork_prefix_only() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        messages = _resume_source_messages()
+        with mock.patch(
+            "orchestra_api.session._timestamp",
+            return_value="2000-01-01T00:00:00.000Z",
+        ):
+            source, _ = _seed_persisted_messages(
+                root / "sessions", "fork-prefix-source", messages
+            )
+        source_records, _ = read_records(source.directory / "run.jsonl")
+        message_records = [
+            record for record in source_records if record["type"] == "message"
+        ]
+        through = message_records[1]["record_id"]
+        through_index = next(
+            index
+            for index, record in enumerate(source_records)
+            if record["record_id"] == through
+        )
+        source_prefix = [
+            record
+            for record in source_records[: through_index + 1]
+            if record["type"] != "run_started"
+        ]
+        destination = SessionStore(root / "sessions", "fork-prefix-destination")
+        forked = fork_run(
+            source,
+            through_record_id=through,
+            new_store=destination,
+        )
+        fork_records, _ = read_records(destination.directory / "run.jsonl")
+        copied = fork_records[1:]
+        if forked.messages != messages[:2] or len(copied) != len(source_prefix):
+            fail(f"fork did not contain exactly the selected prefix: {fork_records!r}")
+        for original, replacement in zip(source_prefix, copied):
+            if (
+                replacement["type"] != original["type"]
+                or replacement["turn_id"] != original["turn_id"]
+                or replacement["data"] != original["data"]
+                or replacement["record_id"] == original["record_id"]
+                or replacement["ts"] == original["ts"]
+            ):
+                fail(
+                    "forked record identity or payload is wrong: "
+                    f"original={original!r}, replacement={replacement!r}"
+                )
+        if fork_records[0]["data"]["parent_run_id"] != load_run(source).run_id:
+            fail("fork run_started does not descend from the source run")
+        destination.close()
+
+
+@check("session.fork_rejects_non_message")
+def check_fork_rejects_non_message() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, agent_id = _seed_persisted_messages(
+            root / "sessions",
+            "fork-non-message-source",
+            [Message(role=Role.ASSISTANT, content="done", turn_id="turn-done")],
+        )
+        writer = TranscriptWriter(source.directory / "run.jsonl")
+        target_id = writer.append(
+            "tool_started",
+            run_id="run-fork-non-message-source",
+            agent_id=agent_id,
+            turn_id="turn-tool-start",
+            data={"tool_call_id": "tool-only", "tool_name": "read_file"},
+        )
+        writer.close()
+        destination = SessionStore(root / "sessions", "fork-non-message-destination")
+        try:
+            fork_run(source, through_record_id=target_id, new_store=destination)
+        except SessionError as exc:
+            if target_id not in str(exc):
+                fail(f"non-message fork error did not name the record: {exc}")
+        else:
+            fail("fork accepted a tool_started record")
+        if (destination.directory / "run.jsonl").exists():
+            fail("rejected non-message fork wrote a transcript")
+
+
+@check("session.fork_rejects_unknown_record")
+def check_fork_rejects_unknown_record() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, _ = _seed_persisted_messages(
+            root / "sessions",
+            "fork-unknown-source",
+            [Message(role=Role.ASSISTANT, content="done", turn_id="turn-done")],
+        )
+        destination = SessionStore(root / "sessions", "fork-unknown-destination")
+        missing = "rec_missing_from_transcript"
+        try:
+            fork_run(source, through_record_id=missing, new_store=destination)
+        except SessionError as exc:
+            if missing not in str(exc):
+                fail(f"unknown-record fork error did not name the id: {exc}")
+        else:
+            fail("fork accepted an unknown record id")
+
+
+@check("session.fork_rejects_unanswered_tool_calls")
+def check_fork_rejects_unanswered_tool_calls() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, _ = _seed_persisted_messages(
+            root / "sessions",
+            "fork-unanswered-source",
+            [
+                Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(id="unanswered-1", name="read_file"),
+                        ToolCall(id="unanswered-2", name="read_file"),
+                    ],
+                    turn_id="turn-unanswered",
+                )
+            ],
+        )
+        through = load_run(source).record_ids[0]
+        destination = SessionStore(root / "sessions", "fork-unanswered-destination")
+        try:
+            fork_run(source, through_record_id=through, new_store=destination)
+        except SessionError as exc:
+            if "unanswered-1" not in str(exc) or "unanswered-2" not in str(exc):
+                fail(f"inconsistent-fork error omitted unanswered ids: {exc}")
+        else:
+            fail("fork accepted unanswered tool calls")
+        if (destination.directory / "run.jsonl").exists():
+            fail("inconsistent fork wrote records before validation")
+
+
+@check("session.fork_leaves_original_untouched")
+def check_fork_leaves_original_untouched() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source, _ = _seed_persisted_messages(
+            root / "sessions", "fork-untouched-source", _resume_source_messages()
+        )
+
+        def snapshot() -> dict[str, tuple[bytes, int]]:
+            return {
+                str(path.relative_to(source.directory)): (
+                    path.read_bytes(),
+                    path.stat().st_mtime_ns,
+                )
+                for path in source.directory.rglob("*")
+                if path.is_file()
+            }
+
+        before = snapshot()
+        through = load_run(source).record_ids[-1]
+        destination = SessionStore(root / "sessions", "fork-untouched-destination")
+        fork_run(source, through_record_id=through, new_store=destination)
+        fork_path = destination.directory / "run.jsonl"
+        if not fork_path.is_file() or not read_records(fork_path)[0]:
+            fail("untouched-source check never produced the fork transcript")
+        if snapshot() != before:
+            fail("fork modified source bytes or mtimes")
+        destination.close()
+
+
+@check("session.resume_after_truncated_tail")
+def check_resume_after_truncated_tail() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        source, _ = _seed_persisted_messages(
+            root / "sessions", "truncated-resume-source", _resume_source_messages()
+        )
+        with (source.directory / "run.jsonl").open("ab") as handle:
+            handle.write(b'{"schema_version":1,"record_id":"truncated')
+        loaded = load_run(source)
+        if loaded.dropped_bytes <= 0:
+            fail("truncated transcript did not report dropped bytes")
+        resumed_messages, resumed_id = resume_run(source)
+        destination = SessionStore(root / "sessions", "truncated-resume-destination")
+        result = resume_task(
+            FakeModelProvider([_final_response("continued")]),
+            PermissionPolicy(repo_root=repo),
+            "continue",
+            store=source,
+            new_store=destination,
+        )
+        if resumed_messages != loaded.messages or resumed_id != loaded.run_id:
+            fail("resume_run changed a crash-tail-recovered load")
+        if result.run.parent_run_id != loaded.run_id:
+            fail("resume after a truncated tail lost lineage")
+        destination.close()
+
+
+@check("session.schema_version_from_the_future")
+def check_schema_version_from_the_future() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        store, _ = _seed_persisted_messages(
+            Path(temporary) / "sessions",
+            "future-schema",
+            [Message(role=Role.ASSISTANT, content="future", turn_id="turn-future")],
+        )
+        path = store.directory / "run.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        future_version = SCHEMA_VERSION + 1
+        first["schema_version"] = future_version
+        lines[0] = json.dumps(first, separators=(",", ":"))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            load_run(store)
+        except SessionError as exc:
+            error = str(exc)
+            if str(future_version) not in error or str(SCHEMA_VERSION) not in error:
+                fail(f"future-schema error did not name both versions: {error}")
+        else:
+            fail("future transcript schema was accepted")

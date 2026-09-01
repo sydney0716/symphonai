@@ -6,11 +6,15 @@ import json
 import os
 import tempfile
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from orchestra_api.identity import SCHEMA_VERSION, new_id
+
+if TYPE_CHECKING:
+    from orchestra_api.models import Message
 
 
 _RECORD_TYPES = frozenset(
@@ -32,6 +36,22 @@ _RECORD_TYPES = frozenset(
 
 class TranscriptError(RuntimeError):
     """A transcript cannot be serialized, persisted, or safely read."""
+
+
+class SessionError(TranscriptError):
+    """A persisted run cannot be loaded, resumed, or forked safely."""
+
+
+@dataclass(frozen=True)
+class LoadedRun:
+    run_id: str
+    agent_id: str
+    parent_run_id: str | None
+    messages: list[Message]
+    record_ids: list[str]
+    stopped_reason: str | None
+    dropped_bytes: int
+    meta: dict
 
 
 def _timestamp() -> str:
@@ -278,3 +298,171 @@ def read_records(path: Path) -> tuple[list[dict], int]:
             ) from exc
         records.append(value)
     return records, 0
+
+
+def _transcript_path(store: SessionStore, agent_id: str | None) -> Path:
+    if agent_id is None:
+        return store.directory / "run.jsonl"
+    return store.directory / f"agent-{agent_id}.jsonl"
+
+
+def _checked_records(
+    store: SessionStore, agent_id: str | None
+) -> tuple[list[dict], int]:
+    if not store.directory.is_dir():
+        raise SessionError(
+            f"run {store.run_id!r} cannot be loaded: run directory is missing"
+        )
+    path = _transcript_path(store, agent_id)
+    if not path.is_file():
+        raise SessionError(
+            f"run {store.run_id!r} cannot be loaded: transcript {path.name!r} is missing"
+        )
+    records, dropped_bytes = read_records(path)
+    for record in records:
+        version = record.get("schema_version")
+        if isinstance(version, int) and version > SCHEMA_VERSION:
+            raise SessionError(
+                f"run {store.run_id!r} uses schema_version {version}, "
+                f"but this build supports {SCHEMA_VERSION}"
+            )
+    return records, dropped_bytes
+
+
+def load_run(
+    store: SessionStore, *, agent_id: str | None = None
+) -> LoadedRun:
+    """Rebuild one agent's persisted conversation from its transcript."""
+
+    # Local import avoids a cycle: serialization's public errors live here.
+    from orchestra_api.serialization import message_from_json
+
+    records, dropped_bytes = _checked_records(store, agent_id)
+    messages: list[Message] = []
+    record_ids: list[str] = []
+    run_id: str | None = None
+    loaded_agent_id: str | None = None
+    parent_run_id: str | None = None
+    stopped_reason: str | None = None
+    for record in records:
+        record_type = record.get("type")
+        if record_type == "run_started" and run_id is None:
+            run_id = record.get("run_id")
+            loaded_agent_id = record.get("agent_id")
+            parent_run_id = record.get("data", {}).get("parent_run_id")
+        elif record_type == "message":
+            messages.append(message_from_json(record["data"]))
+            record_ids.append(record["record_id"])
+        elif record_type == "run_finished":
+            stopped_reason = record.get("data", {}).get("stopped_reason")
+        elif record_type == "run_failed":
+            stopped_reason = "failed"
+    if not isinstance(run_id, str) or not isinstance(loaded_agent_id, str):
+        raise SessionError(
+            f"run {store.run_id!r} cannot be loaded: transcript has no run_started record"
+        )
+    return LoadedRun(
+        run_id=run_id,
+        agent_id=loaded_agent_id,
+        parent_run_id=parent_run_id,
+        messages=messages,
+        record_ids=record_ids,
+        stopped_reason=stopped_reason,
+        dropped_bytes=dropped_bytes,
+        meta=store.read_meta(),
+    )
+
+
+def resume_run(
+    store: SessionStore, *, agent_id: str | None = None
+) -> tuple[list[Message], str]:
+    """Return the loaded conversation and the run id it continues."""
+
+    loaded = load_run(store, agent_id=agent_id)
+    return loaded.messages, loaded.run_id
+
+
+def _unanswered_tool_call_ids(messages: list[Message]) -> list[str]:
+    outstanding: list[str] = []
+    for message in messages:
+        if message.tool_calls:
+            outstanding = [call.id for call in message.tool_calls]
+        if message.tool_result is not None:
+            outstanding = [
+                call_id
+                for call_id in outstanding
+                if call_id != message.tool_result.tool_call_id
+            ]
+    return outstanding
+
+
+def fork_run(
+    store: SessionStore,
+    *,
+    through_record_id: str,
+    new_store: SessionStore,
+    agent_id: str | None = None,
+) -> LoadedRun:
+    """Copy a consistent message-addressed prefix into a descendant run."""
+
+    from orchestra_api.serialization import message_from_json
+
+    records, _ = _checked_records(store, agent_id)
+    target_index = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if record.get("record_id") == through_record_id
+        ),
+        None,
+    )
+    if target_index is None:
+        raise SessionError(
+            f"run {store.run_id!r} has no record {through_record_id!r}"
+        )
+    target = records[target_index]
+    if target.get("type") != "message":
+        raise SessionError(
+            f"run {store.run_id!r} record {through_record_id!r} is not a message"
+        )
+    prefix = records[: target_index + 1]
+    prefix_messages = [
+        message_from_json(record["data"])
+        for record in prefix
+        if record.get("type") == "message"
+    ]
+    unanswered = _unanswered_tool_call_ids(prefix_messages)
+    if unanswered:
+        raise SessionError(
+            f"run {store.run_id!r} fork through {through_record_id!r} has "
+            f"unanswered tool call ids: {', '.join(unanswered)}"
+        )
+
+    loaded = load_run(store, agent_id=agent_id)
+    source_started = next(
+        record for record in records if record.get("type") == "run_started"
+    )
+    writer = new_store.writer_for(loaded.agent_id, is_root=agent_id is None)
+    source_start_data = source_started.get("data", {})
+    writer.append(
+        "run_started",
+        run_id=new_store.run_id,
+        agent_id=loaded.agent_id,
+        turn_id=None,
+        data={
+            "agent_name": source_start_data.get("agent_name"),
+            "parent_run_id": loaded.run_id,
+            "model": source_start_data.get("model"),
+        },
+    )
+    for record in prefix:
+        if record.get("type") == "run_started":
+            continue
+        writer.append(
+            record["type"],
+            run_id=new_store.run_id,
+            agent_id=loaded.agent_id,
+            turn_id=record.get("turn_id"),
+            data=record.get("data", {}),
+        )
+    return load_run(new_store, agent_id=agent_id)
