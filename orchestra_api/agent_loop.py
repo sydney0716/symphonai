@@ -103,6 +103,7 @@ class ApiAgent:
         self._agent_ref = agent_ref or new_agent_ref("agent")
         self._events = events
         self._transcript = transcript
+        self._persisted_messages = 0
         # Schemas actually sent to the model so it knows these tools exist.
         # `tools` above is only the *execution* registry, keyed by name --
         # without this, a real provider is never told any tool exists and
@@ -220,6 +221,15 @@ class ApiAgent:
                     "model": requested_model,
                 },
             )
+            if len(messages) < self._persisted_messages:
+                self._persisted_messages = 0
+            for seed_message in messages[self._persisted_messages :]:
+                append_record(
+                    "message",
+                    turn_id=seed_message.turn_id,
+                    data=message_to_json(seed_message),
+                )
+            self._persisted_messages = len(messages)
             emit(
                 event_sink,
                 RunStarted(
@@ -283,6 +293,7 @@ class ApiAgent:
                     turn_id=turn_ref.turn_id,
                     data=message_to_json(response.message),
                 )
+                self._persisted_messages += 1
                 if cancel is not None:
                     cancel.raise_if_cancelled()
                 if not response.has_tool_calls:
@@ -404,6 +415,7 @@ class ApiAgent:
                             turn_id=turn_ref.turn_id,
                             data=message_to_json(tool_message),
                         )
+                        self._persisted_messages += 1
                         emit(
                             event_sink,
                             ToolCallFinished(
@@ -516,6 +528,7 @@ class ApiAgent:
                                 turn_id=current_turn_ref.turn_id,
                                 data=message_to_json(repaired_message),
                             )
+                            self._persisted_messages += 1
             append_record(
                 "cancellation",
                 turn_id=(

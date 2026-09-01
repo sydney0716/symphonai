@@ -158,38 +158,55 @@ class TranscriptWriter:
 class SessionStore:
     """Owns one run's directory: transcripts, sidecar, result store dir."""
 
-    def __init__(self, root: Path, run_id: str) -> None:
+    def __init__(self, root: Path, run_id: str, *, create: bool = True) -> None:
         self._run_id = run_id
         self._root = Path(root)
         self._directory = self._root / run_id
         self._writers: dict[Path, TranscriptWriter] = {}
         self._writers_lock = threading.Lock()
         self._meta_lock = threading.Lock()
-        try:
-            self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self._root.chmod(0o700)
-            self._directory.mkdir(exist_ok=True, mode=0o700)
-            self._directory.chmod(0o700)
-            tool_results = self._directory / "tool-results"
-            tool_results.mkdir(exist_ok=True, mode=0o700)
-            tool_results.chmod(0o700)
-        except OSError as exc:
-            raise TranscriptError(
-                f"cannot create session directory {self._directory}: {exc}"
-            ) from exc
-        now = _timestamp()
-        self.write_meta(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "run_id": run_id,
-                "agent_id": None,
-                "created_at": now,
-                "updated_at": now,
-                "title": None,
-                "parent_run_id": None,
-                "stopped_reason": None,
-            }
-        )
+        if create:
+            try:
+                self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self._root.chmod(0o700)
+                self._directory.mkdir(exist_ok=True, mode=0o700)
+                self._directory.chmod(0o700)
+                tool_results = self._directory / "tool-results"
+                tool_results.mkdir(exist_ok=True, mode=0o700)
+                tool_results.chmod(0o700)
+            except OSError as exc:
+                raise TranscriptError(
+                    f"cannot create session directory {self._directory}: {exc}"
+                ) from exc
+        if create and not (self._directory / "meta.json").exists():
+            now = _timestamp()
+            self.write_meta(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "agent_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                    "title": None,
+                    "parent_run_id": None,
+                    "stopped_reason": None,
+                }
+            )
+
+    @classmethod
+    def open(cls, root: Path, run_id: str) -> "SessionStore":
+        """Open an existing run without creating or rewriting anything."""
+
+        directory = Path(root) / run_id
+        if not directory.is_dir():
+            raise SessionError(
+                f"run {run_id!r} cannot be opened: run directory is missing"
+            )
+        if not (directory / "meta.json").is_file():
+            raise SessionError(
+                f"run {run_id!r} cannot be opened: meta.json is missing"
+            )
+        return cls(root, run_id, create=False)
 
     @property
     def directory(self) -> Path:

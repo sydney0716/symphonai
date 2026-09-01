@@ -189,6 +189,13 @@ def main() -> None:
         "session.fork_leaves_original_untouched",
         "session.resume_after_truncated_tail",
         "session.schema_version_from_the_future",
+        "session.seed_messages_persisted",
+        "session.resume_round_trips_a_real_run",
+        "session.chat_persists_each_turn_once",
+        "session.resumed_run_transcript_is_self_contained",
+        "session.construct_does_not_clobber_meta",
+        "session.open_preserves_meta",
+        "session.open_missing_run_raises",
         "cost.usage_totals_merge",
         "cost.run_accumulates_usage",
         "cost.cancelled_run_reports_usage",
@@ -354,7 +361,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "274 passed, 0 failed, 274 selected of 274 registered",
+        == "281 passed, 0 failed, 281 selected of 281 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -402,7 +409,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 274 registered"
+                "of 281 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -429,7 +436,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 274 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 281 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

@@ -7,10 +7,11 @@ import os
 import stat
 import tempfile
 import unittest.mock as mock
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from orchestra_api.agent_loop import ApiAgent
+from orchestra_api.agent_loop import AgentRunResult, ApiAgent
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.identity import SCHEMA_VERSION, new_agent_ref, new_id
 from orchestra_api.leader import Leader, LeaderConfig
@@ -149,11 +150,14 @@ def check_record_sequence() -> None:
             FakeModelProvider([_final_response()]),
             PermissionPolicy(repo_root=repo),
             "hello",
+            system_prompt="system guidance",
             session=store,
         )
         records, dropped = read_records(store.directory / "run.jsonl")
         expected = [
             "run_started",
+            "message",
+            "message",
             "turn_started",
             "request",
             "message",
@@ -541,13 +545,17 @@ def check_load_round_trip() -> None:
             ]
         )
         tools = standard_tool_registry(["read_file"])
+        seed = [
+            Message(role=Role.SYSTEM, content="load system"),
+            Message(role=Role.USER, content="load note.txt"),
+        ]
         result = ApiAgent(
             provider,
             tools,
             PermissionPolicy(repo_root=repo),
             agent_ref=agent_ref,
             transcript=store.writer_for(agent_ref.agent_id, is_root=True),
-        ).run([])
+        ).run(seed)
         loaded = load_run(store)
         records, _ = read_records(store.directory / "run.jsonl")
         expected_record_ids = [
@@ -808,18 +816,21 @@ def check_fork_leaves_original_untouched() -> None:
         source, _ = _seed_persisted_messages(
             root / "sessions", "fork-untouched-source", _resume_source_messages()
         )
+        source_directory = source.directory
+        source_run_id = source.run_id
 
         def snapshot() -> dict[str, tuple[bytes, int]]:
             return {
-                str(path.relative_to(source.directory)): (
+                str(path.relative_to(source_directory)): (
                     path.read_bytes(),
                     path.stat().st_mtime_ns,
                 )
-                for path in source.directory.rglob("*")
+                for path in source_directory.rglob("*")
                 if path.is_file()
             }
 
         before = snapshot()
+        source = SessionStore.open(root / "sessions", source_run_id)
         through = load_run(source).record_ids[-1]
         destination = SessionStore(root / "sessions", "fork-untouched-destination")
         fork_run(source, through_record_id=through, new_store=destination)
@@ -884,3 +895,225 @@ def check_schema_version_from_the_future() -> None:
                 fail(f"future-schema error did not name both versions: {error}")
         else:
             fail("future transcript schema was accepted")
+
+
+def _real_run(
+    root: Path, name: str
+) -> tuple[Path, SessionStore, AgentRunResult]:
+    repo = root / f"repo-{name}"
+    repo.mkdir()
+    store = SessionStore(root / "sessions", name)
+    result = run_task(
+        FakeModelProvider([_final_response("original answer")]),
+        PermissionPolicy(repo_root=repo),
+        "original question",
+        system_prompt="original system",
+        session=store,
+    )
+    return repo, store, result
+
+
+def _snapshot_directory(directory: Path) -> dict[str, tuple]:
+    snapshot: dict[str, tuple] = {
+        ".": ("directory", directory.stat().st_mtime_ns)
+    }
+    for path in sorted(directory.rglob("*")):
+        relative = str(path.relative_to(directory))
+        if path.is_file():
+            snapshot[relative] = ("file", path.read_bytes(), path.stat().st_mtime_ns)
+        elif path.is_dir():
+            snapshot[relative] = ("directory", path.stat().st_mtime_ns)
+    return snapshot
+
+
+@check("session.seed_messages_persisted")
+def check_seed_messages_persisted() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        _, store, result = _real_run(Path(temporary), "seed-persisted")
+        records, _ = read_records(store.directory / "run.jsonl")
+        expected_types = [
+            "run_started",
+            "message",
+            "message",
+            "turn_started",
+            "request",
+            "message",
+            "turn_finished",
+            "run_finished",
+        ]
+        message_records = [record for record in records if record["type"] == "message"]
+        if [record["type"] for record in records] != expected_types:
+            fail(f"seed messages were not persisted before the first turn: {records!r}")
+        if [record["data"]["role"] for record in message_records[:2]] != [
+            "system",
+            "user",
+        ]:
+            fail(f"seed role ordering changed: {message_records!r}")
+        if any(record["turn_id"] is not None for record in message_records[:2]):
+            fail(f"fresh seed messages gained envelope turn ids: {message_records!r}")
+        if load_run(store).messages != result.messages:
+            fail("real run did not load back into its complete conversation")
+        store.close()
+
+
+@check("session.resume_round_trips_a_real_run")
+def check_resume_round_trips_a_real_run() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo, source, original = _real_run(root, "real-resume-source")
+        loaded = load_run(source)
+        if loaded.messages != original.messages:
+            fail(f"real source run lost its seed conversation: {loaded!r}")
+        destination = SessionStore(root / "sessions", "real-resume-destination")
+        provider = _RecordingProvider([_final_response("resumed answer")])
+        resume_task(
+            provider,
+            PermissionPolicy(repo_root=repo),
+            "new prompt",
+            store=source,
+            new_store=destination,
+        )
+        expected = [*original.messages, Message(role=Role.USER, content="new prompt")]
+        request_messages = provider.requests[0].messages
+        if request_messages != expected:
+            fail(f"real resume request lost or reordered messages: {request_messages!r}")
+        if sum(message.role == Role.SYSTEM for message in request_messages) != 1:
+            fail("real resume request did not contain exactly one system message")
+        destination.close()
+
+
+@check("session.chat_persists_each_turn_once")
+def check_chat_persists_each_turn_once() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        store = SessionStore(root / "sessions", "chat-once")
+        leader = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(
+                    [_final_response("first answer"), _final_response("second answer")]
+                ),
+                subagent_provider=FakeModelProvider([_final_response("unused")]),
+                repo_root=str(repo),
+            ),
+            session=store,
+        )
+        leader.chat("first question")
+        second = leader.chat("second question")
+        records, _ = read_records(store.directory / "run.jsonl")
+        persisted = Counter(
+            json.dumps(record["data"], sort_keys=True, separators=(",", ":"))
+            for record in records
+            if record["type"] == "message"
+        )
+        held = Counter(
+            json.dumps(message_to_json(message), sort_keys=True, separators=(",", ":"))
+            for message in second.leader_messages
+        )
+        if persisted != held or any(count != 1 for count in persisted.values()):
+            fail(
+                "chat transcript duplicated or omitted accumulated history: "
+                f"persisted={persisted!r}, held={held!r}"
+            )
+        store.close()
+
+
+@check("session.resumed_run_transcript_is_self_contained")
+def check_resumed_run_transcript_is_self_contained() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo, source, _ = _real_run(root, "self-contained-source")
+        first_destination = SessionStore(
+            root / "sessions", "self-contained-first-resume"
+        )
+        first_result = resume_task(
+            FakeModelProvider([_final_response("first resumed answer")]),
+            PermissionPolicy(repo_root=repo),
+            "first resumed prompt",
+            store=source,
+            new_store=first_destination,
+        )
+        first_loaded = load_run(first_destination)
+        if first_loaded.messages != first_result.messages:
+            fail("resumed run transcript is not self-contained")
+        second_destination = SessionStore(
+            root / "sessions", "self-contained-second-resume"
+        )
+        provider = _RecordingProvider([_final_response("second resumed answer")])
+        resume_task(
+            provider,
+            PermissionPolicy(repo_root=repo),
+            "second resumed prompt",
+            store=first_destination,
+            new_store=second_destination,
+        )
+        expected = [
+            *first_result.messages,
+            Message(role=Role.USER, content="second resumed prompt"),
+        ]
+        if provider.requests[0].messages != expected:
+            fail("a second resume lost history from the first resumed run")
+        first_destination.close()
+        second_destination.close()
+
+
+@check("session.construct_does_not_clobber_meta")
+def check_construct_does_not_clobber_meta() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        _, store, result = _real_run(root, "construct-existing")
+        store.close()
+        path = store.directory / "meta.json"
+        before_bytes = path.read_bytes()
+        before = json.loads(before_bytes)
+        reopened = SessionStore(root / "sessions", store.run_id)
+        after_bytes = path.read_bytes()
+        after = reopened.read_meta()
+        if before_bytes != after_bytes:
+            fail("constructing an existing SessionStore rewrote meta.json")
+        if (
+            after["created_at"] != before["created_at"]
+            or after["agent_id"] != result.agent.agent_id
+            or after["stopped_reason"] != "final_response"
+        ):
+            fail(f"existing session metadata was reset: before={before!r}, after={after!r}")
+        reopened.close()
+
+
+@check("session.open_preserves_meta")
+def check_open_preserves_meta() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        _, store, result = _real_run(root, "open-existing")
+        store.close()
+        directory = store.directory
+        run_id = store.run_id
+        before = _snapshot_directory(directory)
+        opened = SessionStore.open(root / "sessions", run_id)
+        loaded = load_run(opened)
+        after = _snapshot_directory(directory)
+        if after != before:
+            fail("opening and loading an existing run changed bytes or mtimes")
+        if (
+            loaded.meta.get("agent_id") != result.agent.agent_id
+            or loaded.meta.get("stopped_reason") != "final_response"
+        ):
+            fail(f"opened run returned reset metadata: {loaded.meta!r}")
+        opened.close()
+
+
+@check("session.open_missing_run_raises")
+def check_open_missing_run_raises() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        sessions_root = Path(temporary) / "sessions"
+        missing_run_id = "missing-run-id"
+        try:
+            SessionStore.open(sessions_root, missing_run_id)
+        except SessionError as exc:
+            if missing_run_id not in str(exc):
+                fail(f"missing-run error did not name the run id: {exc}")
+        else:
+            fail("opening a missing run silently created it")
+        if sessions_root.exists():
+            fail("opening a missing run created the sessions root or an entry")
