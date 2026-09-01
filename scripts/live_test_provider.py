@@ -23,12 +23,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestra_api.models import Message, ModelRequest, Role  # noqa: E402
-from orchestra_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
-from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
-from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
-from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
-from orchestra_api.providers.openai_provider import OpenAIProvider  # noqa: E402
+from symphonai_api.models import Message, ModelRequest, Role  # noqa: E402
+from symphonai_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
+from symphonai_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
+from symphonai_api.providers.base import ModelProvider, ProviderError  # noqa: E402
+from symphonai_api.providers.gemini_provider import GeminiProvider  # noqa: E402
+from symphonai_api.providers.openai_provider import OpenAIProvider  # noqa: E402
 
 # Providers with their own wire format and a dedicated implementation.
 NATIVE_PROVIDERS = {
@@ -58,7 +58,7 @@ def _build(provider_name: str, model: str | None = None) -> ModelProvider:
 
 
 def report_configuration() -> None:
-    print("Orchestra API live-test (dry-run unless --live is passed)")
+    print("SymphonAI API live-test (dry-run unless --live is passed)")
     print()
     for name in ALL_PROVIDERS:
         provider = _build(name)

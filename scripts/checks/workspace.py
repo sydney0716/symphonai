@@ -14,11 +14,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestra_api.models import ToolCall  # noqa: E402
-from orchestra_api.permissions import PermissionPolicy  # noqa: E402
-from orchestra_api.runner import standard_tool_registry  # noqa: E402
-from orchestra_api.tools.base import LocalTool  # noqa: E402
-import orchestra_api.tools.filesystem as filesystem_tools  # noqa: E402
+from symphonai_api.models import ToolCall  # noqa: E402
+from symphonai_api.permissions import PermissionPolicy  # noqa: E402
+from symphonai_api.runner import standard_tool_registry  # noqa: E402
+from symphonai_api.tools.base import LocalTool  # noqa: E402
+import symphonai_api.tools.filesystem as filesystem_tools  # noqa: E402
 
 
 @dataclass(frozen=True)

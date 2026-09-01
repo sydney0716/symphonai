@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import unittest.mock as mock
-from orchestra_api.models import ToolCall
-import orchestra_api.tools.filesystem as filesystem_tools
+from symphonai_api.models import ToolCall
+import symphonai_api.tools.filesystem as filesystem_tools
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

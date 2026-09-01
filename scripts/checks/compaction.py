@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.compaction import (
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.compaction import (
     CLEARED_CONTENT_MARKER,
     COMPACTABLE_TOOL_NAMES,
     ContextCompactionError,
@@ -14,8 +14,8 @@ from orchestra_api.compaction import (
     estimate_messages_tokens,
     microcompact_messages,
 )
-from orchestra_api.models import ImageBlock, Message, Role, ToolCall, ToolResult
-from orchestra_api.tool_results import ToolResultStore, offload_tool_result
+from symphonai_api.models import ImageBlock, Message, Role, ToolCall, ToolResult
+from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from scripts.checks.harness import check, fail
 
 

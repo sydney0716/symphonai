@@ -5,13 +5,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import unittest.mock as mock
 
-from orchestra_api.budgets import RunBudget
-from orchestra_api.cancellation import OperationCancelled
-from orchestra_api.circuit_breaker import CircuitOpen, ConsecutiveFailureBreaker
-from orchestra_api.compaction import CompactionResult, ContextCompactionError
-from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall, Usage
-from orchestra_api.providers.fake import FakeModelProvider
+from symphonai_api.budgets import RunBudget
+from symphonai_api.cancellation import OperationCancelled
+from symphonai_api.circuit_breaker import CircuitOpen, ConsecutiveFailureBreaker
+from symphonai_api.compaction import CompactionResult, ContextCompactionError
+from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.providers.fake import FakeModelProvider
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -125,7 +125,7 @@ def check_leader_stops_automatic_compaction() -> None:
             )
         )
         with mock.patch(
-            "orchestra_api.leader.compact_messages_for_budget",
+            "symphonai_api.leader.compact_messages_for_budget",
             side_effect=failing_compactor,
         ):
             first = leader.chat("first")
@@ -170,7 +170,7 @@ def check_manual_compaction_still_runs() -> None:
             )
         )
         with mock.patch(
-            "orchestra_api.leader.compact_messages_for_budget",
+            "symphonai_api.leader.compact_messages_for_budget",
             side_effect=controlled_compactor,
         ):
             leader.chat("open the breaker")
@@ -333,7 +333,7 @@ def check_stopped_repairs_reported() -> None:
             return _unchanged_compaction(messages, budget)
 
         with mock.patch(
-            "orchestra_api.leader.compact_messages_for_budget",
+            "symphonai_api.leader.compact_messages_for_budget",
             side_effect=fail_post_run,
         ):
             chat_result = leader.chat("open compaction after the model run")

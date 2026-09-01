@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import copy
 
-from orchestra_api.compaction import (
+from symphonai_api.compaction import (
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_text_tokens,
 )
-from orchestra_api.context_report import ContextSource, account_context
-from orchestra_api.instructions import load_instructions
-from orchestra_api.models import ImageBlock, Message, Role, ToolCall, ToolResult
+from symphonai_api.context_report import ContextSource, account_context
+from symphonai_api.instructions import load_instructions
+from symphonai_api.models import ImageBlock, Message, Role, ToolCall, ToolResult
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

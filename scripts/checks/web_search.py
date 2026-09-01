@@ -12,13 +12,13 @@ import unittest.mock as mock
 from contextlib import contextmanager
 from typing import Iterator
 
-from orchestra_api.call_class import CallClass
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.models import ToolCall
-from orchestra_api.runner import standard_tool_registry
-from orchestra_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
-from orchestra_api.tools.web_search import WebSearchTool
-from orchestra_api.web_search import (
+from symphonai_api.call_class import CallClass
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.models import ToolCall
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
+from symphonai_api.tools.web_search import WebSearchTool
+from symphonai_api.web_search import (
     HttpJsonSearchBackend,
     SearchBackend,
     SearchBackendError,
@@ -30,7 +30,7 @@ from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
 
-KEY_ENV_VAR = "ORCHESTRA_WEB_SEARCH_TEST_KEY"
+KEY_ENV_VAR = "SYMPHONAI_WEB_SEARCH_TEST_KEY"
 
 
 def _endpoint(**overrides: object) -> SearchEndpoint:
@@ -223,7 +223,7 @@ def check_limit_clamped() -> None:
 def check_background_call_class() -> None:
     backend = HttpJsonSearchBackend(_endpoint())
     with _environment_value("background-secret"), mock.patch(
-        "orchestra_api.web_search.read_with_retry",
+        "symphonai_api.web_search.read_with_retry",
         return_value=b'{"outer":{"items":[]}}',
     ) as reader:
         backend.search("background", limit=5)

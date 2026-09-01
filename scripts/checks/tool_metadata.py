@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import FrozenInstanceError
-from orchestra_api import FAIL_CLOSED, InterruptBehavior, ResultHint, SCHEMA_VERSION, ToolEffect, ToolMetadata, safe_metadata
-from orchestra_api.cancellation import OperationCancelled
-from orchestra_api.models import ToolResult
-from orchestra_api.runner import standard_tool_registry
-from orchestra_api.tool_schema import to_provider_tool_schema
-from orchestra_api.tools.base import LocalTool
+from symphonai_api import FAIL_CLOSED, InterruptBehavior, ResultHint, SCHEMA_VERSION, ToolEffect, ToolMetadata, safe_metadata
+from symphonai_api.cancellation import OperationCancelled
+from symphonai_api.models import ToolResult
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tool_schema import to_provider_tool_schema
+from symphonai_api.tools.base import LocalTool
 from scripts.checks.harness import check, fail
 
 

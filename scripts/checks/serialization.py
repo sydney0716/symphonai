@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from orchestra_api.models import (
+from symphonai_api.models import (
     DocumentBlock,
     ImageBlock,
     Message,
@@ -15,14 +15,14 @@ from orchestra_api.models import (
     ToolCall,
     ToolResult,
 )
-from orchestra_api.serialization import (
+from symphonai_api.serialization import (
     content_blocks_from_json,
     message_from_json,
     message_to_json,
     tool_result_from_json,
     tool_result_to_json,
 )
-from orchestra_api.session import TranscriptError, TranscriptWriter
+from symphonai_api.session import TranscriptError, TranscriptWriter
 from scripts.checks.harness import check, fail
 
 

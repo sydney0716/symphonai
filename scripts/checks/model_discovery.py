@@ -6,12 +6,12 @@ import json
 import os
 import unittest.mock as mock
 from datetime import date, timedelta
-from orchestra_api.model_discovery import list_models
-from orchestra_api.providers.anthropic_provider import ANTHROPIC_VERSION, API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
-from orchestra_api.providers.anthropic_provider import AnthropicProvider
-from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
-from orchestra_api.providers.gemini_provider import GeminiProvider
-from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.model_discovery import list_models
+from symphonai_api.providers.anthropic_provider import ANTHROPIC_VERSION, API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
+from symphonai_api.providers.anthropic_provider import AnthropicProvider
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
+from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
 from scripts.checks.harness import check, fail
 
 
@@ -151,7 +151,7 @@ def check_discovery_gemini_models() -> None:
 @check("discovery.text_model_filter")
 def check_discovery_text_model_filter() -> None:
     # -- the coding-model filter: non-text modalities out, coding models in --
-    from orchestra_api.model_discovery import is_probably_text_model
+    from symphonai_api.model_discovery import is_probably_text_model
 
     must_keep = [
         "gpt-5-codex",            # "codex" must NOT be treated as non-text

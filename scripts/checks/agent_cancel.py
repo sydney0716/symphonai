@@ -6,16 +6,16 @@ import json
 import os
 import time
 import unittest.mock as mock
-from orchestra_api import ToolEffect, ToolMetadata
-from orchestra_api.agent_loop import ApiAgent
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.events import CollectingSink, RunFailed, RunFinished, RunStarted
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
-from orchestra_api.providers.base import ModelProvider, ProviderError
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
-from orchestra_api.providers.openai_provider import _build_request_body as _build_openai_body
-from orchestra_api.tools.base import LocalTool
+from symphonai_api import ToolEffect, ToolMetadata
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.events import CollectingSink, RunFailed, RunFinished, RunStarted
+from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
+from symphonai_api.providers.base import ModelProvider, ProviderError
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.providers.openai_provider import _build_request_body as _build_openai_body
+from symphonai_api.tools.base import LocalTool
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

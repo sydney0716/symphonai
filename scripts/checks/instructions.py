@@ -5,12 +5,12 @@ from __future__ import annotations
 import os
 import unittest.mock as mock
 
-import orchestra_api.instructions as instructions
-from orchestra_api.instructions import InstructionScope, load_instructions
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import run_task, standard_tool_registry
-from orchestra_api.tools.read_ledger import ReadLedger
+import symphonai_api.instructions as instructions
+from symphonai_api.instructions import InstructionScope, load_instructions
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import run_task, standard_tool_registry
+from symphonai_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -378,7 +378,7 @@ def check_user_scope_guards() -> None:
 @check("instructions.user_scope_relative_denylist")
 def check_user_scope_relative_denylist() -> None:
     with workspace() as ws:
-        user_home = ws.outside / "build" / ".orchestra"
+        user_home = ws.outside / "build" / ".symphonai"
         user_home.mkdir(parents=True)
         user_file = user_home / "CLAUDE.md"
         included = user_home / "style.md"

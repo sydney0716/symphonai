@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
-from orchestra_api.agent_loop import ApiAgent
-from orchestra_api.compaction import estimate_message_tokens, estimate_messages_tokens
-from orchestra_api.context_report import ContextSource, account_context
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import standard_tool_registry
-from orchestra_api.tool_results import (
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.compaction import estimate_message_tokens, estimate_messages_tokens
+from symphonai_api.context_report import ContextSource, account_context
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tool_results import (
     MAX_RESULT_SLICE_CHARS,
     MAX_STORE_CHARS,
     MAX_STORE_ENTRIES,
@@ -21,9 +21,9 @@ from orchestra_api.tool_results import (
     ToolResultStore,
     offload_tool_result,
 )
-from orchestra_api.tools.base import LocalTool
-from orchestra_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata, safe_metadata
-from orchestra_api.tools.stored_result import ReadToolResultTool
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata, safe_metadata
+from symphonai_api.tools.stored_result import ReadToolResultTool
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

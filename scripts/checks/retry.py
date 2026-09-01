@@ -15,20 +15,20 @@ import unittest.mock as mock
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
-from orchestra_api.call_class import CallClass
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.leader import Leader, LeaderConfig
-from orchestra_api.model_discovery import list_models
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
-from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
-from orchestra_api.providers.anthropic_provider import AnthropicProvider
-from orchestra_api.providers.base import ProviderError
-from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
-from orchestra_api.providers.gemini_provider import GeminiProvider
-from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider
-from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.retry import read_with_retry
+from symphonai_api.call_class import CallClass
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.leader import Leader, LeaderConfig
+from symphonai_api.model_discovery import list_models
+from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
+from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
+from symphonai_api.providers.anthropic_provider import AnthropicProvider
+from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
+from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.retry import read_with_retry
 from scripts.checks.harness import check, fail
 
 
@@ -90,7 +90,7 @@ def check_retry_backoff_wakes_promptly() -> None:
         timer.start()
         try:
             with mock.patch("urllib.request.urlopen", side_effect=retryable_error):
-                with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                     try:
                         read_with_retry(
                             retry_request,
@@ -130,8 +130,8 @@ def check_retry_cancel_none_uses_time_sleep() -> None:
         "urllib.request.urlopen",
         side_effect=[retryable_then_success, _FakeHttpResponse(b"ok")],
     ):
-        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-            with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                 raw = read_with_retry(
                     retry_request,
                     timeout=2.0,
@@ -198,8 +198,8 @@ def check_retry_http_503_succeeds() -> None:
                 _FakeHttpResponse(json.dumps(gemini_success).encode("utf-8")),
             ],
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                     retry_response = GeminiProvider().create_response(basic_request)
     if retry_response.message.text != "retry worked" or urlopen_mock.call_count != 2:
         fail("expected Gemini HTTP 503 to retry once and then succeed")
@@ -218,8 +218,8 @@ def check_retry_timeout_error_succeeds() -> None:
             "urllib.request.urlopen",
             side_effect=[TimeoutError("mock timeout"), _openai_success("timeout recovered")],
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                     timeout_response = OpenAIProvider().create_response(basic_request)
     if timeout_response.message.text != "timeout recovered" or urlopen_mock.call_count != 2:
         fail("expected TimeoutError to retry once and then succeed")
@@ -239,8 +239,8 @@ def check_retry_transient_urlerror_succeeds() -> None:
                 _openai_success("URL error recovered"),
             ],
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                     url_error_response = OpenAIProvider().create_response(basic_request)
     if url_error_response.message.text != "URL error recovered" or urlopen_mock.call_count != 2:
         fail("expected transient URLError to retry once and then succeed")
@@ -258,7 +258,7 @@ def check_retry_certificate_urlerror_fails_immediately() -> None:
             "urllib.request.urlopen",
             side_effect=urllib.error.URLError(certificate_error),
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 try:
                     OpenAIProvider().create_response(basic_request)
                 except ProviderError:
@@ -282,8 +282,8 @@ def check_retry_truncated_body_succeeds() -> None:
                 _openai_success("incomplete read recovered"),
             ],
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                     incomplete_response = OpenAIProvider().create_response(basic_request)
     if incomplete_response.message.text != "incomplete read recovered" or urlopen_mock.call_count != 2:
         fail("expected IncompleteRead to retry once and then succeed")
@@ -301,7 +301,7 @@ def check_retry_permanent_http_statuses_fail_immediately() -> None:
                 "urllib.request.urlopen",
                 side_effect=_http_error(permanent_status, '{"error":"permanent"}'),
             ) as urlopen_mock:
-                with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                     try:
                         OpenAIProvider().create_response(basic_request)
                     except ProviderError:
@@ -324,10 +324,10 @@ def check_retry_overall_deadline() -> None:
             "urllib.request.urlopen",
             side_effect=_http_error(503, '{"error":"late failure"}', retry_after="8"),
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 deadline_clock = iter([100.0, 100.0])
                 with mock.patch(
-                    "orchestra_api.retry.time.monotonic",
+                    "symphonai_api.retry.time.monotonic",
                     side_effect=lambda: next(deadline_clock, 129.75),
                 ):
                     try:
@@ -355,7 +355,7 @@ def check_retry_http_400_fails_immediately() -> None:
 
     with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: anthropic_retry_key}):
         with mock.patch("urllib.request.urlopen", side_effect=_always_400) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 try:
                     AnthropicProvider().create_response(basic_request)
                 except ProviderError:
@@ -377,8 +377,8 @@ def check_retry_exhausted_transient_failures() -> None:
 
     with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: openai_retry_key}):
         with mock.patch("urllib.request.urlopen", side_effect=_always_503) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                     try:
                         OpenAIProvider().create_response(basic_request)
                     except ProviderError as exc:
@@ -405,7 +405,7 @@ def check_retry_numeric_retry_after() -> None:
             _FakeHttpResponse(b"ok"),
         ],
     ) as urlopen_mock:
-        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
             raw = read_with_retry(
                 retry_request,
                 timeout=30.0,
@@ -430,8 +430,8 @@ def check_retry_http_date_retry_after() -> None:
             _FakeHttpResponse(b"ok"),
         ],
     ) as urlopen_mock:
-        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-            with mock.patch("orchestra_api.retry._utc_now", return_value=retry_now):
+        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry._utc_now", return_value=retry_now):
                 raw = read_with_retry(
                     retry_request,
                     timeout=30.0,
@@ -455,8 +455,8 @@ def check_retry_malformed_retry_after() -> None:
             _FakeHttpResponse(b"ok"),
         ],
     ) as urlopen_mock:
-        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-            with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                 raw = read_with_retry(
                     retry_request,
                     timeout=30.0,
@@ -479,7 +479,7 @@ def check_retry_retry_after_capped() -> None:
             _FakeHttpResponse(b"ok"),
         ],
     ) as urlopen_mock:
-        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
             raw = read_with_retry(
                 retry_request,
                 timeout=30.0,
@@ -496,7 +496,7 @@ def check_retry_keys_redacted() -> None:
     basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
     # -- vendor-controlled HTTP error bodies pass through the same key
     # redaction boundary for OpenAI-compatible providers too. --
-    redaction_key_env = "ORCHESTRA_RETRY_REDACTION_TEST_KEY"
+    redaction_key_env = "SYMPHONAI_RETRY_REDACTION_TEST_KEY"
     redaction_key = "secret-key-that-must-never-escape"
     redaction_provider = OpenAICompatibleProvider(
         api_key_env_var=redaction_key_env,
@@ -507,7 +507,7 @@ def check_retry_keys_redacted() -> None:
             "urllib.request.urlopen",
             side_effect=_http_error(401, f'{{"error":"bad key {redaction_key}"}}'),
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 try:
                     redaction_provider.create_response(basic_request)
                 except ProviderError as exc:
@@ -525,7 +525,7 @@ def check_retry_key_prefix_boundary_redacted() -> None:
     basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
     # -- redact before the 500-byte diagnostic cap. With truncation-first,
     # the first ten characters of this key would survive at the boundary. --
-    boundary_key_env = "ORCHESTRA_RETRY_BOUNDARY_KEY"
+    boundary_key_env = "SYMPHONAI_RETRY_BOUNDARY_KEY"
     boundary_key = "BOUNDARY_SECRET_PREFIX_0123456789"
     boundary_prefix = boundary_key[:10]
     boundary_provider = OpenAICompatibleProvider(
@@ -538,7 +538,7 @@ def check_retry_key_prefix_boundary_redacted() -> None:
             "urllib.request.urlopen",
             side_effect=_http_error(401, boundary_body),
         ):
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 try:
                     boundary_provider.create_response(basic_request)
                 except ProviderError as exc:
@@ -567,7 +567,7 @@ def check_overload_foreground_retries() -> None:
                 _FakeHttpResponse(b"ok"),
             ],
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 raw = read_with_retry(
                     retry_request,
                     timeout=30.0,
@@ -592,7 +592,7 @@ def check_overload_background_bails() -> None:
             "urllib.request.urlopen",
             side_effect=_http_error(status, f"overloaded {secret}", retry_after="1"),
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
                 try:
                     read_with_retry(
                         retry_request,
@@ -634,8 +634,8 @@ def check_background_still_retries_transient() -> None:
             "urllib.request.urlopen",
             side_effect=[transient, _FakeHttpResponse(b"ok")],
         ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
                     raw = read_with_retry(
                         retry_request,
                         timeout=30.0,
@@ -684,24 +684,24 @@ def check_providers_forward_call_class() -> None:
             "usageMetadata": {},
         }
     ).encode("utf-8")
-    compatible_env = "ORCHESTRA_CALL_CLASS_COMPATIBLE_KEY"
+    compatible_env = "SYMPHONAI_CALL_CLASS_COMPATIBLE_KEY"
     cases = [
         (
             OpenAIProvider(),
             API_KEY_ENV_VAR,
-            "orchestra_api.providers.openai_provider.read_with_retry",
+            "symphonai_api.providers.openai_provider.read_with_retry",
             openai_payload,
         ),
         (
             AnthropicProvider(),
             ANTHROPIC_API_KEY_ENV_VAR,
-            "orchestra_api.providers.anthropic_provider.read_with_retry",
+            "symphonai_api.providers.anthropic_provider.read_with_retry",
             anthropic_payload,
         ),
         (
             GeminiProvider(),
             GEMINI_API_KEY_ENV_VAR,
-            "orchestra_api.providers.gemini_provider.read_with_retry",
+            "symphonai_api.providers.gemini_provider.read_with_retry",
             gemini_payload,
         ),
         (
@@ -710,7 +710,7 @@ def check_providers_forward_call_class() -> None:
                 base_url="https://mock.invalid/v1",
             ),
             compatible_env,
-            "orchestra_api.providers.openai_compatible.read_with_retry",
+            "symphonai_api.providers.openai_compatible.read_with_retry",
             openai_payload,
         ),
     ]
@@ -723,7 +723,7 @@ def check_providers_forward_call_class() -> None:
 
     with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "test-key"}):
         with mock.patch(
-            "orchestra_api.model_discovery.read_with_retry",
+            "symphonai_api.model_discovery.read_with_retry",
             return_value=b'{"data":[]}',
         ) as discovery_retry:
             list_models(OpenAIProvider())

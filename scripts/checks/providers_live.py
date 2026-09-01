@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import os
 import unittest.mock as mock
-from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
-from orchestra_api.providers.gemini_provider import GeminiProvider
-from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
-from orchestra_api.runner import run_task
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
+from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.runner import run_task
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

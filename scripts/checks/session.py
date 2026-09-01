@@ -12,11 +12,11 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from orchestra_api.agent_loop import AgentRunResult, ApiAgent
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.identity import SCHEMA_VERSION, new_agent_ref, new_id
-from orchestra_api.leader import Leader, LeaderConfig
-from orchestra_api.models import (
+from symphonai_api.agent_loop import AgentRunResult, ApiAgent
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.identity import SCHEMA_VERSION, new_agent_ref, new_id
+from symphonai_api.leader import Leader, LeaderConfig
+from symphonai_api.models import (
     DocumentBlock,
     ImageBlock,
     Message,
@@ -27,12 +27,12 @@ from orchestra_api.models import (
     ToolCall,
     ToolResult,
 )
-from orchestra_api.permissions import PermissionPolicy
-from orchestra_api.providers.base import ModelProvider
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import resume_task, run_task, standard_tool_registry
-from orchestra_api.serialization import message_to_json
-from orchestra_api.session import (
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import resume_task, run_task, standard_tool_registry
+from symphonai_api.serialization import message_to_json
+from symphonai_api.session import (
     SessionError,
     SessionStore,
     TranscriptError,
@@ -43,8 +43,8 @@ from orchestra_api.session import (
     read_records,
     resume_run,
 )
-from orchestra_api.tools.base import LocalTool
-from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from scripts.checks.harness import check, fail
 
 
@@ -401,7 +401,7 @@ def check_meta_atomic_replace() -> None:
         transcript_before = (store.directory / "run.jsonl").read_bytes()
         meta = store.read_meta()
         meta["title"] = "updated atomically"
-        with mock.patch("orchestra_api.session.os.replace", wraps=os.replace) as replaced:
+        with mock.patch("symphonai_api.session.os.replace", wraps=os.replace) as replaced:
             store.write_meta(meta)
         if replaced.call_count != 1:
             fail("metadata rewrite did not use one atomic os.replace")
@@ -469,7 +469,7 @@ def check_sessions_root_env_override() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         override = Path(temporary) / "override-root"
         with mock.patch.dict(
-            os.environ, {"ORCHESTRA_SESSIONS_DIR": str(override)}, clear=False
+            os.environ, {"SYMPHONAI_SESSIONS_DIR": str(override)}, clear=False
         ):
             resolved = default_sessions_root()
         if resolved != override or override.exists():
@@ -681,7 +681,7 @@ def check_fork_prefix_only() -> None:
         root = Path(temporary)
         messages = _resume_source_messages()
         with mock.patch(
-            "orchestra_api.session._timestamp",
+            "symphonai_api.session._timestamp",
             return_value="2000-01-01T00:00:00.000Z",
         ):
             source, _ = _seed_persisted_messages(

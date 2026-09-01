@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import os
 import unittest.mock as mock
-from orchestra_api.models import Message, ModelRequest, Role
-from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
-from orchestra_api.providers.anthropic_provider import AnthropicProvider
-from orchestra_api.providers.base import ProviderError
-from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
-from orchestra_api.providers.gemini_provider import GeminiProvider
-from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider
-from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.models import Message, ModelRequest, Role
+from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
+from symphonai_api.providers.anthropic_provider import AnthropicProvider
+from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
+from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
 from scripts.checks.harness import check, fail
 
 
@@ -68,7 +68,7 @@ def check_providers_model_overrides() -> None:
     if anthropic_override_body.get("model") != "anthropic-wire-override":
         fail(f"Anthropic request model override did not reach body: {anthropic_override_body!r}")
 
-    compatible_override_env = "ORCHESTRA_MODEL_OVERRIDE_TEST_KEY"
+    compatible_override_env = "SYMPHONAI_MODEL_OVERRIDE_TEST_KEY"
     compatible_override_body: dict = {}
 
     def _fake_compatible_override_urlopen(request, timeout=None):  # noqa: ANN001
@@ -98,7 +98,7 @@ def check_providers_malformed_json() -> None:
     basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
     # -- every real provider normalizes malformed or non-object HTTP 200
     # JSON into ProviderError rather than leaking decoder/parser errors. --
-    malformed_compatible_env = "ORCHESTRA_MALFORMED_JSON_TEST_KEY"
+    malformed_compatible_env = "SYMPHONAI_MALFORMED_JSON_TEST_KEY"
     malformed_providers = [
         (OpenAIProvider(max_attempts=1), API_KEY_ENV_VAR, "openai-malformed-key"),
         (

@@ -6,13 +6,13 @@ import json
 import tempfile
 import unittest.mock as mock
 from pathlib import Path
-import orchestra_api.content as content
-from orchestra_api.compaction import _message_excerpts, estimate_message_tokens
-from orchestra_api.content import content_block_from_bytes, content_block_from_path, detect_media_type
-from orchestra_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, TextBlock, ToolCall, ToolResult, has_attachments, reject_system_attachments
-from orchestra_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body
-from orchestra_api.providers.gemini_provider import _build_request_body as _build_gemini_body
-from orchestra_api.providers.openai_provider import _build_request_body as _build_openai_body
+import symphonai_api.content as content
+from symphonai_api.compaction import _message_excerpts, estimate_message_tokens
+from symphonai_api.content import content_block_from_bytes, content_block_from_path, detect_media_type
+from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, TextBlock, ToolCall, ToolResult, has_attachments, reject_system_attachments
+from symphonai_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body
+from symphonai_api.providers.gemini_provider import _build_request_body as _build_gemini_body
+from symphonai_api.providers.openai_provider import _build_request_body as _build_openai_body
 from scripts.checks.harness import check, fail
 
 

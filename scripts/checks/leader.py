@@ -8,8 +8,8 @@ import os
 import unittest.mock as mock
 from dataclasses import fields
 
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.events import (
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.events import (
     CollectingSink,
     CompactionApplied,
     RunFailed,
@@ -18,9 +18,9 @@ from orchestra_api.events import (
     SubagentSpawned,
     ToolCallStarted,
 )
-import orchestra_api.leader as leader_module
-from orchestra_api.leader import DispatchSubagentTool, Leader, LeaderConfig
-from orchestra_api.models import (
+import symphonai_api.leader as leader_module
+from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig
+from symphonai_api.models import (
     Message,
     ModelRequest,
     ModelResponse,
@@ -28,19 +28,19 @@ from orchestra_api.models import (
     ToolCall,
     ToolResult,
 )
-from orchestra_api.permissions import PermissionPolicy
-from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.providers.gemini_provider import (
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.providers.gemini_provider import (
     API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
 )
-from orchestra_api.providers.gemini_provider import GeminiProvider
-from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider
-from orchestra_api.providers.openai_provider import (
+from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
+from symphonai_api.providers.openai_provider import (
     _build_request_body as _build_openai_body,
 )
-from orchestra_api.tools.base import LocalTool
-from orchestra_api.tools.metadata import (
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import (
     InterruptBehavior,
     ResultHint,
     ToolEffect,
@@ -51,7 +51,7 @@ from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
 
-OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "ORCHESTRA_OPENAI_COMPATIBLE_SMOKE_KEY"
+OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "SYMPHONAI_OPENAI_COMPATIBLE_SMOKE_KEY"
 
 
 def lifecycle(events: CollectingSink) -> list[tuple[str, str, str | None]]:
@@ -375,7 +375,7 @@ def check_cancellation_transcript() -> None:
         )
         cancelling_tool = _CancellingSubagentTool()
         with mock.patch(
-            "orchestra_api.leader.standard_tool_registry",
+            "symphonai_api.leader.standard_tool_registry",
             return_value={cancelling_tool.name: cancelling_tool},
         ):
             cancellation_result = cancellation_leader.chat(
@@ -490,7 +490,7 @@ def check_standalone_dispatch() -> None:
             ),
             policy,
         )
-        with mock.patch("orchestra_api.leader.emit") as standalone_emit:
+        with mock.patch("symphonai_api.leader.emit") as standalone_emit:
             standalone_result = standalone_tool.execute(
                 ToolCall(
                     id="standalone-dispatch",

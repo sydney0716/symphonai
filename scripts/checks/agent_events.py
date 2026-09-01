@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import unittest.mock as mock
-from orchestra_api.agent_loop import ApiAgent
-from orchestra_api.cancellation import OperationCancelled
-from orchestra_api.events import CollectingSink, RunFailed, RunFinished, RunStarted, ToolCallFinished, ToolCallStarted, TurnFinished, TurnStarted
-from orchestra_api.identity import TurnRef
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall
-from orchestra_api.providers.base import ModelProvider, ProviderError
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import standard_tool_registry
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.cancellation import OperationCancelled
+from symphonai_api.events import CollectingSink, RunFailed, RunFinished, RunStarted, ToolCallFinished, ToolCallStarted, TurnFinished, TurnStarted
+from symphonai_api.identity import TurnRef
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.providers.base import ModelProvider, ProviderError
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import standard_tool_registry
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -204,7 +204,7 @@ def check_events_stream_optional() -> None:
         def _fixed_turn(run_id: str, index: int) -> TurnRef:
             return TurnRef(turn_id=f"turn_fixed_{index}", run_id=run_id, index=index)
 
-        with mock.patch("orchestra_api.agent_loop.new_turn_ref", side_effect=_fixed_turn):
+        with mock.patch("symphonai_api.agent_loop.new_turn_ref", side_effect=_fixed_turn):
             without_events = ApiAgent(
                 FakeModelProvider([inert_response]), {}, policy
             ).run([Message(Role.USER, "same input")])

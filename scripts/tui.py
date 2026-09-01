@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin launcher for the optional Textual Orchestra TUI."""
+"""Thin launcher for the optional Textual SymphonAI TUI."""
 
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestra_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
-from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
-from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
-from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
-from orchestra_api.providers.openai_provider import OpenAIProvider  # noqa: E402
-from orchestra_api.providers.base import ModelProvider  # noqa: E402
+from symphonai_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
+from symphonai_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
+from symphonai_api.providers.fake import FakeModelProvider  # noqa: E402
+from symphonai_api.providers.gemini_provider import GeminiProvider  # noqa: E402
+from symphonai_api.providers.openai_provider import OpenAIProvider  # noqa: E402
+from symphonai_api.providers.base import ModelProvider  # noqa: E402
 
 NATIVE_PROVIDERS = {
     "openai": OpenAIProvider,
@@ -28,13 +28,13 @@ OFFLINE_PROVIDER = "fake"
 
 def _default_provider(role: str) -> str | None:
     return (
-        os.environ.get(f"ORCHESTRA_TUI_{role.upper()}_PROVIDER")
-        or os.environ.get("ORCHESTRA_TUI_PROVIDER")
+        os.environ.get(f"SYMPHONAI_TUI_{role.upper()}_PROVIDER")
+        or os.environ.get("SYMPHONAI_TUI_PROVIDER")
     )
 
 
 def _default_model(role: str) -> str | None:
-    return os.environ.get(f"ORCHESTRA_TUI_{role.upper()}_MODEL") or os.environ.get("ORCHESTRA_TUI_MODEL")
+    return os.environ.get(f"SYMPHONAI_TUI_{role.upper()}_MODEL") or os.environ.get("SYMPHONAI_TUI_MODEL")
 
 
 def _build_provider(provider_name: str, model: str | None) -> ModelProvider:
@@ -57,7 +57,7 @@ def _is_fully_specified(provider_name: str | None, model: str | None) -> bool:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Launch the Orchestra Leader Textual TUI.")
+    parser = argparse.ArgumentParser(description="Launch the SymphonAI Leader Textual TUI.")
     parser.add_argument("--leader-provider", default=_default_provider("leader"))
     parser.add_argument("--leader-model", default=_default_model("leader"))
     parser.add_argument("--subagent-provider", default=_default_provider("subagent"))
@@ -68,17 +68,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load_app_class():
     try:
-        from orchestra_tui.app import OrchestraTuiApp
+        from symphonai_tui.app import SymphonAITuiApp
     except ModuleNotFoundError as exc:
         if exc.name in {"textual", "rich"}:
             print(
-                "The Orchestra TUI requires the optional Textual extra.\n"
+                "The SymphonAI TUI requires the optional Textual extra.\n"
                 "Install it with: python3 -m pip install -e '.[tui]'",
                 file=sys.stderr,
             )
             return None
         raise
-    return OrchestraTuiApp
+    return SymphonAITuiApp
 
 
 def main() -> int:

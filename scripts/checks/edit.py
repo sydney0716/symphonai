@@ -6,9 +6,9 @@ import json
 import os
 import unittest.mock as mock
 from pathlib import Path
-from orchestra_api.models import ToolCall, ToolResult
-from orchestra_api.runner import standard_tool_registry
-import orchestra_api.tools.filesystem as filesystem_tools
+from symphonai_api.models import ToolCall, ToolResult
+from symphonai_api.runner import standard_tool_registry
+import symphonai_api.tools.filesystem as filesystem_tools
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

@@ -5,16 +5,16 @@ from __future__ import annotations
 import unittest.mock as mock
 from decimal import Decimal
 
-from orchestra_api.agent_loop import ApiAgent
-from orchestra_api.budgets import BudgetState, RunBudget
-from orchestra_api.cancellation import CancellationToken
-from orchestra_api.cost import ModelPrice, PriceTable, UsageTotals
-from orchestra_api.events import CollectingSink, RunFailed, RunFinished
-from orchestra_api.identity import AgentRef, RunRef, TurnRef
-from orchestra_api.leader import Leader, LeaderConfig
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall, Usage
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import run_task
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.budgets import BudgetState, RunBudget
+from symphonai_api.cancellation import CancellationToken
+from symphonai_api.cost import ModelPrice, PriceTable, UsageTotals
+from symphonai_api.events import CollectingSink, RunFailed, RunFinished
+from symphonai_api.identity import AgentRef, RunRef, TurnRef
+from symphonai_api.leader import Leader, LeaderConfig
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import run_task
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -76,9 +76,9 @@ def check_none_is_todays_behaviour() -> None:
             arguments = {"budget": None} if explicit_none else {}
             provider = FakeModelProvider(responses)
             agent = ApiAgent(provider, {}, ws.policy, agent_ref=agent_ref, **arguments)
-            with mock.patch("orchestra_api.agent_loop.new_run_ref", return_value=run_ref):
+            with mock.patch("symphonai_api.agent_loop.new_run_ref", return_value=run_ref):
                 with mock.patch(
-                    "orchestra_api.agent_loop.new_turn_ref",
+                    "symphonai_api.agent_loop.new_turn_ref",
                     side_effect=lambda run_id, index: TurnRef(
                         turn_id=f"turn_{index}", run_id=run_id, index=index
                     ),
@@ -106,9 +106,9 @@ def check_wall_time_stops_before_provider_call() -> None:
             ws.policy,
             budget=RunBudget(max_turns=3, wall_seconds=1),
         )
-        with mock.patch("orchestra_api.agent_loop.time.monotonic", return_value=0.0):
+        with mock.patch("symphonai_api.agent_loop.time.monotonic", return_value=0.0):
             with mock.patch(
-                "orchestra_api.budgets.time.monotonic",
+                "symphonai_api.budgets.time.monotonic",
                 side_effect=[0.0, 0.0, 2.0],
             ):
                 result = agent.run([Message(role=Role.USER, content="work")])
@@ -200,7 +200,7 @@ def check_reason_precedence() -> None:
         max_cost=Decimal(0),
         price_table=_price_table(),
     )
-    with mock.patch("orchestra_api.budgets.time.monotonic", return_value=2.0):
+    with mock.patch("symphonai_api.budgets.time.monotonic", return_value=2.0):
         if state.exceeded(all_limits) != "budget_wall_time":
             fail("wall time did not take precedence over token and cost ceilings")
 
@@ -210,7 +210,7 @@ def check_reason_precedence() -> None:
         max_cost=Decimal(0),
         price_table=_price_table(),
     )
-    with mock.patch("orchestra_api.budgets.time.monotonic", return_value=0.0):
+    with mock.patch("symphonai_api.budgets.time.monotonic", return_value=0.0):
         if state.exceeded(token_and_cost) != "budget_tokens":
             fail("tokens did not take precedence over the cost ceiling")
 

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from orchestra_api.models import ToolCall
-from orchestra_api.permissions import DenialReason, PermissionPolicy
-from orchestra_api.tools.shell_classify import classify
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import DenialReason, PermissionPolicy
+from symphonai_api.tools.shell_classify import classify
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

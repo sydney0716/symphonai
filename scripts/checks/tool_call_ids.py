@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from orchestra_api.models import Message, ModelRequest, Role, ToolCall, ToolResult
-from orchestra_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body
-from orchestra_api.providers.anthropic_provider import _parse_response as _parse_anthropic_response
-from orchestra_api.providers.gemini_provider import _build_request_body as _build_gemini_body
-from orchestra_api.providers.gemini_provider import _parse_response as _parse_gemini_response
-from orchestra_api.providers.openai_provider import _build_request_body as _build_openai_body
-from orchestra_api.providers.openai_provider import _parse_response as _parse_openai_response
+from symphonai_api.models import Message, ModelRequest, Role, ToolCall, ToolResult
+from symphonai_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body
+from symphonai_api.providers.anthropic_provider import _parse_response as _parse_anthropic_response
+from symphonai_api.providers.gemini_provider import _build_request_body as _build_gemini_body
+from symphonai_api.providers.gemini_provider import _parse_response as _parse_gemini_response
+from symphonai_api.providers.openai_provider import _build_request_body as _build_openai_body
+from symphonai_api.providers.openai_provider import _parse_response as _parse_openai_response
 from scripts.checks.harness import check, fail
 
 

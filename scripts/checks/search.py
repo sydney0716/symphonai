@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import unittest.mock as mock
 from pathlib import Path
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.models import ToolCall
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.models import ToolCall
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import search_tree
 

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from orchestra_api import ToolEffect, ToolMetadata
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.runner import run_task, standard_tool_registry
-from orchestra_api.tools.base import LocalTool
+from symphonai_api import ToolEffect, ToolMetadata
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import run_task, standard_tool_registry
+from symphonai_api.tools.base import LocalTool
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

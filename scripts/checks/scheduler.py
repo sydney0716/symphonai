@@ -8,21 +8,21 @@ import unittest.mock as mock
 from collections import Counter
 from types import SimpleNamespace
 
-from orchestra_api.agent_loop import ApiAgent
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.events import (
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.events import (
     CollectingSink,
     ToolCallFinished,
     ToolCallStarted,
 )
-from orchestra_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
-from orchestra_api.permissions import PermissionPolicy
-from orchestra_api.providers.fake import FakeModelProvider
-from orchestra_api.scheduler import partition_tool_calls
-from orchestra_api.tools.base import LocalTool
-from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
-import orchestra_api.tools.read_ledger as read_ledger
-from orchestra_api.tools.read_ledger import ReadLedger
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.scheduler import partition_tool_calls
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+import symphonai_api.tools.read_ledger as read_ledger
+from symphonai_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

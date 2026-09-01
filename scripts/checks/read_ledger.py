@@ -7,12 +7,12 @@ import unittest.mock as mock
 from pathlib import Path
 from types import SimpleNamespace
 
-from orchestra_api.models import ToolCall
-from orchestra_api.runner import standard_tool_registry
-import orchestra_api.tools.filesystem as filesystem
-import orchestra_api.tools.read_ledger as read_ledger
-from orchestra_api.tools.filesystem import MAX_READ_LINES
-from orchestra_api.tools.read_ledger import ReadLedger
+from symphonai_api.models import ToolCall
+from symphonai_api.runner import standard_tool_registry
+import symphonai_api.tools.filesystem as filesystem
+import symphonai_api.tools.read_ledger as read_ledger
+from symphonai_api.tools.filesystem import MAX_READ_LINES
+from symphonai_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

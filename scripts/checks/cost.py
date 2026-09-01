@@ -8,19 +8,19 @@ from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 
-from orchestra_api.agent_loop import ApiAgent
-from orchestra_api.cancellation import CancellationToken
-from orchestra_api.cost import (
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.cancellation import CancellationToken
+from symphonai_api.cost import (
     ModelPrice,
     PriceTable,
     UsageTotals,
     load_price_table,
     total_cost,
 )
-from orchestra_api.events import Event
-from orchestra_api.leader import Leader, LeaderConfig
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
-from orchestra_api.providers.fake import FakeModelProvider
+from symphonai_api.events import Event
+from symphonai_api.leader import Leader, LeaderConfig
+from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.providers.fake import FakeModelProvider
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 

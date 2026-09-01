@@ -7,13 +7,13 @@ import unittest.mock as mock
 from dataclasses import dataclass
 from email.message import Message as HeaderMessage
 
-from orchestra_api.permissions import DenialReason, PermissionPolicy
-from orchestra_api.runner import standard_tool_registry
-from orchestra_api.tools.metadata import ToolEffect, ToolMetadata
-from orchestra_api.tools.web_fetch import WebFetchTool
-from orchestra_api.web import MAX_FETCH_BYTES, MAX_REDIRECTS, WebFetchError, fetch_url
-from orchestra_api.web_domains import preapproved_domains
-from orchestra_api.models import ToolCall
+from symphonai_api.permissions import DenialReason, PermissionPolicy
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.web_fetch import WebFetchTool
+from symphonai_api.web import MAX_FETCH_BYTES, MAX_REDIRECTS, WebFetchError, fetch_url
+from symphonai_api.web_domains import preapproved_domains
+from symphonai_api.models import ToolCall
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -85,7 +85,7 @@ def _patched_opener(routes: dict[str, _Response | _Redirect]):
         opened.append(opener)
         return opener
 
-    return mock.patch("orchestra_api.web.urllib.request.build_opener", side_effect=build), opened
+    return mock.patch("symphonai_api.web.urllib.request.build_opener", side_effect=build), opened
 
 
 def _call(url: str, index: int = 0) -> ToolCall:
@@ -295,7 +295,7 @@ def check_domain_table_missing_is_empty() -> None:
     try:
         for content in (None, "{broken"):
             preapproved_domains.cache_clear()
-            with mock.patch("orchestra_api.web_domains.resources.files", return_value=_Resource(content)):
+            with mock.patch("symphonai_api.web_domains.resources.files", return_value=_Resource(content)):
                 if preapproved_domains() != ():
                     fail(f"missing or malformed domain table was not fail-closed: {content!r}")
     finally:
@@ -307,7 +307,7 @@ def check_domain_table_missing_is_empty() -> None:
 @check("web_fetch.subdomain_not_inherited")
 def check_subdomain_not_inherited() -> None:
     with workspace() as ws, mock.patch(
-        "orchestra_api.permissions.preapproved_domains",
+        "symphonai_api.permissions.preapproved_domains",
         return_value=("docs.python.org",),
     ):
         policy = PermissionPolicy(repo_root=ws.root)

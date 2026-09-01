@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from orchestra_api import ToolEffect, ToolMetadata
-from orchestra_api.models import ToolCall
-from orchestra_api.permissions import (
+from symphonai_api import ToolEffect, ToolMetadata
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import (
     MAX_SHELL_OUTPUT_CHARS,
     MIN_SHELL_OUTPUT_CHARS,
     PermissionPolicy,
 )
-from orchestra_api.runner import standard_tool_registry
-from orchestra_api.tools.shell_classify import classify
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tools.shell_classify import classify
 from scripts.checks.harness import check, fail, ok
 
 

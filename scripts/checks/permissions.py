@@ -7,8 +7,8 @@ import threading
 import time
 from dataclasses import fields
 
-from orchestra_api.models import ToolCall
-from orchestra_api.permissions import (
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import (
     DenialReason,
     PermissionDecision,
     PermissionPolicy,

@@ -17,21 +17,21 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestra_api.cancellation import CancellationToken  # noqa: E402
-from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall  # noqa: E402
-from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
-from orchestra_api.events import Event, RunStarted, SubagentSpawned  # noqa: E402
-from orchestra_api.providers.fake import FakeModelProvider  # noqa: E402
-from orchestra_tui.app import (  # noqa: E402
+from symphonai_api.cancellation import CancellationToken  # noqa: E402
+from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall  # noqa: E402
+from symphonai_api.providers.base import ModelProvider, ProviderError  # noqa: E402
+from symphonai_api.events import Event, RunStarted, SubagentSpawned  # noqa: E402
+from symphonai_api.providers.fake import FakeModelProvider  # noqa: E402
+from symphonai_tui.app import (  # noqa: E402
     AGENT_STATE_CANCELLED,
     AGENT_STATE_DONE,
     AGENT_STATE_EXHAUSTED,
     AGENT_STATE_FAILED,
     AGENT_STATE_WORKING,
-    OrchestraTuiApp,
+    SymphonAITuiApp,
     ToolApprovalScreen,
 )
-from orchestra_tui.picker import (  # noqa: E402
+from symphonai_tui.picker import (  # noqa: E402
     ProviderConfirmationScreen,
     ProviderPickerScreen,
     build_picker_provider,
@@ -123,7 +123,7 @@ async def smoke_success_case(root: Path) -> None:
             ModelResponse(message=Message(role=Role.ASSISTANT, content="assistant reply from leader")),
         ]
     )
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=root,
@@ -160,7 +160,7 @@ async def smoke_success_case(root: Path) -> None:
 
 
 async def smoke_error_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FailingProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -184,7 +184,7 @@ async def smoke_error_case(root: Path) -> None:
 
 async def smoke_stop_case(root: Path) -> None:
     provider = BlockingProvider()
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=provider,
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -221,7 +221,7 @@ async def smoke_stop_before_worker_starts_case(root: Path) -> None:
     stubs the worker out entirely and asserts the invariant directly: once
     on_input_submitted has marked the turn in flight, a token exists.
     """
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -250,7 +250,7 @@ async def smoke_unknown_event_case(root: Path) -> None:
     events.emit swallows sink exceptions at runtime, so this guard can only be
     observed by calling the sink directly -- which is exactly what this does.
     """
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -269,7 +269,7 @@ async def smoke_unknown_event_case(root: Path) -> None:
 
 
 async def smoke_idle_stop_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -295,7 +295,7 @@ async def smoke_idle_stop_case(root: Path) -> None:
 
 
 async def smoke_small_terminal_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -307,7 +307,7 @@ async def smoke_small_terminal_case(root: Path) -> None:
 
 
 async def smoke_terminal_status_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -350,7 +350,7 @@ async def smoke_terminal_status_case(root: Path) -> None:
 
 
 async def smoke_duplicate_agent_label_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -419,8 +419,8 @@ async def smoke_picker_success_case(root: Path) -> None:
             return ["claude-picked-subagent", "claude-other"]
         return [f"{provider.name}-model"]
 
-    app = OrchestraTuiApp(repo_root=root, confirm_real_providers=False)
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=fake_list_models):
+    app = SymphonAITuiApp(repo_root=root, confirm_real_providers=False)
+    with mock.patch("symphonai_tui.picker.list_models", side_effect=fake_list_models):
         async with app.run_test(size=(82, 28)) as pilot:
             screen = await wait_for_picker(pilot)
 
@@ -473,8 +473,8 @@ async def smoke_picker_fallback_case(root: Path) -> None:
     def failing_list_models(provider: ModelProvider, *, include_all: bool = False) -> list[str]:
         raise ProviderError("scripted listing failure")
 
-    app = OrchestraTuiApp(repo_root=root, confirm_real_providers=False)
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=failing_list_models):
+    app = SymphonAITuiApp(repo_root=root, confirm_real_providers=False)
+    with mock.patch("symphonai_tui.picker.list_models", side_effect=failing_list_models):
         async with app.run_test(size=(82, 28)) as pilot:
             screen = await wait_for_picker(pilot)
             set_select(screen, "leader-provider", "openai")
@@ -517,8 +517,8 @@ async def smoke_picker_include_all_case(root: Path) -> None:
             return ["visible-text-model", "hidden-image-model"]
         return ["visible-text-model"]
 
-    app = OrchestraTuiApp(repo_root=root, confirm_real_providers=False)
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=fake_list_models):
+    app = SymphonAITuiApp(repo_root=root, confirm_real_providers=False)
+    with mock.patch("symphonai_tui.picker.list_models", side_effect=fake_list_models):
         async with app.run_test(size=(82, 28)) as pilot:
             screen = await wait_for_picker(pilot)
             set_select(screen, "leader-provider", "openai")
@@ -555,8 +555,8 @@ async def smoke_confirmation_before_discovery_case(root: Path) -> None:
         discovery_calls.append(provider.name)
         return [getattr(provider, "model", "model")]
 
-    app = OrchestraTuiApp(repo_root=root)
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=fake_list_models):
+    app = SymphonAITuiApp(repo_root=root)
+    with mock.patch("symphonai_tui.picker.list_models", side_effect=fake_list_models):
         async with app.run_test(size=(82, 28)) as pilot:
             picker = await wait_for_picker(pilot)
             set_select(picker, "leader-provider", "openai")
@@ -573,7 +573,7 @@ async def smoke_confirmation_before_discovery_case(root: Path) -> None:
 
 
 async def smoke_slash_commands_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -650,7 +650,7 @@ async def smoke_slash_commands_case(root: Path) -> None:
 
 
 async def smoke_model_command_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -698,14 +698,14 @@ async def smoke_model_preselection_and_divider_case(root: Path) -> None:
     def fake_list_models(provider: ModelProvider, *, include_all: bool = False) -> list[str]:
         return [getattr(provider, "model", ""), "replacement-model"]
 
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=root,
         confirm_real_providers=False,
     )
     app.chat_entries.append(("leader", "old transcript"))
-    with mock.patch("orchestra_tui.picker.list_models", side_effect=fake_list_models):
+    with mock.patch("symphonai_tui.picker.list_models", side_effect=fake_list_models):
         async with app.run_test(size=(82, 28)) as pilot:
             await submit_message(pilot, "/model")
             screen = await wait_for_picker(pilot)
@@ -735,7 +735,7 @@ async def smoke_model_preselection_and_divider_case(root: Path) -> None:
 
 
 async def smoke_exit_command_case(root: Path) -> None:
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=FakeModelProvider(),
         subagent_provider=FakeModelProvider(),
         repo_root=root,
@@ -791,7 +791,7 @@ async def smoke_approval_case(
             ModelResponse(message=Message(role=Role.ASSISTANT, content="leader saw tool result")),
         ]
     )
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=root,
@@ -886,7 +886,7 @@ async def smoke_approval_stop_case(root: Path) -> None:
             ModelResponse(message=Message(role=Role.ASSISTANT, content="unused")),
         ]
     )
-    app = OrchestraTuiApp(
+    app = SymphonAITuiApp(
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=root,

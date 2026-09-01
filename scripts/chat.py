@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminal chat CLI for the orchestra_api Leader.
+"""Terminal chat CLI for the symphonai_api Leader.
 
 Pick a leader provider+model and a subagent provider+model at startup
 (one shared provider for all subagents in the session), then chat with
@@ -22,20 +22,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestra_api.events import (  # noqa: E402
+from symphonai_api.events import (  # noqa: E402
     Event,
     RunFailed,
     RunFinished,
     RunStarted,
     SubagentSpawned,
 )
-from orchestra_api.leader import Leader, LeaderConfig  # noqa: E402
-from orchestra_api.model_discovery import list_models  # noqa: E402
-from orchestra_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
-from orchestra_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
-from orchestra_api.providers.base import ModelProvider, ProviderError  # noqa: E402
-from orchestra_api.providers.gemini_provider import GeminiProvider  # noqa: E402
-from orchestra_api.providers.openai_provider import OpenAIProvider  # noqa: E402
+from symphonai_api.leader import Leader, LeaderConfig  # noqa: E402
+from symphonai_api.model_discovery import list_models  # noqa: E402
+from symphonai_api.provider_catalog import build_catalog_provider, catalog_keys  # noqa: E402
+from symphonai_api.providers.anthropic_provider import AnthropicProvider  # noqa: E402
+from symphonai_api.providers.base import ModelProvider, ProviderError  # noqa: E402
+from symphonai_api.providers.gemini_provider import GeminiProvider  # noqa: E402
+from symphonai_api.providers.openai_provider import OpenAIProvider  # noqa: E402
 
 # Providers with their own wire format and a dedicated implementation.
 NATIVE_PROVIDERS = {
@@ -46,7 +46,7 @@ NATIVE_PROVIDERS = {
 
 # Everything else is an OpenAI-compatible endpoint from the catalog, which
 # is configuration rather than new provider code. Catalog entries are
-# unverified -- see orchestra_api/provider_catalog.py.
+# unverified -- see symphonai_api/provider_catalog.py.
 NATIVE_CHOICES = list(NATIVE_PROVIDERS)
 CATALOG_CHOICES = catalog_keys()
 ALL_CHOICES = NATIVE_CHOICES + CATALOG_CHOICES
@@ -162,7 +162,7 @@ def _provider_summary(provider: ModelProvider) -> str:
 
 
 def main() -> int:
-    print("Orchestra API terminal chat")
+    print("SymphonAI API terminal chat")
     print("Pick a provider for the leader and for subagents (one shared provider for all subagents).")
     print()
 

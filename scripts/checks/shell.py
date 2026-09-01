@@ -9,10 +9,10 @@ import sys
 import threading
 import time
 import unittest.mock as mock
-from orchestra_api.cancellation import CancellationToken, OperationCancelled
-from orchestra_api.models import ToolCall
-from orchestra_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
-from orchestra_api.tools.shell import RunShellTool, _terminate_process_group
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
+from symphonai_api.tools.shell import RunShellTool, _terminate_process_group
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -43,10 +43,10 @@ def check_shell_process_group_fallback() -> None:
                     "same-group termination test did not exercise the guard: "
                     f"child={child_pgid}, current={current_pgid}"
                 )
-            with mock.patch("orchestra_api.tools.shell.os.killpg") as killpg_mock:
+            with mock.patch("symphonai_api.tools.shell.os.killpg") as killpg_mock:
                 _terminate_process_group(same_group_proc)
             if killpg_mock.called:
-                fail("same-group termination attempted to signal orchestra's process group")
+                fail("same-group termination attempted to signal SymphonAI's process group")
             try:
                 same_group_proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
@@ -82,7 +82,7 @@ def check_shell_cancellation_reaps_child() -> None:
         shell_timer.start()
         try:
             with mock.patch(
-                "orchestra_api.tools.shell.subprocess.Popen",
+                "symphonai_api.tools.shell.subprocess.Popen",
                 side_effect=_capturing_popen,
             ):
                 try:
