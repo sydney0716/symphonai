@@ -306,6 +306,7 @@ class GeminiProvider(ModelProvider):
             api_key=api_key,
             operation="Gemini API",
             cancel=cancel,
+            call_class=request.call_class,
         )
         data = parse_json_object(raw, "Gemini API")
 

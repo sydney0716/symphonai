@@ -109,6 +109,12 @@ def main() -> None:
         "retry.retry_after_capped",
         "retry.keys_redacted",
         "retry.key_prefix_boundary_redacted",
+        "retry.overload_foreground_retries",
+        "retry.overload_background_bails",
+        "retry.background_still_retries_transient",
+        "retry.call_class_defaults_foreground",
+        "retry.providers_forward_call_class",
+        "retry.leader_subagents_are_background",
         "discovery.openai_models",
         "discovery.anthropic_models",
         "discovery.gemini_models",
@@ -287,7 +293,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "207 passed, 0 failed, 207 selected of 207 registered",
+        == "213 passed, 0 failed, 213 selected of 213 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -308,14 +314,14 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 207 registered",
+            == "1 passed, 0 failed, 1 selected of 213 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
     listed_retry = invoke_check("--list", "--only", "retry")
     require(listed_retry.returncode == 0, f"filtered list failed: {listed_retry.stderr!r}")
     require(
-        listed_retry.stdout.splitlines() == expected_names[17:34],
+        listed_retry.stdout.splitlines() == expected_names[17:40],
         f"unexpected filtered list: {listed_retry.stdout!r}",
     )
 
@@ -324,7 +330,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 207 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 213 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

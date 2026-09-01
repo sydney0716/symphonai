@@ -15,6 +15,7 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 
 from orchestra_api.budgets import BudgetState, RunBudget, DEFAULT_MAX_TURNS
+from orchestra_api.call_class import CallClass
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.cost import UsageTotals
 from orchestra_api.events import (
@@ -84,6 +85,7 @@ class ApiAgent:
         agent_ref: AgentRef | None = None,
         events: EventSink | None = None,
         budget: RunBudget | None = None,
+        call_class: CallClass = CallClass.FOREGROUND,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns < 1:
@@ -93,6 +95,7 @@ class ApiAgent:
         self._policy = policy
         self._max_turns = effective_max_turns
         self._budget = budget
+        self._call_class = call_class
         self._result_store = result_store
         self._agent_ref = agent_ref or new_agent_ref("agent")
         self._events = events
@@ -213,7 +216,10 @@ class ApiAgent:
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)
                 request = ModelRequest(
-                    messages=list(conversation), model=model, tools=self._tool_schemas
+                    messages=list(conversation),
+                    model=model,
+                    tools=self._tool_schemas,
+                    call_class=self._call_class,
                 )
                 if cancel is None:
                     response = self._provider.create_response(request)

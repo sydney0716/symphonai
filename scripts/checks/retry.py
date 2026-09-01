@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import http.client
 import io
+import inspect
 import json
 import os
 import ssl
+import tempfile
 import threading
 import time
 import unittest.mock as mock
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from orchestra_api.call_class import CallClass
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
+from orchestra_api.leader import Leader, LeaderConfig
 from orchestra_api.model_discovery import list_models
-from orchestra_api.models import Message, ModelRequest, Role
+from orchestra_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
 from orchestra_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
 from orchestra_api.providers.anthropic_provider import AnthropicProvider
 from orchestra_api.providers.base import ProviderError
@@ -23,6 +27,7 @@ from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_AP
 from orchestra_api.providers.gemini_provider import GeminiProvider
 from orchestra_api.providers.openai_compatible import OpenAICompatibleProvider
 from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from orchestra_api.providers.fake import FakeModelProvider
 from orchestra_api.retry import read_with_retry
 from scripts.checks.harness import check, fail
 
@@ -71,40 +76,45 @@ def _openai_success(content: str) -> _FakeHttpResponse:
 @check("retry.backoff_wakes_promptly")
 def check_retry_backoff_wakes_promptly() -> None:
     retry_request = urllib.request.Request("https://mock.invalid/test")
-    backoff_token = CancellationToken()
-    timer = threading.Timer(0.02, backoff_token.cancel)
-    retryable_error = urllib.error.HTTPError(
-        retry_request.full_url,
-        503,
-        "unavailable",
-        {},
-        io.BytesIO(b"retry later"),
-    )
-    started = time.monotonic()
-    timer.start()
-    try:
-        with mock.patch("urllib.request.urlopen", side_effect=retryable_error):
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                try:
-                    read_with_retry(
-                        retry_request,
-                        timeout=2.0,
-                        api_key="test-key",
-                        operation="cancel test",
-                        cancel=backoff_token,
-                    )
-                except OperationCancelled as exc:
-                    if isinstance(exc, ProviderError):
-                        fail("OperationCancelled was wrapped as ProviderError")
-                else:
-                    fail("interruptible retry backoff did not raise OperationCancelled")
-                if sleep_mock.called:
-                    fail("cancellable retry backoff called time.sleep")
-    finally:
-        timer.cancel()
-        timer.join()
-    if time.monotonic() - started >= 0.3:
-        fail("retry backoff cancellation did not wake promptly")
+    for call_class in CallClass:
+        backoff_token = CancellationToken()
+        timer = threading.Timer(0.02, backoff_token.cancel)
+        retryable_error = urllib.error.HTTPError(
+            retry_request.full_url,
+            503,
+            "unavailable",
+            {},
+            io.BytesIO(b"retry later"),
+        )
+        started = time.monotonic()
+        timer.start()
+        try:
+            with mock.patch("urllib.request.urlopen", side_effect=retryable_error):
+                with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                    try:
+                        read_with_retry(
+                            retry_request,
+                            timeout=2.0,
+                            api_key="test-key",
+                            operation="cancel test",
+                            cancel=backoff_token,
+                            call_class=call_class,
+                        )
+                    except OperationCancelled as exc:
+                        if isinstance(exc, ProviderError):
+                            fail("OperationCancelled was wrapped as ProviderError")
+                    else:
+                        fail(
+                            f"{call_class.value} retry backoff did not raise "
+                            "OperationCancelled"
+                        )
+                    if sleep_mock.called:
+                        fail("cancellable retry backoff called time.sleep")
+        finally:
+            timer.cancel()
+            timer.join()
+        if time.monotonic() - started >= 0.3:
+            fail(f"{call_class.value} retry cancellation did not wake promptly")
 
 @check("retry.cancel_none_uses_time_sleep")
 def check_retry_cancel_none_uses_time_sleep() -> None:
@@ -385,104 +395,100 @@ def check_retry_exhausted_transient_failures() -> None:
 
 @check("retry.numeric_retry_after")
 def check_retry_numeric_retry_after() -> None:
-    # -- model discovery shares the retry transport and honours a
-    # numeric Retry-After value instead of exponential backoff. --
-    compatible_key_env = "ORCHESTRA_RETRY_AFTER_TEST_KEY"
-    compatible_retry_key = "compatible-retry-test-key-do-not-use"
-    compatible_provider = OpenAICompatibleProvider(
-        api_key_env_var=compatible_key_env,
-        base_url="https://mock.invalid/v1",
-        max_attempts=2,
-    )
-    with mock.patch.dict(os.environ, {compatible_key_env: compatible_retry_key}):
-        with mock.patch(
-            "urllib.request.urlopen",
-            side_effect=[
-                _http_error(429, '{"error":"slow down"}', retry_after="2"),
-                _FakeHttpResponse(b'{"data":[{"id":"retry-after-model"}]}'),
-            ],
-        ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                retry_after_models = list_models(compatible_provider)
-    if retry_after_models != ["retry-after-model"] or urlopen_mock.call_count != 2:
-        fail("expected model discovery to retry HTTP 429 and return the model listing")
+    # -- a foreground call honours numeric Retry-After instead of exponential
+    # backoff. Model discovery is background and now correctly bails on 429. --
+    retry_request = urllib.request.Request("https://mock.invalid/retry-after")
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=[
+            _http_error(429, '{"error":"slow down"}', retry_after="2"),
+            _FakeHttpResponse(b"ok"),
+        ],
+    ) as urlopen_mock:
+        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            raw = read_with_retry(
+                retry_request,
+                timeout=30.0,
+                max_attempts=2,
+                api_key="test-key",
+                operation="numeric Retry-After test",
+            )
+    if raw != b"ok" or urlopen_mock.call_count != 2:
+        fail("expected foreground HTTP 429 to honour numeric Retry-After")
     sleep_mock.assert_called_once_with(2.0)
 
 @check("retry.http_date_retry_after")
 def check_retry_http_date_retry_after() -> None:
-    compatible_key_env = "ORCHESTRA_RETRY_AFTER_TEST_KEY"
-    compatible_retry_key = "compatible-retry-test-key-do-not-use"
-    compatible_provider = OpenAICompatibleProvider(
-        api_key_env_var=compatible_key_env,
-        base_url="https://mock.invalid/v1",
-        max_attempts=2,
-    )
     # -- RFC 9110 also permits Retry-After as an HTTP-date. --
     retry_now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
     retry_at = format_datetime(retry_now + timedelta(seconds=4), usegmt=True)
-    with mock.patch.dict(os.environ, {compatible_key_env: compatible_retry_key}):
-        with mock.patch(
-            "urllib.request.urlopen",
-            side_effect=[
-                _http_error(429, '{"error":"wait until date"}', retry_after=retry_at),
-                _FakeHttpResponse(b'{"data":[{"id":"http-date-model"}]}'),
-            ],
-        ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry._utc_now", return_value=retry_now):
-                    http_date_models = list_models(compatible_provider)
-    if http_date_models != ["http-date-model"] or urlopen_mock.call_count != 2:
-        fail("expected HTTP-date Retry-After to delay and retry model discovery")
+    retry_request = urllib.request.Request("https://mock.invalid/retry-after")
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=[
+            _http_error(429, '{"error":"wait until date"}', retry_after=retry_at),
+            _FakeHttpResponse(b"ok"),
+        ],
+    ) as urlopen_mock:
+        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("orchestra_api.retry._utc_now", return_value=retry_now):
+                raw = read_with_retry(
+                    retry_request,
+                    timeout=30.0,
+                    max_attempts=2,
+                    api_key="test-key",
+                    operation="HTTP-date Retry-After test",
+                )
+    if raw != b"ok" or urlopen_mock.call_count != 2:
+        fail("expected foreground HTTP-date Retry-After to delay and retry")
     sleep_mock.assert_called_once_with(4.0)
 
 @check("retry.malformed_retry_after")
 def check_retry_malformed_retry_after() -> None:
-    compatible_key_env = "ORCHESTRA_RETRY_AFTER_TEST_KEY"
-    compatible_retry_key = "compatible-retry-test-key-do-not-use"
-    compatible_provider = OpenAICompatibleProvider(
-        api_key_env_var=compatible_key_env,
-        base_url="https://mock.invalid/v1",
-        max_attempts=2,
-    )
     # -- malformed Retry-After is not a zero-second hint; it falls back
     # to the normal exponential delay. --
-    with mock.patch.dict(os.environ, {compatible_key_env: compatible_retry_key}):
-        with mock.patch(
-            "urllib.request.urlopen",
-            side_effect=[
-                _http_error(429, '{"error":"bad hint"}', retry_after="not-a-date"),
-                _FakeHttpResponse(b'{"data":[{"id":"fallback-model"}]}'),
-            ],
-        ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
-                    fallback_models = list_models(compatible_provider)
-    if fallback_models != ["fallback-model"] or urlopen_mock.call_count != 2:
-        fail("expected malformed Retry-After to fall back and retry")
+    retry_request = urllib.request.Request("https://mock.invalid/retry-after")
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=[
+            _http_error(429, '{"error":"bad hint"}', retry_after="not-a-date"),
+            _FakeHttpResponse(b"ok"),
+        ],
+    ) as urlopen_mock:
+        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+                raw = read_with_retry(
+                    retry_request,
+                    timeout=30.0,
+                    max_attempts=2,
+                    api_key="test-key",
+                    operation="malformed Retry-After test",
+                )
+    if raw != b"ok" or urlopen_mock.call_count != 2:
+        fail("expected malformed Retry-After to fall back and retry foreground")
     sleep_mock.assert_called_once_with(0.5)
 
 @check("retry.retry_after_capped")
 def check_retry_retry_after_capped() -> None:
-    compatible_key_env = "ORCHESTRA_RETRY_AFTER_TEST_KEY"
-    compatible_retry_key = "compatible-retry-test-key-do-not-use"
-    compatible_provider = OpenAICompatibleProvider(
-        api_key_env_var=compatible_key_env,
-        base_url="https://mock.invalid/v1",
-        max_attempts=2,
-    )
     # -- an excessive Retry-After is bounded by the per-sleep cap. --
-    with mock.patch.dict(os.environ, {compatible_key_env: compatible_retry_key}):
-        with mock.patch(
-            "urllib.request.urlopen",
-            side_effect=[
-                _http_error(429, '{"error":"long hint"}', retry_after="120"),
-                _FakeHttpResponse(b'{"data":[{"id":"capped-model"}]}'),
-            ],
-        ) as urlopen_mock:
-            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
-                capped_models = list_models(compatible_provider)
-    if capped_models != ["capped-model"] or urlopen_mock.call_count != 2:
-        fail("expected capped Retry-After to retry model discovery")
+    retry_request = urllib.request.Request("https://mock.invalid/retry-after")
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=[
+            _http_error(429, '{"error":"long hint"}', retry_after="120"),
+            _FakeHttpResponse(b"ok"),
+        ],
+    ) as urlopen_mock:
+        with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+            raw = read_with_retry(
+                retry_request,
+                timeout=30.0,
+                max_attempts=2,
+                api_key="test-key",
+                operation="capped Retry-After test",
+            )
+    if raw != b"ok" or urlopen_mock.call_count != 2:
+        fail("expected capped Retry-After to retry foreground")
     sleep_mock.assert_called_once_with(8.0)
 
 @check("retry.keys_redacted")
@@ -547,3 +553,236 @@ def check_retry_key_prefix_boundary_redacted() -> None:
     if "[redacted]" not in boundary_message:
         fail(f"expected redaction marker in boundary error: {boundary_message!r}")
     sleep_mock.assert_not_called()
+
+
+@check("retry.overload_foreground_retries")
+def check_overload_foreground_retries() -> None:
+    retry_request = urllib.request.Request("https://mock.invalid/overload")
+    for status in (429, 529):
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[
+                _http_error(status, "overloaded", retry_after="1"),
+                _http_error(status, "still overloaded", retry_after="1"),
+                _FakeHttpResponse(b"ok"),
+            ],
+        ) as urlopen_mock:
+            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                raw = read_with_retry(
+                    retry_request,
+                    timeout=30.0,
+                    max_attempts=3,
+                    api_key="test-key",
+                    operation=f"foreground HTTP {status}",
+                    call_class=CallClass.FOREGROUND,
+                )
+        if raw != b"ok" or urlopen_mock.call_count != 3:
+            fail(f"foreground HTTP {status} did not use its retry budget")
+        if sleep_mock.call_args_list != [mock.call(1.0), mock.call(1.0)]:
+            fail(f"foreground HTTP {status} did not honor Retry-After")
+
+
+@check("retry.overload_background_bails")
+def check_overload_background_bails() -> None:
+    retry_request = urllib.request.Request("https://mock.invalid/overload")
+    secret = "background-secret-must-not-escape"
+    for status in (429, 529):
+        operation = f"background HTTP {status} test"
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=_http_error(status, f"overloaded {secret}", retry_after="1"),
+        ) as urlopen_mock:
+            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                try:
+                    read_with_retry(
+                        retry_request,
+                        timeout=30.0,
+                        max_attempts=3,
+                        api_key=secret,
+                        operation=operation,
+                        call_class=CallClass.BACKGROUND,
+                    )
+                except ProviderError as exc:
+                    message = str(exc)
+                else:
+                    fail(f"background HTTP {status} retried instead of raising")
+        if urlopen_mock.call_count != 1 or sleep_mock.called:
+            fail(f"background HTTP {status} did not bail on its first response")
+        expected_parts = (
+            operation,
+            f"HTTP {status}",
+            "the first attempt",
+            "background calls do not retry provider overload",
+        )
+        if any(part not in message for part in expected_parts):
+            fail(f"background overload error omitted its reason: {message!r}")
+        if secret in message:
+            fail(f"background overload error leaked its API key: {message!r}")
+
+
+@check("retry.background_still_retries_transient")
+def check_background_still_retries_transient() -> None:
+    retry_request = urllib.request.Request("https://mock.invalid/transient")
+    failures = {
+        "HTTP 500": _http_error(500, "server error"),
+        "timeout": TimeoutError("timed out"),
+        "incomplete read": http.client.IncompleteRead(b"partial", 10),
+        "connection": ConnectionError("reset"),
+    }
+    for label, transient in failures.items():
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[transient, _FakeHttpResponse(b"ok")],
+        ) as urlopen_mock:
+            with mock.patch("orchestra_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("orchestra_api.retry.random.uniform", return_value=0.0):
+                    raw = read_with_retry(
+                        retry_request,
+                        timeout=30.0,
+                        max_attempts=2,
+                        api_key="test-key",
+                        operation=f"background {label}",
+                        call_class=CallClass.BACKGROUND,
+                    )
+        if raw != b"ok" or urlopen_mock.call_count != 2:
+            fail(f"background {label} did not retain transient retry behavior")
+        sleep_mock.assert_called_once_with(0.5)
+
+
+@check("retry.call_class_defaults_foreground")
+def check_call_class_defaults_foreground() -> None:
+    request = ModelRequest(messages=[])
+    if request.call_class is not CallClass.FOREGROUND:
+        fail(f"ModelRequest defaulted to {request.call_class!r}")
+    default = inspect.signature(read_with_retry).parameters["call_class"].default
+    if default is not CallClass.FOREGROUND:
+        fail(f"read_with_retry defaulted to {default!r}")
+
+
+@check("retry.providers_forward_call_class")
+def check_providers_forward_call_class() -> None:
+    request = ModelRequest(
+        messages=[Message(role=Role.USER, content="background")],
+        call_class=CallClass.BACKGROUND,
+    )
+    openai_payload = json.dumps(
+        {
+            "choices": [
+                {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+            ],
+            "usage": {},
+        }
+    ).encode("utf-8")
+    anthropic_payload = json.dumps(
+        {"content": [{"type": "text", "text": "ok"}], "usage": {}, "stop_reason": "end_turn"}
+    ).encode("utf-8")
+    gemini_payload = json.dumps(
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {},
+        }
+    ).encode("utf-8")
+    compatible_env = "ORCHESTRA_CALL_CLASS_COMPATIBLE_KEY"
+    cases = [
+        (
+            OpenAIProvider(),
+            API_KEY_ENV_VAR,
+            "orchestra_api.providers.openai_provider.read_with_retry",
+            openai_payload,
+        ),
+        (
+            AnthropicProvider(),
+            ANTHROPIC_API_KEY_ENV_VAR,
+            "orchestra_api.providers.anthropic_provider.read_with_retry",
+            anthropic_payload,
+        ),
+        (
+            GeminiProvider(),
+            GEMINI_API_KEY_ENV_VAR,
+            "orchestra_api.providers.gemini_provider.read_with_retry",
+            gemini_payload,
+        ),
+        (
+            OpenAICompatibleProvider(
+                api_key_env_var=compatible_env,
+                base_url="https://mock.invalid/v1",
+            ),
+            compatible_env,
+            "orchestra_api.providers.openai_compatible.read_with_retry",
+            openai_payload,
+        ),
+    ]
+    for provider, env_var, patch_target, payload in cases:
+        with mock.patch.dict(os.environ, {env_var: "test-key"}):
+            with mock.patch(patch_target, return_value=payload) as retry_mock:
+                provider.create_response(request)
+        if retry_mock.call_args.kwargs.get("call_class") is not CallClass.BACKGROUND:
+            fail(f"{provider.name} did not forward ModelRequest.call_class")
+
+    with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "test-key"}):
+        with mock.patch(
+            "orchestra_api.model_discovery.read_with_retry",
+            return_value=b'{"data":[]}',
+        ) as discovery_retry:
+            list_models(OpenAIProvider())
+    if discovery_retry.call_args.kwargs.get("call_class") is not CallClass.BACKGROUND:
+        fail("model discovery did not classify its transport as background")
+
+
+@check("retry.leader_subagents_are_background")
+def check_leader_subagents_are_background() -> None:
+    class _RecordingFakeProvider(FakeModelProvider):
+        def __init__(self, responses: list[ModelResponse]) -> None:
+            super().__init__(responses)
+            self.requests: list[ModelRequest] = []
+
+        def create_response(
+            self,
+            request: ModelRequest,
+            *,
+            cancel: CancellationToken | None = None,
+        ) -> ModelResponse:
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    leader_provider = _RecordingFakeProvider(
+        [
+            ModelResponse(
+                message=Message(
+                    role=Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            id="dispatch",
+                            name="dispatch_subagent",
+                            arguments={"subagent_name": "worker", "task": "work"},
+                        )
+                    ],
+                )
+            ),
+            ModelResponse(message=Message(role=Role.ASSISTANT, content="done")),
+        ]
+    )
+    subagent_provider = _RecordingFakeProvider(
+        [ModelResponse(message=Message(role=Role.ASSISTANT, content="worked"))]
+    )
+    with tempfile.TemporaryDirectory() as root:
+        Leader(
+            LeaderConfig(
+                leader_provider=leader_provider,
+                subagent_provider=subagent_provider,
+                repo_root=root,
+            )
+        ).run("delegate")
+
+    if not leader_provider.requests or any(
+        request.call_class is not CallClass.FOREGROUND
+        for request in leader_provider.requests
+    ):
+        fail(f"leader requests were not all foreground: {leader_provider.requests!r}")
+    if not subagent_provider.requests or any(
+        request.call_class is not CallClass.BACKGROUND
+        for request in subagent_provider.requests
+    ):
+        fail(f"subagent requests were not all background: {subagent_provider.requests!r}")

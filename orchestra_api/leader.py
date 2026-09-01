@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from orchestra_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from orchestra_api.budgets import RunBudget
+from orchestra_api.call_class import CallClass
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.cost import UsageTotals
 from orchestra_api.compaction import (
@@ -280,6 +281,7 @@ class DispatchSubagentTool(LocalTool):
                     agent_ref=agent_ref,
                     events=self._events,
                     budget=self._subagent_budget,
+                    call_class=CallClass.BACKGROUND,
                 ),
                 agent_ref=agent_ref,
             )
@@ -395,6 +397,7 @@ class Leader:
             tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.wire_format)],
             agent_ref=self._agent_ref,
             events=self._event_sink,
+            call_class=CallClass.FOREGROUND,
         )
         self._chat_messages: list[Message] = []
 

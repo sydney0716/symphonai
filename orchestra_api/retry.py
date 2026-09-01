@@ -12,6 +12,7 @@ import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
+from orchestra_api.call_class import CallClass
 from orchestra_api.cancellation import CancellationToken, OperationCancelled
 from orchestra_api.providers.base import ProviderError
 
@@ -19,6 +20,7 @@ DEFAULT_MAX_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
 MAX_RETRY_DELAY_SECONDS = 8.0
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 529})
+OVERLOAD_STATUS_CODES = frozenset({429, 529})
 NON_RETRYABLE_SERVER_STATUS_CODES = frozenset({501, 505, 511})
 MAX_ERROR_DETAIL_BYTES = 500
 
@@ -47,6 +49,7 @@ def read_with_retry(
     api_key: str,
     operation: str,
     cancel: CancellationToken | None = None,
+    call_class: CallClass = CallClass.FOREGROUND,
 ) -> bytes:
     """Open ``request`` and return its body, retrying transient failures.
 
@@ -78,6 +81,14 @@ def read_with_retry(
                 return body
         except urllib.error.HTTPError as exc:
             detail = _redacted_error_detail(exc.read(), api_key)
+            if exc.code in OVERLOAD_STATUS_CODES and call_class is CallClass.BACKGROUND:
+                attempt_text = (
+                    "the first attempt" if attempt == 1 else f"attempt {attempt}"
+                )
+                raise ProviderError(
+                    f"{operation} returned HTTP {exc.code} on {attempt_text} "
+                    "and did not retry: background calls do not retry provider overload"
+                ) from None
             if _is_retryable_status(exc.code) and _wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,

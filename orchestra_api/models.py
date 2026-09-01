@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from orchestra_api.call_class import CallClass
 from orchestra_api.identity import SCHEMA_VERSION
 
 
@@ -225,6 +226,7 @@ class ModelRequest:
     model: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    call_class: CallClass = CallClass.FOREGROUND
 
 
 @dataclass(frozen=True)

@@ -226,6 +226,7 @@ class AnthropicProvider(ModelProvider):
             api_key=api_key,
             operation="Anthropic API",
             cancel=cancel,
+            call_class=request.call_class,
         )
         data = parse_json_object(raw, "Anthropic API")
 

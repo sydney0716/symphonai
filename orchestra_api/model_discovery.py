@@ -21,7 +21,7 @@ from orchestra_api.providers.anthropic_provider import (
 from orchestra_api.providers.base import ModelProvider, ProviderError
 from orchestra_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
 from orchestra_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_API_KEY_ENV_VAR
-from orchestra_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
+from orchestra_api.retry import CallClass, DEFAULT_MAX_ATTEMPTS, read_with_retry
 
 
 # Substrings marking a model as something other than a text-generating LLM.
@@ -213,6 +213,7 @@ def _get_json(
         max_attempts=getattr(provider, "max_attempts", DEFAULT_MAX_ATTEMPTS),
         api_key=api_key,
         operation=f"{provider.name} model listing",
+        call_class=CallClass.BACKGROUND,
     ).decode("utf-8")
 
     try:
