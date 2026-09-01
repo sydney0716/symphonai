@@ -14,11 +14,15 @@ caller (see `orchestra_api.tools`) is allowed to.
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal
+from urllib.parse import urlsplit
+
+from orchestra_api.web_domains import preapproved_domains
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     ".env",
@@ -79,6 +83,9 @@ class DenialReason(str, Enum):
     DENIED_BY_USER = "denied_by_user"
     INVALID_APPROVAL = "invalid_approval"
     PLAN_MODE = "plan_mode"
+    UNSUPPORTED_SCHEME = "unsupported_scheme"
+    BLOCKED_HOST = "blocked_host"
+    DOMAIN_NOT_APPROVED = "domain_not_approved"
 
 
 @dataclass(frozen=True)
@@ -133,6 +140,8 @@ class PermissionPolicy:
     forbidden_patterns: tuple[str, ...] = DEFAULT_FORBIDDEN_PATTERNS
     shell_enabled: bool = False
     shell_allowlist: list[tuple[str, ...]] = field(default_factory=list)
+    fetch_enabled: bool = False
+    fetch_allowlist: list[str] = field(default_factory=list)
     shell_timeout_seconds: float = 10.0
     shell_output_limit_chars: int = DEFAULT_SHELL_OUTPUT_CHARS
     mode: PermissionMode = "auto"
@@ -141,6 +150,9 @@ class PermissionPolicy:
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
         self.allowed_write_scope = [Path(p).resolve() for p in self.allowed_write_scope]
+        self.fetch_allowlist = [
+            host.casefold().rstrip(".") for host in self.fetch_allowlist
+        ]
         self.shell_output_limit_chars = max(
             MIN_SHELL_OUTPUT_CHARS,
             min(MAX_SHELL_OUTPUT_CHARS, int(self.shell_output_limit_chars)),
@@ -222,6 +234,65 @@ class PermissionPolicy:
         return PermissionDecision.deny(
             f"path is outside the explicit allowed write scope: {path!r}",
             denial=DenialReason.OUTSIDE_WRITE_SCOPE,
+        )
+
+    # -- fetch checks -------------------------------------------------------
+
+    def check_fetch(self, url: str) -> PermissionDecision:
+        try:
+            parsed = urlsplit(url)
+            scheme = parsed.scheme.casefold()
+        except (TypeError, ValueError):
+            scheme = ""
+            parsed = None
+        if scheme not in ("http", "https"):
+            return PermissionDecision.deny(
+                "web_fetch supports only http and https URLs",
+                denial=DenialReason.UNSUPPORTED_SCHEME,
+            )
+
+        try:
+            host = (parsed.hostname or "").casefold().rstrip(".")
+        except ValueError:
+            host = ""
+        blocked = not host or host == "localhost" or host.endswith(
+            (".localhost", ".local")
+        )
+        if not blocked:
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            if address is not None:
+                blocked = any(
+                    (
+                        address.is_loopback,
+                        address.is_private,
+                        address.is_link_local,
+                        address.is_reserved,
+                        address.is_unspecified,
+                        address.is_multicast,
+                    )
+                )
+        if blocked:
+            return PermissionDecision.deny(
+                f"web_fetch blocks host {host or '[missing]'}",
+                denial=DenialReason.BLOCKED_HOST,
+            )
+
+        if host in preapproved_domains() or host in self.fetch_allowlist:
+            return PermissionDecision.allow()
+        if self.mode in ("prompt", "accept_edits"):
+            return self._ask_approval(
+                operation="web_fetch",
+                target=url,
+                details=f"HTTP GET from {host}",
+            )
+        if self.fetch_enabled:
+            return PermissionDecision.allow()
+        return PermissionDecision.deny(
+            f"domain is not approved for web_fetch: {host}",
+            denial=DenialReason.DOMAIN_NOT_APPROVED,
         )
 
     # -- shell checks -------------------------------------------------------

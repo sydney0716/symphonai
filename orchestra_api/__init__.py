@@ -50,6 +50,16 @@ from orchestra_api.tools.metadata import (
     ToolMetadata,
     safe_metadata,
 )
+from orchestra_api.tools.web_fetch import WebFetchTool
+from orchestra_api.web import (
+    DEFAULT_FETCH_TIMEOUT_SECONDS,
+    MAX_FETCH_BYTES,
+    MAX_REDIRECTS,
+    FetchedPage,
+    WebFetchError,
+    fetch_url,
+)
+from orchestra_api.web_domains import preapproved_domains
 
 __all__ = [
     "AgentRef",
@@ -59,8 +69,11 @@ __all__ = [
     "ContentBlock",
     "Event",
     "EventSink",
+    "FetchedPage",
     "FAIL_CLOSED",
     "InterruptBehavior",
+    "MAX_FETCH_BYTES",
+    "MAX_REDIRECTS",
     "Message",
     "ModelRequest",
     "ModelResponse",
@@ -84,10 +97,15 @@ __all__ = [
     "TurnRef",
     "TurnStarted",
     "Usage",
+    "WebFetchError",
+    "WebFetchTool",
+    "DEFAULT_FETCH_TIMEOUT_SECONDS",
+    "fetch_url",
     "new_agent_ref",
     "new_id",
     "new_run_ref",
     "new_turn_ref",
+    "preapproved_domains",
     "safe_metadata",
     "wire_tool_call_ids",
 ]

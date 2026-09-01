@@ -257,6 +257,23 @@ def main() -> None:
         "shell.cancellation_kills_group",
         "shell.cancellation_bounded",
         "shell.execution_paths",
+        "web_fetch.get_only_schema",
+        "web_fetch.preapproved_no_prompt",
+        "web_fetch.unapproved_auto_denied",
+        "web_fetch.unapproved_prompt_asks",
+        "web_fetch.scheme_denied",
+        "web_fetch.blocked_hosts",
+        "web_fetch.redirect_offsite_refused",
+        "web_fetch.redirect_onsite_followed",
+        "web_fetch.redirect_limit",
+        "web_fetch.size_cap_refuses",
+        "web_fetch.content_type_refused",
+        "web_fetch.html_to_text",
+        "web_fetch.domain_table_missing_is_empty",
+        "web_fetch.subdomain_not_inherited",
+        "web_fetch.plan_mode_allows_fetch",
+        "web_fetch.metadata_contract",
+        "web_fetch.registry_registration",
         "providers_live.openai_tools_and_model_override",
         "providers_live.gemini_tools_and_model_override",
         "providers_live.gemini_thought_signature",
@@ -300,7 +317,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "220 passed, 0 failed, 220 selected of 220 registered",
+        == "237 passed, 0 failed, 237 selected of 237 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -321,7 +338,7 @@ def main() -> None:
         )
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 220 registered",
+            == "1 passed, 0 failed, 1 selected of 237 registered",
             f"standalone check selected more than one entry: {selected_alone.stdout!r}",
         )
 
@@ -347,7 +364,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 220 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 237 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

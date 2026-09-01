@@ -132,7 +132,7 @@ def _selfcheck() -> None:
             first.policy.allowed_write_scope == [first.root],
             "policy write scope changed",
         )
-        _require(len(first.tools) == 8, "workspace registry is not complete")
+        _require(len(first.tools) == 9, "workspace registry is not complete")
 
         read = first.tools["read_file"].execute(
             ToolCall(

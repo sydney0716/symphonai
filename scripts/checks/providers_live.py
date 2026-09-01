@@ -66,6 +66,7 @@ def check_providers_live_openai_tools_and_model_override() -> None:
                 "glob",
                 "grep",
                 "run_shell",
+                "web_fetch",
             }
             if sent_tool_names != expected_tool_names:
                 fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
@@ -95,6 +96,7 @@ def check_providers_live_gemini_tools_and_model_override() -> None:
                 "glob",
                 "grep",
                 "run_shell",
+                "web_fetch",
             }
             # -- regression: a real GeminiProvider request must carry the eight
             # tools as sanitized tools[].functionDeclarations, not raw schemas --

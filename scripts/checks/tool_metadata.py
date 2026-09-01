@@ -101,6 +101,7 @@ def check_tools_metadata_contract() -> None:
         "glob": {"pattern": "**/*.py", "path": "sample-dir"},
         "grep": {"pattern": "needle", "path": "sample-dir"},
         "run_shell": {"argv": ["ls"]},
+        "web_fetch": {"url": "https://docs.python.org/3/"},
     }
     expected_metadata = {
         "read_file": ToolMetadata(
@@ -156,6 +157,15 @@ def check_tools_metadata_contract() -> None:
             effect=ToolEffect.READ_ONLY,
             concurrency_safe=True,
             paths=None,
+            result_hint=ResultHint.TEXT,
+            interrupt_behavior=InterruptBehavior.CANCEL,
+        ),
+        # paths=() and not None: a fetch provably touches no path, which is a
+        # different answer from run_shell's "not derivable from the arguments".
+        "web_fetch": ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=True,
+            paths=(),
             result_hint=ResultHint.TEXT,
             interrupt_behavior=InterruptBehavior.CANCEL,
         ),

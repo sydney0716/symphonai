@@ -16,3 +16,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["orchestra_api*", "orchestra_tui*"]
+
+[tool.setuptools.package-data]
+"orchestra_api.data" = ["*.json"]

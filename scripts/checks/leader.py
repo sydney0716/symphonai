@@ -1155,6 +1155,7 @@ def check_anthropic_subagent_tool_schemas() -> None:
                 "glob",
                 "grep",
                 "run_shell",
+                "web_fetch",
             }
             if sent_tool_names != expected_tool_names:
                 fail(f"expected subagent request to include {expected_tool_names}, got {sent_tool_names!r}")
@@ -1314,6 +1315,7 @@ def check_openai_compatible_tool_schemas() -> None:
                 "glob",
                 "grep",
                 "run_shell",
+                "web_fetch",
             }
             compatible_leader_requests: list[dict] = []
             compatible_subagent_requests: list[dict] = []

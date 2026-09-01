@@ -25,6 +25,7 @@ from orchestra_api.tools.read_ledger import ReadLedger
 from orchestra_api.tools.search import GlobTool, GrepTool
 from orchestra_api.tools.shell import RunShellTool
 from orchestra_api.tools.stored_result import ReadToolResultTool
+from orchestra_api.tools.web_fetch import WebFetchTool
 
 
 def standard_tool_registry(
@@ -33,7 +34,7 @@ def standard_tool_registry(
     ledger: ReadLedger | None = None,
     result_store: ToolResultStore | None = None,
 ) -> dict[str, LocalTool]:
-    """The eight standard tools, plus read_tool_result when a store is supplied.
+    """The nine standard tools, plus read_tool_result when a store is supplied.
 
     `names` selects a subset, returned in canonical registry order, and an
     unknown or empty sequence raises `ValueError`.
@@ -49,6 +50,7 @@ def standard_tool_registry(
         GlobTool(),
         GrepTool(),
         RunShellTool(),
+        WebFetchTool(),
     ]
     if result_store is not None:
         tools.append(ReadToolResultTool(result_store))

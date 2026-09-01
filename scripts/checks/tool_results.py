@@ -395,15 +395,16 @@ def check_registry_opt_in() -> None:
         "glob",
         "grep",
         "run_shell",
+        "web_fetch",
     ]
     default = standard_tool_registry()
     store = ToolResultStore()
     opted_in = standard_tool_registry(result_store=store)
     selected = standard_tool_registry(["read_tool_result"], result_store=store)
     if list(default) != existing_names:
-        fail(f"default registry changed from its eight tools: {list(default)!r}")
+        fail(f"default registry changed from its nine tools: {list(default)!r}")
     if list(opted_in) != [*existing_names, "read_tool_result"]:
-        fail(f"stored-result registry did not append the ninth tool: {list(opted_in)!r}")
+        fail(f"stored-result registry did not append the tenth tool: {list(opted_in)!r}")
     if list(selected) != ["read_tool_result"]:
         fail(f"stored-result tool was not selectable by name: {list(selected)!r}")
 

@@ -131,6 +131,7 @@ def check_registry_subsets() -> None:
         "glob",
         "grep",
         "run_shell",
+        "web_fetch",
     ]
     if list(metadata_tools) != expected_full_order:
         fail(f"full standard registry order changed: {list(metadata_tools)!r}")

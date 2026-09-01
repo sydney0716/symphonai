@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "notes": "Preapproved domains for web_fetch. Documentation and package indexes only: a domain here can be read without asking the user, so nothing that serves user-generated content or accepts a query as part of a path belongs in it.",
+  "preapproved": [
+    "docs.python.org",
+    "peps.python.org",
+    "pypi.org",
+    "docs.rs",
+    "developer.mozilla.org",
+    "nodejs.org",
+    "go.dev",
+    "docs.oracle.com",
+    "kernel.org",
+    "man7.org",
+    "www.rfc-editor.org",
+    "www.w3.org",
+    "docs.anthropic.com",
+    "platform.openai.com",
+    "ai.google.dev",
+    "github.com",
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "tauri.app",
+    "react.dev",
+    "www.typescriptlang.org",
+    "textual.textualize.io"
+  ]
+}
