@@ -26,6 +26,8 @@ from orchestra_api.tools.search import GlobTool, GrepTool
 from orchestra_api.tools.shell import RunShellTool
 from orchestra_api.tools.stored_result import ReadToolResultTool
 from orchestra_api.tools.web_fetch import WebFetchTool
+from orchestra_api.tools.web_search import WebSearchTool
+from orchestra_api.web_search import SearchBackend
 
 
 def standard_tool_registry(
@@ -33,8 +35,9 @@ def standard_tool_registry(
     *,
     ledger: ReadLedger | None = None,
     result_store: ToolResultStore | None = None,
+    search_backend: SearchBackend | None = None,
 ) -> dict[str, LocalTool]:
-    """The nine standard tools, plus read_tool_result when a store is supplied.
+    """The nine standard tools, plus optional search and stored-result tools.
 
     `names` selects a subset, returned in canonical registry order, and an
     unknown or empty sequence raises `ValueError`.
@@ -52,6 +55,8 @@ def standard_tool_registry(
         RunShellTool(),
         WebFetchTool(),
     ]
+    if search_backend is not None:
+        tools.append(WebSearchTool(search_backend))
     if result_store is not None:
         tools.append(ReadToolResultTool(result_store))
     if names is not None:
@@ -83,6 +88,7 @@ def run_task(
     include_instructions: bool = False,
     offload_tool_results: bool = False,
     budget: RunBudget | None = None,
+    search_backend: SearchBackend | None = None,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -103,7 +109,11 @@ def run_task(
     messages.append(Message(role=Role.USER, content=prompt))
 
     result_store = ToolResultStore() if offload_tool_results else None
-    tools = standard_tool_registry(ledger=ledger, result_store=result_store)
+    tools = standard_tool_registry(
+        ledger=ledger,
+        result_store=result_store,
+        search_backend=search_backend,
+    )
     agent = ApiAgent(
         provider=provider,
         tools=tools,

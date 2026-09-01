@@ -107,3 +107,9 @@ agents:
 # a future config loader, same as the rest of this file.
 leader: anthropic-default
 subagent: openai-default
+
+# Optional built-in web_search. The backend preset names only an environment
+# variable; the key itself must remain in the shell or secret store.
+web_search:
+  backend: brave
+  api_key_env_var: BRAVE_SEARCH_API_KEY

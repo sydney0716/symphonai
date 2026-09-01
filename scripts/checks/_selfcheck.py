@@ -274,6 +274,16 @@ def main() -> None:
         "web_fetch.plan_mode_allows_fetch",
         "web_fetch.metadata_contract",
         "web_fetch.registry_registration",
+        "web_search.absent_without_backend",
+        "web_search.registered_with_backend",
+        "web_search.key_from_env_not_url",
+        "web_search.parses_results",
+        "web_search.limit_clamped",
+        "web_search.background_call_class",
+        "web_search.contacts_only_endpoint",
+        "web_search.metadata_contract",
+        "web_search.error_carries_no_secret",
+        "web_search.cancel_propagates",
         "providers_live.openai_tools_and_model_override",
         "providers_live.gemini_tools_and_model_override",
         "providers_live.gemini_thought_signature",
@@ -317,13 +327,27 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "237 passed, 0 failed, 237 selected of 237 registered",
+        == "247 passed, 0 failed, 247 selected of 247 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
     listed = invoke_check("--list")
     require(listed.returncode == 0, f"list failed: {listed.stderr!r}")
     require(listed.stdout.splitlines() == expected_names, f"unexpected list: {listed.stdout!r}")
+
+    # --only selects by substring, so a check name that is a substring of
+    # another makes that name un-selectable on its own. The per-name assertion
+    # below used to depend on this holding by accident; state it instead.
+    collisions = [
+        (shorter, longer)
+        for shorter in expected_names
+        for longer in expected_names
+        if shorter != longer and shorter in longer
+    ]
+    require(
+        not collisions,
+        f"check names collide under --only substring selection: {collisions!r}",
+    )
 
     for name in expected_names:
         selected_alone = invoke_check("--only", name)
@@ -332,14 +356,28 @@ def main() -> None:
             f"standalone check {name!r} failed: {selected_alone.stdout!r}",
         )
         selected_alone_lines = selected_alone.stdout.splitlines()
+        expected_selected_names = [
+            candidate
+            for candidate in expected_names
+            if name.casefold() in candidate.casefold()
+        ]
         require(
-            selected_alone_lines[0] == f"PASS  {name}",
+            [
+                line.removeprefix("PASS  ")
+                for line in selected_alone_lines
+                if line.startswith("PASS  ")
+            ]
+            == expected_selected_names,
             f"standalone check selected the wrong name: {selected_alone.stdout!r}",
         )
+        selected_count = len(expected_selected_names)
         require(
             selected_alone_lines[-1]
-            == "1 passed, 0 failed, 1 selected of 237 registered",
-            f"standalone check selected more than one entry: {selected_alone.stdout!r}",
+            == (
+                f"{selected_count} passed, 0 failed, {selected_count} selected "
+                "of 247 registered"
+            ),
+            f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
 
     listed_retry = invoke_check("--list", "--only", "retry")
@@ -364,7 +402,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 237 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 247 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

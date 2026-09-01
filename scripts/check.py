@@ -36,6 +36,7 @@ from scripts.checks import edit  # noqa: E402, F401
 from scripts.checks import permissions  # noqa: E402, F401
 from scripts.checks import shell  # noqa: E402, F401
 from scripts.checks import web_fetch  # noqa: E402, F401
+from scripts.checks import web_search  # noqa: E402, F401
 from scripts.checks import providers_live  # noqa: E402, F401
 from scripts.checks import leader  # noqa: E402, F401
 from scripts.checks import scheduler  # noqa: E402, F401

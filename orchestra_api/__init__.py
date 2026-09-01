@@ -60,6 +60,20 @@ from orchestra_api.web import (
     fetch_url,
 )
 from orchestra_api.web_domains import preapproved_domains
+from orchestra_api.web_search import (
+    DEFAULT_SEARCH_LIMIT,
+    DEFAULT_SEARCH_TIMEOUT_SECONDS,
+    MAX_SEARCH_LIMIT,
+    MIN_SEARCH_LIMIT,
+    HttpJsonSearchBackend,
+    SearchBackend,
+    SearchBackendError,
+    SearchEndpoint,
+    SearchHit,
+    search_endpoint,
+    search_endpoints,
+)
+from orchestra_api.tools.web_search import WebSearchTool
 
 __all__ = [
     "AgentRef",
@@ -74,6 +88,7 @@ __all__ = [
     "InterruptBehavior",
     "MAX_FETCH_BYTES",
     "MAX_REDIRECTS",
+    "MAX_SEARCH_LIMIT",
     "Message",
     "ModelRequest",
     "ModelResponse",
@@ -85,6 +100,10 @@ __all__ = [
     "RunRef",
     "RunStarted",
     "SCHEMA_VERSION",
+    "SearchBackend",
+    "SearchBackendError",
+    "SearchEndpoint",
+    "SearchHit",
     "SubagentSpawned",
     "TextBlock",
     "ToolCall",
@@ -99,13 +118,20 @@ __all__ = [
     "Usage",
     "WebFetchError",
     "WebFetchTool",
+    "WebSearchTool",
     "DEFAULT_FETCH_TIMEOUT_SECONDS",
+    "DEFAULT_SEARCH_LIMIT",
+    "DEFAULT_SEARCH_TIMEOUT_SECONDS",
+    "HttpJsonSearchBackend",
+    "MIN_SEARCH_LIMIT",
     "fetch_url",
     "new_agent_ref",
     "new_id",
     "new_run_ref",
     "new_turn_ref",
     "preapproved_domains",
+    "search_endpoint",
+    "search_endpoints",
     "safe_metadata",
     "wire_tool_call_ids",
 ]

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "notes": "Unverified web-search endpoint presets. No live account has been used; check current vendor documentation before relying on any entry.",
+  "backends": [
+    {
+      "key": "brave",
+      "label": "Brave Search",
+      "url": "https://api.search.brave.com/res/v1/web/search",
+      "api_key_env_var": "BRAVE_SEARCH_API_KEY",
+      "query_parameter": "q",
+      "auth_header": "X-Subscription-Token",
+      "results_path": ["web", "results"],
+      "title_field": "title",
+      "url_field": "url",
+      "snippet_field": "description",
+      "notes": "UNVERIFIED: shaped from public examples, but never probed with a live account in this project."
+    },
+    {
+      "key": "tavily",
+      "label": "Tavily Search",
+      "url": "https://api.tavily.com/search",
+      "api_key_env_var": "TAVILY_API_KEY",
+      "query_parameter": "query",
+      "auth_header": "Authorization",
+      "results_path": ["results"],
+      "title_field": "title",
+      "url_field": "url",
+      "snippet_field": "content",
+      "notes": "UNVERIFIED: the GET and header form has not been tested against a live account; confirm current vendor documentation first."
+    }
+  ]
+}
