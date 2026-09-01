@@ -28,6 +28,7 @@ _RECORD_TYPES = frozenset(
         "turn_finished",
         "cancellation",
         "compaction",
+        "conversation_rewritten",
         "run_finished",
         "run_failed",
     }
@@ -370,6 +371,22 @@ def load_run(
         elif record_type == "message":
             messages.append(message_from_json(record["data"]))
             record_ids.append(record["record_id"])
+        elif record_type == "conversation_rewritten":
+            kept_prefix = record.get("data", {}).get("kept_prefix")
+            # `bool` is an `int` in Python, and a negative prefix would slice
+            # silently from the end -- both are corruption, not a boundary.
+            if (
+                not isinstance(kept_prefix, int)
+                or isinstance(kept_prefix, bool)
+                or not 0 <= kept_prefix <= len(messages)
+            ):
+                raise SessionError(
+                    f"run {run_id or store.run_id!r} has conversation rewrite "
+                    f"kept_prefix {kept_prefix!r}, but only {len(messages)} "
+                    "messages were loaded"
+                )
+            messages = messages[:kept_prefix]
+            record_ids = record_ids[:kept_prefix]
         elif record_type == "run_finished":
             stopped_reason = record.get("data", {}).get("stopped_reason")
         elif record_type == "run_failed":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import stat
 import tempfile
@@ -1117,3 +1118,283 @@ def check_open_missing_run_raises() -> None:
             fail("opening a missing run silently created it")
         if sessions_root.exists():
             fail("opening a missing run created the sessions root or an entry")
+
+
+def _digest_for_check(message: Message) -> str:
+    canonical = json.dumps(
+        message_to_json(message), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.blake2b(canonical, digest_size=16).hexdigest()
+
+
+def _compacted_chat(
+    root: Path, name: str
+) -> tuple[Leader, SessionStore, list[tuple[list[str], list[str], list[Message]]]]:
+    repo = root / f"repo-{name}"
+    repo.mkdir()
+    store = SessionStore(root / "sessions", name)
+    leader = Leader(
+        LeaderConfig(
+            leader_provider=FakeModelProvider(
+                [
+                    _final_response("a" * 320),
+                    _final_response("b" * 320),
+                    _final_response("c" * 320),
+                    _final_response("d" * 40),
+                ]
+            ),
+            subagent_provider=FakeModelProvider([_final_response("unused")]),
+            repo_root=str(repo),
+            chat_token_budget=260,
+            chat_recent_turns=1,
+        ),
+        session=store,
+    )
+    observations: list[tuple[list[str], list[str], list[Message]]] = []
+    original_run = leader._agent.run
+
+    def observed_run(messages: list[Message], **kwargs: object) -> AgentRunResult:
+        observations.append(
+            (
+                list(leader._agent._persisted_digests),
+                [_digest_for_check(message) for message in messages],
+                list(messages),
+            )
+        )
+        return original_run(messages, **kwargs)
+
+    leader._agent.run = observed_run
+    questions = [
+        "q0 " + "u" * 320,
+        "q1 " + "v" * 320,
+        "q2 " + "w" * 320,
+        "q3 final question",
+    ]
+    for question in questions:
+        leader.chat(question)
+    return leader, store, observations
+
+
+@check("session.compacted_chat_persists_every_message")
+def check_compacted_chat_persists_every_message() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        leader, store, observations = _compacted_chat(
+            Path(temporary), "compacted-every-message"
+        )
+        records, _ = read_records(store.directory / "run.jsonl")
+        if not any(record["type"] == "compaction" for record in records):
+            fail("four-turn scenario did not actually compact")
+        equal_length_divergence = [
+            messages
+            for persisted, current, messages in observations
+            if len(persisted) == len(current) and persisted != current
+        ]
+        if not equal_length_divergence or not any(
+            messages
+            and messages[-1].role == Role.USER
+            and messages[-1].text == "q3 final question"
+            for messages in equal_length_divergence
+        ):
+            fail(f"check did not reproduce the equal-length q3 rewrite: {observations!r}")
+        raw_messages = [
+            message_from_record["data"]
+            for message_from_record in records
+            if message_from_record["type"] == "message"
+        ]
+        q3_json = message_to_json(Message(role=Role.USER, content="q3 final question"))
+        if q3_json not in raw_messages:
+            fail("the post-compaction q3 user message was never persisted")
+        loaded = load_run(store)
+        if loaded.messages != leader._chat_messages:
+            fail(
+                "compacted transcript does not rebuild the leader conversation: "
+                f"loaded={loaded.messages!r}, held={leader._chat_messages!r}"
+            )
+        store.close()
+
+
+@check("session.conversation_rewritten_record_shape")
+def check_conversation_rewritten_record_shape() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        _, store, observations = _compacted_chat(root, "rewrite-shape")
+        records, _ = read_records(store.directory / "run.jsonl")
+        rewrites = [
+            record for record in records if record["type"] == "conversation_rewritten"
+        ]
+        expected: list[dict[str, int]] = []
+        for persisted, current, _ in observations:
+            kept = 0
+            for old_digest, new_digest in zip(persisted, current):
+                if old_digest != new_digest:
+                    break
+                kept += 1
+            if kept < len(persisted):
+                expected.append(
+                    {"kept_prefix": kept, "replaced": len(persisted) - kept}
+                )
+        if [record["data"] for record in rewrites] != expected:
+            fail(f"rewrite record shape or cardinality changed: {rewrites!r}")
+
+        plain_repo = root / "plain-repo"
+        plain_repo.mkdir()
+        plain_store = SessionStore(root / "sessions", "plain-no-rewrite")
+        plain_leader = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(
+                    [_final_response("one"), _final_response("two")]
+                ),
+                subagent_provider=FakeModelProvider([_final_response("unused")]),
+                repo_root=str(plain_repo),
+            ),
+            session=plain_store,
+        )
+        plain_leader.chat("first")
+        plain_leader.chat("second")
+        plain_records, _ = read_records(plain_store.directory / "run.jsonl")
+        if any(record["type"] == "conversation_rewritten" for record in plain_records):
+            fail("plain append-only chat wrote a conversation_rewritten record")
+        store.close()
+        plain_store.close()
+
+
+@check("session.load_run_honours_a_rewrite")
+def check_load_run_honours_a_rewrite() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        leader, store, _ = _compacted_chat(root, "load-rewrite")
+        loaded = load_run(store)
+        if loaded.messages != leader._chat_messages:
+            fail("load_run concatenated superseded and compacted conversations")
+        if len(loaded.record_ids) != len(loaded.messages):
+            fail("rewrite handling broke message/record-id alignment")
+
+        _, plain_store, plain_result = _real_run(root, "load-without-rewrite")
+        if load_run(plain_store).messages != plain_result.messages:
+            fail("load_run changed behavior for a transcript without rewrites")
+
+        reorder_repo = root / "reorder-repo"
+        reorder_repo.mkdir()
+        reorder_store = SessionStore(root / "sessions", "load-reordered-prefix")
+        reorder_agent_ref = new_agent_ref("reorder-check")
+        reorder_agent = ApiAgent(
+            FakeModelProvider(
+                [_final_response("first order"), _final_response("second order")]
+            ),
+            {},
+            PermissionPolicy(repo_root=reorder_repo),
+            agent_ref=reorder_agent_ref,
+            transcript=reorder_store.writer_for(
+                reorder_agent_ref.agent_id, is_root=True
+            ),
+        )
+        first = Message(role=Role.USER, content="first seed")
+        second = Message(role=Role.USER, content="second seed")
+        reorder_agent.run([first, second])
+        reordered_result = reorder_agent.run([second, first])
+        if load_run(reorder_store).messages != reordered_result.messages:
+            fail("load_run treated reordered digests as an unchanged prefix")
+        store.close()
+        plain_store.close()
+        reorder_store.close()
+
+
+@check("session.rewrite_prefix_beyond_messages_raises")
+def check_rewrite_prefix_beyond_messages_raises() -> None:
+    # A negative prefix would slice silently from the end, and `bool` is an
+    # `int`, so both must be rejected as loudly as one that is too large.
+    for index, kept_prefix in enumerate((99, -1, True)):
+        with tempfile.TemporaryDirectory() as temporary:
+            name = f"impossible-rewrite-{index}"
+            source, agent_id = _seed_persisted_messages(
+                Path(temporary) / "sessions",
+                name,
+                [Message(role=Role.ASSISTANT, content="only one", turn_id="turn-one")],
+            )
+            writer = TranscriptWriter(source.directory / "run.jsonl")
+            writer.append(
+                "conversation_rewritten",
+                run_id=f"run-{name}",
+                agent_id=agent_id,
+                turn_id=None,
+                data={"kept_prefix": kept_prefix, "replaced": 1},
+            )
+            writer.close()
+            try:
+                loaded = load_run(source)
+            except SessionError as exc:
+                error = str(exc)
+                if source.run_id not in error or repr(kept_prefix) not in error:
+                    fail(
+                        "impossible-rewrite error omitted required values: "
+                        f"kept_prefix={kept_prefix!r}, error={error}"
+                    )
+            else:
+                fail(
+                    "load_run accepted an impossible rewrite prefix "
+                    f"{kept_prefix!r}: loaded={loaded.messages!r}"
+                )
+
+
+@check("session.resume_a_compacted_chat")
+def check_resume_a_compacted_chat() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        leader, source, _ = _compacted_chat(root, "resume-compacted")
+        destination = SessionStore(root / "sessions", "resume-compacted-destination")
+        provider = _RecordingProvider([_final_response("resumed compacted answer")])
+        resume_task(
+            provider,
+            PermissionPolicy(repo_root=Path(leader._config.repo_root)),
+            "resume prompt",
+            store=source,
+            new_store=destination,
+        )
+        expected = [
+            *leader._chat_messages,
+            Message(role=Role.USER, content="resume prompt"),
+        ]
+        request_messages = provider.requests[0].messages
+        if request_messages != expected:
+            fail(f"compacted resume included superseded messages: {request_messages!r}")
+        held_systems = sum(
+            message.role == Role.SYSTEM for message in leader._chat_messages
+        )
+        resumed_systems = sum(message.role == Role.SYSTEM for message in request_messages)
+        if resumed_systems != held_systems:
+            fail("compacted resume duplicated a system message")
+        source.close()
+        destination.close()
+
+
+@check("session.one_shot_after_chat_repersists")
+def check_one_shot_after_chat_repersistence() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        store = SessionStore(root / "sessions", "one-shot-after-chat")
+        leader = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(
+                    [_final_response("chat answer"), _final_response("run answer")]
+                ),
+                subagent_provider=FakeModelProvider([_final_response("unused")]),
+                repo_root=str(repo),
+            ),
+            session=store,
+        )
+        leader.chat("chat question")
+        result = leader.run("fresh run question", system_prompt="fresh run system")
+        records, _ = read_records(store.directory / "run.jsonl")
+        rewrites = [
+            record for record in records if record["type"] == "conversation_rewritten"
+        ]
+        if not rewrites or rewrites[-1]["data"] != {
+            "kept_prefix": 0,
+            "replaced": 2,
+        }:
+            fail(f"fresh one-shot run did not supersede prior chat: {rewrites!r}")
+        if load_run(store).messages != result.leader_messages:
+            fail("fresh one-shot conversation was skipped after chat")
+        store.close()
