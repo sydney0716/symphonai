@@ -49,6 +49,7 @@ from symphonai_api.models import (
 )
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
+from symphonai_api.repair import repair_unanswered_tool_calls
 from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from symphonai_api.serialization import message_to_json
 from symphonai_api.session import TranscriptWriter
@@ -516,45 +517,26 @@ class ApiAgent:
             )
             return result
         except OperationCancelled:
-            repaired_tool_call_ids: list[str] = []
-            if current_turn_ref is not None:
-                assistant_index = next(
-                    (
-                        index
-                        for index in range(len(conversation) - 1, -1, -1)
-                        if conversation[index].role == Role.ASSISTANT
-                        and conversation[index].tool_calls
-                    ),
-                    None,
-                )
-                if assistant_index is not None:
-                    answered_ids = {
-                        message.tool_result.tool_call_id
-                        for message in conversation[assistant_index + 1 :]
-                        if message.tool_result is not None
-                    }
-                    for tool_call in conversation[assistant_index].tool_calls:
-                        if tool_call.id not in answered_ids:
-                            repaired_message = Message(
-                                role=Role.TOOL,
-                                tool_result=ToolResult(
-                                    tool_call_id=tool_call.id,
-                                    ok=False,
-                                    cancelled=True,
-                                    error="cancelled before this tool completed",
-                                ),
-                                turn_id=current_turn_ref.turn_id,
-                            )
-                            conversation.append(repaired_message)
-                            repaired_tool_call_ids.append(tool_call.id)
-                            append_record(
-                                "message",
-                                turn_id=current_turn_ref.turn_id,
-                                data=message_to_json(repaired_message),
-                            )
-                            self._persisted_digests.append(
-                                _message_digest(repaired_message)
-                            )
+            repair_turn_id = (
+                None if current_turn_ref is None else current_turn_ref.turn_id
+            )
+            repaired_tool_call_ids = repair_unanswered_tool_calls(
+                conversation,
+                error="cancelled before this tool completed",
+                cancelled=True,
+                turn_id=repair_turn_id,
+            )
+            if repaired_tool_call_ids:
+                repaired_messages = conversation[-len(repaired_tool_call_ids) :]
+                for repaired_message in repaired_messages:
+                    append_record(
+                        "message",
+                        turn_id=repair_turn_id,
+                        data=message_to_json(repaired_message),
+                    )
+                    self._persisted_digests.append(
+                        _message_digest(repaired_message)
+                    )
             append_record(
                 "cancellation",
                 turn_id=(

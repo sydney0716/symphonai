@@ -176,6 +176,7 @@ def main() -> None:
         "tool_results.write_failure_raises",
         "tool_results.tool_resolves_disk_handle",
         "tool_results.resume_fallback_directory",
+        "tool_results.resume_chain_resolves_ancestor_handle",
         "serialization.message_round_trip",
         "serialization.tool_result_round_trip",
         "serialization.provider_metadata_verbatim",
@@ -216,6 +217,19 @@ def main() -> None:
         "session.rewrite_prefix_beyond_messages_raises",
         "session.resume_a_compacted_chat",
         "session.one_shot_after_chat_repersists",
+        "session.diagnose_completed",
+        "session.diagnose_cancelled",
+        "session.diagnose_failed",
+        "session.diagnose_crashed",
+        "session.turn_states",
+        "session.diagnose_does_not_mutate",
+        "session.repair_on_resume",
+        "session.repair_leaves_transcript_untouched",
+        "session.diagnose_last_run_of_many",
+        "session.loaded_run_id_is_the_last_run",
+        "session.diagnose_a_compacted_transcript",
+        "session.search_path_walks_ancestry",
+        "session.search_path_creates_nothing",
         "cost.usage_totals_merge",
         "cost.run_accumulates_usage",
         "cost.cancelled_run_reports_usage",
@@ -242,6 +256,8 @@ def main() -> None:
         "cancel.tool_repair",
         "cancel.http_read_recheck",
         "cancel.late_response_retained",
+        "agent_cancel.unanswered_ids_last_assistant_only",
+        "agent_cancel.cancelled_messages_unchanged_by_refactor",
         "agent.full_run",
         "agent.base_validation",
         "search.permission_gates",
@@ -381,7 +397,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "301 passed, 0 failed, 301 selected of 301 registered",
+        == "317 passed, 0 failed, 317 selected of 317 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -429,7 +445,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 301 registered"
+                "of 317 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -456,7 +472,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 301 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 317 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

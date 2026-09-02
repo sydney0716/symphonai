@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import stat
 import tempfile
 import unittest.mock as mock
@@ -33,16 +34,22 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import resume_task, run_task, standard_tool_registry
 from symphonai_api.serialization import message_to_json
 from symphonai_api.session import (
+    RunState,
     SessionError,
     SessionStore,
     TranscriptError,
     TranscriptWriter,
+    TurnState,
+    classify_run,
     default_sessions_root,
     fork_run,
     load_run,
+    load_run_for_resume,
     read_records,
     resume_run,
+    tool_result_search_path,
 )
+from symphonai_api.repair import unanswered_tool_call_ids
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from scripts.checks.harness import check, fail
@@ -1398,3 +1405,489 @@ def check_one_shot_after_chat_repersistence() -> None:
         if load_run(store).messages != result.leader_messages:
             fail("fresh one-shot conversation was skipped after chat")
         store.close()
+
+
+def _diagnosis(store: SessionStore):
+    loaded = load_run(store)
+    records, _ = read_records(store.directory / "run.jsonl")
+    return loaded, classify_run(loaded, records)
+
+
+def _partial_crash_store(root: Path, name: str) -> SessionStore:
+    store = SessionStore(root / "sessions", name)
+    writer = store.writer_for(f"agent-{name}", is_root=True)
+    run_id = f"run-{name}"
+    turn_id = f"turn-{name}"
+    writer.append(
+        "run_started",
+        run_id=run_id,
+        agent_id=f"agent-{name}",
+        turn_id=None,
+        data={"agent_name": name, "parent_run_id": None, "model": "fake"},
+    )
+    writer.append(
+        "turn_started",
+        run_id=run_id,
+        agent_id=f"agent-{name}",
+        turn_id=turn_id,
+        data={"index": 1},
+    )
+    assistant = Message(
+        role=Role.ASSISTANT,
+        tool_calls=[
+            ToolCall(id="crash-answered", name="read_file"),
+            ToolCall(id="crash-unanswered", name="read_file"),
+        ],
+        turn_id=turn_id,
+    )
+    answered = Message(
+        role=Role.TOOL,
+        tool_result=ToolResult(
+            tool_call_id="crash-answered", ok=True, content="answer"
+        ),
+        turn_id=turn_id,
+    )
+    for message in (assistant, answered):
+        writer.append(
+            "message",
+            run_id=run_id,
+            agent_id=f"agent-{name}",
+            turn_id=turn_id,
+            data=message_to_json(message),
+        )
+    writer.close()
+    return store
+
+
+def _three_turn_chat(root: Path, name: str) -> tuple[Leader, SessionStore, list[str]]:
+    repo = root / f"repo-{name}"
+    repo.mkdir()
+    store = SessionStore(root / "sessions", name)
+    leader = Leader(
+        LeaderConfig(
+            leader_provider=FakeModelProvider(
+                [_final_response("one"), _final_response("two"), _final_response("three")]
+            ),
+            subagent_provider=FakeModelProvider([_final_response("unused")]),
+            repo_root=str(repo),
+        ),
+        session=store,
+    )
+    for question in ("question one", "question two", "question three"):
+        leader.chat(question)
+    records, _ = read_records(store.directory / "run.jsonl")
+    run_ids = [record["run_id"] for record in records if record["type"] == "run_started"]
+    return leader, store, run_ids
+
+
+@check("session.diagnose_completed")
+def check_diagnose_completed() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        completed = SessionStore(root / "sessions", "completed")
+        run_task(
+            FakeModelProvider([_final_response("complete")]),
+            PermissionPolicy(repo_root=repo),
+            "finish",
+            session=completed,
+        )
+        _, final_diagnosis = _diagnosis(completed)
+        if (
+            final_diagnosis.state != RunState.COMPLETED
+            or final_diagnosis.stopped_reason != "final_response"
+        ):
+            fail(f"final response was diagnosed incorrectly: {final_diagnosis!r}")
+
+        capped = SessionStore(root / "sessions", "max-turns")
+        tool_response = ModelResponse(
+            message=Message(
+                role=Role.ASSISTANT,
+                tool_calls=[ToolCall(id="unknown", name="not_registered")],
+            )
+        )
+        run_task(
+            FakeModelProvider([tool_response]),
+            PermissionPolicy(repo_root=repo),
+            "hit cap",
+            max_turns=1,
+            session=capped,
+        )
+        _, capped_diagnosis = _diagnosis(capped)
+        if (
+            capped_diagnosis.state != RunState.COMPLETED
+            or capped_diagnosis.stopped_reason != "max_turns"
+        ):
+            fail(f"max-turn run was diagnosed incorrectly: {capped_diagnosis!r}")
+        completed.close()
+        capped.close()
+
+
+@check("session.diagnose_cancelled")
+def check_diagnose_cancelled() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        store = SessionStore(root / "sessions", "cancelled")
+        token = CancellationToken()
+        response = ModelResponse(
+            message=Message(
+                role=Role.ASSISTANT,
+                tool_calls=[ToolCall(id="cancelled-call", name="cancel_work")],
+            )
+        )
+        agent_ref = new_agent_ref("cancelled-diagnosis")
+        ApiAgent(
+            FakeModelProvider([response]),
+            {"cancel_work": _CancellingTool()},
+            PermissionPolicy(repo_root=repo),
+            agent_ref=agent_ref,
+            transcript=store.writer_for(agent_ref.agent_id, is_root=True),
+        ).run([Message(role=Role.USER, content="cancel")], cancel=token)
+        _, diagnosis = _diagnosis(store)
+        if diagnosis.state != RunState.CANCELLED or diagnosis.stopped_reason != "cancelled":
+            fail(f"cancelled run was diagnosed incorrectly: {diagnosis!r}")
+        store.close()
+
+
+@check("session.diagnose_failed")
+def check_diagnose_failed() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        store = SessionStore(root / "sessions", "failed")
+        try:
+            run_task(
+                _FailingProvider(),
+                PermissionPolicy(repo_root=repo),
+                "fail",
+                session=store,
+            )
+        except RuntimeError:
+            pass
+        else:
+            fail("scripted provider failure did not escape")
+        _, diagnosis = _diagnosis(store)
+        if diagnosis.state != RunState.FAILED or diagnosis.stopped_reason != "failed":
+            fail(f"failed run was diagnosed incorrectly: {diagnosis!r}")
+        store.close()
+
+
+@check("session.diagnose_crashed")
+def check_diagnose_crashed() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        store = SessionStore(root / "sessions", "crashed")
+        writer = store.writer_for("agent-crashed", is_root=True)
+        writer.append(
+            "run_started",
+            run_id="run-crashed",
+            agent_id="agent-crashed",
+            turn_id=None,
+            data={"agent_name": "crashed", "parent_run_id": None, "model": "fake"},
+        )
+        writer.close()
+        with (store.directory / "run.jsonl").open("ab") as handle:
+            handle.write(b'{"truncated":')
+        _, diagnosis = _diagnosis(store)
+        if diagnosis.state != RunState.CRASHED or diagnosis.dropped_bytes == 0:
+            fail(f"truncated crash was diagnosed incorrectly: {diagnosis!r}")
+
+
+@check("session.turn_states")
+def check_turn_states() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        store = SessionStore(root / "sessions", "turn-states")
+        writer = store.writer_for("agent-turns", is_root=True)
+        writer.append(
+            "run_started",
+            run_id="run-turns",
+            agent_id="agent-turns",
+            turn_id=None,
+            data={"agent_name": "turns", "parent_run_id": None, "model": "fake"},
+        )
+        completed_assistant = Message(
+            role=Role.ASSISTANT,
+            tool_calls=[ToolCall(id="done-call", name="read_file")],
+            turn_id="turn-completed",
+        )
+        completed_result = Message(
+            role=Role.TOOL,
+            tool_result=ToolResult("done-call", True, "done"),
+            turn_id="turn-completed",
+        )
+        partial_assistant = Message(
+            role=Role.ASSISTANT,
+            tool_calls=[ToolCall(id="partial-call", name="read_file")],
+            turn_id="turn-partial",
+        )
+        fixtures = (
+            ("turn-completed", (completed_assistant, completed_result)),
+            ("turn-partial", (partial_assistant,)),
+            ("turn-empty", ()),
+        )
+        for index, (turn_id, messages) in enumerate(fixtures, start=1):
+            writer.append(
+                "turn_started",
+                run_id="run-turns",
+                agent_id="agent-turns",
+                turn_id=turn_id,
+                data={"index": index},
+            )
+            for message in messages:
+                writer.append(
+                    "message",
+                    run_id="run-turns",
+                    agent_id="agent-turns",
+                    turn_id=turn_id,
+                    data=message_to_json(message),
+                )
+        writer.close()
+        _, diagnosis = _diagnosis(store)
+        expected = (
+            ("turn-completed", TurnState.COMPLETED),
+            ("turn-partial", TurnState.PARTIAL),
+            ("turn-empty", TurnState.EMPTY),
+        )
+        if diagnosis.turns != expected:
+            fail(f"turn states were classified incorrectly: {diagnosis.turns!r}")
+
+
+@check("session.diagnose_does_not_mutate")
+def check_diagnose_does_not_mutate() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        store = _partial_crash_store(Path(temporary), "observe-only")
+        loaded = load_run(store)
+        before = list(loaded.messages)
+        records, _ = read_records(store.directory / "run.jsonl")
+        classify_run(loaded, records)
+        if loaded.messages != before:
+            fail("diagnosis repaired or otherwise mutated loaded messages")
+
+
+@check("session.repair_on_resume")
+def check_repair_on_resume() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        store = _partial_crash_store(root, "repair")
+        loaded, diagnosis, repaired = load_run_for_resume(store)
+        if repaired != ["crash-unanswered"]:
+            fail(f"repair returned the wrong ids: {repaired!r}")
+        repair = loaded.messages[-1].tool_result
+        if (
+            diagnosis.state != RunState.CRASHED
+            or repair is None
+            or repair.ok
+            or repair.cancelled
+            or "session ended" not in (repair.error or "")
+        ):
+            fail(f"crash repair has the wrong state or result: {diagnosis!r}, {repair!r}")
+        if unanswered_tool_call_ids(loaded.messages) != []:
+            fail("repaired conversation still has unanswered tool calls")
+        repo = root / "repo-repair"
+        repo.mkdir()
+        destination = SessionStore(root / "sessions", "repair-destination")
+        resume_task(
+            FakeModelProvider([_final_response("resumed")]),
+            PermissionPolicy(repo_root=repo),
+            "continue",
+            store=store,
+            new_store=destination,
+        )
+        records, _ = read_records(destination.directory / "run.jsonl")
+        persisted_repairs = [
+            record
+            for record in records
+            if record["type"] == "message"
+            and (record["data"].get("tool_result") or {}).get("tool_call_id")
+            == "crash-unanswered"
+        ]
+        if len(persisted_repairs) != 1:
+            fail(f"descendant transcript did not persist the repair: {records!r}")
+        destination.close()
+
+
+@check("session.repair_leaves_transcript_untouched")
+def check_repair_leaves_transcript_untouched() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        store = _partial_crash_store(Path(temporary), "repair-bytes")
+        path = store.directory / "run.jsonl"
+        before = path.read_bytes()
+        load_run_for_resume(store)
+        if path.read_bytes() != before:
+            fail("repair rewrote the original transcript")
+
+
+@check("session.diagnose_last_run_of_many")
+def check_diagnose_last_run_of_many() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        _, completed, run_ids = _three_turn_chat(root, "many-completed")
+        loaded, diagnosis = _diagnosis(completed)
+        if (
+            diagnosis.state != RunState.COMPLETED
+            or diagnosis.run_count != 3
+            or diagnosis.run_id != run_ids[-1]
+            or loaded.run_id != run_ids[-1]
+            or len(diagnosis.turns) != 1
+        ):
+            fail(f"last completed run was not isolated: {diagnosis!r}")
+
+        _, crashed, crashed_ids = _three_turn_chat(root, "many-crashed")
+        path = crashed.directory / "run.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        last_finish = max(
+            index
+            for index, line in enumerate(lines)
+            if json.loads(line)["type"] == "run_finished"
+        )
+        path.write_text("".join(lines[:last_finish] + lines[last_finish + 1 :]), encoding="utf-8")
+        crashed_loaded, crashed_diagnosis = _diagnosis(crashed)
+        if (
+            crashed_diagnosis.state != RunState.CRASHED
+            or crashed_diagnosis.run_id != crashed_ids[-1]
+            or crashed_loaded.run_id != crashed_ids[-1]
+            or crashed_diagnosis.run_count != 3
+        ):
+            fail(f"earlier terminal record masked the final crash: {crashed_diagnosis!r}")
+        completed.close()
+        crashed.close()
+
+
+@check("session.loaded_run_id_is_the_last_run")
+def check_loaded_run_id_is_the_last_run() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        leader, source, run_ids = _three_turn_chat(root, "last-run-id")
+        loaded = load_run(source)
+        destination = SessionStore(root / "sessions", "last-run-destination")
+        result = resume_task(
+            FakeModelProvider([_final_response("resumed")]),
+            PermissionPolicy(repo_root=Path(leader._config.repo_root)),
+            "resume",
+            store=source,
+            new_store=destination,
+        )
+        if loaded.run_id != run_ids[-1] or loaded.run_count != 3:
+            fail(f"LoadedRun did not identify the final run: {loaded!r}")
+        if result.run.parent_run_id != run_ids[-1]:
+            fail(f"resume descended from {result.run.parent_run_id!r}, not the last run")
+        source.close()
+        destination.close()
+
+
+@check("session.diagnose_a_compacted_transcript")
+def check_diagnose_a_compacted_transcript() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        leader, store, _ = _compacted_chat(Path(temporary), "diagnose-compacted")
+        records, _ = read_records(store.directory / "run.jsonl")
+        loaded, diagnosis, repaired = load_run_for_resume(store)
+        expected_compactions = sum(record["type"] == "compaction" for record in records)
+        if loaded.messages != leader._chat_messages:
+            fail("recovery did not load the conversation held after compaction")
+        if (
+            diagnosis.state != RunState.COMPLETED
+            or diagnosis.compactions != expected_compactions
+            or expected_compactions == 0
+            or repaired
+        ):
+            fail(f"compacted transcript diagnosis was wrong: {diagnosis!r}, {repaired!r}")
+        store.close()
+
+
+@check("session.search_path_walks_ancestry")
+def check_search_path_walks_ancestry() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        sessions = Path(temporary) / "sessions"
+        first = SessionStore(sessions, "first")
+        second = SessionStore(sessions, "second")
+        third = SessionStore(sessions, "third")
+        second.set_parent_session(first.run_id)
+        third.set_parent_session(second.run_id)
+        expected = (
+            third.directory / "tool-results",
+            second.directory / "tool-results",
+            first.directory / "tool-results",
+        )
+        if tool_result_search_path(third) != expected:
+            fail(f"three-deep search path was wrong: {tool_result_search_path(third)!r}")
+        first.set_parent_session(third.run_id)
+        if tool_result_search_path(third) != expected:
+            fail("sidecar cycle changed or failed to terminate the search path")
+
+        deleted_first = SessionStore(sessions, "deleted-first")
+        deleted_second = SessionStore(sessions, "deleted-second")
+        deleted_third = SessionStore(sessions, "deleted-third")
+        deleted_second.set_parent_session(deleted_first.run_id)
+        deleted_third.set_parent_session(deleted_second.run_id)
+        shutil.rmtree(deleted_first.directory)
+        deleted_path = tool_result_search_path(deleted_third)
+        if deleted_path != (
+            deleted_third.directory / "tool-results",
+            deleted_second.directory / "tool-results",
+        ):
+            fail(f"deleted ancestor did not terminate safely: {deleted_path!r}")
+
+
+@check("session.search_path_creates_nothing")
+def check_search_path_creates_nothing() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sessions = root / "sessions"
+        first = SessionStore(sessions, "path-first")
+        middle = SessionStore(sessions, "path-middle")
+        last = SessionStore(sessions, "path-last")
+        middle.set_parent_session(first.run_id)
+        last.set_parent_session(middle.run_id)
+        missing = middle.directory / "tool-results"
+        missing.rmdir()
+        middle_before = _snapshot_directory(middle.directory)
+        paths = tool_result_search_path(last)
+        if missing.exists() or _snapshot_directory(middle.directory) != middle_before:
+            fail("search path created or modified the middle result directory")
+        if paths != (
+            last.directory / "tool-results",
+            first.directory / "tool-results",
+        ):
+            fail(f"missing result directory was not skipped: {paths!r}")
+
+        repo, existing_source, _ = _real_run(root, "readonly-existing-source")
+        existing_before = _snapshot_directory(existing_source.directory)
+        existing_destination = SessionStore(sessions, "readonly-existing-destination")
+        resume_task(
+            FakeModelProvider([_final_response("done")]),
+            PermissionPolicy(repo_root=repo),
+            "resume",
+            store=existing_source,
+            new_store=existing_destination,
+            offload_tool_results=True,
+        )
+        if _snapshot_directory(existing_source.directory) != existing_before:
+            fail("resume changed the source run with an existing result directory")
+
+        missing_repo, missing_source, _ = _real_run(root, "readonly-missing-source")
+        missing_source_results = missing_source.directory / "tool-results"
+        missing_source_results.rmdir()
+        missing_before = _snapshot_directory(missing_source.directory)
+        missing_destination = SessionStore(sessions, "readonly-missing-destination")
+        resume_task(
+            FakeModelProvider([_final_response("done")]),
+            PermissionPolicy(repo_root=missing_repo),
+            "resume",
+            store=missing_source,
+            new_store=missing_destination,
+            offload_tool_results=True,
+        )
+        if (
+            missing_source_results.exists()
+            or _snapshot_directory(missing_source.directory) != missing_before
+        ):
+            fail("resume created or modified a missing source result directory")
+        existing_source.close()
+        existing_destination.close()
+        missing_source.close()
+        missing_destination.close()

@@ -762,3 +762,96 @@ def check_resume_fallback_directory() -> None:
             fail("fallback result was copied into the new run directory")
         source.close()
         destination.close()
+
+
+@check("tool_results.resume_chain_resolves_ancestor_handle")
+def check_resume_chain_resolves_ancestor_handle() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        (repo / "large.txt").write_text("ancestor line\n" * 400, encoding="utf-8")
+        sessions = root / "sessions"
+        first_store = SessionStore(sessions, "run-a")
+        first = run_task(
+            FakeModelProvider(
+                responses=[
+                    ModelResponse(
+                        message=Message(
+                            role=Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="read-ancestor",
+                                    name="read_file",
+                                    arguments={"path": "large.txt"},
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(message=Message(role=Role.ASSISTANT, content="stored")),
+                ]
+            ),
+            PermissionPolicy(repo_root=repo),
+            "read it",
+            offload_tool_results=True,
+            session=first_store,
+        )
+        offloaded = next(
+            message.tool_result.offloaded
+            for message in first.messages
+            if message.role == Role.TOOL
+            and message.tool_result is not None
+            and message.tool_result.offloaded is not None
+        )
+
+        second_store = SessionStore(sessions, "run-b")
+        resume_task(
+            FakeModelProvider(
+                [ModelResponse(message=Message(role=Role.ASSISTANT, content="untouched"))]
+            ),
+            PermissionPolicy(repo_root=repo),
+            "continue without reading it",
+            store=first_store,
+            new_store=second_store,
+            offload_tool_results=True,
+        )
+        if any(second_store.tool_results_directory.iterdir()):
+            fail("middle run unexpectedly copied or touched the ancestor result")
+
+        third_store = SessionStore(sessions, "run-c")
+        third = resume_task(
+            FakeModelProvider(
+                responses=[
+                    ModelResponse(
+                        message=Message(
+                            role=Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="read-grandparent",
+                                    name="read_tool_result",
+                                    arguments={"id": offloaded.id, "limit": 100},
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(message=Message(role=Role.ASSISTANT, content="resolved")),
+                ]
+            ),
+            PermissionPolicy(repo_root=repo),
+            "read the ancestor handle",
+            store=second_store,
+            new_store=third_store,
+            offload_tool_results=True,
+        )
+        resolved = next(
+            message.tool_result
+            for message in third.messages
+            if message.role == Role.TOOL
+            and message.tool_result is not None
+            and message.tool_result.tool_call_id == "read-grandparent"
+        )
+        if not resolved.ok or not resolved.content:
+            fail(f"grandchild did not resolve the ancestor handle: {resolved!r}")
+        first_store.close()
+        second_store.close()
+        third_store.close()

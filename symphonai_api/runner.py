@@ -17,7 +17,11 @@ from symphonai_api.identity import new_agent_ref
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
-from symphonai_api.session import SessionStore, resume_run
+from symphonai_api.session import (
+    SessionStore,
+    load_run_for_resume,
+    tool_result_search_path,
+)
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
@@ -156,12 +160,15 @@ def resume_task(
 ) -> AgentRunResult:
     """Continue a persisted conversation as a new descendant run."""
 
-    messages, parent_run_id = resume_run(store)
+    loaded, _, _ = load_run_for_resume(store)
+    messages = loaded.messages
+    parent_run_id = loaded.run_id
     messages.append(Message(role=Role.USER, content=prompt))
+    new_store.set_parent_session(store.run_id)
     result_store = (
         ToolResultStore(
             directory=new_store.tool_results_directory,
-            fallback_directories=(store.tool_results_directory,),
+            fallback_directories=tool_result_search_path(store),
         )
         if offload_tool_results
         else None

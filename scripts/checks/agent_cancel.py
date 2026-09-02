@@ -10,11 +10,21 @@ from symphonai_api import ToolEffect, ToolMetadata
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.events import CollectingSink, RunFailed, RunFinished, RunStarted
-from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
+from symphonai_api.identity import AgentRef, RunRef, TurnRef
+from symphonai_api.models import (
+    Message,
+    ModelRequest,
+    ModelResponse,
+    Role,
+    ToolCall,
+    ToolResult,
+)
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
 from symphonai_api.providers.openai_provider import _build_request_body as _build_openai_body
+from symphonai_api.repair import unanswered_tool_call_ids
+from symphonai_api.serialization import message_to_json
 from symphonai_api.tools.base import LocalTool
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -247,3 +257,108 @@ def check_cancel_late_response_retained() -> None:
             for message in late_agent_result.messages
         ):
             fail(f"late assistant response was not retained: {late_agent_result.messages!r}")
+
+
+@check("agent_cancel.unanswered_ids_last_assistant_only")
+def check_unanswered_ids_last_assistant_only() -> None:
+    earlier = Message(
+        role=Role.ASSISTANT,
+        tool_calls=[ToolCall(id="earlier", name="first")],
+    )
+    latest = Message(
+        role=Role.ASSISTANT,
+        tool_calls=[
+            ToolCall(id="latest-1", name="second"),
+            ToolCall(id="latest-2", name="second"),
+            ToolCall(id="latest-3", name="second"),
+        ],
+    )
+    answered = Message(
+        role=Role.TOOL,
+        tool_result=ToolResult(tool_call_id="latest-2", ok=True, content="done"),
+    )
+    if unanswered_tool_call_ids([Message(role=Role.USER, content="plain")]) != []:
+        fail("conversation without tool calls reported unanswered ids")
+    if unanswered_tool_call_ids([latest, answered]) != ["latest-1", "latest-3"]:
+        fail("unanswered ids lost the latest assistant's tool-call order")
+    fully_answered = [
+        latest,
+        Message(role=Role.TOOL, tool_result=ToolResult("latest-1", True)),
+        answered,
+        Message(role=Role.TOOL, tool_result=ToolResult("latest-3", True)),
+    ]
+    if unanswered_tool_call_ids(fully_answered) != []:
+        fail("fully answered assistant message still reported ids")
+    if unanswered_tool_call_ids([earlier, latest, answered]) != [
+        "latest-1",
+        "latest-3",
+    ]:
+        fail("an earlier unanswered turn was selected instead of the latest one")
+
+
+# Captured from commit 210ebf6 -- the last tree before the cancellation repair
+# moved into repair.py -- by running the scenario below against a `git archive`
+# extraction of it. Frozen rather than recomputed: comparing against HEAD would
+# compare this refactor with itself the moment it is committed, and would need a
+# git checkout to run at all, which the published snapshot does not have.
+_CANCELLED_MESSAGES_BEFORE_THE_REFACTOR = """
+[
+  {"role": "user", "schema_version": 1, "turn_id": null, "tool_calls": [],
+   "tool_result": null,
+   "content": [{"kind": "text", "schema_version": 1, "text": "cancel"}]},
+  {"role": "assistant", "schema_version": 1, "turn_id": "turn-fixed",
+   "content": [], "tool_result": null,
+   "tool_calls": [
+     {"id": "cancel-1", "name": "cancel_work", "arguments": {},
+      "provider_metadata": {}, "schema_version": 1, "vendor_id": null},
+     {"id": "cancel-2", "name": "cancel_work", "arguments": {},
+      "provider_metadata": {}, "schema_version": 1, "vendor_id": null}]},
+  {"role": "tool", "schema_version": 1, "turn_id": "turn-fixed",
+   "content": [], "tool_calls": [],
+   "tool_result": {"tool_call_id": "cancel-1", "ok": false, "content": "",
+                   "error": "cancelled before this tool completed",
+                   "cancelled": true, "offloaded": null, "payload": null,
+                   "schema_version": 1}},
+  {"role": "tool", "schema_version": 1, "turn_id": "turn-fixed",
+   "content": [], "tool_calls": [],
+   "tool_result": {"tool_call_id": "cancel-2", "ok": false, "content": "",
+                   "error": "cancelled before this tool completed",
+                   "cancelled": true, "offloaded": null, "payload": null,
+                   "schema_version": 1}}
+]
+"""
+
+
+@check("agent_cancel.cancelled_messages_unchanged_by_refactor")
+def check_cancelled_messages_unchanged_by_refactor() -> None:
+    response = ModelResponse(
+        message=Message(
+            role=Role.ASSISTANT,
+            tool_calls=[
+                ToolCall(id="cancel-1", name="cancel_work"),
+                ToolCall(id="cancel-2", name="cancel_work"),
+            ],
+        )
+    )
+    with workspace() as ws:
+        # Fixed ids: the run and turn ids are the only nondeterminism in the
+        # messages, and the old tree stamped the repairs with the turn id too.
+        with mock.patch(
+            "symphonai_api.agent_loop.new_run_ref",
+            return_value=RunRef("run-fixed", "agent-fixed"),
+        ), mock.patch(
+            "symphonai_api.agent_loop.new_turn_ref",
+            return_value=TurnRef("turn-fixed", "run-fixed", 1),
+        ):
+            result = ApiAgent(
+                FakeModelProvider([response]),
+                {"cancel_work": _CancellingTool()},
+                ws.policy,
+                agent_ref=AgentRef("agent-fixed", "agent"),
+            ).run(
+                [Message(role=Role.USER, content="cancel")],
+                cancel=CancellationToken(),
+            )
+    produced = [message_to_json(message) for message in result.messages]
+    if produced != json.loads(_CANCELLED_MESSAGES_BEFORE_THE_REFACTOR):
+        fail(f"refactored cancellation messages differ from 210ebf6: {produced!r}")

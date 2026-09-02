@@ -6,8 +6,10 @@ import json
 import os
 import tempfile
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -46,6 +48,7 @@ class SessionError(TranscriptError):
 @dataclass(frozen=True)
 class LoadedRun:
     run_id: str
+    run_count: int
     agent_id: str
     parent_run_id: str | None
     messages: list[Message]
@@ -53,6 +56,31 @@ class LoadedRun:
     stopped_reason: str | None
     dropped_bytes: int
     meta: dict
+
+
+class RunState(str, Enum):
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    CRASHED = "crashed"
+
+
+class TurnState(str, Enum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class RunDiagnosis:
+    state: RunState
+    run_id: str
+    run_count: int
+    stopped_reason: str | None
+    turns: tuple[tuple[str, TurnState], ...]
+    unanswered_tool_call_ids: tuple[str, ...]
+    compactions: int
+    dropped_bytes: int
 
 
 def _timestamp() -> str:
@@ -231,6 +259,21 @@ class SessionStore:
             ) from exc
         return path
 
+    @property
+    def existing_tool_results_directory(self) -> Path | None:
+        """Return the existing result directory without changing anything."""
+
+        path = self._directory / "tool-results"
+        return path if path.is_dir() else None
+
+    def set_parent_session(self, parent_session_id: str) -> None:
+        """Record which session directory this run descends from."""
+
+        meta = self.read_meta()
+        meta["parent_session_id"] = parent_session_id
+        meta["updated_at"] = _timestamp()
+        self.write_meta(meta)
+
     def _record_appended(self, record: dict) -> None:
         if record["type"] not in {"run_started", "run_finished", "run_failed"}:
             return
@@ -373,15 +416,18 @@ def load_run(
     messages: list[Message] = []
     record_ids: list[str] = []
     run_id: str | None = None
+    run_count = 0
     loaded_agent_id: str | None = None
     parent_run_id: str | None = None
     stopped_reason: str | None = None
     for record in records:
         record_type = record.get("type")
-        if record_type == "run_started" and run_id is None:
+        if record_type == "run_started":
             run_id = record.get("run_id")
+            run_count += 1
             loaded_agent_id = record.get("agent_id")
             parent_run_id = record.get("data", {}).get("parent_run_id")
+            stopped_reason = None
         elif record_type == "message":
             messages.append(message_from_json(record["data"]))
             record_ids.append(record["record_id"])
@@ -411,6 +457,7 @@ def load_run(
         )
     return LoadedRun(
         run_id=run_id,
+        run_count=run_count,
         agent_id=loaded_agent_id,
         parent_run_id=parent_run_id,
         messages=messages,
@@ -430,18 +477,128 @@ def resume_run(
     return loaded.messages, loaded.run_id
 
 
-def _unanswered_tool_call_ids(messages: list[Message]) -> list[str]:
-    outstanding: list[str] = []
-    for message in messages:
-        if message.tool_calls:
-            outstanding = [call.id for call in message.tool_calls]
-        if message.tool_result is not None:
-            outstanding = [
-                call_id
-                for call_id in outstanding
-                if call_id != message.tool_result.tool_call_id
-            ]
-    return outstanding
+def classify_run(loaded: LoadedRun, records: Sequence[dict]) -> RunDiagnosis:
+    """Classify the final run segment without mutating its conversation."""
+
+    from symphonai_api.repair import unanswered_tool_call_ids
+    from symphonai_api.models import Role
+    from symphonai_api.serialization import message_from_json
+
+    starts = [
+        index
+        for index, record in enumerate(records)
+        if record.get("type") == "run_started"
+    ]
+    if not starts or starts[0] != 0:
+        raise SessionError("transcript has records before its first run_started")
+    segment = records[starts[-1] :]
+    run_id = segment[0].get("run_id")
+    if not isinstance(run_id, str):
+        raise SessionError("final run_started record has no run id")
+
+    failed = any(record.get("type") == "run_failed" for record in segment)
+    finishes = [record for record in segment if record.get("type") == "run_finished"]
+    if failed:
+        state = RunState.FAILED
+        stopped_reason = "failed"
+    elif finishes:
+        stopped_reason = finishes[-1].get("data", {}).get("stopped_reason")
+        state = (
+            RunState.CANCELLED
+            if stopped_reason == "cancelled"
+            else RunState.COMPLETED
+        )
+    else:
+        state = RunState.CRASHED
+        stopped_reason = None
+
+    turn_starts = [
+        index
+        for index, record in enumerate(segment)
+        if record.get("type") == "turn_started"
+    ]
+    turns: list[tuple[str, TurnState]] = []
+    for position, start in enumerate(turn_starts):
+        end = (
+            turn_starts[position + 1]
+            if position + 1 < len(turn_starts)
+            else len(segment)
+        )
+        turn_id = segment[start].get("turn_id")
+        if not isinstance(turn_id, str):
+            raise SessionError("turn_started record has no turn id")
+        messages = [
+            message_from_json(record["data"])
+            for record in segment[start:end]
+            if record.get("type") == "message"
+        ]
+        if not any(message.role == Role.ASSISTANT for message in messages):
+            turn_state = TurnState.EMPTY
+        elif unanswered_tool_call_ids(messages):
+            turn_state = TurnState.PARTIAL
+        else:
+            turn_state = TurnState.COMPLETED
+        turns.append((turn_id, turn_state))
+
+    assert not (
+        state == RunState.COMPLETED
+        and any(turn_state == TurnState.PARTIAL for _, turn_state in turns)
+    ), "a completed run cannot contain a partial turn"
+    return RunDiagnosis(
+        state=state,
+        run_id=run_id,
+        run_count=len(starts),
+        stopped_reason=stopped_reason,
+        turns=tuple(turns),
+        unanswered_tool_call_ids=tuple(unanswered_tool_call_ids(loaded.messages)),
+        compactions=sum(record.get("type") == "compaction" for record in records),
+        dropped_bytes=loaded.dropped_bytes,
+    )
+
+
+def load_run_for_resume(
+    store: SessionStore, *, agent_id: str | None = None
+) -> tuple[LoadedRun, RunDiagnosis, list[str]]:
+    """Load, diagnose, and repair a conversation for provider-safe resume."""
+
+    from symphonai_api.repair import repair_unanswered_tool_calls
+
+    loaded = load_run(store, agent_id=agent_id)
+    records, _ = _checked_records(store, agent_id)
+    diagnosis = classify_run(loaded, records)
+    repaired = repair_unanswered_tool_calls(
+        loaded.messages,
+        error="the session ended before this tool completed",
+        cancelled=False,
+    )
+    return loaded, diagnosis, repaired
+
+
+def tool_result_search_path(store: SessionStore) -> tuple[Path, ...]:
+    """Return existing result directories for a session and its ancestors."""
+
+    paths: list[Path] = []
+    current = store
+    seen = {store.run_id}
+    own_directory = current.existing_tool_results_directory
+    if own_directory is not None:
+        paths.append(own_directory)
+    for _ in range(64):
+        try:
+            parent_session_id = current.read_meta().get("parent_session_id")
+        except TranscriptError:
+            break
+        if not isinstance(parent_session_id, str) or parent_session_id in seen:
+            break
+        seen.add(parent_session_id)
+        try:
+            current = SessionStore.open(store.directory.parent, parent_session_id)
+        except SessionError:
+            break
+        directory = current.existing_tool_results_directory
+        if directory is not None:
+            paths.append(directory)
+    return tuple(paths)
 
 
 def fork_run(
@@ -479,7 +636,9 @@ def fork_run(
         for record in prefix
         if record.get("type") == "message"
     ]
-    unanswered = _unanswered_tool_call_ids(prefix_messages)
+    from symphonai_api.repair import unanswered_tool_call_ids
+
+    unanswered = unanswered_tool_call_ids(prefix_messages)
     if unanswered:
         raise SessionError(
             f"run {store.run_id!r} fork through {through_record_id!r} has "
@@ -487,6 +646,7 @@ def fork_run(
         )
 
     loaded = load_run(store, agent_id=agent_id)
+    new_store.set_parent_session(store.run_id)
     source_started = next(
         record for record in records if record.get("type") == "run_started"
     )
