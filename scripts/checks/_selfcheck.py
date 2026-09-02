@@ -284,6 +284,15 @@ def main() -> None:
         "events.provider_failure",
         "events.sink_isolation",
         "events.stream_optional",
+        "host_protocol.encodes_every_event",
+        "host_protocol.round_trip_events",
+        "host_protocol.unknown_type_preserved",
+        "host_protocol.field_mismatch",
+        "host_protocol.registry_is_derived",
+        "host_protocol.frame_version",
+        "host_protocol.request_validation",
+        "host_protocol.document_covers_registry",
+        "host_protocol.import_direction",
         "cancel.pre_cancelled_agent",
         "cancel.tool_repair",
         "cancel.http_read_recheck",
@@ -429,7 +438,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "349 passed, 0 failed, 349 selected of 349 registered",
+        == "358 passed, 0 failed, 358 selected of 358 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -477,7 +486,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 349 registered"
+                "of 358 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -505,7 +514,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 349 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 358 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
