@@ -162,6 +162,20 @@ def main() -> None:
         "results.agent_loop_offload",
         "results.registry_opt_in",
         "results.context_report_counts_preview",
+        "tool_results.memory_only_touches_no_disk",
+        "tool_results.disk_write_and_mode",
+        "tool_results.disk_write_atomic",
+        "tool_results.duplicate_store_skips_write",
+        "tool_results.cold_store_reads_disk",
+        "tool_results.cold_read_preserves_newlines",
+        "tool_results.disk_hit_readmits_to_memory",
+        "tool_results.handle_pattern_rejected",
+        "tool_results.unreadable_file_is_none",
+        "tool_results.eviction_keeps_file",
+        "tool_results.prune_bounds_directory",
+        "tool_results.write_failure_raises",
+        "tool_results.tool_resolves_disk_handle",
+        "tool_results.resume_fallback_directory",
         "serialization.message_round_trip",
         "serialization.tool_result_round_trip",
         "serialization.provider_metadata_verbatim",
@@ -367,7 +381,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "287 passed, 0 failed, 287 selected of 287 registered",
+        == "301 passed, 0 failed, 301 selected of 301 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -415,7 +429,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 287 registered"
+                "of 301 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -442,7 +456,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 287 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 301 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

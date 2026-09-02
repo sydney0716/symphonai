@@ -111,7 +111,13 @@ def run_task(
         messages.append(Message(role=Role.SYSTEM, content=combined_system_prompt))
     messages.append(Message(role=Role.USER, content=prompt))
 
-    result_store = ToolResultStore() if offload_tool_results else None
+    result_store = (
+        ToolResultStore(
+            directory=None if session is None else session.tool_results_directory
+        )
+        if offload_tool_results
+        else None
+    )
     tools = standard_tool_registry(
         ledger=ledger,
         result_store=result_store,
@@ -146,12 +152,21 @@ def resume_task(
     model: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     cancel: CancellationToken | None = None,
+    offload_tool_results: bool = False,
 ) -> AgentRunResult:
     """Continue a persisted conversation as a new descendant run."""
 
     messages, parent_run_id = resume_run(store)
     messages.append(Message(role=Role.USER, content=prompt))
-    tools = standard_tool_registry()
+    result_store = (
+        ToolResultStore(
+            directory=new_store.tool_results_directory,
+            fallback_directories=(store.tool_results_directory,),
+        )
+        if offload_tool_results
+        else None
+    )
+    tools = standard_tool_registry(result_store=result_store)
     agent_ref = new_agent_ref("agent")
     agent = ApiAgent(
         provider=provider,
@@ -159,6 +174,7 @@ def resume_task(
         policy=policy,
         max_turns=max_turns,
         tool_schemas=tool_registry_schemas(tools, provider.wire_format),
+        result_store=result_store,
         agent_ref=agent_ref,
         transcript=new_store.writer_for(agent_ref.agent_id, is_root=True),
     )

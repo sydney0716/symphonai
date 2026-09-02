@@ -217,6 +217,20 @@ class SessionStore:
     def run_id(self) -> str:
         return self._run_id
 
+    @property
+    def tool_results_directory(self) -> Path:
+        """`<run>/tool-results/`, created on first access with mode 0o700."""
+
+        path = self._directory / "tool-results"
+        try:
+            path.mkdir(exist_ok=True, mode=0o700)
+            path.chmod(0o700)
+        except OSError as exc:
+            raise TranscriptError(
+                f"cannot create tool-result directory {path}: {exc}"
+            ) from exc
+        return path
+
     def _record_appended(self, record: dict) -> None:
         if record["type"] not in {"run_started", "run_finished", "run_failed"}:
             return

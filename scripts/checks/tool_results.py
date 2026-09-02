@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest import mock
 
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.compaction import estimate_message_tokens, estimate_messages_tokens
 from symphonai_api.context_report import ContextSource, account_context
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
 from symphonai_api.providers.fake import FakeModelProvider
-from symphonai_api.runner import standard_tool_registry
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.runner import resume_task, run_task, standard_tool_registry
+from symphonai_api.session import SessionStore, TranscriptError
 from symphonai_api.tool_results import (
     MAX_RESULT_SLICE_CHARS,
     MAX_STORE_CHARS,
@@ -435,3 +442,323 @@ def check_context_report_counts_preview() -> None:
         for value in (entry.label, entry.detail or "")
     ):
         fail(f"context entry mentioned the off-store length: {report.entries!r}")
+
+
+@check("tool_results.memory_only_touches_no_disk")
+def check_memory_only_touches_no_disk() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        missing_cwd = Path(temporary) / "removed-cwd"
+        missing_cwd.mkdir()
+        previous_cwd = os.open(".", os.O_RDONLY)
+        try:
+            os.chdir(missing_cwd)
+            missing_cwd.rmdir()
+            store = ToolResultStore()
+            stored = store.store(tool_name="grep", tool_call_id="memory", content="memory")
+            resolved = store.get(stored.id)
+        finally:
+            os.fchdir(previous_cwd)
+            os.close(previous_cwd)
+        if resolved != stored:
+            fail(f"memory-only store failed with a missing cwd: {resolved!r}")
+
+
+@check("tool_results.disk_write_and_mode")
+def check_disk_write_and_mode() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        stored = ToolResultStore(directory=directory).store(
+            tool_name="grep", tool_call_id="disk", content="persisted text"
+        )
+        path = directory / stored.id
+        if path.read_text(encoding="utf-8") != "persisted text":
+            fail("persisted result content changed")
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            fail(f"persisted result mode was {oct(stat.S_IMODE(path.stat().st_mode))}")
+
+
+@check("tool_results.disk_write_atomic")
+def check_disk_write_atomic() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        content = "atomic content"
+        result_id = "res_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        destination = directory / result_id
+        real_replace = os.replace
+        observed = False
+
+        def observe_replace(source, target) -> None:
+            nonlocal observed
+            observed = True
+            if destination.exists():
+                fail("handle path existed before atomic replacement")
+            source_path = Path(source)
+            if source_path.parent != directory or not source_path.name.startswith(
+                f".{result_id}-"
+            ):
+                fail(f"replacement did not use a same-directory temporary file: {source_path}")
+            real_replace(source, target)
+
+        with mock.patch(
+            "symphonai_api.tool_results.os.replace", side_effect=observe_replace
+        ):
+            ToolResultStore(directory=directory).store(
+                tool_name="grep", tool_call_id="atomic", content=content
+            )
+        if not observed or destination.read_text(encoding="utf-8") != content:
+            fail("atomic replacement was not observed with complete content")
+
+
+@check("tool_results.duplicate_store_skips_write")
+def check_duplicate_store_skips_write() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        store = ToolResultStore(directory=directory)
+        first = store.store(tool_name="grep", tool_call_id="first", content="duplicate")
+        path = directory / first.id
+        original_mtime = path.stat().st_mtime_ns
+        with mock.patch(
+            "symphonai_api.tool_results.os.replace",
+            side_effect=AssertionError("duplicate store rewrote its file"),
+        ):
+            second = store.store(
+                tool_name="read_file", tool_call_id="second", content="duplicate"
+            )
+        if second != first or path.stat().st_mtime_ns != original_mtime:
+            fail("duplicate content changed the stored entry or its mtime")
+
+
+@check("tool_results.cold_store_reads_disk")
+def check_cold_store_reads_disk() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        stored = ToolResultStore(directory=directory).store(
+            tool_name="grep", tool_call_id="warm", content="cold content"
+        )
+        resolved = ToolResultStore(directory=directory).get(stored.id)
+        if resolved is None or resolved.content != "cold content":
+            fail(f"fresh store did not read persisted content: {resolved!r}")
+
+
+@check("tool_results.cold_read_preserves_newlines")
+def check_cold_read_preserves_newlines() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        content = "line one\r\nline two\rprogress\n"
+        stored = ToolResultStore(directory=directory).store(
+            tool_name="run_shell", tool_call_id="carriage", content=content
+        )
+        if (directory / stored.id).read_bytes() != content.encode("utf-8"):
+            fail("persisted bytes did not match the stored content")
+        resolved = ToolResultStore(directory=directory).get(stored.id)
+        if resolved is None or resolved.content != content:
+            fail(f"cold read rewrote carriage returns: {resolved!r}")
+        rehashed = "res_" + hashlib.sha256(resolved.content.encode("utf-8")).hexdigest()[:12]
+        if rehashed != stored.id:
+            fail(f"cold-read content no longer hashes to its handle: {rehashed}")
+
+
+@check("tool_results.disk_hit_readmits_to_memory")
+def check_disk_hit_readmits_to_memory() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        stored = ToolResultStore(directory=directory).store(
+            tool_name="grep", tool_call_id="warm", content="readmitted"
+        )
+        cold = ToolResultStore(directory=directory)
+        if cold.get(stored.id) is None:
+            fail("initial disk lookup failed")
+        with mock.patch("pathlib.Path.open", side_effect=AssertionError("disk reread")):
+            resolved = cold.get(stored.id)
+        if resolved is None or resolved.content != "readmitted":
+            fail(f"readmitted result was not retained in memory: {resolved!r}")
+
+
+@check("tool_results.handle_pattern_rejected")
+def check_handle_pattern_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        store = ToolResultStore(directory=Path(temporary))
+        invalid_ids = ("res_../../etc/passwd", "res_missing", "res_ABCDEF123456", "")
+        with mock.patch(
+            "pathlib.Path.open", side_effect=AssertionError("filesystem touched")
+        ):
+            resolved = [store.get(result_id) for result_id in invalid_ids]
+        if resolved != [None] * len(invalid_ids):
+            fail(f"invalid handles did not all resolve to None: {resolved!r}")
+
+
+@check("tool_results.unreadable_file_is_none")
+def check_unreadable_file_is_none() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        store = ToolResultStore(directory=directory)
+        absent = "res_000000000000"
+        unreadable = "res_111111111111"
+        invalid_utf8 = "res_222222222222"
+        (directory / unreadable).write_text("blocked", encoding="utf-8")
+        (directory / invalid_utf8).write_bytes(b"\xff\xfe")
+        if store.get(absent) is not None:
+            fail("absent persisted result did not return None")
+        real_open = Path.open
+
+        def deny_one(path, *args, **kwargs):
+            if path.name == unreadable:
+                raise PermissionError("unreadable fixture")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("pathlib.Path.open", autospec=True, side_effect=deny_one):
+            if store.get(unreadable) is not None:
+                fail("unreadable persisted result did not return None")
+        if store.get(invalid_utf8) is not None:
+            fail("invalid UTF-8 persisted result did not return None")
+
+
+@check("tool_results.eviction_keeps_file")
+def check_eviction_keeps_file() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        store = ToolResultStore(directory=directory)
+        oldest = store.store(tool_name="grep", tool_call_id="oldest", content="oldest-disk")
+        for index in range(MAX_STORE_ENTRIES):
+            store.store(tool_name="grep", tool_call_id=str(index), content=f"disk-{index}")
+        path = directory / oldest.id
+        if not path.is_file():
+            fail("memory eviction deleted the persisted file")
+        resolved = store.get(oldest.id)
+        if resolved is None or resolved.content != "oldest-disk":
+            fail(f"evicted result did not resolve again from disk: {resolved!r}")
+
+
+@check("tool_results.prune_bounds_directory")
+def check_prune_bounds_directory() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        store = ToolResultStore(directory=directory)
+        entries = [
+            store.store(tool_name="grep", tool_call_id=str(index), content=value)
+            for index, value in enumerate(("old", "middle", "newest"))
+        ]
+        for index, entry in enumerate(entries, start=1):
+            os.utime(directory / entry.id, ns=(index, index))
+        before = {path.name for path in directory.iterdir()}
+        total = sum(path.stat().st_size for path in directory.iterdir())
+        store.prune(total)
+        if {path.name for path in directory.iterdir()} != before:
+            fail("prune deleted a file while the directory was already under the cap")
+        newest_size = (directory / entries[-1].id).stat().st_size
+        store.prune(newest_size)
+        remaining = {path.name for path in directory.iterdir()}
+        if remaining != {entries[-1].id}:
+            fail(f"prune did not delete least-recently-modified files first: {remaining!r}")
+
+
+@check("tool_results.write_failure_raises")
+def check_write_failure_raises() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        content = "cannot persist"
+        result_id = "res_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        with mock.patch(
+            "symphonai_api.tool_results.tempfile.mkstemp",
+            side_effect=OSError("full"),
+        ):
+            try:
+                ToolResultStore(directory=Path(temporary)).store(
+                    tool_name="grep", tool_call_id="failure", content=content
+                )
+            except TranscriptError as exc:
+                if result_id not in str(exc):
+                    fail(f"write failure omitted its result id: {exc}")
+            else:
+                fail("write failure did not raise TranscriptError")
+
+
+@check("tool_results.tool_resolves_disk_handle")
+def check_tool_resolves_disk_handle() -> None:
+    with tempfile.TemporaryDirectory() as temporary, workspace() as ws:
+        directory = Path(temporary)
+        stored = ToolResultStore(directory=directory).store(
+            tool_name="grep", tool_call_id="source", content="disk-only tool content"
+        )
+        tool = ReadToolResultTool(ToolResultStore(directory=directory))
+        result = _read_result(tool, ws.policy, stored.id)
+        if not result.ok or result.content != "disk-only tool content":
+            fail(f"unchanged tool did not resolve a disk-only handle: {result!r}")
+
+
+@check("tool_results.resume_fallback_directory")
+def check_resume_fallback_directory() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        (repo / "large.txt").write_text("persistent line\n" * 400, encoding="utf-8")
+        sessions = root / "sessions"
+        source = SessionStore(sessions, "source")
+        first = run_task(
+            FakeModelProvider(
+                responses=[
+                    ModelResponse(
+                        message=Message(
+                            role=Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="read-large",
+                                    name="read_file",
+                                    arguments={"path": "large.txt"},
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(message=Message(role=Role.ASSISTANT, content="stored")),
+                ]
+            ),
+            PermissionPolicy(repo_root=repo),
+            "read it",
+            offload_tool_results=True,
+            session=source,
+        )
+        offloaded = next(
+            message.tool_result.offloaded
+            for message in first.messages
+            if message.role == Role.TOOL and message.tool_result is not None
+        )
+        if offloaded is None or not (source.tool_results_directory / offloaded.id).is_file():
+            fail("initial run did not persist its offloaded result")
+        destination = SessionStore(sessions, "destination")
+        resumed = resume_task(
+            FakeModelProvider(
+                responses=[
+                    ModelResponse(
+                        message=Message(
+                            role=Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="read-persisted",
+                                    name="read_tool_result",
+                                    arguments={"id": offloaded.id, "limit": 100},
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(message=Message(role=Role.ASSISTANT, content="resumed")),
+                ]
+            ),
+            PermissionPolicy(repo_root=repo),
+            "read the old handle",
+            store=source,
+            new_store=destination,
+            offload_tool_results=True,
+        )
+        disk_read = next(
+            message.tool_result
+            for message in resumed.messages
+            if message.role == Role.TOOL
+            and message.tool_result is not None
+            and message.tool_result.tool_call_id == "read-persisted"
+        )
+        if not disk_read.ok or not disk_read.content:
+            fail(f"resumed run did not resolve the source fallback handle: {disk_read!r}")
+        if (destination.tool_results_directory / offloaded.id).exists():
+            fail("fallback result was copied into the new run directory")
+        source.close()
+        destination.close()
