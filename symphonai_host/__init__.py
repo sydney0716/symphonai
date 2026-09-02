@@ -14,6 +14,7 @@ from symphonai_host.protocol import (
     encode_frame,
     event_type_name,
 )
+from symphonai_host.server import HostServer
 
 __all__ = [
     "PROTOCOL_VERSION",
@@ -28,4 +29,5 @@ __all__ = [
     "encode_event",
     "encode_frame",
     "event_type_name",
+    "HostServer",
 ]
