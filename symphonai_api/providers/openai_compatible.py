@@ -24,12 +24,18 @@ import json
 import os
 import urllib.request
 from dataclasses import dataclass
+from typing import Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.models import ModelRequest, ModelResponse
 from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
-from symphonai_api.providers.openai_provider import _build_request_body, _parse_response
+from symphonai_api.providers.openai_provider import (
+    _build_request_body,
+    _openai_stream_chunks,
+    _parse_response,
+)
 from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
+from symphonai_api.streaming import StreamChunk, open_stream_with_retry
 
 DEFAULT_MODEL = "openai-compatible-placeholder"
 
@@ -51,6 +57,7 @@ class OpenAICompatibleProvider(ModelProvider):
     provider_label: str = "openai-compatible"
     timeout_seconds: float = 30.0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    stream_usage: bool = True
 
     @property
     def name(self) -> str:
@@ -94,3 +101,35 @@ class OpenAICompatibleProvider(ModelProvider):
         data = parse_json_object(raw, f"{self.provider_label} API")
 
         return _parse_response(data)
+
+    def create_response_stream(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> Iterator[StreamChunk]:
+        api_key = os.environ.get(self.api_key_env_var, "").strip()
+        if not api_key:
+            raise ProviderError(f"{self.api_key_env_var} is not set")
+
+        model = request.model if request.model is not None else self.model
+        body = _build_request_body(request, model)
+        body["stream"] = True
+        if self.stream_usage:
+            body["stream_options"] = {"include_usage": True}
+        http_request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+            },
+        )
+        operation = f"{self.provider_label} API"
+        lines = open_stream_with_retry(
+            http_request,
+            timeout=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            api_key=api_key,
+            operation=operation,
+            cancel=cancel,
+        )
+        yield from _openai_stream_chunks(lines, operation=operation, api_key=api_key)

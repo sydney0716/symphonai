@@ -54,6 +54,11 @@ class TurnFinished(Event):
 
 
 @dataclass(frozen=True)
+class AssistantTextDelta(Event):
+    text: str = ""
+
+
+@dataclass(frozen=True)
 class ToolCallStarted(Event):
     tool_name: str = ""
     tool_call_id: str = ""

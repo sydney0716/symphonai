@@ -20,6 +20,7 @@ from scripts.checks import retry  # noqa: E402, F401
 from scripts.checks import circuit_breaker  # noqa: E402, F401
 from scripts.checks import model_discovery  # noqa: E402, F401
 from scripts.checks import providers  # noqa: E402, F401
+from scripts.checks import streaming  # noqa: E402, F401
 from scripts.checks import compaction  # noqa: E402, F401
 from scripts.checks import context_report  # noqa: E402, F401
 from scripts.checks import tool_results  # noqa: E402, F401

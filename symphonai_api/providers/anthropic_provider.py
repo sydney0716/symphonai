@@ -18,7 +18,7 @@ import json
 import os
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
@@ -37,7 +37,15 @@ from symphonai_api.models import (
     wire_tool_call_ids,
 )
 from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
-from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
+from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_secret
+from symphonai_api.streaming import (
+    StreamChunk,
+    StreamCompleted,
+    TextDelta,
+    ToolCallDelta,
+    open_stream_with_retry,
+    sse_events,
+)
 
 API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
@@ -172,6 +180,71 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     )
 
 
+def _anthropic_stream_chunks(
+    lines: Iterator[bytes], *, api_key: str
+) -> Iterator[StreamChunk]:
+    """Map Anthropic Messages SSE events to the provider-neutral chunks."""
+    input_tokens = 0
+    output_tokens = 0
+    stop_reason = "end_turn"
+    for event, payload in sse_events(lines):
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"Anthropic API stream returned invalid JSON: {exc}") from None
+        if not isinstance(data, dict):
+            raise ProviderError("Anthropic API stream returned non-object JSON")
+
+        if event == "error":
+            error = data.get("error", {})
+            message = error.get("message", "Anthropic API stream returned an error") if isinstance(error, dict) else "Anthropic API stream returned an error"
+            raise ProviderError(redact_secret(str(message), api_key))
+        if event == "message_start":
+            message = data.get("message", {})
+            usage = message.get("usage", {}) if isinstance(message, dict) else {}
+            if isinstance(usage, dict):
+                input_tokens = usage.get("input_tokens", 0)
+            continue
+        if event == "content_block_start":
+            block = data.get("content_block", {})
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                yield ToolCallDelta(
+                    data["index"],
+                    id=block.get("id"),
+                    name=block.get("name"),
+                    vendor_id=block.get("id"),
+                )
+            continue
+        if event == "content_block_delta":
+            delta = data.get("delta", {})
+            if not isinstance(delta, dict):
+                continue
+            if delta.get("type") == "text_delta":
+                yield TextDelta(delta.get("text", ""))
+            elif delta.get("type") == "input_json_delta":
+                yield ToolCallDelta(
+                    data["index"], arguments_fragment=delta.get("partial_json", "")
+                )
+            continue
+        if event == "message_delta":
+            delta = data.get("delta", {})
+            usage = data.get("usage", {})
+            if isinstance(delta, dict) and delta.get("stop_reason") is not None:
+                stop_reason = delta["stop_reason"]
+            if isinstance(usage, dict):
+                output_tokens = usage.get("output_tokens", 0)
+            continue
+        if event == "message_stop":
+            yield StreamCompleted(
+                ModelResponse(
+                    Message(role=Role.ASSISTANT),
+                    usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+                    stop_reason=stop_reason,
+                )
+            )
+            return
+
+
 @dataclass
 class AnthropicProvider(ModelProvider):
     """Calls the real Anthropic Messages API.
@@ -231,3 +304,33 @@ class AnthropicProvider(ModelProvider):
         data = parse_json_object(raw, "Anthropic API")
 
         return _parse_response(data)
+
+    def create_response_stream(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> Iterator[StreamChunk]:
+        api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+        if not api_key:
+            raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
+
+        model = request.model if request.model is not None else self.model
+        body = _build_request_body(request, model, self.max_tokens)
+        body["stream"] = True
+        http_request = urllib.request.Request(
+            f"{self.base_url}/messages",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
+        )
+        lines = open_stream_with_retry(
+            http_request,
+            timeout=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            api_key=api_key,
+            operation="Anthropic API",
+            cancel=cancel,
+        )
+        yield from _anthropic_stream_chunks(lines, api_key=api_key)

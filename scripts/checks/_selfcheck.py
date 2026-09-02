@@ -129,6 +129,31 @@ def main() -> None:
         "discovery.shutdown_date_filter",
         "providers.model_overrides",
         "providers.malformed_json",
+        "streaming.default_yields_one_completion",
+        "streaming.text_accumulates",
+        "streaming.tool_fragments_by_index",
+        "streaming.arguments_parsed_once",
+        "streaming.synthesized_ids_unique",
+        "streaming.no_completion_raises",
+        "streaming.terminal_response_wins",
+        "streaming.loop_matches_non_streaming",
+        "streaming.deltas_emitted",
+        "streaming.dropped_events_change_nothing",
+        "streaming.retry_before_first_line_only",
+        "streaming.cancel_mid_stream",
+        "streaming.sse_parsing",
+        "streaming.anthropic_matches_non_streaming",
+        "streaming.openai_matches_non_streaming",
+        "streaming.compatible_shares_openai_mapping",
+        "streaming.anthropic_partial_json",
+        "streaming.openai_parallel_tool_calls",
+        "streaming.anthropic_error_event",
+        "streaming.openai_empty_choices_ignored",
+        "streaming.compatible_without_stream_usage",
+        "streaming.truncated_stream_raises",
+        "streaming.stream_flag_present",
+        "streaming.non_streaming_path_unchanged",
+        "streaming.openai_error_event",
         "compaction.cancellation_at_entry",
         "compaction.under_budget_unchanged",
         "compaction.preserves_required_context",
@@ -397,7 +422,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "317 passed, 0 failed, 317 selected of 317 registered",
+        == "342 passed, 0 failed, 342 selected of 342 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -445,7 +470,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 317 registered"
+                "of 342 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -453,7 +478,8 @@ def main() -> None:
     listed_retry = invoke_check("--list", "--only", "retry")
     require(listed_retry.returncode == 0, f"filtered list failed: {listed_retry.stderr!r}")
     require(
-        listed_retry.stdout.splitlines() == expected_names[17:40],
+        listed_retry.stdout.splitlines()
+        == expected_names[17:40] + [expected_names[64]],
         f"unexpected filtered list: {listed_retry.stdout!r}",
     )
 
@@ -472,7 +498,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 317 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 342 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

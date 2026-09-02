@@ -18,7 +18,7 @@ import json
 import os
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
@@ -37,7 +37,15 @@ from symphonai_api.models import (
     wire_tool_call_ids,
 )
 from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
-from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
+from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_secret
+from symphonai_api.streaming import (
+    StreamChunk,
+    StreamCompleted,
+    TextDelta,
+    ToolCallDelta,
+    open_stream_with_retry,
+    sse_events,
+)
 
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -174,6 +182,81 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     )
 
 
+def _openai_stream_chunks(
+    lines: Iterator[bytes], *, operation: str, api_key: str = ""
+) -> Iterator[StreamChunk]:
+    """Map OpenAI SSE payloads to chunks, ignoring valid usage-only choices."""
+    usage = Usage()
+    finish_reason = "stop"
+    for _, payload in sse_events(lines):
+        if payload == "[DONE]":
+            yield StreamCompleted(
+                ModelResponse(
+                    Message(role=Role.ASSISTANT),
+                    usage=usage,
+                    stop_reason=finish_reason,
+                )
+            )
+            return
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"{operation} stream returned invalid JSON: {exc}") from None
+        if not isinstance(data, dict):
+            raise ProviderError(f"{operation} stream returned non-object JSON")
+
+        # An error payload carries no choices, so without this it would be
+        # skipped and the vendor's reason replaced by "stream ended without a
+        # completion event".
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or f"{operation} stream returned an error"
+            raise ProviderError(redact_secret(str(message), api_key))
+
+        usage_raw = data.get("usage")
+        if isinstance(usage_raw, dict):
+            usage = Usage(
+                input_tokens=usage_raw.get("prompt_tokens", 0),
+                output_tokens=usage_raw.get("completion_tokens", 0),
+            )
+        # Unlike _parse_response, this accepts an empty choices list because
+        # include_usage makes the final usage payload legitimately choice-less.
+        choices = data.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise ProviderError(f"{operation} stream returned invalid choice")
+        if choice.get("finish_reason") is not None:
+            finish_reason = choice["finish_reason"]
+        delta = choice.get("delta", {})
+        if not isinstance(delta, dict):
+            continue
+        if isinstance(delta.get("content"), str):
+            yield TextDelta(delta["content"])
+        tool_calls = delta.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            raise ProviderError(f"{operation} stream returned invalid tool calls")
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict) or not isinstance(tool_call.get("index"), int):
+                raise ProviderError(f"{operation} stream tool call omitted its index")
+            function = tool_call.get("function", {})
+            if not isinstance(function, dict):
+                function = {}
+            arguments = function.get("arguments", "")
+            if arguments is None:
+                arguments = ""
+            if not isinstance(arguments, str):
+                raise ProviderError(f"{operation} stream returned invalid tool arguments")
+            yield ToolCallDelta(
+                tool_call["index"],
+                id=tool_call.get("id"),
+                name=function.get("name"),
+                arguments_fragment=arguments,
+                vendor_id=tool_call.get("id"),
+            )
+
+
 @dataclass
 class OpenAIProvider(ModelProvider):
     """Calls the real OpenAI Chat Completions API.
@@ -231,3 +314,35 @@ class OpenAIProvider(ModelProvider):
         data = parse_json_object(raw, "OpenAI API")
 
         return _parse_response(data)
+
+    def create_response_stream(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> Iterator[StreamChunk]:
+        api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+        if not api_key:
+            raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
+
+        model = request.model if request.model is not None else self.model
+        body = _build_request_body(request, model)
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+        http_request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+            },
+        )
+        lines = open_stream_with_retry(
+            http_request,
+            timeout=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            api_key=api_key,
+            operation="OpenAI API",
+            cancel=cancel,
+        )
+        yield from _openai_stream_chunks(
+            lines, operation="OpenAI API", api_key=api_key
+        )

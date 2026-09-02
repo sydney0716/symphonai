@@ -67,6 +67,9 @@ def check_usage_totals_merge() -> None:
         "RunFailed": {"agent_id", "run_id", "turn_id", "schema_version", "agent_name", "error"},
         "TurnStarted": {"agent_id", "run_id", "turn_id", "schema_version", "index"},
         "TurnFinished": {"agent_id", "run_id", "turn_id", "schema_version", "index"},
+        "AssistantTextDelta": {
+            "agent_id", "run_id", "turn_id", "schema_version", "text",
+        },
         "ToolCallStarted": {
             "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id",
         },

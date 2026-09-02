@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.models import ModelRequest, ModelResponse
+
+if TYPE_CHECKING:
+    from symphonai_api.streaming import StreamChunk
 
 
 class ProviderError(Exception):
@@ -60,3 +63,16 @@ class ModelProvider(ABC):
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
     ) -> ModelResponse:
         """Given the conversation so far, return the model's next turn."""
+
+    def create_response_stream(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> Iterator[StreamChunk]:
+        """Return this response as a stream, defaulting to one completion."""
+
+        from symphonai_api.streaming import StreamCompleted
+
+        if cancel is None:
+            response = self.create_response(request)
+        else:
+            response = self.create_response(request, cancel=cancel)
+        yield StreamCompleted(response)

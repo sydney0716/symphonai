@@ -21,6 +21,7 @@ from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
+    AssistantTextDelta,
     EventSink,
     RunFailed,
     RunFinished,
@@ -53,6 +54,7 @@ from symphonai_api.repair import repair_unanswered_tool_calls
 from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from symphonai_api.serialization import message_to_json
 from symphonai_api.session import TranscriptWriter
+from symphonai_api.streaming import StreamAssembler, TextDelta
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
 
@@ -99,6 +101,7 @@ class ApiAgent:
         budget: RunBudget | None = None,
         call_class: CallClass = CallClass.FOREGROUND,
         transcript: TranscriptWriter | None = None,
+        stream: bool = False,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns < 1:
@@ -113,6 +116,7 @@ class ApiAgent:
         self._agent_ref = agent_ref or new_agent_ref("agent")
         self._events = events
         self._transcript = transcript
+        self._stream = stream
         self._persisted_digests: list[str] = []
         # Schemas actually sent to the model so it knows these tools exist.
         # `tools` above is only the *execution* registry, keyed by name --
@@ -298,7 +302,31 @@ class ApiAgent:
                         "tool_names": sorted(self._tools),
                     },
                 )
-                if cancel is None:
+                if self._stream:
+                    assembler = StreamAssembler()
+                    chunks = (
+                        self._provider.create_response_stream(request)
+                        if cancel is None
+                        else self._provider.create_response_stream(
+                            request, cancel=cancel
+                        )
+                    )
+                    for chunk in chunks:
+                        if cancel is not None:
+                            cancel.raise_if_cancelled()
+                        if isinstance(chunk, TextDelta):
+                            emit(
+                                event_sink,
+                                AssistantTextDelta(
+                                    agent_id=self._agent_ref.agent_id,
+                                    run_id=run_ref.run_id,
+                                    turn_id=turn_ref.turn_id,
+                                    text=chunk.text,
+                                ),
+                            )
+                        assembler.add(chunk)
+                    response = assembler.finish()
+                elif cancel is None:
                     response = self._provider.create_response(request)
                 else:
                     response = self._provider.create_response(request, cancel=cancel)

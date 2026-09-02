@@ -8,9 +8,15 @@ can be exercised end-to-end without any real model or network access.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Iterator
+
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role
 from symphonai_api.providers.base import ModelProvider
+
+if TYPE_CHECKING:
+    from symphonai_api.streaming import StreamChunk
 
 _NO_SCRIPT_RESPONSE = ModelResponse(
     message=Message(role=Role.ASSISTANT, content="(no scripted response configured)")
@@ -27,8 +33,18 @@ class FakeModelProvider(ModelProvider):
     counts.
     """
 
-    def __init__(self, responses: list[ModelResponse] | None = None) -> None:
-        self._responses: list[ModelResponse] = list(responses) if responses else [_NO_SCRIPT_RESPONSE]
+    def __init__(
+        self,
+        responses: list[ModelResponse] | None = None,
+        *,
+        streams: list[Sequence[StreamChunk]] | None = None,
+    ) -> None:
+        self._responses: list[ModelResponse] = (
+            list(responses) if responses else [_NO_SCRIPT_RESPONSE]
+        )
+        self._streams = (
+            None if not streams else [tuple(stream) for stream in streams]
+        )
         self._call_count = 0
 
     @property
@@ -51,3 +67,16 @@ class FakeModelProvider(ModelProvider):
         index = min(self._call_count, len(self._responses) - 1)
         self._call_count += 1
         return self._responses[index]
+
+    def create_response_stream(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> Iterator[StreamChunk]:
+        if self._streams is None:
+            yield from super().create_response_stream(request, cancel=cancel)
+            return
+        index = min(self._call_count, len(self._streams) - 1)
+        self._call_count += 1
+        for chunk in self._streams[index]:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            yield chunk

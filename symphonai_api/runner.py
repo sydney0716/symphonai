@@ -96,6 +96,7 @@ def run_task(
     budget: RunBudget | None = None,
     search_backend: SearchBackend | None = None,
     session: SessionStore | None = None,
+    stream: bool = False,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -142,6 +143,7 @@ def run_task(
             if session is None
             else session.writer_for(agent_ref.agent_id, is_root=True)
         ),
+        stream=stream,
     )
     return agent.run(messages, model=model, cancel=cancel)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.events import (
+    AssistantTextDelta,
     CollectingSink,
     CompactionApplied,
     Event,
@@ -107,9 +108,19 @@ from symphonai_api.repair import (
     unanswered_tool_call_ids,
 )
 from symphonai_api.runner import resume_task
+from symphonai_api.streaming import (
+    StreamAssembler,
+    StreamChunk,
+    StreamCompleted,
+    TextDelta,
+    ToolCallDelta,
+    open_stream_with_retry,
+    sse_events,
+)
 
 __all__ = [
     "AgentRef",
+    "AssistantTextDelta",
     "CancellationToken",
     "CollectingSink",
     "CompactionApplied",
@@ -143,10 +154,15 @@ __all__ = [
     "SessionError",
     "SessionStore",
     "SubagentSpawned",
+    "StreamAssembler",
+    "StreamChunk",
+    "StreamCompleted",
     "TextBlock",
+    "TextDelta",
     "ToolCall",
     "ToolCallFinished",
     "ToolCallStarted",
+    "ToolCallDelta",
     "ToolEffect",
     "ToolMetadata",
     "ToolResult",
@@ -179,10 +195,12 @@ __all__ = [
     "new_id",
     "new_run_ref",
     "new_turn_ref",
+    "open_stream_with_retry",
     "preapproved_domains",
     "search_endpoint",
     "search_endpoints",
     "safe_metadata",
+    "sse_events",
     "read_records",
     "resume_run",
     "repair_unanswered_tool_calls",
