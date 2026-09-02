@@ -27,7 +27,7 @@ import json
 import os
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.gemini_schema import sanitize_for_gemini
@@ -46,7 +46,15 @@ from symphonai_api.models import (
     reject_system_attachments,
 )
 from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
-from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
+from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_secret
+from symphonai_api.streaming import (
+    StreamChunk,
+    StreamCompleted,
+    TextDelta,
+    ToolCallDelta,
+    open_stream_with_retry,
+    sse_events,
+)
 
 API_KEY_ENV_VAR = "GEMINI_API_KEY"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -252,6 +260,77 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     )
 
 
+def _gemini_stream_chunks(
+    lines: Iterator[bytes], *, api_key: str
+) -> Iterator[StreamChunk]:
+    """Map Gemini streamGenerateContent SSE payloads to runtime chunks."""
+    usage = Usage()
+    finish_reason = "STOP"
+    function_call_index = 0
+    for _, payload in sse_events(lines):
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"Gemini API stream returned invalid JSON: {exc}") from None
+        if not isinstance(data, dict):
+            raise ProviderError("Gemini API stream returned non-object JSON")
+
+        feedback = data.get("promptFeedback")
+        if isinstance(feedback, dict) and feedback.get("blockReason") is not None:
+            reason = redact_secret(str(feedback["blockReason"]), api_key)
+            raise ProviderError(f"Gemini prompt was blocked: {reason}")
+
+        usage_raw = data.get("usageMetadata")
+        if isinstance(usage_raw, dict):
+            usage = Usage(
+                input_tokens=usage_raw.get("promptTokenCount", 0),
+                output_tokens=usage_raw.get("candidatesTokenCount", 0),
+            )
+        candidates = data.get("candidates") or []
+        if not candidates:
+            continue
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise ProviderError("Gemini API stream returned invalid candidate")
+        if candidate.get("finishReason") is not None:
+            finish_reason = candidate["finishReason"]
+        content = candidate.get("content", {})
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        if not isinstance(parts, list):
+            raise ProviderError("Gemini API stream returned invalid content parts")
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if "text" in part:
+                yield TextDelta(part["text"] or "")
+            function_call = part.get("functionCall")
+            if not isinstance(function_call, dict) or not function_call.get("name"):
+                continue
+            provider_metadata = (
+                {"thoughtSignature": part["thoughtSignature"]}
+                if "thoughtSignature" in part
+                else None
+            )
+            # The vendor id goes back on the wire as this call's id
+            # (`_build_request_body`); dropping it here would answer Gemini
+            # with an id it never issued.
+            vendor_id = function_call.get("id") or None
+            yield ToolCallDelta(
+                function_call_index,
+                id=vendor_id,
+                name=function_call["name"],
+                arguments_fragment=json.dumps(function_call.get("args") or {}),
+                vendor_id=vendor_id,
+                provider_metadata=provider_metadata,
+            )
+            function_call_index += 1
+    yield StreamCompleted(
+        ModelResponse(
+            Message(role=Role.ASSISTANT), usage=usage, stop_reason=finish_reason
+        )
+    )
+
+
 @dataclass
 class GeminiProvider(ModelProvider):
     """Calls the real Gemini Generative Language API.
@@ -311,3 +390,31 @@ class GeminiProvider(ModelProvider):
         data = parse_json_object(raw, "Gemini API")
 
         return _parse_response(data)
+
+    def create_response_stream(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> Iterator[StreamChunk]:
+        api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+        if not api_key:
+            raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
+
+        model = request.model if request.model is not None else self.model
+        body = _build_request_body(request)
+        http_request = urllib.request.Request(
+            f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "x-goog-api-key": api_key,
+                "content-type": "application/json",
+            },
+        )
+        lines = open_stream_with_retry(
+            http_request,
+            timeout=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            api_key=api_key,
+            operation="Gemini API",
+            cancel=cancel,
+        )
+        yield from _gemini_stream_chunks(lines, api_key=api_key)

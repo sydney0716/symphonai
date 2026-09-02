@@ -154,6 +154,13 @@ def main() -> None:
         "streaming.stream_flag_present",
         "streaming.non_streaming_path_unchanged",
         "streaming.openai_error_event",
+        "streaming.gemini_matches_non_streaming",
+        "streaming.gemini_thought_signature_round_trip",
+        "streaming.gemini_no_signature_no_key",
+        "streaming.gemini_two_calls",
+        "streaming.gemini_block_reason",
+        "streaming.gemini_truncated_stream",
+        "streaming.gemini_url_has_no_key",
         "compaction.cancellation_at_entry",
         "compaction.under_budget_unchanged",
         "compaction.preserves_required_context",
@@ -422,7 +429,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "342 passed, 0 failed, 342 selected of 342 registered",
+        == "349 passed, 0 failed, 349 selected of 349 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -470,7 +477,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 342 registered"
+                "of 349 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -498,7 +505,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 342 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 349 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

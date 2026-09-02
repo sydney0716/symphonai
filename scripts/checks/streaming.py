@@ -24,7 +24,7 @@ from symphonai_api.models import (
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
-from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.gemini_provider import GeminiProvider, _build_request_body
 from symphonai_api.providers import openai_compatible
 from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
 from symphonai_api.providers.openai_provider import OpenAIProvider
@@ -90,14 +90,17 @@ def check_default_yields_one_completion() -> None:
         fail(f"default stream changed the response: {chunks[0]!r}")
     if hasattr(chunks[0], "schema_version"):
         fail("transport chunk gained a schema_version")
-    if GeminiProvider.create_response_stream is not ModelProvider.create_response_stream:
-        fail("Gemini unexpectedly needed a streaming override before phase 05c")
-    overridden = (OpenAIProvider, AnthropicProvider, OpenAICompatibleProvider)
+    overridden = (
+        OpenAIProvider,
+        AnthropicProvider,
+        OpenAICompatibleProvider,
+        GeminiProvider,
+    )
     if any(
         cls.create_response_stream is ModelProvider.create_response_stream
         for cls in overridden
     ):
-        fail("a wire-format 1 or 2 provider did not override streaming")
+        fail("a real wire-format provider did not override streaming")
     fake_chunks = list(
         FakeModelProvider(
             [ModelResponse(Message(role=Role.ASSISTANT, content="fake complete"))]
@@ -798,7 +801,20 @@ _NON_STREAMING_BEFORE_05 = """
 {
   "anthropic": {"stop_reason": "tool_use", "usage": [3, 5]},
   "openai": {"stop_reason": "tool_calls", "usage": [3, 5]},
-  "compatible": {"stop_reason": "tool_calls", "usage": [3, 5]}
+  "compatible": {"stop_reason": "tool_calls", "usage": [3, 5]},
+  "gemini": {"stop_reason": "STOP", "usage": [3, 5]}
+}
+"""
+_GEMINI_MESSAGE_BEFORE_05 = """
+{
+  "content": [{"kind": "text", "schema_version": 1, "text": "hello world"}],
+  "role": "assistant",
+  "schema_version": 1,
+  "tool_calls": [{"arguments": {"city": "Seoul"}, "id": "tool-1", "name": "weather",
+                  "provider_metadata": {"thoughtSignature": "frozen-signature"},
+                  "schema_version": 1, "vendor_id": "tool-1"}],
+  "tool_result": null,
+  "turn_id": null
 }
 """
 _NON_STREAMING_MESSAGE_BEFORE_05 = """
@@ -844,19 +860,43 @@ def check_non_streaming_path_unchanged() -> None:
         ],
         "usage": {"prompt_tokens": 3, "completion_tokens": 5},
     }
+    gemini_body = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "hello world"},
+                        {
+                            "functionCall": {
+                                "id": "tool-1",
+                                "name": "weather",
+                                "args": {"city": "Seoul"},
+                            },
+                            "thoughtSignature": "frozen-signature",
+                        },
+                    ]
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 5},
+    }
     expected = json.loads(_NON_STREAMING_BEFORE_05)
     expected_message = json.loads(_NON_STREAMING_MESSAGE_BEFORE_05)
+    gemini_message = json.loads(_GEMINI_MESSAGE_BEFORE_05)
     cases = (
-        ("anthropic", AnthropicProvider(), "ANTHROPIC_API_KEY", anthropic_body),
-        ("openai", OpenAIProvider(), "OPENAI_API_KEY", openai_body),
+        ("anthropic", AnthropicProvider(), "ANTHROPIC_API_KEY", anthropic_body, expected_message),
+        ("openai", OpenAIProvider(), "OPENAI_API_KEY", openai_body, expected_message),
         (
             "compatible",
             OpenAICompatibleProvider("SYMPHONAI_FROZEN", "https://compatible.invalid/v1"),
             "SYMPHONAI_FROZEN",
             openai_body,
+            expected_message,
         ),
+        ("gemini", GeminiProvider(), "GEMINI_API_KEY", gemini_body, gemini_message),
     )
-    for label, provider, environment, body in cases:
+    for label, provider, environment, body, expected_message in cases:
         with mock.patch.dict(os.environ, {environment: "frozen-key"}):
             with mock.patch(
                 "urllib.request.urlopen",
@@ -890,3 +930,153 @@ def check_openai_error_event() -> None:
                     fail(f"OpenAI error did not retain/redact the vendor message: {exc}")
             else:
                 fail("OpenAI SSE error payload did not raise ProviderError")
+
+
+def _gemini_transcript(*, signature: bool = True, two_calls: bool = False) -> list[bytes]:
+    if two_calls:
+        return [
+            b'data: {"candidates":[{"content":{"parts":[{"text":"hello "},{"functionCall":{"name":"first","args":{"a":1}}},{"functionCall":{"name":"second","args":{"b":2}}},{"text":"world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5}}\n\n'
+        ]
+    if signature:
+        return [
+            b'data: {"candidates":[{"content":{"parts":[{"text":"hello "},{"functionCall":{"id":"tool-1","name":"weather","args":{"city":"Seoul"}},"thoughtSignature":"streamed-thought"},{"text":"world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5}}\n\n'
+        ]
+    return [
+        b'data: {"candidates":[{"content":{"parts":[{"text":"hello "},{"functionCall":{"id":"tool-1","name":"weather","args":{"city":"Seoul"}}},{"text":"world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5}}\n\n'
+    ]
+
+
+@check("streaming.gemini_matches_non_streaming")
+def check_gemini_matches_non_streaming() -> None:
+    body = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "hello "},
+                        {"functionCall": {"id": "tool-1", "name": "weather", "args": {"city": "Seoul"}}},
+                        {"text": "world"},
+                    ]
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 5},
+    }
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-stream-key"}):
+        with mock.patch(
+            "symphonai_api.providers.gemini_provider._synthesize_tool_call_id",
+            return_value="call-fixed",
+        ), mock.patch("symphonai_api.streaming.new_id", return_value="call-fixed"):
+            with mock.patch(
+                "urllib.request.urlopen", return_value=_BytesResponse(json.dumps(body).encode())
+            ):
+                expected = GeminiProvider().create_response(_request())
+            with mock.patch(
+                "urllib.request.urlopen", return_value=_LinesResponse(_gemini_transcript(signature=False))
+            ):
+                actual = _assemble(GeminiProvider().create_response_stream(_request()))
+    if actual != expected:
+        fail(f"Gemini streaming response differed from non-streaming: {actual!r}")
+
+
+@check("streaming.gemini_thought_signature_round_trip")
+def check_gemini_thought_signature_round_trip() -> None:
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-thought-key"}):
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_LinesResponse(_gemini_transcript())
+        ):
+            response = _assemble(GeminiProvider().create_response_stream(_request()))
+    tool_call = response.message.tool_calls[0]
+    if tool_call.provider_metadata.get("thoughtSignature") != "streamed-thought":
+        fail(f"streamed thoughtSignature was not retained: {tool_call!r}")
+    next_body = _build_request_body(
+        ModelRequest(messages=[Message(role=Role.USER, content="continue"), response.message])
+    )
+    outgoing_part = next(
+        part
+        for part in next_body["contents"][1]["parts"]
+        if "functionCall" in part
+    )
+    if outgoing_part.get("thoughtSignature") != "streamed-thought":
+        fail(f"next Gemini request dropped thoughtSignature: {outgoing_part!r}")
+
+
+@check("streaming.gemini_no_signature_no_key")
+def check_gemini_no_signature_no_key() -> None:
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-no-signature-key"}):
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_LinesResponse(_gemini_transcript(signature=False))
+        ):
+            response = _assemble(GeminiProvider().create_response_stream(_request()))
+    metadata = response.message.tool_calls[0].provider_metadata
+    if "thoughtSignature" in metadata:
+        fail(f"signature-free Gemini part invented a thoughtSignature: {metadata!r}")
+
+
+@check("streaming.gemini_two_calls")
+def check_gemini_two_calls() -> None:
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-two-calls-key"}):
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=_LinesResponse(_gemini_transcript(signature=False, two_calls=True)),
+        ):
+            chunks = list(GeminiProvider().create_response_stream(_request()))
+    real_loads = json.loads
+    with mock.patch("symphonai_api.streaming.json.loads", wraps=real_loads) as loads:
+        calls = _assemble(chunks).message.tool_calls
+    if loads.call_count != 2 or [call.name for call in calls] != ["first", "second"]:
+        fail(f"Gemini calls were not parsed once each in arrival order: {calls!r}")
+    if len({call.id for call in calls}) != 2 or [call.arguments for call in calls] != [{"a": 1}, {"b": 2}]:
+        fail(f"Gemini calls were not distinct assembled calls: {calls!r}")
+
+
+@check("streaming.gemini_block_reason")
+def check_gemini_block_reason() -> None:
+    key = "gemini-block-key"
+    transcript = [b'data: {"promptFeedback":{"blockReason":"SAFETY gemini-block-key"}}\n\n']
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": key}):
+        with mock.patch("urllib.request.urlopen", return_value=_LinesResponse(transcript)):
+            try:
+                _assemble(GeminiProvider().create_response_stream(_request()))
+            except ProviderError as exc:
+                if "SAFETY" not in str(exc) or key in str(exc):
+                    fail(f"Gemini block reason was omitted or leaked the key: {exc}")
+            else:
+                fail("Gemini prompt block did not raise ProviderError")
+
+
+@check("streaming.gemini_truncated_stream")
+def check_gemini_truncated_stream() -> None:
+    class _BrokenGeminiResponse(_LinesResponse):
+        def __iter__(self):
+            yield b'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n'
+            yield b"\n"
+            raise ConnectionError("stream closed early")
+
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-truncated-key"}):
+        with mock.patch("urllib.request.urlopen", return_value=_BrokenGeminiResponse([])):
+            try:
+                _assemble(GeminiProvider().create_response_stream(_request()))
+            except ProviderError:
+                pass
+            else:
+                fail("truncated Gemini stream returned a partial response")
+
+
+@check("streaming.gemini_url_has_no_key")
+def check_gemini_url_has_no_key() -> None:
+    key = "gemini-url-secret"
+    captured: list[str] = []
+
+    def open_stream(request, timeout=None):
+        captured.append(request.full_url)
+        return _LinesResponse(_gemini_transcript(signature=False))
+
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": key}):
+        with mock.patch("urllib.request.urlopen", side_effect=open_stream):
+            _assemble(GeminiProvider().create_response_stream(_request()))
+    if captured != [
+        f"{GeminiProvider().base_url}/models/{GeminiProvider().model}:streamGenerateContent?alt=sse"
+    ] or key in captured[0]:
+        fail(f"Gemini streaming URL was incorrect or exposed the API key: {captured!r}")
