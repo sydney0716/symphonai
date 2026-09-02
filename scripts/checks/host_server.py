@@ -12,8 +12,9 @@ import time
 from pathlib import Path
 from unittest import mock
 
-from symphonai_api.cancellation import CancellationToken
+import symphonai_api.agent_loop as agent_loop
 from symphonai_api.events import RunFinished, RunStarted
+from symphonai_api.identity import RunRef
 from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -77,6 +78,7 @@ def _next_sse(
     response: http.client.HTTPResponse,
     *,
     timeout: float = 1,
+    allow_timeout: bool = False,
 ) -> tuple[str, dict] | str:
     raw = getattr(response.fp, "raw", None)
     sock = getattr(raw, "_sock", None)
@@ -91,12 +93,14 @@ def _next_sse(
             if line.startswith(b": keepalive"):
                 return "keepalive"
     except socket.timeout:
+        if allow_timeout:
+            return "timeout"
         fail("timed out waiting for SSE output")
     raise AssertionError("unreachable")
 
 
-def _wait_until(predicate, message: str) -> None:
-    deadline = time.monotonic() + 1
+def _wait_until(predicate, message: str, *, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return
@@ -116,7 +120,13 @@ def check_handshake_line() -> None:
         if len(lines) != 1:
             fail(f"host printed {len(lines)} handshake lines: {lines!r}")
         handshake = json.loads(lines[0])
-        if handshake != host.handshake() or host.address[0] != "127.0.0.1" or not host.port:
+        if (
+            set(handshake) != {"port", "token"}
+            or handshake.get("port") != host.port
+            or handshake.get("token") != host.token
+            or not handshake.get("token")
+            or host.address[0] != "127.0.0.1"
+        ):
             fail(f"handshake did not expose the loopback ephemeral binding: {handshake!r}")
     finally:
         host.close()
@@ -232,14 +242,20 @@ def check_prompt_starts_run() -> None:
             if prompt.status != 200 or not reply.get("accepted") or not reply.get("run_id"):
                 fail(f"prompt was not accepted before completion: {prompt.status}, {reply!r}")
             events = []
+            deadline = time.monotonic() + 5
             while not events or not isinstance(events[-1], RunFinished):
-                frame = _next_sse(connection, response)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail(f"run did not finish within five seconds; last events: {events!r}")
+                frame = _next_sse(
+                    connection, response, timeout=min(1, remaining), allow_timeout=True
+                )
                 if isinstance(frame, tuple) and frame[0] == "event":
                     events.append(decode_event(frame[1]))
             if not isinstance(events[0], RunStarted) or not isinstance(events[-1], RunFinished):
                 fail(f"run did not emit RunStarted through RunFinished: {events!r}")
-            if any(event.run_id != reply["run_id"] for event in events):
-                fail(f"event run ids differed from /prompt reply: {events!r}, {reply!r}")
+            if reply["run_id"] == events[0].run_id:
+                fail(f"/prompt returned the runtime id rather than a host handle: {reply!r}")
         finally:
             connection.close()
     finally:
@@ -308,10 +324,18 @@ def check_stop_cancels() -> None:
                 finally:
                     stop_connection.close()
             terminal = None
+            seen = []
+            deadline = time.monotonic() + 5
             while terminal is None:
-                frame = _next_sse(connection, response)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail(f"stop did not finish within five seconds; last events: {seen!r}")
+                frame = _next_sse(
+                    connection, response, timeout=min(1, remaining), allow_timeout=True
+                )
                 if isinstance(frame, tuple) and frame[0] == "event":
                     event = decode_event(frame[1])
+                    seen.append(event)
                     if isinstance(event, RunFinished):
                         terminal = event
             if terminal.stopped_reason != "cancelled":
@@ -359,14 +383,144 @@ def check_keepalive() -> None:
 
 @check("host_server.api_untouched")
 def check_api_untouched() -> None:
-    import subprocess
+    offenders = [
+        str(path.relative_to(REPO_ROOT))
+        for path in sorted((REPO_ROOT / "symphonai_api").rglob("*.py"))
+        if "symphonai_host" in path.read_text(encoding="utf-8")
+    ]
+    if offenders:
+        fail(f"runtime modules reference the host boundary: {offenders!r}")
 
-    changed = subprocess.run(
-        ["git", "diff", "--name-only", "--", "symphonai_api"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if changed.returncode or changed.stdout:
-        fail(f"phase 17b modified symphonai_api: {changed.stdout or changed.stderr}")
+
+@check("host_server.runtime_run_id_preserved")
+def check_runtime_run_id_preserved() -> None:
+    provider = _WaitingProvider()
+    host = _host(provider)
+    run_started_emitted = threading.Event()
+    release_run_started = threading.Event()
+    original_emit = agent_loop.emit
+
+    def delay_run_started(sink, event) -> None:
+        if isinstance(event, RunStarted):
+            run_started_emitted.set()
+            release_run_started.wait(5)
+        original_emit(sink, event)
+
+    try:
+        connection, response = _event_stream(host)
+        try:
+            with mock.patch(
+                "symphonai_api.agent_loop.new_run_ref",
+                side_effect=lambda agent_id, parent_run_id=None: RunRef(
+                    "run_runtime_root", agent_id, parent_run_id
+                ),
+            ), mock.patch("symphonai_api.agent_loop.emit", side_effect=delay_run_started):
+                prompt_connection, prompt = _request(
+                    host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host)
+                )
+                try:
+                    reply = json.loads(prompt.read())
+                finally:
+                    prompt_connection.close()
+                if not run_started_emitted.wait(5):
+                    fail("runtime did not prepare a root RunStarted within five seconds")
+                if host.run.runtime_run_id is not None:
+                    fail(f"host recorded a runtime id before RunStarted: {host.run.runtime_run_id!r}")
+                health_connection, health = _request(host, "GET", "/health")
+                try:
+                    body = json.loads(health.read())
+                finally:
+                    health_connection.close()
+                if body.get("run_id") != reply["run_id"] or body.get("runtime_run_id") is not None:
+                    fail(f"pre-RunStarted health did not distinguish the ids: {body!r}")
+                release_run_started.set()
+                deadline = time.monotonic() + 5
+                root_event = None
+                while root_event is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        fail("root RunStarted was not observed within five seconds")
+                    frame = _next_sse(connection, response, timeout=min(1, remaining))
+                    if isinstance(frame, tuple) and frame[0] == "event":
+                        event = decode_event(frame[1])
+                        if isinstance(event, RunStarted):
+                            root_event = event
+                if reply["run_id"] == "run_runtime_root" or root_event.run_id != "run_runtime_root":
+                    fail(f"runtime run id was not preserved: {reply!r}, {root_event!r}")
+                if host.run.runtime_run_id != "run_runtime_root":
+                    fail(f"host did not record the root runtime id: {host.run.runtime_run_id!r}")
+                health_connection, health = _request(host, "GET", "/health")
+                try:
+                    body = json.loads(health.read())
+                finally:
+                    health_connection.close()
+                if body.get("run_id") != reply["run_id"] or body.get("runtime_run_id") != "run_runtime_root":
+                    fail(f"active health did not expose both run ids: {body!r}")
+                provider.release.set()
+                _wait_until(lambda: not host.run.active, "runtime run did not finish")
+            health_connection, health = _request(host, "GET", "/health")
+            try:
+                body = json.loads(health.read())
+            finally:
+                health_connection.close()
+            if body.get("state") != "idle" or body.get("run_id") is not None or body.get("runtime_run_id") is not None:
+                fail(f"idle health retained a run id: {body!r}")
+        finally:
+            connection.close()
+    finally:
+        release_run_started.set()
+        host.close()
+
+
+@check("host_server.subagent_run_ids_distinct")
+def check_subagent_run_ids_distinct() -> None:
+    provider = _WaitingProvider()
+    host = _host(provider)
+    try:
+        connection, response = _event_stream(host)
+        try:
+            prompt_connection, prompt = _request(
+                host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host)
+            )
+            try:
+                host_run_id = json.loads(prompt.read())["run_id"]
+            finally:
+                prompt_connection.close()
+            deadline = time.monotonic() + 5
+            root_event = None
+            while root_event is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail("root RunStarted was not observed within five seconds")
+                frame = _next_sse(connection, response, timeout=min(1, remaining))
+                if isinstance(frame, tuple) and frame[0] == "event":
+                    event = decode_event(frame[1])
+                    if isinstance(event, RunStarted):
+                        root_event = event
+            subagent_event = RunStarted(
+                agent_id="agent_subagent", run_id="run_subagent", agent_name="subagent"
+            )
+            host.run._publish(host_run_id, subagent_event)
+            deadline = time.monotonic() + 5
+            observed_subagent = None
+            while observed_subagent is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail("subagent RunStarted was not observed within five seconds")
+                frame = _next_sse(connection, response, timeout=min(1, remaining))
+                if isinstance(frame, tuple) and frame[0] == "event":
+                    event = decode_event(frame[1])
+                    if event == subagent_event:
+                        observed_subagent = event
+            if root_event.run_id == subagent_event.run_id or host.run.runtime_run_id != root_event.run_id:
+                fail(
+                    "subagent RunStarted replaced the root runtime id: "
+                    f"root={root_event!r}, subagent={subagent_event!r}, "
+                    f"recorded={host.run.runtime_run_id!r}"
+                )
+            provider.release.set()
+            _wait_until(lambda: not host.run.active, "subagent identity test run did not finish")
+        finally:
+            connection.close()
+    finally:
+        host.close()

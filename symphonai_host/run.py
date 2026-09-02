@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import dataclasses
 import threading
 from dataclasses import dataclass
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import Event
-from symphonai_api.identity import new_agent_ref, new_id
+from symphonai_api.events import Event, RunStarted
+from symphonai_api.identity import AgentRef, new_agent_ref, new_id
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -31,6 +30,8 @@ class _ActiveRun:
     run_id: str
     cancel: CancellationToken
     thread: threading.Thread
+    root_agent_id: str
+    runtime_run_id: str | None = None
 
 
 class HostRun:
@@ -64,19 +65,26 @@ class HostRun:
     def active(self) -> bool:
         return self.active_run_id is not None
 
+    @property
+    def runtime_run_id(self) -> str | None:
+        """The root runtime id once its RunStarted event has been published."""
+        with self._lock:
+            return None if self._active is None else self._active.runtime_run_id
+
     def start(self, prompt: str) -> str:
         with self._lock:
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
             run_id = new_id("run")
             cancel = CancellationToken()
+            agent_ref = new_agent_ref("agent")
             thread = threading.Thread(
                 target=self._run,
-                args=(run_id, prompt, cancel),
+                args=(run_id, agent_ref, prompt, cancel),
                 name=f"symphonai-host-{run_id}",
                 daemon=True,
             )
-            self._active = _ActiveRun(run_id, cancel, thread)
+            self._active = _ActiveRun(run_id, cancel, thread, agent_ref.agent_id)
             thread.start()
             return run_id
 
@@ -87,12 +95,23 @@ class HostRun:
             active.cancel.cancel()
 
     def _publish(self, host_run_id: str, event: Event) -> None:
-        # ApiAgent allocates its own internal run id. The host owns the wire run,
-        # so clients can safely use the id returned by /prompt for every event.
-        self._broker.publish(dataclasses.replace(event, run_id=host_run_id))
+        if isinstance(event, RunStarted):
+            try:
+                with self._lock:
+                    active = self._active
+                    if (
+                        active is not None
+                        and active.run_id == host_run_id
+                        and active.root_agent_id == event.agent_id
+                        and active.runtime_run_id is None
+                    ):
+                        active.runtime_run_id = event.run_id
+            except Exception:
+                # Observation must survive a bookkeeping failure in the host.
+                pass
+        self._broker.publish(event)
 
-    def _run(self, run_id: str, prompt: str, cancel: CancellationToken) -> None:
-        agent_ref = new_agent_ref("agent")
+    def _run(self, run_id: str, agent_ref: AgentRef, prompt: str, cancel: CancellationToken) -> None:
         tools = standard_tool_registry()
         agent = ApiAgent(
             provider=self._provider,

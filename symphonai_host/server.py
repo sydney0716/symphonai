@@ -157,6 +157,8 @@ class HostServer:
                         {
                             "protocol_version": PROTOCOL_VERSION,
                             "state": "active" if host.run.active else "idle",
+                            "run_id": host.run.active_run_id,
+                            "runtime_run_id": host.run.runtime_run_id,
                         },
                     )
                     return

@@ -305,6 +305,8 @@ def main() -> None:
         "host_server.bad_request_and_unknown_path",
         "host_server.keepalive",
         "host_server.api_untouched",
+        "host_server.runtime_run_id_preserved",
+        "host_server.subagent_run_ids_distinct",
         "cancel.pre_cancelled_agent",
         "cancel.tool_repair",
         "cancel.http_read_recheck",
@@ -450,7 +452,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "370 passed, 0 failed, 370 selected of 370 registered",
+        == "372 passed, 0 failed, 372 selected of 372 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -498,7 +500,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 370 registered"
+                "of 372 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -526,7 +528,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 370 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 372 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
