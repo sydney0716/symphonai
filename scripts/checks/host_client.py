@@ -5,13 +5,17 @@ from __future__ import annotations
 import ast
 import io
 import json
+import os
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 from pathlib import Path
 
-from symphonai_api.models import Message, ModelResponse, Role
+from symphonai_api.models import Message, ModelRequest, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR
+from symphonai_host import __main__ as host_main
 from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host import cli
 from symphonai_host.protocol import UnknownEvent, decode_event
@@ -77,6 +81,55 @@ def check_connection_error() -> None:
             fail(f"connection error leaked or omitted endpoint: {exc}")
         return
     fail("unreachable host did not raise HostClientError")
+
+
+@check("host_client.base_url_reaches_provider")
+def check_base_url_reaches_provider() -> None:
+    requests: list[tuple[str, dict]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers["Content-Length"])
+            requests.append((self.path, json.loads(self.rfile.read(length))))
+            payload = json.dumps({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "loopback"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        arguments = host_main._arguments(["--base-url", base_url])
+        provider = host_main._provider(
+            arguments.provider, arguments.model, arguments.base_url
+        )
+        if provider.base_url != base_url:
+            fail(f"base URL argument did not reach the provider: {provider.base_url!r}")
+        with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "loopback-test-key"}):
+            response = provider.create_response(
+                ModelRequest(messages=[Message(Role.USER, "hello")])
+            )
+        if response.message.text != "loopback":
+            fail(f"loopback provider response was not returned: {response!r}")
+        if requests != [("/v1/chat/completions", {"model": provider.model, "messages": [{"role": "user", "content": "hello"}]})]:
+            fail(f"base URL did not reach only the loopback provider: {requests!r}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @check("host_client.blank_line_and_eof")

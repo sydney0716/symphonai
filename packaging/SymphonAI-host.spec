@@ -25,10 +25,17 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [],
     [],
     name=binary_name,
     console=True,
+    exclude_binaries=True,
+    upx=False,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    name=binary_name,
     upx=False,
 )

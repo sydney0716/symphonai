@@ -9,11 +9,14 @@ import os
 import platform
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_BINARY_BYTES = 40 * 1_000_000
+MAX_START_SECONDS = 3.0
 
 
 def target_triple() -> str:
@@ -47,10 +50,11 @@ def target_triple() -> str:
         ) from exc
 
 
-def verify_handshake_without_python(binary: Path) -> None:
+def verify_handshake_without_python(binary: Path) -> float:
     """Prove the frozen executable starts independently of PATH's Python."""
     environment = os.environ.copy()
     environment["PATH"] = ""
+    started = time.monotonic()
     process = subprocess.Popen(
         [str(binary)],
         stdout=subprocess.PIPE,
@@ -61,12 +65,25 @@ def verify_handshake_without_python(binary: Path) -> None:
     try:
         if process.stdout is None:
             raise RuntimeError("sidecar did not expose stdout")
-        line = process.stdout.readline()
-        handshake = json.loads(line)
+        line: list[str] = []
+        ready = threading.Event()
+
+        def read_handshake() -> None:
+            line.append(process.stdout.readline())
+            ready.set()
+
+        threading.Thread(target=read_handshake, daemon=True).start()
+        if not ready.wait(MAX_START_SECONDS):
+            elapsed = time.monotonic() - started
+            raise RuntimeError(
+                f"host binary start time {elapsed:.2f}s exceeds {MAX_START_SECONDS:.1f}s"
+            )
+        handshake = json.loads(line[0])
         if not isinstance(handshake.get("port"), int) or not isinstance(
             handshake.get("token"), str
         ):
-            raise RuntimeError(f"sidecar emitted an invalid handshake: {line!r}")
+            raise RuntimeError(f"sidecar emitted an invalid handshake: {line[0]!r}")
+        return time.monotonic() - started
     finally:
         process.terminate()
         try:
@@ -83,6 +100,11 @@ def main() -> None:
 
     triple = target_triple()
     binary_name = f"SymphonAI-host-{triple}"
+    output = ROOT / "dist" / binary_name
+    if output.is_file():
+        # 17o deliberately changes one-file output into an onedir bundle.
+        # A previous generated file cannot occupy the required directory.
+        output.unlink()
     environment = os.environ.copy()
     environment["SYMPHONAI_HOST_BINARY_NAME"] = binary_name
     subprocess.run(
@@ -103,8 +125,12 @@ def main() -> None:
         check=True,
     )
 
-    binary = ROOT / "dist" / binary_name
-    size_bytes = binary.stat().st_size
+    binary = output / binary_name if output.is_dir() else output
+    size_bytes = (
+        sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
+        if output.is_dir()
+        else binary.stat().st_size
+    )
     size_mb = size_bytes / 1_000_000
     print(f"{binary} ({size_mb:.1f} MB)")
     if size_bytes > MAX_BINARY_BYTES:
@@ -126,8 +152,12 @@ def main() -> None:
         if excluded in report_text:
             raise SystemExit(f"PyInstaller dependency report includes excluded module {excluded}")
 
-    verify_handshake_without_python(binary)
-    print("OK:   sidecar emitted its first handshake line with PATH cleared")
+    start_seconds = verify_handshake_without_python(binary)
+    print(f"OK:   sidecar emitted its first handshake line with PATH cleared in {start_seconds:.2f}s")
+    if start_seconds > MAX_START_SECONDS:
+        raise SystemExit(
+            f"host binary start time {start_seconds:.2f}s exceeds {MAX_START_SECONDS:.1f}s"
+        )
     if not arguments.skip_smoke:
         subprocess.run(
             [sys.executable, "scripts/smoke_host.py", "--binary", str(binary)],
