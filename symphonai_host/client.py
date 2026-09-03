@@ -69,22 +69,26 @@ class HostClient:
             response = connection.getresponse()
             if response.status != 200:
                 raise HostClientError(f"/events returned HTTP {response.status}")
-            lines: list[str] = []
-            for raw in response:
-                line = raw.decode("utf-8").rstrip("\r\n")
-                if line.startswith(":"):
-                    continue
-                if line.startswith("data:"):
-                    lines.append(line.removeprefix("data:").lstrip())
-                    continue
-                if not line and lines:
-                    yield decode_frame("\n".join(lines))
-                    lines.clear()
+            yield from self._decode_sse(response)
         except (OSError, http.client.HTTPException, UnicodeDecodeError) as exc:
             raise HostClientError(f"/events connection failed: {type(exc).__name__}") from None
         finally:
             connection.close()
             self._events_connection = None
+
+    @staticmethod
+    def _decode_sse(lines) -> Iterator[tuple[str, dict]]:
+        """Decode one SSE response while keeping protocol parsing centralized."""
+        data: list[str] = []
+        for raw in lines:
+            line = raw.decode("utf-8").rstrip("\r\n")
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                data.append(line.removeprefix("data:").lstrip())
+            elif not line and data:
+                yield decode_frame("\n".join(data))
+                data.clear()
 
     def send_prompt(self, prompt: str) -> dict:
         return self._request("POST", "/prompt", {"prompt": prompt})

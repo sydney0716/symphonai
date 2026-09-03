@@ -32,6 +32,7 @@ from scripts.checks import agent_events  # noqa: E402, F401
 from scripts.checks import host_protocol  # noqa: E402, F401
 from scripts.checks import host_server  # noqa: E402, F401
 from scripts.checks import host_approvals  # noqa: E402, F401
+from scripts.checks import host_client  # noqa: E402, F401
 from scripts.checks import agent_cancel  # noqa: E402, F401
 from scripts.checks import agent_run  # noqa: E402, F401
 from scripts.checks import search  # noqa: E402, F401

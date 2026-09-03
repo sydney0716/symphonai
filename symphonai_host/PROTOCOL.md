@@ -70,6 +70,7 @@ frame may have been a question.
 Read the host handshake line into its `port` and bearer `token`, send that
 token only in the `Authorization` header, and decode every SSE `data:` frame
 with the protocol decoder. Keep unknown events and dropped notices visible.
+Receive the handshake through a pipe or stdin, never on a command line.
 
 ## HTTP transport
 
