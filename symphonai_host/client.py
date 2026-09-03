@@ -61,6 +61,13 @@ class HostClient:
     def health(self) -> dict:
         return self._request("GET", "/health")
 
+    def pending_approvals(self) -> list[dict]:
+        """Approvals still waiting for a decision, per 17i's reconciliation."""
+        response = self._request("GET", "/approvals")
+        if not isinstance(response, dict) or not isinstance(response.get("pending"), list):
+            raise HostClientError("/approvals returned an invalid response")
+        return response["pending"]
+
     def list_sessions(self) -> list[dict]:
         response = self._request("GET", "/sessions")
         if not isinstance(response, list):

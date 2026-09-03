@@ -24,7 +24,8 @@ try:
         if arguments.repo_root:
             command.extend(["--repo-root", arguments.repo_root])
         child = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
-        assert child.stdout is not None
+        if child.stdout is None:
+            raise HostClientError("spawned host has no handshake pipe")
         line = child.stdout.readline()
     else:
         line = sys.stdin.readline()

@@ -46,7 +46,7 @@ def run(client: HostClient) -> None:
                     enqueue_approval(payload)
                 elif kind == "error" and payload.get("dropped"):
                     print(describe(kind, payload))
-                    for approval in client._request("GET", "/approvals").get("pending", []):
+                    for approval in client.pending_approvals():
                         enqueue_approval(approval)
                 else:
                     print(describe(kind, payload))

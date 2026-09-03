@@ -58,6 +58,8 @@ def check_round_trip_against_host() -> None:
         client = HostClient(HostAddress(host.port, host.token))
         if client.health().get("state") != "idle" or not client.send_prompt("hello").get("accepted"):
             fail("client did not round-trip health and prompt")
+        if client.pending_approvals() != []:
+            fail("unexpected pending approvals")
         if not client.stop().get("accepted"):
             fail("client did not round-trip stop")
         if host.token in f"{client.address.port}{client.health()}":

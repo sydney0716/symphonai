@@ -5,9 +5,10 @@ from __future__ import annotations
 import tempfile
 import threading
 import time
+import json
 from pathlib import Path
 
-from symphonai_api.models import Message, ModelResponse, Role
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.client import HostAddress, HostClient, HostClientError
@@ -108,7 +109,13 @@ def check_open_during_run_409() -> None:
 
 
 def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[dict], dict]:
-    host, client, run_id = _finished_session(root)
+    marker = "history-secret-argument"
+    host, client = _host(root, [
+        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall("history-tool", "run_shell", {"command": marker})])),
+        ModelResponse(Message(Role.ASSISTANT, "done")),
+    ])
+    run_id = client.send_prompt("first")["run_id"]
+    _wait_idle(client)
     frames: list[dict] = []
     ready = threading.Event()
 
@@ -118,7 +125,7 @@ def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[di
             for kind, payload in client.events():
                 if kind == "event" and payload.get("type") == "HistoryMessage":
                     frames.append(payload)
-                    if payload["role"] == "assistant":
+                    if len(frames) == 4:
                         return
         except Exception:
             return
@@ -138,7 +145,11 @@ def check_replay_order() -> None:
             deadline = time.monotonic() + 5
             while len(frames) < 2 and time.monotonic() < deadline:
                 time.sleep(0.02)
-            if [frame["role"] for frame in frames] != ["user", "assistant"] or any("arguments" in call for frame in frames for call in frame["tool_calls"]):
+            if [frame["role"] for frame in frames] != ["user", "assistant", "tool", "assistant"]:
+                fail(f"history replay was out of order: {frames!r}")
+            if any(set(call) != {"id", "name"} for frame in frames for call in frame["tool_calls"]):
+                fail(f"history tool calls leaked fields: {frames!r}")
+            if "history-secret-argument" in json.dumps(frames):
                 fail(f"history replay was unsafe or out of order: {frames!r}")
         finally:
             host.close()
