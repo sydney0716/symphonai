@@ -180,7 +180,7 @@ def check_request_validation() -> None:
 @check("host_protocol.document_covers_registry")
 def check_document_covers_registry() -> None:
     gc.collect()
-    rows = (REPO_ROOT / "docs" / "SymphonAI-host-protocol.md").read_text().splitlines()
+    rows = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text().splitlines()
     for name, event_class in event_registry().items():
         row = next((line for line in rows if line.startswith(f"| `{name}` |")), None)
         if row is None:

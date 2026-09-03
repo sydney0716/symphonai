@@ -476,27 +476,50 @@ def check_runtime_run_id_preserved() -> None:
 def check_subagent_run_ids_distinct() -> None:
     provider = _WaitingProvider()
     host = _host(provider)
+    root_run_started = threading.Event()
+    release_root_run_started = threading.Event()
+    original_emit = agent_loop.emit
+
+    def delay_root_run_started(sink, event) -> None:
+        if isinstance(event, RunStarted):
+            root_run_started.set()
+            release_root_run_started.wait(5)
+        original_emit(sink, event)
+
     try:
         connection, response = _event_stream(host)
         try:
-            prompt_connection, prompt = _request(
-                host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host)
-            )
-            try:
-                host_run_id = json.loads(prompt.read())["run_id"]
-            finally:
-                prompt_connection.close()
-            deadline = time.monotonic() + 5
-            root_event = None
-            while root_event is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    fail("root RunStarted was not observed within five seconds")
-                frame = _next_sse(connection, response, timeout=min(1, remaining))
-                if isinstance(frame, tuple) and frame[0] == "event":
-                    event = decode_event(frame[1])
-                    if isinstance(event, RunStarted):
-                        root_event = event
+            with mock.patch("symphonai_api.agent_loop.emit", side_effect=delay_root_run_started):
+                prompt_connection, prompt = _request(
+                    host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host)
+                )
+                try:
+                    host_run_id = json.loads(prompt.read())["run_id"]
+                finally:
+                    prompt_connection.close()
+                if not root_run_started.wait(5):
+                    fail("runtime did not prepare a root RunStarted within five seconds")
+                first_subagent_event = RunStarted(
+                    agent_id="agent_subagent_first", run_id="run_subagent_first", agent_name="subagent"
+                )
+                host.run._publish(host_run_id, first_subagent_event)
+                frame = _next_sse(connection, response, timeout=1)
+                if not isinstance(frame, tuple) or decode_event(frame[1]) != first_subagent_event:
+                    fail(f"first subagent event did not retain its own identity: {frame!r}")
+                if host.run.runtime_run_id is not None:
+                    fail(f"subagent RunStarted claimed the root runtime id: {host.run.runtime_run_id!r}")
+                release_root_run_started.set()
+                deadline = time.monotonic() + 5
+                root_event = None
+                while root_event is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        fail("root RunStarted was not observed within five seconds")
+                    frame = _next_sse(connection, response, timeout=min(1, remaining))
+                    if isinstance(frame, tuple) and frame[0] == "event":
+                        event = decode_event(frame[1])
+                        if isinstance(event, RunStarted):
+                            root_event = event
             subagent_event = RunStarted(
                 agent_id="agent_subagent", run_id="run_subagent", agent_name="subagent"
             )
@@ -512,10 +535,13 @@ def check_subagent_run_ids_distinct() -> None:
                     event = decode_event(frame[1])
                     if event == subagent_event:
                         observed_subagent = event
-            if root_event.run_id == subagent_event.run_id or host.run.runtime_run_id != root_event.run_id:
+            if (
+                root_event.run_id in {first_subagent_event.run_id, subagent_event.run_id}
+                or host.run.runtime_run_id != root_event.run_id
+            ):
                 fail(
                     "subagent RunStarted replaced the root runtime id: "
-                    f"root={root_event!r}, subagent={subagent_event!r}, "
+                    f"root={root_event!r}, first={first_subagent_event!r}, subagent={subagent_event!r}, "
                     f"recorded={host.run.runtime_run_id!r}"
                 )
             provider.release.set()
@@ -523,4 +549,5 @@ def check_subagent_run_ids_distinct() -> None:
         finally:
             connection.close()
     finally:
+        release_root_run_started.set()
         host.close()
