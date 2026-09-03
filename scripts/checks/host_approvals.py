@@ -13,6 +13,10 @@ from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.server import HostServer
+from symphonai_host.broker import EventBroker
+from symphonai_api.events import RunStarted
+from symphonai_host.protocol import decode_frame
+from scripts.checks.host_server import _event_stream, _headers, _next_sse, _request
 from scripts.checks.harness import check, fail
 
 
@@ -139,4 +143,79 @@ def check_pending_endpoint() -> None:
             if response.status != expected or (expected == 200 and body != b'{"pending": []}'):
                 fail(f"approval listing response was wrong: {response.status}, {body!r}")
     finally:
+        host.close()
+
+
+def _host(*, broker: EventBroker | None = None) -> HostServer:
+    host = HostServer(
+        FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+        PermissionPolicy(repo_root=ROOT),
+        broker=broker,
+        approval_timeout=1,
+        keepalive_seconds=0.05,
+    )
+    host.start()
+    return host
+
+
+@check("host_approvals.round_trip_over_http")
+def check_round_trip_over_http() -> None:
+    host = _host()
+    result = []
+    try:
+        connection, response = _event_stream(host)
+        try:
+            thread = threading.Thread(target=lambda: result.append(host.run.approvals.callback(REQUEST)))
+            thread.start()
+            frame = _next_sse(connection, response, timeout=5)
+            if not isinstance(frame, tuple) or frame[0] != "approval_requested":
+                fail(f"approval frame was not published over SSE: {frame!r}")
+            approval_id = frame[1].get("approval_id")
+            reply_connection, reply = _request(
+                host, "POST", "/approval", body={"approval_id": approval_id, "allowed": True}, headers=_headers(host)
+            )
+            try:
+                if reply.status != 200:
+                    fail(f"approval reply was not accepted: {reply.status}")
+            finally:
+                reply_connection.close()
+            thread.join(5)
+            if thread.is_alive() or not result or not result[0].allowed:
+                fail(f"approval reply did not resume callback: {result!r}")
+        finally:
+            connection.close()
+    finally:
+        host.close()
+
+
+@check("host_approvals.survives_a_dropped_frame")
+def check_survives_a_dropped_frame() -> None:
+    broker = EventBroker(max_queued_events=1)
+    host = _host(broker=broker)
+    result = []
+    subscription = broker.subscribe()
+    try:
+        broker.publish(RunStarted(agent_id="agent", run_id="before", agent_name="agent"))
+        thread = threading.Thread(target=lambda: result.append(host.run.approvals.callback(REQUEST)))
+        thread.start()
+        deadline = time.monotonic() + 5
+        pending = []
+        while not pending and time.monotonic() < deadline:
+            pending = host.pending_approvals()
+            time.sleep(0.01)
+        if not pending or subscription.take_dropped() == 0:
+            fail(f"dropped approval was not recoverable: {pending!r}")
+        reply_connection, reply = _request(
+            host, "POST", "/approval", body={"approval_id": pending[0]["approval_id"], "allowed": True}, headers=_headers(host)
+        )
+        try:
+            if reply.status != 200:
+                fail(f"reconciled approval was not accepted: {reply.status}")
+        finally:
+            reply_connection.close()
+        thread.join(5)
+        if thread.is_alive() or not result or not result[0].allowed:
+            fail(f"dropped approval did not resume: {result!r}")
+    finally:
+        subscription.close()
         host.close()
