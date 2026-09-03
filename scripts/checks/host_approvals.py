@@ -96,14 +96,6 @@ def check_stop_unparks() -> None:
         fail(f"stop did not unpark approval: {result!r}")
 
 
-@check("host_approvals.serialized_by_policy_lock")
-def check_serialized_by_policy_lock() -> None:
-    # PermissionPolicy owns serialization; the broker has one pending slot per callback.
-    broker, item, result, thread = _waiting()
-    broker.resolve(item.approval_id, allowed=True, reason="")
-    thread.join(1)
-
-
 @check("host_approvals.callback_never_raises")
 def check_callback_never_raises() -> None:
     result = ApprovalBroker(lambda _: (_ for _ in ()).throw(RuntimeError("boom"))).callback(REQUEST)
@@ -146,12 +138,12 @@ def check_pending_endpoint() -> None:
         host.close()
 
 
-def _host(*, broker: EventBroker | None = None) -> HostServer:
+def _host(*, broker: EventBroker | None = None, approval_timeout: float = 1) -> HostServer:
     host = HostServer(
         FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
         PermissionPolicy(repo_root=ROOT),
         broker=broker,
-        approval_timeout=1,
+        approval_timeout=approval_timeout,
         keepalive_seconds=0.05,
     )
     host.start()
@@ -218,4 +210,51 @@ def check_survives_a_dropped_frame() -> None:
             fail(f"dropped approval did not resume: {result!r}")
     finally:
         subscription.close()
+        host.close()
+
+
+@check("host_approvals.no_subscriber_over_http")
+def check_no_subscriber_over_http() -> None:
+    host = _host(approval_timeout=5)
+    try:
+        callback = host.run._policy.approval_callback
+        if callback is None:
+            fail("host did not install an approval callback")
+        started = time.monotonic()
+        decision = callback(REQUEST)
+        elapsed = time.monotonic() - started
+        if decision.allowed or decision.denial is not DenialReason.NO_APPROVAL_CALLBACK or elapsed >= 1:
+            fail(f"no-subscriber approval did not deny promptly: {decision!r}, elapsed={elapsed:.3f}s")
+    finally:
+        host.close()
+
+
+@check("host_approvals.stop_unparks_over_http")
+def check_stop_unparks_over_http() -> None:
+    host = _host(approval_timeout=5)
+    result = []
+    try:
+        connection, response = _event_stream(host)
+        try:
+            callback = host.run._policy.approval_callback
+            if callback is None:
+                fail("host did not install an approval callback")
+            thread = threading.Thread(target=lambda: result.append(callback(REQUEST)))
+            thread.start()
+            deadline = time.monotonic() + 5
+            while not host.run.approvals.pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            pending = host.run.approvals.pending()
+            if not pending:
+                fail(f"approval did not park before stop; result={result!r}")
+            host.run.stop()
+            thread.join(5)
+            if thread.is_alive() or not result:
+                fail(f"stop did not unpark approval; pending={pending!r}, result={result!r}")
+            decision = result[0]
+            if decision.allowed or decision.denial is not DenialReason.APPROVAL_FAILED or "stopped" not in decision.reason:
+                fail(f"stop returned the wrong approval decision: {decision!r}")
+        finally:
+            connection.close()
+    finally:
         host.close()
