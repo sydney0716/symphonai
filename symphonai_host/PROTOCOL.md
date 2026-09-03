@@ -65,6 +65,12 @@ id is single-use; unknown or expired replies are rejected. After any `error`
 frame carrying `dropped`, a client re-reads `GET /approvals`, because a dropped
 frame may have been a question.
 
+## Writing a client
+
+Read the host handshake line into its `port` and bearer `token`, send that
+token only in the `Authorization` header, and decode every SSE `data:` frame
+with the protocol decoder. Keep unknown events and dropped notices visible.
+
 ## HTTP transport
 
 The reference host binds only to `127.0.0.1` on an ephemeral port. On startup

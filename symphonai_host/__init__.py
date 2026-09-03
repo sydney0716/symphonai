@@ -15,6 +15,7 @@ from symphonai_host.protocol import (
     event_type_name,
 )
 from symphonai_host.server import HostServer
+from symphonai_host.client import HostAddress, HostClient, HostClientError
 
 __all__ = [
     "PROTOCOL_VERSION",
@@ -30,4 +31,7 @@ __all__ = [
     "encode_frame",
     "event_type_name",
     "HostServer",
+    "HostAddress",
+    "HostClient",
+    "HostClientError",
 ]
