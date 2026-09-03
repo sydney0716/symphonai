@@ -84,6 +84,9 @@ class HostServer:
         )
         return True
 
+    def pending_approvals(self) -> list[dict[str, str]]:
+        return [approval.__dict__ for approval in self.run.approvals.pending()]
+
     def print_handshake(self) -> None:
         if not self._handshake_printed:
             print(json.dumps(self.handshake()), flush=True)
@@ -175,6 +178,11 @@ class HostServer:
                             "runtime_run_id": host.run.runtime_run_id,
                         },
                     )
+                    return
+                if self.path == "/approvals":
+                    if not self._authorized():
+                        return
+                    self._json(HTTPStatus.OK, {"pending": host.pending_approvals()})
                     return
                 if self.path != "/events":
                     self._not_found()

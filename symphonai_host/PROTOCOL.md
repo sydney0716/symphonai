@@ -61,7 +61,9 @@ authentication mechanism.
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,
 and `details`. A client answers with the `approval` request above. An approval
-id is single-use; unknown or expired replies are rejected.
+id is single-use; unknown or expired replies are rejected. After any `error`
+frame carrying `dropped`, a client re-reads `GET /approvals`, because a dropped
+frame may have been a question.
 
 ## HTTP transport
 

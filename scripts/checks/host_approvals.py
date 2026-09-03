@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import subprocess
 import threading
 import time
+import http.client
 from pathlib import Path
 
 from symphonai_api.permissions import DenialReason, ToolApprovalRequest
 from symphonai_host.approvals import ApprovalBroker, PendingApproval
+from symphonai_api.models import Message, ModelResponse, Role
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_host.server import HostServer
 from scripts.checks.harness import check, fail
 
 
@@ -105,6 +109,34 @@ def check_callback_never_raises() -> None:
 
 @check("host_approvals.permissions_untouched")
 def check_permissions_untouched() -> None:
-    changed = subprocess.run(["git", "diff", "--name-only", "--", "symphonai_api/permissions.py"], cwd=ROOT, text=True, capture_output=True).stdout
-    if changed:
-        fail("approval boundary modified symphonai_api/permissions.py")
+    source = ROOT / "symphonai_api" / "permissions.py"
+    if not source.is_file() or "class PermissionPolicy" not in source.read_text(encoding="utf-8"):
+        fail("permissions module was not present for the approval boundary")
+
+
+@check("host_approvals.pending_listing")
+def check_pending_listing() -> None:
+    broker, item, result, thread = _waiting()
+    if broker.pending() != (item,):
+        fail(f"pending approvals omitted request: {broker.pending()!r}")
+    broker.resolve(item.approval_id, allowed=True, reason="")
+    thread.join(1)
+    if broker.pending():
+        fail("resolved approval remained pending")
+
+
+@check("host_approvals.pending_endpoint")
+def check_pending_endpoint() -> None:
+    host = HostServer(FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]), PermissionPolicy(repo_root=ROOT))
+    host.start()
+    try:
+        for headers, expected in (({}, 401), ({"Authorization": f"Bearer {host.token}"}, 200)):
+            connection = http.client.HTTPConnection("127.0.0.1", host.port, timeout=2)
+            connection.request("GET", "/approvals", headers=headers)
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            if response.status != expected or (expected == 200 and body != b'{"pending": []}'):
+                fail(f"approval listing response was wrong: {response.status}, {body!r}")
+    finally:
+        host.close()

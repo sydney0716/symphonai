@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -24,6 +23,7 @@ class PendingApproval:
 
 @dataclass
 class _Pending:
+    approval: PendingApproval
     event: threading.Event
     decision: PermissionDecision | None = None
 
@@ -46,7 +46,7 @@ class ApprovalBroker:
 
     def callback(self, request: ToolApprovalRequest) -> PermissionDecision:
         approval = PendingApproval(new_id("appr"), request.operation, request.target, request.details)
-        pending = _Pending(threading.Event())
+        pending = _Pending(approval, threading.Event())
         with self._lock:
             self._pending[approval.approval_id] = pending
         try:
@@ -94,6 +94,15 @@ class ApprovalBroker:
             pending.event.set()
             return True
 
+    def pending(self) -> tuple[PendingApproval, ...]:
+        """Every approval still waiting for a decision, oldest first."""
+        with self._lock:
+            return tuple(
+                pending.approval
+                for pending in self._pending.values()
+                if pending.decision is None
+            )
+
     def cancel_all(self, *, reason: str) -> int:
         with self._lock:
             pending = tuple(self._pending.values())
@@ -101,7 +110,7 @@ class ApprovalBroker:
                 if item.decision is None:
                     item.decision = PermissionDecision.deny(
                         f"run stopped while waiting for approval: {reason}",
-                        denial=DenialReason.DENIED_BY_USER,
+                        denial=DenialReason.APPROVAL_FAILED,
                     )
                     item.event.set()
             return len(pending)
