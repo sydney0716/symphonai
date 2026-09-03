@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from symphonai_api.events import RunFinished
+from symphonai_api.events import RunFailed, RunFinished
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
@@ -37,7 +40,67 @@ class _SmokeProvider(FakeModelProvider):
         return super().create_response(request, cancel=cancel)
 
 
-def main() -> None:
+def main(binary: str | None = None) -> None:
+    if binary:
+        _smoke_binary(Path(binary))
+        return
+    _smoke_interpreter()
+
+
+def _smoke_binary(binary: Path) -> None:
+    """Exercise a frozen host through the same client protocol boundary."""
+    binary = binary.resolve()
+    with tempfile.TemporaryDirectory() as directory:
+        environment = os.environ.copy()
+        # A binary smoke must stay offline even on a developer machine with a key.
+        environment["OPENAI_API_KEY"] = ""
+        child = subprocess.Popen(
+            [str(binary), "--repo-root", directory],
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd=directory,
+            env=environment,
+        )
+        try:
+            if child.stdout is None:
+                raise RuntimeError("binary has no handshake pipe")
+            address = HostAddress.from_handshake(child.stdout.readline())
+            client = HostClient(address)
+            failed = threading.Event()
+            stream_error: list[str] = []
+
+            def consume() -> None:
+                try:
+                    for kind, payload in client.events():
+                        if kind == "event" and isinstance(decode_event(payload), RunFailed):
+                            failed.set()
+                            return
+                except Exception as exc:
+                    stream_error.append(str(exc))
+
+            threading.Thread(target=consume, daemon=True).start()
+            if client.health().get("state") != "idle":
+                raise RuntimeError("binary host did not become idle")
+            if not client.send_prompt("binary smoke").get("accepted"):
+                raise RuntimeError("binary host did not accept a prompt")
+            if not failed.wait(5):
+                raise RuntimeError(
+                    "binary host did not report the offline provider failure: "
+                    f"{stream_error}"
+                )
+            if client.health().get("state") != "idle":
+                raise RuntimeError("binary host did not return to idle")
+            print("OK:   binary completed an offline client protocol run")
+        finally:
+            try:
+                client.close()
+            except UnboundLocalError:
+                pass
+            child.terminate()
+            child.wait(timeout=5)
+
+
+def _smoke_interpreter() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         provider = _SmokeProvider([
@@ -117,7 +180,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        parser = argparse.ArgumentParser(); parser.add_argument("--binary")
+        main(parser.parse_args().binary)
     except Exception as exc:
         print(f"FAIL: host client smoke: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

@@ -9,6 +9,7 @@ dependencies = []
 
 [project.optional-dependencies]
 tui = ["textual>=8,<9"]
+build = ["pyinstaller>=6,<7"]
 
 [build-system]
 requires = ["setuptools>=68"]

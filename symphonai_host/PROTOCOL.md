@@ -79,6 +79,11 @@ Receive the handshake through a pipe or stdin, never on a command line.
 its reply, and holds that conversation for the next prompt. The continuation
 is written as a new descendant session; the opened transcript is never changed.
 
+## Packaged sidecar
+
+The packaged host is launched directly by its parent; its first stdout line is
+the handshake JSON and the parent is responsible for terminating the sidecar.
+
 ## HTTP transport
 
 The reference host binds only to `127.0.0.1` on an ephemeral port. On startup
