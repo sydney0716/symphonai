@@ -13,7 +13,8 @@ One message is one JSON object:
 {"protocol_version": 1, "kind": "event", "payload": {}}
 ```
 
-`kind` is one of `event`, `reply`, or `error`; `payload` is always an object.
+`kind` is one of `event`, `reply`, `error`, or `approval_requested`; `payload`
+is always an object.
 A peer must reject a `protocol_version` greater than 1 and report both its
 version and the supported version. Older versions may be accepted where their
 shape remains compatible.
@@ -55,6 +56,12 @@ listed type; `reason` is optional and defaults to `""`.
 Unknown request kinds and malformed fields are protocol errors. This document
 defines encoding only; it does not define a socket, HTTP endpoint, client, or
 authentication mechanism.
+
+## Approvals
+
+An `approval_requested` frame carries `approval_id`, `operation`, `target`,
+and `details`. A client answers with the `approval` request above. An approval
+id is single-use; unknown or expired replies are rejected.
 
 ## HTTP transport
 

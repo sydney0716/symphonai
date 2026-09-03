@@ -15,6 +15,7 @@ from symphonai_api.providers.base import ModelProvider
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_host.broker import EventBroker
+from symphonai_host.approvals import ApprovalBroker, PendingApproval
 
 
 class RunActiveError(RuntimeError):
@@ -46,6 +47,8 @@ class HostRun:
         system_prompt: str | None = None,
         max_turns: int = DEFAULT_MAX_TURNS,
         model: str | None = None,
+        publish_approval=None,
+        approval_timeout: float = 300.0,
     ) -> None:
         self._provider = provider
         self._policy = policy
@@ -55,6 +58,8 @@ class HostRun:
         self._model = model
         self._active: _ActiveRun | None = None
         self._lock = threading.Lock()
+        self.approvals = ApprovalBroker(publish_approval or (lambda _: False), timeout=approval_timeout)
+        self._policy.approval_callback = self.approvals.callback
 
     @property
     def active_run_id(self) -> str | None:
@@ -93,6 +98,7 @@ class HostRun:
             active = self._active
         if active is not None:
             active.cancel.cancel()
+        self.approvals.cancel_all(reason="stopped")
 
     def _publish(self, host_run_id: str, event: Event) -> None:
         if isinstance(event, RunStarted):

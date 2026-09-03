@@ -13,6 +13,7 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.protocol import (
+    ApprovalRequested,
     PROTOCOL_VERSION,
     ProtocolError,
     decode_request,
@@ -36,6 +37,7 @@ class HostServer:
         system_prompt: str | None = None,
         max_turns: int = 20,
         model: str | None = None,
+        approval_timeout: float = 300.0,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
@@ -48,6 +50,8 @@ class HostServer:
             system_prompt=system_prompt,
             max_turns=max_turns,
             model=model,
+            publish_approval=self._publish_approval,
+            approval_timeout=approval_timeout,
         )
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
@@ -69,6 +73,16 @@ class HostServer:
 
     def handshake(self) -> dict[str, Any]:
         return {"port": self.port, "token": self.token}
+
+    def _publish_approval(self, approval: Any) -> bool:
+        if self.broker.subscriber_count == 0:
+            return False
+        self.broker.publish(
+            ApprovalRequested(
+                approval.approval_id, approval.operation, approval.target, approval.details
+            )
+        )
+        return True
 
     def print_handshake(self) -> None:
         if not self._handshake_printed:
@@ -192,14 +206,17 @@ class HostServer:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
-                    self._sse(encode_frame("event", encode_event(event)))
+                    if isinstance(event, ApprovalRequested):
+                        self._sse(encode_frame("approval_requested", event.__dict__))
+                    else:
+                        self._sse(encode_frame("event", encode_event(event)))
 
             def _sse(self, frame: str) -> None:
                 self.wfile.write(f"data: {frame}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
             def do_POST(self) -> None:
-                if self.path not in ("/prompt", "/stop"):
+                if self.path not in ("/prompt", "/stop", "/approval"):
                     self._not_found()
                     return
                 if not self._authorized():
@@ -217,6 +234,14 @@ class HostServer:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
                         return
                     self._json(HTTPStatus.OK, {"accepted": True, "run_id": run_id})
+                    return
+                if kind == "approval":
+                    if not host.run.approvals.resolve(
+                        request.approval_id, allowed=request.allowed, reason=request.reason
+                    ):
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown approval id"})
+                        return
+                    self._json(HTTPStatus.OK, {"resolved": True})
                     return
                 host.run.stop()
                 self._json(HTTPStatus.OK, {"accepted": True})

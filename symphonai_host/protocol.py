@@ -11,7 +11,7 @@ from symphonai_api.events import Event
 
 
 PROTOCOL_VERSION = 1
-_FRAME_KINDS = {"event", "reply", "error"}
+_FRAME_KINDS = {"event", "reply", "error", "approval_requested"}
 
 
 class ProtocolError(ValueError):
@@ -36,6 +36,14 @@ class ApprovalReply:
     approval_id: str
     allowed: bool
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class ApprovalRequested:
+    approval_id: str
+    operation: str
+    target: str
+    details: str
 
 
 @dataclass(frozen=True)
