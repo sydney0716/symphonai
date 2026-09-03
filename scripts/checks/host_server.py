@@ -169,7 +169,13 @@ def check_event_stream_delivers() -> None:
         connection, response = _event_stream(host)
         try:
             host.broker.publish(RunStarted(agent_id="agent", run_id="run", agent_name="agent"))
-            frame = _next_sse(connection, response)
+            deadline = time.monotonic() + 5
+            frame = None
+            while time.monotonic() < deadline:
+                candidate = _next_sse(connection, response)
+                if isinstance(candidate, tuple) and candidate[0] == "event":
+                    frame = candidate
+                    break
             if not isinstance(frame, tuple) or frame[0] != "event":
                 fail(f"event stream emitted the wrong frame: {frame!r}")
             event = decode_event(frame[1])

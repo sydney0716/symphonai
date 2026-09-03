@@ -142,10 +142,13 @@ def check_replay_order() -> None:
     with tempfile.TemporaryDirectory() as directory:
         host, _, _, frames, _ = _open_with_history(Path(directory))
         try:
+            expected = ["user", "assistant", "tool", "assistant"]
             deadline = time.monotonic() + 5
-            while len(frames) < 2 and time.monotonic() < deadline:
+            while len(frames) < len(expected) and time.monotonic() < deadline:
                 time.sleep(0.02)
-            if [frame["role"] for frame in frames] != ["user", "assistant", "tool", "assistant"]:
+            if len(frames) < len(expected):
+                fail(f"history replay timed out with {len(frames)} frames: {frames!r}")
+            if [frame["role"] for frame in frames] != expected:
                 fail(f"history replay was out of order: {frames!r}")
             if any(set(call) != {"id", "name"} for frame in frames for call in frame["tool_calls"]):
                 fail(f"history tool calls leaked fields: {frames!r}")
