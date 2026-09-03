@@ -14,6 +14,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -57,6 +58,7 @@ def _smoke_binary(binary: Path) -> None:
         raise RuntimeError(f"binary launch failed: {binary} is missing")
     with tempfile.TemporaryDirectory() as directory:
         with _ScriptedProvider() as provider:
+            _require_loopback_base_url(provider.base_url)
             environment = {
                 key: value
                 for key, value in os.environ.items()
@@ -155,6 +157,13 @@ def _smoke_binary(binary: Path) -> None:
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
+
+
+def _require_loopback_base_url(base_url: str) -> None:
+    """Refuse a smoke run before a synthetic key can reach the internet."""
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+        raise RuntimeError(f"local-only guard failed: {base_url!r} is not a 127.0.0.1 URL")
 
 
 def _read_binary_handshake(child: subprocess.Popen[str]) -> HostAddress:

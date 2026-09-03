@@ -10,6 +10,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
@@ -112,7 +113,14 @@ def check_base_url_reaches_provider() -> None:
     thread.start()
     try:
         base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        parsed = urlsplit(base_url)
+        # A prior mutation proof reached the real default endpoint. Refuse an
+        # invalid fixture before provider construction can open any request.
+        if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+            fail(f"base URL fixture is not loopback: {base_url!r}")
         arguments = host_main._arguments(["--base-url", base_url])
+        if host_main._arguments([]).permission_mode != "prompt":
+            fail("host permission mode no longer defaults to prompt")
         provider = host_main._provider(
             arguments.provider, arguments.model, arguments.base_url
         )

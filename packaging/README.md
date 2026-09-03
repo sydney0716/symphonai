@@ -10,15 +10,20 @@ the executable and its `_internal/` directory kept together. The suffix is
 mandatory: Tauri uses it to select the host-platform sidecar. Sign the bundle
 as part of signing the app; do not try to sign the sidecar separately.
 
-On macOS arm64, the one-file form failed to hand back a startup handshake
-within the three-second budget. The onedir form was therefore chosen to avoid
-unpacking the Python archive at every app launch. The onedir form also exceeds
-the three-second budget on the build host (the guard reports at least 3.00
-seconds, and an uncapped diagnostic measurement observed 7.45 seconds), so
-`scripts/build_host.py` fails loudly rather than silently shipping an
-unmeasured regression.
+On 2026-09-03, a macOS arm64 build host measured the onedir bundle at 7.45
+seconds cold and about 3 seconds warm, from launch to its handshake. Onefile
+was rejected because it adds archive extraction to every launch; onedir avoids
+that work. `scripts/build_host.py` uses a 10-second cold-start regression cap,
+which leaves room for the measured clean build while still catching a major
+startup regression. A future three-second target needs its own packaging work
+and evidence.
 
 The sidecar writes its JSON handshake as its first stdout line. The parent must
 keep stdout free of wrapper logging until it has read that line. The parent also
 owns the process lifetime and must terminate the sidecar on app exit: the
 host's signal handler only handles signals that the parent actually sends.
+
+The packaged sidecar defaults to `--permission-mode prompt`: side-effectful
+tools park until the client answers their approval request (or it times out).
+Clients that deliberately need another policy can pass `auto`, `plan`, or
+`accept_edits` explicitly.

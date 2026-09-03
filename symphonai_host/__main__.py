@@ -35,6 +35,11 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--provider", choices=("anthropic", "gemini", "openai"), default="openai")
     parser.add_argument("--model")
     parser.add_argument("--base-url")
+    parser.add_argument(
+        "--permission-mode",
+        choices=("auto", "prompt", "plan", "accept_edits"),
+        default="prompt",
+    )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--max-turns", type=int, default=20)
     return parser.parse_args(argv)
@@ -44,7 +49,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     arguments = _arguments(argv)
     host = HostServer(
         _provider(arguments.provider, arguments.model, arguments.base_url),
-        PermissionPolicy(repo_root=arguments.repo_root, mode="prompt"),
+        PermissionPolicy(repo_root=arguments.repo_root, mode=arguments.permission_mode),
         max_turns=arguments.max_turns,
     )
 

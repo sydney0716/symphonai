@@ -194,11 +194,35 @@ def check_two_subscribers() -> None:
         first_connection, first = _event_stream(host)
         second_connection, second = _event_stream(host)
         try:
+            # An SSE subscriber can observe another valid frame first; only
+            # the shared RunStarted is the assertion this check makes.
+            host.broker.publish(
+                RunFinished(
+                    agent_id="earlier-agent",
+                    run_id="earlier-run",
+                    agent_name="earlier-agent",
+                    stopped_reason="done",
+                )
+            )
             host.broker.publish(RunStarted(agent_id="agent", run_id="run", agent_name="agent"))
-            for connection, response in ((first_connection, first), (second_connection, second)):
-                frame = _next_sse(connection, response)
-                if not isinstance(frame, tuple) or not isinstance(decode_event(frame[1]), RunStarted):
-                    fail("a subscriber did not receive the shared event")
+            for label, connection, response in (
+                ("first", first_connection, first),
+                ("second", second_connection, second),
+            ):
+                deadline = time.monotonic() + 5
+                last_frame: object = None
+                while time.monotonic() < deadline:
+                    frame = _next_sse(connection, response, timeout=0.5, allow_timeout=True)
+                    last_frame = frame
+                    if isinstance(frame, tuple) and frame[0] == "event" and isinstance(
+                        decode_event(frame[1]), RunStarted
+                    ):
+                        break
+                else:
+                    fail(
+                        f"{label} subscriber did not receive the shared event; "
+                        f"last frame: {last_frame!r}"
+                    )
         finally:
             first_connection.close()
             second_connection.close()
