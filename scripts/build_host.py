@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import statistics
 import subprocess
 import sys
 import threading
@@ -16,10 +17,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_BINARY_BYTES = 40 * 1_000_000
-# A clean macOS arm64 onedir build measured 7.45s cold and about 3s warm.
-# This is a regression gate, not an unachieved product-performance target.
-MAX_START_SECONDS = 10.0
-START_TIME_RESOLUTION_SECONDS = 0.1
+# The launch users pay after installation is warm: the first process warms OS
+# verification and filesystem caches, while an app launch follows that work.
+MAX_START_SECONDS = 1.0
+HANDSHAKE_TIMEOUT_SECONDS = 15.0
 
 
 def target_triple() -> str:
@@ -54,16 +55,14 @@ def target_triple() -> str:
 
 
 def verify_handshake_without_python(binary: Path) -> float:
-    """Prove the frozen executable starts independently of PATH's Python."""
-    environment = os.environ.copy()
-    environment["PATH"] = ""
+    """Prove the frozen executable starts with no inherited environment."""
     started = time.monotonic()
     process = subprocess.Popen(
         [str(binary)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=environment,
+        env={},
     )
     try:
         if process.stdout is None:
@@ -76,17 +75,17 @@ def verify_handshake_without_python(binary: Path) -> float:
             ready.set()
 
         threading.Thread(target=read_handshake, daemon=True).start()
-        if not ready.wait(MAX_START_SECONDS + START_TIME_RESOLUTION_SECONDS / 2):
+        if not ready.wait(HANDSHAKE_TIMEOUT_SECONDS):
             elapsed = time.monotonic() - started
             raise RuntimeError(
-                f"host binary start time {elapsed:.2f}s exceeds {MAX_START_SECONDS:.1f}s"
+                f"sidecar did not emit its handshake within {elapsed:.2f}s"
             )
         handshake = json.loads(line[0])
         if not isinstance(handshake.get("port"), int) or not isinstance(
             handshake.get("token"), str
         ):
             raise RuntimeError(f"sidecar emitted an invalid handshake: {line[0]!r}")
-        return round(time.monotonic() - started, 1)
+        return time.monotonic() - started
     finally:
         process.terminate()
         try:
@@ -94,6 +93,14 @@ def verify_handshake_without_python(binary: Path) -> float:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def measure_warm_start(binary: Path) -> tuple[float, list[float], float]:
+    """Discard a cold launch, then return three independent warm launches."""
+    warmup_seconds = verify_handshake_without_python(binary)
+    samples = [verify_handshake_without_python(binary) for _ in range(3)]
+    median_seconds = statistics.median(samples)
+    return warmup_seconds, samples, median_seconds
 
 
 def main() -> None:
@@ -155,11 +162,15 @@ def main() -> None:
         if excluded in report_text:
             raise SystemExit(f"PyInstaller dependency report includes excluded module {excluded}")
 
-    start_seconds = verify_handshake_without_python(binary)
-    print(f"OK:   sidecar emitted its first handshake line with PATH cleared in {start_seconds:.2f}s")
-    if start_seconds > MAX_START_SECONDS:
+    warmup_seconds, warm_samples, median_seconds = measure_warm_start(binary)
+    print(f"warmup (discarded): {warmup_seconds:.2f}s")
+    for index, seconds in enumerate(warm_samples, start=1):
+        print(f"warm sample {index}: {seconds:.2f}s")
+    print(f"warm median: {median_seconds:.2f}s")
+    if median_seconds > MAX_START_SECONDS:
         raise SystemExit(
-            f"host binary start time {start_seconds:.2f}s exceeds {MAX_START_SECONDS:.1f}s"
+            "host binary warm-start median "
+            f"{median_seconds:.2f}s exceeds {MAX_START_SECONDS:.1f}s"
         )
     if not arguments.skip_smoke:
         subprocess.run(

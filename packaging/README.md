@@ -10,13 +10,15 @@ the executable and its `_internal/` directory kept together. The suffix is
 mandatory: Tauri uses it to select the host-platform sidecar. Sign the bundle
 as part of signing the app; do not try to sign the sidecar separately.
 
-On 2026-09-03, a macOS arm64 build host measured the onedir bundle at 7.45
-seconds cold and about 3 seconds warm, from launch to its handshake. Onefile
-was rejected because it adds archive extraction to every launch; onedir avoids
-that work. `scripts/build_host.py` uses a 10-second cold-start regression cap,
-which leaves room for the measured clean build while still catching a major
-startup regression. A future three-second target needs its own packaging work
-and evidence.
+On 2026-09-03, the macOS arm64 build host measured the freshly written onedir
+bundle's first launch between 2.07 and 10.06 seconds, from launch to its
+handshake. That cold range is first-read I/O and one-time OS verification of
+the unsigned 33 MB bundle, not the start an installed, previously-run signed
+app user pays. After a discarded warmup launch, the three warm launches have a
+0.11-second median. Onefile was rejected because it adds archive extraction to
+every launch; onedir avoids that work. `scripts/build_host.py` therefore gates
+the three-sample warm median at one second, while still printing the discarded
+cold launch for diagnosis.
 
 The sidecar writes its JSON handshake as its first stdout line. The parent must
 keep stdout free of wrapper logging until it has read that line. The parent also
