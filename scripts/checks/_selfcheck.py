@@ -330,6 +330,18 @@ def main() -> None:
         "host_client.stdin_is_read_once",
         "host_client.no_token_in_argv",
         "host_client.stdlib_only",
+        "host_sessions.list_order_and_fields",
+        "host_sessions.damaged_session_listed",
+        "host_sessions.empty_root",
+        "host_sessions.open_unknown_404",
+        "host_sessions.open_during_run_409",
+        "host_sessions.replay_order",
+        "host_sessions.open_reply_fields",
+        "host_sessions.open_crashed_session",
+        "host_sessions.continuation_conversation",
+        "host_sessions.original_untouched",
+        "host_sessions.offloaded_handle_survives",
+        "host_sessions.client_session_calls",
         "cancel.pre_cancelled_agent",
         "cancel.tool_repair",
         "cancel.http_read_recheck",
@@ -475,7 +487,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "395 passed, 0 failed, 395 selected of 395 registered",
+        == "407 passed, 0 failed, 407 selected of 407 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -523,7 +535,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 395 registered"
+                "of 407 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -551,7 +563,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 395 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 407 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

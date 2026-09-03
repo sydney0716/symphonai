@@ -72,6 +72,13 @@ token only in the `Authorization` header, and decode every SSE `data:` frame
 with the protocol decoder. Keep unknown events and dropped notices visible.
 Receive the handshake through a pipe or stdin, never on a command line.
 
+## Sessions
+
+`GET /sessions` returns persisted session metadata newest first. `POST
+/session/open` takes a `run_id`, replays `HistoryMessage` event frames before
+its reply, and holds that conversation for the next prompt. The continuation
+is written as a new descendant session; the opened transcript is never changed.
+
 ## HTTP transport
 
 The reference host binds only to `127.0.0.1` on an ephemeral port. On startup

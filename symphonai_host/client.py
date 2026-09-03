@@ -38,7 +38,7 @@ class HostClient:
         self.timeout = timeout
         self._events_connection: http.client.HTTPConnection | None = None
 
-    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _request(self, method: str, path: str, body: dict | None = None) -> dict | list:
         connection = http.client.HTTPConnection("127.0.0.1", self.address.port, timeout=self.timeout)
         try:
             encoded = None if body is None else json.dumps(body)
@@ -60,6 +60,18 @@ class HostClient:
 
     def health(self) -> dict:
         return self._request("GET", "/health")
+
+    def list_sessions(self) -> list[dict]:
+        response = self._request("GET", "/sessions")
+        if not isinstance(response, list):
+            raise HostClientError("/sessions returned an invalid response")
+        return response
+
+    def open_session(self, run_id: str) -> dict:
+        response = self._request("POST", "/session/open", {"run_id": run_id})
+        if not isinstance(response, dict):
+            raise HostClientError("/session/open returned an invalid response")
+        return response
 
     def events(self) -> Iterator[tuple[str, dict]]:
         connection = http.client.HTTPConnection("127.0.0.1", self.address.port, timeout=self.timeout)

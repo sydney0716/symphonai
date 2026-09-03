@@ -51,6 +51,30 @@ class StopRequest:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class OpenSessionRequest:
+    run_id: str
+
+
+@dataclass(frozen=True)
+class HistoryMessage:
+    """A replay record intentionally limited to display-safe message fields."""
+
+    role: str
+    text: str
+    tool_calls: list[dict[str, str]]
+    turn_id: str | None
+
+    def payload(self) -> dict:
+        return {
+            "type": "HistoryMessage",
+            "role": self.role,
+            "text": self.text,
+            "tool_calls": self.tool_calls,
+            "turn_id": self.turn_id,
+        }
+
+
 def event_type_name(event_class: type) -> str:
     """Return an Event subclass's unchanged class name for the wire."""
     return event_class.__name__
@@ -145,7 +169,7 @@ def _optional_string(payload: dict, kind: str, field: str) -> str:
     return _required(payload, kind, field, str)
 
 
-def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | StopRequest:
+def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | StopRequest | OpenSessionRequest:
     """Validate and decode a client request independent of its transport."""
     if not isinstance(payload, dict):
         raise ProtocolError(f"{kind} request payload must be an object")
@@ -159,4 +183,6 @@ def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | 
         )
     if kind == "stop":
         return StopRequest(reason=_optional_string(payload, kind, "reason"))
+    if kind == "session/open":
+        return OpenSessionRequest(run_id=_required(payload, kind, "run_id", str))
     raise ProtocolError(f"unknown request kind {kind!r}")

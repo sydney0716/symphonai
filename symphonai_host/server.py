@@ -7,13 +7,16 @@ import secrets
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
+from symphonai_api.session import SessionError, TranscriptError
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.protocol import (
     ApprovalRequested,
+    HistoryMessage,
     PROTOCOL_VERSION,
     ProtocolError,
     decode_request,
@@ -21,6 +24,7 @@ from symphonai_host.protocol import (
     encode_frame,
 )
 from symphonai_host.run import HostRun, RunActiveError
+from symphonai_host.sessions import list_sessions
 
 
 class HostServer:
@@ -38,6 +42,7 @@ class HostServer:
         max_turns: int = 20,
         model: str | None = None,
         approval_timeout: float = 300.0,
+        sessions_root: Path | None = None,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
@@ -52,6 +57,7 @@ class HostServer:
             model=model,
             publish_approval=self._publish_approval,
             approval_timeout=approval_timeout,
+            sessions_root=sessions_root,
         )
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
@@ -146,7 +152,7 @@ class HostServer:
                     return False
                 return True
 
-            def _json(self, status: HTTPStatus, body: dict) -> None:
+            def _json(self, status: HTTPStatus, body: object) -> None:
                 encoded = json.dumps(body).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -184,6 +190,11 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, {"pending": host.pending_approvals()})
                     return
+                if self.path == "/sessions":
+                    if not self._authorized():
+                        return
+                    self._json(HTTPStatus.OK, list_sessions(host.run.sessions_root))
+                    return
                 if self.path != "/events":
                     self._not_found()
                     return
@@ -216,6 +227,8 @@ class HostServer:
                         continue
                     if isinstance(event, ApprovalRequested):
                         self._sse(encode_frame("approval_requested", event.__dict__))
+                    elif isinstance(event, HistoryMessage):
+                        self._sse(encode_frame("event", event.payload()))
                     else:
                         self._sse(encode_frame("event", encode_event(event)))
 
@@ -224,7 +237,7 @@ class HostServer:
                 self.wfile.flush()
 
             def do_POST(self) -> None:
-                if self.path not in ("/prompt", "/stop", "/approval"):
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open"):
                     self._not_found()
                     return
                 if not self._authorized():
@@ -250,6 +263,20 @@ class HostServer:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "unknown approval id"})
                         return
                     self._json(HTTPStatus.OK, {"resolved": True})
+                    return
+                if kind == "session/open":
+                    try:
+                        reply = host.run.open_session(request.run_id)
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except SessionError:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "session not found"})
+                        return
+                    except TranscriptError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
                     return
                 host.run.stop()
                 self._json(HTTPStatus.OK, {"accepted": True})

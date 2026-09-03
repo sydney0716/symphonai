@@ -80,5 +80,15 @@ def run(client: HostClient) -> None:
             return
         elif line == "/stop":
             client.stop()
+        elif line == "/sessions":
+            for session in client.list_sessions():
+                print(f"{session['run_id']} {session['state']} {session.get('title') or ''}".rstrip())
+        elif line.startswith("/open "):
+            run_id = line.removeprefix("/open ").strip()
+            if not run_id:
+                print("usage: /open <run_id>", file=sys.stderr)
+            else:
+                reply = client.open_session(run_id)
+                print(f"opened {reply['run_id']} ({reply['state']}); replayed {reply['replayed']} messages")
         else:
             client.send_prompt(line)

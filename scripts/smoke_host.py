@@ -47,7 +47,11 @@ def main() -> None:
             )),
             ModelResponse(Message(Role.ASSISTANT, "done")),
         ])
-        host = HostServer(provider, PermissionPolicy(repo_root=root, mode="prompt"))
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root, mode="prompt"),
+            sessions_root=root / "sessions",
+        )
         host.start()
         client = HostClient(HostAddress(host.port, host.token))
         finished = threading.Event()
@@ -83,12 +87,19 @@ def main() -> None:
                 raise RuntimeError(f"run did not finish: {failed}")
             if failed:
                 raise RuntimeError(failed[0])
+            deadline = time.monotonic() + 5
+            while client.health().get("state") == "active" and time.monotonic() < deadline:
+                time.sleep(0.05)
             if (root / "approved.txt").read_text(encoding="utf-8") != "ok":
                 raise RuntimeError("approved tool did not execute")
             print("OK:   approved run finished")
+            sessions = client.list_sessions()
+            if len(sessions) != 1 or client.open_session(sessions[0]["run_id"])["replayed"] < 2:
+                raise RuntimeError("finished session did not reopen with its history")
+            print("OK:   client reopened the finished session")
             provider.block = True
-            if not client.send_prompt("wait for stop").get("accepted"):
-                raise RuntimeError("second prompt was not accepted")
+            if not client.send_prompt("continue then stop").get("accepted"):
+                raise RuntimeError("continuation prompt was not accepted")
             if not provider.blocking_started.wait(5):
                 raise RuntimeError("second prompt did not become active")
             if not client.stop().get("accepted"):
