@@ -313,7 +313,7 @@ def main() -> None:
         "host_approvals.unknown_id_404",
         "host_approvals.timeout_denies",
         "host_approvals.no_subscriber_denies_fast",
-        "host_approvals.stop_unparks",
+        "host_approvals.broker_cancel_all_unparks",
         "host_approvals.callback_never_raises",
         "host_approvals.permissions_untouched",
         "host_approvals.pending_listing",

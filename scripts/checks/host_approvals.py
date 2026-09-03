@@ -87,8 +87,8 @@ def check_no_subscriber_denies_fast() -> None:
         fail(f"missing subscriber parked approval: {result!r}")
 
 
-@check("host_approvals.stop_unparks")
-def check_stop_unparks() -> None:
+@check("host_approvals.broker_cancel_all_unparks")
+def check_broker_cancel_all_unparks() -> None:
     broker, item, result, thread = _waiting()
     broker.cancel_all(reason="stopped")
     thread.join(1)
