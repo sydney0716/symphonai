@@ -685,6 +685,54 @@ def check_narrow_never_widens() -> None:
         ]
         for parent, ceiling in pairs:
             _assert_never_widens(parent, ceiling, paths, urls, argvs)
+
+        absolute_root_paths = [
+            root / "root-probe.txt",
+            root / "src" / "one-level-probe.txt",
+            root / "src" / "nested" / "two-level-probe.txt",
+            root.parent / "outside-root-probe.txt",
+        ]
+        for path in absolute_root_paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        for ceiling_root in (root / "src", root / "src" / "nested", root):
+            _assert_never_widens(
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root],
+                ),
+                PermissionPolicy(
+                    repo_root=ceiling_root,
+                    allowed_write_scope=[ceiling_root],
+                ),
+                absolute_root_paths,
+                [],
+                [],
+            )
+
+        fetch_parent = PermissionPolicy(
+            repo_root=root,
+            fetch_enabled=False,
+            fetch_allowlist=["parent.example", "shared.example"],
+        )
+        fetch_ceiling = PermissionPolicy(
+            repo_root=root,
+            fetch_enabled=False,
+            fetch_allowlist=["ceiling.example", "shared.example"],
+        )
+        _assert_never_widens(
+            fetch_parent,
+            fetch_ceiling,
+            [],
+            [
+                "https://parent.example/path",
+                "https://ceiling.example/path",
+                "https://shared.example/path",
+                "https://neither.example/path",
+            ],
+            [],
+        )
+
         forbidden_parent = PermissionPolicy(repo_root=root)
         try:
             forbidden_parent.narrowed(PermissionPolicy(repo_root=root / "build"))
