@@ -370,6 +370,13 @@ def main() -> None:
         "agent_spec.validate_output_never_raises",
         "agent_spec.with_overrides",
         "agent_spec.no_runtime_imports",
+        "agent_run.identity_and_parenting",
+        "agent_run.lifecycle_transitions",
+        "agent_run.result_and_cancellation",
+        "agent_run.token_closed_in_finally",
+        "agent_run.parent_close_does_not_detach_children",
+        "agent_run.graph_from_transcripts",
+        "agent_run.graph_covers_every_run",
         "agent.full_run",
         "agent.base_validation",
         "search.permission_gates",
@@ -518,7 +525,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "438 passed, 0 failed, 438 selected of 438 registered",
+        == "445 passed, 0 failed, 445 selected of 445 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -566,7 +573,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 438 registered"
+                "of 445 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -594,7 +601,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 438 registered",
+            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 445 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
