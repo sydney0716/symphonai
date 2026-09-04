@@ -349,6 +349,16 @@ def main() -> None:
         "cancel.late_response_retained",
         "agent_cancel.unanswered_ids_last_assistant_only",
         "agent_cancel.cancelled_messages_unchanged_by_refactor",
+        "cancellation.plain_token_unchanged",
+        "cancellation.parent_cancels_the_subtree",
+        "cancellation.child_never_cancels_the_parent",
+        "cancellation.reasons",
+        "cancellation.child_of_a_cancelled_parent",
+        "cancellation.deadline_fires_and_is_cancellable",
+        "cancellation.listeners_fire_once",
+        "cancellation.close_removes_the_listener",
+        "cancellation.no_deadlock_from_a_callback",
+        "cancellation.concurrent_cancel_and_child",
         "agent.full_run",
         "agent.base_validation",
         "search.permission_gates",
@@ -488,7 +498,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "408 passed, 0 failed, 408 selected of 408 registered",
+        == "418 passed, 0 failed, 418 selected of 418 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -536,7 +546,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 408 registered"
+                "of 418 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -564,7 +574,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 408 registered",
+            selected_lines[-1] == "11 passed, 0 failed, 11 selected of 418 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
