@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import time
 from dataclasses import fields
+from pathlib import Path
 
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import (
@@ -358,3 +360,435 @@ def check_permissions_approval_serialization() -> None:
             fail(f"serialized approvals lost decisions: {decisions!r}")
         if peak != 1:
             fail(f"approval callbacks overlapped; observed peak concurrency {peak}")
+
+
+@check("permissions.narrow_returns_a_new_policy")
+def check_narrow_returns_a_new_policy() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        def parent_approval(request) -> bool:
+            return True
+
+        def ceiling_approval(request) -> bool:
+            return True
+
+        parent = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root],
+            mode="prompt",
+            approval_callback=parent_approval,
+        )
+        ceiling = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root],
+            mode="prompt",
+            approval_callback=ceiling_approval,
+        )
+        child = parent.narrowed(ceiling)
+        if child is parent or child is ceiling:
+            fail("narrowing returned one of its inputs")
+        if parent.narrowed(parent) is parent:
+            fail("self narrowing returned the parent instead of a fresh policy")
+        if child._approval_lock in (parent._approval_lock, ceiling._approval_lock):  # noqa: SLF001
+            fail("narrowed policy reused an input approval lock")
+        if child.approval_callback is not ceiling_approval:
+            fail("narrowed policy did not prefer the ceiling approval callback")
+
+        completed = threading.Event()
+
+        def ask_child() -> None:
+            child.check_shell(["ls"])
+            completed.set()
+
+        parent._approval_lock.acquire()  # noqa: SLF001
+        try:
+            worker = threading.Thread(target=ask_child)
+            worker.start()
+            if not completed.wait(0.5):
+                fail("child approval serialized behind the parent lock")
+        finally:
+            parent._approval_lock.release()  # noqa: SLF001
+        worker.join(timeout=0.5)
+        if worker.is_alive():
+            fail("child approval worker did not finish")
+
+        fallback = PermissionPolicy(
+            repo_root=root, mode="prompt", approval_callback=parent_approval
+        ).narrowed(PermissionPolicy(repo_root=root, mode="prompt"))
+        if fallback.approval_callback is not parent_approval:
+            fail("narrowed policy did not retain a parent callback when ceiling lacked one")
+
+
+@check("permissions.narrow_repo_root")
+def check_narrow_repo_root() -> None:
+    with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as outside:
+        root = Path(temporary)
+        inside = root / "inside"
+        inside.mkdir()
+        parent = PermissionPolicy(repo_root=root)
+        child = parent.narrowed(PermissionPolicy(repo_root=inside))
+        if child.repo_root != inside.resolve():
+            fail(f"narrowed root was not the ceiling root: {child.repo_root!r}")
+        outside_policy = PermissionPolicy(repo_root=Path(outside))
+        try:
+            parent.narrowed(outside_policy)
+        except ValueError as exc:
+            if str(root.resolve()) not in str(exc) or str(Path(outside).resolve()) not in str(exc):
+                fail(f"outside-root error did not name both roots: {exc!r}")
+        else:
+            fail("narrowing accepted an outside repo root")
+
+
+@check("permissions.narrow_write_scope")
+def check_narrow_write_scope() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        shared = root / "shared"
+        nested = shared / "nested"
+        left = root / "left"
+        right = root / "right"
+        for path in (nested, left, right):
+            path.mkdir(parents=True, exist_ok=True)
+
+        nested_child = PermissionPolicy(
+            repo_root=root, allowed_write_scope=[shared]
+        ).narrowed(PermissionPolicy(repo_root=root, allowed_write_scope=[nested]))
+        if nested_child.allowed_write_scope != [nested.resolve()]:
+            fail(f"nested write scopes did not keep the deeper scope: {nested_child.allowed_write_scope!r}")
+        if not nested_child.check_write(nested / "ok.txt").allowed:
+            fail("the common nested write scope was denied")
+
+        disjoint_child = PermissionPolicy(
+            repo_root=root, allowed_write_scope=[left]
+        ).narrowed(PermissionPolicy(repo_root=root, allowed_write_scope=[right]))
+        if disjoint_child.allowed_write_scope:
+            fail(f"disjoint write scopes survived intersection: {disjoint_child.allowed_write_scope!r}")
+
+
+@check("permissions.narrow_forbidden_union")
+def check_narrow_forbidden_union() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        parent_only = root / "parent-only.secret"
+        ceiling_only = root / "ceiling-only.secret"
+        parent_only.touch()
+        ceiling_only.touch()
+        child = PermissionPolicy(
+            repo_root=root, forbidden_patterns=("parent-only.secret",)
+        ).narrowed(
+            PermissionPolicy(repo_root=root, forbidden_patterns=("ceiling-only.secret",))
+        )
+        if child.forbidden_patterns != ("parent-only.secret", "ceiling-only.secret"):
+            fail(f"forbidden patterns were not ordered union: {child.forbidden_patterns!r}")
+        if child.check_read(parent_only).allowed or child.check_read(ceiling_only).allowed:
+            fail("a pattern forbidden by either policy was readable in the child")
+
+
+@check("permissions.narrow_shell_and_fetch")
+def check_narrow_shell_and_fetch() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        parent = PermissionPolicy(
+            repo_root=root,
+            shell_enabled=True,
+            shell_allowlist=[("git",), ("python", "-m")],
+            fetch_enabled=False,
+            fetch_allowlist=["parent.example", "shared.example"],
+            shell_timeout_seconds=20,
+            shell_output_limit_chars=8_000,
+        )
+        ceiling = PermissionPolicy(
+            repo_root=root,
+            shell_enabled=True,
+            shell_allowlist=[("git", "status"), ("python",)],
+            fetch_enabled=False,
+            fetch_allowlist=["shared.example", "ceiling.example"],
+            shell_timeout_seconds=4,
+            shell_output_limit_chars=1_500,
+        )
+        child = parent.narrowed(ceiling)
+        if child.shell_allowlist != [("git", "status"), ("python", "-m")]:
+            fail(f"shell allowlist intersection was wrong: {child.shell_allowlist!r}")
+        if not child.check_shell(["git", "status"]).allowed or child.check_shell(
+            ["git", "log"]
+        ).allowed:
+            fail("shell intersection did not keep only common argv prefixes")
+        if child.fetch_allowlist != ["shared.example"]:
+            fail(f"fetch allowlist intersection was wrong: {child.fetch_allowlist!r}")
+        if not child.check_fetch("https://shared.example/path").allowed or child.check_fetch(
+            "https://parent.example/path"
+        ).allowed:
+            fail("fetch intersection did not keep only common hosts")
+        if child.shell_timeout_seconds != 4 or child.shell_output_limit_chars != 1_500:
+            fail("narrowed shell limits were not minima")
+
+        disabled = PermissionPolicy(
+            repo_root=root, shell_enabled=True, fetch_enabled=True
+        ).narrowed(
+            PermissionPolicy(repo_root=root, shell_enabled=False, fetch_enabled=False)
+        )
+        if disabled.shell_enabled or disabled.fetch_enabled:
+            fail("narrowed enabled flags were not intersected")
+
+
+@check("permissions.narrow_mode")
+def check_narrow_mode() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        parent = PermissionPolicy(repo_root=root, mode="auto")
+        if parent.narrowed(PermissionPolicy(repo_root=root, mode="auto")).mode != "auto":
+            fail("matching mode was not preserved")
+        if parent.narrowed(PermissionPolicy(repo_root=root, mode="plan")).mode != "plan":
+            fail("plan ceiling did not narrow the mode")
+        for ceiling_mode in ("prompt", "accept_edits"):
+            try:
+                parent.narrowed(PermissionPolicy(repo_root=root, mode=ceiling_mode))
+            except ValueError as exc:
+                if "auto" not in str(exc) or ceiling_mode not in str(exc):
+                    fail(f"incompatible-mode error did not name both modes: {exc!r}")
+            else:
+                fail(f"incompatible mode {ceiling_mode!r} was accepted")
+
+
+def _assert_never_widens(
+    parent: PermissionPolicy,
+    ceiling: PermissionPolicy,
+    paths: list[Path],
+    urls: list[str],
+    argvs: list[list[str]],
+) -> None:
+    child = parent.narrowed(ceiling)
+    for path in paths:
+        for check_name in ("check_read", "check_list", "check_write"):
+            child_decision = getattr(child, check_name)(path)
+            if child_decision.allowed and not (
+                getattr(parent, check_name)(path).allowed
+                and getattr(ceiling, check_name)(path).allowed
+            ):
+                fail(f"{check_name} widened for {path!s}")
+    for url in urls:
+        if child.check_fetch(url).allowed and not (
+            parent.check_fetch(url).allowed and ceiling.check_fetch(url).allowed
+        ):
+            fail(f"check_fetch widened for {url!r}")
+    for argv in argvs:
+        if child.check_shell(argv).allowed and not (
+            parent.check_shell(argv).allowed and ceiling.check_shell(argv).allowed
+        ):
+            fail(f"check_shell widened for {argv!r}")
+
+
+@check("permissions.narrow_never_widens")
+def check_narrow_never_widens() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths = [
+            root / name
+            for name in (
+                "read.txt",
+                "parent-only/write.txt",
+                "ceiling-only/write.txt",
+                "shared/nested/write.txt",
+                "shared/other.txt",
+                "parent-secret",
+                "ceiling-secret",
+                ".env",
+                "build/output.txt",
+                "ordinary/a.txt",
+                "ordinary/b.txt",
+                "ordinary/c.txt",
+            )
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        outside = root.parent / "outside-policy-probe.txt"
+        outside.touch()
+        paths.append(outside)
+        urls = [
+            "https://parent.example/path",
+            "https://ceiling.example/path",
+            "https://shared.example/path",
+            "https://unlisted.example/path",
+            "ftp://shared.example/path",
+        ]
+        argvs = [
+            ["parent-command"],
+            ["ceiling-command"],
+            ["shared", "nested"],
+            ["shared", "other"],
+            ["echo", "no"],
+            [],
+        ]
+        pairs = [
+            (
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root / "parent-only"],
+                    forbidden_patterns=("parent-secret",),
+                    shell_enabled=True,
+                    shell_allowlist=[("parent-command",), ("shared",)],
+                    fetch_enabled=True,
+                    fetch_allowlist=["parent.example", "shared.example"],
+                ),
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root / "ceiling-only"],
+                    forbidden_patterns=("ceiling-secret",),
+                    shell_enabled=True,
+                    shell_allowlist=[("ceiling-command",), ("shared", "nested")],
+                    fetch_enabled=True,
+                    fetch_allowlist=["ceiling.example", "shared.example"],
+                ),
+            ),
+            (
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root / "shared"],
+                    forbidden_patterns=("parent-secret",),
+                    shell_enabled=True,
+                    shell_allowlist=[("shared",)],
+                    fetch_enabled=True,
+                    fetch_allowlist=["shared.example"],
+                ),
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root / "shared/nested"],
+                    forbidden_patterns=("ceiling-secret",),
+                    shell_enabled=True,
+                    shell_allowlist=[("shared", "nested")],
+                    fetch_enabled=True,
+                    fetch_allowlist=["shared.example"],
+                ),
+            ),
+            (
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root / "shared/nested"],
+                    forbidden_patterns=("parent-secret", "ceiling-secret"),
+                    shell_enabled=True,
+                    shell_allowlist=[("shared", "nested")],
+                    fetch_enabled=True,
+                    fetch_allowlist=["shared.example"],
+                ),
+                PermissionPolicy(
+                    repo_root=root,
+                    allowed_write_scope=[root / "shared/nested"],
+                    forbidden_patterns=("parent-secret", "ceiling-secret"),
+                    shell_enabled=True,
+                    shell_allowlist=[("shared", "nested")],
+                    fetch_enabled=True,
+                    fetch_allowlist=["shared.example"],
+                ),
+            ),
+        ]
+        for parent, ceiling in pairs:
+            _assert_never_widens(parent, ceiling, paths, urls, argvs)
+        forbidden_parent = PermissionPolicy(repo_root=root)
+        try:
+            forbidden_parent.narrowed(PermissionPolicy(repo_root=root / "build"))
+        except ValueError:
+            pass
+        else:
+            fail("root narrowing through forbidden ground was accepted")
+
+
+@check("permissions.narrow_rejects_a_forbidden_root")
+def check_narrow_rejects_a_forbidden_root() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        parent = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
+        patterns = (".git/", "build/", "dist/", "node_modules/", ".venv/", "__pycache__/", ".ssh/", "*.egg-info/")
+        for pattern in patterns:
+            name = "anything.egg-info" if pattern == "*.egg-info/" else pattern.rstrip("/")
+            ceiling_root = root / name
+            ceiling_root.mkdir()
+            try:
+                parent.narrowed(PermissionPolicy(repo_root=ceiling_root))
+            except ValueError as exc:
+                if str(ceiling_root) not in str(exc) or pattern not in str(exc):
+                    fail(f"forbidden-root error was incomplete: {exc!r}")
+            else:
+                fail(f"forbidden root was accepted: {ceiling_root!s}")
+        nested = root / "a" / "build" / "b"
+        nested.mkdir(parents=True)
+        try:
+            parent.narrowed(PermissionPolicy(repo_root=nested))
+        except ValueError as exc:
+            if "build/" not in str(exc):
+                fail(f"nested root named the wrong pattern: {exc!r}")
+        else:
+            fail("nested forbidden root was accepted")
+        for allowed in (root, root / "src", root / "src" / "nested"):
+            allowed.mkdir(parents=True, exist_ok=True)
+            if parent.narrowed(PermissionPolicy(repo_root=allowed)).repo_root != allowed.resolve():
+                fail(f"allowed root did not narrow: {allowed!s}")
+        named_root = root / "build"
+        named_root.mkdir(exist_ok=True)
+        named = PermissionPolicy(repo_root=named_root)
+        if named.narrowed(named).repo_root != named_root.resolve():
+            fail("self narrowing rejected a forbidden-named root")
+
+
+@check("permissions.narrow_is_idempotent_and_composes")
+def check_narrow_is_idempotent_and_composes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths = [root / "common/nested/file.txt", root / "a/file.txt", root / "b/file.txt"]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        urls = ["https://shared.example/x", "https://parent.example/x"]
+        argvs = [["git", "status"], ["git", "log"], ["echo", "x"]]
+        parent = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root / "a", root / "b", root / "common"],
+            forbidden_patterns=("parent-secret",),
+            shell_enabled=True,
+            shell_allowlist=[("git",), ("echo",)],
+            fetch_enabled=True,
+            fetch_allowlist=["shared.example", "parent.example"],
+        )
+        first_ceiling = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root / "a", root / "common"],
+            forbidden_patterns=("first-secret",),
+            shell_enabled=True,
+            shell_allowlist=[("git",)],
+            fetch_enabled=True,
+            fetch_allowlist=["shared.example"],
+        )
+        second_ceiling = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root / "b", root / "common/nested"],
+            forbidden_patterns=("second-secret",),
+            shell_enabled=True,
+            shell_allowlist=[("git", "status")],
+            fetch_enabled=True,
+            fetch_allowlist=["shared.example"],
+        )
+        same = parent.narrowed(parent)
+        for path in paths:
+            for check_name in ("check_read", "check_list", "check_write"):
+                if getattr(same, check_name)(path).allowed != getattr(parent, check_name)(path).allowed:
+                    fail(f"self narrowing changed {check_name} for {path!s}")
+        for url in urls:
+            if same.check_fetch(url).allowed != parent.check_fetch(url).allowed:
+                fail(f"self narrowing changed fetch permission for {url!r}")
+        for argv in argvs:
+            if same.check_shell(argv).allowed != parent.check_shell(argv).allowed:
+                fail(f"self narrowing changed shell permission for {argv!r}")
+
+        left = parent.narrowed(first_ceiling).narrowed(second_ceiling)
+        right = parent.narrowed(second_ceiling).narrowed(first_ceiling)
+        for path in paths:
+            for check_name in ("check_read", "check_list", "check_write"):
+                if getattr(left, check_name)(path).allowed != getattr(right, check_name)(path).allowed:
+                    fail(f"narrowing did not compose for {check_name} and {path!s}")
+        for url in urls:
+            if left.check_fetch(url).allowed != right.check_fetch(url).allowed:
+                fail(f"narrowing did not compose for fetch {url!r}")
+        for argv in argvs:
+            if left.check_shell(argv).allowed != right.check_shell(argv).allowed:
+                fail(f"narrowing did not compose for shell {argv!r}")

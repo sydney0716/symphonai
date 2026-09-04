@@ -10,9 +10,8 @@ from scripts.checks.harness import check, fail
 
 @check("cancellation.plain_token_unchanged")
 def check_plain_token_unchanged() -> None:
-    thread_count = threading.active_count()
     token = CancellationToken()
-    if threading.active_count() != thread_count:
+    if token._deadline_timer is not None:  # noqa: SLF001
         fail("a plain cancellation token started a thread")
     if token.cancelled or token.reason is not None:
         fail("a new token was not live")

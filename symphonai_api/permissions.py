@@ -164,6 +164,54 @@ class PermissionPolicy:
             )
         self._approval_lock = threading.Lock()
 
+    def narrowed(self, ceiling: "PermissionPolicy") -> "PermissionPolicy":
+        """Return a new policy allowing only what both policies allow."""
+        if not _contains_path(self.repo_root, ceiling.repo_root):
+            raise ValueError(
+                "cannot narrow repo_root "
+                f"{self.repo_root!s} with outside root {ceiling.repo_root!s}"
+            )
+        for component in ceiling.repo_root.relative_to(self.repo_root).parts:
+            forbidden = _matching_forbidden_component(component, self.forbidden_patterns)
+            if forbidden is not None:
+                raise ValueError(
+                    f"cannot narrow to forbidden root {ceiling.repo_root!s}: {forbidden!r}"
+                )
+        if ceiling.mode != self.mode and ceiling.mode != "plan":
+            raise ValueError(
+                "cannot narrow permission mode "
+                f"{self.mode!r} with {ceiling.mode!r}"
+            )
+        return PermissionPolicy(
+            repo_root=ceiling.repo_root,
+            allowed_write_scope=_intersect_write_scopes(
+                self.allowed_write_scope, ceiling.allowed_write_scope
+            ),
+            forbidden_patterns=_ordered_union(
+                self.forbidden_patterns, ceiling.forbidden_patterns
+            ),
+            shell_enabled=self.shell_enabled and ceiling.shell_enabled,
+            shell_allowlist=_intersect_shell_allowlists(
+                self.shell_allowlist, ceiling.shell_allowlist
+            ),
+            fetch_enabled=self.fetch_enabled and ceiling.fetch_enabled,
+            fetch_allowlist=[
+                host for host in self.fetch_allowlist if host in ceiling.fetch_allowlist
+            ],
+            shell_timeout_seconds=min(
+                self.shell_timeout_seconds, ceiling.shell_timeout_seconds
+            ),
+            shell_output_limit_chars=min(
+                self.shell_output_limit_chars, ceiling.shell_output_limit_chars
+            ),
+            mode=ceiling.mode,
+            approval_callback=(
+                ceiling.approval_callback
+                if ceiling.approval_callback is not None
+                else self.approval_callback
+            ),
+        )
+
     # -- path checks ------------------------------------------------------
 
     def _resolve_within_root(self, path: str | Path) -> Path | None:
@@ -188,8 +236,7 @@ class PermissionPolicy:
         except ValueError:
             rel_parts = resolved.parts
         for pattern in self.forbidden_patterns:
-            glob = pattern.rstrip("/")
-            if any(fnmatch.fnmatch(part, glob) for part in rel_parts):
+            if any(_matching_forbidden_component(part, (pattern,)) for part in rel_parts):
                 return pattern
         return None
 
@@ -370,3 +417,58 @@ class PermissionPolicy:
                 f"approval callback returned an invalid decision for {operation}",
                 denial=DenialReason.INVALID_APPROVAL,
             )
+
+
+def _contains_path(parent: Path, child: Path) -> bool:
+    return child == parent or parent in child.parents
+
+
+def _matching_forbidden_component(
+    component: str, patterns: tuple[str, ...]
+) -> str | None:
+    for pattern in patterns:
+        if fnmatch.fnmatch(component, pattern.rstrip("/")):
+            return pattern
+    return None
+
+
+def _intersect_write_scopes(
+    parent_scopes: list[Path], ceiling_scopes: list[Path]
+) -> list[Path]:
+    intersections: list[Path] = []
+    for parent_scope in parent_scopes:
+        for ceiling_scope in ceiling_scopes:
+            if _contains_path(parent_scope, ceiling_scope):
+                candidate = ceiling_scope
+            elif _contains_path(ceiling_scope, parent_scope):
+                candidate = parent_scope
+            else:
+                continue
+            if candidate not in intersections:
+                intersections.append(candidate)
+    return intersections
+
+
+def _ordered_union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*first, *second)))
+
+
+def _intersect_shell_allowlists(
+    parent_allowlist: list[tuple[str, ...]], ceiling_allowlist: list[tuple[str, ...]]
+) -> list[tuple[str, ...]]:
+    intersections: list[tuple[str, ...]] = []
+    for parent_prefix in parent_allowlist:
+        for ceiling_prefix in ceiling_allowlist:
+            if _is_prefix(parent_prefix, ceiling_prefix):
+                candidate = ceiling_prefix
+            elif _is_prefix(ceiling_prefix, parent_prefix):
+                candidate = parent_prefix
+            else:
+                continue
+            if candidate not in intersections:
+                intersections.append(candidate)
+    return intersections
+
+
+def _is_prefix(prefix: tuple[str, ...], value: tuple[str, ...]) -> bool:
+    return value[: len(prefix)] == prefix
