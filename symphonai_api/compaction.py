@@ -147,7 +147,7 @@ def microcompact_messages(
             recent_turns=recent_turns,
         )
 
-    recent_start = _recent_window_start(original, recent_turns)
+    recent_start = recent_window_start(original, recent_turns)
     tool_names: dict[str, str] = {}
     clearable_indices: list[int] = []
     for index, message in enumerate(original):
@@ -253,7 +253,7 @@ def compact_messages_for_budget(
         )
 
     working = microcompacted.messages
-    recent_start = _recent_window_start(working, recent_turns)
+    recent_start = recent_window_start(working, recent_turns)
     prefix_indices = _preserved_prefix_indices(working, recent_start)
     recent_indices = set(range(recent_start, len(working)))
     dropped_indices = [
@@ -367,7 +367,7 @@ def _is_cleared_tool_result_content(content: str) -> bool:
     )
 
 
-def _recent_window_start(messages: list[Message], recent_turns: int) -> int:
+def recent_window_start(messages: list[Message], recent_turns: int) -> int:
     user_indices = [index for index, message in enumerate(messages) if message.role == Role.USER]
     if not user_indices:
         return max(0, len(messages) - recent_turns)
