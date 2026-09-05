@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import chain, product
 import tempfile
 from pathlib import Path
 
@@ -83,6 +84,60 @@ def _assert_no_orphan_tools(
         fail(f"orphan tool result: {sorted(unexpected_orphan_ids)!r}")
 
 
+PARENT_SYSTEM = Message(Role.SYSTEM, "parent system")
+WEDGED_USER = [
+    Message(Role.USER, "one"),
+    _assistant("one"),
+    Message(Role.USER, "between"),
+    _tool("one"),
+]
+USERLESS_TOOL_GROUPS = [
+    [_assistant("c0"), _tool("c0")],
+    [_assistant("c0"), _tool("c0"), Message(Role.ASSISTANT, "reply")],
+]
+GHOST_PARENTS = [
+    [_tool("ghost")],
+    [Message(Role.USER, "one"), _tool("ghost")],
+]
+REGRESSION_CONVERSATIONS = [
+    [],
+    [Message(Role.USER, "one")],
+    [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply")],
+    [Message(Role.USER, "one"), _assistant("a"), _tool("a")],
+    [Message(Role.USER, "one"), _assistant("a", "b"), _tool("a"), _tool("b")],
+    [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply"), Message(Role.USER, "two")],
+    [Message(Role.USER, "one"), _assistant("a"), _tool("a"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "reply")],
+    WEDGED_USER,
+    [Message(Role.SYSTEM, "system"), Message(Role.ASSISTANT, "reply")],
+    *USERLESS_TOOL_GROUPS,
+    *GHOST_PARENTS,
+    [PARENT_SYSTEM],
+    [PARENT_SYSTEM, Message(Role.USER, "one"), _assistant("one"), _tool("one"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "final")],
+]
+ALPHABET = [
+    Message(Role.USER, "u"),
+    Message(Role.SYSTEM, "s"),
+    Message(Role.ASSISTANT, "a"),
+    _assistant("a"),
+    _tool("a"),
+    _tool("g"),
+]
+
+def _enumerated_conversations() -> list[list[Message]]:
+    conversations: list[list[Message]] = []
+    for length in range(6):
+        conversations.extend(list(messages) for messages in product(ALPHABET, repeat=length))
+    return conversations
+
+
+def _tool_result_ids(messages: list[Message]) -> set[str]:
+    return {
+        message.tool_result.tool_call_id
+        for message in messages
+        if message.role is Role.TOOL and message.tool_result is not None
+    }
+
+
 @check("child_context.fresh_is_todays_behaviour")
 def fresh_is_todays_behaviour() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -142,22 +197,7 @@ def inherit_all() -> None:
 def inherit_tail() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        windows = [
-            [],
-            [Message(Role.USER, "one")],
-            [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply")],
-            [Message(Role.USER, "one"), _assistant("a"), _tool("a")],
-            [Message(Role.USER, "one"), _assistant("a", "b"), _tool("a"), _tool("b")],
-            [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply"), Message(Role.USER, "two")],
-            [Message(Role.USER, "one"), _assistant("a"), _tool("a"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "reply")],
-            [Message(Role.USER, "one"), _assistant("one"), Message(Role.USER, "between"), _tool("one")],
-            [Message(Role.SYSTEM, "system"), Message(Role.ASSISTANT, "reply")],
-            [_assistant("c0"), _tool("c0")],
-            [_assistant("c0"), _tool("c0"), Message(Role.ASSISTANT, "reply")],
-            [_tool("ghost")],
-            [Message(Role.USER, "one"), _tool("ghost")],
-        ]
-        for messages in windows:
+        for messages in chain(REGRESSION_CONVERSATIONS, _enumerated_conversations()):
             for turns in range(1, 5):
                 recent_start = recent_window_start(messages, turns)
                 start = tail_start(messages, turns)
@@ -175,7 +215,7 @@ def inherit_tail() -> None:
                     fail(f"tail_start diverged without a rescuable orphan: {messages!r}")
                 _assert_no_orphan_tools(
                     messages[start:],
-                    literal_orphan_ids - rescuable_orphan_ids,
+                    _orphan_tool_result_ids(messages),
                 )
 
         parent = [
@@ -208,7 +248,6 @@ def inherit_tail() -> None:
             fail("oversized tail did not retain the full conversation")
 
 
-
 @check("child_context.purity")
 def purity() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -232,32 +271,9 @@ def purity() -> None:
 def never_orphans_a_tool_result() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        parent_system = Message(Role.SYSTEM, "parent system")
-        wedged_user = [
-            Message(Role.USER, "one"),
-            _assistant("one"),
-            Message(Role.USER, "between"),
-            _tool("one"),
-        ]
-        conversations = [
-            [],
-            [parent_system],
-            [Message(Role.USER, "one")],
-            [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply")],
-            [Message(Role.USER, "one"), _assistant("one"), _tool("one")],
-            [Message(Role.USER, "one"), _assistant("one", "two"), _tool("one"), _tool("two")],
-            [Message(Role.USER, "one"), _assistant("one"), _tool("one"), Message(Role.ASSISTANT, "final")],
-            [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "reply two")],
-            [parent_system, Message(Role.USER, "one"), _assistant("one"), _tool("one"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "final")],
-            wedged_user,
-            [_assistant("c0"), _tool("c0")],
-            [_assistant("c0"), _tool("c0"), Message(Role.ASSISTANT, "reply")],
-            [_tool("ghost")],
-            [Message(Role.USER, "one"), _tool("ghost")],
-        ]
-        for parent in conversations:
+        for parent in chain(REGRESSION_CONVERSATIONS, _enumerated_conversations()):
             parent_systems = [message for message in parent if message.role is Role.SYSTEM]
-            parent_unissued_ids = _orphan_tool_result_ids(parent) - _issued_tool_call_ids(parent)
+            parent_orphan_ids = _orphan_tool_result_ids(parent)
             specs = [
                 _spec(root),
                 _spec(root, inherit=ContextInheritance.ALL),
@@ -268,19 +284,20 @@ def never_orphans_a_tool_result() -> None:
             ]
             for spec in specs:
                 seeded = seed_messages(spec, "task", parent_messages=parent)
-                _assert_no_orphan_tools(seeded, parent_unissued_ids)
+                _assert_no_orphan_tools(seeded, parent_orphan_ids)
                 if any(message is parent_system for message in seeded for parent_system in parent_systems):
                     fail("seeded context retained a parent system message")
-                if parent_unissued_ids and spec.isolation.inherit is not ContextInheritance.FRESH:
-                    seeded_ids = {
-                        message.tool_result.tool_call_id
-                        for message in seeded
-                        if message.role is Role.TOOL and message.tool_result is not None
-                    }
-                    if not parent_unissued_ids <= seeded_ids:
-                        fail("seeding dropped an unissued parent tool result")
+                if spec.isolation.inherit is ContextInheritance.ALL:
+                    inherited = parent
+                elif spec.isolation.inherit is ContextInheritance.TAIL:
+                    inherited = parent[tail_start(parent, spec.isolation.inherit_tail):]
+                else:
+                    inherited = []
+                expected_orphan_ids = parent_orphan_ids & _tool_result_ids(inherited)
+                if not expected_orphan_ids <= _tool_result_ids(seeded):
+                    fail("seeding dropped an unrescuable parent tool result")
 
-        if tail_start(wedged_user, 1) >= recent_window_start(wedged_user, 1):
+        if tail_start(WEDGED_USER, 1) >= recent_window_start(WEDGED_USER, 1):
             fail("tail_start did not extend an orphaning tool group backward")
 
 
