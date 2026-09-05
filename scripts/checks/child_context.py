@@ -53,25 +53,34 @@ def _tool(call_id: str) -> Message:
     )
 
 
-def _assert_no_orphan_tools(messages: list[Message]) -> None:
+def _issued_tool_call_ids(messages: list[Message]) -> set[str]:
     issued: set[str] = set()
+    for message in messages:
+        if message.role is Role.ASSISTANT:
+            issued.update(call.id for call in message.tool_calls)
+    return issued
+
+
+def _orphan_tool_result_ids(messages: list[Message]) -> set[str]:
+    issued: set[str] = set()
+    orphan_ids: set[str] = set()
     for message in messages:
         if message.role is Role.ASSISTANT:
             issued.update(call.id for call in message.tool_calls)
         elif message.role is Role.TOOL and message.tool_result is not None:
             if message.tool_result.tool_call_id not in issued:
-                fail(f"orphan tool result: {message.tool_result.tool_call_id!r}")
+                orphan_ids.add(message.tool_result.tool_call_id)
+    return orphan_ids
 
 
-def _has_orphan_tools(messages: list[Message]) -> bool:
-    issued: set[str] = set()
-    for message in messages:
-        if message.role is Role.ASSISTANT:
-            issued.update(call.id for call in message.tool_calls)
-        elif message.role is Role.TOOL and message.tool_result is not None:
-            if message.tool_result.tool_call_id not in issued:
-                return True
-    return False
+def _assert_no_orphan_tools(
+    messages: list[Message],
+    permitted_orphan_ids: set[str] | None = None,
+) -> None:
+    permitted_ids = permitted_orphan_ids if permitted_orphan_ids is not None else set()
+    unexpected_orphan_ids = _orphan_tool_result_ids(messages) - permitted_ids
+    if unexpected_orphan_ids:
+        fail(f"orphan tool result: {sorted(unexpected_orphan_ids)!r}")
 
 
 @check("child_context.fresh_is_todays_behaviour")
@@ -141,9 +150,12 @@ def inherit_tail() -> None:
             [Message(Role.USER, "one"), _assistant("a", "b"), _tool("a"), _tool("b")],
             [Message(Role.USER, "one"), Message(Role.ASSISTANT, "reply"), Message(Role.USER, "two")],
             [Message(Role.USER, "one"), _assistant("a"), _tool("a"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "reply")],
+            [Message(Role.USER, "one"), _assistant("one"), Message(Role.USER, "between"), _tool("one")],
             [Message(Role.SYSTEM, "system"), Message(Role.ASSISTANT, "reply")],
             [_assistant("c0"), _tool("c0")],
             [_assistant("c0"), _tool("c0"), Message(Role.ASSISTANT, "reply")],
+            [_tool("ghost")],
+            [Message(Role.USER, "one"), _tool("ghost")],
         ]
         for messages in windows:
             for turns in range(1, 5):
@@ -151,16 +163,20 @@ def inherit_tail() -> None:
                 start = tail_start(messages, turns)
                 if start > recent_start:
                     fail(f"tail_start advanced beyond the recent window: {messages!r}")
-                _assert_no_orphan_tools(messages[start:])
-                literal_has_orphan = _has_orphan_tools(messages[recent_start:])
-                if any(message.role is Role.USER for message in messages):
-                    if start != recent_start:
-                        fail(f"tail_start diverged on a user-anchored window: {messages!r}")
-                elif literal_has_orphan:
+                literal_orphan_ids = _orphan_tool_result_ids(messages[recent_start:])
+                literal_has_orphan = bool(literal_orphan_ids)
+                rescuable_orphan_ids = literal_orphan_ids & _issued_tool_call_ids(
+                    messages[:recent_start]
+                )
+                if literal_has_orphan and rescuable_orphan_ids:
                     if start >= recent_start:
                         fail(f"tail_start did not extend an orphaning window: {messages!r}")
                 elif start != recent_start:
-                    fail(f"tail_start diverged on a well-formed window: {messages!r}")
+                    fail(f"tail_start diverged without a rescuable orphan: {messages!r}")
+                _assert_no_orphan_tools(
+                    messages[start:],
+                    literal_orphan_ids - rescuable_orphan_ids,
+                )
 
         parent = [
             Message(Role.USER, "first"),
@@ -190,6 +206,8 @@ def inherit_tail() -> None:
         )
         if tail_many != [*parent, Message(Role.USER, "task")]:
             fail("oversized tail did not retain the full conversation")
+
+
 
 @check("child_context.purity")
 def purity() -> None:
@@ -234,9 +252,12 @@ def never_orphans_a_tool_result() -> None:
             wedged_user,
             [_assistant("c0"), _tool("c0")],
             [_assistant("c0"), _tool("c0"), Message(Role.ASSISTANT, "reply")],
+            [_tool("ghost")],
+            [Message(Role.USER, "one"), _tool("ghost")],
         ]
         for parent in conversations:
             parent_systems = [message for message in parent if message.role is Role.SYSTEM]
+            parent_unissued_ids = _orphan_tool_result_ids(parent) - _issued_tool_call_ids(parent)
             specs = [
                 _spec(root),
                 _spec(root, inherit=ContextInheritance.ALL),
@@ -247,9 +268,17 @@ def never_orphans_a_tool_result() -> None:
             ]
             for spec in specs:
                 seeded = seed_messages(spec, "task", parent_messages=parent)
-                _assert_no_orphan_tools(seeded)
+                _assert_no_orphan_tools(seeded, parent_unissued_ids)
                 if any(message is parent_system for message in seeded for parent_system in parent_systems):
                     fail("seeded context retained a parent system message")
+                if parent_unissued_ids and spec.isolation.inherit is not ContextInheritance.FRESH:
+                    seeded_ids = {
+                        message.tool_result.tool_call_id
+                        for message in seeded
+                        if message.role is Role.TOOL and message.tool_result is not None
+                    }
+                    if not parent_unissued_ids <= seeded_ids:
+                        fail("seeding dropped an unissued parent tool result")
 
         if tail_start(wedged_user, 1) >= recent_window_start(wedged_user, 1):
             fail("tail_start did not extend an orphaning tool group backward")
