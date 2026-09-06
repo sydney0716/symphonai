@@ -370,6 +370,14 @@ def main() -> None:
         "agent_spec.validate_output_never_raises",
         "agent_spec.with_overrides",
         "agent_spec.no_runtime_imports",
+        "leases.acquire_and_release",
+        "leases.conflicts_by_containment",
+        "leases.same_holder_reentrant",
+        "leases.holder_for_path",
+        "leases.prefix_outside_root",
+        "leases.held_releases_on_exception",
+        "leases.concurrent_acquire_has_one_winner",
+        "leases.no_symphonai_imports",
         "child_context.fresh_is_todays_behaviour",
         "child_context.inherit_all",
         "child_context.inherit_tail",
@@ -533,7 +541,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "453 passed, 0 failed, 453 selected of 453 registered",
+        == "461 passed, 0 failed, 461 selected of 461 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -581,7 +589,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 453 registered"
+                "of 461 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
