@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -16,6 +17,7 @@ from symphonai_api.session import SessionStore, read_records
 class RunPhase(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    PAUSED = "paused"
     FINISHED = "finished"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -42,7 +44,10 @@ class AgentRun:
 
     @property
     def quiet_seconds(self) -> float | None:
-        if self.phase is not RunPhase.RUNNING or self.last_heartbeat_monotonic is None:
+        if (
+            self.phase not in (RunPhase.RUNNING, RunPhase.PAUSED)
+            or self.last_heartbeat_monotonic is None
+        ):
             return None
         return time.monotonic() - self.last_heartbeat_monotonic
 
@@ -60,8 +65,16 @@ class AgentRun:
         self.token = token
 
     def heartbeat(self) -> None:
-        self._require("heartbeat", RunPhase.RUNNING)
+        self._require("heartbeat", RunPhase.RUNNING, RunPhase.PAUSED)
         self.last_heartbeat_monotonic = time.monotonic()
+
+    def pause(self) -> None:
+        self._require("pause", RunPhase.RUNNING)
+        self.phase = RunPhase.PAUSED
+
+    def resume(self) -> None:
+        self._require("resume", RunPhase.PAUSED)
+        self.phase = RunPhase.RUNNING
 
     def finish(self, result: object) -> None:
         self._require("finish", RunPhase.RUNNING)
@@ -76,7 +89,7 @@ class AgentRun:
                 self.token.close()
 
     def fail(self, error: str) -> None:
-        self._require("fail", RunPhase.RUNNING)
+        self._require("fail", RunPhase.RUNNING, RunPhase.PAUSED)
         try:
             self.error = error
             self.finished_monotonic = time.monotonic()
@@ -86,7 +99,7 @@ class AgentRun:
                 self.token.close()
 
     def cancel(self) -> None:
-        self._require("cancel", RunPhase.PENDING, RunPhase.RUNNING)
+        self._require("cancel", RunPhase.PENDING, RunPhase.RUNNING, RunPhase.PAUSED)
         try:
             if self.token is not None:
                 self.token.cancel()
@@ -95,6 +108,43 @@ class AgentRun:
         finally:
             if self.token is not None:
                 self.token.close()
+
+
+class PauseGate:
+    """A reversible turn-boundary gate, independent of cancellation."""
+
+    def __init__(self) -> None:
+        self._resumed = threading.Event()
+        self._resumed.set()
+
+    def pause(self) -> None:
+        self._resumed.clear()
+
+    def resume(self) -> None:
+        self._resumed.set()
+
+    @property
+    def paused(self) -> bool:
+        return not self._resumed.is_set()
+
+    def wait_while_paused(
+        self,
+        cancel: CancellationToken | None = None,
+    ) -> None:
+        if not self.paused:
+            return
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        unsubscribe = (
+            None if cancel is None else cancel.on_cancel(self._resumed.set)
+        )
+        try:
+            self._resumed.wait()
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
 
 
 def new_agent_run(spec: AgentSpec, *, parent: AgentRun | None = None) -> AgentRun:

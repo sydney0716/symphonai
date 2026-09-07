@@ -40,6 +40,7 @@ from symphonai_api.identity import (
     new_run_ref,
     new_turn_ref,
 )
+from symphonai_api.agent_run import PauseGate
 from symphonai_api.models import (
     Message,
     ModelRequest,
@@ -158,6 +159,7 @@ class ApiAgent:
         model: str | None = None,
         parent_run_id: str | None = None,
         cancel: CancellationToken | None = None,
+        pause: PauseGate | None = None,
         events: EventSink | None = None,
     ) -> AgentRunResult:
         run_ref = new_run_ref(self._agent_ref.agent_id, parent_run_id)
@@ -284,6 +286,8 @@ class ApiAgent:
                 )
                 if cancel is not None:
                     cancel.raise_if_cancelled()
+                if pause is not None:
+                    pause.wait_while_paused(cancel)
                 budget_reason = exceeded_budget()
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)

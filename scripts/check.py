@@ -42,6 +42,7 @@ from scripts.checks import agent_memory  # noqa: E402, F401
 from scripts.checks import leases  # noqa: E402, F401
 from scripts.checks import child_context  # noqa: E402, F401
 from scripts.checks import agent_run_graph  # noqa: E402, F401
+from scripts.checks import run_control  # noqa: E402, F401
 from scripts.checks import agent_run  # noqa: E402, F401
 from scripts.checks import search  # noqa: E402, F401
 from scripts.checks import read_file  # noqa: E402, F401
