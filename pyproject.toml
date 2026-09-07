@@ -2,7 +2,7 @@
 name = "symphonai"
 version = "0.1.0"
 description = "A customizable coding-agent runtime and terminal UI."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 # The runtime is standard-library only. Textual is the sole dependency and it
 # is optional, so `symphonai_api` imports and runs anywhere Python does.
 dependencies = []

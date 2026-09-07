@@ -29,15 +29,25 @@ def _frozen(value: object) -> object:
     return value
 
 
+class Effort(str, Enum):
+    DEFAULT = "default"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 @dataclass(frozen=True)
 class ModelSelector:
     provider: str
     model: str | None = None
+    effort: Effort = Effort.DEFAULT
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider.strip():
             raise ValueError("provider must be a non-empty string")
+        if not isinstance(self.effort, Effort):
+            raise ValueError("effort must be an Effort value")
 
 
 class ContextInheritance(str, Enum):
