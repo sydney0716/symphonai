@@ -26,6 +26,8 @@ class AgentFileError(ValueError):
 
 _TOP_LEVEL_KEYS = {
     "prompt",
+    "tools",
+    "deny_tools",
     "model",
     "isolation",
     "budget",
@@ -52,6 +54,17 @@ _TABLE_KEYS = {
     },
     "io": {"input_schema", "output_schema"},
 }
+_STANDARD_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "multi_edit_file",
+    "list_files",
+    "glob",
+    "grep",
+    "run_shell",
+    "web_fetch",
+)
 
 
 def _raise(path: Path, key: str, detail: str) -> None:
@@ -113,6 +126,40 @@ def _strings(path: Path, key: str, value: object) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         _raise(path, key, "must be an array of strings")
     return value
+
+
+def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | None:
+    tools_present = "tools" in values
+    deny_present = "deny_tools" in values
+    if not tools_present and not deny_present:
+        return None
+    tools = (
+        _strings(path, "tools", values["tools"])
+        if tools_present
+        else list(_STANDARD_TOOL_NAMES)
+    )
+    denied = (
+        _strings(path, "deny_tools", values["deny_tools"])
+        if deny_present
+        else []
+    )
+    if tools_present and not tools:
+        _raise(path, "tools", "must not be empty")
+    for key, names in (("tools", tools), ("deny_tools", denied)):
+        for name in names:
+            if name not in _STANDARD_TOOL_NAMES:
+                _raise(path, key, f"unknown tool name: {name!r}")
+    base = set(tools)
+    denied_names = set(denied)
+    result = tuple(
+        name
+        for name in _STANDARD_TOOL_NAMES
+        if name in base and name not in denied_names
+    )
+    if not result:
+        key = "tools and deny_tools" if deny_present else "tools"
+        _raise(path, key, "resolved tool set was empty")
+    return result
 
 
 def _model(
@@ -311,6 +358,7 @@ def load_agent_file(
         "prompt": prompt,
         "model": _model(source, model_table, default_model),
         "policy_ceiling": _policy(source, policy_table, Path(repo_root)),
+        "tool_names": _tool_names(source, data),
         "budget": _budget(source, budget_table, price_table),
         "isolation": _isolation(source, isolation_table),
         "io": _io(source, io_table),

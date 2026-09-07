@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import itertools
+import json
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +28,7 @@ from symphonai_api.call_class import CallClass
 from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.identity import SCHEMA_VERSION
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.runner import standard_tool_registry
 from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
@@ -41,6 +44,17 @@ FORBIDDEN_AGENT_FILE_IMPORTS = {
     "provider_catalog",
     "providers",
 }
+STANDARD_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "multi_edit_file",
+    "list_files",
+    "glob",
+    "grep",
+    "run_shell",
+    "web_fetch",
+)
 
 
 def _write(directory: Path, name: str, content: str) -> Path:
@@ -455,6 +469,169 @@ def directory_roster() -> None:
                 fail(f"directory error omitted bad file: {exc!r}")
         else:
             fail("directory silently dropped a malformed agent file")
+
+
+@check("agent_file.tool_allow_and_deny")
+def tool_allow_and_deny() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        default_model = ModelSelector("fake")
+        if tuple(standard_tool_registry()) != STANDARD_TOOL_NAMES:
+            fail("test's canonical tool names do not match the runtime registry")
+
+        allow_only = _write(
+            directory,
+            "allow-only.toml",
+            'prompt = "Review."\ntools = ["run_shell", "read_file", "grep"]\n',
+        )
+        allowed = load_agent_file(
+            allow_only,
+            repo_root=directory,
+            default_model=default_model,
+        )
+        if allowed.tool_names != ("read_file", "grep", "run_shell"):
+            fail(f"allow list was not canonicalized: {allowed.tool_names!r}")
+
+        deny_only = _write(
+            directory,
+            "deny-only.toml",
+            'prompt = "Review."\ndeny_tools = ["run_shell", "write_file"]\n',
+        )
+        denied = load_agent_file(
+            deny_only,
+            repo_root=directory,
+            default_model=default_model,
+        )
+        expected_denied = tuple(
+            name
+            for name in STANDARD_TOOL_NAMES
+            if name not in {"run_shell", "write_file"}
+        )
+        if denied.tool_names is None or denied.tool_names != expected_denied:
+            fail(f"deny-only list did not remain explicit: {denied.tool_names!r}")
+        if tuple(standard_tool_registry(denied.tool_names)) != expected_denied:
+            fail("deny-only tuple widened when handed to the runtime registry")
+
+        both = _write(
+            directory,
+            "both.toml",
+            (
+                'prompt = "Review."\n'
+                'tools = ["run_shell", "grep", "read_file"]\n'
+                'deny_tools = ["run_shell"]\n'
+            ),
+        )
+        narrowed = load_agent_file(
+            both,
+            repo_root=directory,
+            default_model=default_model,
+        )
+        if narrowed.tool_names != ("read_file", "grep"):
+            fail(f"deny did not win over allow: {narrowed.tool_names!r}")
+
+        unknown_cases = (
+            ("tools", "unknown_tool"),
+            ("deny_tools", "unknown_tool"),
+            ("tools", "web_search"),
+            ("deny_tools", "web_search"),
+            ("tools", "read_tool_result"),
+            ("deny_tools", "read_tool_result"),
+        )
+        for index, (key, unknown) in enumerate(unknown_cases):
+            path = _write(
+                directory,
+                f"unknown-tool-{index}.toml",
+                (
+                    'prompt = "Review."\n'
+                    f'{key} = ["read_file", "{unknown}"]\n'
+                ),
+            )
+            message = _expect_error(
+                path,
+                key,
+                repo_root=directory,
+                default_model=default_model,
+            )
+            if unknown not in message:
+                fail(f"unknown tool error omitted {unknown!r}: {message!r}")
+
+        empty = _write(
+            directory,
+            "empty-tools.toml",
+            'prompt = "Review."\ntools = []\n',
+        )
+        _expect_error(
+            empty,
+            "tools",
+            repo_root=directory,
+            default_model=default_model,
+        )
+        cancelled = _write(
+            directory,
+            "cancelled-tools.toml",
+            (
+                'prompt = "Review."\n'
+                'tools = ["read_file"]\n'
+                'deny_tools = ["read_file"]\n'
+            ),
+        )
+        cancelled_message = _expect_error(
+            cancelled,
+            "tools and deny_tools",
+            repo_root=directory,
+            default_model=default_model,
+        )
+        if "empty" not in cancelled_message:
+            fail(f"empty resolved set error was unclear: {cancelled_message!r}")
+        try:
+            standard_tool_registry(())
+        except ValueError:
+            pass
+        else:
+            fail("runtime registry accepted the empty tuple")
+
+        for size in range(3):
+            for selected in itertools.combinations(STANDARD_TOOL_NAMES, size):
+                for denied_name in STANDARD_TOOL_NAMES:
+                    path = _write(
+                        directory,
+                        "enumerated.toml",
+                        (
+                            'prompt = "Review."\n'
+                            f"tools = {json.dumps(selected)}\n"
+                            f'deny_tools = ["{denied_name}"]\n'
+                        ),
+                    )
+                    expected = tuple(
+                        name
+                        for name in STANDARD_TOOL_NAMES
+                        if name in selected and name != denied_name
+                    )
+                    if not selected or not expected:
+                        _expect_error(
+                            path,
+                            "tools",
+                            repo_root=directory,
+                            default_model=default_model,
+                        )
+                        continue
+                    loaded = load_agent_file(
+                        path,
+                        repo_root=directory,
+                        default_model=default_model,
+                    )
+                    if (
+                        loaded.tool_names != expected
+                        or not set(loaded.tool_names).issubset(STANDARD_TOOL_NAMES)
+                        or denied_name in loaded.tool_names
+                    ):
+                        fail(
+                            "enumerated tool resolution was not a canonical narrowing: "
+                            f"{selected!r}, {denied_name!r}, {loaded.tool_names!r}"
+                        )
+                    registry = standard_tool_registry(loaded.tool_names)
+                    if tuple(registry) != loaded.tool_names:
+                        fail(f"runtime rejected or reordered tool tuple: {loaded.tool_names!r}")
 
 
 @check("agent_file.effort_leaves_schema_version_alone")
