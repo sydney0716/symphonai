@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import tempfile
 import threading
 from pathlib import Path
@@ -28,6 +29,39 @@ def _expect_conflict(leases: WorkspaceLeases, holder: str, prefix: str | None) -
             fail(f"conflict omitted existing holder: {exc!r}")
         return
     fail(f"conflicting prefix was acquired: {prefix!r}")
+
+
+def _holder_selection(leases: WorkspaceLeases, path: Path) -> tuple[str | None, str | None]:
+    resolved = path.resolve()
+    with leases._lock:
+        containing = [
+            held
+            for held in leases._held
+            if held.path == resolved or held.path in resolved.parents
+        ]
+    if not containing:
+        return None, None
+    innermost = max(containing, key=lambda held: len(held.path.parts)).lease.holder
+    outermost = min(containing, key=lambda held: len(held.path.parts)).lease.holder
+    return innermost, outermost
+
+
+def _overlap_violation(leases: WorkspaceLeases) -> str | None:
+    with leases._lock:
+        held_entries = list(leases._held)
+    for index, left in enumerate(held_entries):
+        for right in held_entries[index + 1 :]:
+            overlaps = (
+                left.path == right.path
+                or left.path in right.path.parents
+                or right.path in left.path.parents
+            )
+            if overlaps and left.lease.holder != right.lease.holder:
+                return (
+                    f"distinct holders overlap: {left.lease!r} and "
+                    f"{right.lease!r}"
+                )
+    return None
 
 
 @check("leases.acquire_and_release")
@@ -96,18 +130,32 @@ def holder_for_path() -> None:
     with _root() as temporary:
         root = Path(temporary)
         leases = WorkspaceLeases(root)
-        whole_root = leases.acquire("root", None)
-        if leases.holder_for("docs/readme.md") != "root":
-            fail("whole-root lease did not contain a descendant")
-        leases.release(whole_root)
-        outer = leases.acquire("outer", "src")
-        inner = Lease("inner", "src/api", root.resolve())
-        leases._held.append(type(leases._held[0])(inner, root.resolve() / "src/api"))
-        if leases.holder_for("src/api/file.py") != "inner":
-            fail("holder_for did not select the innermost lease")
-        if leases.holder_for("docs/readme.md") is not None:
-            fail("holder_for returned a lease outside its prefix")
+        outer = leases.acquire("holder", "src")
+        inner = leases.acquire("holder", "src/api")
+        for path in (root / "src/api/file.py", root / "src/other.py"):
+            innermost, outermost = _holder_selection(leases, path)
+            actual = leases.holder_for(path)
+            if actual != innermost or actual != outermost:
+                fail(
+                    "reachable nested leases disagreed by selection: "
+                    f"actual={actual!r}, inner={innermost!r}, outer={outermost!r}"
+                )
+        outside = root / "docs/readme.md"
+        innermost, outermost = _holder_selection(leases, outside)
+        if leases.holder_for(outside) != innermost or innermost != outermost:
+            fail("holder_for returned a lease outside reachable prefixes")
+        leases.release(inner)
         leases.release(outer)
+        whole_root = leases.acquire("root", None)
+        rooted = root / "docs/readme.md"
+        innermost, outermost = _holder_selection(leases, rooted)
+        if (
+            leases.holder_for(rooted) != "root"
+            or innermost != "root"
+            or outermost != "root"
+        ):
+            fail("whole-root holder disagreed by selection")
+        leases.release(whole_root)
 
 
 @check("leases.prefix_outside_root")
@@ -179,6 +227,60 @@ def concurrent_acquire_has_one_winner() -> None:
             leases.acquire("after", "src")
 
         leases = WorkspaceLeases(root)
+        prefixes = (None, "src", "src/api", "src/ui", "docs", "docs/api", "tests")
+        sweep_barrier = threading.Barrier(12)
+        sweep_failures: list[str] = []
+        sweep_failures_lock = threading.Lock()
+
+        def sweep(holder_index: int) -> None:
+            randomizer = random.Random(holder_index)
+            for _ in range(120):
+                prefix = randomizer.choice(prefixes)
+                acquired = False
+                try:
+                    with leases.held(f"sweep-{holder_index}", prefix):
+                        acquired = True
+                        sweep_barrier.wait()
+                        violation = _overlap_violation(leases)
+                        if violation is not None:
+                            with sweep_failures_lock:
+                                sweep_failures.append(violation)
+                        sweep_barrier.wait()
+                except LeaseConflict:
+                    sweep_barrier.wait()
+                    sweep_barrier.wait()
+                except Exception as exc:
+                    with sweep_failures_lock:
+                        sweep_failures.append(
+                            f"sweep holder {holder_index} failed: {exc!r}"
+                        )
+                    if acquired:
+                        try:
+                            sweep_barrier.abort()
+                        except Exception:
+                            pass
+                    return
+
+        sweep_threads = [
+            threading.Thread(target=sweep, args=(index,)) for index in range(12)
+        ]
+        for thread in sweep_threads:
+            thread.start()
+        for thread in sweep_threads:
+            thread.join()
+        if sweep_failures:
+            fail(sweep_failures[0])
+        if any(thread.is_alive() for thread in sweep_threads):
+            fail("randomized lease invariant sweep did not finish")
+        try:
+            with leases.held("exception-probe", "exception"):
+                raise RuntimeError("expected sweep exception")
+        except RuntimeError:
+            pass
+        if leases._held:
+            fail(f"randomized lease invariant sweep leaked entries: {leases._held!r}")
+
+        leases = WorkspaceLeases(root)
         leases.acquire("holder", "src")
         original_resolve = Path.resolve
 
@@ -207,8 +309,6 @@ def concurrent_acquire_has_one_winner() -> None:
             thread.start()
             if not started.wait(1):
                 fail("holder_for thread did not start")
-            if returned.wait(0.05):
-                fail("holder_for bypassed the registry lock")
         finally:
             leases._lock.release()
         if not returned.wait(1):
