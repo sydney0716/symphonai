@@ -12,8 +12,8 @@ from pathlib import Path
 import symphonai_api.agent_file as agent_file_module
 from symphonai_api.agent_file import (
     AgentFileError,
-    load_agent_directory,
-    load_agent_file,
+    load_agent_directory as _load_agent_directory,
+    load_agent_file as _load_agent_file,
 )
 from symphonai_api.agent_spec import (
     AgentSpec,
@@ -53,6 +53,41 @@ STANDARD_TOOL_NAMES = (
     "run_shell",
     "web_fetch",
 )
+
+
+def _load_with_none_equivalence(loader, *args, **kwargs):
+    """Exercise every existing loader case both omitted and explicitly None."""
+    if "ceiling" in kwargs:
+        return loader(*args, **kwargs)
+    try:
+        implicit = loader(*args, **kwargs)
+    except Exception as implicit_error:
+        try:
+            loader(*args, **kwargs, ceiling=None)
+        except Exception as explicit_error:
+            if (
+                type(explicit_error) is not type(implicit_error)
+                or str(explicit_error) != str(implicit_error)
+            ):
+                fail(
+                    "ceiling=None changed loader failure: "
+                    f"{implicit_error!r} != {explicit_error!r}"
+                )
+        else:
+            fail("ceiling=None accepted a case rejected when omitted")
+        raise implicit_error
+    explicit = loader(*args, **kwargs, ceiling=None)
+    if explicit != implicit:
+        fail(f"ceiling=None changed loader result: {implicit!r} != {explicit!r}")
+    return implicit
+
+
+def load_agent_file(*args, **kwargs):
+    return _load_with_none_equivalence(_load_agent_file, *args, **kwargs)
+
+
+def load_agent_directory(*args, **kwargs):
+    return _load_with_none_equivalence(_load_agent_directory, *args, **kwargs)
 
 
 def _write(directory: Path, name: str, content: str) -> Path:

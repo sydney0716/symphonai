@@ -16,12 +16,20 @@ from __future__ import annotations
 import fnmatch
 import ipaddress
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlsplit
 
+from symphonai_api.events import (
+    EventSink,
+    PermissionDenied,
+    PermissionRequested,
+    emit,
+)
 from symphonai_api.web_domains import preapproved_domains
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
@@ -163,6 +171,107 @@ class PermissionPolicy:
                 "'auto', 'prompt', 'plan', or 'accept_edits'"
             )
         self._approval_lock = threading.Lock()
+        self._event_sink: EventSink | None = None
+        self._event_agent_id = ""
+        self._event_run_id = ""
+        self._event_local = threading.local()
+
+    def attach_event_sink(
+        self,
+        sink: EventSink | None,
+        *,
+        agent_id: str,
+        run_id: str,
+    ) -> None:
+        """Attach observation identity for direct permission checks."""
+        self._event_sink = sink
+        self._event_agent_id = agent_id
+        self._event_run_id = run_id
+
+    @contextmanager
+    def event_context(
+        self,
+        sink: EventSink | None,
+        *,
+        agent_id: str,
+        run_id: str,
+        turn_id: str | None,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> Iterator[None]:
+        """Supply one thread's tool identity while a permission check runs."""
+        previous = getattr(self._event_local, "context", None)
+        self._event_local.context = (
+            sink,
+            agent_id,
+            run_id,
+            turn_id,
+            tool_name,
+            tool_call_id,
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._event_local.context
+            else:
+                self._event_local.context = previous
+
+    def _event_identity(
+        self,
+        default_tool_name: str,
+    ) -> tuple[EventSink | None, str, str, str | None, str, str]:
+        context = getattr(self._event_local, "context", None)
+        if context is not None:
+            return context
+        return (
+            self._event_sink,
+            self._event_agent_id,
+            self._event_run_id,
+            None,
+            default_tool_name,
+            "",
+        )
+
+    def _deny(
+        self,
+        reason: str,
+        *,
+        denial: DenialReason,
+        tool_name: str,
+    ) -> PermissionDecision:
+        decision = PermissionDecision.deny(reason, denial=denial)
+        sink, agent_id, run_id, turn_id, actual_tool_name, tool_call_id = (
+            self._event_identity(tool_name)
+        )
+        emit(
+            sink,
+            PermissionDenied(
+                agent_id=agent_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                tool_name=actual_tool_name,
+                tool_call_id=tool_call_id,
+                reason=decision.reason,
+            ),
+        )
+        return decision
+
+    def _permission_requested(self, tool_name: str) -> None:
+        sink, agent_id, run_id, turn_id, actual_tool_name, tool_call_id = (
+            self._event_identity(tool_name)
+        )
+        emit(
+            sink,
+            PermissionRequested(
+                agent_id=agent_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                tool_name=actual_tool_name,
+                tool_call_id=tool_call_id,
+                mode=self.mode,
+            ),
+        )
 
     def narrowed(self, ceiling: "PermissionPolicy") -> "PermissionPolicy":
         """Return a new policy allowing only what both policies allow."""
@@ -243,15 +352,17 @@ class PermissionPolicy:
     def check_read(self, path: str | Path) -> PermissionDecision:
         resolved = self._resolve_within_root(path)
         if resolved is None:
-            return PermissionDecision.deny(
+            return self._deny(
                 f"path escapes repo_root: {path!r}",
                 denial=DenialReason.OUTSIDE_ROOT,
+                tool_name="read_file",
             )
         forbidden = self._matches_forbidden(resolved)
         if forbidden is not None:
-            return PermissionDecision.deny(
+            return self._deny(
                 f"path matches forbidden pattern {forbidden!r}: {path!r}",
                 denial=DenialReason.FORBIDDEN_PATTERN,
+                tool_name="read_file",
             )
         return PermissionDecision.allow()
 
@@ -265,9 +376,10 @@ class PermissionPolicy:
         resolved = self._resolve_within_root(path)
         assert resolved is not None  # check_read already validated this
         if self.mode == "plan":
-            return PermissionDecision.deny(
+            return self._deny(
                 "plan mode allows reads only; this call would change the world",
                 denial=DenialReason.PLAN_MODE,
+                tool_name="write_file",
             )
         if self.mode == "prompt":
             return self._ask_approval(
@@ -278,9 +390,10 @@ class PermissionPolicy:
         for allowed_root in self.allowed_write_scope:
             if resolved == allowed_root or allowed_root in resolved.parents:
                 return PermissionDecision.allow()
-        return PermissionDecision.deny(
+        return self._deny(
             f"path is outside the explicit allowed write scope: {path!r}",
             denial=DenialReason.OUTSIDE_WRITE_SCOPE,
+            tool_name="write_file",
         )
 
     # -- fetch checks -------------------------------------------------------
@@ -293,9 +406,10 @@ class PermissionPolicy:
             scheme = ""
             parsed = None
         if scheme not in ("http", "https"):
-            return PermissionDecision.deny(
+            return self._deny(
                 "web_fetch supports only http and https URLs",
                 denial=DenialReason.UNSUPPORTED_SCHEME,
+                tool_name="web_fetch",
             )
 
         try:
@@ -322,9 +436,10 @@ class PermissionPolicy:
                     )
                 )
         if blocked:
-            return PermissionDecision.deny(
+            return self._deny(
                 f"web_fetch blocks host {host or '[missing]'}",
                 denial=DenialReason.BLOCKED_HOST,
+                tool_name="web_fetch",
             )
 
         if host in preapproved_domains() or host in self.fetch_allowlist:
@@ -337,29 +452,34 @@ class PermissionPolicy:
             )
         if self.fetch_enabled:
             return PermissionDecision.allow()
-        return PermissionDecision.deny(
+        return self._deny(
             f"domain is not approved for web_fetch: {host}",
             denial=DenialReason.DOMAIN_NOT_APPROVED,
+            tool_name="web_fetch",
         )
 
     # -- shell checks -------------------------------------------------------
 
     def check_shell(self, argv: list[str]) -> PermissionDecision:
         if not argv:
-            return PermissionDecision.deny(
-                "empty command", denial=DenialReason.EMPTY_COMMAND
+            return self._deny(
+                "empty command",
+                denial=DenialReason.EMPTY_COMMAND,
+                tool_name="run_shell",
             )
         argv_tuple = tuple(argv)
         for denied_prefix in ALWAYS_DENY_COMMANDS:
             if argv_tuple[: len(denied_prefix)] == denied_prefix:
-                return PermissionDecision.deny(
+                return self._deny(
                     f"command matches always-deny rule: {' '.join(denied_prefix)!r}",
                     denial=DenialReason.ALWAYS_DENY,
+                    tool_name="run_shell",
                 )
         if self.mode == "plan":
-            return PermissionDecision.deny(
+            return self._deny(
                 "plan mode allows reads only; this call would change the world",
                 denial=DenialReason.PLAN_MODE,
+                tool_name="run_shell",
             )
         if self.mode in ("prompt", "accept_edits"):
             return self._ask_approval(
@@ -368,16 +488,18 @@ class PermissionPolicy:
                 details=f"run in repo root: {self.repo_root}",
             )
         if not self.shell_enabled:
-            return PermissionDecision.deny(
+            return self._deny(
                 "run_shell is disabled by this policy",
                 denial=DenialReason.SHELL_DISABLED,
+                tool_name="run_shell",
             )
         for allowed_prefix in self.shell_allowlist:
             if argv_tuple[: len(allowed_prefix)] == allowed_prefix:
                 return PermissionDecision.allow()
-        return PermissionDecision.deny(
+        return self._deny(
             f"command does not match the shell allowlist: {list(argv)}",
             denial=DenialReason.NOT_ALLOWLISTED,
+            tool_name="run_shell",
         )
 
     def _ask_approval(
@@ -388,10 +510,12 @@ class PermissionPolicy:
         details: str = "",
     ) -> PermissionDecision:
         with self._approval_lock:
+            self._permission_requested(operation)
             if self.approval_callback is None:
-                return PermissionDecision.deny(
+                return self._deny(
                     f"{operation} requires approval, but no approval callback is configured",
                     denial=DenialReason.NO_APPROVAL_CALLBACK,
+                    tool_name=operation,
                 )
             try:
                 decision = self.approval_callback(
@@ -400,22 +524,40 @@ class PermissionPolicy:
                     )
                 )
             except Exception as exc:  # noqa: BLE001
-                return PermissionDecision.deny(
+                return self._deny(
                     f"approval callback failed ({type(exc).__name__}): {exc}",
                     denial=DenialReason.APPROVAL_FAILED,
+                    tool_name=operation,
                 )
             if isinstance(decision, PermissionDecision):
+                if not decision.allowed:
+                    sink, agent_id, run_id, turn_id, tool_name, tool_call_id = (
+                        self._event_identity(operation)
+                    )
+                    emit(
+                        sink,
+                        PermissionDenied(
+                            agent_id=agent_id,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            tool_name=tool_name,
+                            tool_call_id=tool_call_id,
+                            reason=decision.reason or "permission denied",
+                        ),
+                    )
                 return decision
             if decision is True:
                 return PermissionDecision.allow()
             if decision is False:
-                return PermissionDecision.deny(
+                return self._deny(
                     f"{operation} denied by user",
                     denial=DenialReason.DENIED_BY_USER,
+                    tool_name=operation,
                 )
-            return PermissionDecision.deny(
+            return self._deny(
                 f"approval callback returned an invalid decision for {operation}",
                 denial=DenialReason.INVALID_APPROVAL,
+                tool_name=operation,
             )
 
 

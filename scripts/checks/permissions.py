@@ -9,6 +9,7 @@ import time
 from dataclasses import fields
 from pathlib import Path
 
+from symphonai_api.events import CollectingSink, PermissionDenied, PermissionRequested
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import (
     DenialReason,
@@ -840,3 +841,200 @@ def check_narrow_is_idempotent_and_composes() -> None:
         for argv in argvs:
             if left.check_shell(argv).allowed != right.check_shell(argv).allowed:
                 fail(f"narrowing did not compose for shell {argv!r}")
+
+
+@check("permissions.event_order")
+def permission_event_order() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sink = CollectingSink()
+        callback_order: list[str] = []
+
+        def deny(request) -> bool:
+            if len(sink.of_type(PermissionRequested)) != 1:
+                fail("approval callback ran before PermissionRequested")
+            callback_order.append(request.operation)
+            return False
+
+        policy = PermissionPolicy(
+            root,
+            mode="prompt",
+            approval_callback=deny,
+        )
+        policy.attach_event_sink(
+            sink,
+            agent_id="agent-permission",
+            run_id="run-permission",
+        )
+        decision = policy.check_write("new.txt")
+        requested = sink.of_type(PermissionRequested)
+        denied = sink.of_type(PermissionDenied)
+        if decision.allowed or callback_order != ["write_file"]:
+            fail(f"approval denial decision changed: {decision!r}, {callback_order!r}")
+        if len(requested) != 1 or len(denied) != 1:
+            fail(f"permission event cardinality differed: {sink.events!r}")
+        if sink.events != [requested[0], denied[0]]:
+            fail(f"permission request/denial order differed: {sink.events!r}")
+        if (
+            requested[0].agent_id != "agent-permission"
+            or requested[0].run_id != "run-permission"
+            or requested[0].tool_name != "write_file"
+            or requested[0].mode != "prompt"
+            or denied[0].tool_name != "write_file"
+            or not denied[0].reason
+        ):
+            fail(f"permission event payload differed: {sink.events!r}")
+
+
+def _permission_cases(root: Path):
+    return (
+        (
+            "read_allowed",
+            PermissionPolicy(root),
+            lambda policy: policy.check_read("inside.txt"),
+            (True, "", None),
+            0,
+        ),
+        (
+            "static_read_denial",
+            PermissionPolicy(root),
+            lambda policy: policy.check_read("../outside.txt"),
+            (
+                False,
+                "path escapes repo_root: '../outside.txt'",
+                DenialReason.OUTSIDE_ROOT,
+            ),
+            0,
+        ),
+        (
+            "write_allowed",
+            PermissionPolicy(root, allowed_write_scope=[root]),
+            lambda policy: policy.check_write("inside.txt"),
+            (True, "", None),
+            0,
+        ),
+        (
+            "static_write_denial",
+            PermissionPolicy(root),
+            lambda policy: policy.check_write("inside.txt"),
+            (
+                False,
+                "path is outside the explicit allowed write scope: 'inside.txt'",
+                DenialReason.OUTSIDE_WRITE_SCOPE,
+            ),
+            0,
+        ),
+        (
+            "plan_write_denial",
+            PermissionPolicy(root, allowed_write_scope=[root], mode="plan"),
+            lambda policy: policy.check_write("inside.txt"),
+            (
+                False,
+                "plan mode allows reads only; this call would change the world",
+                DenialReason.PLAN_MODE,
+            ),
+            0,
+        ),
+        (
+            "shell_allowed",
+            PermissionPolicy(
+                root,
+                shell_enabled=True,
+                shell_allowlist=[("echo",)],
+            ),
+            lambda policy: policy.check_shell(["echo", "hello"]),
+            (True, "", None),
+            0,
+        ),
+        (
+            "static_shell_denial",
+            PermissionPolicy(root),
+            lambda policy: policy.check_shell(["echo", "hello"]),
+            (
+                False,
+                "run_shell is disabled by this policy",
+                DenialReason.SHELL_DISABLED,
+            ),
+            0,
+        ),
+        (
+            "always_deny_shell",
+            PermissionPolicy(
+                root,
+                shell_enabled=True,
+                shell_allowlist=[("rm",)],
+            ),
+            lambda policy: policy.check_shell(["rm", "file"]),
+            (
+                False,
+                "command matches always-deny rule: 'rm'",
+                DenialReason.ALWAYS_DENY,
+            ),
+            0,
+        ),
+        (
+            "fetch_scheme_denial",
+            PermissionPolicy(root, fetch_enabled=True),
+            lambda policy: policy.check_fetch("ftp://example.com"),
+            (
+                False,
+                "web_fetch supports only http and https URLs",
+                DenialReason.UNSUPPORTED_SCHEME,
+            ),
+            0,
+        ),
+        (
+            "approval_false_denial",
+            PermissionPolicy(
+                root,
+                mode="prompt",
+                approval_callback=lambda request: False,
+            ),
+            lambda policy: policy.check_write("inside.txt"),
+            (
+                False,
+                "write_file denied by user",
+                DenialReason.DENIED_BY_USER,
+            ),
+            1,
+        ),
+    )
+
+
+@check("permissions.events_preserve_decisions")
+def permission_events_preserve_decisions() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        plain_cases = _permission_cases(root)
+        observed_cases = _permission_cases(root)
+        for plain_case, observed_case in zip(
+            plain_cases,
+            observed_cases,
+            strict=True,
+        ):
+            name, plain_policy, operation, frozen, expected_requests = plain_case
+            observed_name, observed_policy, observed_operation, _, _ = observed_case
+            if observed_name != name:
+                fail("permission decision table order changed")
+            plain = operation(plain_policy)
+            sink = CollectingSink()
+            observed_policy.attach_event_sink(
+                sink,
+                agent_id="agent-table",
+                run_id="run-table",
+            )
+            observed = observed_operation(observed_policy)
+            actual = (observed.allowed, observed.reason, observed.denial)
+            if plain != observed or actual != frozen:
+                fail(
+                    f"permission decision changed for {name}: "
+                    f"plain={plain!r}, observed={observed!r}, frozen={frozen!r}"
+                )
+            denied = sink.of_type(PermissionDenied)
+            expected_denials = 0 if observed.allowed else 1
+            if len(denied) != expected_denials:
+                fail(f"denial event count changed for {name}: {sink.events!r}")
+            if denied and not denied[0].reason:
+                fail(f"denial event reason was empty for {name}")
+            if len(sink.of_type(PermissionRequested)) != expected_requests:
+                fail(f"request event count changed for {name}: {sink.events!r}")

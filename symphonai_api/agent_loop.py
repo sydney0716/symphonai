@@ -23,9 +23,11 @@ from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
     AssistantTextDelta,
     EventSink,
+    PromptSubmitted,
     RunFailed,
     RunFinished,
     RunStarted,
+    ToolCallFailed,
     ToolCallFinished,
     ToolCallStarted,
     TurnFinished,
@@ -133,6 +135,9 @@ class ApiAgent:
         self,
         tool_call: ToolCall,
         cancel: CancellationToken | None,
+        event_sink: EventSink | None,
+        run_id: str,
+        turn_id: str,
     ) -> ToolResult:
         tool = self._tools.get(tool_call.name)
         if tool is None:
@@ -142,7 +147,15 @@ class ApiAgent:
                 error=f"unknown tool: {tool_call.name!r}",
             )
         try:
-            return tool.execute(tool_call, self._policy, cancel=cancel)
+            with self._policy.event_context(
+                event_sink,
+                agent_id=self._agent_ref.agent_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+            ):
+                return tool.execute(tool_call, self._policy, cancel=cancel)
         except OperationCancelled:
             raise
         except Exception as exc:
@@ -269,6 +282,16 @@ class ApiAgent:
                     agent_id=self._agent_ref.agent_id,
                     run_id=run_ref.run_id,
                     agent_name=self._agent_ref.name,
+                ),
+            )
+            submitted = messages[-1].text if messages else ""
+            emit(
+                event_sink,
+                PromptSubmitted(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    text=submitted,
+                    message_count=max(len(messages) - 1, 0),
                 ),
             )
             for turn in range(1, self._max_turns + 1):
@@ -442,15 +465,30 @@ class ApiAgent:
                                 error=f"unknown tool: {tool_call.name!r}",
                             )
                         else:
-                            results[0] = tool.execute(
-                                tool_call, self._policy, cancel=cancel
-                            )
+                            with self._policy.event_context(
+                                event_sink,
+                                agent_id=self._agent_ref.agent_id,
+                                run_id=run_ref.run_id,
+                                turn_id=turn_ref.turn_id,
+                                tool_name=tool_call.name,
+                                tool_call_id=tool_call.id,
+                            ):
+                                results[0] = tool.execute(
+                                    tool_call, self._policy, cancel=cancel
+                                )
                     else:
                         executor = ThreadPoolExecutor(
                             max_workers=min(len(batch), MAX_TOOL_CONCURRENCY)
                         )
                         futures = {
-                            executor.submit(self._execute_tool_call, tool_call, cancel): index
+                            executor.submit(
+                                self._execute_tool_call,
+                                tool_call,
+                                cancel,
+                                event_sink,
+                                run_ref.run_id,
+                                turn_ref.turn_id,
+                            ): index
                             for index, tool_call in enumerate(batch)
                         }
                         try:
@@ -500,6 +538,18 @@ class ApiAgent:
                                 ok=tool_result.ok,
                             ),
                         )
+                        if not tool_result.ok:
+                            emit(
+                                event_sink,
+                                ToolCallFailed(
+                                    agent_id=self._agent_ref.agent_id,
+                                    run_id=run_ref.run_id,
+                                    turn_id=turn_ref.turn_id,
+                                    tool_name=tool_call.name,
+                                    tool_call_id=tool_call.id,
+                                    error=tool_result.error or "tool call failed",
+                                ),
+                            )
                         append_record(
                             "tool_result",
                             turn_id=turn_ref.turn_id,

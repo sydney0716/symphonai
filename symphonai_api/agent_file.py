@@ -18,6 +18,7 @@ from symphonai_api.agent_spec import (
 from symphonai_api.agent_memory import MAX_ENTRIES, MemorySettings
 from symphonai_api.budgets import PriceTable, RunBudget
 from symphonai_api.call_class import CallClass
+from symphonai_api.config import CapabilityCeiling, ConfigError
 from symphonai_api.permissions import PermissionPolicy
 
 
@@ -368,6 +369,7 @@ def load_agent_file(
     repo_root: Path,
     price_table: PriceTable | None = None,
     default_model: ModelSelector | None = None,
+    ceiling: CapabilityCeiling | None = None,
 ) -> AgentSpec:
     """Parse one TOML agent file into an AgentSpec."""
     source = Path(path)
@@ -409,12 +411,18 @@ def load_agent_file(
     if "max_depth" in data:
         values["max_depth"] = _integer(source, "max_depth", data["max_depth"])
     try:
-        return AgentSpec(**values)
+        spec = AgentSpec(**values)
     except ValueError as exc:
         for key in ("name", "deadline_seconds", "max_depth"):
             if key in str(exc):
                 _raise(source, key, str(exc))
         _raise(source, "agent", str(exc))
+    if ceiling is not None:
+        try:
+            ceiling.refuse(spec.policy_ceiling, source=source)
+        except ConfigError as exc:
+            raise AgentFileError(str(exc)) from None
+    return spec
 
 
 def memory_settings(path: Path) -> MemorySettings:
@@ -431,6 +439,7 @@ def load_agent_directory(
     repo_root: Path,
     price_table: PriceTable | None = None,
     default_model: ModelSelector | None = None,
+    ceiling: CapabilityCeiling | None = None,
 ) -> dict[str, AgentSpec]:
     """Load every direct ``*.toml`` child, keyed by filename stem."""
     directory = Path(path)
@@ -442,6 +451,7 @@ def load_agent_directory(
             repo_root=repo_root,
             price_table=price_table,
             default_model=default_model,
+            ceiling=ceiling,
         )
         for file in sorted(directory.glob("*.toml"))
         if file.is_file()

@@ -55,6 +55,7 @@ from symphonai_api.events import (
     EventSink,
     RunStarted,
     SubagentSpawned,
+    SubagentStopped,
     ToolCallStarted,
     emit,
 )
@@ -485,6 +486,17 @@ class DispatchSubagentTool(LocalTool):
                     child_run.cancel()
                 else:
                     child_run.finish(run_result)
+            if self._event_run_id is not None:
+                emit(
+                    self._events,
+                    SubagentStopped(
+                        agent_id=self._event_agent_id,
+                        run_id=self._event_run_id,
+                        turn_id=self._event_turn_id,
+                        subagent_name=subagent_name,
+                        subagent_agent_id=record.agent_ref.agent_id,
+                    ),
+                )
         assert run_result is not None
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used

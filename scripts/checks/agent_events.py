@@ -2,15 +2,40 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
 import unittest.mock as mock
+
 from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.agent_run import RunPhase
 from symphonai_api.cancellation import OperationCancelled
-from symphonai_api.events import CollectingSink, RunFailed, RunFinished, RunStarted, ToolCallFinished, ToolCallStarted, TurnFinished, TurnStarted
-from symphonai_api.identity import TurnRef
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.events import (
+    CollectingSink,
+    Event,
+    PermissionDenied,
+    PermissionRequested,
+    PromptSubmitted,
+    RunFailed,
+    RunFinished,
+    RunStarted,
+    SessionEnded,
+    SessionStarted,
+    SubagentSpawned,
+    SubagentStopped,
+    ToolCallFailed,
+    ToolCallFinished,
+    ToolCallStarted,
+    TurnFinished,
+    TurnStarted,
+)
+from symphonai_api.identity import SCHEMA_VERSION, TurnRef
+from symphonai_api.leader import Leader, LeaderConfig
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import standard_tool_registry
+from symphonai_api.session import SessionStore
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -216,3 +241,478 @@ def check_events_stream_optional() -> None:
             or without_events.stopped_reason != with_events.stopped_reason
         ):
             fail("collecting events changed the agent result")
+
+
+@check("events.new_types_and_schema")
+def new_types_and_schema() -> None:
+    event_types = (
+        PromptSubmitted,
+        ToolCallFailed,
+        PermissionRequested,
+        PermissionDenied,
+        SessionStarted,
+        SessionEnded,
+        SubagentStopped,
+    )
+    if SCHEMA_VERSION != 1:
+        fail(f"event additions changed SCHEMA_VERSION: {SCHEMA_VERSION}")
+    base_names = {"agent_id", "run_id", "turn_id", "schema_version"}
+    for event_type in event_types:
+        event = event_type(agent_id="agent", run_id="run", turn_id="turn")
+        if not isinstance(event, Event):
+            fail(f"{event_type.__name__} is not an Event")
+        if not base_names.issubset({item.name for item in fields(event_type)}):
+            fail(f"{event_type.__name__} omitted base event fields")
+        if event.schema_version != 1:
+            fail(f"{event_type.__name__} reported schema {event.schema_version}")
+        try:
+            event.run_id = "changed"  # type: ignore[misc]
+        except FrozenInstanceError:
+            pass
+        else:
+            fail(f"{event_type.__name__} was mutable")
+
+
+@check("events.prompt_submitted")
+def prompt_submitted() -> None:
+    with workspace() as ws:
+        sink = CollectingSink()
+        messages = [
+            Message(Role.SYSTEM, "system"),
+            Message(Role.USER, "earlier"),
+            Message(Role.ASSISTANT, "answer"),
+            Message(Role.USER, "submitted now"),
+        ]
+        ApiAgent(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            {},
+            ws.policy,
+            events=sink,
+        ).run(messages)
+        submitted = sink.of_type(PromptSubmitted)
+        if (
+            len(submitted) != 1
+            or submitted[0].text != "submitted now"
+            or submitted[0].message_count != 3
+        ):
+            fail(f"prompt event payload differed: {sink.events!r}")
+        first_turn = next(
+            index
+            for index, event in enumerate(sink.events)
+            if isinstance(event, TurnStarted)
+        )
+        if sink.events.index(submitted[0]) >= first_turn:
+            fail(f"prompt event did not precede the first turn: {sink.events!r}")
+
+
+@check("events.tool_failure_is_additional")
+def tool_failure_is_additional() -> None:
+    with workspace() as ws:
+        sink = CollectingSink()
+        result = ApiAgent(
+            FakeModelProvider(
+                [
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="successful-read",
+                                    name="read_file",
+                                    arguments={"path": "existing.txt"},
+                                ),
+                                ToolCall(id="failed-missing", name="missing"),
+                            ],
+                        )
+                    ),
+                    ModelResponse(Message(Role.ASSISTANT, "done")),
+                ]
+            ),
+            standard_tool_registry(),
+            ws.policy,
+            events=sink,
+        ).run([Message(Role.USER, "use tools")])
+        if result.stopped_reason != "final_response":
+            fail(f"tool event run changed result: {result!r}")
+        finished = {
+            event.tool_call_id: event
+            for event in sink.of_type(ToolCallFinished)
+        }
+        failed = sink.of_type(ToolCallFailed)
+        if set(finished) != {"successful-read", "failed-missing"}:
+            fail(f"tool completions were replaced or duplicated: {sink.events!r}")
+        if not finished["successful-read"].ok or finished["failed-missing"].ok:
+            fail(f"tool completion status changed: {finished!r}")
+        if len(failed) != 1 or failed[0].tool_call_id != "failed-missing":
+            fail(f"tool failure event cardinality differed: {sink.events!r}")
+        finished_index = sink.events.index(finished["failed-missing"])
+        if sink.events[finished_index + 1] is not failed[0]:
+            fail(f"ToolCallFailed did not immediately follow failure finish: {sink.events!r}")
+        if any(event.tool_call_id == "successful-read" for event in failed):
+            fail("a successful tool emitted ToolCallFailed")
+
+
+@check("events.session_lifecycle")
+def session_lifecycle() -> None:
+    with workspace() as ws:
+        sink = CollectingSink()
+        store = SessionStore(ws.root / "sessions", "session-events", events=sink)
+        if sink.of_type(SessionEnded):
+            fail("SessionEnded fired during construction")
+        started = sink.of_type(SessionStarted)
+        if (
+            len(started) != 1
+            or started[0].session_run_id != store.run_id
+            or started[0].run_id != store.run_id
+        ):
+            fail(f"SessionStarted payload differed: {sink.events!r}")
+        store.close()
+        store.close()
+        ended = sink.of_type(SessionEnded)
+        if len(ended) != 1 or ended[0].session_run_id != store.run_id:
+            fail(f"SessionEnded cardinality or payload differed: {sink.events!r}")
+
+        reopened_sink = CollectingSink()
+        reopened = SessionStore.open(
+            ws.root / "sessions",
+            store.run_id,
+            events=reopened_sink,
+        )
+        reopened.close()
+        if (
+            len(reopened_sink.of_type(SessionStarted)) != 1
+            or len(reopened_sink.of_type(SessionEnded)) != 1
+        ):
+            fail(f"opened session lifecycle differed: {reopened_sink.events!r}")
+
+
+def _one_subagent_leader(root: Path, events) -> Leader:
+    return Leader(
+        LeaderConfig(
+            leader_provider=FakeModelProvider(
+                [
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="dispatch-one",
+                                    name="dispatch_subagent",
+                                    arguments={
+                                        "subagent_name": "worker",
+                                        "task": "work",
+                                    },
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(Message(Role.ASSISTANT, "leader done")),
+                ]
+            ),
+            subagent_provider=FakeModelProvider(
+                [ModelResponse(Message(Role.ASSISTANT, "worker done"))]
+            ),
+            repo_root=str(root),
+            events=events,
+        )
+    )
+
+
+@check("events.subagent_stopped")
+def subagent_stopped() -> None:
+    with workspace() as ws:
+        sink = CollectingSink()
+        result = _one_subagent_leader(ws.root, sink).run("delegate")
+        spawned = sink.of_type(SubagentSpawned)
+        stopped = sink.of_type(SubagentStopped)
+        if len(spawned) != 1 or len(stopped) != 1:
+            fail(f"subagent boundary events differed: {sink.events!r}")
+        if (
+            spawned[0].agent_id != stopped[0].agent_id
+            or spawned[0].run_id != stopped[0].run_id
+            or spawned[0].turn_id != stopped[0].turn_id
+            or spawned[0].subagent_name != stopped[0].subagent_name
+            or spawned[0].subagent_agent_id != stopped[0].subagent_agent_id
+        ):
+            fail(f"SubagentStopped did not mirror SubagentSpawned: {sink.events!r}")
+        child_finished = next(
+            index
+            for index, event in enumerate(sink.events)
+            if isinstance(event, RunFinished)
+            and event.agent_id == stopped[0].subagent_agent_id
+        )
+        if sink.events.index(stopped[0]) <= child_finished:
+            fail(f"SubagentStopped preceded the child terminal: {sink.events!r}")
+        if result.subagents["worker"].runs[0].phase is not RunPhase.FINISHED:
+            fail("SubagentStopped fired without a finished child run")
+
+
+@check("events.new_sink_isolation")
+def new_sink_isolation() -> None:
+    with workspace() as ws:
+        seen: list[type[Event]] = []
+
+        def raising_sink(event: Event) -> None:
+            seen.append(type(event))
+            raise RuntimeError("observer failed")
+
+        tool_result = ApiAgent(
+            FakeModelProvider(
+                [
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[ToolCall(id="failed", name="missing")],
+                        )
+                    ),
+                    ModelResponse(Message(Role.ASSISTANT, "done")),
+                ]
+            ),
+            {},
+            ws.policy,
+            events=raising_sink,
+        ).run([Message(Role.USER, "fail a tool")])
+        if tool_result.stopped_reason != "final_response":
+            fail("raising sink changed the tool-failure run")
+
+        policy = PermissionPolicy(
+            ws.root,
+            mode="prompt",
+            approval_callback=lambda request: False,
+        )
+        policy.attach_event_sink(
+            raising_sink,
+            agent_id="permission-agent",
+            run_id="permission-run",
+        )
+        if policy.check_write("new.txt").allowed:
+            fail("raising sink changed a permission denial")
+
+        store = SessionStore(
+            ws.root / "raising-sessions",
+            "raising-session",
+            events=raising_sink,
+        )
+        store.close()
+
+        leader_result = _one_subagent_leader(ws.root, raising_sink).run("delegate")
+        if leader_result.stopped_reason != "final_response":
+            fail("raising sink changed a subagent run")
+        expected = {
+            PromptSubmitted,
+            ToolCallFailed,
+            PermissionRequested,
+            PermissionDenied,
+            SessionStarted,
+            SessionEnded,
+            SubagentStopped,
+        }
+        if not expected.issubset(seen):
+            missing = sorted(item.__name__ for item in expected - set(seen))
+            fail(f"raising sink did not observe every new event: {missing!r}")
+
+
+def _message_snapshot(message: Message):
+    tool_result = message.tool_result
+    return (
+        message.role.value,
+        message.text,
+        tuple((call.id, call.name) for call in message.tool_calls),
+        (
+            None
+            if tool_result is None
+            else (tool_result.tool_call_id, tool_result.ok, tool_result.error)
+        ),
+    )
+
+
+_PRE_10B_COMMIT = "ff3163a"
+_FROZEN_PRE_10B_OUTCOME = {
+    "leader_messages": (
+        ("user", "goal", (), None),
+        ("assistant", "", (("dispatch-main", "dispatch_subagent"),), None),
+        ("tool", "", (), ("dispatch-main", True, None)),
+        ("assistant", "leader done", (), None),
+    ),
+    "pool": {
+        "worker": {
+            "messages": (
+                ("user", "inspect", (), None),
+                (
+                    "assistant",
+                    "",
+                    (
+                        ("successful-read", "read_file"),
+                        ("failed-missing", "missing"),
+                        ("denied-write", "write_file"),
+                    ),
+                    None,
+                ),
+                ("tool", "", (), ("successful-read", True, None)),
+                (
+                    "tool",
+                    "",
+                    (),
+                    ("failed-missing", False, "unknown tool: 'missing'"),
+                ),
+                (
+                    "tool",
+                    "",
+                    (),
+                    (
+                        "denied-write",
+                        False,
+                        "path is outside the explicit allowed write scope: "
+                        "'denied.txt'",
+                    ),
+                ),
+                ("assistant", "child done", (), None),
+            ),
+            "turns": 2,
+            "phases": ("finished",),
+            "breaker": 0,
+        }
+    },
+    "stop": "final_response",
+    "usage": {
+        "leader": {"unknown": (4, 6)},
+        "worker": {"unknown": (12, 14)},
+    },
+    "session_stop": "final_response",
+}
+
+
+def _scripted_leader_outcome(root: Path, events, session_id: str):
+    session = SessionStore(root / "scripted-sessions", session_id, events=events)
+    leader = Leader(
+        LeaderConfig(
+            leader_provider=FakeModelProvider(
+                [
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="dispatch-main",
+                                    name="dispatch_subagent",
+                                    arguments={
+                                        "subagent_name": "worker",
+                                        "task": "inspect",
+                                    },
+                                )
+                            ],
+                        ),
+                        usage=Usage(1, 2),
+                    ),
+                    ModelResponse(
+                        Message(Role.ASSISTANT, "leader done"),
+                        usage=Usage(3, 4),
+                    ),
+                ]
+            ),
+            subagent_provider=FakeModelProvider(
+                [
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="successful-read",
+                                    name="read_file",
+                                    arguments={"path": "existing.txt"},
+                                ),
+                                ToolCall(id="failed-missing", name="missing"),
+                                ToolCall(
+                                    id="denied-write",
+                                    name="write_file",
+                                    arguments={"path": "denied.txt", "content": "x"},
+                                ),
+                            ],
+                        ),
+                        usage=Usage(5, 6),
+                    ),
+                    ModelResponse(
+                        Message(Role.ASSISTANT, "child done"),
+                        usage=Usage(7, 8),
+                    ),
+                ]
+            ),
+            repo_root=str(root),
+            events=events,
+        ),
+        session=session,
+    )
+    result = leader.run("goal")
+    session_stop = session.read_meta()["stopped_reason"]
+    session.close()
+    worker = result.subagents["worker"]
+    summary = {
+        "leader_messages": tuple(_message_snapshot(item) for item in result.leader_messages),
+        "pool": {
+            "worker": {
+                "messages": tuple(_message_snapshot(item) for item in worker.messages),
+                "turns": worker.turns_used,
+                "phases": tuple(run.phase.value for run in worker.runs),
+                "breaker": worker.breaker.consecutive_failures,
+            }
+        },
+        "stop": result.stopped_reason,
+        "usage": {
+            "leader": {
+                model: (usage.input_tokens, usage.output_tokens)
+                for model, usage in result.usage_by_agent[result.agent.agent_id].items()
+            },
+            "worker": {
+                model: (usage.input_tokens, usage.output_tokens)
+                for model, usage in result.usage_by_agent[worker.agent_ref.agent_id].items()
+            },
+        },
+        "session_stop": session_stop,
+    }
+    return result, summary
+
+
+@check("events.dropping_all_changes_nothing")
+def dropping_all_changes_nothing() -> None:
+    with workspace() as ws:
+        def fixed_turn(run_id: str, index: int) -> TurnRef:
+            return TurnRef(turn_id=f"turn-fixed-{index}", run_id=run_id, index=index)
+
+        sink = CollectingSink()
+        with mock.patch(
+            "symphonai_api.agent_loop.new_turn_ref",
+            side_effect=fixed_turn,
+        ):
+            without_events, without_summary = _scripted_leader_outcome(
+                ws.root,
+                None,
+                "without-events",
+            )
+            with_events, with_summary = _scripted_leader_outcome(
+                ws.root,
+                sink,
+                "with-events",
+            )
+        without_worker = without_events.subagents["worker"]
+        with_worker = with_events.subagents["worker"]
+        if (
+            without_events.leader_messages != with_events.leader_messages
+            or without_events.stopped_reason != with_events.stopped_reason
+            or without_worker.messages != with_worker.messages
+            or without_worker.turns_used != with_worker.turns_used
+            or without_summary["usage"] != with_summary["usage"]
+            or without_summary["pool"] != with_summary["pool"]
+        ):
+            fail("dropping all events changed messages, stop, usage, or pool state")
+        if without_summary != _FROZEN_PRE_10B_OUTCOME:
+            fail(
+                f"outcome changed from {_PRE_10B_COMMIT}: "
+                f"{without_summary!r}"
+            )
+        denied = [
+            event
+            for event in sink.of_type(PermissionDenied)
+            if event.tool_call_id == "denied-write"
+        ]
+        if len(denied) != 1 or denied[0].tool_name != "write_file":
+            fail(f"scripted permission denial event differed: {sink.events!r}")

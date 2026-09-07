@@ -13,6 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from symphonai_api.events import EventSink, SessionEnded, SessionStarted, emit
 from symphonai_api.identity import SCHEMA_VERSION, new_id
 
 if TYPE_CHECKING:
@@ -187,10 +188,19 @@ class TranscriptWriter:
 class SessionStore:
     """Owns one run's directory: transcripts, sidecar, result store dir."""
 
-    def __init__(self, root: Path, run_id: str, *, create: bool = True) -> None:
+    def __init__(
+        self,
+        root: Path,
+        run_id: str,
+        *,
+        create: bool = True,
+        events: EventSink | None = None,
+    ) -> None:
         self._run_id = run_id
         self._root = Path(root)
         self._directory = self._root / run_id
+        self._events = events
+        self._closed = False
         self._writers: dict[Path, TranscriptWriter] = {}
         self._writers_lock = threading.Lock()
         self._meta_lock = threading.Lock()
@@ -221,9 +231,23 @@ class SessionStore:
                     "stopped_reason": None,
                 }
             )
+        emit(
+            self._events,
+            SessionStarted(
+                agent_id="",
+                run_id=self._run_id,
+                session_run_id=self._run_id,
+            ),
+        )
 
     @classmethod
-    def open(cls, root: Path, run_id: str) -> "SessionStore":
+    def open(
+        cls,
+        root: Path,
+        run_id: str,
+        *,
+        events: EventSink | None = None,
+    ) -> "SessionStore":
         """Open an existing run without creating or rewriting anything."""
 
         directory = Path(root) / run_id
@@ -235,7 +259,7 @@ class SessionStore:
             raise SessionError(
                 f"run {run_id!r} cannot be opened: meta.json is missing"
             )
-        return cls(root, run_id, create=False)
+        return cls(root, run_id, create=False, events=events)
 
     @property
     def directory(self) -> Path:
@@ -344,10 +368,21 @@ class SessionStore:
                         pass
 
     def close(self) -> None:
+        if self._closed:
+            return
         with self._writers_lock:
             writers = list(self._writers.values())
         for writer in writers:
             writer.close()
+        self._closed = True
+        emit(
+            self._events,
+            SessionEnded(
+                agent_id="",
+                run_id=self._run_id,
+                session_run_id=self._run_id,
+            ),
+        )
 
 
 def read_records(path: Path) -> tuple[list[dict], int]:

@@ -72,7 +72,50 @@ class ToolCallFinished(Event):
 
 
 @dataclass(frozen=True)
+class PromptSubmitted(Event):
+    text: str = ""
+    message_count: int = 0
+
+
+@dataclass(frozen=True)
+class ToolCallFailed(Event):
+    tool_name: str = ""
+    tool_call_id: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class PermissionRequested(Event):
+    tool_name: str = ""
+    tool_call_id: str = ""
+    mode: str = ""
+
+
+@dataclass(frozen=True)
+class PermissionDenied(Event):
+    tool_name: str = ""
+    tool_call_id: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class SessionStarted(Event):
+    session_run_id: str = ""
+
+
+@dataclass(frozen=True)
+class SessionEnded(Event):
+    session_run_id: str = ""
+
+
+@dataclass(frozen=True)
 class SubagentSpawned(Event):
+    subagent_name: str = ""
+    subagent_agent_id: str = ""
+
+
+@dataclass(frozen=True)
+class SubagentStopped(Event):
     subagent_name: str = ""
     subagent_agent_id: str = ""
 

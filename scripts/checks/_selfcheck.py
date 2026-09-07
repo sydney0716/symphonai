@@ -284,6 +284,13 @@ def main() -> None:
         "events.provider_failure",
         "events.sink_isolation",
         "events.stream_optional",
+        "events.new_types_and_schema",
+        "events.prompt_submitted",
+        "events.tool_failure_is_additional",
+        "events.session_lifecycle",
+        "events.subagent_stopped",
+        "events.new_sink_isolation",
+        "events.dropping_all_changes_nothing",
         "host_protocol.encodes_every_event",
         "host_protocol.round_trip_events",
         "host_protocol.unknown_type_preserved",
@@ -378,6 +385,20 @@ def main() -> None:
         "agent_file.tool_allow_and_deny",
         "agent_file.effort_leaves_schema_version_alone",
         "agent_file.no_runtime_imports",
+        "config.scope_precedence",
+        "config.merges_per_leaf",
+        "config.missing_and_malformed",
+        "config.provenance",
+        "config.ceiling_refuses",
+        "config.empty_ceiling_refuses_nothing",
+        "config.ceiling_applies_to_agent_files",
+        "config.no_runtime_imports",
+        "config.layers_are_per_scope",
+        "config.ceiling_meet_is_the_tighter_side",
+        "config.ceiling_cannot_be_raised_from_below",
+        "config.shell_allowlist_uses_prefixes",
+        "config.refusal_agrees_with_narrowing",
+        "config.sections_are_open",
         "agent_memory.read_write_and_order",
         "agent_memory.bounds_drop_oldest",
         "agent_memory.refuses_bad_entries",
@@ -495,6 +516,8 @@ def main() -> None:
         "permissions.narrow_never_widens",
         "permissions.narrow_rejects_a_forbidden_root",
         "permissions.narrow_is_idempotent_and_composes",
+        "permissions.event_order",
+        "permissions.events_preserve_decisions",
         "shell.process_group_fallback",
         "shell.cancellation_reaps_child",
         "shell.cancellation_kills_group",
@@ -579,7 +602,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "499 passed, 0 failed, 499 selected of 499 registered",
+        == "522 passed, 0 failed, 522 selected of 522 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -627,7 +650,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 499 registered"
+                "of 522 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -655,7 +678,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 499 registered",
+            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 522 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
