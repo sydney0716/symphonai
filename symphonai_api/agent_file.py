@@ -15,6 +15,7 @@ from symphonai_api.agent_spec import (
     Isolation,
     ModelSelector,
 )
+from symphonai_api.agent_memory import MAX_ENTRIES, MemorySettings
 from symphonai_api.budgets import PriceTable, RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.permissions import PermissionPolicy
@@ -28,6 +29,7 @@ _TOP_LEVEL_KEYS = {
     "prompt",
     "tools",
     "deny_tools",
+    "memory",
     "model",
     "isolation",
     "budget",
@@ -38,6 +40,7 @@ _TOP_LEVEL_KEYS = {
     "max_depth",
 }
 _TABLE_KEYS = {
+    "memory": {"enabled", "max_entries"},
     "model": {"provider", "model", "effort"},
     "isolation": {"inherit", "inherit_tail", "workspace_prefix"},
     "budget": {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"},
@@ -96,6 +99,15 @@ def _table(
         _raise(path, key, "must be a table")
     _unknown_keys(path, key, value)
     return value
+
+
+def _read_toml(path: Path) -> dict[str, object]:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        _raise(path, "file", f"could not be read: {exc}")
+    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+        _raise(path, "toml", f"could not be parsed: {exc}")
 
 
 def _string(path: Path, key: str, value: object) -> str:
@@ -160,6 +172,27 @@ def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | N
         key = "tools and deny_tools" if deny_present else "tools"
         _raise(path, key, "resolved tool set was empty")
     return result
+
+
+def _memory_settings(
+    path: Path,
+    table: Mapping[str, object] | None,
+) -> MemorySettings:
+    if table is None:
+        return MemorySettings()
+    enabled = False
+    if "enabled" in table:
+        enabled = _boolean(path, "enabled", table["enabled"])
+    max_entries = MAX_ENTRIES
+    if "max_entries" in table:
+        max_entries = _integer(path, "max_entries", table["max_entries"])
+    if not 1 <= max_entries <= MAX_ENTRIES:
+        _raise(
+            path,
+            "max_entries",
+            f"must be between 1 and the ceiling {MAX_ENTRIES}",
+        )
+    return MemorySettings(enabled=enabled, max_entries=max_entries)
 
 
 def _model(
@@ -338,21 +371,18 @@ def load_agent_file(
 ) -> AgentSpec:
     """Parse one TOML agent file into an AgentSpec."""
     source = Path(path)
-    try:
-        data = tomllib.loads(source.read_text(encoding="utf-8"))
-    except OSError as exc:
-        _raise(source, "file", f"could not be read: {exc}")
-    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
-        _raise(source, "toml", f"could not be parsed: {exc}")
+    data = _read_toml(source)
     _unknown_keys(source, "file", data)
     if "prompt" not in data:
         _raise(source, "prompt", "is required")
     prompt = _string(source, "prompt", data["prompt"])
+    memory_table = _table(source, data, "memory")
     model_table = _table(source, data, "model")
     isolation_table = _table(source, data, "isolation")
     budget_table = _table(source, data, "budget")
     policy_table = _table(source, data, "policy")
     io_table = _table(source, data, "io")
+    _memory_settings(source, memory_table)
     values: dict[str, object] = {
         "name": source.stem,
         "prompt": prompt,
@@ -385,6 +415,14 @@ def load_agent_file(
             if key in str(exc):
                 _raise(source, key, str(exc))
         _raise(source, "agent", str(exc))
+
+
+def memory_settings(path: Path) -> MemorySettings:
+    """Read the opt-in memory settings from one agent TOML file."""
+    source = Path(path)
+    data = _read_toml(source)
+    _unknown_keys(source, "file", data)
+    return _memory_settings(source, _table(source, data, "memory"))
 
 
 def load_agent_directory(

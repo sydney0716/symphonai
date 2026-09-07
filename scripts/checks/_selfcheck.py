@@ -378,6 +378,13 @@ def main() -> None:
         "agent_file.tool_allow_and_deny",
         "agent_file.effort_leaves_schema_version_alone",
         "agent_file.no_runtime_imports",
+        "agent_memory.read_write_and_order",
+        "agent_memory.bounds_drop_oldest",
+        "agent_memory.refuses_bad_entries",
+        "agent_memory.forget_and_isolation",
+        "agent_memory.corrupt_file_is_inert",
+        "agent_memory.settings_from_the_file",
+        "agent_memory.no_runtime_imports",
         "leases.acquire_and_release",
         "leases.conflicts_by_containment",
         "leases.same_holder_reentrant",
@@ -391,6 +398,7 @@ def main() -> None:
         "child_context.inherit_tail",
         "child_context.purity",
         "child_context.never_orphans_a_tool_result",
+        "child_context.seeds_memory",
         "child_context.no_runtime_imports",
         "agent_run.identity_and_parenting",
         "agent_run.lifecycle_transitions",
@@ -558,7 +566,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "478 passed, 0 failed, 478 selected of 478 registered",
+        == "486 passed, 0 failed, 486 selected of 486 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -606,7 +614,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 478 registered"
+                "of 486 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -634,7 +642,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 478 registered",
+            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 486 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

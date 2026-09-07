@@ -38,6 +38,7 @@ from scripts.checks import agent_cancel  # noqa: E402, F401
 from scripts.checks import cancellation  # noqa: E402, F401
 from scripts.checks import agent_spec  # noqa: E402, F401
 from scripts.checks import agent_file  # noqa: E402, F401
+from scripts.checks import agent_memory  # noqa: E402, F401
 from scripts.checks import leases  # noqa: E402, F401
 from scripts.checks import child_context  # noqa: E402, F401
 from scripts.checks import agent_run_graph  # noqa: E402, F401
