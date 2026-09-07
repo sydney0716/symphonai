@@ -40,7 +40,7 @@ from symphonai_api.identity import (
     new_run_ref,
     new_turn_ref,
 )
-from symphonai_api.agent_run import PauseGate
+from symphonai_api.agent_run import AgentRun, PauseGate
 from symphonai_api.models import (
     Message,
     ModelRequest,
@@ -77,8 +77,8 @@ class AgentRunResult:
     final_response: ModelResponse
     messages: list[Message]
     turns_used: int
-    # "final_response", "max_turns", "cancelled", "budget_wall_time",
-    # "budget_tokens", or "budget_cost"
+    # "final_response", "max_turns", "cancelled", "budget_turns",
+    # "budget_wall_time", "budget_tokens", or "budget_cost"
     stopped_reason: str
     run: RunRef
     agent: AgentRef
@@ -160,6 +160,7 @@ class ApiAgent:
         parent_run_id: str | None = None,
         cancel: CancellationToken | None = None,
         pause: PauseGate | None = None,
+        run: AgentRun | None = None,
         events: EventSink | None = None,
     ) -> AgentRunResult:
         run_ref = new_run_ref(self._agent_ref.agent_id, parent_run_id)
@@ -169,7 +170,7 @@ class ApiAgent:
         usage_by_model: dict[str, UsageTotals] = {}
         budget_state = (
             BudgetState(time.monotonic(), usage_by_model)
-            if self._budget is not None
+            if self._budget is not None or run is not None
             else None
         )
         requested_model = (
@@ -222,10 +223,11 @@ class ApiAgent:
             )
             return result
 
-        def exceeded_budget() -> str | None:
-            if budget_state is None or self._budget is None:
+        def exceeded_budget(budget: RunBudget | None = None) -> str | None:
+            effective_budget = self._budget if budget is None else budget
+            if budget_state is None or effective_budget is None:
                 return None
-            return budget_state.exceeded(self._budget)
+            return budget_state.exceeded(effective_budget)
 
         try:
             append_record(
@@ -288,7 +290,21 @@ class ApiAgent:
                     cancel.raise_if_cancelled()
                 if pause is not None:
                     pause.wait_while_paused(cancel)
-                budget_reason = exceeded_budget()
+                boundary_budget = self._budget
+                if run is not None:
+                    for text in run.take_redirects():
+                        redirect = Message(role=Role.USER, content=text)
+                        conversation.append(redirect)
+                        append_record(
+                            "message",
+                            turn_id=redirect.turn_id,
+                            data=message_to_json(redirect),
+                        )
+                        self._persisted_digests.append(_message_digest(redirect))
+                    boundary_budget = run.budget
+                    if boundary_budget.max_turns <= provider_calls:
+                        return finish_for_budget("budget_turns")
+                budget_reason = exceeded_budget(boundary_budget)
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)
                 request = ModelRequest(

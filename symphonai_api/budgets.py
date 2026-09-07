@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
@@ -43,6 +43,32 @@ class RunBudget:
             raise ValueError("max_cost must be non-negative")
         if self.max_cost is not None and self.price_table is None:
             raise ValueError("max_cost requires price_table")
+
+    def lowered(self, **changes: object) -> "RunBudget":
+        """Return a copy whose limits are never more permissive than these."""
+        if (
+            changes.get("price_table", self.price_table) is None
+            and changes.get("max_cost", self.max_cost) is not None
+        ):
+            raise ValueError("price_table cannot be None while max_cost is set")
+        for field_name in (
+            "max_turns",
+            "wall_seconds",
+            "max_total_tokens",
+            "max_cost",
+        ):
+            if field_name not in changes:
+                continue
+            old_value = getattr(self, field_name)
+            new_value = changes[field_name]
+            if old_value is not None and (
+                new_value is None or new_value > old_value
+            ):
+                raise ValueError(
+                    f"{field_name} cannot increase from {old_value!r} to {new_value!r}"
+                )
+        result = replace(self, **changes)
+        return result
 
 
 @dataclass(frozen=True)

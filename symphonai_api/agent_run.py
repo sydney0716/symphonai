@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 
 from symphonai_api.agent_spec import AgentSpec
+from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.cost import UsageTotals
 from symphonai_api.identity import AgentRef, RunRef, new_agent_ref, new_run_ref
@@ -37,10 +38,31 @@ class AgentRun:
     stopped_reason: str | None = None
     error: str | None = None
     token: CancellationToken | None = None
+    _budget: RunBudget = field(init=False, repr=False, compare=False)
+    _redirects: list[str] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _control_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        self._budget = self.spec.budget or RunBudget()
 
     @property
     def workspace_prefix(self) -> str | None:
         return self.spec.isolation.workspace_prefix
+
+    @property
+    def budget(self) -> RunBudget:
+        with self._control_lock:
+            return self._budget
 
     @property
     def quiet_seconds(self) -> float | None:
@@ -75,6 +97,40 @@ class AgentRun:
     def resume(self) -> None:
         self._require("resume", RunPhase.PAUSED)
         self.phase = RunPhase.RUNNING
+
+    def cap_budget(self, **changes: object) -> None:
+        self._require(
+            "cap_budget",
+            RunPhase.PENDING,
+            RunPhase.RUNNING,
+            RunPhase.PAUSED,
+        )
+        while True:
+            with self._control_lock:
+                current = self._budget
+            lowered = current.lowered(**changes)
+            with self._control_lock:
+                if self._budget is current:
+                    self._budget = lowered
+                    return
+
+    def redirect(self, text: str) -> None:
+        self._require(
+            "redirect",
+            RunPhase.PENDING,
+            RunPhase.RUNNING,
+            RunPhase.PAUSED,
+        )
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("redirect text must not be blank")
+        with self._control_lock:
+            self._redirects.append(text)
+
+    def take_redirects(self) -> tuple[str, ...]:
+        with self._control_lock:
+            redirects = tuple(self._redirects)
+            self._redirects.clear()
+            return redirects
 
     def finish(self, result: object) -> None:
         self._require("finish", RunPhase.RUNNING)

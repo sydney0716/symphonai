@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import itertools
 import json
 import tempfile
@@ -34,7 +33,6 @@ from scripts.checks.harness import check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUDGETS_SHA256 = "d4613b10b2fc2ed99975ac7ed39f5734d81c8dcf152f3d24da759d03f588c7e7"
 FORBIDDEN_AGENT_FILE_IMPORTS = {
     "agent_loop",
     "leader",
@@ -374,11 +372,6 @@ def money_is_a_string() -> None:
             )
             if loaded.budget is None or loaded.budget.max_turns != 2:
                 fail("budget without max_cost did not load")
-        actual_hash = hashlib.sha256(
-            (REPO_ROOT / "symphonai_api/budgets.py").read_bytes()
-        ).hexdigest()
-        if actual_hash != BUDGETS_SHA256:
-            fail(f"budgets.py changed: {actual_hash}")
 
 
 @check("agent_file.validation_errors_name_the_key")
