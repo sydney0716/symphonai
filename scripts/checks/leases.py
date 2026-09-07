@@ -7,6 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+import symphonai_api.leases as leases_module
 from symphonai_api.leases import Lease, LeaseConflict, WorkspaceLeases
 from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
@@ -200,10 +201,18 @@ def concurrent_acquire_has_one_winner() -> None:
             barrier = threading.Barrier(16)
             winners: list[Lease] = []
             conflicts: list[LeaseConflict] = []
+            barrier_failures: list[str] = []
             results_lock = threading.Lock()
 
             def acquire_one(index: int) -> None:
-                barrier.wait()
+                try:
+                    barrier.wait(timeout=1)
+                except threading.BrokenBarrierError:
+                    with results_lock:
+                        barrier_failures.append(
+                            f"winner barrier broke for holder-{index}"
+                        )
+                    return
                 try:
                     lease = leases.acquire(f"holder-{index}", "src")
                 except LeaseConflict as exc:
@@ -218,6 +227,8 @@ def concurrent_acquire_has_one_winner() -> None:
                 thread.start()
             for thread in threads:
                 thread.join()
+            if barrier_failures:
+                fail(barrier_failures[0])
             if len(winners) != 1 or len(conflicts) != 15:
                 fail(
                     f"round {round_number} had {len(winners)} winners and "
@@ -232,33 +243,43 @@ def concurrent_acquire_has_one_winner() -> None:
         sweep_failures: list[str] = []
         sweep_failures_lock = threading.Lock()
 
+        def wait_for_sweep(holder_index: int) -> bool:
+            try:
+                sweep_barrier.wait(timeout=1)
+                return True
+            except threading.BrokenBarrierError:
+                sweep_barrier.abort()
+                with sweep_failures_lock:
+                    sweep_failures.append(
+                        f"sweep barrier broke for holder-{holder_index}"
+                    )
+                return False
+
         def sweep(holder_index: int) -> None:
             randomizer = random.Random(holder_index)
             for _ in range(120):
                 prefix = randomizer.choice(prefixes)
-                acquired = False
                 try:
                     with leases.held(f"sweep-{holder_index}", prefix):
-                        acquired = True
-                        sweep_barrier.wait()
+                        if not wait_for_sweep(holder_index):
+                            return
                         violation = _overlap_violation(leases)
                         if violation is not None:
                             with sweep_failures_lock:
                                 sweep_failures.append(violation)
-                        sweep_barrier.wait()
+                        if not wait_for_sweep(holder_index):
+                            return
                 except LeaseConflict:
-                    sweep_barrier.wait()
-                    sweep_barrier.wait()
+                    if not wait_for_sweep(holder_index):
+                        return
+                    if not wait_for_sweep(holder_index):
+                        return
                 except Exception as exc:
+                    sweep_barrier.abort()
                     with sweep_failures_lock:
                         sweep_failures.append(
                             f"sweep holder {holder_index} failed: {exc!r}"
                         )
-                    if acquired:
-                        try:
-                            sweep_barrier.abort()
-                        except Exception:
-                            pass
                     return
 
         sweep_threads = [
@@ -279,6 +300,81 @@ def concurrent_acquire_has_one_winner() -> None:
             pass
         if leases._held:
             fail(f"randomized lease invariant sweep leaked entries: {leases._held!r}")
+
+        probe_leases = WorkspaceLeases(root)
+        probe_leases.acquire("existing", None)
+        probe_barrier = threading.Barrier(2)
+        probe_timeout = 0.2
+        if probe_timeout <= 0:
+            fail("mutual-exclusion probe timeout must be positive")
+        both_inside = threading.Event()
+        probe_outcomes: list[str] = []
+        probe_outcomes_lock = threading.Lock()
+        probe_call_counts = threading.local()
+        original_contains_path = leases_module._contains_path
+
+        def synchronized_contains_path(parent: Path, child: Path) -> bool:
+            call_count = getattr(probe_call_counts, "value", 0) + 1
+            probe_call_counts.value = call_count
+            if call_count == 1:
+                return original_contains_path(parent, child)
+            try:
+                probe_barrier.wait(timeout=probe_timeout)
+            except threading.BrokenBarrierError:
+                raise
+            both_inside.set()
+            return original_contains_path(parent, child)
+
+        def probe_acquire(holder: str) -> None:
+            try:
+                probe_leases.acquire(holder, "src")
+            except threading.BrokenBarrierError:
+                outcome = "timed-out"
+            except LeaseConflict:
+                outcome = "conflict"
+            except Exception as exc:
+                outcome = f"error:{exc!r}"
+            else:
+                outcome = "acquired"
+            with probe_outcomes_lock:
+                probe_outcomes.append(f"{holder}:{outcome}")
+
+        probe_threads = [
+            threading.Thread(target=probe_acquire, args=(holder,))
+            for holder in ("probe-one", "probe-two")
+        ]
+        try:
+            leases_module._contains_path = synchronized_contains_path
+            for thread in probe_threads:
+                thread.start()
+            for thread in probe_threads:
+                thread.join(2)
+        finally:
+            leases_module._contains_path = original_contains_path
+            probe_barrier.abort()
+        if any(thread.is_alive() for thread in probe_threads):
+            fail("mutual-exclusion probe threads did not finish")
+        if both_inside.is_set():
+            fail("probe-one and probe-two entered the critical section together")
+        if sorted(probe_outcomes) != [
+            "probe-one:timed-out",
+            "probe-two:timed-out",
+        ]:
+            fail(f"mutual-exclusion probe had unexpected outcomes: {probe_outcomes!r}")
+
+        append_scope_leases = WorkspaceLeases(root)
+        append_outside_lock: list[Lease] = []
+
+        class LockCheckingList(list):
+            def append(self, item) -> None:  # noqa: ANN001
+                if not append_scope_leases._lock.locked():
+                    append_outside_lock.append(item.lease)
+                super().append(item)
+
+        append_scope_leases._held = LockCheckingList()
+        append_scope_leases.acquire("append-probe", "src")
+        if append_outside_lock:
+            fail(f"lease was appended outside the registry lock: {append_outside_lock!r}")
 
         leases = WorkspaceLeases(root)
         leases.acquire("holder", "src")
