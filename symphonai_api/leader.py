@@ -3,10 +3,9 @@
 The leader is itself an `ApiAgent`, but with exactly one tool available:
 `dispatch_subagent`. Calling it with a new `subagent_name` creates a fresh
 subagent (its own `ApiAgent`, backed by the one configured subagent
-provider, with the standard local tool registry and a deny-by-default
-`PermissionPolicy`); calling it again with the same name continues that
-subagent's existing conversation instead of starting over -- that is the
-"reuse" behavior.
+provider, with capabilities and limits taken from its `AgentSpec`); calling it
+again with the same name continues that subagent's existing conversation
+instead of starting over -- that is the "reuse" behavior.
 
 The leader never chooses which vendor/model backs itself or its
 subagents. Both are fixed by `LeaderConfig`, set by the caller, never
@@ -18,12 +17,25 @@ Subagent pool state lives only in memory for the duration of one
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
+from symphonai_api.agent_run import (
+    AgentRun,
+    RunNode,
+    RunPhase,
+    new_agent_run,
+    read_run_graph,
+)
+from symphonai_api.agent_spec import AgentSpec, Isolation, ModelSelector, validate_output
 from symphonai_api.budgets import RunBudget
 from symphonai_api.call_class import CallClass
-from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.cancellation import (
+    CancelReason,
+    CancellationToken,
+    OperationCancelled,
+)
+from symphonai_api.child_context import seed_messages
 from symphonai_api.circuit_breaker import (
     DEFAULT_MAX_CONSECUTIVE_FAILURES,
     ConsecutiveFailureBreaker,
@@ -41,11 +53,13 @@ from symphonai_api.events import (
     CompactionApplied,
     Event,
     EventSink,
+    RunStarted,
     SubagentSpawned,
     ToolCallStarted,
     emit,
 )
 from symphonai_api.identity import AgentRef, RunRef, new_agent_ref
+from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import Message, Role, ToolCall, ToolResult
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -71,6 +85,8 @@ class _LeaderEventSink:
         dispatch_tool.attach_event_sink(self)
 
     def __call__(self, event: Event) -> None:
+        if self._dispatch_tool is not None:
+            self._dispatch_tool.observe_event(event)
         if (
             isinstance(event, ToolCallStarted)
             and event.tool_name == DISPATCH_TOOL_NAME
@@ -163,22 +179,22 @@ class SubagentRecord:
     messages: list[Message] = field(default_factory=list)
     turns_used: int = 0
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
+    runs: list[AgentRun] = field(default_factory=list)
 
 
 class DispatchSubagentTool(LocalTool):
     """The leader's only tool: create-or-reuse a named subagent and run it.
 
-    Note: the `policy` argument `execute()` receives is the *leader's own*
-    policy (passed in by the leader's ApiAgent), which this tool
-    deliberately ignores -- each subagent runs under its own
-    `subagent_policy`, fixed at construction time, independent of whatever
-    the leader itself is permitted to touch.
+    A child's effective policy is the meet of the leader policy and its
+    `AgentSpec` ceiling. Its first dispatch seeds context according to the
+    spec; later dispatches append to the named child's existing conversation
+    instead of inheriting the parent again.
     """
 
     def __init__(
         self,
         subagent_provider: ModelProvider,
-        subagent_policy: PermissionPolicy,
+        leader_policy: PermissionPolicy,
         *,
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
@@ -187,9 +203,13 @@ class DispatchSubagentTool(LocalTool):
         subagent_budget: RunBudget | None = None,
         max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
         session: SessionStore | None = None,
+        subagent_specs: Mapping[str, AgentSpec] | None = None,
+        leases: WorkspaceLeases | None = None,
+        parent_run: AgentRun | None = None,
+        dispatching_depth: int = -1,
     ) -> None:
         self._subagent_provider = subagent_provider
-        self._subagent_policy = subagent_policy
+        self._leader_policy = leader_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
         self._subagent_tool_names = (
@@ -201,11 +221,53 @@ class DispatchSubagentTool(LocalTool):
         self._subagent_budget = subagent_budget
         self._max_consecutive_subagent_failures = max_consecutive_subagent_failures
         self._session = session
+        self._subagent_specs = subagent_specs
+        self._leases = leases or WorkspaceLeases(leader_policy.repo_root)
+        self._parent_run = parent_run
+        self._parent_messages: list[Message] = []
+        self._dispatching_depth = dispatching_depth
+        self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id: str | None = None
         self._event_turn_id: str | None = None
         self.pool: dict[str, SubagentRecord] = {}
+
+    def set_parent_context(
+        self,
+        run: AgentRun,
+        messages: list[Message],
+        *,
+        depth: int = -1,
+    ) -> None:
+        self._parent_run = run
+        self._parent_messages = messages
+        self._dispatching_depth = depth
+
+    def observe_event(self, event: Event) -> None:
+        if isinstance(event, RunStarted):
+            if (
+                self._active_run is not None
+                and event.agent_id == self._active_run.agent.agent_id
+            ):
+                self._active_run.run = RunRef(
+                    run_id=event.run_id,
+                    agent_id=event.agent_id,
+                    parent_run_id=(
+                        None
+                        if self._parent_run is None
+                        else self._parent_run.run.run_id
+                    ),
+                )
+            elif (
+                self._parent_run is not None
+                and event.agent_id == self._parent_run.agent.agent_id
+            ):
+                self._parent_run.run = RunRef(
+                    run_id=event.run_id,
+                    agent_id=event.agent_id,
+                    parent_run_id=None,
+                )
 
     def attach_event_sink(self, sink: EventSink) -> None:
         self._events = sink
@@ -246,6 +308,37 @@ class DispatchSubagentTool(LocalTool):
             return "missing required argument: subagent_name and/or task"
         return None
 
+    def _spec_for(self, subagent_name: str) -> AgentSpec | None:
+        if self._subagent_specs is not None:
+            return self._subagent_specs.get(subagent_name)
+        provider_name = getattr(self._subagent_provider, "name", None) or "unknown"
+        return AgentSpec(
+            name=subagent_name,
+            prompt="",
+            model=ModelSelector(
+                provider=provider_name,
+                model=getattr(self._subagent_provider, "model", None),
+            ),
+            policy_ceiling=self._leader_policy,
+            tool_names=self._subagent_tool_names,
+            budget=self._subagent_budget,
+            isolation=Isolation(),
+            call_class=CallClass.BACKGROUND,
+            max_depth=0,
+        )
+
+    def _new_run(self, spec: AgentSpec, agent_ref: AgentRef) -> AgentRun:
+        run = new_agent_run(spec, parent=self._parent_run)
+        run.agent = agent_ref
+        run.run = RunRef(
+            run_id=run.run.run_id,
+            agent_id=agent_ref.agent_id,
+            parent_run_id=(
+                None if self._parent_run is None else self._parent_run.run.run_id
+            ),
+        )
+        return run
+
     def _execute(
         self,
         tool_call: ToolCall,
@@ -254,6 +347,28 @@ class DispatchSubagentTool(LocalTool):
     ) -> ToolResult:
         subagent_name = tool_call.arguments.get("subagent_name")
         task = tool_call.arguments.get("task")
+
+        spec = self._spec_for(subagent_name)
+        if spec is None:
+            known = ", ".join(sorted(self._subagent_specs or ())) or "none"
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"unknown subagent {subagent_name!r}; known subagents: {known}",
+            )
+        if self._dispatching_depth >= spec.max_depth:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=(
+                    f"subagent {subagent_name!r} cannot dispatch at depth "
+                    f"{self._dispatching_depth}; max_depth is {spec.max_depth}"
+                ),
+            )
+        try:
+            effective_policy = self._leader_policy.narrowed(spec.policy_ceiling)
+        except ValueError as exc:
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
 
         record = self.pool.get(subagent_name)
         if record is None:
@@ -266,7 +381,7 @@ class DispatchSubagentTool(LocalTool):
                         f"cannot create new subagent {subagent_name!r}"
                     ),
                 )
-            subagent_tools = standard_tool_registry(self._subagent_tool_names)
+            subagent_tools = standard_tool_registry(spec.tool_names)
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
             if self._events is not None:
                 if self._event_run_id is None:
@@ -285,13 +400,13 @@ class DispatchSubagentTool(LocalTool):
                 agent=ApiAgent(
                     provider=self._subagent_provider,
                     tools=subagent_tools,
-                    policy=self._subagent_policy,
+                    policy=effective_policy,
                     max_turns=self._subagent_max_turns,
                     tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
                     agent_ref=agent_ref,
                     events=self._events,
-                    budget=self._subagent_budget,
-                    call_class=CallClass.BACKGROUND,
+                    budget=spec.budget,
+                    call_class=spec.call_class,
                     transcript=(
                         None
                         if self._session is None
@@ -305,6 +420,10 @@ class DispatchSubagentTool(LocalTool):
                 ),
             )
             self.pool[subagent_name] = record
+        else:
+            # The ceiling is mutable even though AgentSpec is frozen, so take
+            # the meet again for every dispatch instead of retaining authority.
+            record.agent._policy = effective_policy
 
         if record.breaker.is_open:
             return ToolResult(
@@ -317,13 +436,56 @@ class DispatchSubagentTool(LocalTool):
                 ),
             )
 
-        record.messages.append(Message(role=Role.USER, content=task))
+        child_run = self._new_run(spec, record.agent_ref)
+        record.runs.append(child_run)
+        token = (
+            cancel.child(deadline_seconds=spec.deadline_seconds)
+            if cancel is not None
+            else CancellationToken(deadline_seconds=spec.deadline_seconds)
+        )
+        child_run.start(token)
+        if record.messages:
+            record.messages.append(Message(role=Role.USER, content=task))
+        else:
+            record.messages = seed_messages(
+                spec,
+                task,
+                parent_messages=self._parent_messages,
+            )
+        run_result = None
+        failure: str | None = None
+        self._active_run = child_run
         try:
-            run_result = record.agent.run(record.messages, cancel=cancel)
-        except OperationCancelled:
+            with self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix):
+                run_result = record.agent.run(
+                    record.messages,
+                    model=spec.model.model,
+                    parent_run_id=(
+                        None
+                        if self._parent_run is None
+                        else self._parent_run.run.run_id
+                    ),
+                    cancel=token,
+                )
+        except LeaseConflict as exc:
+            failure = str(exc)
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
+        except Exception as exc:
+            failure = str(exc)
             raise
-        except Exception:
-            raise
+        finally:
+            self._active_run = None
+            if child_run.phase is RunPhase.RUNNING:
+                if run_result is None:
+                    if token.cancelled:
+                        child_run.cancel()
+                    else:
+                        child_run.fail(failure or "subagent dispatch failed")
+                elif run_result.stopped_reason == "cancelled":
+                    child_run.cancel()
+                else:
+                    child_run.finish(run_result)
+        assert run_result is not None
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
         for model, usage in run_result.usage_by_model.items():
@@ -331,14 +493,35 @@ class DispatchSubagentTool(LocalTool):
                 model, UsageTotals()
             ).merged(usage)
         if run_result.stopped_reason == "cancelled":
-            raise OperationCancelled
+            if token.reason is CancelReason.PARENT:
+                raise OperationCancelled
+            record.breaker.record_failure()
+            if token.reason is CancelReason.DEADLINE:
+                error = "subagent deadline elapsed before a final answer"
+            else:
+                error = "subagent was cancelled explicitly before a final answer"
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                content=run_result.final_response.message.text,
+                error=error,
+            )
 
         succeeded = run_result.stopped_reason == "final_response"
+        output_error = None
+        if succeeded and spec.io.output_schema is not None:
+            _, output_error = validate_output(
+                spec.io,
+                run_result.final_response.message.text,
+            )
+            succeeded = output_error is None
         if succeeded:
             record.breaker.record_success()
         else:
             record.breaker.record_failure()
-        if succeeded:
+        if output_error is not None:
+            error = output_error
+        elif succeeded:
             error = None
         elif run_result.stopped_reason == "max_turns":
             error = "subagent reached max_turns without a final answer"
@@ -362,8 +545,8 @@ class LeaderConfig:
     The leader never picks its own or its subagents' provider/model --
     both are fixed here by the caller, once, before the run starts.
     Each subagent independently accounts against ``subagent_budget``; there is
-    no shared drawdown because coordinating that across agents belongs to
-    phase 07.
+    no shared drawdown. Optional ``subagent_specs`` declare named child roles;
+    omitting them preserves the legacy synthesized defaults.
     """
 
     leader_provider: ModelProvider
@@ -374,6 +557,7 @@ class LeaderConfig:
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
     subagent_budget: RunBudget | None = None
     subagent_tool_names: Sequence[str] | None = None
+    subagent_specs: Mapping[str, AgentSpec] | None = None
     permission_mode: PermissionMode = "auto"
     approval_callback: ApprovalCallback | None = None
     chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
@@ -412,14 +596,30 @@ class Leader:
         self._agent_ref = new_agent_ref("leader")
         self._event_sink = _LeaderEventSink(config.events)
         self._last_run_id: str | None = None
-        subagent_policy = PermissionPolicy(
+        leader_policy = PermissionPolicy(
             repo_root=config.repo_root,
             mode=config.permission_mode,
             approval_callback=config.approval_callback,
         )
+        self._leader_policy = leader_policy
+        self._leases = WorkspaceLeases(config.repo_root)
+        provider_name = getattr(config.leader_provider, "name", None) or "unknown"
+        self._leader_spec = AgentSpec(
+            name="leader",
+            prompt="",
+            model=ModelSelector(
+                provider=provider_name,
+                model=getattr(config.leader_provider, "model", None),
+            ),
+            policy_ceiling=leader_policy,
+            tool_names=(DISPATCH_TOOL_NAME,),
+            call_class=CallClass.FOREGROUND,
+            max_depth=0,
+        )
+        self._leader_run: AgentRun | None = None
         self._dispatch_tool = DispatchSubagentTool(
             subagent_provider=config.subagent_provider,
-            subagent_policy=subagent_policy,
+            leader_policy=leader_policy,
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
             subagent_tool_names=config.subagent_tool_names,
@@ -429,13 +629,10 @@ class Leader:
                 config.max_consecutive_subagent_failures
             ),
             session=session,
+            subagent_specs=config.subagent_specs,
+            leases=self._leases,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
-        leader_policy = PermissionPolicy(
-            repo_root=config.repo_root,
-            mode=config.permission_mode,
-            approval_callback=config.approval_callback,
-        )
         self._agent = ApiAgent(
             provider=config.leader_provider,
             tools={DISPATCH_TOOL_NAME: self._dispatch_tool},
@@ -471,12 +668,28 @@ class Leader:
     def _run_messages(
         self, messages: list[Message], *, cancel: CancellationToken | None = None
     ) -> LeaderRunResult:
+        leader_run = new_agent_run(self._leader_spec)
+        leader_run.agent = self._agent_ref
+        leader_run.run = RunRef(
+            run_id=leader_run.run.run_id,
+            agent_id=self._agent_ref.agent_id,
+        )
+        leader_run.start(CancellationToken())
+        self._leader_run = leader_run
+        self._dispatch_tool.set_parent_context(leader_run, list(messages))
         try:
             result = self._agent.run(messages, cancel=cancel)
         except OperationCancelled:
+            leader_run.cancel()
             raise
-        except Exception:
+        except Exception as exc:
+            leader_run.fail(str(exc))
             raise
+        if result.stopped_reason == "cancelled":
+            leader_run.cancel()
+        else:
+            leader_run.finish(result)
+        leader_run.run = result.run
         self._last_run_id = result.run.run_id
         usage_by_agent = {result.agent.agent_id: dict(result.usage_by_model)}
         usage_by_agent.update(
@@ -495,6 +708,13 @@ class Leader:
             usage_by_agent=usage_by_agent,
             stopped_repairs=self._stopped_repairs(),
         )
+
+    def run_graph(self) -> tuple[RunNode, ...]:
+        """The run graph of this leader's session, or () without a session."""
+
+        if self._session is None:
+            return ()
+        return read_run_graph(self._session)
 
     def run(
         self,

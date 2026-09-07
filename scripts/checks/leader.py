@@ -5,10 +5,24 @@ from __future__ import annotations
 import inspect
 import json
 import os
+from pathlib import Path
 import unittest.mock as mock
 from dataclasses import fields
 
-from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.agent_run import RunPhase, new_agent_run
+from symphonai_api.agent_spec import (
+    AgentSpec,
+    ContextInheritance,
+    IOContract,
+    Isolation,
+    ModelSelector,
+)
+from symphonai_api.call_class import CallClass
+from symphonai_api.cancellation import (
+    CancelReason,
+    CancellationToken,
+    OperationCancelled,
+)
 from symphonai_api.events import (
     CollectingSink,
     CompactionApplied,
@@ -20,6 +34,7 @@ from symphonai_api.events import (
 )
 import symphonai_api.leader as leader_module
 from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig
+from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import (
     Message,
     ModelRequest,
@@ -39,6 +54,8 @@ from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
 from symphonai_api.providers.openai_provider import (
     _build_request_body as _build_openai_body,
 )
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.session import SessionStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import (
     InterruptBehavior,
@@ -109,6 +126,218 @@ class _RecordingFakeProvider(FakeModelProvider):
     ) -> ModelResponse:
         self.requests.append(request)
         return super().create_response(request, cancel=cancel)
+
+
+class _RaisingProvider(FakeModelProvider):
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        raise RuntimeError("scripted provider failure")
+
+
+class _DeadlineProvider(FakeModelProvider):
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        assert cancel is not None
+        cancel.wait(1.0)
+        cancel.raise_if_cancelled()
+        raise AssertionError("deadline did not cancel the provider")
+
+
+class _LeaseObservingProvider(FakeModelProvider):
+    def __init__(self, leases: WorkspaceLeases, prefix: str) -> None:
+        super().__init__([ModelResponse(Message(Role.ASSISTANT, "leased"))])
+        self._leases = leases
+        self._prefix = prefix
+        self.observed_holder: str | None = None
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        self.observed_holder = self._leases.holder_for(self._prefix)
+        return super().create_response(request, cancel=cancel)
+
+
+def _spec(
+    root: Path,
+    name: str,
+    *,
+    policy: PermissionPolicy | None = None,
+    prompt: str = "",
+    isolation: Isolation = Isolation(),
+    io: IOContract = IOContract(),
+    deadline_seconds: float | None = None,
+    max_depth: int = 0,
+) -> AgentSpec:
+    return AgentSpec(
+        name=name,
+        prompt=prompt,
+        model=ModelSelector("fake", "test-model"),
+        policy_ceiling=policy or PermissionPolicy(root),
+        deadline_seconds=deadline_seconds,
+        isolation=isolation,
+        io=io,
+        call_class=CallClass.BACKGROUND,
+        max_depth=max_depth,
+    )
+
+
+def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        name="dispatch_subagent",
+        arguments={"subagent_name": name, "task": task},
+    )
+
+
+# Captured from commit c11c7c3 -- the last tree before leader control-plane
+# wiring -- by running the probe below. Frozen rather than recomputed from
+# repository history: that would compare this change with itself once
+# committed, and fails outright in the .git-less tree publish.sh validates.
+_DEFAULT_SPECS_PRE_07G_OUTPUT = json.loads(
+    r'''
+{
+  "final": "final",
+  "lifecycle": [
+    ["started", "leader", null],
+    ["spawned", "worker", null],
+    ["started", "worker", null],
+    ["finished", "worker", "final_response"],
+    ["finished", "leader", "final_response"]
+  ],
+  "messages": [
+    {"calls": [], "content": "system", "result": null, "role": "system"},
+    {"calls": [], "content": "goal", "result": null, "role": "user"},
+    {
+      "calls": [["d1", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"}]],
+      "content": "",
+      "result": null,
+      "role": "assistant"
+    },
+    {
+      "calls": [],
+      "content": "",
+      "result": ["d1", true, "child", null, false],
+      "role": "tool"
+    },
+    {"calls": [], "content": "final", "result": null, "role": "assistant"}
+  ],
+  "pool": {
+    "worker": {
+      "messages": [
+        {"calls": [], "content": "inspect", "result": null, "role": "user"},
+        {"calls": [], "content": "child", "result": null, "role": "assistant"}
+      ],
+      "turns": 1,
+      "usage": [["unknown", {"calls": 1, "input_tokens": 0, "output_tokens": 0}]]
+    }
+  },
+  "stop": "final_response",
+  "usage": [
+    [["unknown", {"calls": 1, "input_tokens": 0, "output_tokens": 0}]],
+    [["unknown", {"calls": 2, "input_tokens": 0, "output_tokens": 0}]]
+  ]
+}
+'''
+)
+
+
+def _default_specs_probe() -> tuple[dict, int]:
+    def message(value: Message) -> dict:
+        result = value.tool_result
+        return {
+            "role": value.role.value,
+            "content": value.text,
+            "calls": [
+                (call.id, call.name, call.arguments) for call in value.tool_calls
+            ],
+            "result": (
+                None
+                if result is None
+                else (
+                    result.tool_call_id,
+                    result.ok,
+                    result.content,
+                    result.error,
+                    result.cancelled,
+                )
+            ),
+        }
+
+    events = CollectingSink()
+    leader = Leader(
+        LeaderConfig(
+            leader_provider=FakeModelProvider(
+                [
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[
+                                ToolCall(
+                                    id="d1",
+                                    name="dispatch_subagent",
+                                    arguments={
+                                        "subagent_name": "worker",
+                                        "task": "inspect",
+                                    },
+                                )
+                            ],
+                        )
+                    ),
+                    ModelResponse(Message(Role.ASSISTANT, "final")),
+                ]
+            ),
+            subagent_provider=FakeModelProvider(
+                [ModelResponse(Message(Role.ASSISTANT, "child"))]
+            ),
+            repo_root=".",
+            events=events,
+        )
+    )
+    outcome = leader.run("goal", system_prompt="system")
+    lifecycle_summary = []
+    for event in events.events:
+        if isinstance(event, SubagentSpawned):
+            lifecycle_summary.append(("spawned", event.subagent_name, None))
+        elif isinstance(event, RunStarted):
+            lifecycle_summary.append(("started", event.agent_name, None))
+        elif isinstance(event, RunFinished):
+            lifecycle_summary.append(
+                ("finished", event.agent_name, event.stopped_reason)
+            )
+        elif isinstance(event, RunFailed):
+            lifecycle_summary.append(("failed", event.agent_name, None))
+    pool = {
+        name: {
+            "messages": [message(item) for item in record.messages],
+            "turns": record.turns_used,
+            "usage": sorted(
+                (model, vars(usage))
+                for model, usage in record.usage_by_model.items()
+            ),
+        }
+        for name, record in outcome.subagents.items()
+    }
+    measured = {
+        "final": outcome.final_answer,
+        "stop": outcome.stopped_reason,
+        "messages": [message(item) for item in outcome.leader_messages],
+        "pool": pool,
+        "lifecycle": lifecycle_summary,
+        "usage": sorted(
+            (
+                sorted(
+                    (model, vars(usage)) for model, usage in totals.items()
+                )
+                for totals in outcome.usage_by_agent.values()
+            ),
+            key=lambda item: json.dumps(item, sort_keys=True),
+        ),
+    }
+    normalized = json.loads(json.dumps(measured, sort_keys=True))
+    default_max_depth = outcome.subagents["worker"].runs[0].spec.max_depth
+    return normalized, default_max_depth
 
 
 def _assert_openai_tool_calls_answered(request: ModelRequest, context: str) -> None:
@@ -381,14 +610,14 @@ def check_cancellation_transcript() -> None:
             cancellation_result = cancellation_leader.chat(
                 "delegate cancellable work", cancel=cancellation_token
             )
-        if cancellation_result.stopped_reason != "cancelled":
-            fail(f"leader did not carry subagent cancellation through: {cancellation_result!r}")
+        if cancellation_result.stopped_reason != "final_response":
+            fail(f"leader did not continue after child cancellation: {cancellation_result!r}")
         expected_cancellation_events = [
             ("started", "leader", None),
             ("spawned", "cancellable", None),
             ("started", "cancellable", None),
             ("finished", "cancellable", "cancelled"),
-            ("finished", "leader", "cancelled"),
+            ("finished", "leader", "final_response"),
         ]
         cancellation_lifecycle = lifecycle(cancellation_typed_events)
         if cancellation_lifecycle != expected_cancellation_events:
@@ -418,9 +647,9 @@ def check_cancellation_transcript() -> None:
         if (
             len(leader_tool_results) != 1
             or leader_tool_results[0].ok
-            or not leader_tool_results[0].cancelled
+            or "explicitly" not in (leader_tool_results[0].error or "")
         ):
-            fail(f"leader cancellation did not synthesize a cancelled tool result: {leader_tool_results!r}")
+            fail(f"child cancellation did not return a distinct tool error: {leader_tool_results!r}")
         cancelled_record = cancellation_result.subagents["cancellable"]
         if not any(message.role == Role.ASSISTANT for message in cancelled_record.messages):
             fail(f"cancelled subagent lost its partial conversation: {cancelled_record.messages!r}")
@@ -430,12 +659,9 @@ def check_cancellation_transcript() -> None:
         ):
             fail(f"cancelled subagent transcript was not repaired: {cancelled_record.messages!r}")
 
-        continued_result = cancellation_leader.chat("continue after cancellation")
-        if continued_result.stopped_reason != "final_response":
-            fail(f"leader could not continue after cancellation: {continued_result!r}")
         _assert_openai_tool_calls_answered(
             cancellation_leader_provider.requests[-1],
-            "leader chat after subagent cancellation",
+            "leader turn after subagent cancellation",
         )
 
 
@@ -515,7 +741,7 @@ def check_dispatch_metadata() -> None:
             responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="sub reply"))]
         )
         tool = DispatchSubagentTool(
-            subagent_provider=pool_provider, subagent_policy=policy, max_subagents=2, subagent_max_turns=3
+            subagent_provider=pool_provider, leader_policy=policy, max_subagents=2, subagent_max_turns=3
         )
         dispatch_metadata = tool.metadata(
             {"subagent_name": "worker", "task": "inspect metadata"}
@@ -560,7 +786,7 @@ def check_dispatch_pool() -> None:
             responses=[ModelResponse(message=Message(role=Role.ASSISTANT, content="sub reply"))]
         )
         tool = DispatchSubagentTool(
-            subagent_provider=pool_provider, subagent_policy=policy, max_subagents=2, subagent_max_turns=3
+            subagent_provider=pool_provider, leader_policy=policy, max_subagents=2, subagent_max_turns=3
         )
         r1 = tool.execute(
             ToolCall(id="c1", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": "task one"}),
@@ -1414,3 +1640,396 @@ def check_openai_compatible_tool_schemas() -> None:
                 os.environ.pop(OPENAI_COMPATIBLE_API_KEY_ENV_VAR, None)
             else:
                 os.environ[OPENAI_COMPATIBLE_API_KEY_ENV_VAR] = previous_api_key
+
+
+@check("leader.default_specs_match_old_behaviour")
+def check_default_specs_match_old_behaviour() -> None:
+    with mock.patch.object(
+        leader_module,
+        "seed_messages",
+        wraps=leader_module.seed_messages,
+    ) as seed_messages_spy:
+        actual, default_max_depth = _default_specs_probe()
+    if actual != _DEFAULT_SPECS_PRE_07G_OUTPUT:
+        fail(
+            "default behavior differs from the pre-07g baseline: "
+            f"expected={_DEFAULT_SPECS_PRE_07G_OUTPUT!r}, actual={actual!r}"
+        )
+    if default_max_depth != 0:
+        fail(f"default max_depth changed: expected=0, actual={default_max_depth}")
+    if seed_messages_spy.call_count != 1:
+        fail(
+            "default first dispatch did not seed exactly once: "
+            f"calls={seed_messages_spy.call_count}"
+        )
+
+
+@check("leader.subagent_policy_is_narrowed")
+def check_subagent_policy_is_narrowed() -> None:
+    with workspace() as ws:
+        root = ws.root
+        allowed = PermissionPolicy(
+            root,
+            shell_enabled=True,
+            shell_allowlist=[("git", "status")],
+        )
+        denied = PermissionPolicy(root)
+        outside = PermissionPolicy(root.parent)
+        forbidden = PermissionPolicy(root / ".git")
+        wrong_mode = PermissionPolicy(root, mode="prompt")
+        specs = {
+            "ceiling-denies": _spec(root, "ceiling-denies", policy=denied),
+            "leader-denies": _spec(root, "leader-denies", policy=allowed),
+            "outside": _spec(root, "outside", policy=outside),
+            "forbidden": _spec(root, "forbidden", policy=forbidden),
+            "wrong-mode": _spec(root, "wrong-mode", policy=wrong_mode),
+            "still-works": _spec(root, "still-works", policy=denied),
+        }
+        ceiling_tool = DispatchSubagentTool(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            allowed,
+            subagent_specs=specs,
+        )
+        first = ceiling_tool.execute(_dispatch("ceiling-denies", "work"), allowed)
+        if not first.ok or ceiling_tool.pool["ceiling-denies"].agent._policy.check_shell(["git", "status"]).allowed:
+            fail("a child policy escaped its denying AgentSpec ceiling")
+
+        leader_tool = DispatchSubagentTool(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            denied,
+            subagent_specs=specs,
+        )
+        second = leader_tool.execute(_dispatch("leader-denies", "work"), denied)
+        if not second.ok or leader_tool.pool["leader-denies"].agent._policy.check_shell(["git", "status"]).allowed:
+            fail("a child policy escaped its denying leader policy")
+        for name, fragment in (
+            ("outside", "outside root"),
+            ("forbidden", "forbidden root"),
+            ("wrong-mode", "permission mode"),
+        ):
+            rejected = leader_tool.execute(_dispatch(name, "work", name), denied)
+            if rejected.ok or fragment not in (rejected.error or "") or name in leader_tool.pool:
+                fail(f"invalid policy meet did not fail closed for {name!r}: {rejected!r}")
+        continued = leader_tool.execute(_dispatch("still-works", "work"), denied)
+        if not continued.ok:
+            fail(f"leader could not continue after an invalid policy meet: {continued!r}")
+
+
+@check("leader.unknown_spec_name")
+def check_unknown_spec_name_fails() -> None:
+    with workspace() as ws:
+        specs = {
+            "coder": _spec(ws.root, "coder"),
+            "reviewer": _spec(ws.root, "reviewer"),
+        }
+        tool = DispatchSubagentTool(
+            FakeModelProvider(), ws.policy, subagent_specs=specs
+        )
+        result = tool.execute(_dispatch("missing", "work"), ws.policy)
+        error = result.error or ""
+        if result.ok or "missing" not in error or "coder" not in error or "reviewer" not in error:
+            fail(f"unknown mapped name was not actionable: {result!r}")
+        if tool.pool:
+            fail(f"unknown mapped name created pool state: {tool.pool!r}")
+
+
+@check("leader.child_token_isolation")
+def check_child_token_isolation() -> None:
+    with workspace() as ws:
+        policy = ws.policy
+        explicit_parent = CancellationToken()
+        explicit = DispatchSubagentTool(
+            FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(id="cancel", name="cancel_work")]))
+            ]),
+            policy,
+        )
+        cancelling_tool = _CancellingSubagentTool()
+        with mock.patch(
+            "symphonai_api.leader.standard_tool_registry",
+            return_value={cancelling_tool.name: cancelling_tool},
+        ):
+            explicit_result = explicit.execute(
+                _dispatch("worker", "cancel"), policy, cancel=explicit_parent
+            )
+        if explicit_result.ok or "explicitly" not in (explicit_result.error or ""):
+            fail(f"explicit child cancellation was not distinct: {explicit_result!r}")
+        if explicit_parent.cancelled:
+            fail("explicit child cancellation cancelled its parent token")
+
+        parent = CancellationToken()
+
+        class ParentCancellingProvider(FakeModelProvider):
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                parent.cancel()
+                assert cancel is not None and cancel.reason is CancelReason.PARENT
+                cancel.raise_if_cancelled()
+                raise AssertionError("parent cancellation did not reach child")
+
+        propagated = DispatchSubagentTool(ParentCancellingProvider(), policy)
+        try:
+            propagated.execute(_dispatch("worker", "cancel parent"), policy, cancel=parent)
+        except OperationCancelled:
+            pass
+        else:
+            fail("parent cancellation did not propagate as OperationCancelled")
+
+        deadline_parent = CancellationToken()
+        deadline = DispatchSubagentTool(
+            _DeadlineProvider(),
+            policy,
+            subagent_specs={
+                "worker": _spec(
+                    ws.root, "worker", deadline_seconds=0.01
+                )
+            },
+        )
+        deadline_result = deadline.execute(
+            _dispatch("worker", "wait"), policy, cancel=deadline_parent
+        )
+        if deadline_result.ok or "deadline" not in (deadline_result.error or ""):
+            fail(f"deadline cancellation was not distinct: {deadline_result!r}")
+        if deadline_parent.cancelled:
+            fail("child deadline cancelled its parent token")
+
+        reusable_parent = CancellationToken()
+        baseline = len(reusable_parent._callbacks)
+        normal = DispatchSubagentTool(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            policy,
+        )
+        for index in range(20):
+            outcome = normal.execute(
+                _dispatch("worker", f"task {index}", f"normal-{index}"),
+                policy,
+                cancel=reusable_parent,
+            )
+            if not outcome.ok:
+                fail(f"normal dispatch {index} failed: {outcome!r}")
+        if len(reusable_parent._callbacks) != baseline:
+            fail("normal child runs leaked parent cancellation listeners")
+
+        raising_parent = CancellationToken()
+        raising_baseline = len(raising_parent._callbacks)
+        raising = DispatchSubagentTool(_RaisingProvider(), policy)
+        try:
+            raising.execute(
+                _dispatch("worker", "raise"), policy, cancel=raising_parent
+            )
+        except RuntimeError:
+            pass
+        else:
+            fail("scripted provider failure did not escape the dispatch")
+        if len(raising_parent._callbacks) != raising_baseline:
+            fail("raising child run leaked a parent cancellation listener")
+
+
+@check("leader.dispatch_records_a_run")
+def check_dispatch_records_a_run() -> None:
+    with workspace() as ws:
+        failing = DispatchSubagentTool(_RaisingProvider(), ws.policy)
+        try:
+            failing.execute(_dispatch("worker", "fail"), ws.policy)
+        except RuntimeError:
+            pass
+        else:
+            fail("expected the failing child provider to raise")
+        failed_run = failing.pool["worker"].runs[0]
+        if failed_run.phase is not RunPhase.FAILED or "scripted provider failure" not in (failed_run.error or ""):
+            fail(f"child exception did not terminalize its AgentRun: {failed_run!r}")
+        if failed_run.agent is not failing.pool["worker"].agent_ref:
+            fail("the pooled ApiAgent does not own its recorded AgentRun")
+
+        session = SessionStore(ws.root / "sessions", "leader-graph")
+        leader = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider([
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("worker", "work", "graph-dispatch")])),
+                    ModelResponse(Message(Role.ASSISTANT, "final")),
+                ]),
+                subagent_provider=FakeModelProvider([
+                    ModelResponse(Message(Role.ASSISTANT, "child"))
+                ]),
+                repo_root=str(ws.root),
+            ),
+            session=session,
+        )
+        leader.run("goal")
+        graph = leader.run_graph()
+        if len(graph) != 1 or graph[0].agent_name != "leader":
+            fail(f"session graph did not have one leader root: {graph!r}")
+        if len(graph[0].children) != 1 or graph[0].children[0].agent_name != "worker":
+            fail(f"session graph did not parent the child under the leader: {graph!r}")
+        control_run = leader.subagents["worker"].runs[0]
+        if control_run.run.run_id != graph[0].children[0].run_id:
+            fail("recorded child AgentRun did not use the transcript run identity")
+
+        no_session = Leader(
+            LeaderConfig(
+                leader_provider=FakeModelProvider(),
+                subagent_provider=FakeModelProvider(),
+                repo_root=str(ws.root),
+            )
+        )
+        if no_session.run_graph() != ():
+            fail("leader without a session returned a non-empty run graph")
+
+
+@check("leader.child_context_seeding")
+def check_child_context_seeding() -> None:
+    with workspace() as ws:
+        parent_messages = [
+            Message(Role.SYSTEM, "parent system"),
+            Message(Role.USER, "old user"),
+            Message(Role.ASSISTANT, "old answer"),
+            Message(Role.USER, "recent user"),
+            Message(Role.ASSISTANT, "recent answer"),
+        ]
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done"))
+        ])
+        specs = {
+            "fresh": _spec(ws.root, "fresh", prompt="fresh prompt"),
+            "all": _spec(
+                ws.root,
+                "all",
+                prompt="all prompt",
+                isolation=Isolation(inherit=ContextInheritance.ALL),
+            ),
+            "tail": _spec(
+                ws.root,
+                "tail",
+                prompt="tail prompt",
+                isolation=Isolation(
+                    inherit=ContextInheritance.TAIL, inherit_tail=1
+                ),
+            ),
+        }
+        parent_run = new_agent_run(_spec(ws.root, "leader"))
+        tool = DispatchSubagentTool(
+            provider,
+            ws.policy,
+            subagent_specs=specs,
+            parent_run=parent_run,
+        )
+        tool.set_parent_context(parent_run, parent_messages)
+        for name in ("fresh", "all", "tail"):
+            result = tool.execute(_dispatch(name, f"{name} task", name), ws.policy)
+            if not result.ok:
+                fail(f"{name} context dispatch failed: {result!r}")
+
+        request_messages = [list(request.messages) for request in provider.requests]
+        fresh_contents = [message.text for message in request_messages[0]]
+        all_contents = [message.text for message in request_messages[1]]
+        tail_contents = [message.text for message in request_messages[2]]
+        if fresh_contents != ["fresh prompt", "fresh task"]:
+            fail(f"FRESH inherited parent context: {fresh_contents!r}")
+        if all_contents != [
+            "all prompt", "old user", "old answer", "recent user", "recent answer", "all task"
+        ]:
+            fail(f"ALL did not inherit non-system parent context: {all_contents!r}")
+        if tail_contents != ["tail prompt", "recent user", "recent answer", "tail task"]:
+            fail(f"TAIL did not inherit exactly the recent parent turn: {tail_contents!r}")
+
+        followup = tool.execute(_dispatch("all", "follow up", "all-again"), ws.policy)
+        followup_contents = [message.text for message in provider.requests[3].messages]
+        if (
+            not followup.ok
+            or followup_contents.count("old user") != 1
+            or followup_contents.count("done") != 1
+            or followup_contents[-1] != "follow up"
+        ):
+            fail(f"reused child re-inherited context instead of appending: {followup_contents!r}")
+
+
+@check("leader.dispatch_holds_a_lease")
+def check_dispatch_holds_a_lease() -> None:
+    with workspace() as ws:
+        leases = WorkspaceLeases(ws.root)
+        observing = _LeaseObservingProvider(leases, "work")
+        specs = {
+            "worker": _spec(
+                ws.root, "worker", isolation=Isolation(workspace_prefix="work")
+            )
+        }
+        tool = DispatchSubagentTool(
+            observing, ws.policy, subagent_specs=specs, leases=leases
+        )
+        result = tool.execute(_dispatch("worker", "work"), ws.policy)
+        recorded_run = tool.pool["worker"].runs[0]
+        if not result.ok or observing.observed_holder != recorded_run.run.run_id:
+            fail("dispatch did not hold its workspace lease for the child run")
+        if leases.holder_for("work") is not None:
+            fail("successful dispatch did not release its workspace lease")
+
+        raising = DispatchSubagentTool(
+            _RaisingProvider(), ws.policy, subagent_specs=specs, leases=leases
+        )
+        try:
+            raising.execute(_dispatch("worker", "raise"), ws.policy)
+        except RuntimeError:
+            pass
+        else:
+            fail("raising provider did not raise during lease check")
+        if leases.holder_for("work") is not None:
+            fail("exceptional dispatch did not release its workspace lease")
+
+        external = leases.acquire("external-holder", "work")
+        try:
+            conflicted = tool.execute(
+                _dispatch("worker", "conflict", "conflict"), ws.policy
+            )
+        finally:
+            leases.release(external)
+        error = conflicted.error or ""
+        if conflicted.ok or "work" not in error or "external-holder" not in error:
+            fail(f"lease conflict was not an actionable ToolResult: {conflicted!r}")
+
+
+@check("leader.max_depth_refusal")
+def check_max_depth_is_enforced() -> None:
+    with workspace() as ws:
+        tool = DispatchSubagentTool(
+            FakeModelProvider(),
+            ws.policy,
+            subagent_specs={"leaf": _spec(ws.root, "leaf", max_depth=0)},
+            dispatching_depth=0,
+        )
+        result = tool.execute(_dispatch("leaf", "recurse"), ws.policy)
+        if result.ok or "depth" not in (result.error or "") or "leaf" not in (result.error or ""):
+            fail(f"max depth denial was not actionable: {result!r}")
+        if tool.pool:
+            fail("depth-denied dispatch created pool state")
+        if "dispatch_subagent" in standard_tool_registry():
+            fail("dispatch_subagent leaked into the standard child tool registry")
+
+
+@check("leader.typed_output_contract")
+def check_typed_subagent_output() -> None:
+    with workspace() as ws:
+        schema = IOContract(
+            output_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            }
+        )
+        specs = {
+            "valid": _spec(ws.root, "valid", io=schema),
+            "invalid": _spec(ws.root, "invalid", io=schema),
+        }
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, '{"answer":"yes"}')),
+            ModelResponse(Message(Role.ASSISTANT, '{"answer":7}')),
+        ])
+        tool = DispatchSubagentTool(
+            provider, ws.policy, subagent_specs=specs
+        )
+        valid = tool.execute(_dispatch("valid", "work", "valid"), ws.policy)
+        if not valid.ok or valid.content != '{"answer":"yes"}':
+            fail(f"valid typed output was changed or rejected: {valid!r}")
+        invalid = tool.execute(_dispatch("invalid", "work", "invalid"), ws.policy)
+        if invalid.ok or "output.answer must be string" not in (invalid.error or ""):
+            fail(f"invalid typed output was accepted: {invalid!r}")
+        if tool.pool["invalid"].breaker.consecutive_failures != 1:
+            fail("typed-output validation failure did not advance the child breaker")

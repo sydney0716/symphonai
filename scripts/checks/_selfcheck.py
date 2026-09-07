@@ -523,6 +523,15 @@ def main() -> None:
         "leader.subagent_tool_subsets",
         "leader.gemini_dispatch_schema",
         "leader.openai_compatible_tool_schemas",
+        "leader.default_specs_match_old_behaviour",
+        "leader.subagent_policy_is_narrowed",
+        "leader.unknown_spec_name",
+        "leader.child_token_isolation",
+        "leader.dispatch_records_a_run",
+        "leader.child_context_seeding",
+        "leader.dispatch_holds_a_lease",
+        "leader.max_depth_refusal",
+        "leader.typed_output_contract",
         "scheduler.partition_barriers",
         "scheduler.metadata_fail_closed",
         "scheduler.classification",
@@ -541,7 +550,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "461 passed, 0 failed, 461 selected of 461 registered",
+        == "470 passed, 0 failed, 470 selected of 470 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -589,7 +598,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 461 registered"
+                "of 470 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -617,7 +626,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 453 registered",
+            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 470 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
