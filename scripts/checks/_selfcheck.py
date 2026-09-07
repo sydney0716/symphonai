@@ -214,6 +214,7 @@ def main() -> None:
         "serialization.provider_metadata_verbatim",
         "serialization.unknown_kind_rejected",
         "session.no_transcript_no_files",
+        "session.close_is_repeatable",
         "session.record_sequence",
         "session.tool_records",
         "session.cancellation_record",
@@ -602,7 +603,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "522 passed, 0 failed, 522 selected of 522 registered",
+        == "523 passed, 0 failed, 523 selected of 523 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -650,7 +651,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 522 registered"
+                "of 523 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -678,7 +679,7 @@ def main() -> None:
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 522 registered",
+            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 523 registered",
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(

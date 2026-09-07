@@ -27,8 +27,8 @@ from symphonai_api.providers.fake import FakeModelProvider
 from scripts.checks.harness import check, fail
 
 
-_DEFAULT_BASELINE_COMMIT = "8f0891240951b771201a60ba22f72928b067e0ea"
-_CONTROL_BASELINE_COMMIT = "60e2b688740c86ecd48b9663210a03892cfaae2c"
+_DEFAULT_BASELINE_COMMIT = "ff3163a"
+_CONTROL_BASELINE_COMMIT = "ff3163a"
 _DEFAULT_PRE_08D = (
     "final_response",
     1,
@@ -43,6 +43,7 @@ _DEFAULT_PRE_08D = (
     (("unknown", 0, 0, 1),),
     (
         ("RunStarted", None, None, "agent", None),
+        ("PromptSubmitted", None, None, None, None),
         ("TurnStarted", "turn-fixed", 1, None, None),
         ("TurnFinished", "turn-fixed", 1, None, None),
         ("RunFinished", None, None, "agent", "final_response"),

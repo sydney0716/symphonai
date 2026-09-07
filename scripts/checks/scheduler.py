@@ -29,6 +29,7 @@ from scripts.checks.workspace import workspace
 
 LEGACY_SINGLETON_EVENT_SEQUENCE = [
     ("RunStarted", None, None),
+    ("PromptSubmitted", None, None),
     ("TurnStarted", None, None),
     ("ToolCallStarted", "single", None),
     ("ToolCallFinished", "single", True),

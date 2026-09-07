@@ -76,7 +76,28 @@ def check_usage_totals_merge() -> None:
         "ToolCallFinished": {
             "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "ok",
         },
+        "PromptSubmitted": {
+            "agent_id", "run_id", "turn_id", "schema_version", "text", "message_count",
+        },
+        "ToolCallFailed": {
+            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "error",
+        },
+        "PermissionRequested": {
+            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "mode",
+        },
+        "PermissionDenied": {
+            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "reason",
+        },
+        "SessionStarted": {
+            "agent_id", "run_id", "turn_id", "schema_version", "session_run_id",
+        },
+        "SessionEnded": {
+            "agent_id", "run_id", "turn_id", "schema_version", "session_run_id",
+        },
         "SubagentSpawned": {
+            "agent_id", "run_id", "turn_id", "schema_version", "subagent_name", "subagent_agent_id",
+        },
+        "SubagentStopped": {
             "agent_id", "run_id", "turn_id", "schema_version", "subagent_name", "subagent_agent_id",
         },
         "CompactionApplied": {

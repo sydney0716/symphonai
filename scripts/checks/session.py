@@ -15,6 +15,7 @@ from pathlib import Path
 
 from symphonai_api.agent_loop import AgentRunResult, ApiAgent
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.events import CollectingSink, SessionEnded
 from symphonai_api.identity import SCHEMA_VERSION, new_agent_ref, new_id
 from symphonai_api.leader import Leader, LeaderConfig
 from symphonai_api.models import (
@@ -148,6 +149,26 @@ def check_no_transcript_no_files() -> None:
             ).run([Message(role=Role.USER, content="hello")])
         if expected_default.exists():
             fail("running without a transcript created the default sessions root")
+
+
+@check("session.close_is_repeatable")
+def check_close_is_repeatable() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        sink = CollectingSink()
+        store = SessionStore(
+            Path(temporary) / "sessions",
+            "repeatable-close",
+            events=sink,
+        )
+        first = store.writer_for("first")
+        store.close()
+        second = store.writer_for("second")
+        store.close()
+        if not first._file.closed or not second._file.closed:
+            fail("a repeated close left a session writer open")
+        ended = sink.of_type(SessionEnded)
+        if len(ended) != 1 or ended[0].session_run_id != store.run_id:
+            fail(f"repeated close changed SessionEnded cardinality: {sink.events!r}")
 
 
 @check("session.record_sequence")

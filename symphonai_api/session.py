@@ -368,12 +368,12 @@ class SessionStore:
                         pass
 
     def close(self) -> None:
-        if self._closed:
-            return
         with self._writers_lock:
             writers = list(self._writers.values())
         for writer in writers:
             writer.close()
+        if self._closed:
+            return
         self._closed = True
         emit(
             self._events,
