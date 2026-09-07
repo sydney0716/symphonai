@@ -74,6 +74,18 @@ def _orphan_tool_result_ids(messages: list[Message]) -> set[str]:
     return orphan_ids
 
 
+def _orphan_tool_result_count(messages: list[Message]) -> int:
+    issued: set[str] = set()
+    orphan_count = 0
+    for message in messages:
+        if message.role is Role.ASSISTANT:
+            issued.update(call.id for call in message.tool_calls)
+        elif message.role is Role.TOOL and message.tool_result is not None:
+            if message.tool_result.tool_call_id not in issued:
+                orphan_count += 1
+    return orphan_count
+
+
 def _assert_no_orphan_tools(
     messages: list[Message],
     permitted_orphan_ids: set[str] | None = None,
@@ -85,20 +97,28 @@ def _assert_no_orphan_tools(
 
 
 PARENT_SYSTEM = Message(Role.SYSTEM, "parent system")
+
+
 WEDGED_USER = [
     Message(Role.USER, "one"),
     _assistant("one"),
     Message(Role.USER, "between"),
     _tool("one"),
 ]
+
+
 USERLESS_TOOL_GROUPS = [
     [_assistant("c0"), _tool("c0")],
     [_assistant("c0"), _tool("c0"), Message(Role.ASSISTANT, "reply")],
 ]
+
+
 GHOST_PARENTS = [
     [_tool("ghost")],
     [Message(Role.USER, "one"), _tool("ghost")],
 ]
+
+
 REGRESSION_CONVERSATIONS = [
     [],
     [Message(Role.USER, "one")],
@@ -114,6 +134,8 @@ REGRESSION_CONVERSATIONS = [
     [PARENT_SYSTEM],
     [PARENT_SYSTEM, Message(Role.USER, "one"), _assistant("one"), _tool("one"), Message(Role.USER, "two"), Message(Role.ASSISTANT, "final")],
 ]
+
+
 ALPHABET = [
     Message(Role.USER, "u"),
     Message(Role.SYSTEM, "s"),
@@ -123,19 +145,12 @@ ALPHABET = [
     _tool("g"),
 ]
 
+
 def _enumerated_conversations() -> list[list[Message]]:
     conversations: list[list[Message]] = []
     for length in range(6):
         conversations.extend(list(messages) for messages in product(ALPHABET, repeat=length))
     return conversations
-
-
-def _tool_result_ids(messages: list[Message]) -> set[str]:
-    return {
-        message.tool_result.tool_call_id
-        for message in messages
-        if message.role is Role.TOOL and message.tool_result is not None
-    }
 
 
 @check("child_context.fresh_is_todays_behaviour")
@@ -269,11 +284,27 @@ def purity() -> None:
 
 @check("child_context.never_orphans_a_tool_result")
 def never_orphans_a_tool_result() -> None:
+    occurrence_witness = [_tool("a"), _assistant("a"), _tool("a")]
+    occurrence_witness_seen = False
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         for parent in chain(REGRESSION_CONVERSATIONS, _enumerated_conversations()):
+            if parent == occurrence_witness:
+                occurrence_witness_seen = True
+                doubled_orphans = [parent[0], parent[2]]
+                if (
+                    _orphan_tool_result_count(parent) != 1
+                    or _orphan_tool_result_count(doubled_orphans) != 2
+                    or _orphan_tool_result_ids(parent)
+                    != _orphan_tool_result_ids(doubled_orphans)
+                ):
+                    fail("orphan occurrence guard collapsed repeated ids")
+            parent_without_system = [
+                message for message in parent if message.role is not Role.SYSTEM
+            ]
             parent_systems = [message for message in parent if message.role is Role.SYSTEM]
             parent_orphan_ids = _orphan_tool_result_ids(parent)
+            parent_orphan_count = _orphan_tool_result_count(parent)
             specs = [
                 _spec(root),
                 _spec(root, inherit=ContextInheritance.ALL),
@@ -284,21 +315,46 @@ def never_orphans_a_tool_result() -> None:
             ]
             for spec in specs:
                 seeded = seed_messages(spec, "task", parent_messages=parent)
+                task = Message(role=Role.USER, content="task")
+                if not seeded or seeded[-1] != task:
+                    fail("seeded context did not append the task last")
+                inherited_actual = seeded[:-1]
+                if any(message.role is Role.SYSTEM for message in inherited_actual):
+                    fail("inherited context contained a system message")
+                if len(inherited_actual) > len(parent_without_system):
+                    fail("inherited context was longer than the eligible parent")
+                suffix = parent_without_system[
+                    len(parent_without_system) - len(inherited_actual) :
+                ]
+                if any(
+                    actual is not expected
+                    for actual, expected in zip(inherited_actual, suffix)
+                ):
+                    fail("inherited context was not a contiguous parent suffix")
+                if (
+                    spec.isolation.inherit is ContextInheritance.FRESH
+                    and inherited_actual
+                ):
+                    fail("fresh context inherited a non-empty suffix")
+                if (
+                    spec.isolation.inherit is ContextInheritance.ALL
+                    and len(inherited_actual) != len(parent_without_system)
+                ):
+                    fail("all context did not inherit the whole eligible parent")
+                if _orphan_tool_result_count(seeded) > parent_orphan_count:
+                    fail("seeding increased the number of orphan tool results")
                 _assert_no_orphan_tools(seeded, parent_orphan_ids)
-                if any(message is parent_system for message in seeded for parent_system in parent_systems):
+                if any(
+                    message is parent_system
+                    for message in seeded
+                    for parent_system in parent_systems
+                ):
                     fail("seeded context retained a parent system message")
-                if spec.isolation.inherit is ContextInheritance.ALL:
-                    inherited = parent
-                elif spec.isolation.inherit is ContextInheritance.TAIL:
-                    inherited = parent[tail_start(parent, spec.isolation.inherit_tail):]
-                else:
-                    inherited = []
-                expected_orphan_ids = parent_orphan_ids & _tool_result_ids(inherited)
-                if not expected_orphan_ids <= _tool_result_ids(seeded):
-                    fail("seeding dropped an unrescuable parent tool result")
 
         if tail_start(WEDGED_USER, 1) >= recent_window_start(WEDGED_USER, 1):
             fail("tail_start did not extend an orphaning tool group backward")
+    if not occurrence_witness_seen:
+        fail("enumeration did not reach the repeated-orphan witness")
 
 
 @check("child_context.no_runtime_imports")
