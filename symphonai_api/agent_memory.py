@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -37,6 +38,23 @@ class MemorySettings:
             raise ValueError(f"max_entries must be between 1 and {MAX_ENTRIES}")
 
 
+class MemoryUnavailable(RuntimeError):
+    """A memory operation failed because its backing store was unavailable."""
+
+    def __init__(
+        self,
+        operation: str,
+        agent_name: str,
+        path: Path,
+        error: OSError,
+    ) -> None:
+        self.agent_name = agent_name
+        self.path = path
+        super().__init__(
+            f"memory {operation} failed for agent {agent_name!r} at {path}: {error}"
+        )
+
+
 class AgentMemory:
     def __init__(self, root: Path) -> None:
         self._root = Path(root).resolve()
@@ -46,8 +64,8 @@ class AgentMemory:
     def _path(self, agent_name: str) -> Path:
         if not isinstance(agent_name, str) or not agent_name.strip():
             raise ValueError("agent_name must be a non-blank string")
-        encoded = agent_name.encode("utf-8").hex()
-        return self._root / f"{encoded}.json"
+        digest = hashlib.sha256(agent_name.encode("utf-8")).hexdigest()
+        return self._root / f"{digest}.json"
 
     def _read_path(self, path: Path) -> tuple[MemoryEntry, ...]:
         try:
@@ -121,11 +139,17 @@ class AgentMemory:
                 for existing in entries
             ]
             temporary = path.with_name(f".{path.name}.tmp")
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
-            temporary.replace(path)
+            try:
+                temporary.write_text(json.dumps(payload), encoding="utf-8")
+                temporary.replace(path)
+            except OSError as exc:
+                raise MemoryUnavailable("write", agent_name, path, exc) from exc
         return entry
 
     def forget(self, agent_name: str) -> None:
         path = self._path(agent_name)
         with self._lock:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise MemoryUnavailable("forget", agent_name, path, exc) from exc

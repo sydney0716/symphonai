@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import tempfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import re
+import stat
 
 from symphonai_api.agent_file import AgentFileError, memory_settings
 from symphonai_api.agent_memory import (
@@ -13,12 +16,38 @@ from symphonai_api.agent_memory import (
     MAX_TOTAL_CHARS,
     AgentMemory,
     MemorySettings,
+    MemoryUnavailable,
 )
 from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+MEMORY_FILENAME = re.compile(r"^[0-9a-f]{64}\.json$")
+ADVERSARIAL_NAMES = (
+    "../escape",
+    "/abs/name",
+    "a/b/c",
+    "..",
+    r"..\windows",
+    "%2e%2e%2f",
+    "~",
+    "$HOME",
+    "nul\0byte",
+    "line\nbreak",
+    "emoji-🧠",
+    "A",
+    "a",
+    "Reviewer",
+    "reviewer",
+    ".",
+    "./relative",
+    r"back\slash",
+    "name:colon",
+    "name%2Fencoded",
+    "collision-23",
+    "collision-313",
+)
 
 
 def _write(directory: Path, name: str, content: str) -> Path:
@@ -38,6 +67,26 @@ def _settings_error(path: Path, key: str) -> str:
     except Exception as exc:
         fail(f"memory settings exposed {type(exc).__name__}: {exc!r}")
     fail(f"memory settings accepted invalid {key}")
+
+
+def _expect_unavailable(
+    operation: Callable[[], object],
+    *,
+    agent_name: str,
+    path: Path,
+) -> None:
+    try:
+        operation()
+    except MemoryUnavailable as exc:
+        message = str(exc)
+        if agent_name not in message or str(path) not in message:
+            fail(f"MemoryUnavailable omitted agent name or path: {message!r}")
+        if not isinstance(exc, RuntimeError) or not isinstance(exc.__cause__, OSError):
+            fail("MemoryUnavailable did not wrap an OSError as a RuntimeError")
+    except OSError as exc:
+        fail(f"memory operation leaked bare {type(exc).__name__}: {exc}")
+    else:
+        fail("unavailable memory operation returned normally")
 
 
 @check("agent_memory.read_write_and_order")
@@ -130,27 +179,40 @@ def refuses_bad_entries() -> None:
 @check("agent_memory.forget_and_isolation")
 def forget_and_isolation() -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        base = Path(temporary)
+        base = Path(temporary).resolve()
         root = base / "memory"
         store = AgentMemory(root)
-        values = {
-            "reviewer": "lower",
-            "Reviewer": "upper",
-        }
-        for index, (agent_name, text) in enumerate(values.items()):
+        long_name = "l" * 250
+        long_entry = store.write(long_name, "long name", run_id="run-long")
+        if store.read(long_name) != (long_entry,):
+            fail("a 250-character agent name did not round-trip memory")
+        store.forget(long_name)
+        if store.read(long_name) != ():
+            fail("forget failed for a 250-character agent name")
+
+        length_names = ("x", "x" * 124, "x" * 125, long_name, "x" * 10_000)
+        names = (*ADVERSARIAL_NAMES, *length_names)
+        if len(ADVERSARIAL_NAMES) != 22 or len(set(names)) != len(names):
+            fail("adversarial and length enumeration is incomplete or duplicated")
+        paths = [store._path(agent_name) for agent_name in names]
+        if len(set(paths)) != len(paths):
+            fail("distinct agent names shared a memory path")
+        for index, agent_name in enumerate(names):
+            text = f"entry-{index}"
             store.write(agent_name, text, run_id=f"run-{index}")
-        store.write("../escaped", "traversal", run_id="run-traversal")
-        outside = base / "escaped.json"
-        if outside.exists():
-            fail(f"agent name wrote a memory file outside root: {outside!s}")
-        store.write("nested/name", "separator", run_id="run-separator")
-        values["../escaped"] = "traversal"
-        values["nested/name"] = "separator"
-        for agent_name, text in values.items():
             entries = store.read(agent_name)
             if len(entries) != 1 or entries[0].text != text:
                 fail(f"agent memories shared storage: {agent_name!r}, {entries!r}")
-        for file in base.rglob("*.json"):
+
+        path_probes = ("p", "p" * 100, long_name, "p" * 10_000, "multi-byte-한")
+        for agent_name in path_probes:
+            path = store._path(agent_name)
+            if path.parent != root or not MEMORY_FILENAME.fullmatch(path.name):
+                fail(f"agent name did not produce a fixed-width safe path: {path!s}")
+        files = list(base.rglob("*.json"))
+        if len(files) != len(names):
+            fail(f"enumerated names did not produce one file each: {files!r}")
+        for file in files:
             try:
                 file.relative_to(root)
             except ValueError:
@@ -159,7 +221,8 @@ def forget_and_isolation() -> None:
         store.forget("reviewer")
         if store.read("reviewer") != ():
             fail("forget did not remove the selected agent")
-        if store.read("Reviewer")[0].text != "upper":
+        case_distinct = store.read("Reviewer")
+        if len(case_distinct) != 1 or case_distinct[0].agent_name != "Reviewer":
             fail("forget disturbed a case-distinct agent")
 
 
@@ -179,6 +242,36 @@ def corrupt_file_is_inert() -> None:
             fail("corrupt memory did not read as empty")
         if not path.exists() or path.read_bytes() != corrupt:
             fail("reading corrupt memory changed or deleted the file")
+
+        unavailable_root = Path(temporary) / "unavailable"
+        unavailable = AgentMemory(unavailable_root)
+        original_mode = stat.S_IMODE(unavailable_root.stat().st_mode)
+        write_agent = "write failure"
+        write_path = unavailable._path(write_agent)
+        unavailable_root.chmod(0o500)
+        try:
+            _expect_unavailable(
+                lambda: unavailable.write(write_agent, "note", run_id="run-write"),
+                agent_name=write_agent,
+                path=write_path,
+            )
+        finally:
+            unavailable_root.chmod(original_mode)
+
+        forget_agent = "forget failure"
+        unavailable.write(forget_agent, "note", run_id="run-forget")
+        forget_path = unavailable._path(forget_agent)
+        unavailable_root.chmod(0o500)
+        try:
+            _expect_unavailable(
+                lambda: unavailable.forget(forget_agent),
+                agent_name=forget_agent,
+                path=forget_path,
+            )
+        finally:
+            unavailable_root.chmod(original_mode)
+        if not forget_path.exists():
+            fail("failed forget unexpectedly removed the memory file")
 
 
 @check("agent_memory.settings_from_the_file")
