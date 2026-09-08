@@ -19,6 +19,7 @@ from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.trust import TrustList
 
 if TYPE_CHECKING:
     from symphonai_api.cancellation import CancellationToken
@@ -69,11 +70,21 @@ def _positive_timeout(
     return timeout
 
 
-def mcp_servers_from_config(config: ResolvedConfig) -> tuple[McpServerSpec, ...]:
+def mcp_servers_from_config(
+    config: ResolvedConfig,
+    *,
+    repo_root: Path | None = None,
+    trust: TrustList | None = None,
+) -> tuple[McpServerSpec, ...]:
     """Parse the winning ``mcp.servers`` list with its scope provenance."""
     value = config.get("mcp.servers", [])
     origin = config.provenance.get("mcp.servers")
     source = origin.source if origin is not None else None
+    trust_root = (
+        "<unspecified>"
+        if repo_root is None
+        else repr(str(Path(repo_root).resolve()))
+    )
     if not isinstance(value, list):
         raise _config_error(source, "mcp.servers", "must be an array of tables")
 
@@ -119,12 +130,19 @@ def mcp_servers_from_config(config: ResolvedConfig) -> tuple[McpServerSpec, ...]
             enabled
             and origin is not None
             and origin.scope in (Scope.PROJECT, Scope.PRIVATE)
+            and not (
+                repo_root is not None
+                and trust is not None
+                and trust.allows(repo_root, "mcp")
+            )
         ):
             raise _config_error(
                 source,
                 f"{key}.enabled",
                 f"repository server {name!r} may be declared here, but only "
-                "~/.symphonai/config.toml or session configuration may enable it",
+                "~/.symphonai/config.toml or session configuration may enable it; "
+                f"the machine owner may grant {trust_root} "
+                "under [[trust.repositories]]",
             )
         startup_timeout = _positive_timeout(
             source,

@@ -304,6 +304,7 @@ def main() -> None:
         "hooks.blocking_fail_closed",
         "hooks.agent_veto",
         "hooks.none_is_unchanged_and_imports",
+        "hooks.trust_grants_a_repository",
         "skills.load_and_measure",
         "skills.measured_text_is_reachable",
         "skills.roster_cost",
@@ -410,6 +411,11 @@ def main() -> None:
         "mcp.protocol_failures_are_bounded",
         "mcp.close_is_idempotent",
         "mcp.import_boundary",
+        "mcp.trust_grants_a_repository",
+        "trust.owner_only",
+        "trust.vocabulary_and_shape",
+        "trust.matching_is_exact",
+        "trust.no_runtime_imports",
         "agent_file.minimal_and_full",
         "agent_file.unknown_and_forbidden_keys",
         "agent_file.money_is_a_string",
@@ -637,7 +643,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "557 passed, 0 failed, 557 selected of 557 registered",
+        == "563 passed, 0 failed, 563 selected of 563 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -685,7 +691,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 557 registered"
+                "of 563 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

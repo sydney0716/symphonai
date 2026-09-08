@@ -65,7 +65,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust")
 _VALID_MODES = {"auto", "prompt", "plan", "accept_edits"}
 
 

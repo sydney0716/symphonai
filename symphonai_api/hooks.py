@@ -14,6 +14,7 @@ from pathlib import Path
 
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.events import Event
+from symphonai_api.trust import TrustList
 
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
@@ -64,16 +65,21 @@ def hooks_from_config(
     config: ResolvedConfig,
     *,
     repo_root: Path,
+    trust: TrustList | None = None,
 ) -> tuple[HookSpec, ...]:
     """Parse the resolved hook array and retain its winning provenance."""
-    del repo_root  # Commands run relative to the runner's cwd, not while parsing.
     raw_hooks = config.get("hooks", [])
     origin = config.provenance.get("hooks")
     source = origin.source if origin is not None else None
-    if origin is not None and origin.scope in (Scope.PROJECT, Scope.PRIVATE):
+    if (
+        origin is not None
+        and origin.scope in (Scope.PROJECT, Scope.PRIVATE)
+        and not (trust is not None and trust.allows(repo_root, "hooks"))
+    ):
         raise ConfigError(
             f"{source}: hooks: hooks are not read from configuration inside "
-            "a repository; define them in ~/.symphonai/config.toml"
+            "a repository; define them in ~/.symphonai/config.toml or grant "
+            f"{str(Path(repo_root).resolve())!r} under [[trust.repositories]]"
         )
     if not isinstance(raw_hooks, list):
         raise _config_error(source, 0, "hooks", "must be an array of tables")

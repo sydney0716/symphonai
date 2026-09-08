@@ -30,6 +30,7 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect
+from symphonai_api.trust import RepositoryTrust, TrustList
 from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
@@ -703,3 +704,90 @@ def import_boundary() -> None:
         )
     if forbidden:
         fail(f"mcp.py imports forbidden runtime modules: {sorted(set(forbidden))!r}")
+
+
+@check("mcp.trust_grants_a_repository")
+def trust_grants_a_repository() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        repo_root = base / "repo"
+        home = base / "home"
+        source = repo_root / ".symphonai" / "config.toml"
+        _write(source, _server_table(enabled=True))
+        config = load_config(repo_root=repo_root, home=home)
+        exact_mcp = TrustList(
+            (
+                RepositoryTrust(
+                    repo_root.resolve(),
+                    frozenset(("mcp",)),
+                    None,
+                ),
+            )
+        )
+        cases = (
+            (repo_root, None),
+            (repo_root, TrustList()),
+            (
+                repo_root,
+                TrustList(
+                    (
+                        RepositoryTrust(
+                            (base / "other").resolve(),
+                            frozenset(("mcp",)),
+                            None,
+                        ),
+                    )
+                ),
+            ),
+            (
+                repo_root,
+                TrustList(
+                    (
+                        RepositoryTrust(
+                            repo_root.resolve(),
+                            frozenset(("hooks",)),
+                            None,
+                        ),
+                    )
+                ),
+            ),
+            (None, exact_mcp),
+        )
+        for candidate_root, trust in cases:
+            try:
+                mcp_servers_from_config(
+                    config,
+                    repo_root=candidate_root,
+                    trust=trust,
+                )
+            except ConfigError as exc:
+                message = str(exc)
+                required = (
+                    str(source),
+                    "docs",
+                    "~/.symphonai/config.toml",
+                    "[[trust.repositories]]",
+                )
+                if not all(fragment in message for fragment in required):
+                    fail(f"MCP trust refusal was incomplete: {message!r}")
+            else:
+                fail(
+                    "project MCP server accepted insufficient trust: "
+                    f"root={candidate_root!r}, trust={trust!r}"
+                )
+
+        actual = mcp_servers_from_config(
+            config,
+            repo_root=repo_root,
+            trust=exact_mcp,
+        )
+        expected = (
+            McpServerSpec(
+                name="docs",
+                command=("fake-server", "--stdio"),
+                enabled=True,
+                source=source,
+            ),
+        )
+        if actual != expected:
+            fail(f"trusted project MCP server parsed incorrectly: {actual!r}")

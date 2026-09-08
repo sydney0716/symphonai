@@ -25,6 +25,7 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.trust import RepositoryTrust, TrustList
 from scripts.checks.harness import check, fail
 
 
@@ -691,3 +692,78 @@ def none_is_unchanged_and_imports() -> None:
         for node in ast.walk(check_tree)
     ):
         fail("hooks checks use time.sleep")
+
+
+@check("hooks.trust_grants_a_repository")
+def trust_grants_a_repository() -> None:
+    repo_toml = (
+        '[[hooks]]\non = ["RunFinished"]\ncommand = ["./repo-hook"]\n'
+    )
+    for scope in (Scope.PROJECT, Scope.PRIVATE):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo_root = base / "repo"
+            home = base / "home"
+            source = _scope_path(scope, repo_root, home)
+            _write_config(source, repo_toml)
+            config = load_config(repo_root=repo_root, home=home)
+            grants = (
+                None,
+                TrustList(),
+                TrustList(
+                    (
+                        RepositoryTrust(
+                            (base / "other").resolve(),
+                            frozenset(("hooks",)),
+                            None,
+                        ),
+                    )
+                ),
+                TrustList(
+                    (
+                        RepositoryTrust(
+                            repo_root.resolve(),
+                            frozenset(("mcp",)),
+                            None,
+                        ),
+                    )
+                ),
+            )
+            for trust in grants:
+                try:
+                    hooks_from_config(config, repo_root=repo_root, trust=trust)
+                except ConfigError as exc:
+                    message = str(exc)
+                    required = (
+                        str(source),
+                        "inside a repository",
+                        "~/.symphonai/config.toml",
+                        "[[trust.repositories]]",
+                    )
+                    if not all(fragment in message for fragment in required):
+                        fail(f"{scope.value} trust refusal was incomplete: {message!r}")
+                else:
+                    fail(f"{scope.value} hooks accepted insufficient trust: {trust!r}")
+
+            trust = TrustList(
+                (
+                    RepositoryTrust(
+                        repo_root.resolve(),
+                        frozenset(("hooks",)),
+                        None,
+                    ),
+                )
+            )
+            actual = hooks_from_config(config, repo_root=repo_root, trust=trust)
+            expected = (
+                HookSpec(
+                    ("RunFinished",),
+                    ("./repo-hook",),
+                    source=source,
+                ),
+            )
+            if actual != expected:
+                fail(
+                    f"{scope.value} hooks did not parse after exact trust grant: "
+                    f"{actual!r}"
+                )
