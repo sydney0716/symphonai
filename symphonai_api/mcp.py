@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 
 _CLEANUP_TIMEOUT_SECONDS = 0.2
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+# Both OpenAI and Anthropic require this function-name shape.
+_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SERVER_KEYS = {
     "name",
     "command",
@@ -430,6 +433,12 @@ class McpClient:
                 description=description,
                 parameters=dict(parameters),
             )
+            if _TOOL_NAME_PATTERN.fullmatch(adapted.name) is None:
+                raise McpError(
+                    f"MCP server {self.spec.name!r} tool {tool_name!r} composes "
+                    f"unusable name {adapted.name!r}; expected "
+                    "^[a-zA-Z0-9_-]{1,64}$"
+                )
             if adapted.name in self._reserved_names:
                 raise McpError(
                     f"MCP server {self.spec.name!r} tool {tool_name!r} collides "

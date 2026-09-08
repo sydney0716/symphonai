@@ -413,6 +413,69 @@ def reserved_names_are_injected() -> None:
             unrestricted.close()
 
 
+@check("mcp.namespaced_name_shape")
+def namespaced_name_shape() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        script = _write_fake(directory)
+        invalid_names = (
+            "bad.tool",
+            "bad tool",
+            "x" * 60,
+        )
+        accepted = []
+        for tool_name in invalid_names:
+            client = McpClient(
+                _spec(script, tool=tool_name),
+                cwd=directory,
+            )
+            composed = f"mcp__docs__{tool_name}"
+            try:
+                client.start()
+                try:
+                    client.list_tools()
+                except McpError as exc:
+                    message = str(exc)
+                    required = ("docs", repr(tool_name), repr(composed), "1,64")
+                    if not all(fragment in message for fragment in required):
+                        fail(f"name-shape error omitted {required!r}: {message!r}")
+                else:
+                    accepted.append(tool_name)
+            finally:
+                client.close()
+        if accepted:
+            fail(f"MCP accepted unusable names: {accepted!r}")
+
+        malformed = "bad.tool"
+        composed = f"mcp__docs__{malformed}"
+        collision = McpClient(
+            _spec(script, tool=malformed),
+            cwd=directory,
+            reserved_names={composed},
+        )
+        try:
+            collision.start()
+            try:
+                collision.list_tools()
+            except McpError as exc:
+                message = str(exc)
+                if "unusable name" not in message or "collides" in message:
+                    fail(f"reserved-name check ran before shape check: {message!r}")
+            else:
+                fail("malformed reserved name was accepted")
+        finally:
+            collision.close()
+
+        normal = McpClient(_spec(script), cwd=directory)
+        try:
+            normal.start()
+            tools = normal.list_tools()
+            if len(tools) != 1 or tools[0].name != "mcp__docs__search":
+                fail(f"ordinary config-loaded MCP name changed: {tools!r}")
+        finally:
+            normal.close()
+
+
 @check("mcp.policy_modes_fail_closed")
 def policy_modes_fail_closed() -> None:
     with tempfile.TemporaryDirectory() as temporary:

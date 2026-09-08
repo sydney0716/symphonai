@@ -404,6 +404,7 @@ def main() -> None:
         "mcp.owner_scope_controls_enablement",
         "mcp.handshake_tools_and_namespaces",
         "mcp.reserved_names_are_injected",
+        "mcp.namespaced_name_shape",
         "mcp.policy_modes_fail_closed",
         "mcp.refusals_are_observed",
         "mcp.startup_timeout_kills_tree",
@@ -416,6 +417,15 @@ def main() -> None:
         "trust.vocabulary_and_shape",
         "trust.matching_is_exact",
         "trust.no_runtime_imports",
+        "plugins.all_members_use_existing_loaders",
+        "plugins.optional_members",
+        "plugins.manifest_validation",
+        "plugins.member_failures_are_atomic",
+        "plugins.namespaces_do_not_shadow",
+        "plugins.composed_mcp_names_are_usable",
+        "plugins.hooks_append_in_plugin_order",
+        "plugins.agent_ceiling_is_forwarded",
+        "plugins.directory_and_import_boundary",
         "agent_file.minimal_and_full",
         "agent_file.unknown_and_forbidden_keys",
         "agent_file.money_is_a_string",
@@ -643,7 +653,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "563 passed, 0 failed, 563 selected of 563 registered",
+        == "573 passed, 0 failed, 573 selected of 573 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -691,7 +701,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 563 registered"
+                "of 573 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
