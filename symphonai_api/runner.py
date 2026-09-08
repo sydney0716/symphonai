@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
+from symphonai_api.extensions import Extensions
 from symphonai_api.instructions import load_instructions
 from symphonai_api.identity import new_agent_ref
 from symphonai_api.models import Message, Role
@@ -97,6 +98,7 @@ def run_task(
     search_backend: SearchBackend | None = None,
     session: SessionStore | None = None,
     stream: bool = False,
+    extensions: Extensions | None = None,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -128,6 +130,11 @@ def run_task(
         result_store=result_store,
         search_backend=search_backend,
     )
+    hook_runner = (
+        None
+        if extensions is None
+        else extensions.hook_runner(cwd=policy.repo_root)
+    )
     agent_ref = new_agent_ref("agent")
     agent = ApiAgent(
         provider=provider,
@@ -144,8 +151,9 @@ def run_task(
             else session.writer_for(agent_ref.agent_id, is_root=True)
         ),
         stream=stream,
+        events=hook_runner,
     )
-    return agent.run(messages, model=model, cancel=cancel)
+    return agent.run(messages, model=model, cancel=cancel, hooks=hook_runner)
 
 
 def resume_task(

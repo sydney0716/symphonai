@@ -143,6 +143,21 @@ def emit(sink: EventSink | None, event: Event) -> None:
         pass
 
 
+def fan_out(*sinks: EventSink | None) -> EventSink | None:
+    """One sink delivering to each of `sinks`, or None when all are None."""
+    active = tuple(sink for sink in sinks if sink is not None)
+    if not active:
+        return None
+    if len(active) == 1:
+        return active[0]
+
+    def deliver(event: Event) -> None:
+        for sink in active:
+            emit(sink, event)
+
+    return deliver
+
+
 class CollectingSink:
     """An event sink that records events in order for tests and debugging."""
 

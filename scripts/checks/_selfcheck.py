@@ -280,6 +280,7 @@ def main() -> None:
         "budget.stop_answers_every_tool_call",
         "budget.subagents_have_their_own",
         "budget.run_task_forwards",
+        "events.fan_out",
         "events.final_identity",
         "events.tool_bracketing",
         "events.provider_failure",
@@ -400,6 +401,14 @@ def main() -> None:
         "agent_spec.validate_output_never_raises",
         "agent_spec.with_overrides",
         "agent_spec.no_runtime_imports",
+        "extensions.load_real_config",
+        "extensions.errors_are_atomic",
+        "extensions.empty_and_runner",
+        "extensions.run_task_default",
+        "extensions.run_task_hooks",
+        "extensions.ceiling_composes",
+        "extensions.leader_hooks",
+        "extensions.leader_default_and_imports",
         "mcp.config_parsing_and_disabled_default",
         "mcp.owner_scope_controls_enablement",
         "mcp.handshake_tools_and_namespaces",
@@ -653,7 +662,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "573 passed, 0 failed, 573 selected of 573 registered",
+        == "582 passed, 0 failed, 582 selected of 582 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -701,7 +710,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 573 registered"
+                "of 582 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

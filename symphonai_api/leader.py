@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from symphonai_api.agent_run import (
     AgentRun,
@@ -58,7 +60,10 @@ from symphonai_api.events import (
     SubagentStopped,
     ToolCallStarted,
     emit,
+    fan_out,
 )
+from symphonai_api.extensions import Extensions
+from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import AgentRef, RunRef, new_agent_ref
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import Message, Role, ToolCall, ToolResult
@@ -208,6 +213,7 @@ class DispatchSubagentTool(LocalTool):
         leases: WorkspaceLeases | None = None,
         parent_run: AgentRun | None = None,
         dispatching_depth: int = -1,
+        hooks: HookRunner | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -227,6 +233,7 @@ class DispatchSubagentTool(LocalTool):
         self._parent_run = parent_run
         self._parent_messages: list[Message] = []
         self._dispatching_depth = dispatching_depth
+        self._hooks = hooks
         self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
@@ -467,6 +474,7 @@ class DispatchSubagentTool(LocalTool):
                         else self._parent_run.run.run_id
                     ),
                     cancel=token,
+                    hooks=self._hooks,
                 )
         except LeaseConflict as exc:
             failure = str(exc)
@@ -577,6 +585,7 @@ class LeaderConfig:
     events: EventSink | None = None
     max_consecutive_compaction_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
     max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
+    extensions: Extensions | None = None
 
 
 @dataclass
@@ -606,7 +615,14 @@ class Leader:
         self._config = config
         self._session = session
         self._agent_ref = new_agent_ref("leader")
-        self._event_sink = _LeaderEventSink(config.events)
+        self._hook_runner = (
+            None
+            if config.extensions is None
+            else config.extensions.hook_runner(cwd=Path(config.repo_root))
+        )
+        self._event_sink = _LeaderEventSink(
+            fan_out(config.events, self._hook_runner)
+        )
         self._last_run_id: str | None = None
         leader_policy = PermissionPolicy(
             repo_root=config.repo_root,
@@ -643,6 +659,7 @@ class Leader:
             session=session,
             subagent_specs=config.subagent_specs,
             leases=self._leases,
+            hooks=self._hook_runner,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         self._agent = ApiAgent(
@@ -690,7 +707,11 @@ class Leader:
         self._leader_run = leader_run
         self._dispatch_tool.set_parent_context(leader_run, list(messages))
         try:
-            result = self._agent.run(messages, cancel=cancel)
+            result = self._agent.run(
+                messages,
+                cancel=cancel,
+                hooks=self._hook_runner,
+            )
         except OperationCancelled:
             leader_run.cancel()
             raise

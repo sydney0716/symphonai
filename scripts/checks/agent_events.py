@@ -27,6 +27,7 @@ from symphonai_api.events import (
     ToolCallStarted,
     TurnFinished,
     TurnStarted,
+    fan_out,
 )
 from symphonai_api.identity import SCHEMA_VERSION, TurnRef
 from symphonai_api.leader import Leader, LeaderConfig
@@ -53,6 +54,37 @@ class _RaisingProvider(ModelProvider):
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
     ) -> ModelResponse:
         raise ProviderError("event test failure")
+
+
+@check("events.fan_out")
+def check_fan_out() -> None:
+    event = Event(agent_id="agent", run_id="run")
+    if fan_out(None, None) is not None:
+        fail("all-None fan_out did not preserve the absence of a sink")
+
+    single = CollectingSink()
+    if fan_out(None, single, None) is not single:
+        fail("fan_out wrapped a single sink")
+
+    calls: list[str] = []
+
+    def raising(_: Event) -> None:
+        calls.append("raising")
+        raise RuntimeError("observer failed")
+
+    def second(_: Event) -> None:
+        calls.append("second")
+
+    def third(_: Event) -> None:
+        calls.append("third")
+
+    combined = fan_out(raising, second, third)
+    if combined is None:
+        fail("fan_out dropped three live sinks")
+    combined(event)
+    if calls != ["raising", "second", "third"]:
+        fail(f"fan_out did not isolate sinks in argument order: {calls!r}")
+
 
 @check("events.final_identity")
 def check_events_final_identity() -> None:
