@@ -162,12 +162,18 @@ def load_from_a_real_file() -> None:
             )
             if resolved.scope_of("hooks") is not scope:
                 fail(f"{scope.value} hooks had the wrong provenance")
-            if scope is Scope.PROJECT:
+            if scope in (Scope.PROJECT, Scope.PRIVATE):
                 try:
                     hooks_from_config(resolved, repo_root=repo_root)
-                except ConfigError:
+                except ConfigError as exc:
+                    message = str(exc)
+                    if (
+                        str(source) not in message
+                        or "inside a repository" not in message
+                    ):
+                        fail(f"{scope.value} refusal was incomplete: {message!r}")
                     continue
-                fail("project hooks loaded from a real file")
+                fail(f"{scope.value} hooks loaded from a real file")
             expected = (
                 HookSpec(
                     ("RunStarted",),
@@ -287,39 +293,53 @@ def pre_tool_requires_blocking() -> None:
 
 @check("hooks.project_scope_is_refused")
 def project_scope_is_refused() -> None:
-    project_toml = (
-        '[[hooks]]\non = ["RunFinished"]\ncommand = ["./project-hook"]\n'
+    repo_toml = (
+        '[[hooks]]\non = ["RunFinished"]\ncommand = ["./repo-hook"]\n'
     )
-    for user_present in (False, True):
-        with tempfile.TemporaryDirectory() as temporary:
-            repo_root = Path(temporary) / "repo"
-            home = Path(temporary) / "home"
-            project_path = _scope_path(Scope.PROJECT, repo_root, home)
-            _write_config(project_path, project_toml)
-            if user_present:
-                user_path = _scope_path(Scope.USER, repo_root, home)
-                _write_config(
-                    user_path,
-                    '[[hooks]]\non = ["RunStarted"]\ncommand = ["./user-hook"]\n',
-                )
-            resolved = load_config(repo_root=repo_root, home=home)
-            if resolved.scope_of("hooks") is not Scope.PROJECT:
-                fail("project hooks did not win over the lower user scope")
-            try:
-                hooks_from_config(resolved, repo_root=repo_root)
-            except ConfigError as exc:
-                message = str(exc)
-                required = (
-                    str(project_path),
-                    "repository-committed",
-                    "~/.symphonai/config.toml",
-                    ".symphonai/config.local.toml",
-                )
-                if not all(fragment in message for fragment in required):
-                    fail(f"project hook refusal was incomplete: {message!r}")
-            else:
-                detail = " over user hooks" if user_present else ""
-                fail(f"project hooks were honoured{detail}")
+    user_toml = '[[hooks]]\non = ["RunStarted"]\ncommand = ["./user-hook"]\n'
+    for scope in (Scope.PROJECT, Scope.PRIVATE):
+        for user_present in (False, True):
+            with tempfile.TemporaryDirectory() as temporary:
+                repo_root = Path(temporary) / "repo"
+                home = Path(temporary) / "home"
+                source = _scope_path(scope, repo_root, home)
+                _write_config(source, repo_toml)
+                if user_present:
+                    _write_config(
+                        _scope_path(Scope.USER, repo_root, home),
+                        user_toml,
+                    )
+                resolved = load_config(repo_root=repo_root, home=home)
+                if resolved.scope_of("hooks") is not scope:
+                    fail(f"{scope.value} hooks did not win over user hooks")
+                try:
+                    hooks_from_config(resolved, repo_root=repo_root)
+                except ConfigError as exc:
+                    message = str(exc)
+                    required = (
+                        str(source),
+                        "inside a repository",
+                        "~/.symphonai/config.toml",
+                    )
+                    if not all(fragment in message for fragment in required):
+                        fail(f"{scope.value} hook refusal was incomplete: {message!r}")
+                    guidance = message.removeprefix(str(source))
+                    if ".symphonai/config.local.toml" in guidance:
+                        fail(f"private config was advertised as trusted: {message!r}")
+                else:
+                    detail = " over user hooks" if user_present else ""
+                    fail(f"{scope.value} hooks were honoured{detail}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root = Path(temporary) / "repo"
+        home = Path(temporary) / "home"
+        user_path = _scope_path(Scope.USER, repo_root, home)
+        _write_config(user_path, user_toml)
+        resolved = load_config(repo_root=repo_root, home=home)
+        expected = (HookSpec(("RunStarted",), ("./user-hook",), source=user_path),)
+        actual = hooks_from_config(resolved, repo_root=repo_root)
+        if actual != expected:
+            fail(f"user hooks without a repository winner differed: {actual!r}")
 
 
 @check("hooks.exact_matching_and_sink")

@@ -17,4 +17,7 @@ build/
 .env.*
 !.env.example
 
+# Developer's local SymphonAI configuration
+.symphonai/config.local.toml
+
 ref/

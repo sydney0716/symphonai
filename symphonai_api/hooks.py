@@ -70,11 +70,10 @@ def hooks_from_config(
     raw_hooks = config.get("hooks", [])
     origin = config.provenance.get("hooks")
     source = origin.source if origin is not None else None
-    if origin is not None and origin.scope is Scope.PROJECT:
+    if origin is not None and origin.scope in (Scope.PROJECT, Scope.PRIVATE):
         raise ConfigError(
-            f"{source}: hooks: hooks are not read from a repository-committed "
-            "config; move them to ~/.symphonai/config.toml or "
-            ".symphonai/config.local.toml"
+            f"{source}: hooks: hooks are not read from configuration inside "
+            "a repository; define them in ~/.symphonai/config.toml"
         )
     if not isinstance(raw_hooks, list):
         raise _config_error(source, 0, "hooks", "must be an array of tables")
