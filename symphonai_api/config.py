@@ -118,9 +118,6 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
-    for section in _SECTIONS:
-        if section != "agents" and section in values:
-            _table(source, values, section)
     agents = _table(source, values, "agents")
     if agents is None:
         return

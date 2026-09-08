@@ -824,3 +824,104 @@ def sections_are_open() -> None:
                     fail(f"unknown session key lacked source or key: {exc!r}")
             else:
                 fail(f"unknown session key was accepted: {key}")
+
+
+@check("config.sections_hold_any_shape")
+def sections_hold_any_shape() -> None:
+    sections = ("hooks", "skills", "mcp", "plugins")
+    shapes = (
+        (
+            "table",
+            '[{section}]\nvalue = "table"\n',
+            {"value": "table"},
+            "{section}.value",
+            "table",
+        ),
+        (
+            "array of tables",
+            '[[{section}]]\nvalue = "array-table"\n',
+            [{"value": "array-table"}],
+            "{section}",
+            [{"value": "array-table"}],
+        ),
+        (
+            "flat array",
+            "{section} = [1, 2]\n",
+            [1, 2],
+            "{section}",
+            [1, 2],
+        ),
+        (
+            "scalar",
+            '{section} = "scalar"\n',
+            "scalar",
+            "{section}",
+            "scalar",
+        ),
+    )
+    for scope in Scope:
+        for section in sections:
+            for shape, toml, session_value, key_template, expected in shapes:
+                with tempfile.TemporaryDirectory() as temporary:
+                    repo_root, home = _roots(temporary)
+                    if scope is Scope.SESSION:
+                        source = None
+                        session = {section: session_value}
+                    else:
+                        source = _scope_path(scope, repo_root, home)
+                        _write(source, toml.format(section=section))
+                        session = None
+                    resolved = load_config(
+                        repo_root=repo_root,
+                        home=home,
+                        session=session,
+                    )
+                    key = key_template.format(section=section)
+                    if resolved.get(key) != expected:
+                        fail(
+                            f"{scope.value} {section} {shape} did not flatten: "
+                            f"{resolved.values!r}"
+                        )
+                    if resolved.provenance.get(key) != Provenance(key, scope, source):
+                        fail(
+                            f"{scope.value} {section} {shape} provenance differed"
+                        )
+
+    invalid_agents = (
+        ({"agents": {"unknown": True}}, "agents.unknown"),
+        ({"agents": {"ceiling": {"unknown": True}}}, "agents.ceiling.unknown"),
+        ({"agents": {"directory": ["not", "a", "string"]}}, "agents.directory"),
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        for session, key in invalid_agents:
+            try:
+                load_config(repo_root=repo_root, home=home, session=session)
+            except ConfigError as exc:
+                if "<session>" not in str(exc) or key not in str(exc):
+                    fail(f"invalid agents value lacked source or key: {exc!r}")
+            else:
+                fail(f"invalid agents value was accepted: {key}")
+
+        unknown_path = _scope_path(Scope.USER, repo_root, home)
+        _write(unknown_path, 'outside = "reserved sections"\n')
+        try:
+            load_config(repo_root=repo_root, home=home)
+        except ConfigError as exc:
+            if str(unknown_path) not in str(exc) or "outside" not in str(exc):
+                fail(f"unknown file key lacked source or key: {exc!r}")
+        else:
+            fail("unknown top-level file key was accepted")
+        unknown_path.unlink()
+
+        try:
+            load_config(
+                repo_root=repo_root,
+                home=home,
+                session={"outside": "reserved sections"},
+            )
+        except ConfigError as exc:
+            if "<session>" not in str(exc) or "outside" not in str(exc):
+                fail(f"unknown session key lacked source or key: {exc!r}")
+        else:
+            fail("unknown top-level session key was accepted")

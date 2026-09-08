@@ -292,6 +292,18 @@ def main() -> None:
         "events.subagent_stopped",
         "events.new_sink_isolation",
         "events.dropping_all_changes_nothing",
+        "hooks.config_parsing",
+        "hooks.load_from_a_real_file",
+        "hooks.config_rejections",
+        "hooks.pre_tool_requires_blocking",
+        "hooks.project_scope_is_refused",
+        "hooks.exact_matching_and_sink",
+        "hooks.configuration_order",
+        "hooks.observation_isolation",
+        "hooks.timeout_kills_process_group",
+        "hooks.blocking_fail_closed",
+        "hooks.agent_veto",
+        "hooks.none_is_unchanged_and_imports",
         "host_protocol.encodes_every_event",
         "host_protocol.round_trip_events",
         "host_protocol.unknown_type_preserved",
@@ -400,6 +412,7 @@ def main() -> None:
         "config.shell_allowlist_uses_prefixes",
         "config.refusal_agrees_with_narrowing",
         "config.sections_are_open",
+        "config.sections_hold_any_shape",
         "agent_memory.read_write_and_order",
         "agent_memory.bounds_drop_oldest",
         "agent_memory.refuses_bad_entries",
@@ -603,7 +616,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "523 passed, 0 failed, 523 selected of 523 registered",
+        == "536 passed, 0 failed, 536 selected of 536 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -651,7 +664,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 523 registered"
+                "of 536 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
@@ -674,31 +687,27 @@ def main() -> None:
         f"unexpected filtered breaker list: {listed_breakers.stdout!r}",
     )
 
+    shell_selected = [name for name in expected_names if "shell" in name.lower()]
     for selector in ("shell", "SHELL"):
         selected = invoke_check("--only", selector)
         require(selected.returncode == 0, f"selector {selector!r} failed")
         selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1] == "12 passed, 0 failed, 12 selected of 523 registered",
+            selected_lines[-1]
+            == (
+                f"{len(shell_selected)} passed, 0 failed, "
+                f"{len(shell_selected)} selected of {len(expected_names)} registered"
+            ),
             f"unexpected selector summary: {selected.stdout!r}",
         )
         require(
-            [line.removeprefix("PASS  ") for line in selected_lines if line.startswith("PASS  ")]
-            == [
-                "shell.classify_table",
-                "shell.metadata_contract",
-                "shell.metadata_fails_closed",
-                "shell.permission_not_granted",
-                "permissions.shell_disabled",
-                "permissions.shell_always_denied",
-                "permissions.narrow_shell_and_fetch",
-                "shell.process_group_fallback",
-                "shell.cancellation_reaps_child",
-                "shell.cancellation_kills_group",
-                "shell.cancellation_bounded",
-                "shell.execution_paths",
-            ],
-            f"unexpected selected checks: {selected.stdout!r}",
+            [
+                line.removeprefix("PASS  ")
+                for line in selected_lines
+                if line.startswith("PASS  ")
+            ]
+            == shell_selected,
+            f"selector {selector!r} returned unexpected names: {selected.stdout!r}",
         )
 
     missing = invoke_check("--only", "nosuchthing")

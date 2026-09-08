@@ -42,6 +42,7 @@ from symphonai_api.identity import (
     new_run_ref,
     new_turn_ref,
 )
+from symphonai_api.hooks import HookRunner
 from symphonai_api.agent_run import AgentRun, PauseGate
 from symphonai_api.models import (
     Message,
@@ -138,6 +139,9 @@ class ApiAgent:
         event_sink: EventSink | None,
         run_id: str,
         turn_id: str,
+        hooks: HookRunner | None,
+        *,
+        catch_exceptions: bool = True,
     ) -> ToolResult:
         tool = self._tools.get(tool_call.name)
         if tool is None:
@@ -155,10 +159,20 @@ class ApiAgent:
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
             ):
+                if hooks is not None:
+                    refusal = hooks.pre_tool(tool_call.name, tool_call.id)
+                    if refusal is not None:
+                        return ToolResult(
+                            tool_call_id=tool_call.id,
+                            ok=False,
+                            error=refusal,
+                        )
                 return tool.execute(tool_call, self._policy, cancel=cancel)
         except OperationCancelled:
             raise
         except Exception as exc:
+            if not catch_exceptions:
+                raise
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=False,
@@ -175,6 +189,7 @@ class ApiAgent:
         pause: PauseGate | None = None,
         run: AgentRun | None = None,
         events: EventSink | None = None,
+        hooks: HookRunner | None = None,
     ) -> AgentRunResult:
         run_ref = new_run_ref(self._agent_ref.agent_id, parent_run_id)
         event_sink = events if events is not None else self._events
@@ -457,25 +472,15 @@ class ApiAgent:
                     results: dict[int, ToolResult] = {}
                     if len(batch) == 1:
                         tool_call = batch[0]
-                        tool = self._tools.get(tool_call.name)
-                        if tool is None:
-                            results[0] = ToolResult(
-                                tool_call_id=tool_call.id,
-                                ok=False,
-                                error=f"unknown tool: {tool_call.name!r}",
-                            )
-                        else:
-                            with self._policy.event_context(
-                                event_sink,
-                                agent_id=self._agent_ref.agent_id,
-                                run_id=run_ref.run_id,
-                                turn_id=turn_ref.turn_id,
-                                tool_name=tool_call.name,
-                                tool_call_id=tool_call.id,
-                            ):
-                                results[0] = tool.execute(
-                                    tool_call, self._policy, cancel=cancel
-                                )
+                        results[0] = self._execute_tool_call(
+                            tool_call,
+                            cancel,
+                            event_sink,
+                            run_ref.run_id,
+                            turn_ref.turn_id,
+                            hooks,
+                            catch_exceptions=False,
+                        )
                     else:
                         executor = ThreadPoolExecutor(
                             max_workers=min(len(batch), MAX_TOOL_CONCURRENCY)
@@ -488,6 +493,7 @@ class ApiAgent:
                                 event_sink,
                                 run_ref.run_id,
                                 turn_ref.turn_id,
+                                hooks,
                             ): index
                             for index, tool_call in enumerate(batch)
                         }

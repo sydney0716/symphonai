@@ -27,8 +27,8 @@ from symphonai_api.providers.fake import FakeModelProvider
 from scripts.checks.harness import check, fail
 
 
-_DEFAULT_BASELINE_COMMIT = "ff3163a"
-_CONTROL_BASELINE_COMMIT = "ff3163a"
+_DEFAULT_BASELINE_COMMIT = "cad0e4aa1c2259ca26cc0748d373acd6ea2264b5"
+_CONTROL_BASELINE_COMMIT = "cad0e4aa1c2259ca26cc0748d373acd6ea2264b5"
 _DEFAULT_PRE_08D = (
     "final_response",
     1,
