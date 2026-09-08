@@ -399,6 +399,17 @@ def main() -> None:
         "agent_spec.validate_output_never_raises",
         "agent_spec.with_overrides",
         "agent_spec.no_runtime_imports",
+        "mcp.config_parsing_and_disabled_default",
+        "mcp.owner_scope_controls_enablement",
+        "mcp.handshake_tools_and_namespaces",
+        "mcp.reserved_names_are_injected",
+        "mcp.policy_modes_fail_closed",
+        "mcp.refusals_are_observed",
+        "mcp.startup_timeout_kills_tree",
+        "mcp.call_timeout_kills_tree",
+        "mcp.protocol_failures_are_bounded",
+        "mcp.close_is_idempotent",
+        "mcp.import_boundary",
         "agent_file.minimal_and_full",
         "agent_file.unknown_and_forbidden_keys",
         "agent_file.money_is_a_string",
@@ -541,6 +552,7 @@ def main() -> None:
         "permissions.narrow_is_idempotent_and_composes",
         "permissions.event_order",
         "permissions.events_preserve_decisions",
+        "permissions.opaque_tool_modes",
         "shell.process_group_fallback",
         "shell.cancellation_reaps_child",
         "shell.cancellation_kills_group",
@@ -625,7 +637,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "545 passed, 0 failed, 545 selected of 545 registered",
+        == "557 passed, 0 failed, 557 selected of 557 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -673,7 +685,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 545 registered"
+                "of 557 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

@@ -502,6 +502,28 @@ class PermissionPolicy:
             tool_name="run_shell",
         )
 
+    def check_opaque_tool(
+        self,
+        tool_name: str,
+        *,
+        target: str,
+        details: str = "",
+    ) -> PermissionDecision:
+        """Decide a call whose blast radius is not derivable from its arguments."""
+        if self.mode == "plan":
+            return self._deny(
+                "a read-only mode cannot permit an opaque effect",
+                denial=DenialReason.PLAN_MODE,
+                tool_name=tool_name,
+            )
+        if self.mode in ("prompt", "accept_edits"):
+            return self._ask_approval(
+                operation=tool_name,
+                target=target,
+                details=details,
+            )
+        return PermissionDecision.allow()
+
     def _ask_approval(
         self,
         *,

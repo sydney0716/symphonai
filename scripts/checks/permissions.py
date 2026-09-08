@@ -1038,3 +1038,84 @@ def permission_events_preserve_decisions() -> None:
                 fail(f"denial event reason was empty for {name}")
             if len(sink.of_type(PermissionRequested)) != expected_requests:
                 fail(f"request event count changed for {name}: {sink.events!r}")
+
+
+@check("permissions.opaque_tool_modes")
+def opaque_tool_modes() -> None:
+    frozen_denial_reasons = (
+        ("OUTSIDE_ROOT", "outside_root"),
+        ("FORBIDDEN_PATTERN", "forbidden_pattern"),
+        ("OUTSIDE_WRITE_SCOPE", "outside_write_scope"),
+        ("EMPTY_COMMAND", "empty_command"),
+        ("ALWAYS_DENY", "always_deny"),
+        ("SHELL_DISABLED", "shell_disabled"),
+        ("NOT_ALLOWLISTED", "not_allowlisted"),
+        ("NO_APPROVAL_CALLBACK", "no_approval_callback"),
+        ("APPROVAL_FAILED", "approval_failed"),
+        ("DENIED_BY_USER", "denied_by_user"),
+        ("INVALID_APPROVAL", "invalid_approval"),
+        ("PLAN_MODE", "plan_mode"),
+        ("UNSUPPORTED_SCHEME", "unsupported_scheme"),
+        ("BLOCKED_HOST", "blocked_host"),
+        ("DOMAIN_NOT_APPROVED", "domain_not_approved"),
+    )
+    actual_denial_reasons = tuple(
+        (member.name, member.value) for member in DenialReason
+    )
+    if actual_denial_reasons != frozen_denial_reasons:
+        fail(f"DenialReason members changed: {tuple(DenialReason)!r}")
+
+    callbacks = (
+        ("allow", lambda request: True),
+        ("deny", lambda request: False),
+        ("none", None),
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for mode in ("auto", "prompt", "plan", "accept_edits"):
+            for callback_name, callback in callbacks:
+                sink = CollectingSink()
+                policy = PermissionPolicy(
+                    repo_root=root,
+                    mode=mode,
+                    approval_callback=callback,
+                )
+                policy.attach_event_sink(
+                    sink,
+                    agent_id="agent-opaque",
+                    run_id=f"run-{mode}-{callback_name}",
+                )
+                decision = policy.check_opaque_tool(
+                    "mcp__docs__search",
+                    target="docs",
+                    details="call MCP tool 'search'",
+                )
+                requested = sink.of_type(PermissionRequested)
+                denied = sink.of_type(PermissionDenied)
+                if mode == "auto":
+                    expected = (True, None, 0, 0)
+                elif mode == "plan":
+                    expected = (False, DenialReason.PLAN_MODE, 0, 1)
+                elif callback_name == "allow":
+                    expected = (True, None, 1, 0)
+                elif callback_name == "deny":
+                    expected = (False, DenialReason.DENIED_BY_USER, 1, 1)
+                else:
+                    expected = (False, DenialReason.NO_APPROVAL_CALLBACK, 1, 1)
+                actual = (
+                    decision.allowed,
+                    decision.denial,
+                    len(requested),
+                    len(denied),
+                )
+                if actual != expected:
+                    fail(
+                        f"opaque permission cell {mode}/{callback_name} differed: "
+                        f"actual={actual!r}, expected={expected!r}, events={sink.events!r}"
+                    )
+                if denied and denied[0].tool_name != "mcp__docs__search":
+                    fail(f"opaque denial named the wrong tool: {denied[0]!r}")
+                if requested and requested[0].tool_name != "mcp__docs__search":
+                    fail(f"opaque request named the wrong tool: {requested[0]!r}")
+                if requested and denied and sink.events != [requested[0], denied[0]]:
+                    fail(f"opaque permission event order differed: {sink.events!r}")

@@ -39,6 +39,7 @@ from scripts.checks import host_sessions  # noqa: E402, F401
 from scripts.checks import agent_cancel  # noqa: E402, F401
 from scripts.checks import cancellation  # noqa: E402, F401
 from scripts.checks import agent_spec  # noqa: E402, F401
+from scripts.checks import mcp  # noqa: E402, F401
 from scripts.checks import agent_file  # noqa: E402, F401
 from scripts.checks import config  # noqa: E402, F401
 from scripts.checks import agent_memory  # noqa: E402, F401
