@@ -304,6 +304,15 @@ def main() -> None:
         "hooks.blocking_fail_closed",
         "hooks.agent_veto",
         "hooks.none_is_unchanged_and_imports",
+        "skills.load_and_measure",
+        "skills.measured_text_is_reachable",
+        "skills.roster_cost",
+        "skills.roster_renders_and_sums",
+        "skills.body_is_live",
+        "skills.frontmatter_rejections",
+        "skills.malformed_files",
+        "skills.directory_roster",
+        "skills.no_runtime_imports",
         "host_protocol.encodes_every_event",
         "host_protocol.round_trip_events",
         "host_protocol.unknown_type_preserved",
@@ -616,7 +625,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "536 passed, 0 failed, 536 selected of 536 registered",
+        == "545 passed, 0 failed, 545 selected of 545 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -664,7 +673,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 536 registered"
+                "of 545 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
