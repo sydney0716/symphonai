@@ -338,6 +338,11 @@ def main() -> None:
         "host_server.api_untouched",
         "host_server.runtime_run_id_preserved",
         "host_server.subagent_run_ids_distinct",
+        "host_server.extensions_defaults",
+        "host_server.extensions_observe_and_veto",
+        "host_server.extension_runner_lifetime",
+        "host_server.extensions_forward_and_main",
+        "host_server.extensions_protocol_frozen",
         "host_approvals.request_published",
         "host_approvals.allow_resumes",
         "host_approvals.deny_blocks_call",
@@ -409,6 +414,14 @@ def main() -> None:
         "extensions.ceiling_composes",
         "extensions.leader_hooks",
         "extensions.leader_default_and_imports",
+        "extensions.discovery",
+        "discovery.user_missing_and_safe_default",
+        "discovery.trust_matrix",
+        "discovery.withheld_without_loading",
+        "discovery.cross_scope_collisions",
+        "discovery.member_failures_are_atomic",
+        "discovery.ceiling_forwarding",
+        "discovery.determinism_and_imports",
         "mcp.config_parsing_and_disabled_default",
         "mcp.owner_scope_controls_enablement",
         "mcp.handshake_tools_and_namespaces",
@@ -662,7 +675,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "582 passed, 0 failed, 582 selected of 582 registered",
+        == "595 passed, 0 failed, 595 selected of 595 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -710,7 +723,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 582 registered"
+                "of 595 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

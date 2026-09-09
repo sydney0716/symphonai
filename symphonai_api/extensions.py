@@ -6,9 +6,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from symphonai_api.agent_spec import AgentSpec
 from symphonai_api.config import CapabilityCeiling, ResolvedConfig, load_config
+from symphonai_api.discovery import Offered, discover
 from symphonai_api.hooks import HookRunner, HookSpec, hooks_from_config
 from symphonai_api.mcp import McpServerSpec, mcp_servers_from_config
+from symphonai_api.plugins import Plugin
+from symphonai_api.skills import Skill
 from symphonai_api.trust import TrustList, trust_from_config
 
 
@@ -19,6 +23,10 @@ class Extensions:
     ceiling: CapabilityCeiling
     hooks: tuple[HookSpec, ...]
     mcp_servers: tuple[McpServerSpec, ...]
+    agents: Mapping[str, AgentSpec]
+    skills: Mapping[str, Skill]
+    plugins: Mapping[str, Plugin]
+    withheld: tuple[Offered, ...]
 
     def hook_runner(self, *, cwd: Path) -> HookRunner | None:
         """Build a runner over configured hooks, or None when there are none."""
@@ -43,4 +51,20 @@ def load_extensions(
         repo_root=repo_root,
         trust=trust,
     )
-    return Extensions(config, trust, ceiling, hooks, mcp_servers)
+    discovered = discover(
+        repo_root=repo_root,
+        home=home,
+        trust=trust,
+        ceiling=ceiling,
+    )
+    return Extensions(
+        config,
+        trust,
+        ceiling,
+        hooks,
+        mcp_servers,
+        discovered.agents,
+        discovered.skills,
+        discovered.plugins,
+        discovered.withheld,
+    )

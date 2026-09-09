@@ -14,7 +14,8 @@ import symphonai_api.extensions as extensions_module
 import symphonai_api.runner as runner_module
 from symphonai_api.agent_file import AgentFileError, load_agent_directory
 from symphonai_api.agent_loop import ApiAgent
-from symphonai_api.config import CapabilityCeiling, ConfigError
+from symphonai_api.config import CapabilityCeiling, ConfigError, Scope
+from symphonai_api.discovery import Offered
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import CollectingSink
 from symphonai_api.extensions import Extensions, load_extensions
@@ -248,12 +249,26 @@ def empty_and_runner() -> None:
         if (
             loaded.hooks != ()
             or loaded.mcp_servers != ()
+            or loaded.agents
+            or loaded.skills
+            or loaded.plugins
+            or loaded.withheld != ()
             or loaded.ceiling != CapabilityCeiling()
             or loaded.trust != TrustList()
             or loaded.hook_runner(cwd=root) is not None
         ):
             fail(f"empty configuration was not exactly empty: {loaded!r}")
-        expected_fields = ["config", "trust", "ceiling", "hooks", "mcp_servers"]
+        expected_fields = [
+            "config",
+            "trust",
+            "ceiling",
+            "hooks",
+            "mcp_servers",
+            "agents",
+            "skills",
+            "plugins",
+            "withheld",
+        ]
         if [item.name for item in fields(Extensions)] != expected_fields:
             fail("Extensions advertises an unsupported or missing capability")
         try:
@@ -583,3 +598,47 @@ def leader_default_and_imports() -> None:
         )
     if shared_forbidden or imported:
         fail(f"extensions.py imports runtime orchestration: {shared_forbidden + imported!r}")
+
+
+@check("extensions.discovery")
+def extension_discovery() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        home = base / "home"
+        root.mkdir()
+        user_skills = home / ".symphonai" / "skills"
+        project_skills = root / ".symphonai" / "skills"
+        _write(
+            user_skills / "personal.md",
+            "+++\n"
+            'name = "personal"\n'
+            'description = "Personal skill"\n'
+            'when_to_use = "When requested"\n'
+            "+++\nbody\n",
+        )
+        _write(project_skills / "offered.md", "untrusted content is not parsed")
+        with mock.patch.object(
+            extensions_module,
+            "discover",
+            wraps=extensions_module.discover,
+        ) as discover_spy:
+            loaded = load_extensions(repo_root=root, home=home)
+        if tuple(loaded.skills) != ("personal",):
+            fail(f"Extensions did not carry discovered user skills: {loaded!r}")
+        expected_withheld = (
+            Offered(Scope.PROJECT, project_skills, ("offered",)),
+        )
+        if loaded.withheld != expected_withheld:
+            fail(f"Extensions did not carry the repository offer: {loaded!r}")
+        if "offered" in loaded.skills:
+            fail("Extensions exposed an untrusted repository skill")
+        if discover_spy.call_count != 1:
+            fail("load_extensions did not discover exactly once")
+        arguments = discover_spy.call_args.kwargs
+        if (
+            arguments.get("home") != home
+            or arguments.get("trust") != loaded.trust
+            or arguments.get("ceiling") != loaded.ceiling
+        ):
+            fail(f"load_extensions did not forward resolved discovery inputs: {arguments!r}")

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.extensions import Extensions
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import SessionError, TranscriptError
 from symphonai_host.broker import EventBroker, Subscription
@@ -43,6 +44,7 @@ class HostServer:
         model: str | None = None,
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
+        extensions: Extensions | None = None,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
@@ -58,6 +60,7 @@ class HostServer:
             publish_approval=self._publish_approval,
             approval_timeout=approval_timeout,
             sessions_root=sessions_root,
+            extensions=extensions,
         )
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False

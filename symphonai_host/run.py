@@ -8,7 +8,8 @@ from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import Event, RunStarted
+from symphonai_api.events import Event, RunStarted, fan_out
+from symphonai_api.extensions import Extensions
 from symphonai_api.identity import AgentRef, new_agent_ref, new_id
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
@@ -61,6 +62,7 @@ class HostRun:
         publish_approval=None,
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
+        extensions: Extensions | None = None,
     ) -> None:
         self._provider = provider
         self._policy = policy
@@ -68,6 +70,11 @@ class HostRun:
         self._system_prompt = system_prompt
         self._max_turns = max_turns
         self._model = model
+        self._hooks = (
+            None
+            if extensions is None
+            else extensions.hook_runner(cwd=policy.repo_root)
+        )
         self._active: _ActiveRun | None = None
         self._opened: tuple[SessionStore, LoadedRun, RunDiagnosis, list[str]] | None = None
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
@@ -188,6 +195,10 @@ class HostRun:
             fallback_directories=fallback_directories,
         )
         tools = standard_tool_registry(result_store=result_store)
+        events = fan_out(
+            lambda event: self._publish(run_id, event),
+            self._hooks,
+        )
         agent = ApiAgent(
             provider=self._provider,
             tools=tools,
@@ -195,12 +206,18 @@ class HostRun:
             max_turns=self._max_turns,
             tool_schemas=tool_registry_schemas(tools, self._provider.wire_format),
             agent_ref=agent_ref,
-            events=lambda event: self._publish(run_id, event),
+            events=events,
             result_store=result_store,
             transcript=session.writer_for(agent_ref.agent_id, is_root=True),
         )
         try:
-            agent.run(messages, model=self._model, parent_run_id=parent_run_id, cancel=cancel)
+            agent.run(
+                messages,
+                model=self._model,
+                parent_run_id=parent_run_id,
+                cancel=cancel,
+                hooks=self._hooks,
+            )
         finally:
             session.close()
             with self._lock:

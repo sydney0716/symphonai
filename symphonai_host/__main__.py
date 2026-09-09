@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import signal
+import sys
 import threading
 from collections.abc import Sequence
 from pathlib import Path
 
+from symphonai_api.config import ConfigError
+from symphonai_api.extensions import load_extensions
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
 from symphonai_api.providers.gemini_provider import GeminiProvider
@@ -47,10 +50,16 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = _arguments(argv)
+    try:
+        extensions = load_extensions(repo_root=arguments.repo_root)
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     host = HostServer(
         _provider(arguments.provider, arguments.model, arguments.base_url),
         PermissionPolicy(repo_root=arguments.repo_root, mode=arguments.permission_mode),
         max_turns=arguments.max_turns,
+        extensions=extensions,
     )
 
     def shutdown(signum, frame) -> None:

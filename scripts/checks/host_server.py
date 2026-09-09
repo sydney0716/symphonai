@@ -6,26 +6,58 @@ import contextlib
 import http.client
 import io
 import json
+import os
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import get_args, get_type_hints
 from unittest import mock
 
 import symphonai_api.agent_loop as agent_loop
+import symphonai_host.__main__ as host_main
+import symphonai_host.protocol as protocol_module
+import symphonai_host.run as host_run_module
+import symphonai_host.server as host_server_module
 from symphonai_api.events import RunFinished, RunStarted
+from symphonai_api.extensions import Extensions, load_extensions
+from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import RunRef
-from symphonai_api.models import Message, ModelResponse, Role
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.session import SessionStore, load_run_for_resume
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_host.broker import EventBroker
 from symphonai_host.protocol import decode_event, decode_frame
+from symphonai_host.run import HostRun
 from symphonai_host.server import HostServer
 from scripts.checks.harness import check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_PRE_19B_COMMIT = "08206022734f05d5c2afb9b32c7e2789a892f1ed"
+_FROZEN_HOST_RUN = (
+    (
+        "RunStarted",
+        "PromptSubmitted",
+        "TurnStarted",
+        "TurnFinished",
+        "RunFinished",
+    ),
+    (("user", "frozen host"), ("assistant", "done")),
+    "final_response",
+)
+_FROZEN_PROTOCOL = (
+    1,
+    ("ApprovalReply", "OpenSessionRequest", "PromptRequest", "StopRequest"),
+    ("approval_requested", "error", "event", "reply"),
+)
 
 
 def _host(
@@ -581,3 +613,486 @@ def check_subagent_run_ids_distinct() -> None:
     finally:
         release_root_run_started.set()
         host.close()
+
+
+class _GatedProvider(ModelProvider):
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self._responses = responses
+        self._calls = 0
+        self.entered = [threading.Event() for _ in responses]
+        self.release = [threading.Event() for _ in responses]
+        self.requests = []
+
+    @property
+    def name(self) -> str:
+        return "gated"
+
+    @property
+    def wire_format(self) -> int:
+        return 4
+
+    def create_response(self, request, *, cancel=None) -> ModelResponse:
+        index = min(self._calls, len(self._responses) - 1)
+        self._calls += 1
+        self.requests.append(request)
+        self.entered[index].set()
+        if not self.release[index].wait(5):
+            raise RuntimeError("host check did not release provider")
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        return self._responses[index]
+
+
+class _RecordingTool(LocalTool):
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    @property
+    def name(self) -> str:
+        return "recording"
+
+    @property
+    def description(self) -> str:
+        return "Record whether host tool execution happened."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}}
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(ToolEffect.READ_ONLY, True, ())
+
+    def _execute(
+        self,
+        tool_call: ToolCall,
+        policy: PermissionPolicy,
+        cancel=None,
+    ) -> ToolResult:
+        self.invocations += 1
+        return ToolResult(tool_call_id=tool_call.id, ok=True, content="ran")
+
+
+class _HookProbe:
+    def __call__(self, event) -> None:  # noqa: ANN001
+        return
+
+    def pre_tool(self, tool_name: str, tool_call_id: str) -> str | None:
+        return None
+
+
+class _CountingExtensions:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.runners: list[_HookProbe] = []
+
+    def hook_runner(self, *, cwd: Path) -> _HookProbe:
+        self.calls += 1
+        runner = _HookProbe()
+        self.runners.append(runner)
+        return runner
+
+
+def _start_gated(host_run: HostRun, provider: _GatedProvider, prompt: str, index: int) -> str:
+    host_run_id = host_run.start(prompt)
+    if not provider.entered[index].wait(5):
+        fail("host provider was not called within five seconds")
+    with host_run._lock:
+        active = host_run._active
+    if active is None:
+        fail("gated host run was not active")
+    provider.release[index].set()
+    active.thread.join(5)
+    if active.thread.is_alive():
+        fail("host run did not finish within five seconds")
+    return host_run_id
+
+
+def _host_run_snapshot(
+    root: Path,
+    extensions: Extensions | None,
+) -> tuple[tuple, HostRun, tuple]:
+    provider = _GatedProvider(
+        [ModelResponse(Message(Role.ASSISTANT, "done"))]
+    )
+    broker = EventBroker()
+    subscription = broker.subscribe()
+    run = HostRun(
+        provider,
+        PermissionPolicy(root),
+        broker,
+        sessions_root=root / "sessions",
+        extensions=extensions,
+    )
+    calls: list[tuple] = []
+    real_fan_out = host_run_module.fan_out
+
+    def record_fan_out(*sinks):  # noqa: ANN002, ANN202
+        combined = real_fan_out(*sinks)
+        calls.append((sinks, combined))
+        return combined
+
+    with mock.patch.object(host_run_module, "fan_out", side_effect=record_fan_out):
+        host_run_id = _start_gated(run, provider, "frozen host", 0)
+    events = []
+    while True:
+        event = subscription.get(timeout=0.01)
+        if event is None:
+            break
+        events.append(event)
+    store = SessionStore.open(root / "sessions", host_run_id)
+    loaded, _, _ = load_run_for_resume(store)
+    terminal = next(
+        (event.stopped_reason for event in events if isinstance(event, RunFinished)),
+        None,
+    )
+    snapshot = (
+        tuple(type(event).__name__ for event in events),
+        tuple((message.role.value, message.text) for message in loaded.messages),
+        terminal,
+    )
+    subscription.close()
+    broker.close()
+    return snapshot, run, tuple(calls)
+
+
+@check("host_server.extensions_defaults")
+def check_extensions_defaults() -> None:
+    for label, configured in (("None", False), ("empty", True)):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            extensions = (
+                load_extensions(repo_root=root, home=root / "home")
+                if configured
+                else None
+            )
+            snapshot, run, fan_out_calls = _host_run_snapshot(root, extensions)
+            if snapshot != _FROZEN_HOST_RUN:
+                fail(
+                    f"extensions={label} changed HostRun from {_PRE_19B_COMMIT}: "
+                    f"expected={_FROZEN_HOST_RUN!r}, actual={snapshot!r}"
+                )
+            if run._hooks is not None:
+                fail(f"extensions={label} constructed an empty HookRunner")
+            if len(fan_out_calls) != 1:
+                fail(f"extensions={label} did not fan out once: {fan_out_calls!r}")
+            sinks, combined = fan_out_calls[0]
+            if len(sinks) != 2 or sinks[1] is not None or combined is not sinks[0]:
+                fail(f"extensions={label} wrapped the publish-only sink")
+
+
+@check("host_server.extensions_observe_and_veto")
+def check_extensions_observe_and_veto() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        event_log = root / "events.jsonl"
+        observer = root / "observer.py"
+        observer.write_text(
+            "import json,sys\n"
+            "payload=json.load(sys.stdin)\n"
+            "with open(sys.argv[1], 'a', encoding='utf-8') as out:\n"
+            " out.write(json.dumps(payload)+'\\n')\n",
+            encoding="utf-8",
+        )
+        extensions = load_extensions(
+            repo_root=root,
+            home=root / "home",
+            session={
+                "hooks": [
+                    {
+                        "on": [
+                            "RunStarted",
+                            "PromptSubmitted",
+                            "TurnStarted",
+                            "TurnFinished",
+                            "RunFinished",
+                        ],
+                        "command": [sys.executable, str(observer), str(event_log)],
+                    }
+                ]
+            },
+        )
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            extensions=extensions,
+        )
+        host.start()
+        try:
+            connection, response = _event_stream(host)
+            try:
+                prompt_connection, prompt = _request(
+                    host,
+                    "POST",
+                    "/prompt",
+                    body={"prompt": "observe"},
+                    headers=_headers(host),
+                )
+                prompt.read()
+                prompt_connection.close()
+                received = []
+                while not received or not isinstance(received[-1], RunFinished):
+                    frame = _next_sse(connection, response, timeout=5)
+                    if isinstance(frame, tuple) and frame[0] == "event":
+                        received.append(decode_event(frame[1]))
+                with host.run._lock:
+                    active = host.run._active
+                if active is not None:
+                    active.thread.join(5)
+                    if active.thread.is_alive():
+                        fail("observational host run did not finish")
+                hook_types = tuple(
+                    json.loads(line)["type"]
+                    for line in event_log.read_text(encoding="utf-8").splitlines()
+                )
+                broker_types = tuple(type(event).__name__ for event in received)
+                if hook_types != broker_types or not hook_types:
+                    fail(
+                        "hook and broker did not receive the same host events: "
+                        f"hook={hook_types!r}, broker={broker_types!r}"
+                    )
+            finally:
+                connection.close()
+        finally:
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        guard_log = root / "guard.jsonl"
+        guard = root / "guard.py"
+        guard.write_text(
+            "import json,sys\n"
+            "payload=json.load(sys.stdin)\n"
+            "with open(sys.argv[1], 'a', encoding='utf-8') as out:\n"
+            " out.write(json.dumps(payload)+'\\n')\n"
+            "print('deny: host guarded')\n",
+            encoding="utf-8",
+        )
+        extensions = load_extensions(
+            repo_root=root,
+            home=root / "home",
+            session={
+                "hooks": [
+                    {
+                        "on": ["PreToolUse"],
+                        "command": [sys.executable, str(guard), str(guard_log)],
+                        "blocking": True,
+                    }
+                ]
+            },
+        )
+        tool = _RecordingTool()
+        provider = _GatedProvider(
+            [
+                ModelResponse(
+                    Message(
+                        Role.ASSISTANT,
+                        tool_calls=[ToolCall(id="record", name=tool.name)],
+                    )
+                ),
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+            ]
+        )
+        provider.release[0].set()
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            extensions=extensions,
+        )
+        host.start()
+        try:
+            with mock.patch.object(
+                host_run_module,
+                "standard_tool_registry",
+                return_value={tool.name: tool},
+            ):
+                connection, response = _event_stream(host)
+                try:
+                    prompt_connection, prompt = _request(
+                        host,
+                        "POST",
+                        "/prompt",
+                        body={"prompt": "veto"},
+                        headers=_headers(host),
+                    )
+                    prompt.read()
+                    prompt_connection.close()
+                    if not provider.entered[1].wait(5):
+                        fail("model did not receive the tool result")
+                    tool_results = [
+                        message.tool_result
+                        for message in provider.requests[1].messages
+                        if message.tool_result is not None
+                    ]
+                    if (
+                        tool.invocations != 0
+                        or len(tool_results) != 1
+                        or tool_results[0].ok
+                        or tool_results[0].error != "host guarded"
+                    ):
+                        fail(
+                            "host blocking hook did not veto before execution: "
+                            f"invocations={tool.invocations}, results={tool_results!r}"
+                        )
+                    provider.release[1].set()
+                    received_terminal = False
+                    while not received_terminal:
+                        frame = _next_sse(connection, response, timeout=5)
+                        if isinstance(frame, tuple) and frame[0] == "event":
+                            received_terminal = isinstance(
+                                decode_event(frame[1]), RunFinished
+                            )
+                    payloads = [
+                        json.loads(line)
+                        for line in guard_log.read_text(encoding="utf-8").splitlines()
+                    ]
+                    if [item.get("tool_name") for item in payloads] != [tool.name]:
+                        fail(f"host guard saw the wrong tool: {payloads!r}")
+                finally:
+                    provider.release[1].set()
+                    connection.close()
+        finally:
+            host.close()
+
+
+@check("host_server.extension_runner_lifetime")
+def check_extension_runner_lifetime() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _GatedProvider(
+            [
+                ModelResponse(Message(Role.ASSISTANT, "one")),
+                ModelResponse(Message(Role.ASSISTANT, "two")),
+            ]
+        )
+        configured = _CountingExtensions()
+        run = HostRun(
+            provider,
+            PermissionPolicy(root),
+            EventBroker(),
+            sessions_root=root / "sessions",
+            extensions=configured,  # type: ignore[arg-type]
+        )
+        original_runner = run._hooks
+        _start_gated(run, provider, "one", 0)
+        _start_gated(run, provider, "two", 1)
+        if (
+            configured.calls != 1
+            or len(configured.runners) != 1
+            or run._hooks is not original_runner
+            or run._hooks is not configured.runners[0]
+        ):
+            fail(
+                "HostRun did not retain one runner across prompts: "
+                f"calls={configured.calls}, runners={configured.runners!r}"
+            )
+
+
+@check("host_server.extensions_forward_and_main")
+def check_extensions_forward_and_main() -> None:
+    marker = _CountingExtensions()
+    with mock.patch.object(host_server_module, "HostRun") as host_run_factory:
+        server = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(REPO_ROOT),
+            extensions=marker,  # type: ignore[arg-type]
+        )
+        try:
+            forwarded = host_run_factory.call_args.kwargs.get("extensions")
+            if forwarded is not marker:
+                fail("HostServer did not forward extensions unchanged")
+        finally:
+            server.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        repo = base / "repo"
+        repo.mkdir()
+        malformed = home / ".symphonai" / "config.toml"
+        malformed.parent.mkdir(parents=True)
+        malformed.write_text("unknown = true\n", encoding="utf-8")
+        environment = dict(os.environ)
+        environment["HOME"] = str(home)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "symphonai_host",
+                "--repo-root",
+                str(repo),
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if (
+            completed.returncode != 2
+            or not completed.stderr.startswith(
+                f"configuration error: {malformed}: unknown:"
+            )
+            or "Traceback" in completed.stderr
+            or completed.stdout != ""
+        ):
+            fail(
+                "malformed startup did not fail cleanly before binding: "
+                f"returncode={completed.returncode}, stdout={completed.stdout!r}, "
+                f"stderr={completed.stderr!r}"
+            )
+
+        malformed.write_text(
+            "[[hooks]]\n"
+            'on = ["RunStarted"]\n'
+            f"command = [{json.dumps(sys.executable)}, \"-c\", \"pass\"]\n",
+            encoding="utf-8",
+        )
+        fake_host = mock.Mock()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(
+            host_main,
+            "_provider",
+            return_value=FakeModelProvider(),
+        ), mock.patch.object(
+            host_main,
+            "HostServer",
+            return_value=fake_host,
+        ) as host_factory:
+            host_main.main(["--repo-root", str(repo)])
+        resolved = host_factory.call_args.kwargs.get("extensions")
+        if (
+            not isinstance(resolved, Extensions)
+            or len(resolved.hooks) != 1
+            or resolved.hooks[0].events != ("RunStarted",)
+            or not isinstance(resolved.hook_runner(cwd=repo), HookRunner)
+        ):
+            fail(f"valid startup did not pass resolved hooks: {resolved!r}")
+        fake_host.print_handshake.assert_called_once_with()
+        fake_host.serve_forever.assert_called_once_with()
+        fake_host.close.assert_called_once_with()
+
+
+@check("host_server.extensions_protocol_frozen")
+def check_extensions_protocol_frozen() -> None:
+    return_types = get_args(
+        get_type_hints(protocol_module.decode_request)["return"]
+    )
+    actual = (
+        protocol_module.PROTOCOL_VERSION,
+        tuple(sorted(item.__name__ for item in return_types)),
+        tuple(sorted(protocol_module._FRAME_KINDS)),
+    )
+    if actual != _FROZEN_PROTOCOL:
+        fail(
+            "extension wiring changed the host protocol: "
+            f"expected={_FROZEN_PROTOCOL!r}, actual={actual!r}"
+        )
+    offenders = [
+        str(path.relative_to(REPO_ROOT))
+        for path in sorted((REPO_ROOT / "symphonai_api").rglob("*.py"))
+        if "symphonai_host" in path.read_text(encoding="utf-8")
+    ]
+    if offenders:
+        fail(f"runtime import direction reversed: {offenders!r}")
