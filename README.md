@@ -55,6 +55,9 @@ placeholder until the real app lands.
 
 ## Running it
 
+Contributors need Python 3.11 or later and Node 18 or later. Node's built-in
+test runner checks the dependency-free JavaScript app; no npm install is needed.
+
 ```bash
 python3 scripts/check.py                 # the check suite (--only selects a subset)
 pip install -e ".[tui]"                  # optional Textual UI

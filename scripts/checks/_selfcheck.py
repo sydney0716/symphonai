@@ -385,6 +385,12 @@ def main() -> None:
         "host_sessions.original_untouched",
         "host_sessions.offloaded_handle_survives",
         "host_sessions.client_session_calls",
+        "app.node_required",
+        "app.protocol",
+        "app.client",
+        "app.turn",
+        "app.test_registration",
+        "app.import_boundary",
         "cancel.pre_cancelled_agent",
         "cancel.tool_repair",
         "cancel.http_read_recheck",
@@ -690,7 +696,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "610 passed, 0 failed, 610 selected of 610 registered",
+        == "616 passed, 0 failed, 616 selected of 616 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -738,7 +744,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 610 registered"
+                "of 616 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

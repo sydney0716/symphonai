@@ -36,6 +36,7 @@ from scripts.checks import host_server  # noqa: E402, F401
 from scripts.checks import host_approvals  # noqa: E402, F401
 from scripts.checks import host_client  # noqa: E402, F401
 from scripts.checks import host_sessions  # noqa: E402, F401
+from scripts.checks import app  # noqa: E402, F401
 from scripts.checks import agent_cancel  # noqa: E402, F401
 from scripts.checks import cancellation  # noqa: E402, F401
 from scripts.checks import agent_spec  # noqa: E402, F401

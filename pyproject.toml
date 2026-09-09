@@ -17,6 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["symphonai_api*", "symphonai_tui*", "symphonai_host*"]
+exclude = ["symphonai_app*"]
 
 [tool.setuptools.package-data]
 "symphonai_api.data" = ["*.json"]
