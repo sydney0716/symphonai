@@ -42,6 +42,7 @@ from scripts.checks import agent_spec  # noqa: E402, F401
 from scripts.checks import extensions  # noqa: E402, F401
 from scripts.checks import discovery  # noqa: E402, F401
 from scripts.checks import mcp  # noqa: E402, F401
+from scripts.checks import mcp_pool  # noqa: E402, F401
 from scripts.checks import trust  # noqa: E402, F401
 from scripts.checks import plugins  # noqa: E402, F401
 from scripts.checks import agent_file  # noqa: E402, F401

@@ -435,6 +435,14 @@ def main() -> None:
         "mcp.close_is_idempotent",
         "mcp.import_boundary",
         "mcp.trust_grants_a_repository",
+        "mcp_pool.starts_and_orders",
+        "mcp_pool.disabled_not_started",
+        "mcp_pool.start_is_atomic",
+        "mcp_pool.cross_server_collisions",
+        "mcp_pool.standard_registry_collision",
+        "mcp_pool.close_and_context",
+        "mcp_pool.run_task_tools",
+        "mcp_pool.default_and_imports",
         "trust.owner_only",
         "trust.vocabulary_and_shape",
         "trust.matching_is_exact",
@@ -675,7 +683,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "595 passed, 0 failed, 595 selected of 595 registered",
+        == "603 passed, 0 failed, 603 selected of 603 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -723,7 +731,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 595 registered"
+                "of 603 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

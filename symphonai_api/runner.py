@@ -7,7 +7,7 @@ script, or a future CLI) to run one agent task.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
 from symphonai_api.budgets import RunBudget
@@ -99,6 +99,7 @@ def run_task(
     session: SessionStore | None = None,
     stream: bool = False,
     extensions: Extensions | None = None,
+    mcp_tools: Mapping[str, LocalTool] | None = None,
 ) -> AgentRunResult:
     """Run a single task to completion using the standard tool registry.
 
@@ -130,6 +131,13 @@ def run_task(
         result_store=result_store,
         search_backend=search_backend,
     )
+    if mcp_tools is not None:
+        duplicate = next((name for name in mcp_tools if name in tools), None)
+        if duplicate is not None:
+            raise ValueError(
+                f"MCP tool {duplicate!r} collides with a standard tool"
+            )
+        tools.update(mcp_tools)
     hook_runner = (
         None
         if extensions is None
