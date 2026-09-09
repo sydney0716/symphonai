@@ -11,10 +11,13 @@ from pathlib import Path
 
 from symphonai_api.config import ConfigError
 from symphonai_api.extensions import load_extensions
+from symphonai_api.mcp import McpError
+from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
 from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_provider import OpenAIProvider
+from symphonai_api.runner import standard_tool_registry
 from symphonai_host.server import HostServer
 
 
@@ -55,23 +58,40 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
-    host = HostServer(
-        _provider(arguments.provider, arguments.model, arguments.base_url),
-        PermissionPolicy(repo_root=arguments.repo_root, mode=arguments.permission_mode),
-        max_turns=arguments.max_turns,
-        extensions=extensions,
+    pool = McpPool(
+        extensions.mcp_servers,
+        cwd=arguments.repo_root,
+        reserved_names=set(standard_tool_registry()),
     )
-
-    def shutdown(signum, frame) -> None:
-        threading.Thread(target=host.close, daemon=True).start()
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-    host.print_handshake()
     try:
+        mcp_tools = pool.start()
+    except McpError as exc:
+        print(f"mcp error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    host = None
+    try:
+        host = HostServer(
+            _provider(arguments.provider, arguments.model, arguments.base_url),
+            PermissionPolicy(
+                repo_root=arguments.repo_root,
+                mode=arguments.permission_mode,
+            ),
+            max_turns=arguments.max_turns,
+            extensions=extensions,
+            mcp_tools=mcp_tools,
+        )
+
+        def shutdown(signum, frame) -> None:
+            threading.Thread(target=host.close, daemon=True).start()
+
+        signal.signal(signal.SIGINT, shutdown)
+        signal.signal(signal.SIGTERM, shutdown)
+        host.print_handshake()
         host.serve_forever()
     finally:
-        host.close()
+        if host is not None:
+            host.close()
+        pool.close()
 
 
 if __name__ == "__main__":

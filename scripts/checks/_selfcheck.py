@@ -343,6 +343,12 @@ def main() -> None:
         "host_server.extension_runner_lifetime",
         "host_server.extensions_forward_and_main",
         "host_server.extensions_protocol_frozen",
+        "host_server.mcp_start_and_schema",
+        "host_server.mcp_start_failures",
+        "host_server.mcp_sigterm_shutdown",
+        "host_server.mcp_close_order",
+        "host_server.mcp_pass_through_and_ownership",
+        "host_server.mcp_defaults_merge_and_protocol",
         "host_approvals.request_published",
         "host_approvals.allow_resumes",
         "host_approvals.deny_blocks_call",
@@ -443,6 +449,7 @@ def main() -> None:
         "mcp_pool.close_and_context",
         "mcp_pool.run_task_tools",
         "mcp_pool.default_and_imports",
+        "mcp_pool.merge_tool_registry",
         "trust.owner_only",
         "trust.vocabulary_and_shape",
         "trust.matching_is_exact",
@@ -683,7 +690,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "603 passed, 0 failed, 603 selected of 603 registered",
+        == "610 passed, 0 failed, 610 selected of 610 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -731,7 +738,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 603 registered"
+                "of 610 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

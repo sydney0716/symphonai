@@ -7,6 +7,7 @@ import http.client
 import io
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -18,18 +19,23 @@ from typing import get_args, get_type_hints
 from unittest import mock
 
 import symphonai_api.agent_loop as agent_loop
+import symphonai_api.mcp as mcp_module
 import symphonai_host.__main__ as host_main
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
+from symphonai_api.cancellation import CancellationToken
 from symphonai_api.events import RunFinished, RunStarted
 from symphonai_api.extensions import Extensions, load_extensions
 from symphonai_api.hooks import HookRunner
-from symphonai_api.identity import RunRef
+from symphonai_api.identity import RunRef, new_agent_ref
+from symphonai_api.mcp import McpServerSpec
+from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore, load_run_for_resume
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
@@ -42,6 +48,7 @@ from scripts.checks.harness import check, fail
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _PRE_19B_COMMIT = "08206022734f05d5c2afb9b32c7e2789a892f1ed"
+_PRE_19E_COMMIT = "fa9a7dd06eee2b5f29772c1870e57a648dac9cdc"
 _FROZEN_HOST_RUN = (
     (
         "RunStarted",
@@ -710,6 +717,7 @@ def _start_gated(host_run: HostRun, provider: _GatedProvider, prompt: str, index
 def _host_run_snapshot(
     root: Path,
     extensions: Extensions | None,
+    mcp_tools=None,  # noqa: ANN001
 ) -> tuple[tuple, HostRun, tuple]:
     provider = _GatedProvider(
         [ModelResponse(Message(Role.ASSISTANT, "done"))]
@@ -722,6 +730,7 @@ def _host_run_snapshot(
         broker,
         sessions_root=root / "sessions",
         extensions=extensions,
+        mcp_tools=mcp_tools,
     )
     calls: list[tuple] = []
     real_fan_out = host_run_module.fan_out
@@ -1096,3 +1105,515 @@ def check_extensions_protocol_frozen() -> None:
     ]
     if offenders:
         fail(f"runtime import direction reversed: {offenders!r}")
+
+
+_HOST_MCP_SERVER = r'''import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import threading
+
+parent_path = Path(sys.argv[1])
+child_path = None if sys.argv[2] == "-" else Path(sys.argv[2])
+parent_path.write_text(str(os.getpid()), encoding="utf-8")
+if child_path is not None:
+    code = (
+        "import os,signal,sys,threading;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "open(sys.argv[1], 'w').write(str(os.getpid()));"
+        "threading.Event().wait()"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", code, str(child_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    while not child_path.exists():
+        threading.Event().wait(0.01)
+
+def send(request_id, result):
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        send(request_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "host-fake", "version": "1"},
+        })
+    elif method == "tools/list":
+        send(request_id, {"tools": [{
+            "name": "search",
+            "description": "Search through the host MCP server.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]})
+'''
+
+
+def _write_host_mcp(directory: Path) -> Path:
+    script = directory / "host_mcp.py"
+    script.write_text(_HOST_MCP_SERVER, encoding="utf-8")
+    return script
+
+
+def _write_mcp_config(
+    home: Path,
+    command: list[str],
+    *,
+    enabled: bool = True,
+) -> Path:
+    source = home / ".symphonai" / "config.toml"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "[[mcp.servers]]\n"
+        'name = "docs"\n'
+        f"command = {json.dumps(command)}\n"
+        f"enabled = {str(enabled).lower()}\n",
+        encoding="utf-8",
+    )
+    return source
+
+
+def _wait_condition(predicate, message: str, *, timeout: float = 5) -> None:  # noqa: ANN001
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        threading.Event().wait(0.01)
+    if not predicate():
+        fail(message)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _clean_pid(pid: int | None) -> None:
+    if pid is not None and _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class _SchemaProvider(ModelProvider):
+    def __init__(self) -> None:
+        self.requests = []
+
+    @property
+    def name(self) -> str:
+        return "schema"
+
+    @property
+    def wire_format(self) -> int:
+        return 4
+
+    def create_response(self, request, *, cancel=None) -> ModelResponse:  # noqa: ANN001
+        self.requests.append(request)
+        return ModelResponse(Message(Role.ASSISTANT, "done"))
+
+
+class _HostMcpTool(_RecordingTool):
+    @property
+    def name(self) -> str:
+        return "mcp__docs__search"
+
+
+@check("host_server.mcp_start_and_schema")
+def check_mcp_start_and_schema() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        repo = base / "repo"
+        repo.mkdir()
+        script = _write_host_mcp(base)
+        parent_file = base / "normal-parent.pid"
+        child_file = base / "normal-child.pid"
+        _write_mcp_config(
+            home,
+            [sys.executable, str(script), str(parent_file), str(child_file)],
+        )
+        provider = _SchemaProvider()
+        real_host = HostServer
+        captured_process = None
+
+        def construct(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            nonlocal captured_process
+            tools = kwargs.get("mcp_tools")
+            if not isinstance(tools, dict) or tuple(tools) != ("mcp__docs__search",):
+                fail(f"main did not hand MCP tools to HostServer: {tools!r}")
+            tool = tools["mcp__docs__search"]
+            captured_process = tool._client._process
+            if captured_process is None or captured_process.poll() is not None:
+                fail("HostServer was constructed before its MCP server started")
+            host = real_host(*args, **kwargs)
+
+            def serve_one() -> None:
+                host.run.start("schema")
+                _wait_condition(
+                    lambda: not host.run.active,
+                    "configured host run did not finish",
+                )
+
+            host.serve_forever = serve_one
+            return host
+
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"HOME": str(home)}),
+            mock.patch.object(host_main, "_provider", return_value=provider),
+            mock.patch.object(host_main, "HostServer", side_effect=construct),
+            mock.patch.object(host_main.signal, "signal"),
+            contextlib.redirect_stdout(output),
+        ):
+            host_main.main(["--repo-root", str(repo), "--permission-mode", "auto"])
+        parent = int(parent_file.read_text(encoding="utf-8"))
+        child = int(child_file.read_text(encoding="utf-8"))
+        try:
+            if len(provider.requests) != 1 or not any(
+                schema.get("name") == "mcp__docs__search"
+                for schema in provider.requests[0].tools
+            ):
+                fail(
+                    "configured MCP tool was absent from provider schemas: "
+                    f"{provider.requests!r}"
+                )
+            if captured_process is None or captured_process.poll() is None:
+                fail("normal host shutdown left the MCP parent alive")
+            _wait_condition(
+                lambda: not _pid_alive(parent) and not _pid_alive(child),
+                "normal host shutdown left an MCP process alive",
+            )
+        finally:
+            _clean_pid(parent)
+            _clean_pid(child)
+
+        _write_mcp_config(home, ["must-not-start"], enabled=False)
+        fake_host = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"HOME": str(home)}),
+            mock.patch.object(
+                mcp_module.subprocess,
+                "Popen",
+                side_effect=AssertionError("disabled server spawned"),
+            ) as popen,
+            mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
+            mock.patch.object(host_main, "HostServer", return_value=fake_host) as factory,
+            mock.patch.object(host_main.signal, "signal"),
+        ):
+            try:
+                host_main.main(["--repo-root", str(repo)])
+            except SystemExit as exc:
+                fail(f"disabled configured server stopped the host: {exc.code!r}")
+        if popen.called:
+            fail("disabled configured MCP server reached Popen")
+        if factory.call_args.kwargs.get("mcp_tools") != {}:
+            fail("disabled configured server contributed a tool")
+
+
+@check("host_server.mcp_start_failures")
+def check_mcp_start_failures() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        repo = base / "repo"
+        repo.mkdir()
+        source = _write_mcp_config(
+            home,
+            [str(base / "missing-mcp-server")],
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"HOME": str(home)}),
+            mock.patch.object(host_main, "HostServer") as host_factory,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                host_main.main(["--repo-root", str(repo)])
+            except SystemExit as exc:
+                if exc.code != 2:
+                    fail(f"MCP startup failure exited with {exc.code!r}")
+            else:
+                fail("MCP startup failure did not exit")
+        if (
+            not stderr.getvalue().startswith("mcp error: ")
+            or "docs" not in stderr.getvalue()
+            or "Traceback" in stderr.getvalue()
+            or stdout.getvalue() != ""
+            or host_factory.called
+        ):
+            fail(
+                "MCP startup failure was not cleanly refused before binding: "
+                f"stdout={stdout.getvalue()!r}, stderr={stderr.getvalue()!r}"
+            )
+
+        source.write_text("unknown = true\n", encoding="utf-8")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"HOME": str(home)}),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                host_main.main(["--repo-root", str(repo)])
+            except SystemExit as exc:
+                if exc.code != 2:
+                    fail(f"configuration failure exited with {exc.code!r}")
+            else:
+                fail("configuration failure did not exit")
+        if (
+            not stderr.getvalue().startswith("configuration error: ")
+            or stderr.getvalue().startswith("mcp error: ")
+            or "Traceback" in stderr.getvalue()
+            or stdout.getvalue() != ""
+        ):
+            fail("configuration and MCP startup failures were not distinguishable")
+
+
+@check("host_server.mcp_sigterm_shutdown")
+def check_mcp_sigterm_shutdown() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        repo = base / "repo"
+        repo.mkdir()
+        script = _write_host_mcp(base)
+        parent_file = base / "signal-parent.pid"
+        child_file = base / "signal-child.pid"
+        _write_mcp_config(
+            home,
+            [sys.executable, str(script), str(parent_file), str(child_file)],
+        )
+        environment = dict(os.environ)
+        environment["HOME"] = str(home)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "symphonai_host", "--repo-root", str(repo)],
+            cwd=REPO_ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        output: list[str] = []
+        ready = threading.Event()
+        parent = None
+        child = None
+
+        def read_handshake() -> None:
+            if process.stdout is not None:
+                output.append(process.stdout.readline())
+            ready.set()
+
+        reader = threading.Thread(target=read_handshake, daemon=True)
+        reader.start()
+        try:
+            if not ready.wait(5) or not output or not output[0].strip():
+                fail("host did not bind after starting its configured MCP server")
+            json.loads(output[0])
+            parent = int(parent_file.read_text(encoding="utf-8"))
+            child = int(child_file.read_text(encoding="utf-8"))
+            process.send_signal(signal.SIGTERM)
+            try:
+                returncode = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                fail("SIGTERM did not stop the host within five seconds")
+            if returncode != 0:
+                stderr = "" if process.stderr is None else process.stderr.read()
+                fail(f"SIGTERM host exit was {returncode}: {stderr!r}")
+            _wait_condition(
+                lambda: not _pid_alive(parent) and not _pid_alive(child),
+                "SIGTERM host shutdown left an MCP process alive",
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            _clean_pid(parent)
+            _clean_pid(child)
+
+
+@check("host_server.mcp_close_order")
+def check_mcp_close_order() -> None:
+    events: list[str] = []
+    extensions = mock.Mock(mcp_servers=())
+    pool = mock.Mock()
+    pool.start.side_effect = lambda: events.append("pool.start") or {}
+    pool.close.side_effect = lambda: events.append("pool.close")
+    host = mock.Mock()
+    host.close.side_effect = lambda: events.append("host.close")
+
+    def construct_host(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        events.append("host.construct")
+        return host
+
+    standard = standard_tool_registry()
+    with (
+        mock.patch.object(host_main, "load_extensions", return_value=extensions),
+        mock.patch.object(host_main, "McpPool", return_value=pool) as pool_factory,
+        mock.patch.object(host_main, "standard_tool_registry", return_value=standard),
+        mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
+        mock.patch.object(host_main, "HostServer", side_effect=construct_host),
+        mock.patch.object(host_main.signal, "signal"),
+    ):
+        host_main.main(["--repo-root", str(REPO_ROOT)])
+    if events != ["pool.start", "host.construct", "host.close", "pool.close"]:
+        fail(f"host and MCP pool lifetime order changed: {events!r}")
+    if pool.close.call_count != 1:
+        fail(f"MCP pool had more than one owner: {pool.close.call_count} closes")
+    if pool_factory.call_args.kwargs.get("reserved_names") != set(standard):
+        fail("main did not inject the live standard registry keys")
+
+
+@check("host_server.mcp_pass_through_and_ownership")
+def check_mcp_pass_through_and_ownership() -> None:
+    marker = {"mcp__docs__search": _HostMcpTool()}
+    with mock.patch.object(host_server_module, "HostRun") as host_run_factory:
+        server = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(REPO_ROOT),
+            mcp_tools=marker,
+        )
+        try:
+            if host_run_factory.call_args.kwargs.get("mcp_tools") is not marker:
+                fail("HostServer did not forward MCP tools unchanged")
+        finally:
+            server.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        script = _write_host_mcp(directory)
+        parent_file = directory / "owner-parent.pid"
+        pool = McpPool(
+            (
+                McpServerSpec(
+                    "docs",
+                    (sys.executable, str(script), str(parent_file), "-"),
+                    enabled=True,
+                ),
+            ),
+            cwd=directory,
+            reserved_names=set(standard_tool_registry()),
+        )
+        pool.start()
+        tool = pool.tools["mcp__docs__search"]
+        process = tool._client._process
+        host = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(directory),
+            mcp_tools=pool.tools,
+        )
+        try:
+            host.close()
+            if process is None or process.poll() is not None:
+                fail("HostServer.close took ownership of the MCP pool")
+        finally:
+            host.close()
+            pool.close()
+        if process is None or process.poll() is None:
+            fail("explicit pool owner did not close the MCP server")
+
+
+@check("host_server.mcp_defaults_merge_and_protocol")
+def check_mcp_defaults_merge_and_protocol() -> None:
+    for label, tools in (("None", None), ("empty", {})):
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot, _, _ = _host_run_snapshot(
+                Path(temporary),
+                None,
+                mcp_tools=tools,
+            )
+        if snapshot != _FROZEN_HOST_RUN:
+            fail(
+                f"mcp_tools={label} changed HostRun from {_PRE_19E_COMMIT}: "
+                f"expected={_FROZEN_HOST_RUN!r}, actual={snapshot!r}"
+            )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _GatedProvider(
+            [ModelResponse(Message(Role.ASSISTANT, "done"))]
+        )
+        tool = _HostMcpTool()
+        host_run = HostRun(
+            provider,
+            PermissionPolicy(root),
+            EventBroker(),
+            sessions_root=root / "sessions",
+            mcp_tools={tool.name: tool},
+        )
+        with mock.patch.object(
+            host_run_module,
+            "merge_tool_registry",
+            wraps=merge_tool_registry,
+        ) as merge_spy:
+            _start_gated(host_run, provider, "schema", 0)
+        if merge_spy.call_count != 1:
+            fail("HostRun copied the merge instead of calling merge_tool_registry")
+        if not any(
+            schema.get("name") == tool.name
+            for schema in provider.requests[0].tools
+        ):
+            fail(f"HostRun derived schemas before its MCP merge: {provider.requests[0].tools!r}")
+
+        standard_tool = _RecordingTool()
+        extra_tool = _RecordingTool()
+        standard = {standard_tool.name: standard_tool}
+        collision_run = HostRun(
+            FakeModelProvider(),
+            PermissionPolicy(root),
+            EventBroker(),
+            sessions_root=root / "collision-sessions",
+            mcp_tools={extra_tool.name: extra_tool},
+        )
+        session = SessionStore(root / "collision-sessions", "host-collision")
+        try:
+            with mock.patch.object(
+                host_run_module,
+                "standard_tool_registry",
+                return_value=standard,
+            ):
+                try:
+                    collision_run._run(
+                        "host-collision",
+                        new_agent_ref("agent"),
+                        [Message(Role.USER, "collision")],
+                        None,
+                        session,
+                        (),
+                        CancellationToken(),
+                    )
+                except ValueError as exc:
+                    if standard_tool.name not in str(exc):
+                        fail(f"host collision omitted the tool name: {exc!r}")
+                else:
+                    fail("HostRun overwrote a colliding standard tool")
+        finally:
+            session.close()
+        if standard[standard_tool.name] is not standard_tool:
+            fail("HostRun collision changed the standard binding")
+
+    return_types = get_args(get_type_hints(protocol_module.decode_request)["return"])
+    actual_protocol = (
+        protocol_module.PROTOCOL_VERSION,
+        tuple(sorted(item.__name__ for item in return_types)),
+        tuple(sorted(protocol_module._FRAME_KINDS)),
+    )
+    if actual_protocol != _FROZEN_PROTOCOL:
+        fail(f"MCP host ownership changed the protocol: {actual_protocol!r}")

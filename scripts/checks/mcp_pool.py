@@ -18,7 +18,7 @@ from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
-from symphonai_api.runner import run_task, standard_tool_registry
+from symphonai_api.runner import merge_tool_registry, run_task, standard_tool_registry
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from scripts.checks.agent_spec import _forbidden_imports
@@ -33,7 +33,9 @@ from scripts.checks.mcp import (
 
 
 _PRE_19D_COMMIT = "3c09e8404accc6b50a9fffcd94cca4a807614aaa"
+_PRE_19E_COMMIT = "fa9a7dd06eee2b5f29772c1870e57a648dac9cdc"
 _MCP_SHA256 = "9b445f094387b2b226dc7c847aa400fd508be0c4408cedbd9d457123f04a32fb"
+_MCP_POOL_SHA256 = "32b905856e3456257a01f0ea7206967d55d9a2e6209a431a52172b1336832265"
 _FROZEN_RUN_TASK = (
     b'["final_response",1,[["user","frozen",[],null],'
     b'["assistant","done",[],null]],[["frozen-model",4,2,1]]]'
@@ -539,3 +541,65 @@ def default_and_imports() -> None:
     mcp_digest = hashlib.sha256(mcp_source).hexdigest()
     if mcp_digest != _MCP_SHA256:
         fail(f"mcp.py changed from its pre-19d SHA-256: {mcp_digest}")
+
+
+@check("mcp_pool.merge_tool_registry")
+def merge_registry() -> None:
+    first = _NamedTool("first")
+    second = _NamedTool("second")
+    third = _NamedTool("third")
+    standard = {first.name: first}
+    extra = {second.name: second, third.name: third}
+    merged = merge_tool_registry(standard, extra)
+    if tuple(merged) != ("first", "second", "third"):
+        fail(f"merged tool order changed: {tuple(merged)!r}")
+    if merged is standard or merged is extra:
+        fail("merge_tool_registry returned an input mapping")
+    if standard != {"first": first} or extra != {"second": second, "third": third}:
+        fail("merge_tool_registry mutated an input mapping")
+    none_merged = merge_tool_registry(standard, None)
+    if none_merged != standard or none_merged is standard:
+        fail("None did not produce a fresh copy of the standard registry")
+
+    collision = _NamedTool("first", content="collision")
+    try:
+        merge_tool_registry(standard, {"first": collision})
+    except ValueError as exc:
+        if "first" not in str(exc):
+            fail(f"merge collision omitted the tool name: {exc!r}")
+    else:
+        fail("merge_tool_registry overwrote a standard tool")
+    if standard["first"] is not first:
+        fail("collision changed the standard binding")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        with mock.patch.object(
+            runner_module,
+            "merge_tool_registry",
+            wraps=merge_tool_registry,
+        ) as merge_spy:
+            result = run_task(
+                FakeModelProvider(
+                    [ModelResponse(Message(Role.ASSISTANT, "done"), Usage(4, 2))]
+                ),
+                PermissionPolicy(Path(temporary)),
+                "frozen",
+                model="frozen-model",
+                mcp_tools=None,
+            )
+    actual = _run_snapshot(result)
+    if actual != _FROZEN_RUN_TASK:
+        fail(
+            f"merge extraction changed run_task from {_PRE_19E_COMMIT}: "
+            f"expected={_FROZEN_RUN_TASK!r}, actual={actual!r}"
+        )
+    if merge_spy.call_count != 1:
+        fail("run_task did not use merge_tool_registry after extraction")
+
+    root = Path(__file__).resolve().parents[2]
+    mcp_bytes = (root / "symphonai_api/mcp.py").read_bytes()
+    pool_bytes = (root / "symphonai_api/mcp_pool.py").read_bytes()
+    if hashlib.sha256(mcp_bytes).hexdigest() != _MCP_SHA256:
+        fail("19e changed symphonai_api/mcp.py")
+    if hashlib.sha256(pool_bytes).hexdigest() != _MCP_POOL_SHA256:
+        fail("19e changed symphonai_api/mcp_pool.py")

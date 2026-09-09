@@ -83,6 +83,23 @@ def standard_tool_registry(
     }
 
 
+def merge_tool_registry(
+    standard: dict[str, LocalTool],
+    extra: Mapping[str, LocalTool] | None,
+) -> dict[str, LocalTool]:
+    """Standard tools plus `extra`; a colliding key is an error, not an overwrite."""
+    merged = standard.copy()
+    if extra is None:
+        return merged
+    duplicate = next((name for name in extra if name in standard), None)
+    if duplicate is not None:
+        raise ValueError(
+            f"MCP tool {duplicate!r} collides with a standard tool"
+        )
+    merged.update(extra)
+    return merged
+
+
 def run_task(
     provider: ModelProvider,
     policy: PermissionPolicy,
@@ -126,18 +143,14 @@ def run_task(
         if offload_tool_results
         else None
     )
-    tools = standard_tool_registry(
-        ledger=ledger,
-        result_store=result_store,
-        search_backend=search_backend,
+    tools = merge_tool_registry(
+        standard_tool_registry(
+            ledger=ledger,
+            result_store=result_store,
+            search_backend=search_backend,
+        ),
+        mcp_tools,
     )
-    if mcp_tools is not None:
-        duplicate = next((name for name in mcp_tools if name in tools), None)
-        if duplicate is not None:
-            raise ValueError(
-                f"MCP tool {duplicate!r} collides with a standard tool"
-            )
-        tools.update(mcp_tools)
     hook_runner = (
         None
         if extensions is None

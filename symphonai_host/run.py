@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from symphonai_api.identity import AgentRef, new_agent_ref, new_id
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
-from symphonai_api.runner import standard_tool_registry
+from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import (
     LoadedRun,
     RunDiagnosis,
@@ -25,6 +26,7 @@ from symphonai_api.session import (
 )
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
+from symphonai_api.tools.base import LocalTool
 from symphonai_host.broker import EventBroker
 from symphonai_host.approvals import ApprovalBroker, PendingApproval
 from symphonai_host.protocol import HistoryMessage
@@ -63,6 +65,7 @@ class HostRun:
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
         extensions: Extensions | None = None,
+        mcp_tools: Mapping[str, LocalTool] | None = None,
     ) -> None:
         self._provider = provider
         self._policy = policy
@@ -75,6 +78,7 @@ class HostRun:
             if extensions is None
             else extensions.hook_runner(cwd=policy.repo_root)
         )
+        self._mcp_tools = mcp_tools
         self._active: _ActiveRun | None = None
         self._opened: tuple[SessionStore, LoadedRun, RunDiagnosis, list[str]] | None = None
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
@@ -194,7 +198,10 @@ class HostRun:
             directory=session.tool_results_directory,
             fallback_directories=fallback_directories,
         )
-        tools = standard_tool_registry(result_store=result_store)
+        tools = merge_tool_registry(
+            standard_tool_registry(result_store=result_store),
+            self._mcp_tools,
+        )
         events = fan_out(
             lambda event: self._publish(run_id, event),
             self._hooks,

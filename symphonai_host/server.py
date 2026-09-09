@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 import threading
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,7 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.extensions import Extensions
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import SessionError, TranscriptError
+from symphonai_api.tools.base import LocalTool
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.protocol import (
     ApprovalRequested,
@@ -45,6 +47,7 @@ class HostServer:
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
         extensions: Extensions | None = None,
+        mcp_tools: Mapping[str, LocalTool] | None = None,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
@@ -61,6 +64,7 @@ class HostServer:
             approval_timeout=approval_timeout,
             sessions_root=sessions_root,
             extensions=extensions,
+            mcp_tools=mcp_tools,
         )
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
