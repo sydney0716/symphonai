@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 from typing import get_args, get_type_hints
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from unittest import mock
 
 import symphonai_api.agent_loop as agent_loop
@@ -531,6 +531,114 @@ def check_file_route() -> None:
             )
             if actual_protocol != _FROZEN_PROTOCOL:
                 fail(f"file route changed the frozen protocol: {actual_protocol!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.app_routes")
+def check_app_routes() -> None:
+    token = "browser-route-token"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        app_root = root / "symphonai_app"
+        source_root = app_root / "src"
+        source_root.mkdir(parents=True)
+        index = (
+            "<!doctype html><html><head>"
+            f"{host_server_module.APP_HANDSHAKE_MARKER}"
+            "</head><body><main>app</main>"
+            '<script type="module" src="/app/src/app.js"></script>'
+            "</body></html>"
+        )
+        (app_root / "index.html").write_text(index, encoding="utf-8")
+        (app_root / "app.css").write_text("body { color: black; }", encoding="utf-8")
+        (source_root / "app.js").write_text("export const app = true;", encoding="utf-8")
+        (app_root / "secret.py").write_text("secret = True", encoding="utf-8")
+        (app_root / "notes.md").write_text("private notes", encoding="utf-8")
+        outside = root / "outside.js"
+        outside.write_text("outside", encoding="utf-8")
+        (source_root / "escape.js").symlink_to(outside)
+        docs = root / "docs"
+        docs.mkdir()
+        (docs / "roadmap.json").write_text("{}", encoding="utf-8")
+
+        host = _host(repo_root=root, token=token)
+        responses = []
+
+        def get(path: str, *, authorized: bool = False):  # noqa: ANN202
+            headers = _headers(host) if authorized else {}
+            connection, response = _request(host, "GET", path, headers=headers)
+            try:
+                result = (
+                    response.status,
+                    response.getheader("Content-Type"),
+                    response.read(),
+                )
+                responses.append((path, result))
+                return result
+            finally:
+                connection.close()
+
+        try:
+            for path in ("/app", f"/app?token={token}"):
+                status, content_type, body = get(
+                    path,
+                    authorized=path == "/app",
+                )
+                if status != 200 or content_type != "text/html":
+                    fail(f"app index response was wrong: {status}, {content_type!r}")
+                text = body.decode("utf-8")
+                if text.count("window.__symphonai = ") != 1:
+                    fail("app index did not contain exactly one injected handshake")
+                encoded = text.split("window.__symphonai = ", 1)[1].split(";</script>", 1)[0]
+                if json.loads(encoded) != {"port": host.port, "token": token}:
+                    fail(f"app index injected the wrong handshake: {encoded!r}")
+
+            for path, content_type, expected in (
+                ("/app/src/app.js", "text/javascript", b"export const app = true;"),
+                ("/app/app.css", "text/css", b"body { color: black; }"),
+                ("/app/index.html", "text/html", index.encode("utf-8")),
+            ):
+                status, actual_type, body = get(path, authorized=True)
+                if (status, actual_type, body) != (200, content_type, expected):
+                    fail(f"app asset response was wrong for {path!r}: {status}, {actual_type!r}, {body!r}")
+
+            for path in ("/app/secret.py", "/app/notes.md"):
+                status, _, body = get(path, authorized=True)
+                if status != 403 or body != b"":
+                    fail(f"app route served a forbidden extension: {path!r}")
+
+            traversal = (
+                "/app/../outside.js",
+                "/app/src/../../outside.js",
+                f"/app/{outside}",
+                "/app/src/escape.js",
+            )
+            for path in traversal:
+                status, _, body = get(path, authorized=True)
+                if status != 403 or body != b"":
+                    fail(f"app route accepted traversal fixture {path!r}: {status}")
+
+            for path in (
+                f"/app?token=wrong-{token}",
+                f"/app/src/app.js?token={token}",
+                f"/file?path=docs/roadmap.json&token={token}",
+            ):
+                status, _, body = get(path)
+                if status != 401 or body != b"":
+                    fail(f"query authentication escaped exact /app: {path!r}, {status}")
+
+            protected = (str(root),)
+            for path, (_, _, body) in responses:
+                text = body.decode("utf-8", errors="replace")
+                if any(value in text for value in protected):
+                    fail(f"app response exposed an absolute path: {path!r}")
+                if token in text and urlsplit(path).path != "/app":
+                    fail(f"app response exposed the token outside the index: {path!r}")
+
+            source = inspect.getsource(HostServer._handler_type)
+            if "_contains_path(app_root, resolved)" not in source:
+                fail("app containment did not use the shared path rule")
         finally:
             host.close()
 

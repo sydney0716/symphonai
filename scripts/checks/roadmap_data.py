@@ -24,6 +24,8 @@ FOLLOW_UP_SPEC = re.compile(
 UNBOUND_BY_DESIGN: dict[str, str] = {
     "specs/18/18j-five-flaky-checks-one-race.md":
         "test hygiene: five host checks racing a fifty-millisecond keepalive",
+    "specs/18/18k-a-page-you-can-open.md":
+        "development browser shell omitted from the phase 18 roadmap",
 }
 
 
@@ -118,7 +120,10 @@ def _spec_paths(item: dict) -> list[str]:
 
 
 def _unbound_set_errors(unbound_by_design: dict[str, str]) -> list[str]:
-    expected = {"specs/18/18j-five-flaky-checks-one-race.md"}
+    expected = {
+        "specs/18/18j-five-flaky-checks-one-race.md",
+        "specs/18/18k-a-page-you-can-open.md",
+    }
     return sorted(set(unbound_by_design) ^ expected)
 
 

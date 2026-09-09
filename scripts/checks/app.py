@@ -21,6 +21,7 @@ NODE_TESTS = {
     "app.roadmap": "roadmap.test.js",
     "app.spec_view": "spec_view.test.js",
     "app.approvals": "approvals.test.js",
+    "app.page": "app.test.js",
 }
 APP_SOURCE_EXTENSIONS = frozenset({".js", ".mjs", ".json", ".html", ".css"})
 
@@ -106,6 +107,11 @@ def spec_view() -> None:
 @check("app.approvals")
 def approvals() -> None:
     _run_node_test("approvals.test.js")
+
+
+@check("app.page")
+def page() -> None:
+    _run_node_test("app.test.js")
 
 
 @check("app.test_registration")

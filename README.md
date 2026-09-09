@@ -66,6 +66,17 @@ python3 scripts/tui.py                   # run it
 
 API keys are read from the environment and never from a file in the repository.
 
+To open the development browser app, start the host from the repository root:
+
+```bash
+python3 -m symphonai_host --provider openai
+```
+
+Its first line is a JSON handshake containing `port` and `token`. Open
+`http://127.0.0.1:<port>/app?token=<token>` with those exact values. The query
+token is accepted only for that first page navigation; subsequent page requests
+authenticate by header.
+
 ## Where it is going
 
 Streaming, a host process that owns a run and serves an event channel, agents

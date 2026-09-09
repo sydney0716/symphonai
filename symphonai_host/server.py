@@ -10,7 +10,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.extensions import Extensions
@@ -32,6 +32,12 @@ from symphonai_host.sessions import list_sessions
 
 
 MAX_FILE_BYTES = 1024 * 1024
+APP_CONTENT_TYPES = {
+    ".css": "text/css",
+    ".html": "text/html",
+    ".js": "text/javascript",
+}
+APP_HANDSHAKE_MARKER = "<!-- symphonai-handshake -->"
 
 
 class HostServer:
@@ -154,15 +160,24 @@ class HostServer:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-            def _authorized(self) -> bool:
+            def _authorized(self, *, allow_app_query: bool = False) -> bool:
                 supplied = self.headers.get("Authorization", "")
                 expected = f"Bearer {host.token}"
-                if not secrets.compare_digest(supplied, expected):
-                    self.send_response(HTTPStatus.UNAUTHORIZED)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return False
-                return True
+                if secrets.compare_digest(supplied, expected):
+                    return True
+                if allow_app_query:
+                    values = parse_qs(
+                        urlsplit(self.path).query,
+                        keep_blank_values=True,
+                    ).get("token", [])
+                    if len(values) == 1 and secrets.compare_digest(
+                        values[0], host.token
+                    ):
+                        return True
+                self.send_response(HTTPStatus.UNAUTHORIZED)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return False
 
             def _json(self, status: HTTPStatus, body: object) -> None:
                 encoded = json.dumps(body).encode("utf-8")
@@ -176,6 +191,67 @@ class HostServer:
                 self.send_response(status)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            def _bytes(
+                self,
+                status: HTTPStatus,
+                body: bytes,
+                content_type: str,
+            ) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _app_path(self, requested: str) -> Path | None:
+                candidate = Path(unquote(requested))
+                if candidate.is_absolute():
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return None
+                app_root = host._repo_root / "symphonai_app"
+                try:
+                    resolved = (app_root / candidate).resolve()
+                except (OSError, RuntimeError):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return None
+                if not _contains_path(app_root, resolved):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return None
+                return resolved
+
+            def _serve_app_index(self) -> None:
+                resolved = self._app_path("index.html")
+                if resolved is None:
+                    return
+                try:
+                    source = resolved.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    self._not_found()
+                    return
+                if source.count(APP_HANDSHAKE_MARKER) != 1:
+                    self._not_found()
+                    return
+                handshake = json.dumps(host.handshake()).replace("<", "\\u003c")
+                script = f"<script>window.__symphonai = {handshake};</script>"
+                body = source.replace(APP_HANDSHAKE_MARKER, script).encode("utf-8")
+                self._bytes(HTTPStatus.OK, body, APP_CONTENT_TYPES[".html"])
+
+            def _serve_app_asset(self, requested: str) -> None:
+                resolved = self._app_path(requested)
+                if resolved is None:
+                    return
+                content_type = APP_CONTENT_TYPES.get(resolved.suffix)
+                if content_type is None:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    body = resolved.read_bytes()
+                except OSError:
+                    self._not_found()
+                    return
+                self._bytes(HTTPStatus.OK, body, content_type)
 
             def _serve_file(self) -> None:
                 values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
@@ -232,6 +308,7 @@ class HostServer:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
             def do_GET(self) -> None:
+                request_path = urlsplit(self.path).path
                 if self.path == "/health":
                     self._json(
                         HTTPStatus.OK,
@@ -243,7 +320,17 @@ class HostServer:
                         },
                     )
                     return
-                if urlsplit(self.path).path == "/file":
+                if request_path == "/app":
+                    if not self._authorized(allow_app_query=True):
+                        return
+                    self._serve_app_index()
+                    return
+                if request_path.startswith("/app/"):
+                    if not self._authorized():
+                        return
+                    self._serve_app_asset(request_path.removeprefix("/app/"))
+                    return
+                if request_path == "/file":
                     if not self._authorized():
                         return
                     self._serve_file()

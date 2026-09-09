@@ -100,8 +100,12 @@ the handshake JSON and the parent is responsible for terminating the sidecar.
 The reference host binds only to `127.0.0.1` on an ephemeral port. On startup
 it prints exactly one JSON line containing `port` and the process-local token.
 All routes except `GET /health` require `Authorization: Bearer <token>`;
-missing or invalid credentials receive `401` with an empty body. The token is
-never placed in a URL, log, or error response.
+missing or invalid credentials receive `401` with an empty body. The sole
+exception is the browser's initial `GET /app?token=<token>` navigation, which
+cannot set a request header. Query authentication is accepted only on exact
+`GET /app`, never on `/app/<path>`, `/file`, `/events`, or any POST. The host
+does not log request URLs. After loading, the injected handshake supplies the
+token and every page request uses the authorization header.
 
 `GET /events` returns `text/event-stream`. Each event is one `data:` line
 whose content is an `event` frame containing the event payload above. A client
@@ -124,3 +128,11 @@ receive `403` with an empty body. Missing files receive `404`, non-UTF-8 files
 receive `415`, and files larger than 1 MiB receive `413`. The route requires the
 same bearer token as every non-health endpoint and never returns the token or an
 absolute filesystem path.
+
+`GET /app` returns the browser shell with one inline handshake script setting
+`window.__symphonai` to the running host's `port` and `token`. `GET
+/app/<path>` serves only `.js`, `.css`, and `.html` files resolved beneath
+`symphonai_app/`; other extensions, absolute paths, traversal, and escaping
+symlinks receive `403` with an empty body. JavaScript is served as
+`text/javascript`, CSS as `text/css`, and HTML as `text/html`. Static assets do
+not contain the token or absolute filesystem paths.

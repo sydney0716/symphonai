@@ -327,6 +327,7 @@ def main() -> None:
         "host_server.handshake_line",
         "host_server.auth_required",
         "host_server.file_route",
+        "host_server.app_routes",
         "host_server.event_stream_delivers",
         "host_server.two_subscribers",
         "host_server.slow_subscriber_drops_oldest",
@@ -393,6 +394,7 @@ def main() -> None:
         "app.roadmap",
         "app.spec_view",
         "app.approvals",
+        "app.page",
         "app.test_registration",
         "app.import_boundary",
         "roadmap_data.schema",
@@ -702,7 +704,10 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "622 passed, 0 failed, 622 selected of 622 registered",
+        == (
+            f"{len(expected_names)} passed, 0 failed, "
+            f"{len(expected_names)} selected of {len(expected_names)} registered"
+        ),
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -750,7 +755,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 622 registered"
+                f"of {len(expected_names)} registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

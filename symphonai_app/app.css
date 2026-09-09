@@ -1,0 +1,111 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  background: #11151c;
+  color: #e8edf5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: minmax(18rem, 34%) 1fr;
+  min-height: 100vh;
+}
+
+.roadmap-pane,
+.chat-pane {
+  padding: 1rem;
+  overflow: auto;
+}
+
+.roadmap-pane {
+  border-right: 1px solid #394150;
+  background: #171d26;
+}
+
+.chat-pane {
+  display: grid;
+  grid-template-rows: auto 1fr auto auto;
+  gap: 1rem;
+}
+
+.chat-pane > header,
+.prompt-form {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.turn-state,
+.phase-progress {
+  color: #9aa7b8;
+}
+
+.roadmap-phase {
+  display: grid;
+  gap: 0.4rem;
+  margin: 1rem 0;
+}
+
+.roadmap-item {
+  padding: 0.55rem;
+  text-align: left;
+}
+
+.spec-view pre {
+  max-height: 18rem;
+  overflow: auto;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+  background: #0d1117;
+}
+
+.chat-log {
+  min-height: 12rem;
+}
+
+.assistant,
+.tool,
+.dropped,
+.approval {
+  padding: 0.65rem;
+  border-radius: 0.4rem;
+  background: #1d2530;
+}
+
+.dropped,
+.error {
+  color: #ffbd66;
+}
+
+.approval button {
+  margin-right: 0.5rem;
+}
+
+.prompt-form textarea {
+  flex: 1;
+  resize: vertical;
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .roadmap-pane {
+    border-right: 0;
+    border-bottom: 1px solid #394150;
+  }
+}
