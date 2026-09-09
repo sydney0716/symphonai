@@ -389,8 +389,11 @@ def main() -> None:
         "app.protocol",
         "app.client",
         "app.turn",
+        "app.roadmap",
         "app.test_registration",
         "app.import_boundary",
+        "roadmap_data.schema",
+        "roadmap_data.spec_bindings",
         "cancel.pre_cancelled_agent",
         "cancel.tool_repair",
         "cancel.http_read_recheck",
@@ -696,7 +699,7 @@ def main() -> None:
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
-        == "616 passed, 0 failed, 616 selected of 616 registered",
+        == "619 passed, 0 failed, 619 selected of 619 registered",
         f"unexpected full-run summary: {full_run.stdout!r}",
     )
 
@@ -744,7 +747,7 @@ def main() -> None:
             selected_alone_lines[-1]
             == (
                 f"{selected_count} passed, 0 failed, {selected_count} selected "
-                "of 616 registered"
+                "of 619 registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )

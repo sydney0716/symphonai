@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ NODE_TESTS = {
     "app.protocol": "protocol.test.js",
     "app.client": "client.test.js",
     "app.turn": "turn.test.js",
+    "app.roadmap": "roadmap.test.js",
 }
 APP_SOURCE_EXTENSIONS = frozenset({".js", ".mjs", ".json", ".html", ".css"})
 
@@ -41,7 +43,7 @@ def _node() -> str:
     return executable
 
 
-def _run_node_test(filename: str) -> None:
+def _run_node_test(filename: str, *, environment=None) -> None:  # noqa: ANN001
     result = subprocess.run(
         [
             _node(),
@@ -53,6 +55,7 @@ def _run_node_test(filename: str) -> None:
         text=True,
         capture_output=True,
         check=False,
+        env=environment,
     )
     if result.returncode != 0:
         output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
@@ -84,6 +87,13 @@ def client() -> None:
 @check("app.turn")
 def turn() -> None:
     _run_node_test("turn.test.js")
+
+
+@check("app.roadmap")
+def roadmap() -> None:
+    environment = dict(os.environ)
+    environment["SYMPHONAI_ROADMAP_PATH"] = str(REPO_ROOT / "docs" / "roadmap.json")
+    _run_node_test("roadmap.test.js", environment=environment)
 
 
 @check("app.test_registration")
