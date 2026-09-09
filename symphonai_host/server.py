@@ -10,8 +10,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.extensions import Extensions
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import SessionError, TranscriptError
@@ -28,6 +29,9 @@ from symphonai_host.protocol import (
 )
 from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.sessions import list_sessions
+
+
+MAX_FILE_BYTES = 1024 * 1024
 
 
 class HostServer:
@@ -52,6 +56,7 @@ class HostServer:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
         self.token = token or secrets.token_urlsafe(32)
+        self._repo_root = policy.repo_root
         self.broker = broker or EventBroker()
         self.run = HostRun(
             provider,
@@ -167,6 +172,52 @@ class HostServer:
                 self.end_headers()
                 self.wfile.write(encoded)
 
+            def _empty(self, status: HTTPStatus) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def _serve_file(self) -> None:
+                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                paths = values.get("path", [])
+                if len(paths) != 1:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                requested = paths[0]
+                candidate = Path(requested)
+                if candidate.is_absolute():
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    resolved = (host._repo_root / candidate).resolve()
+                except (OSError, RuntimeError):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                allowed_roots = (
+                    host._repo_root / "specs",
+                    host._repo_root / "docs",
+                )
+                if not _contains_path(host._repo_root, resolved) or not any(
+                    _contains_path(root, resolved) for root in allowed_roots
+                ):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    with resolved.open("rb") as source:
+                        data = source.read(MAX_FILE_BYTES + 1)
+                except (OSError, ValueError):
+                    self._not_found()
+                    return
+                if len(data) > MAX_FILE_BYTES:
+                    self._empty(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    return
+                self._json(HTTPStatus.OK, {"path": requested, "text": text})
+
             def _read_object(self) -> dict:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -191,6 +242,11 @@ class HostServer:
                             "runtime_run_id": host.run.runtime_run_id,
                         },
                     )
+                    return
+                if urlsplit(self.path).path == "/file":
+                    if not self._authorized():
+                        return
+                    self._serve_file()
                     return
                 if self.path == "/approvals":
                     if not self._authorized():

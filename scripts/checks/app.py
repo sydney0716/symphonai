@@ -19,6 +19,8 @@ NODE_TESTS = {
     "app.client": "client.test.js",
     "app.turn": "turn.test.js",
     "app.roadmap": "roadmap.test.js",
+    "app.spec_view": "spec_view.test.js",
+    "app.approvals": "approvals.test.js",
 }
 APP_SOURCE_EXTENSIONS = frozenset({".js", ".mjs", ".json", ".html", ".css"})
 
@@ -94,6 +96,16 @@ def roadmap() -> None:
     environment = dict(os.environ)
     environment["SYMPHONAI_ROADMAP_PATH"] = str(REPO_ROOT / "docs" / "roadmap.json")
     _run_node_test("roadmap.test.js", environment=environment)
+
+
+@check("app.spec_view")
+def spec_view() -> None:
+    _run_node_test("spec_view.test.js")
+
+
+@check("app.approvals")
+def approvals() -> None:
+    _run_node_test("approvals.test.js")
 
 
 @check("app.test_registration")

@@ -16,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 from typing import get_args, get_type_hints
+from urllib.parse import urlencode
 from unittest import mock
 
 import symphonai_api.agent_loop as agent_loop
@@ -72,12 +73,15 @@ def _host(
     *,
     broker: EventBroker | None = None,
     keepalive_seconds: float = 0.05,
+    repo_root: Path = REPO_ROOT,
+    token: str | None = None,
 ) -> HostServer:
     host = HostServer(
         provider or FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
-        PermissionPolicy(repo_root=REPO_ROOT),
+        PermissionPolicy(repo_root=repo_root),
         broker=broker,
         keepalive_seconds=keepalive_seconds,
+        token=token,
     )
     host.start()
     return host
@@ -199,6 +203,123 @@ def check_auth_required() -> None:
             connection.close()
     finally:
         host.close()
+
+
+@check("host_server.file_route")
+def check_file_route() -> None:
+    token = "file-route-token"
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture = Path(temporary)
+        root = fixture / "repo"
+        sibling = fixture / "repo-sibling"
+        specs = root / "specs"
+        docs = root / "docs"
+        source = root / "symphonai_host"
+        git = root / ".git"
+        for directory in (
+            specs,
+            specs / "nested",
+            docs,
+            source,
+            git,
+            sibling,
+            fixture / "etc",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        spec = specs / "18d.md"
+        roadmap = docs / "roadmap.json"
+        outside = sibling / "outside.md"
+        spec.write_text("spec text", encoding="utf-8")
+        roadmap.write_text('{"goal":"fixture"}', encoding="utf-8")
+        outside.write_text("outside", encoding="utf-8")
+        (fixture / "etc" / "passwd").write_text("outside", encoding="utf-8")
+        (root / ".env").write_text("secret", encoding="utf-8")
+        (git / "config").write_text("private", encoding="utf-8")
+        (source / "server.py").write_text("source", encoding="utf-8")
+        (specs / "invalid.md").write_bytes(b"\xff")
+        (specs / "large.md").write_bytes(
+            b"x" * (host_server_module.MAX_FILE_BYTES + 1)
+        )
+        (specs / "outside-link.md").symlink_to(outside)
+
+        host = _host(repo_root=root, token=token)
+        protected_values = (token, str(fixture))
+
+        def request_file(path: str, *, authorized: bool = True):  # noqa: ANN202
+            headers = _headers(host) if authorized else {}
+            connection, response = _request(
+                host,
+                "GET",
+                f"/file?{urlencode({'path': path})}",
+                headers=headers,
+            )
+            try:
+                result = (response.status, tuple(response.getheaders()), response.read())
+                wire = repr(result)
+                leaked = [value for value in protected_values if value in wire]
+                if leaked:
+                    fail(f"file route response leaked a protected value: {leaked!r}")
+                return result
+            finally:
+                connection.close()
+
+        try:
+            for path, expected_text in (
+                ("specs/18d.md", "spec text"),
+                ("docs/roadmap.json", '{"goal":"fixture"}'),
+            ):
+                status, _, body = request_file(path)
+                if status != 200 or json.loads(body) != {
+                    "path": path,
+                    "text": expected_text,
+                }:
+                    fail(f"file route returned the wrong document for {path!r}")
+
+            traversal = (
+                "../etc/passwd",
+                str(spec),
+                "specs/nested/../../../repo-sibling/outside.md",
+                "specs/outside-link.md",
+                "docs/../../repo-sibling/outside.md",
+            )
+            for path in traversal:
+                status, _, body = request_file(path)
+                if status != 403 or body != b"":
+                    fail(f"file route accepted traversal fixture {path!r}: {status}")
+
+            for path in (".env", ".git/config", "symphonai_host/server.py"):
+                status, _, body = request_file(path)
+                if status != 403 or body != b"":
+                    fail(f"file route served a path outside its allow-list: {path!r}")
+
+            status, _, body = request_file("specs/missing.md")
+            if status != 404 or json.loads(body) != {"error": "not found"}:
+                fail(f"missing file response was not the generic 404: {status}, {body!r}")
+            for path, expected_status in (
+                ("specs/invalid.md", 415),
+                ("specs/large.md", 413),
+            ):
+                status, _, body = request_file(path)
+                if status != expected_status or body != b"":
+                    fail(f"file route handled {path!r} as {status} with {body!r}")
+
+            status, _, body = request_file("specs/18d.md", authorized=False)
+            if status != 401 or body != b"":
+                fail("file route did not require bearer authorization")
+
+            return_types = get_args(
+                get_type_hints(protocol_module.decode_request)["return"]
+            )
+            actual_protocol = (
+                protocol_module.PROTOCOL_VERSION,
+                tuple(sorted(item.__name__ for item in return_types)),
+                tuple(sorted(protocol_module._FRAME_KINDS)),
+            )
+            if actual_protocol != _FROZEN_PROTOCOL:
+                fail(f"file route changed the frozen protocol: {actual_protocol!r}")
+        finally:
+            host.close()
 
 
 @check("host_server.event_stream_delivers")

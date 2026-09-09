@@ -20,6 +20,12 @@ FOLLOW_UP_SPEC = re.compile(
     r"^specs/(?P<phase>[^/]+)/(?P<id>[0-9]+[A-Za-z])F[0-9]*-[^/]+\.md$"
 )
 
+# Specs that are deliberately not roadmap items, and why each is not.
+UNBOUND_BY_DESIGN: dict[str, str] = {
+    "specs/18/18j-five-flaky-checks-one-race.md":
+        "test hygiene: five host checks racing a fifty-millisecond keepalive",
+}
+
 
 def _is_type(value, expected: str) -> bool:  # noqa: ANN001
     types = {
@@ -111,7 +117,18 @@ def _spec_paths(item: dict) -> list[str]:
     return []
 
 
-def _binding_errors(roadmap: dict, root: Path) -> list[str]:
+def _unbound_set_errors(unbound_by_design: dict[str, str]) -> list[str]:
+    expected = {"specs/18/18j-five-flaky-checks-one-race.md"}
+    return sorted(set(unbound_by_design) ^ expected)
+
+
+def _binding_errors(
+    roadmap: dict,
+    root: Path,
+    unbound_by_design: dict[str, str] | None = None,
+) -> list[str]:
+    exclusions = unbound_by_design or {}
+    excluded = set(exclusions)
     named = {
         path
         for phase in roadmap.get("phases", [])
@@ -126,11 +143,24 @@ def _binding_errors(roadmap: dict, root: Path) -> list[str]:
         for path in (root / "specs" / phase).glob("*.md")
         if not path.name.endswith("-PLAN.md")
     }
-    required = {path for path in expected if FOLLOW_UP_SPEC.fullmatch(path) is None}
+    required = {
+        path
+        for path in expected
+        if FOLLOW_UP_SPEC.fullmatch(path) is None and path not in excluded
+    }
     errors = [path for path in named if not (root / path).is_file()]
     errors.extend(required - named)
-    for path in expected - required:
+    errors.extend(path for path in excluded if not (root / path).is_file())
+    errors.extend(
+        path
+        for path, reason in exclusions.items()
+        if not isinstance(reason, str) or not reason.strip()
+    )
+    errors.extend(excluded & named)
+    for path in expected:
         follow_up = FOLLOW_UP_SPEC.fullmatch(path)
+        if follow_up is None:
+            continue
         parents = {
             candidate
             for candidate in expected
@@ -166,8 +196,20 @@ def spec_bindings() -> None:
         if _binding_errors(fixture, root):
             fail("an unbound follow-up with a bound parent was rejected")
 
+    exact_errors = _unbound_set_errors(UNBOUND_BY_DESIGN)
+    if exact_errors:
+        fail(
+            "UNBOUND_BY_DESIGN does not match the approved set: "
+            f"{exact_errors!r}"
+        )
+
+    extra_exclusion = dict(UNBOUND_BY_DESIGN)
+    extra_exclusion["specs/18/18z-extra.md"] = "not approved"
+    if not _unbound_set_errors(extra_exclusion):
+        fail("UNBOUND_BY_DESIGN exact-set check accepted an extra entry")
+
     roadmap = _load(REPO_ROOT / "docs" / "roadmap.json")
-    errors = _binding_errors(roadmap, REPO_ROOT)
+    errors = _binding_errors(roadmap, REPO_ROOT, UNBOUND_BY_DESIGN)
     if errors:
         fail(f"roadmap spec bindings are incomplete: {errors!r}")
 
@@ -176,7 +218,7 @@ def spec_bindings() -> None:
     phase["items"].append(
         {"title": "missing", "spec": "specs/18/18z-does-not-exist.md"}
     )
-    missing_errors = _binding_errors(missing, REPO_ROOT)
+    missing_errors = _binding_errors(missing, REPO_ROOT, UNBOUND_BY_DESIGN)
     if "specs/18/18z-does-not-exist.md" not in missing_errors:
         fail("a roadmap binding to a missing spec was accepted")
 
@@ -201,6 +243,32 @@ def spec_bindings() -> None:
         fixture_errors = _binding_errors(fixture, root)
         if "specs/18/18b-unbound.md" not in fixture_errors:
             fail("a spec with no roadmap item was not reported")
+
+        stale_path = "specs/18/18z-missing.md"
+        if stale_path not in _binding_errors(
+            fixture,
+            root,
+            {stale_path: "no longer present"},
+        ):
+            fail("an exclusion for a missing spec was accepted")
+
+        empty_reason = directory / "18c-hygiene.md"
+        empty_reason.write_text("hygiene", encoding="utf-8")
+        empty_reason_path = "specs/18/18c-hygiene.md"
+        if empty_reason_path not in _binding_errors(
+            fixture,
+            root,
+            {empty_reason_path: ""},
+        ):
+            fail("an exclusion with an empty reason was accepted")
+
+        also_bound_path = "specs/18/18a-bound.md"
+        if also_bound_path not in _binding_errors(
+            fixture,
+            root,
+            {also_bound_path: "test hygiene"},
+        ):
+            fail("a spec that was excluded and bound was accepted")
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)

@@ -115,3 +115,12 @@ idempotent. `GET /health` returns protocol version, `idle` or `active` state,
 the active host `run_id`, and the root runtime `runtime_run_id` once its
 `RunStarted` event has been seen. Both ids are `null` while idle. Other paths
 return JSON `404` responses.
+
+`GET /file?path=<repository-relative path>` returns a UTF-8 text file as
+`{"path": <path as requested>, "text": <contents>}`. It serves regular files
+only from the resolved repository's `specs/` and `docs/` directories. Absolute
+paths, traversal outside the resolved repository, and symlinks escaping it
+receive `403` with an empty body. Missing files receive `404`, non-UTF-8 files
+receive `415`, and files larger than 1 MiB receive `413`. The route requires the
+same bearer token as every non-health endpoint and never returns the token or an
+absolute filesystem path.
