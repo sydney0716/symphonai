@@ -8,7 +8,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from scripts.checks.harness import check, fail
+from scripts.checks.harness import check, fail, ok
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -122,11 +122,16 @@ def _unbound_set_errors(unbound_by_design: dict[str, str]) -> list[str]:
     return sorted(set(unbound_by_design) ^ expected)
 
 
-def _binding_errors(
+def _report_path(root: Path, spec_path: str) -> Path:
+    spec = Path(spec_path)
+    return root / "specs" / "report" / spec.parent.name / f"{spec.stem}-report.md"
+
+
+def _binding_status(
     roadmap: dict,
     root: Path,
     unbound_by_design: dict[str, str] | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     exclusions = unbound_by_design or {}
     excluded = set(exclusions)
     named = {
@@ -143,9 +148,11 @@ def _binding_errors(
         for path in (root / "specs" / phase).glob("*.md")
         if not path.name.endswith("-PLAN.md")
     }
+    completed = {path for path in expected if _report_path(root, path).is_file()}
+    pending = sorted(expected - completed)
     required = {
         path
-        for path in expected
+        for path in completed
         if FOLLOW_UP_SPEC.fullmatch(path) is None and path not in excluded
     }
     errors = [path for path in named if not (root / path).is_file()]
@@ -157,6 +164,7 @@ def _binding_errors(
         if not isinstance(reason, str) or not reason.strip()
     )
     errors.extend(excluded & named)
+    acceptable_parents = named | excluded
     for path in expected:
         follow_up = FOLLOW_UP_SPEC.fullmatch(path)
         if follow_up is None:
@@ -168,9 +176,17 @@ def _binding_errors(
             and base["phase"] == follow_up["phase"]
             and base["id"] == follow_up["id"]
         }
-        if not parents or parents.isdisjoint(named):
+        if not parents or parents.isdisjoint(acceptable_parents):
             errors.append(path)
-    return sorted(set(errors))
+    return sorted(set(errors)), pending
+
+
+def _binding_errors(
+    roadmap: dict,
+    root: Path,
+    unbound_by_design: dict[str, str] | None = None,
+) -> list[str]:
+    return _binding_status(roadmap, root, unbound_by_design)[0]
 
 
 @check("roadmap_data.spec_bindings")
@@ -196,6 +212,27 @@ def spec_bindings() -> None:
         if _binding_errors(fixture, root):
             fail("an unbound follow-up with a bound parent was rejected")
 
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        directory = root / "specs" / "18"
+        directory.mkdir(parents=True)
+        base_path = "specs/18/18a-hygiene.md"
+        follow_up_path = "specs/18/18aF-review-finding.md"
+        nested_follow_up_path = "specs/18/18aF2-second-review-finding.md"
+        for path in (base_path, follow_up_path, nested_follow_up_path):
+            (root / path).write_text("spec", encoding="utf-8")
+        fixture = {"phases": [{"id": "18", "items": []}]}
+        fixture_errors = _binding_errors(
+            fixture,
+            root,
+            {base_path: "test hygiene"},
+        )
+        if fixture_errors:
+            fail(
+                "follow-ups did not inherit an exempted base parent's standing: "
+                f"{fixture_errors!r}"
+            )
+
     exact_errors = _unbound_set_errors(UNBOUND_BY_DESIGN)
     if exact_errors:
         fail(
@@ -209,7 +246,7 @@ def spec_bindings() -> None:
         fail("UNBOUND_BY_DESIGN exact-set check accepted an extra entry")
 
     roadmap = _load(REPO_ROOT / "docs" / "roadmap.json")
-    errors = _binding_errors(roadmap, REPO_ROOT, UNBOUND_BY_DESIGN)
+    errors, pending = _binding_status(roadmap, REPO_ROOT, UNBOUND_BY_DESIGN)
     if errors:
         fail(f"roadmap spec bindings are incomplete: {errors!r}")
 
@@ -230,6 +267,12 @@ def spec_bindings() -> None:
         unbound = directory / "18b-unbound.md"
         bound.write_text("bound", encoding="utf-8")
         unbound.write_text("unbound", encoding="utf-8")
+        report_directory = root / "specs" / "report" / "18"
+        report_directory.mkdir(parents=True)
+        (report_directory / "18b-unbound-report.md").write_text(
+            "report",
+            encoding="utf-8",
+        )
         fixture = {
             "phases": [
                 {
@@ -270,6 +313,81 @@ def spec_bindings() -> None:
         ):
             fail("a spec that was excluded and bound was accepted")
 
+    for expected_pending, completed_names in [
+        (0, {"18a-first", "18b-second"}),
+        (1, {"18a-first"}),
+        (2, set()),
+    ]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "specs" / "18"
+            directory.mkdir(parents=True)
+            report_directory = root / "specs" / "report" / "18"
+            report_directory.mkdir(parents=True)
+            paths = ["specs/18/18a-first.md", "specs/18/18b-second.md"]
+            for path in paths:
+                (root / path).write_text("spec", encoding="utf-8")
+                if Path(path).stem in completed_names:
+                    (report_directory / f"{Path(path).stem}-report.md").write_text(
+                        "report",
+                        encoding="utf-8",
+                    )
+            fixture = {
+                "phases": [
+                    {
+                        "id": "18",
+                        "items": [
+                            {"title": "completed", "spec": path}
+                            for path in paths
+                            if Path(path).stem in completed_names
+                        ],
+                    }
+                ]
+            }
+            fixture_errors, fixture_pending = _binding_status(fixture, root)
+            if fixture_errors:
+                fail(
+                    f"the {expected_pending}-pending fixture failed: "
+                    f"{fixture_errors!r}"
+                )
+            if len(fixture_pending) != expected_pending:
+                fail(
+                    f"expected {expected_pending} pending specs, got "
+                    f"{fixture_pending!r}"
+                )
+
+    for report_exists in (False, True):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing_path = "specs/18/18z-missing.md"
+            if report_exists:
+                report = root / "specs" / "report" / "18" / "18z-missing-report.md"
+                report.parent.mkdir(parents=True)
+                report.write_text("report", encoding="utf-8")
+            fixture = {
+                "phases": [
+                    {
+                        "id": "18",
+                        "items": [{"title": "missing", "spec": missing_path}],
+                    }
+                ]
+            }
+            if missing_path not in _binding_errors(fixture, root):
+                fail(
+                    "a missing bound spec was accepted with "
+                    f"report_exists={report_exists}"
+                )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        plan = root / "specs" / "18" / "18z-PLAN.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("plan", encoding="utf-8")
+        fixture = {"phases": [{"id": "18", "items": []}]}
+        plan_errors, plan_pending = _binding_status(fixture, root)
+        if plan_errors or plan_pending:
+            fail("a PLAN file was treated as a roadmap spec")
+
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         directory = root / "specs" / "18"
@@ -293,3 +411,5 @@ def spec_bindings() -> None:
         follow_up_path = "specs/18/18aF-review-finding.md"
         if follow_up_path not in _binding_errors(fixture, root):
             fail("a follow-up whose parent is unbound was accepted")
+
+    ok(f"{len(pending)} roadmap specs pending: {pending!r}")

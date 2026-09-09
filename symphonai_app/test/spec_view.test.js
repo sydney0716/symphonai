@@ -4,61 +4,167 @@ import { readFile } from "node:fs/promises";
 
 import * as specViewModule from "../src/spec_view.js";
 import { createSpecView } from "../src/spec_view.js";
+import { ProtocolError } from "../src/protocol.js";
 
 const SPEC_PATH = "specs/18/18d-the-spec-and-its-report.md";
 const REPORT_PATH = "specs/report/18/18d-the-spec-and-its-report-report.md";
 const ITEM = { title: "The spec and its report", spec: SPEC_PATH };
 
-function clientWith(replies) {
+function fileFailure(status) {
+  const error = new ProtocolError(`file failed with status ${status}`);
+  error.status = status;
+  return error;
+}
+
+function clientWith(replies, { forbidden = [] } = {}) {
   const calls = [];
   return {
     calls,
     async file(path) {
       calls.push(path);
-      return replies.get(path) ?? { status: 404 };
+      if (forbidden.includes(path)) {
+        throw new Error(`forbidden eager fetch: ${path}`);
+      }
+      const reply = replies.get(path);
+      if (reply instanceof Error) {
+        throw reply;
+      }
+      if (reply === undefined) {
+        throw fileFailure(404);
+      }
+      return reply;
     },
   };
 }
 
-test("open enumerates spec with report, spec alone, and missing spec", async () => {
+test("open returns a spec and its primary report", async () => {
+  const client = clientWith(
+    new Map([
+      [SPEC_PATH, { path: SPEC_PATH, text: "spec text" }],
+      [REPORT_PATH, { path: REPORT_PATH, text: "report text" }],
+    ]),
+  );
+  assert.deepEqual(await createSpecView({ client }).open(ITEM), {
+    specs: [{ path: SPEC_PATH, text: "spec text" }],
+    report: { path: REPORT_PATH, text: "report text" },
+    followUps: [],
+    error: null,
+  });
+});
+
+test("the real hooks item opens every bound spec in order", async () => {
+  const roadmap = JSON.parse(
+    await readFile(new URL("../../docs/roadmap.json", import.meta.url), "utf8"),
+  );
+  const phase = roadmap.phases.find(({ id }) => id === "10");
+  const item = phase.items.find(
+    ({ spec }) => Array.isArray(spec) && spec.includes("specs/10/10c-hooks.md"),
+  );
+  assert.deepEqual(item.spec, [
+    "specs/10/10b-the-missing-events.md",
+    "specs/10/10c-hooks.md",
+  ]);
+  const replies = new Map(
+    item.spec.map((path) => [path, { path, text: `text for ${path}` }]),
+  );
+  const client = clientWith(replies);
+
+  const result = await createSpecView({ client }).open(item);
+
+  assert.deepEqual(
+    result.specs.map(({ path }) => path),
+    item.spec,
+  );
+  assert.deepEqual(client.calls.slice(0, 2), item.spec);
+});
+
+test("a missing bound spec does not hide the other bound specs", async () => {
+  const first = "specs/18/18a-first.md";
+  const second = "specs/18/18b-second.md";
+  const item = { title: "two specs", spec: [first, second] };
   const cases = [
-    {
-      label: "spec and report",
-      replies: new Map([
-        [SPEC_PATH, { status: 200, path: SPEC_PATH, text: "spec text" }],
-        [REPORT_PATH, { status: 200, path: REPORT_PATH, text: "report text" }],
-      ]),
-      expected: {
-        spec: { path: SPEC_PATH, text: "spec text" },
-        report: { path: REPORT_PATH, text: "report text" },
-      },
-    },
-    {
-      label: "missing report",
-      replies: new Map([
-        [SPEC_PATH, { status: 200, path: SPEC_PATH, text: "spec text" }],
-      ]),
-      expected: { spec: { path: SPEC_PATH, text: "spec text" }, report: null },
-    },
-    {
-      label: "missing spec",
-      replies: new Map(),
-      expected: null,
-    },
+    ["second missing", first, second],
+    ["first missing", second, first],
   ];
-  assert.equal(cases.length, 3);
-  for (const { label, replies, expected } of cases) {
-    const client = clientWith(replies);
-    const result = await createSpecView({ client }).open(ITEM);
-    if (expected === null) {
-      assert.equal(result.spec, null, label);
-      assert.equal(result.error.name, "SpecViewError", label);
-      assert.match(result.error.message, /18d-the-spec-and-its-report/, label);
-      assert.deepEqual(client.calls, [SPEC_PATH], label);
-    } else {
-      assert.deepEqual(result, expected, label);
-    }
+  assert.equal(cases.length, 2);
+
+  for (const [label, available, missing] of cases) {
+    const client = clientWith(
+      new Map([[available, { path: available, text: `${available} text` }]]),
+    );
+    const result = await createSpecView({ client }).open(item);
+    assert.deepEqual(result.specs.map(({ path }) => path), [available], label);
+    assert.deepEqual(client.calls.slice(0, 2), [first, second], label);
+    assert.match(result.error, new RegExp(missing), label);
   }
+});
+
+test("only the first bound spec determines the report", async () => {
+  const first = "specs/18/18a-first.md";
+  const second = "specs/18/18b-second.md";
+  const firstReport = "specs/report/18/18a-first-report.md";
+  const secondReport = "specs/report/18/18b-second-report.md";
+  const replies = new Map([
+    [first, { path: first, text: "first" }],
+    [second, { path: second, text: "second" }],
+    [firstReport, { path: firstReport, text: "first report" }],
+    [secondReport, { path: secondReport, text: "second report" }],
+  ]);
+  const client = clientWith(replies);
+
+  const result = await createSpecView({ client }).open({
+    title: "two specs",
+    spec: [first, second],
+  });
+
+  assert.deepEqual(result.report, {
+    path: firstReport,
+    text: "first report",
+  });
+  assert.deepEqual(
+    client.calls.filter((path) => path.includes("specs/report/")),
+    [firstReport],
+  );
+});
+
+test("a missing primary report is ordinary", async () => {
+  const client = clientWith(
+    new Map([[SPEC_PATH, { path: SPEC_PATH, text: "spec text" }]]),
+  );
+  const result = await createSpecView({ client }).open(ITEM);
+  assert.equal(result.report, null);
+  assert.equal(result.error, null);
+});
+
+test("follow-ups are listed in order without fetching their text", async () => {
+  const primary = "specs/10/10c-hooks.md";
+  const followUps = [
+    "specs/10/10cF-hooks-that-can-actually-load.md",
+    "specs/10/10cF2-a-filename-is-not-a-trust-boundary.md",
+  ];
+  const client = clientWith(
+    new Map([[primary, { path: primary, text: "hooks" }]]),
+    { forbidden: followUps },
+  );
+
+  const result = await createSpecView({ client }).open(
+    { title: "hooks", spec: primary },
+    { specPaths: [followUps[1], primary, followUps[0]] },
+  );
+
+  assert.deepEqual(
+    result.followUps,
+    followUps.map((path) => ({ path, text: null })),
+  );
+  assert.ok(followUps.every((path) => !client.calls.includes(path)));
+});
+
+test("open defaults to no follow-up inventory", async () => {
+  const client = clientWith(
+    new Map([[SPEC_PATH, { path: SPEC_PATH, text: "spec text" }]]),
+  );
+  const result = await createSpecView({ client }).open(ITEM);
+  assert.deepEqual(result.followUps, []);
 });
 
 test("the spec view has no write surface", async () => {

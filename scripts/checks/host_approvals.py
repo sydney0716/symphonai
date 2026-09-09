@@ -16,7 +16,7 @@ from symphonai_host.server import HostServer
 from symphonai_host.broker import EventBroker
 from symphonai_api.events import RunStarted
 from symphonai_host.protocol import decode_frame
-from scripts.checks.host_server import _event_stream, _headers, _next_sse, _request
+from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
 
 
@@ -155,13 +155,17 @@ def check_round_trip_over_http() -> None:
     host = _host()
     result = []
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             thread = threading.Thread(target=lambda: result.append(host.run.approvals.callback(REQUEST)))
             thread.start()
-            frame = _next_sse(connection, response, timeout=5)
-            if not isinstance(frame, tuple) or frame[0] != "approval_requested":
-                fail(f"approval frame was not published over SSE: {frame!r}")
+            frame = _await_sse(
+                connection,
+                response,
+                lambda candidate: isinstance(candidate, tuple)
+                and candidate[0] == "approval_requested",
+                what="approval request",
+            )
             approval_id = frame[1].get("approval_id")
             reply_connection, reply = _request(
                 host, "POST", "/approval", body={"approval_id": approval_id, "allowed": True}, headers=_headers(host)
@@ -234,16 +238,20 @@ def check_stop_unparks_over_http() -> None:
     host = _host(approval_timeout=5)
     result = []
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             callback = host.run._policy.approval_callback
             if callback is None:
                 fail("host did not install an approval callback")
             thread = threading.Thread(target=lambda: result.append(callback(REQUEST)))
             thread.start()
-            deadline = time.monotonic() + 5
-            while not host.run.approvals.pending() and time.monotonic() < deadline:
-                time.sleep(0.01)
+            _await_sse(
+                connection,
+                response,
+                lambda frame: isinstance(frame, tuple)
+                and frame[0] == "approval_requested",
+                what="parked approval request",
+            )
             pending = host.run.approvals.pending()
             if not pending:
                 fail(f"approval did not park before stop; result={result!r}")

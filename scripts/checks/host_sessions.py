@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import threading
 import time
 import json
 from pathlib import Path
 
+from symphonai_api.events import RunFinished
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.client import HostAddress, HostClient, HostClientError
+from symphonai_host.protocol import decode_event
 from symphonai_host.server import HostServer
 from symphonai_host.sessions import list_sessions
+from scripts.checks.host_server import _await_sse, _subscribed_stream
 from scripts.checks.harness import check, fail
 
 
@@ -95,6 +99,7 @@ def check_open_during_run_409() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         host, client, run_id = _finished_session(root)
+        connection, response = _subscribed_stream(host)
         try:
             client.send_prompt("active")
             try:
@@ -104,7 +109,27 @@ def check_open_during_run_409() -> None:
                     fail(f"active session did not return 409: {exc}")
             else:
                 fail("opened while active")
+
+            _await_sse(
+                connection,
+                response,
+                lambda frame: isinstance(frame, tuple)
+                and frame[0] == "event"
+                and isinstance(decode_event(frame[1]), RunFinished),
+                what="active run terminal event",
+            )
+            _wait_idle(client)
+
+            source = inspect.getsource(check_open_during_run_409)
+            if "time." + "sleep(" in source:
+                fail("open-during-run cleanup used time.sleep")
+            if "_await" + "_sse(" not in source or "_wait" + "_idle(client)" not in source:
+                fail("open-during-run cleanup did not wait for a terminal state")
+            for removal in ("rmtree" + "(", ".clean" + "up(", ".un" + "link("):
+                if removal in source:
+                    fail("open-during-run cleanup retries or performs removal directly")
         finally:
+            connection.close()
             host.close()
 
 

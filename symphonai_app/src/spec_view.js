@@ -1,11 +1,4 @@
-import { reportPathFor, specPaths } from "./roadmap.js";
-
-class SpecViewError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "SpecViewError";
-  }
-}
+import { followUpsFor, reportPathFor, specPaths } from "./roadmap.js";
 
 function primarySpec(item) {
   return specPaths(item)[0] ?? null;
@@ -15,7 +8,6 @@ function fileFrom(reply, fallbackPath) {
   if (
     reply === null ||
     typeof reply !== "object" ||
-    reply.status !== 200 ||
     typeof reply.text !== "string"
   ) {
     return null;
@@ -31,37 +23,63 @@ export function createSpecView({ client }) {
     throw new TypeError("spec view requires a file client");
   }
 
-  async function open(item) {
-    const path = primarySpec(item);
+  async function open(item, { specPaths: allSpecPaths = [] } = {}) {
+    const paths = specPaths(item);
+    const path = paths[0] ?? null;
+    const result = {
+      specs: [],
+      report: null,
+      followUps: [],
+      error: null,
+    };
     if (path === null) {
-      return {
-        spec: null,
-        error: new SpecViewError("item has no spec binding"),
-      };
+      result.error = "item has no spec binding";
+      return result;
     }
 
-    const specReply = await client.file(path);
-    const spec = fileFrom(specReply, path);
-    if (spec === null) {
-      return {
-        spec: null,
-        error: new SpecViewError(`spec unavailable: ${path}`),
-      };
+    result.followUps = followUpsFor(path, allSpecPaths).map((followUpPath) => ({
+      path: followUpPath,
+      text: null,
+    }));
+
+    const errors = [];
+    for (const specPath of paths) {
+      let reply;
+      try {
+        reply = await client.file(specPath);
+      } catch {
+        errors.push(`spec unavailable: ${specPath}`);
+        continue;
+      }
+      const spec = fileFrom(reply, specPath);
+      if (spec === null) {
+        errors.push(`spec unavailable: ${specPath}`);
+        continue;
+      }
+      result.specs.push(spec);
     }
 
+    // The first binding is the item's primary spec and owns its report.
     const reportPath = reportPathFor(path);
-    if (reportPath === null) {
-      return { spec, report: null };
+    if (reportPath !== null) {
+      try {
+        const report = fileFrom(await client.file(reportPath), reportPath);
+        if (report === null) {
+          errors.push(`report unavailable: ${reportPath}`);
+        } else {
+          result.report = report;
+        }
+      } catch (error) {
+        if (error?.status !== 404) {
+          errors.push(`report unavailable: ${reportPath}`);
+        }
+      }
     }
-    const reportReply = await client.file(reportPath);
-    if (reportReply.status === 404) {
-      return { spec, report: null };
+
+    if (errors.length > 0) {
+      result.error = errors.join("; ");
     }
-    const report = fileFrom(reportReply, reportPath);
-    if (report === null) {
-      throw new SpecViewError(`report unavailable: ${reportPath}`);
-    }
-    return { spec, report };
+    return result;
   }
 
   function askIntent(item, question) {

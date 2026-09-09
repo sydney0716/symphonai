@@ -259,6 +259,30 @@ export function createClient({
       return request("GET", "/health");
     },
 
+    async file(path) {
+      const query = new URLSearchParams({ path });
+      let response;
+      try {
+        response = await fetchImplementation(`${origin}/file?${query}`, {
+          method: "GET",
+          headers: headers(),
+        });
+      } catch {
+        throw new Error("network request failed");
+      }
+      if (!response || typeof response.status !== "number") {
+        throw new ProtocolError("host returned a malformed response");
+      }
+      if (response.status < 200 || response.status >= 300) {
+        const error = new ProtocolError(
+          `host file request failed with status ${response.status}`,
+        );
+        error.status = response.status;
+        throw error;
+      }
+      return readReply(response);
+    },
+
     get droppedFrames() {
       return droppedFrames;
     },

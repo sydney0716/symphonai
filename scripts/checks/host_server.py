@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import io
+import inspect
 import json
 import os
 import signal
@@ -44,7 +45,7 @@ from symphonai_host.broker import EventBroker
 from symphonai_host.protocol import decode_event, decode_frame
 from symphonai_host.run import HostRun
 from symphonai_host.server import HostServer
-from scripts.checks.harness import check, fail
+from scripts.checks.harness import CheckFailed, check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -142,6 +143,149 @@ def _next_sse(
     raise AssertionError("unreachable")
 
 
+def _await_sse(
+    connection,
+    response,
+    predicate,
+    *,
+    deadline: float = 5.0,
+    what: str = "frame",
+) -> tuple[str, dict]:
+    """Read frames until one satisfies `predicate`, or fail naming `what`."""
+    expires_at = time.monotonic() + deadline
+    frames = []
+    keepalives = 0
+    while True:
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0:
+            fail(
+                f"timed out waiting for {what}; frames seen: {frames!r}; "
+                f"keepalives: {keepalives}"
+            )
+        frame = _next_sse(
+            connection,
+            response,
+            timeout=remaining,
+            allow_timeout=True,
+        )
+        if frame == "timeout":
+            fail(
+                f"timed out waiting for {what}; frames seen: {frames!r}; "
+                f"keepalives: {keepalives}"
+            )
+        if frame == "keepalive":
+            keepalives += 1
+            continue
+        frames.append(frame)
+        if predicate(frame):
+            return frame
+
+
+class _ScriptedSSESocket:
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+
+class _ScriptedSSEReader:
+    def __init__(self, lines: list[bytes], *, interval: float = 0) -> None:
+        self.raw = self
+        self._sock = _ScriptedSSESocket()
+        self._lines = iter(lines)
+        self._interval = interval
+
+    def readline(self) -> bytes:
+        if self._interval:
+            time.sleep(self._interval)
+        try:
+            return next(self._lines)
+        except StopIteration:
+            raise socket.timeout from None
+
+
+class _ScriptedSSEResponse:
+    def __init__(self, lines: list[bytes], *, interval: float = 0) -> None:
+        self.fp = _ScriptedSSEReader(lines, interval=interval)
+
+
+def _sse_line(kind: str, payload: dict) -> bytes:
+    frame = {
+        "protocol_version": protocol_module.PROTOCOL_VERSION,
+        "kind": kind,
+        "payload": payload,
+    }
+    return b"data: " + json.dumps(frame).encode("utf-8") + b"\n"
+
+
+def _check_await_sse_helper() -> None:
+    keepalive = b": keepalive\n"
+    distractor = ("reply", {"distractor": True})
+    target = ("reply", {"target": True})
+    scripted = _ScriptedSSEResponse(
+        [keepalive] * 10
+        + [_sse_line(*distractor), _sse_line(*target)]
+    )
+    actual = _await_sse(
+        None,
+        scripted,
+        lambda frame: frame == target,
+        deadline=0.2,
+        what="target reply",
+    )
+    if actual != target:
+        fail(f"awaited SSE predicate returned the wrong frame: {actual!r}")
+
+    timeout_stream = _ScriptedSSEResponse(
+        [keepalive, keepalive, _sse_line(*distractor)]
+    )
+    try:
+        _await_sse(
+            None,
+            timeout_stream,
+            lambda frame: frame == target,
+            deadline=0.02,
+            what="target reply",
+        )
+    except CheckFailed as exc:
+        message = str(exc)
+        for expected in ("target reply", "distractor", "keepalives: 2"):
+            if expected not in message:
+                fail(f"SSE timeout omitted {expected!r}: {message!r}")
+    else:
+        fail("SSE wait did not expire when its target was absent")
+
+    fast_stream = _ScriptedSSEResponse(
+        [keepalive] * 20 + [_sse_line(*target)],
+        interval=0.001,
+    )
+    if _await_sse(
+        None,
+        fast_stream,
+        lambda frame: frame == target,
+        deadline=0.2,
+        what="target after rapid keepalives",
+    ) != target:
+        fail("rapid keepalives spent the SSE wait budget")
+
+    sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (
+            Path(__file__),
+            REPO_ROOT / "scripts" / "checks" / "host_approvals.py",
+            REPO_ROOT / "scripts" / "checks" / "host_sessions.py",
+        )
+    }
+    definitions = sum(
+        source.count("def _next" + "_sse(")
+        + source.count("def _await" + "_sse(")
+        for source in sources.values()
+    )
+    if definitions != 2:
+        fail(f"SSE readers were duplicated across host checks: {definitions}")
+    for name in ("host_approvals.py", "host_sessions.py"):
+        if "_await_sse" not in sources[name]:
+            fail(f"{name} did not import the shared SSE reader")
+
+
 def _wait_until(predicate, message: str, *, timeout: float = 5) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -149,6 +293,75 @@ def _wait_until(predicate, message: str, *, timeout: float = 5) -> None:
             return
         time.sleep(0.01)
     fail(message)
+
+
+def _subscribed_stream(host, *, expected: int = 1):
+    """Open an event stream and wait until the host has registered it."""
+    connection, response = _event_stream(host)
+    try:
+        _wait_until(
+            lambda: host.broker.subscriber_count >= expected,
+            f"event stream did not reach {expected} registered subscribers",
+        )
+    except CheckFailed:
+        observed = host.broker.subscriber_count
+        connection.close()
+        fail(
+            f"event stream did not reach {expected} registered subscribers; "
+            f"observed subscriber count: {observed}"
+        )
+    return connection, response
+
+
+def _check_subscribed_stream_helper() -> None:
+    sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (
+            Path(__file__),
+            REPO_ROOT / "scripts" / "checks" / "host_approvals.py",
+            REPO_ROOT / "scripts" / "checks" / "host_sessions.py",
+        )
+    }
+    if sources["host_approvals.py"].count("_event" + "_stream(") != 0:
+        fail("an approval check opens an unsubscribed event stream")
+    if sources["host_sessions.py"].count("_event" + "_stream(") != 0:
+        fail("a session check opens an unsubscribed event stream")
+    if sources["host_server.py"].count("_event" + "_stream(") != 4:
+        fail("a host check opens an unsubscribed event stream")
+
+    helper_source = inspect.getsource(_subscribed_stream)
+    if "time." + "sleep(" in helper_source:
+        fail("subscription helper used time.sleep")
+    if "subscriber_count >= expected" not in helper_source:
+        fail("subscription wait did not use the caller's expected count")
+    if "_wait" + "_until(" not in helper_source:
+        fail("subscription helper did not use a predicate wait")
+
+    host = _host()
+    wait_until = _wait_until
+    try:
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_wait_until",
+            side_effect=lambda predicate, message: wait_until(
+                predicate, message, timeout=0.05
+            ),
+        ):
+            try:
+                connection, _ = _subscribed_stream(host, expected=2)
+            except CheckFailed as exc:
+                message = str(exc)
+                if (
+                    "did not reach 2 registered subscribers" not in message
+                    or "observed subscriber count: " not in message
+                    or not message.rsplit("observed subscriber count: ", 1)[1].isdigit()
+                ):
+                    fail(f"subscription timeout omitted the observed count: {message!r}")
+            else:
+                connection.close()
+                fail("subscription wait accepted an unreachable subscriber count")
+    finally:
+        host.close()
 
 
 @check("host_server.handshake_line")
@@ -324,18 +537,20 @@ def check_file_route() -> None:
 
 @check("host_server.event_stream_delivers")
 def check_event_stream_delivers() -> None:
+    _check_await_sse_helper()
+    _check_subscribed_stream_helper()
     host = _host()
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             host.broker.publish(RunStarted(agent_id="agent", run_id="run", agent_name="agent"))
-            deadline = time.monotonic() + 5
-            frame = None
-            while time.monotonic() < deadline:
-                candidate = _next_sse(connection, response)
-                if isinstance(candidate, tuple) and candidate[0] == "event":
-                    frame = candidate
-                    break
+            frame = _await_sse(
+                connection,
+                response,
+                lambda candidate: isinstance(candidate, tuple)
+                and candidate[0] == "event",
+                what="event frame",
+            )
             if not isinstance(frame, tuple) or frame[0] != "event":
                 fail(f"event stream emitted the wrong frame: {frame!r}")
             event = decode_event(frame[1])
@@ -351,9 +566,14 @@ def check_event_stream_delivers() -> None:
 def check_two_subscribers() -> None:
     host = _host()
     try:
-        first_connection, first = _event_stream(host)
-        second_connection, second = _event_stream(host)
+        first_connection, first = _subscribed_stream(host)
+        second_connection, second = _subscribed_stream(host, expected=2)
         try:
+            if host.broker.subscriber_count != 2:
+                fail(
+                    "two-subscriber check published before both subscriptions "
+                    f"registered: {host.broker.subscriber_count}"
+                )
             # An SSE subscriber can observe another valid frame first; only
             # the shared RunStarted is the assertion this check makes.
             host.broker.publish(
@@ -369,20 +589,14 @@ def check_two_subscribers() -> None:
                 ("first", first_connection, first),
                 ("second", second_connection, second),
             ):
-                deadline = time.monotonic() + 5
-                last_frame: object = None
-                while time.monotonic() < deadline:
-                    frame = _next_sse(connection, response, timeout=0.5, allow_timeout=True)
-                    last_frame = frame
-                    if isinstance(frame, tuple) and frame[0] == "event" and isinstance(
-                        decode_event(frame[1]), RunStarted
-                    ):
-                        break
-                else:
-                    fail(
-                        f"{label} subscriber did not receive the shared event; "
-                        f"last frame: {last_frame!r}"
-                    )
+                _await_sse(
+                    connection,
+                    response,
+                    lambda frame: isinstance(frame, tuple)
+                    and frame[0] == "event"
+                    and isinstance(decode_event(frame[1]), RunStarted),
+                    what=f"{label} subscriber shared RunStarted",
+                )
         finally:
             first_connection.close()
             second_connection.close()
@@ -422,7 +636,7 @@ def check_subscriber_disconnect() -> None:
 def check_prompt_starts_run() -> None:
     host = _host()
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             prompt_connection, prompt = _request(host, "POST", "/prompt", body={"prompt": "hello"}, headers=_headers(host))
             try:
@@ -437,8 +651,13 @@ def check_prompt_starts_run() -> None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     fail(f"run did not finish within five seconds; last events: {events!r}")
-                frame = _next_sse(
-                    connection, response, timeout=min(1, remaining), allow_timeout=True
+                frame = _await_sse(
+                    connection,
+                    response,
+                    lambda candidate: isinstance(candidate, tuple)
+                    and candidate[0] == "event",
+                    deadline=min(1, remaining),
+                    what="run event",
                 )
                 if isinstance(frame, tuple) and frame[0] == "event":
                     events.append(decode_event(frame[1]))
@@ -501,7 +720,7 @@ def check_stop_cancels() -> None:
     provider = _WaitingProvider()
     host = _host(provider)
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             prompt_connection, prompt = _request(host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host))
             prompt.read()
@@ -520,8 +739,13 @@ def check_stop_cancels() -> None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     fail(f"stop did not finish within five seconds; last events: {seen!r}")
-                frame = _next_sse(
-                    connection, response, timeout=min(1, remaining), allow_timeout=True
+                frame = _await_sse(
+                    connection,
+                    response,
+                    lambda candidate: isinstance(candidate, tuple)
+                    and candidate[0] == "event",
+                    deadline=min(1, remaining),
+                    what="stopped run event",
                 )
                 if isinstance(frame, tuple) and frame[0] == "event":
                     event = decode_event(frame[1])
@@ -597,7 +821,7 @@ def check_runtime_run_id_preserved() -> None:
         original_emit(sink, event)
 
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             with mock.patch(
                 "symphonai_api.agent_loop.new_run_ref",
@@ -630,7 +854,14 @@ def check_runtime_run_id_preserved() -> None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         fail("root RunStarted was not observed within five seconds")
-                    frame = _next_sse(connection, response, timeout=min(1, remaining))
+                    frame = _await_sse(
+                        connection,
+                        response,
+                        lambda candidate: isinstance(candidate, tuple)
+                        and candidate[0] == "event",
+                        deadline=min(1, remaining),
+                        what="root RunStarted",
+                    )
                     if isinstance(frame, tuple) and frame[0] == "event":
                         event = decode_event(frame[1])
                         if isinstance(event, RunStarted):
@@ -677,7 +908,7 @@ def check_subagent_run_ids_distinct() -> None:
         original_emit(sink, event)
 
     try:
-        connection, response = _event_stream(host)
+        connection, response = _subscribed_stream(host)
         try:
             with mock.patch("symphonai_api.agent_loop.emit", side_effect=delay_root_run_started):
                 prompt_connection, prompt = _request(
@@ -693,7 +924,15 @@ def check_subagent_run_ids_distinct() -> None:
                     agent_id="agent_subagent_first", run_id="run_subagent_first", agent_name="subagent"
                 )
                 host.run._publish(host_run_id, first_subagent_event)
-                frame = _next_sse(connection, response, timeout=1)
+                frame = _await_sse(
+                    connection,
+                    response,
+                    lambda candidate: isinstance(candidate, tuple)
+                    and candidate[0] == "event"
+                    and decode_event(candidate[1]) == first_subagent_event,
+                    deadline=1,
+                    what="first subagent event",
+                )
                 if not isinstance(frame, tuple) or decode_event(frame[1]) != first_subagent_event:
                     fail(f"first subagent event did not retain its own identity: {frame!r}")
                 if host.run.runtime_run_id is not None:
@@ -705,7 +944,14 @@ def check_subagent_run_ids_distinct() -> None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         fail("root RunStarted was not observed within five seconds")
-                    frame = _next_sse(connection, response, timeout=min(1, remaining))
+                    frame = _await_sse(
+                        connection,
+                        response,
+                        lambda candidate: isinstance(candidate, tuple)
+                        and candidate[0] == "event",
+                        deadline=min(1, remaining),
+                        what="root RunStarted",
+                    )
                     if isinstance(frame, tuple) and frame[0] == "event":
                         event = decode_event(frame[1])
                         if isinstance(event, RunStarted):
@@ -720,7 +966,14 @@ def check_subagent_run_ids_distinct() -> None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     fail("subagent RunStarted was not observed within five seconds")
-                frame = _next_sse(connection, response, timeout=min(1, remaining))
+                frame = _await_sse(
+                    connection,
+                    response,
+                    lambda candidate: isinstance(candidate, tuple)
+                    and candidate[0] == "event",
+                    deadline=min(1, remaining),
+                    what="subagent RunStarted",
+                )
                 if isinstance(frame, tuple) and frame[0] == "event":
                     event = decode_event(frame[1])
                     if event == subagent_event:
@@ -949,7 +1202,7 @@ def check_extensions_observe_and_veto() -> None:
         )
         host.start()
         try:
-            connection, response = _event_stream(host)
+            connection, response = _subscribed_stream(host)
             try:
                 prompt_connection, prompt = _request(
                     host,
@@ -962,7 +1215,13 @@ def check_extensions_observe_and_veto() -> None:
                 prompt_connection.close()
                 received = []
                 while not received or not isinstance(received[-1], RunFinished):
-                    frame = _next_sse(connection, response, timeout=5)
+                    frame = _await_sse(
+                        connection,
+                        response,
+                        lambda candidate: isinstance(candidate, tuple)
+                        and candidate[0] == "event",
+                        what="observational hook event",
+                    )
                     if isinstance(frame, tuple) and frame[0] == "event":
                         received.append(decode_event(frame[1]))
                 with host.run._lock:
@@ -1037,7 +1296,7 @@ def check_extensions_observe_and_veto() -> None:
                 "standard_tool_registry",
                 return_value={tool.name: tool},
             ):
-                connection, response = _event_stream(host)
+                connection, response = _subscribed_stream(host)
                 try:
                     prompt_connection, prompt = _request(
                         host,
@@ -1068,7 +1327,13 @@ def check_extensions_observe_and_veto() -> None:
                     provider.release[1].set()
                     received_terminal = False
                     while not received_terminal:
-                        frame = _next_sse(connection, response, timeout=5)
+                        frame = _await_sse(
+                            connection,
+                            response,
+                            lambda candidate: isinstance(candidate, tuple)
+                            and candidate[0] == "event",
+                            what="guarded run terminal event",
+                        )
                         if isinstance(frame, tuple) and frame[0] == "event":
                             received_terminal = isinstance(
                                 decode_event(frame[1]), RunFinished

@@ -121,6 +121,79 @@ test("all eight calls authorize by header and never by URL", async () => {
   }
 });
 
+test("file encodes every significant query character and returns the reply", async () => {
+  const cases = [
+    ["space", "specs/18/a space.md"],
+    ["plus", "specs/18/a+b.md"],
+    ["ampersand", "specs/18/a&b.md"],
+    ["hash", "specs/18/a#b.md"],
+    ["non-ASCII", "specs/18/한글.md"],
+  ];
+  assert.equal(cases.length, 5);
+
+  for (const [label, path] of cases) {
+    let record;
+    const client = createClient({
+      port: 4312,
+      token: TOKEN,
+      fetch: async (url, options) => {
+        record = { url, options };
+        return response(200, { path, text: `${label} text` });
+      },
+    });
+
+    assert.deepEqual(await client.file(path), {
+      path,
+      text: `${label} text`,
+    });
+    const url = new URL(record.url);
+    assert.equal(url.pathname, "/file", label);
+    assert.equal(url.searchParams.get("path"), path, label);
+    assert.equal(
+      record.url,
+      `http://127.0.0.1:4312/file?${new URLSearchParams({ path })}`,
+      label,
+    );
+    assert.equal(record.options.method, "GET", label);
+    assert.equal(record.options.headers.Authorization, `Bearer ${TOKEN}`, label);
+    assert.ok(!record.url.includes(TOKEN), label);
+  }
+});
+
+test("file failures expose status without exposing credentials", async () => {
+  const statuses = [401, 403, 404, 413];
+  const failures = new Map();
+  assert.equal(statuses.length, 4);
+
+  for (const status of statuses) {
+    let recordedUrl;
+    const client = createClient({
+      port: 4312,
+      token: TOKEN,
+      fetch: async (url) => {
+        recordedUrl = url;
+        return response(status, { error: TOKEN, Authorization: `Bearer ${TOKEN}` });
+      },
+    });
+    let thrown;
+    try {
+      await client.file("specs/18/missing report.md");
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof ProtocolError, `${status} was not ProtocolError`);
+    assert.equal(thrown.status, status);
+    assert.match(thrown.message, new RegExp(String(status)));
+    assert.ok(!stringify(thrown).includes(TOKEN));
+    assert.ok(!stringify(thrown).includes("Authorization"));
+    assert.ok(!recordedUrl.includes(TOKEN));
+    failures.set(status, thrown);
+  }
+
+  assert.equal(failures.get(404).status, 404);
+  assert.notEqual(failures.get(404).status, failures.get(403).status);
+});
+
 test("keepalive comments never become frames", async () => {
   const delivered = [];
   const client = createClient({
