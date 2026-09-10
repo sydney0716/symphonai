@@ -6,6 +6,7 @@ import json
 import secrets
 import threading
 from collections.abc import Mapping
+from http.cookies import CookieError, SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +39,11 @@ APP_CONTENT_TYPES = {
     ".js": "text/javascript",
 }
 APP_HANDSHAKE_MARKER = "<!-- symphonai-handshake -->"
+APP_COOKIE_NAME = "symphonai_app"
+
+
+def _app_root() -> Path:
+    return Path(__file__).resolve().parent.parent / "symphonai_app"
 
 
 class HostServer:
@@ -160,7 +166,12 @@ class HostServer:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-            def _authorized(self, *, allow_app_query: bool = False) -> bool:
+            def _authorized(
+                self,
+                *,
+                allow_app_query: bool = False,
+                allow_app_cookie: bool = False,
+            ) -> bool:
                 supplied = self.headers.get("Authorization", "")
                 expected = f"Bearer {host.token}"
                 if secrets.compare_digest(supplied, expected):
@@ -172,6 +183,17 @@ class HostServer:
                     ).get("token", [])
                     if len(values) == 1 and secrets.compare_digest(
                         values[0], host.token
+                    ):
+                        return True
+                if allow_app_cookie:
+                    cookie = SimpleCookie()
+                    try:
+                        cookie.load(self.headers.get("Cookie", ""))
+                    except CookieError:
+                        cookie.clear()
+                    credential = cookie.get(APP_COOKIE_NAME)
+                    if credential is not None and secrets.compare_digest(
+                        credential.value, host.token
                     ):
                         return True
                 self.send_response(HTTPStatus.UNAUTHORIZED)
@@ -197,11 +219,15 @@ class HostServer:
                 status: HTTPStatus,
                 body: bytes,
                 content_type: str,
+                *,
+                headers: tuple[tuple[str, str], ...] = (),
             ) -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                for name, value in headers:
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -210,7 +236,13 @@ class HostServer:
                 if candidate.is_absolute():
                     self._empty(HTTPStatus.FORBIDDEN)
                     return None
-                app_root = host._repo_root / "symphonai_app"
+                app_root = _app_root()
+                if not app_root.is_dir():
+                    self._json(
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "app is not installed"},
+                    )
+                    return None
                 try:
                     resolved = (app_root / candidate).resolve()
                 except (OSError, RuntimeError):
@@ -236,7 +268,16 @@ class HostServer:
                 handshake = json.dumps(host.handshake()).replace("<", "\\u003c")
                 script = f"<script>window.__symphonai = {handshake};</script>"
                 body = source.replace(APP_HANDSHAKE_MARKER, script).encode("utf-8")
-                self._bytes(HTTPStatus.OK, body, APP_CONTENT_TYPES[".html"])
+                cookie = (
+                    f"{APP_COOKIE_NAME}={host.token}; Path=/app/; "
+                    "HttpOnly; SameSite=Strict"
+                )
+                self._bytes(
+                    HTTPStatus.OK,
+                    body,
+                    APP_CONTENT_TYPES[".html"],
+                    headers=(("Set-Cookie", cookie),),
+                )
 
             def _serve_app_asset(self, requested: str) -> None:
                 resolved = self._app_path(requested)
@@ -326,7 +367,7 @@ class HostServer:
                     self._serve_app_index()
                     return
                 if request_path.startswith("/app/"):
-                    if not self._authorized():
+                    if not self._authorized(allow_app_cookie=True):
                         return
                     self._serve_app_asset(request_path.removeprefix("/app/"))
                     return

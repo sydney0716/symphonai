@@ -104,8 +104,23 @@ missing or invalid credentials receive `401` with an empty body. The sole
 exception is the browser's initial `GET /app?token=<token>` navigation, which
 cannot set a request header. Query authentication is accepted only on exact
 `GET /app`, never on `/app/<path>`, `/file`, `/events`, or any POST. The host
-does not log request URLs. After loading, the injected handshake supplies the
-token and every page request uses the authorization header.
+does not log request URLs.
+
+An authenticated `GET /app` response sets exactly one development session
+cookie:
+
+```text
+Set-Cookie: symphonai_app=<token>; Path=/app/; HttpOnly; SameSite=Strict
+```
+
+It has no `Max-Age` or `Expires`. `GET /app/<path>` accepts that cookie or the
+ordinary bearer header so native browser stylesheet and module requests can
+load. No other route accepts the cookie: `/file`, `/events`, `/health`, and all
+POST requests retain their existing authentication behavior. `Path=/app/`
+limits where the browser sends it, `HttpOnly` prevents app JavaScript from
+reading it, and `SameSite=Strict` plus the loopback bind limits ambient use.
+The `?token=` exception remains confined to exact `/app`; the cookie is the only
+subresource exception.
 
 `GET /events` returns `text/event-stream`. Each event is one `data:` line
 whose content is an `event` frame containing the event payload above. A client
@@ -136,3 +151,9 @@ absolute filesystem path.
 symlinks receive `403` with an empty body. JavaScript is served as
 `text/javascript`, CSS as `text/css`, and HTML as `text/html`. Static assets do
 not contain the token or absolute filesystem paths.
+
+The app directory is resolved beside the installed host package, not beneath
+the repository selected by `--repo-root`. If that sibling `symphonai_app/`
+directory is absent, `/app` returns `404` with
+`{"error": "app is not installed"}` and never falls back to a directory in the
+user's repository.

@@ -8,6 +8,7 @@ import io
 import inspect
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -540,71 +541,138 @@ def check_app_routes() -> None:
     token = "browser-route-token"
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        app_root = root / "symphonai_app"
-        source_root = app_root / "src"
-        source_root.mkdir(parents=True)
-        index = (
+        project_root = root / "project"
+        decoy = project_root / "symphonai_app"
+        decoy_source = decoy / "src"
+        decoy_source.mkdir(parents=True)
+        marker = b"user-project-app-marker"
+        (decoy / "index.html").write_text(
             "<!doctype html><html><head>"
             f"{host_server_module.APP_HANDSHAKE_MARKER}"
-            "</head><body><main>app</main>"
+            '<link rel="stylesheet" href="/app/app.css">'
+            "</head><body><main>decoy</main>"
             '<script type="module" src="/app/src/app.js"></script>'
-            "</body></html>"
+            "</body></html>",
+            encoding="utf-8",
         )
-        (app_root / "index.html").write_text(index, encoding="utf-8")
-        (app_root / "app.css").write_text("body { color: black; }", encoding="utf-8")
-        (source_root / "app.js").write_text("export const app = true;", encoding="utf-8")
-        (app_root / "secret.py").write_text("secret = True", encoding="utf-8")
-        (app_root / "notes.md").write_text("private notes", encoding="utf-8")
-        outside = root / "outside.js"
-        outside.write_text("outside", encoding="utf-8")
-        (source_root / "escape.js").symlink_to(outside)
-        docs = root / "docs"
+        (decoy / "app.css").write_text("body { color: red; }", encoding="utf-8")
+        (decoy_source / "app.js").write_text(
+            "export const decoy = true;",
+            encoding="utf-8",
+        )
+        (decoy / "project-marker.js").write_bytes(marker)
+        docs = project_root / "docs"
         docs.mkdir()
         (docs / "roadmap.json").write_text("{}", encoding="utf-8")
+        outside = root / "outside.js"
+        outside.write_text("outside", encoding="utf-8")
 
-        host = _host(repo_root=root, token=token)
         responses = []
 
-        def get(path: str, *, authorized: bool = False):  # noqa: ANN202
-            headers = _headers(host) if authorized else {}
-            connection, response = _request(host, "GET", path, headers=headers)
+        def request(
+            active_host,
+            method: str,
+            path: str,
+            *,
+            headers: dict[str, str] | None = None,
+            body: dict | None = None,
+        ):  # noqa: ANN202
+            connection, response = _request(
+                active_host,
+                method,
+                path,
+                headers=headers,
+                body=body,
+            )
             try:
                 result = (
                     response.status,
-                    response.getheader("Content-Type"),
+                    tuple(response.getheaders()),
                     response.read(),
                 )
-                responses.append((path, result))
+                responses.append((method, path, result))
                 return result
             finally:
                 connection.close()
 
+        def get(
+            active_host,
+            path: str,
+            *,
+            headers: dict[str, str] | None = None,
+        ):  # noqa: ANN202
+            return request(active_host, "GET", path, headers=headers)
+
+        def header_values(headers, name: str) -> list[str]:  # noqa: ANN001
+            return [value for key, value in headers if key.casefold() == name.casefold()]
+
+        host = _host(repo_root=project_root, token=token)
         try:
-            for path in ("/app", f"/app?token={token}"):
-                status, content_type, body = get(
-                    path,
-                    authorized=path == "/app",
-                )
-                if status != 200 or content_type != "text/html":
-                    fail(f"app index response was wrong: {status}, {content_type!r}")
+            served_html = None
+            cookie_header = None
+            for path, request_headers in (
+                ("/app", _headers(host)),
+                (f"/app?token={token}", None),
+            ):
+                status, headers, body = get(host, path, headers=request_headers)
+                content_types = header_values(headers, "Content-Type")
+                cookies = header_values(headers, "Set-Cookie")
+                if status != 200 or content_types != ["text/html"]:
+                    fail(f"app index response was wrong: {status}, {headers!r}")
+                if len(cookies) != 1:
+                    fail(f"app index set {len(cookies)} cookies instead of one")
+                cookie = cookies[0]
+                if not cookie.startswith(f"symphonai_app={token};"):
+                    fail(f"app cookie did not carry the host token: {cookie!r}")
+                if "Path=/app/" not in cookie:
+                    fail(f"app cookie omitted Path=/app/: {cookie!r}")
+                if "HttpOnly" not in cookie:
+                    fail(f"app cookie omitted HttpOnly: {cookie!r}")
+                if "SameSite=Strict" not in cookie:
+                    fail(f"app cookie omitted SameSite=Strict: {cookie!r}")
+                if "max-age" in cookie.casefold() or "expires" in cookie.casefold():
+                    fail(f"app cookie was persistent: {cookie!r}")
                 text = body.decode("utf-8")
                 if text.count("window.__symphonai = ") != 1:
                     fail("app index did not contain exactly one injected handshake")
-                encoded = text.split("window.__symphonai = ", 1)[1].split(";</script>", 1)[0]
+                encoded = text.split("window.__symphonai = ", 1)[1].split(
+                    ";</script>", 1
+                )[0]
                 if json.loads(encoded) != {"port": host.port, "token": token}:
                     fail(f"app index injected the wrong handshake: {encoded!r}")
+                served_html = text
+                cookie_header = cookie.split(";", 1)[0]
 
-            for path, content_type, expected in (
-                ("/app/src/app.js", "text/javascript", b"export const app = true;"),
-                ("/app/app.css", "text/css", b"body { color: black; }"),
-                ("/app/index.html", "text/html", index.encode("utf-8")),
+            if served_html is None or cookie_header is None:
+                fail("app index did not yield browser credentials")
+            references = re.findall(r'(?:src|href)="([^"]+)"', served_html)
+            if not references:
+                fail("app index contained no browser subresource references")
+            for reference in references:
+                status, _, _ = get(
+                    host,
+                    reference,
+                    headers={"Cookie": cookie_header},
+                )
+                if status != 200:
+                    fail(f"browser cookie did not load app resource {reference!r}: {status}")
+
+            for request_headers, label in (
+                ({"Cookie": cookie_header}, "cookie"),
+                (_headers(host), "header"),
             ):
-                status, actual_type, body = get(path, authorized=True)
-                if (status, actual_type, body) != (200, content_type, expected):
-                    fail(f"app asset response was wrong for {path!r}: {status}, {actual_type!r}, {body!r}")
+                status, headers, _ = get(
+                    host,
+                    "/app/src/app.js",
+                    headers=request_headers,
+                )
+                if status != 200 or header_values(headers, "Content-Type") != [
+                    "text/javascript"
+                ]:
+                    fail(f"app JavaScript rejected {label} authentication")
 
             for path in ("/app/secret.py", "/app/notes.md"):
-                status, _, body = get(path, authorized=True)
+                status, _, body = get(host, path, headers=_headers(host))
                 if status != 403 or body != b"":
                     fail(f"app route served a forbidden extension: {path!r}")
 
@@ -612,10 +680,9 @@ def check_app_routes() -> None:
                 "/app/../outside.js",
                 "/app/src/../../outside.js",
                 f"/app/{outside}",
-                "/app/src/escape.js",
             )
             for path in traversal:
-                status, _, body = get(path, authorized=True)
+                status, _, body = get(host, path, headers=_headers(host))
                 if status != 403 or body != b"":
                     fail(f"app route accepted traversal fixture {path!r}: {status}")
 
@@ -624,23 +691,110 @@ def check_app_routes() -> None:
                 f"/app/src/app.js?token={token}",
                 f"/file?path=docs/roadmap.json&token={token}",
             ):
-                status, _, body = get(path)
+                status, _, body = get(host, path)
                 if status != 401 or body != b"":
                     fail(f"query authentication escaped exact /app: {path!r}, {status}")
 
-            protected = (str(root),)
-            for path, (_, _, body) in responses:
-                text = body.decode("utf-8", errors="replace")
-                if any(value in text for value in protected):
-                    fail(f"app response exposed an absolute path: {path!r}")
-                if token in text and urlsplit(path).path != "/app":
-                    fail(f"app response exposed the token outside the index: {path!r}")
+            wrong_cookie = {"Cookie": "symphonai_app=wrong-token"}
+            status, _, body = get(host, "/app/src/app.js", headers=wrong_cookie)
+            if status != 401 or body != b"":
+                fail("app asset accepted a cookie carrying the wrong token")
+
+            for method, path, body in (
+                ("GET", "/file?path=docs/roadmap.json", None),
+                ("GET", "/events", None),
+                ("POST", "/prompt", {"prompt": "must not run"}),
+            ):
+                status, _, response_body = request(
+                    host,
+                    method,
+                    path,
+                    headers={"Cookie": cookie_header},
+                    body=body,
+                )
+                if status != 401 or response_body != b"":
+                    fail(f"app cookie escaped to {method} {path}: {status}")
+
+            status, _, body = get(
+                host,
+                "/app/project-marker.js",
+                headers={"Cookie": cookie_header},
+            )
+            if status != 404 or marker in body:
+                fail("host served a symphonai_app directory from the user project")
 
             source = inspect.getsource(HostServer._handler_type)
             if "_contains_path(app_root, resolved)" not in source:
                 fail("app containment did not use the shared path rule")
+            if "app_root = _app_root()" not in source or (
+                'app_root = host._repo_root / "symphonai_app"' in source
+            ):
+                fail("app assets were resolved from the user project")
         finally:
             host.close()
+
+        packaged_fixture = root / "packaged" / "symphonai_app"
+        packaged_fixture.mkdir(parents=True)
+        (packaged_fixture / "escape.js").symlink_to(outside)
+        with mock.patch.object(
+            host_server_module,
+            "_app_root",
+            return_value=packaged_fixture,
+        ):
+            host = _host(repo_root=project_root, token=token)
+            try:
+                status, _, body = get(
+                    host,
+                    "/app/escape.js",
+                    headers=_headers(host),
+                )
+                if status != 403 or body != b"":
+                    fail("app route accepted an escaping symlink")
+            finally:
+                host.close()
+
+        missing_app = root / "missing" / "symphonai_app"
+        with mock.patch.object(
+            host_server_module,
+            "_app_root",
+            return_value=missing_app,
+        ):
+            host = _host(repo_root=project_root, token=token)
+            try:
+                status, headers, body = get(host, f"/app?token={token}")
+                if (
+                    status != 404
+                    or json.loads(body) != {"error": "app is not installed"}
+                    or header_values(headers, "Set-Cookie")
+                    or marker in body
+                ):
+                    fail(f"missing packaged app fell back to the project: {status}, {body!r}")
+            finally:
+                host.close()
+
+        protected_paths = (
+            str(root),
+            str(project_root),
+            str(REPO_ROOT),
+            str(host_server_module._app_root()),
+        )
+        for method, path, (_, headers, body) in responses:
+            response_text = repr(headers) + body.decode("utf-8", errors="replace")
+            if any(protected in response_text for protected in protected_paths):
+                fail(f"app response exposed an absolute path: {method} {path}")
+            exact_app = method == "GET" and urlsplit(path).path == "/app"
+            if token in body.decode("utf-8", errors="replace") and not exact_app:
+                fail(f"app response body exposed the token: {method} {path}")
+            token_headers = [
+                (name, value)
+                for name, value in headers
+                if token in value
+            ]
+            if token_headers and (
+                not exact_app
+                or [name.casefold() for name, _ in token_headers] != ["set-cookie"]
+            ):
+                fail(f"app response header exposed the token: {method} {path}")
 
 
 @check("host_server.event_stream_delivers")

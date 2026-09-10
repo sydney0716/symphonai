@@ -75,7 +75,11 @@ python3 -m symphonai_host --provider openai
 Its first line is a JSON handshake containing `port` and `token`. Open
 `http://127.0.0.1:<port>/app?token=<token>` with those exact values. The query
 token is accepted only for that first page navigation; subsequent page requests
-authenticate by header.
+load through a session cookie scoped to `/app/`, while data and control requests
+authenticate by header. The host must be installed or run from a checkout where
+it can find the sibling `symphonai_app/` directory; a Python package installed
+without that directory returns `app is not installed` instead of serving files
+from the user's project.
 
 ## Where it is going
 
