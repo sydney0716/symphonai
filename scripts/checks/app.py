@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 NODE_MINIMUM = 18
 NODE_TESTS = {
     "app.protocol": "protocol.test.js",
+    "app.transcript": "transcript.test.js",
     "app.client": "client.test.js",
     "app.turn": "turn.test.js",
     "app.roadmap": "roadmap.test.js",
@@ -80,6 +81,11 @@ def node_required() -> None:
 @check("app.protocol")
 def protocol() -> None:
     _run_node_test("protocol.test.js")
+
+
+@check("app.transcript")
+def transcript() -> None:
+    _run_node_test("transcript.test.js")
 
 
 @check("app.client")

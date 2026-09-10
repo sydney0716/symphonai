@@ -389,6 +389,7 @@ def main() -> None:
         "host_sessions.client_session_calls",
         "app.node_required",
         "app.protocol",
+        "app.transcript",
         "app.client",
         "app.turn",
         "app.roadmap",
