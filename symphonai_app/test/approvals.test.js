@@ -35,10 +35,11 @@ function client({ pending = [], approve } = {}) {
   };
 }
 
-test("approval frames open one transcript-placeable question", async () => {
+test("approval frames keep only a meaningful tool call id", async () => {
   const boundary = client();
   const approvals = createApprovals({ client: boundary });
   await approvals.onFrame(frame("A", { tool_call_id: "tool-call-A" }));
+  await approvals.onFrame(frame("B", { tool_call_id: "" }));
   assert.deepEqual(approvals.state, new Map([
     ["A", {
       operation: "operation-A",
@@ -46,6 +47,12 @@ test("approval frames open one transcript-placeable question", async () => {
       details: "details-A",
       state: "open",
       tool_call_id: "tool-call-A",
+    }],
+    ["B", {
+      operation: "operation-B",
+      target: "target-B",
+      details: "details-B",
+      state: "open",
     }],
   ]));
 });
@@ -86,6 +93,29 @@ test("answer moves open through answering to resolved and sends exact data", asy
   resolveApproval({ resolved: true });
   await answering;
   assert.equal(approvals.state.get("A").state, "resolved");
+});
+
+test("resync leaves an in-flight answer live until it resolves", async () => {
+  let resolveApproval;
+  const pending = new Promise((resolve) => {
+    resolveApproval = resolve;
+  });
+  const boundary = client({ approve: () => pending });
+  const approvals = createApprovals({ client: boundary });
+  await approvals.onFrame(frame("A"));
+
+  const answer = approvals.answer("A", true, "because");
+  assert.equal(approvals.state.get("A").state, "answering");
+  await approvals.resync();
+  const duringFlight = approvals.state.get("A");
+  assert.equal(duringFlight.state, "answering");
+  assert.equal(Object.hasOwn(duringFlight, "reason"), false);
+
+  resolveApproval({ resolved: true });
+  await answer;
+  const resolved = approvals.state.get("A");
+  assert.equal(resolved.state, "resolved");
+  assert.equal(Object.hasOwn(resolved, "reason"), false);
 });
 
 test("a 404 makes an expired question stale with a displayable reason", async () => {

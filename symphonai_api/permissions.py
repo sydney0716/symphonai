@@ -123,6 +123,7 @@ class ToolApprovalRequest:
     operation: str
     target: str
     details: str = ""
+    tool_call_id: str = ""
 
 
 ApprovalCallback = Callable[[ToolApprovalRequest], PermissionDecision | bool]
@@ -540,9 +541,13 @@ class PermissionPolicy:
                     tool_name=operation,
                 )
             try:
+                tool_call_id = self._event_identity(operation)[-1]
                 decision = self.approval_callback(
                     ToolApprovalRequest(
-                        operation=operation, target=target, details=details
+                        operation=operation,
+                        target=target,
+                        details=details,
+                        tool_call_id=tool_call_id,
                     )
                 )
             except Exception as exc:  # noqa: BLE001

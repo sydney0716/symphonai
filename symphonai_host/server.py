@@ -109,7 +109,11 @@ class HostServer:
             return False
         self.broker.publish(
             ApprovalRequested(
-                approval.approval_id, approval.operation, approval.target, approval.details
+                approval_id=approval.approval_id,
+                operation=approval.operation,
+                target=approval.target,
+                details=approval.details,
+                tool_call_id=approval.tool_call_id,
             )
         )
         return True

@@ -19,6 +19,7 @@ class PendingApproval:
     operation: str
     target: str
     details: str
+    tool_call_id: str = ""
 
 
 @dataclass
@@ -45,7 +46,13 @@ class ApprovalBroker:
         self._lock = threading.Lock()
 
     def callback(self, request: ToolApprovalRequest) -> PermissionDecision:
-        approval = PendingApproval(new_id("appr"), request.operation, request.target, request.details)
+        approval = PendingApproval(
+            approval_id=new_id("appr"),
+            operation=request.operation,
+            target=request.target,
+            details=request.details,
+            tool_call_id=request.tool_call_id,
+        )
         pending = _Pending(approval, threading.Event())
         with self._lock:
             self._pending[approval.approval_id] = pending

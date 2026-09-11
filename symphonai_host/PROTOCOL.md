@@ -75,10 +75,11 @@ authentication mechanism.
 ## Approvals
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,
-and `details`. A client answers with the `approval` request above. An approval
-id is single-use; unknown or expired replies are rejected. After any `error`
-frame carrying `dropped`, a client re-reads `GET /approvals`, because a dropped
-frame may have been a question.
+`details`, and `tool_call_id`. The `tool_call_id` is `""` when the approval
+belongs to no tool call. A client answers with the `approval` request above. An
+approval id is single-use; unknown or expired replies are rejected. After any
+`error` frame carrying `dropped`, a client re-reads `GET /approvals`, because a
+dropped frame may have been a question.
 
 ## Writing a client
 

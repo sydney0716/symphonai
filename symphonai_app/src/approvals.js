@@ -23,7 +23,7 @@ function questionOf(value) {
     target: value.target,
     details: value.details,
     state: "open",
-    ...(typeof value.tool_call_id === "string"
+    ...(typeof value.tool_call_id === "string" && value.tool_call_id.length > 0
       ? { tool_call_id: value.tool_call_id }
       : {}),
   };
@@ -66,7 +66,8 @@ export function createApprovals({ client }) {
       if (
         !outstanding.has(id) &&
         question.state !== "resolved" &&
-        question.state !== "stale"
+        question.state !== "stale" &&
+        question.state !== "answering"
       ) {
         questions.set(id, {
           ...question,

@@ -44,6 +44,7 @@ class ApprovalRequested:
     operation: str
     target: str
     details: str
+    tool_call_id: str = ""
 
 
 @dataclass(frozen=True)

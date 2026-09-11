@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import http.client
+import json
 import threading
 import time
-import http.client
+from dataclasses import fields
 from pathlib import Path
 
 from symphonai_api.permissions import DenialReason, ToolApprovalRequest
@@ -15,7 +17,7 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.server import HostServer
 from symphonai_host.broker import EventBroker
 from symphonai_api.events import RunStarted
-from symphonai_host.protocol import decode_frame
+from symphonai_host.protocol import ApprovalRequested, decode_frame
 from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
 
@@ -24,11 +26,16 @@ ROOT = Path(__file__).resolve().parents[2]
 REQUEST = ToolApprovalRequest("write_file", "new.txt", "write test file")
 
 
-def _waiting(timeout: float = 1.0):
+def _waiting(timeout: float = 1.0, invoke=None):  # noqa: ANN001
     published: list[PendingApproval] = []
     broker = ApprovalBroker(lambda item: published.append(item) or True, timeout=timeout)
     result: list = []
-    thread = threading.Thread(target=lambda: result.append(broker.callback(REQUEST)))
+    operation = (
+        (lambda: broker.callback(REQUEST))
+        if invoke is None
+        else (lambda: invoke(broker))
+    )
+    thread = threading.Thread(target=lambda: result.append(operation()))
     thread.start()
     deadline = time.monotonic() + 1
     while not published and time.monotonic() < deadline:
@@ -41,10 +48,55 @@ def _waiting(timeout: float = 1.0):
 @check("host_approvals.request_published")
 def check_request_published() -> None:
     broker, item, result, thread = _waiting()
-    if not item.approval_id or (item.operation, item.target, item.details) != (REQUEST.operation, REQUEST.target, REQUEST.details):
+    if not item.approval_id or (
+        item.operation,
+        item.target,
+        item.details,
+        item.tool_call_id,
+    ) != (
+        REQUEST.operation,
+        REQUEST.target,
+        REQUEST.details,
+        "",
+    ):
         fail(f"approval request shape was wrong: {item!r}")
     broker.resolve(item.approval_id, allowed=True, reason="")
     thread.join(1)
+
+
+def _prompted_write(broker: ApprovalBroker, tool_call_id: str | None):
+    policy = PermissionPolicy(
+        repo_root=ROOT,
+        mode="prompt",
+        approval_callback=broker.callback,
+    )
+    if tool_call_id is None:
+        return policy.check_write("new.txt")
+    with policy.event_context(
+        None,
+        agent_id="agent",
+        run_id="run",
+        turn_id="turn",
+        tool_name="write_file",
+        tool_call_id=tool_call_id,
+    ):
+        return policy.check_write("new.txt")
+
+
+@check("host_approvals.tool_call_identity")
+def check_tool_call_identity() -> None:
+    for supplied, expected in (("call-from-runtime", "call-from-runtime"), (None, "")):
+        broker, item, result, thread = _waiting(
+            invoke=lambda active, value=supplied: _prompted_write(active, value)
+        )
+        broker.resolve(item.approval_id, allowed=True, reason="")
+        thread.join(1)
+        if item.tool_call_id != expected:
+            fail(
+                f"approval tool-call identity was wrong for {supplied!r}: {item!r}"
+            )
+        if thread.is_alive() or not result or not result[0].allowed:
+            fail(f"approval did not finish for {supplied!r}: {result!r}")
 
 
 @check("host_approvals.allow_resumes")
@@ -110,6 +162,26 @@ def check_permissions_untouched() -> None:
         fail("permissions module was not present for the approval boundary")
 
 
+@check("host_approvals.approval_records_match")
+def check_approval_records_match() -> None:
+    pending_fields = tuple(field.name for field in fields(PendingApproval))
+    requested_fields = tuple(field.name for field in fields(ApprovalRequested))
+    if pending_fields != requested_fields:
+        fail(
+            "approval record fields differ: "
+            f"PendingApproval={pending_fields!r}, "
+            f"ApprovalRequested={requested_fields!r}"
+        )
+
+    protocol = (ROOT / "symphonai_host" / "PROTOCOL.md").read_text(
+        encoding="utf-8"
+    )
+    approvals = protocol.partition("## Approvals\n")[2].partition("\n## ")[0]
+    missing = [name for name in requested_fields if f"`{name}`" not in approvals]
+    if missing:
+        fail(f"approval protocol paragraph omits fields: {missing!r}")
+
+
 @check("host_approvals.pending_listing")
 def check_pending_listing() -> None:
     broker, item, result, thread = _waiting()
@@ -136,6 +208,78 @@ def check_pending_endpoint() -> None:
                 fail(f"approval listing response was wrong: {response.status}, {body!r}")
     finally:
         host.close()
+
+
+@check("host_approvals.transport_tool_call_id")
+def check_transport_tool_call_id() -> None:
+    host = _host()
+    request = ToolApprovalRequest(
+        operation="write_file",
+        target="transport.txt",
+        details="transport identity",
+        tool_call_id="call-over-wire",
+    )
+    result = []
+    stream_connection = None
+    thread = None
+    approval_id = None
+    frame_payload = {}
+    listing = {}
+    try:
+        stream_connection, response = _subscribed_stream(host)
+        thread = threading.Thread(
+            target=lambda: result.append(host.run.approvals.callback(request))
+        )
+        thread.start()
+        frame = _await_sse(
+            stream_connection,
+            response,
+            lambda candidate: isinstance(candidate, tuple)
+            and candidate[0] == "approval_requested",
+            what="approval request with tool-call identity",
+        )
+        frame_payload = frame[1]
+        approval_id = frame_payload.get("approval_id")
+
+        listing_connection = http.client.HTTPConnection(
+            "127.0.0.1", host.port, timeout=2
+        )
+        try:
+            listing_connection.request(
+                "GET", "/approvals", headers={"Authorization": f"Bearer {host.token}"}
+            )
+            listing_response = listing_connection.getresponse()
+            body = listing_response.read()
+            if listing_response.status != 200:
+                fail(
+                    "approval listing failed while an approval was pending: "
+                    f"{listing_response.status}, {body!r}"
+                )
+            listing = json.loads(body)
+        finally:
+            listing_connection.close()
+
+        host.run.approvals.resolve(approval_id, allowed=True, reason="")
+        thread.join(1)
+    finally:
+        if isinstance(approval_id, str):
+            host.run.approvals.resolve(approval_id, allowed=True, reason="")
+        if thread is not None:
+            thread.join(1)
+        if stream_connection is not None:
+            stream_connection.close()
+        host.close()
+
+    pending = listing.get("pending", [])
+    frame_id = frame_payload.get("tool_call_id")
+    pending_id = pending[0].get("tool_call_id") if len(pending) == 1 else None
+    if frame_id != request.tool_call_id or pending_id != request.tool_call_id:
+        fail(
+            "approval transport lost tool-call identity: "
+            f"frame={frame_payload!r}, listing={listing!r}"
+        )
+    if thread is None or thread.is_alive() or not result or not result[0].allowed:
+        fail(f"transport approval did not finish: {result!r}")
 
 
 def _host(*, broker: EventBroker | None = None, approval_timeout: float = 1) -> HostServer:
