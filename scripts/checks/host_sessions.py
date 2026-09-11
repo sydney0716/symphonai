@@ -136,7 +136,7 @@ def check_open_during_run_409() -> None:
 def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[dict], dict]:
     marker = "history-secret-argument"
     host, client = _host(root, [
-        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall("history-tool", "run_shell", {"command": marker})])),
+        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall("history-tool", "run_shell", {"argv": [marker]})])),
         ModelResponse(Message(Role.ASSISTANT, "done")),
     ])
     run_id = client.send_prompt("first")["run_id"]

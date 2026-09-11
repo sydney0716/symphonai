@@ -10,8 +10,9 @@ from symphonai_api.models import ToolResult
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tool_schema import to_provider_tool_schema
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import TARGET_LIMIT, call_target
-from scripts.checks.harness import check, fail
+from symphonai_api.tools.metadata import TARGET_LIMIT, _TARGET_KEYS, call_target
+from symphonai_api.web_search import SearchBackend
+from scripts.checks.harness import check, fail, ok
 
 
 class _ToolContractStub(LocalTool):
@@ -62,6 +63,16 @@ class _RaisingMetadataTool(_ToolContractStub):
     ) -> ToolResult:
         return ToolResult(tool_call_id=tool_call.id, ok=True)
 
+
+class _TargetSchemaSearchBackend(SearchBackend):
+    @property
+    def name(self) -> str:
+        return "target-schema"
+
+    def search(self, query, *, limit, cancel=None):
+        return []
+
+
 @check("tools.localtool_contract")
 def check_tools_localtool_contract() -> None:
     for incomplete_tool, missing_member in (
@@ -79,29 +90,63 @@ def check_tools_localtool_contract() -> None:
 def check_tools_metadata_contract() -> None:
     expected_targets = {
         "read_file": ("document.txt", {"path": "document.txt"}),
+        "write_file": ("document.txt", {"path": "document.txt"}),
+        "edit_file": ("document.txt", {"path": "document.txt"}),
+        "multi_edit_file": ("document.txt", {"path": "document.txt"}),
+        "list_files": ("documents", {"path": "documents"}),
+        "glob": ("**/*.py", {"pattern": "**/*.py"}),
         "grep": ("def login", {"pattern": "def login"}),
-        "run_shell": (
-            "python3 scripts/check.py",
-            {"command": "python3 scripts/check.py"},
+        "web_search": ("safe display query", {"query": "safe display query"}),
+        "run_shell": ("deploy.sh", {"argv": ["deploy.sh", "--prod"]}),
+        "web_fetch": (
+            "https://h",
+            {"url": "https://h/v1/x?access_token=t"},
         ),
-        "future_tool": ("", {"new_target": "not yet trusted"}),
+        "future_tool": ("", {"path": "not trusted for an unknown tool"}),
     }
     for tool_name, (expected, arguments) in expected_targets.items():
         actual = call_target(tool_name, arguments)
         if actual != expected:
             fail(f"{tool_name} call target was {actual!r}, expected {expected!r}")
-    if call_target("grep", {"path": "first", "pattern": "second"}) != "first":
-        fail("call target did not honor the documented key priority")
+    if call_target("grep", {"path": "ignored", "pattern": "selected"}) != "selected":
+        fail("call target did not use the tool-specific argument key")
+    shell_secret = "shell-secret"
+    shell_target = call_target("run_shell", {"argv": ["curl", shell_secret]})
+    if shell_target != "curl" or shell_secret in shell_target:
+        fail(f"shell target exposed more than the program name: {shell_target!r}")
+    if call_target("run_shell", {"command": "deploy.sh"}) != "":
+        fail("shell target accepted the undeclared command argument")
+    fetch_secret = "access_token=t"
+    fetch_target = call_target(
+        "web_fetch", {"url": f"https://user:pass@h/v1/x?{fetch_secret}"}
+    )
+    if fetch_target != "https://h" or fetch_secret in fetch_target:
+        fail(f"fetch target exposed more than its origin: {fetch_target!r}")
     long_target = "x" * (TARGET_LIMIT + 17)
     if call_target("read_file", {"path": long_target}) != long_target[:TARGET_LIMIT]:
         fail("call target was not truncated at TARGET_LIMIT")
-    for malformed in ({}, {"path": 3}, None):
+    malformed_targets = (
+        ("read_file", {}),
+        ("read_file", {"path": 3}),
+        ("read_file", None),
+        ([], {}),
+        ("run_shell", {"argv": []}),
+        ("run_shell", {"argv": [""]}),
+        ("run_shell", {"argv": [1]}),
+        ("run_shell", {"argv": "deploy.sh"}),
+        ("run_shell", {}),
+        ("web_fetch", {"url": "http://[invalid"}),
+    )
+    for tool_name, malformed in malformed_targets:
         try:
-            target = call_target("read_file", malformed)
+            target = call_target(tool_name, malformed)
         except Exception as exc:
-            fail(f"call_target raised on {malformed!r}: {exc}")
+            fail(f"call_target raised for {tool_name} on {malformed!r}: {exc}")
         if target != "":
-            fail(f"call_target accepted malformed arguments {malformed!r}: {target!r}")
+            fail(
+                f"call_target accepted malformed {tool_name} arguments "
+                f"{malformed!r}: {target!r}"
+            )
 
     metadata_tools = standard_tool_registry()
     execute_overrides = [
@@ -257,6 +302,23 @@ def check_tools_metadata_contract() -> None:
         pass
     else:
         fail("ToolMetadata fields were mutable")
+
+
+@check("tools.target_keys_match_schemas")
+def check_target_keys_match_schemas() -> None:
+    tools = standard_tool_registry(search_backend=_TargetSchemaSearchBackend())
+    for tool_name, (argument_key, _) in _TARGET_KEYS.items():
+        tool = tools.get(tool_name)
+        if tool is None:
+            fail(f"target table tool {tool_name!r} could not be constructed")
+        properties = tool.parameters.get("properties")
+        if not isinstance(properties, dict) or argument_key not in properties:
+            fail(
+                f"target table maps tool {tool_name!r} to undeclared "
+                f"parameter {argument_key!r}"
+            )
+    ok(f"{len(_TARGET_KEYS)} target keys match declared schemas")
+
 
 @check("tools.metadata_absent_from_schemas")
 def check_tools_metadata_absent_from_schemas() -> None:

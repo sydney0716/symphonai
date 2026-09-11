@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from symphonai_api.cancellation import OperationCancelled
 from symphonai_api.identity import SCHEMA_VERSION
@@ -14,21 +15,64 @@ if TYPE_CHECKING:
 
 
 TARGET_LIMIT = 200
-_TARGET_KEYS = ("path", "pattern", "query", "command", "url")
+
+
+def _plain_target(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _argv_program(argv: list) -> str:
+    if not isinstance(argv, list) or not argv:
+        return ""
+    program = argv[0]
+    return program if isinstance(program, str) and program else ""
+
+
+def _url_origin(url: object) -> str:
+    if not isinstance(url, str):
+        return ""
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    port = parsed.port
+    if port is not None:
+        host = f"{host}:{port}"
+    return f"{parsed.scheme}://{host}"
+
+
+_TARGET_KEYS = {
+    "read_file": ("path", _plain_target),
+    "write_file": ("path", _plain_target),
+    "edit_file": ("path", _plain_target),
+    "multi_edit_file": ("path", _plain_target),
+    "list_files": ("path", _plain_target),
+    "glob": ("pattern", _plain_target),
+    "grep": ("pattern", _plain_target),
+    "web_search": ("query", _plain_target),
+    "run_shell": ("argv", _argv_program),
+    "web_fetch": ("url", _url_origin),
+}
 
 
 def call_target(tool_name: str, arguments: dict) -> str:
-    """Return one bounded, display-safe target from known argument keys."""
+    """Return a bounded display target derived safely for one known tool."""
     if not isinstance(arguments, dict):
         return ""
     try:
-        for key in _TARGET_KEYS:
-            value = arguments.get(key)
-            if isinstance(value, str) and value:
-                return value[:TARGET_LIMIT]
+        target_rule = _TARGET_KEYS.get(tool_name)
+        if target_rule is None:
+            return ""
+        key, reduce_target = target_rule
+        value = arguments.get(key)
+        if not isinstance(value, (str, list)) or not value:
+            return ""
+        target = reduce_target(value)
+        return target[:TARGET_LIMIT]
     except Exception:
         return ""
-    return ""
 
 
 class ToolEffect(str, Enum):

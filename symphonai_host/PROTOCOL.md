@@ -48,6 +48,10 @@ fields on a known event are ignored for forward compatibility.
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
 
+`target` is a bounded display string derived from the call, not the argument
+itself. For a shell call it is the program name, for a fetch it is the origin,
+and it is `""` when the runtime has no safe derivation.
+
 `ToolCallFailed` is emitted in addition to `ToolCallFinished` with `ok: false`,
 never instead of it; clients that treat these events as alternatives will
 double-count some failures or miss others.

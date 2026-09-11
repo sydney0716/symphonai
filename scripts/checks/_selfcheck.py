@@ -87,6 +87,7 @@ def main() -> None:
         "content.provider_encoding",
         "tools.localtool_contract",
         "tools.metadata_contract",
+        "tools.target_keys_match_schemas",
         "tools.metadata_absent_from_schemas",
         "ids.non_empty_and_vendor_boundary",
         "ids.request_bodies_keep_internals_private",
@@ -761,11 +762,17 @@ def main() -> None:
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
         )
 
+    target_schema = invoke_check("--only", "tools.target_keys_match_schemas")
+    require(
+        "  OK:   10 target keys match declared schemas\n" in target_schema.stdout,
+        f"target schema check did not exercise all ten rows: {target_schema.stdout!r}",
+    )
+
     listed_retry = invoke_check("--list", "--only", "retry")
     require(listed_retry.returncode == 0, f"filtered list failed: {listed_retry.stderr!r}")
     require(
         listed_retry.stdout.splitlines()
-        == expected_names[17:40] + [expected_names[64]],
+        == expected_names[18:41] + [expected_names[65]],
         f"unexpected filtered list: {listed_retry.stdout!r}",
     )
 
@@ -775,7 +782,7 @@ def main() -> None:
         f"filtered breaker list failed: {listed_breakers.stderr!r}",
     )
     require(
-        listed_breakers.stdout.splitlines() == expected_names[40:47],
+        listed_breakers.stdout.splitlines() == expected_names[41:48],
         f"unexpected filtered breaker list: {listed_breakers.stdout!r}",
     )
 

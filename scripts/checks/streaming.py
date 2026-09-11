@@ -376,15 +376,54 @@ def check_deltas_emitted() -> None:
     deltas = sink.of_type(AssistantTextDelta)
     if [event.text for event in deltas] != ["thinking", "done"]:
         fail(f"text delta events did not match chunks: {deltas!r}")
-    encoded_events = json.dumps(
-        [
-            {key: value for key, value in event.__dict__.items() if key != "target"}
-            for event in sink.events
-        ],
-        default=str,
-    )
+    encoded_events = json.dumps([event.__dict__ for event in sink.events], default=str)
     if secret_fragment in encoded_events:
         fail("an event exposed partial tool arguments")
+
+    leak_cases = (
+        (
+            "run_shell",
+            {"argv": ["curl", "-H", "Authorization: Bearer stream-shell-secret"]},
+            "curl",
+            "stream-shell-secret",
+        ),
+        (
+            "web_fetch",
+            {"url": "https://api.example/v1/export?access_token=stream-fetch-secret"},
+            "https://api.example",
+            "stream-fetch-secret",
+        ),
+    )
+    for tool_name, arguments, expected_target, secret in leak_cases:
+        with workspace() as ws:
+            sink = CollectingSink()
+            ApiAgent(
+                FakeModelProvider(
+                    streams=[
+                        [
+                            ToolCallDelta(
+                                0,
+                                id=f"{tool_name}-stream",
+                                name=tool_name,
+                                arguments_fragment=json.dumps(arguments),
+                            ),
+                            _empty_completion(stop_reason="tool_use"),
+                        ],
+                        [_empty_completion()],
+                    ]
+                ),
+                {},
+                ws.policy,
+                stream=True,
+                events=sink,
+            ).run([Message(role=Role.USER, content="stream")])
+        encoded_events = json.dumps(
+            [event.__dict__ for event in sink.events], default=str
+        )
+        if secret in encoded_events:
+            fail(f"{tool_name} event exposed a secret-bearing argument")
+        if expected_target not in encoded_events:
+            fail(f"event scan omitted the {tool_name} target field")
 
 
 @check("streaming.dropped_events_change_nothing")
