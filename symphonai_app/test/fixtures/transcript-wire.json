@@ -1,0 +1,68 @@
+{
+  "frames": [
+    {
+      "kind": "event",
+      "payload": {
+        "type": "ToolCallStarted",
+        "agent_id": "agent-wire",
+        "run_id": "run-wire",
+        "turn_id": "turn-wire",
+        "schema_version": 1,
+        "tool_name": "edit_file",
+        "tool_call_id": "wire-edit",
+        "target": "src/auth.py"
+      }
+    },
+    {
+      "kind": "event",
+      "payload": {
+        "type": "ToolCallFinished",
+        "agent_id": "agent-wire",
+        "run_id": "run-wire",
+        "turn_id": "turn-wire",
+        "schema_version": 1,
+        "tool_name": "edit_file",
+        "tool_call_id": "wire-edit",
+        "ok": true,
+        "result_kind": "file_diff",
+        "result_path": "src/auth.py",
+        "lines_added": 1,
+        "lines_removed": 1,
+        "diff": "--- src/auth.py\n+++ src/auth.py\n-old\n+new",
+        "truncated": false
+      }
+    },
+    {
+      "kind": "event",
+      "payload": {
+        "type": "ToolCallStarted",
+        "agent_id": "agent-wire",
+        "run_id": "run-wire",
+        "turn_id": "turn-wire",
+        "schema_version": 1,
+        "tool_name": "read_file",
+        "tool_call_id": "wire-read",
+        "target": "README.md"
+      }
+    },
+    {
+      "kind": "event",
+      "payload": {
+        "type": "ToolCallFinished",
+        "agent_id": "agent-wire",
+        "run_id": "run-wire",
+        "turn_id": "turn-wire",
+        "schema_version": 1,
+        "tool_name": "read_file",
+        "tool_call_id": "wire-read",
+        "ok": true,
+        "result_kind": "",
+        "result_path": "",
+        "lines_added": 0,
+        "lines_removed": 0,
+        "diff": "",
+        "truncated": false
+      }
+    }
+  ]
+}

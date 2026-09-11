@@ -72,9 +72,11 @@ def check_usage_totals_merge() -> None:
         },
         "ToolCallStarted": {
             "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id",
+            "target",
         },
         "ToolCallFinished": {
             "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "ok",
+            "result_kind", "result_path", "lines_added", "lines_removed", "diff", "truncated",
         },
         "PromptSubmitted": {
             "agent_id", "run_id", "turn_id", "schema_version", "text", "message_count",

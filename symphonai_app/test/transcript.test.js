@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { KNOWN_EVENT_TYPES } from "../src/protocol.js";
 import { createTranscript } from "../src/transcript.js";
@@ -38,8 +39,16 @@ const RECORDED_EVENTS = Object.freeze({
   TurnStarted: event("TurnStarted", { index: 1 }),
   TurnFinished: event("TurnFinished", { index: 1 }),
   AssistantTextDelta: event("AssistantTextDelta", { text: "hello" }),
-  ToolCallStarted: call("ToolCallStarted", "recorded-call"),
-  ToolCallFinished: call("ToolCallFinished", "recorded-call", { ok: true }),
+  ToolCallStarted: call("ToolCallStarted", "recorded-call", { target: "recorded.txt" }),
+  ToolCallFinished: call("ToolCallFinished", "recorded-call", {
+    ok: true,
+    result_kind: "",
+    result_path: "",
+    lines_added: 0,
+    lines_removed: 0,
+    diff: "",
+    truncated: false,
+  }),
   PromptSubmitted: event("PromptSubmitted", { text: "hello", message_count: 1 }),
   ToolCallFailed: call("ToolCallFailed", "recorded-call", { error: "broken" }),
   PermissionRequested: call("PermissionRequested", "recorded-call", { mode: "prompt" }),
@@ -180,15 +189,12 @@ test("an edit carries its complete diff immediately", () => {
     call("ToolCallFinished", "edit-1", {
       tool_name: "edit_file",
       ok: true,
-      result: {
-        content: diff,
-        payload: {
-          kind: "file_diff",
-          path: "src/auth.py",
-          lines_added: 1,
-          lines_removed: 1,
-        },
-      },
+      result_kind: "file_diff",
+      result_path: "src/auth.py",
+      lines_added: 1,
+      lines_removed: 1,
+      diff,
+      truncated: false,
     }),
   ]);
 
@@ -200,6 +206,7 @@ test("an edit carries its complete diff immediately", () => {
     added: 1,
     removed: 1,
     diff,
+    truncated: false,
   }]);
 });
 
@@ -210,15 +217,12 @@ test("an edit keeps its arrival position beside concurrent activity", () => {
     call("ToolCallFinished", "edit-first", {
       tool_name: "edit_file",
       ok: true,
-      result: {
-        content: "-old\n+new",
-        payload: {
-          kind: "file_diff",
-          path: "ordered.txt",
-          lines_added: 1,
-          lines_removed: 1,
-        },
-      },
+      result_kind: "file_diff",
+      result_path: "ordered.txt",
+      lines_added: 1,
+      lines_removed: 1,
+      diff: "-old\n+new",
+      truncated: false,
     }),
   ]);
 
@@ -226,6 +230,59 @@ test("an edit keeps its arrival position beside concurrent activity", () => {
   assert.equal(transcript.model[1].calls[0].toolCallId, "read-second");
   transcript.apply(call("ToolCallFinished", "read-second", { ok: true }));
   assert.equal(transcript.model[1].calls[0].status, "succeeded");
+});
+
+test("captured runtime frames produce reachable targets and edits", async () => {
+  const fixture = JSON.parse(await readFile(
+    new URL("./fixtures/transcript-wire.json", import.meta.url),
+    "utf8",
+  ));
+  const transcript = applyAll(fixture.frames);
+
+  assert.deepEqual(transcript.model, [
+    {
+      type: "edit",
+      toolCallId: "wire-edit",
+      name: "edit_file",
+      path: "src/auth.py",
+      added: 1,
+      removed: 1,
+      diff: "--- src/auth.py\n+++ src/auth.py\n-old\n+new",
+      truncated: false,
+    },
+    {
+      type: "activity",
+      calls: [{
+        toolCallId: "wire-read",
+        name: "read_file",
+        target: "README.md",
+        status: "succeeded",
+      }],
+    },
+  ]);
+});
+
+test("an empty wire diff remains ordinary activity", () => {
+  const transcript = applyAll([
+    call("ToolCallStarted", "empty-diff", {
+      tool_name: "edit_file",
+      target: "empty.txt",
+    }),
+    call("ToolCallFinished", "empty-diff", {
+      tool_name: "edit_file",
+      ok: true,
+      result_kind: "file_diff",
+      result_path: "empty.txt",
+      lines_added: 0,
+      lines_removed: 0,
+      diff: "",
+      truncated: false,
+    }),
+  ]);
+
+  assert.equal(transcript.model.length, 1);
+  assert.equal(transcript.model[0].type, "activity");
+  assert.equal(transcript.model[0].calls[0].status, "succeeded");
 });
 
 test("permission questions resolve only on matching answers", () => {
@@ -255,6 +312,18 @@ test("permission questions resolve only on matching answers", () => {
   allowed.apply(call("ToolCallFinished", "allow-1", { ok: true }));
   assert.equal(question.resolved, true);
   assert.equal(question.allowed, true);
+});
+
+test("a failed tool completion does not answer its permission question", () => {
+  const transcript = applyAll([
+    call("ToolCallStarted", "denied-1"),
+    call("PermissionRequested", "denied-1", { mode: "prompt" }),
+    call("ToolCallFinished", "denied-1", { ok: false }),
+  ]);
+  const question = transcript.model.find(({ type }) => type === "question");
+
+  assert.equal(question.resolved, false);
+  assert.equal(Object.hasOwn(question, "allowed"), false);
 });
 
 test("each dropped frame inserts a positional gap", () => {

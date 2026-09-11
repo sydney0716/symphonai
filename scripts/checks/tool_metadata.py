@@ -10,6 +10,7 @@ from symphonai_api.models import ToolResult
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tool_schema import to_provider_tool_schema
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import TARGET_LIMIT, call_target
 from scripts.checks.harness import check, fail
 
 
@@ -76,6 +77,32 @@ def check_tools_localtool_contract() -> None:
 
 @check("tools.metadata_contract")
 def check_tools_metadata_contract() -> None:
+    expected_targets = {
+        "read_file": ("document.txt", {"path": "document.txt"}),
+        "grep": ("def login", {"pattern": "def login"}),
+        "run_shell": (
+            "python3 scripts/check.py",
+            {"command": "python3 scripts/check.py"},
+        ),
+        "future_tool": ("", {"new_target": "not yet trusted"}),
+    }
+    for tool_name, (expected, arguments) in expected_targets.items():
+        actual = call_target(tool_name, arguments)
+        if actual != expected:
+            fail(f"{tool_name} call target was {actual!r}, expected {expected!r}")
+    if call_target("grep", {"path": "first", "pattern": "second"}) != "first":
+        fail("call target did not honor the documented key priority")
+    long_target = "x" * (TARGET_LIMIT + 17)
+    if call_target("read_file", {"path": long_target}) != long_target[:TARGET_LIMIT]:
+        fail("call target was not truncated at TARGET_LIMIT")
+    for malformed in ({}, {"path": 3}, None):
+        try:
+            target = call_target("read_file", malformed)
+        except Exception as exc:
+            fail(f"call_target raised on {malformed!r}: {exc}")
+        if target != "":
+            fail(f"call_target accepted malformed arguments {malformed!r}: {target!r}")
+
     metadata_tools = standard_tool_registry()
     execute_overrides = [
         name

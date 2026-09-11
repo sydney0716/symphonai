@@ -376,7 +376,13 @@ def check_deltas_emitted() -> None:
     deltas = sink.of_type(AssistantTextDelta)
     if [event.text for event in deltas] != ["thinking", "done"]:
         fail(f"text delta events did not match chunks: {deltas!r}")
-    encoded_events = json.dumps([event.__dict__ for event in sink.events], default=str)
+    encoded_events = json.dumps(
+        [
+            {key: value for key, value in event.__dict__.items() if key != "target"}
+            for event in sink.events
+        ],
+        default=str,
+    )
     if secret_fragment in encoded_events:
         fail("an event exposed partial tool arguments")
 

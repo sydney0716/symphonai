@@ -31,7 +31,14 @@ from symphonai_api.events import (
 )
 from symphonai_api.identity import SCHEMA_VERSION, TurnRef
 from symphonai_api.leader import Leader, LeaderConfig
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.models import (
+    Message,
+    ModelResponse,
+    Role,
+    ToolCall,
+    ToolResult,
+    Usage,
+)
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
@@ -133,41 +140,162 @@ def check_events_tool_bracketing() -> None:
         outside_tmp = str(ws.outside)
         policy = ws.policy
         tools = ws.tools
-        tool_events = CollectingSink()
-        tool_event_result = ApiAgent(
-            FakeModelProvider(
-                responses=[
-                    ModelResponse(
-                        Message(
-                            Role.ASSISTANT,
-                            tool_calls=[
-                                ToolCall(
-                                    id="event-read",
-                                    name="read_file",
-                                    arguments={"path": "existing.txt"},
-                                )
-                            ],
-                        )
-                    ),
-                    ModelResponse(Message(Role.ASSISTANT, "done")),
-                ]
-            ),
-            standard_tool_registry(),
-            policy,
-            events=tool_events,
-        ).run([Message(Role.USER, "read")])
+
+        def run_call(tool_call: ToolCall) -> tuple[object, CollectingSink]:
+            recorded = CollectingSink()
+            result = ApiAgent(
+                FakeModelProvider(
+                    responses=[
+                        ModelResponse(
+                            Message(Role.ASSISTANT, tool_calls=[tool_call])
+                        ),
+                        ModelResponse(Message(Role.ASSISTANT, "done")),
+                    ]
+                ),
+                tools,
+                policy,
+                events=recorded,
+            ).run([Message(Role.USER, "tool event")])
+            return result, recorded
+
+        tool_event_result, tool_events = run_call(
+            ToolCall(
+                id="event-read",
+                name="read_file",
+                arguments={"path": "existing.txt"},
+            )
+        )
         tool_started = tool_events.of_type(ToolCallStarted)
         tool_finished = tool_events.of_type(ToolCallFinished)
+        default_result_fields = ("", "", 0, 0, "", False)
         if (
             len(tool_started) != 1
             or len(tool_finished) != 1
             or tool_started[0].tool_call_id != "event-read"
+            or tool_started[0].target != "existing.txt"
             or tool_finished[0].tool_call_id != "event-read"
             or not tool_finished[0].ok
+            or (
+                tool_finished[0].result_kind,
+                tool_finished[0].result_path,
+                tool_finished[0].lines_added,
+                tool_finished[0].lines_removed,
+                tool_finished[0].diff,
+                tool_finished[0].truncated,
+            )
+            != default_result_fields
         ):
             fail(f"successful tool events did not bracket execution: {tool_events.events!r}")
         if tool_event_result.stopped_reason != "final_response":
             fail(f"event-producing tool run changed its result: {tool_event_result!r}")
+
+        edit_result, edit_events = run_call(
+            ToolCall(
+                id="event-edit",
+                name="edit_file",
+                arguments={
+                    "path": "existing.txt",
+                    "old_string": "hello",
+                    "new_string": "goodbye",
+                },
+            )
+        )
+        edit_started = edit_events.of_type(ToolCallStarted)
+        edit_finished = edit_events.of_type(ToolCallFinished)
+        edit_messages = [
+            message.tool_result
+            for message in edit_result.messages
+            if message.tool_result is not None
+        ]
+        if (
+            len(edit_started) != 1
+            or edit_started[0].target != "existing.txt"
+            or len(edit_finished) != 1
+            or edit_finished[0].result_kind != "file_diff"
+            or edit_finished[0].result_path != "existing.txt"
+            or edit_finished[0].lines_added != 1
+            or edit_finished[0].lines_removed != 1
+            or edit_finished[0].truncated
+            or len(edit_messages) != 1
+            or edit_finished[0].diff != edit_messages[0].content
+            or "-hello from disk" not in edit_finished[0].diff
+            or "+goodbye from disk" not in edit_finished[0].diff
+        ):
+            fail(f"edit result did not reach its finish event: {edit_events.events!r}")
+
+        failed_payload = {
+            "kind": "file_diff",
+            "path": "decoy.txt",
+            "lines_added": 8,
+            "lines_removed": 5,
+            "truncated": True,
+        }
+        with mock.patch.object(
+            tools["edit_file"],
+            "_execute",
+            return_value=ToolResult(
+                tool_call_id="event-failed-edit",
+                ok=False,
+                content="decoy diff",
+                error="edit failed",
+                payload=failed_payload,
+            ),
+        ):
+            _, failed_edit_events = run_call(
+                ToolCall(
+                    id="event-failed-edit",
+                    name="edit_file",
+                    arguments={
+                        "path": "existing.txt",
+                        "old_string": "goodbye",
+                        "new_string": "hello",
+                    },
+                )
+            )
+        failed_finished = failed_edit_events.of_type(ToolCallFinished)
+        if len(failed_finished) != 1 or (
+            failed_finished[0].result_kind,
+            failed_finished[0].result_path,
+            failed_finished[0].lines_added,
+            failed_finished[0].lines_removed,
+            failed_finished[0].diff,
+            failed_finished[0].truncated,
+        ) != default_result_fields:
+            fail(f"failed edit leaked a diff summary: {failed_edit_events.events!r}")
+
+        with mock.patch.object(
+            tools["read_file"],
+            "_execute",
+            return_value=ToolResult(
+                tool_call_id="event-non-diff",
+                ok=True,
+                content="ordinary result",
+                payload={
+                    "kind": "search_hits",
+                    "path": "decoy.txt",
+                    "lines_added": 3,
+                    "lines_removed": 2,
+                    "truncated": True,
+                },
+            ),
+        ):
+            _, non_diff_events = run_call(
+                ToolCall(
+                    id="event-non-diff",
+                    name="read_file",
+                    arguments={"path": "existing.txt"},
+                )
+            )
+        non_diff_finished = non_diff_events.of_type(ToolCallFinished)
+        if len(non_diff_finished) != 1 or (
+            non_diff_finished[0].result_kind,
+            non_diff_finished[0].result_path,
+            non_diff_finished[0].lines_added,
+            non_diff_finished[0].lines_removed,
+            non_diff_finished[0].diff,
+            non_diff_finished[0].truncated,
+        ) != default_result_fields:
+            fail(f"non-diff result leaked a diff summary: {non_diff_events.events!r}")
 
         unknown_events = CollectingSink()
         unknown_result = ApiAgent(

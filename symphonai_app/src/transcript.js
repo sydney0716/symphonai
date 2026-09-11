@@ -12,27 +12,24 @@ function unpack(frame) {
 }
 
 function callTarget(fields) {
-  const arguments_ = fields.arguments;
-  return fields.target
-    ?? fields.path
-    ?? arguments_?.path
-    ?? arguments_?.query
-    ?? arguments_?.pattern
-    ?? null;
+  return fields.target || null;
 }
 
 function diffResult(fields) {
-  const result = fields.result ?? fields.tool_result;
-  const payload = result?.payload ?? fields.payload ?? fields;
-  const path = payload?.path;
-  const diff = result?.content ?? payload?.diff ?? fields.diff;
-  const added = payload?.lines_added ?? payload?.added;
-  const removed = payload?.lines_removed ?? payload?.removed;
-  const hasDiffShape = typeof path === "string"
-    && typeof diff === "string"
-    && Number.isInteger(added)
-    && Number.isInteger(removed);
-  return hasDiffShape ? { path, added, removed, diff } : null;
+  const hasDiff = fields.result_kind === "file_diff"
+    && typeof fields.result_path === "string"
+    && fields.result_path.length > 0
+    && typeof fields.diff === "string"
+    && fields.diff.length > 0;
+  return hasDiff
+    ? {
+      path: fields.result_path,
+      added: fields.lines_added,
+      removed: fields.lines_removed,
+      diff: fields.diff,
+      truncated: fields.truncated,
+    }
+    : null;
 }
 
 export function createTranscript() {
@@ -153,7 +150,9 @@ export function createTranscript() {
       if (record === null) {
         return;
       }
-      resolveQuestion(fields, true);
+      if (fields.ok) {
+        resolveQuestion(fields, true);
+      }
       const edit = diffResult(fields);
       if (fields.ok && edit !== null) {
         replaceWithEdit(record, edit);

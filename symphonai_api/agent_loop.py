@@ -61,6 +61,7 @@ from symphonai_api.session import TranscriptWriter
 from symphonai_api.streaming import StreamAssembler, TextDelta
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import call_target
 
 # Re-exported: DEFAULT_MAX_TURNS lives in budgets.py because RunBudget defaults
 # to it, and budgets.py cannot import this module without a cycle.
@@ -71,6 +72,37 @@ def _message_digest(message: Message) -> str:
         message_to_json(message), sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.blake2b(canonical, digest_size=16).hexdigest()
+
+
+def _tool_result_event_fields(result: ToolResult) -> dict[str, str | int | bool]:
+    defaults: dict[str, str | int | bool] = {
+        "result_kind": "",
+        "result_path": "",
+        "lines_added": 0,
+        "lines_removed": 0,
+        "diff": "",
+        "truncated": False,
+    }
+    payload = result.payload
+    if not result.ok or not isinstance(payload, dict):
+        return defaults
+    try:
+        if payload.get("kind") != "file_diff":
+            return defaults
+        path = payload.get("path")
+        lines_added = payload.get("lines_added")
+        lines_removed = payload.get("lines_removed")
+        truncated = payload.get("truncated")
+    except Exception:
+        return defaults
+    return {
+        "result_kind": "file_diff",
+        "result_path": path if isinstance(path, str) else "",
+        "lines_added": lines_added if type(lines_added) is int else 0,
+        "lines_removed": lines_removed if type(lines_removed) is int else 0,
+        "diff": result.content if isinstance(result.content, str) else "",
+        "truncated": truncated if type(truncated) is bool else False,
+    }
 
 
 @dataclass
@@ -465,6 +497,10 @@ class ApiAgent:
                                 turn_id=turn_ref.turn_id,
                                 tool_name=tool_call.name,
                                 tool_call_id=tool_call.id,
+                                target=call_target(
+                                    tool_call.name,
+                                    tool_call.arguments,
+                                ),
                             ),
                         )
 
@@ -542,6 +578,7 @@ class ApiAgent:
                                 tool_name=tool_call.name,
                                 tool_call_id=tool_call.id,
                                 ok=tool_result.ok,
+                                **_tool_result_event_fields(tool_result),
                             ),
                         )
                         if not tool_result.ok:

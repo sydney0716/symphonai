@@ -62,6 +62,7 @@ class AssistantTextDelta(Event):
 class ToolCallStarted(Event):
     tool_name: str = ""
     tool_call_id: str = ""
+    target: str = ""
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,12 @@ class ToolCallFinished(Event):
     tool_name: str = ""
     tool_call_id: str = ""
     ok: bool = False
+    result_kind: str = ""
+    result_path: str = ""
+    lines_added: int = 0
+    lines_removed: int = 0
+    diff: str = ""
+    truncated: bool = False
 
 
 @dataclass(frozen=True)

@@ -23,8 +23,10 @@ export function listen(value, type, listener) {
 const ACTIVITY_VERBS = Object.freeze({
   read_file: "read",
   grep: "searched for",
+  glob: "searched for",
+  list_files: "listed",
   edit_file: "edited",
-  multi_edit: "edited",
+  multi_edit_file: "edited",
   write_file: "wrote",
   run_shell: "ran",
 });
@@ -70,7 +72,7 @@ function renderEdit(document, entry) {
   append(
     details,
     element(document, "summary", {
-      text: `Edited ${entry.path} (+${entry.added} −${entry.removed})`,
+      text: `Edited ${entry.path} (+${entry.added} −${entry.removed})${entry.truncated ? " · diff truncated" : ""}`,
     }),
     element(document, "pre", { text: entry.diff }),
   );

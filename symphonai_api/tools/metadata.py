@@ -13,6 +13,24 @@ if TYPE_CHECKING:
     from symphonai_api.tools.base import LocalTool
 
 
+TARGET_LIMIT = 200
+_TARGET_KEYS = ("path", "pattern", "query", "command", "url")
+
+
+def call_target(tool_name: str, arguments: dict) -> str:
+    """Return one bounded, display-safe target from known argument keys."""
+    if not isinstance(arguments, dict):
+        return ""
+    try:
+        for key in _TARGET_KEYS:
+            value = arguments.get(key)
+            if isinstance(value, str) and value:
+                return value[:TARGET_LIMIT]
+    except Exception:
+        return ""
+    return ""
+
+
 class ToolEffect(str, Enum):
     """What a call does to state outside this process.
 
