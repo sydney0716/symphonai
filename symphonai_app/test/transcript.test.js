@@ -86,7 +86,62 @@ test("assistant deltas join only while consecutive", () => {
     "text",
   ]);
   assert.equal(transcript.model[0].text, "hello world");
+  assert.equal(transcript.model[0].agentId, "agent-1");
+  assert.equal(transcript.model[0].runId, "run-1");
   assert.equal(transcript.model[2].text, "after tool");
+});
+
+test("assistant text separates agents even when their run ids collide", () => {
+  const transcript = applyAll([
+    event("AssistantTextDelta", {
+      agent_id: "leader",
+      run_id: "shared-run",
+      text: "I will delegate this. ",
+    }),
+    event("SubagentSpawned", {
+      agent_id: "leader",
+      run_id: "shared-run",
+      subagent_name: "reader",
+      subagent_agent_id: "reader-agent",
+    }),
+    event("AssistantTextDelta", {
+      agent_id: "reader-agent",
+      run_id: "shared-run",
+      text: "Reading the file...",
+    }),
+  ]);
+
+  assert.deepEqual(transcript.model, [
+    {
+      type: "text",
+      agentId: "leader",
+      runId: "shared-run",
+      text: "I will delegate this. ",
+    },
+    {
+      type: "text",
+      agentId: "reader-agent",
+      runId: "shared-run",
+      text: "Reading the file...",
+    },
+  ]);
+});
+
+test("assistant text separates runs from the same agent", () => {
+  const transcript = applyAll([
+    event("AssistantTextDelta", { run_id: "run-1", text: "first run" }),
+    event("RunStarted", { run_id: "run-2", agent_name: "leader" }),
+    event("AssistantTextDelta", { run_id: "run-2", text: "second run" }),
+  ]);
+
+  assert.equal(transcript.model.length, 2);
+  assert.deepEqual(
+    transcript.model.map(({ agentId, runId, text }) => ({ agentId, runId, text })),
+    [
+      { agentId: "agent-1", runId: "run-1", text: "first run" },
+      { agentId: "agent-1", runId: "run-2", text: "second run" },
+    ],
+  );
 });
 
 test("a prompt retains the submitted text", () => {
@@ -94,7 +149,12 @@ test("a prompt retains the submitted text", () => {
     event("PromptSubmitted", { text: "Explain this", message_count: 7 }),
   ]);
   assert.deepEqual(transcript.model, [
-    { type: "prompt", text: "Explain this", messageCount: 7 },
+    {
+      type: "prompt",
+      agentId: "agent-1",
+      text: "Explain this",
+      messageCount: 7,
+    },
   ]);
 });
 
@@ -132,6 +192,35 @@ test("consecutive calls group by turn and retain ordered parts", () => {
   );
 });
 
+test("activity grouping separates agents with the same turn id", () => {
+  const transcript = applyAll([
+    call("ToolCallStarted", "leader-read", {
+      agent_id: "leader",
+      run_id: "leader-run",
+      turn_id: "colliding-turn",
+      target: "leader.txt",
+    }),
+    call("ToolCallStarted", "worker-read", {
+      agent_id: "worker",
+      run_id: "worker-run",
+      turn_id: "colliding-turn",
+      target: "worker.txt",
+    }),
+  ]);
+
+  assert.equal(transcript.model.length, 2);
+  assert.deepEqual(
+    transcript.model.map(({ agentId, calls }) => ({
+      agentId,
+      ids: calls.map(({ toolCallId }) => toolCallId),
+    })),
+    [
+      { agentId: "leader", ids: ["leader-read"] },
+      { agentId: "worker", ids: ["worker-read"] },
+    ],
+  );
+});
+
 test("activity entries contain parts and no rendered sentence", () => {
   const transcript = applyAll([
     call("ToolCallStarted", "read-1", { target: "src/auth.py" }),
@@ -139,7 +228,8 @@ test("activity entries contain parts and no rendered sentence", () => {
   ]);
   const activity = transcript.model[0];
 
-  assert.deepEqual(Object.keys(activity), ["type", "calls"]);
+  assert.deepEqual(Object.keys(activity), ["type", "agentId", "calls"]);
+  assert.equal(activity.agentId, "agent-1");
   assert.equal(Object.hasOwn(activity, "text"), false);
   assert.equal(Object.hasOwn(activity, "sentence"), false);
   assert.equal(Object.hasOwn(activity, "summary"), false);
@@ -200,6 +290,7 @@ test("an edit carries its complete diff immediately", () => {
 
   assert.deepEqual(transcript.model, [{
     type: "edit",
+    agentId: "agent-1",
     toolCallId: "edit-1",
     name: "edit_file",
     path: "src/auth.py",
@@ -232,6 +323,77 @@ test("an edit keeps its arrival position beside concurrent activity", () => {
   assert.equal(transcript.model[1].calls[0].status, "succeeded");
 });
 
+test("an edit split preserves attribution and trailing activity grouping", () => {
+  const transcript = applyAll([
+    call("ToolCallStarted", "before", {
+      agent_id: "leader",
+      turn_id: "shared-turn",
+      target: "before.txt",
+    }),
+    call("ToolCallStarted", "middle-edit", {
+      agent_id: "leader",
+      turn_id: "shared-turn",
+      tool_name: "edit_file",
+      target: "edited.txt",
+    }),
+    call("ToolCallStarted", "after", {
+      agent_id: "leader",
+      turn_id: "shared-turn",
+      tool_name: "grep",
+      target: "needle",
+    }),
+    call("ToolCallFinished", "middle-edit", {
+      agent_id: "finishing-agent",
+      turn_id: "shared-turn",
+      tool_name: "edit_file",
+      ok: true,
+      result_kind: "file_diff",
+      result_path: "edited.txt",
+      lines_added: 1,
+      lines_removed: 1,
+      diff: "-old\n+new",
+      truncated: false,
+    }),
+  ]);
+
+  assert.deepEqual(
+    transcript.model.map(({ type, agentId }) => ({ type, agentId })),
+    [
+      { type: "activity", agentId: "leader" },
+      { type: "edit", agentId: "finishing-agent" },
+      { type: "activity", agentId: "leader" },
+    ],
+  );
+  assert.deepEqual(
+    transcript.model[2].calls.map(({ toolCallId }) => toolCallId),
+    ["after"],
+  );
+
+  transcript.apply(call("ToolCallStarted", "later", {
+    agent_id: "leader",
+    turn_id: "shared-turn",
+    tool_name: "write_file",
+    target: "later.txt",
+  }));
+  assert.equal(transcript.model.length, 3);
+  assert.deepEqual(
+    transcript.model[2].calls.map(({ toolCallId }) => toolCallId),
+    ["after", "later"],
+  );
+
+  transcript.apply(call("ToolCallStarted", "other-agent", {
+    agent_id: "worker",
+    turn_id: "shared-turn",
+    target: "worker.txt",
+  }));
+  assert.equal(transcript.model.length, 4);
+  assert.equal(transcript.model[3].agentId, "worker");
+  assert.deepEqual(
+    transcript.model[3].calls.map(({ toolCallId }) => toolCallId),
+    ["other-agent"],
+  );
+});
+
 test("captured runtime frames produce reachable targets and edits", async () => {
   const fixture = JSON.parse(await readFile(
     new URL("./fixtures/transcript-wire.json", import.meta.url),
@@ -242,6 +404,7 @@ test("captured runtime frames produce reachable targets and edits", async () => 
   assert.deepEqual(transcript.model, [
     {
       type: "edit",
+      agentId: "agent-wire",
       toolCallId: "wire-edit",
       name: "edit_file",
       path: "src/auth.py",
@@ -252,6 +415,7 @@ test("captured runtime frames produce reachable targets and edits", async () => 
     },
     {
       type: "activity",
+      agentId: "agent-wire",
       calls: [{
         toolCallId: "wire-read",
         name: "read_file",
@@ -294,6 +458,7 @@ test("permission questions resolve only on matching answers", () => {
   denied.apply(call("PermissionDenied", "deny-1", { reason: "user denied" }));
   assert.deepEqual(denied.model[0], {
     type: "question",
+    agentId: "agent-1",
     toolCallId: "deny-1",
     toolName: "read_file",
     mode: "prompt",
@@ -360,7 +525,11 @@ test("all documented event recordings are covered and unknown events survive", (
     future: { nested: [1, 2, 3] },
   };
   const transcript = applyAll([{ kind: "event", payload }]);
-  assert.deepEqual(transcript.model, [{ type: "unknown", event: payload }]);
+  assert.deepEqual(transcript.model, [{
+    type: "unknown",
+    agentId: "agent-1",
+    event: payload,
+  }]);
 });
 
 test("orphan and post-run tool events are inert", () => {
@@ -385,8 +554,72 @@ test("compaction details are retained as data", () => {
   const transcript = applyAll([RECORDED_EVENTS.CompactionApplied]);
   assert.deepEqual(transcript.model, [{
     type: "compaction",
+    agentId: "agent-1",
     beforeTokens: 100,
     afterTokens: 40,
     droppedMessages: 3,
   }]);
+});
+
+test("every event-derived entry is attributed and gaps are not", () => {
+  const entries = applyAll([
+    event("PromptSubmitted", {
+      agent_id: "prompt-agent",
+      text: "prompt",
+      message_count: 1,
+    }),
+    event("AssistantTextDelta", { agent_id: "text-agent", text: "text" }),
+    call("ToolCallStarted", "activity-call", {
+      agent_id: "activity-agent",
+      target: "file.txt",
+    }),
+    call("PermissionRequested", "question-call", {
+      agent_id: "question-agent",
+      mode: "prompt",
+    }),
+    event("CompactionApplied", {
+      agent_id: "compaction-agent",
+      before_tokens: 10,
+      after_tokens: 5,
+      dropped_messages: 1,
+    }),
+    event("FutureEntry", { agent_id: "unknown-agent" }),
+    { kind: "error", dropped: 2 },
+  ]).model;
+  const edit = applyAll([
+    call("ToolCallStarted", "edit-call", {
+      agent_id: "edit-starter",
+      tool_name: "edit_file",
+      target: "edit.txt",
+    }),
+    call("ToolCallFinished", "edit-call", {
+      agent_id: "edit-agent",
+      tool_name: "edit_file",
+      ok: true,
+      result_kind: "file_diff",
+      result_path: "edit.txt",
+      lines_added: 1,
+      lines_removed: 1,
+      diff: "-old\n+new",
+      truncated: false,
+    }),
+  ]).model[0];
+
+  assert.deepEqual(
+    entries.filter(({ type }) => type !== "gap").map(({ type, agentId }) => ({
+      type,
+      agentId,
+    })),
+    [
+      { type: "prompt", agentId: "prompt-agent" },
+      { type: "text", agentId: "text-agent" },
+      { type: "activity", agentId: "activity-agent" },
+      { type: "question", agentId: "question-agent" },
+      { type: "compaction", agentId: "compaction-agent" },
+      { type: "unknown", agentId: "unknown-agent" },
+    ],
+  );
+  assert.equal(edit.agentId, "edit-agent");
+  const gap = entries.find(({ type }) => type === "gap");
+  assert.equal(Object.hasOwn(gap, "agentId"), false);
 });

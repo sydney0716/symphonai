@@ -76,16 +76,30 @@ textarea {
   min-height: 12rem;
 }
 
+.prompt,
 .assistant,
-.tool,
-.dropped,
+.activity,
+.edit,
+.question,
+.compaction,
+.gap,
+.unknown-event,
 .approval {
   padding: 0.65rem;
   border-radius: 0.4rem;
   background: #1d2530;
 }
 
-.dropped,
+.edit summary {
+  cursor: pointer;
+}
+
+.edit pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.gap,
 .error {
   color: #ffbd66;
 }

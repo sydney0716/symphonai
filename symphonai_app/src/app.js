@@ -2,8 +2,9 @@ import { createApprovals } from "./approvals.js";
 import { createClient } from "./client.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
-import { append, element, listen, replace } from "./render.js";
+import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { createSpecView } from "./spec_view.js";
+import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
 
 function filename(path) {
@@ -34,15 +35,16 @@ export async function start({ global, document, client }) {
   const turn = createTurnState();
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
+  const transcript = createTranscript();
   const roadmapReply = await boundary.file("docs/roadmap.json");
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
   );
-  let assistantLine = null;
+  let promptFailure = "";
 
   function showState() {
-    stateLabel.textContent = turn.state;
+    stateLabel.textContent = promptFailure || turn.state;
   }
 
   function showSpec(result) {
@@ -97,12 +99,6 @@ export async function start({ global, document, client }) {
   }
   replace(roadmapRoot, ...roadmapChildren);
 
-  function chatLine(className, text) {
-    const line = element(document, "p", { className, text });
-    append(chatRoot, line);
-    return line;
-  }
-
   function showApprovals() {
     const children = [];
     for (const [id, question] of approvals.state) {
@@ -144,10 +140,11 @@ export async function start({ global, document, client }) {
       if (action.kind === "prompt") {
         try {
           const reply = await boundary.prompt(action.text);
+          promptFailure = "";
           await perform(turn.accepted(reply.run_id));
         } catch (error) {
           turn.rejected(String(error));
-          chatLine("error", "Prompt failed.");
+          promptFailure = "Prompt failed.";
         }
       }
       if (action.kind === "stop") {
@@ -161,12 +158,15 @@ export async function start({ global, document, client }) {
     event.preventDefault();
     const text = input.value;
     input.value = "";
+    promptFailure = "";
     const actions = turn.submit(text);
     showState();
     return perform(actions);
   });
 
   async function onFrame(frame) {
+    transcript.apply(frame);
+    renderTranscript(document, chatRoot, transcript.model);
     if (frame.kind === "approval_requested") {
       await approvals.onFrame(frame);
       showApprovals();
@@ -174,7 +174,6 @@ export async function start({ global, document, client }) {
     }
     const dropped = frame.dropped ?? frame.payload?.dropped;
     if (frame.kind === "error" && Number.isInteger(dropped) && dropped > 0) {
-      chatLine("dropped", `${dropped} events were dropped`);
       await approvals.onFrame(frame);
       showApprovals();
       return;
@@ -183,22 +182,6 @@ export async function start({ global, document, client }) {
       return;
     }
     const event = decodeEvent(frame.payload);
-    if (event.type === "RunStarted") {
-      assistantLine = null;
-    }
-    if (event.type === "AssistantTextDelta") {
-      if (assistantLine === null) {
-        assistantLine = chatLine("assistant", "");
-      }
-      assistantLine.textContent += event.fields.text;
-    }
-    if (event.type === "ToolCallStarted") {
-      chatLine("tool", `Tool started: ${event.fields.tool_name}`);
-    }
-    if (event.type === "ToolCallFinished") {
-      const outcome = event.fields.ok ? "finished" : "failed";
-      chatLine("tool", `Tool ${outcome}: ${event.fields.tool_name}`);
-    }
     await perform(turn.event({ ...event, ...event.fields }));
   }
 
@@ -211,6 +194,7 @@ export async function start({ global, document, client }) {
     specPaths: allSpecPaths,
     specView,
     subscription,
+    transcript,
     turn,
   };
 }

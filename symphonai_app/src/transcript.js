@@ -42,7 +42,10 @@ export function createTranscript() {
   const activityTurns = new WeakMap();
 
   function turnKey(fields) {
-    return fields.turn_id ?? activeTurn ?? `implicit:${fields.run_id ?? ""}:${turnSerial}`;
+    const turn = fields.turn_id
+      ?? activeTurn
+      ?? `implicit:${fields.run_id ?? ""}:${turnSerial}`;
+    return JSON.stringify([fields.agent_id ?? null, turn]);
   }
 
   function appendActivity(fields) {
@@ -50,7 +53,7 @@ export function createTranscript() {
     const previous = model.at(-1);
     const entry = previous?.type === "activity" && activityTurns.get(previous) === key
       ? previous
-      : { type: "activity", calls: [] };
+      : { type: "activity", agentId: fields.agent_id, calls: [] };
     if (entry !== previous) {
       model.push(entry);
       activityTurns.set(entry, key);
@@ -87,7 +90,7 @@ export function createTranscript() {
     question.reason = reason;
   }
 
-  function replaceWithEdit(record, edit) {
+  function replaceWithEdit(record, edit, agentId) {
     const activityIndex = model.indexOf(record.entry);
     const callIndex = record.entry.calls.indexOf(record.call);
     if (activityIndex < 0 || callIndex < 0) {
@@ -103,12 +106,17 @@ export function createTranscript() {
     }
     replacements.push({
       type: "edit",
+      agentId,
       toolCallId: record.call.toolCallId,
       name: record.call.name,
       ...edit,
     });
     if (after.length > 0) {
-      const trailing = { type: "activity", calls: after };
+      const trailing = {
+        type: "activity",
+        agentId: record.entry.agentId,
+        calls: after,
+      };
       activityTurns.set(trailing, key);
       for (const call of after) {
         calls.get(call.toolCallId).entry = trailing;
@@ -124,6 +132,7 @@ export function createTranscript() {
     if (type === "PromptSubmitted") {
       model.push({
         type: "prompt",
+        agentId: fields.agent_id,
         text: fields.text,
         messageCount: fields.message_count,
       });
@@ -131,10 +140,19 @@ export function createTranscript() {
     }
     if (type === "AssistantTextDelta") {
       const previous = model.at(-1);
-      if (previous?.type === "text") {
+      if (
+        previous?.type === "text"
+        && previous.agentId === fields.agent_id
+        && previous.runId === fields.run_id
+      ) {
         previous.text += fields.text;
       } else {
-        model.push({ type: "text", text: fields.text });
+        model.push({
+          type: "text",
+          agentId: fields.agent_id,
+          runId: fields.run_id,
+          text: fields.text,
+        });
       }
       return;
     }
@@ -155,7 +173,7 @@ export function createTranscript() {
       }
       const edit = diffResult(fields);
       if (fields.ok && edit !== null) {
-        replaceWithEdit(record, edit);
+        replaceWithEdit(record, edit, fields.agent_id);
         return;
       }
       record.call.status = fields.ok ? "succeeded" : "failed";
@@ -173,6 +191,7 @@ export function createTranscript() {
     if (type === "PermissionRequested") {
       const question = {
         type: "question",
+        agentId: fields.agent_id,
         toolCallId: fields.tool_call_id,
         toolName: fields.tool_name,
         mode: fields.mode,
@@ -189,6 +208,7 @@ export function createTranscript() {
     if (type === "CompactionApplied") {
       model.push({
         type: "compaction",
+        agentId: fields.agent_id,
         beforeTokens: fields.before_tokens,
         afterTokens: fields.after_tokens,
         droppedMessages: fields.dropped_messages,
@@ -223,7 +243,11 @@ export function createTranscript() {
     ) {
       return;
     }
-    model.push({ type: "unknown", event: { type, ...fields } });
+    model.push({
+      type: "unknown",
+      agentId: fields.agent_id,
+      event: { type, ...fields },
+    });
   }
 
   function apply(frame) {

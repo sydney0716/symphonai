@@ -139,6 +139,43 @@ function fakeClient() {
   };
 }
 
+function eventFrame(type, fields = {}) {
+  return {
+    kind: "event",
+    payload: {
+      type,
+      agent_id: "agent-1",
+      run_id: "run-1",
+      turn_id: "turn-1",
+      schema_version: 1,
+      ...fields,
+    },
+  };
+}
+
+function toolStarted(id, name, target = "") {
+  return eventFrame("ToolCallStarted", {
+    tool_name: name,
+    tool_call_id: id,
+    target,
+  });
+}
+
+function toolFinished(id, name, fields = {}) {
+  return eventFrame("ToolCallFinished", {
+    tool_name: name,
+    tool_call_id: id,
+    ok: true,
+    result_kind: "",
+    result_path: "",
+    lines_added: 0,
+    lines_removed: 0,
+    diff: "",
+    truncated: false,
+    ...fields,
+  });
+}
+
 test("start renders both panes from injected dependencies", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -151,6 +188,8 @@ test("start renders both panes from injected dependencies", async () => {
   assert.ok(document.getElementById("chat"));
   assert.equal(document.getElementById("turn-state").textContent, "idle");
   assert.equal(app.client, client);
+  assert.ok(app.transcript);
+  assert.deepEqual(app.transcript.model, []);
 });
 
 test("selecting an item opens its spec, report, and follow-up names", async () => {
@@ -193,32 +232,35 @@ test("submit dispatches once and assistant deltas render in order", async () => 
   await submitting;
   assert.equal(app.turn.state, RUNNING);
 
-  await client.emit({
-    kind: "event",
-    payload: { type: "AssistantTextDelta", run_id: "run-1", text: "hello " },
-  });
-  await client.emit({
-    kind: "event",
-    payload: { type: "AssistantTextDelta", run_id: "run-1", text: "world" },
-  });
-  assert.match(visibleText(document.getElementById("chat")), /hello world/);
+  await client.emit(eventFrame("AssistantTextDelta", { text: "hello " }));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "world" }));
+  const chat = document.getElementById("chat");
+  assert.equal(chat.children.length, 1);
+  assert.equal(chat.children[0].className, "assistant");
+  assert.equal(chat.children[0].textContent, "hello world");
 });
 
-test("tool activity, approvals, and dropped notices stay visible", async () => {
+test("two tool calls in one turn render as one activity", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   await start({ global: {}, document, client });
 
-  await client.emit({
-    kind: "event",
-    payload: { type: "ToolCallStarted", tool_name: "read_file" },
-  });
-  await client.emit({
-    kind: "event",
-    payload: { type: "ToolCallFinished", tool_name: "read_file", ok: true },
-  });
-  assert.match(visibleText(document.getElementById("chat")), /Tool started: read_file/);
-  assert.match(visibleText(document.getElementById("chat")), /Tool finished: read_file/);
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("call-1", "read_file", "one.txt"));
+  await client.emit(toolFinished("call-1", "read_file"));
+  await client.emit(toolStarted("call-2", "grep", "needle"));
+  await client.emit(toolFinished("call-2", "grep"));
+
+  const chat = document.getElementById("chat");
+  assert.equal(chat.children.length, 1);
+  assert.equal(chat.children[0].className, "activity");
+  assert.match(chat.children[0].textContent, /Read `one\.txt` and searched for `needle`\./);
+});
+
+test("approvals stay separate and dropped frames render one model gap", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
 
   await client.emit({
     kind: "approval_requested",
@@ -247,8 +289,107 @@ test("tool activity, approvals, and dropped notices stay visible", async () => {
     { id: "approval-1", allowed: true, reason: "" },
   ]);
 
-  await client.emit({ kind: "error", dropped: 3 });
-  assert.match(visibleText(document.getElementById("chat")), /3 events were dropped/);
+  await client.emit({ kind: "error", dropped: 2 });
+  const chat = document.getElementById("chat");
+  assert.equal(chat.children.length, 1);
+  assert.equal(chat.children[0].className, "gap");
+  assert.equal(chat.children[0].textContent, "2 events were dropped.");
+  assert.deepEqual(app.transcript.model, [{ type: "gap", dropped: 2 }]);
+});
+
+test("assistant runs split around tool activity", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+
+  await client.emit(eventFrame("AssistantTextDelta", { text: "before " }));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "tool" }));
+  await client.emit(toolStarted("call-1", "read_file", "file.txt"));
+  await client.emit(toolFinished("call-1", "read_file"));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "after " }));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "tool" }));
+
+  const chat = document.getElementById("chat");
+  assert.deepEqual(
+    chat.children.map((child) => child.className),
+    ["assistant", "activity", "assistant"],
+  );
+  assert.equal(chat.children[0].textContent, "before tool");
+  assert.equal(chat.children[2].textContent, "after tool");
+});
+
+test("prompt and edit entries render from wire fields", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+
+  await client.emit(eventFrame("PromptSubmitted", {
+    text: "change the file",
+    message_count: 1,
+  }));
+  await client.emit(toolStarted("edit-1", "edit_file", "notes.txt"));
+  await client.emit(toolFinished("edit-1", "edit_file", {
+    result_kind: "file_diff",
+    result_path: "notes.txt",
+    lines_added: 2,
+    lines_removed: 1,
+    diff: "@@ -1 +1,2 @@\n-old\n+new\n+line",
+  }));
+
+  const chat = document.getElementById("chat");
+  assert.equal(chat.children[0].className, "prompt");
+  assert.equal(chat.children[0].textContent, "change the file");
+  const edit = chat.children[1];
+  assert.equal(edit.tagName, "DETAILS");
+  assert.equal(edit.className, "edit");
+  assert.equal(edit.children[0].tagName, "SUMMARY");
+  assert.match(edit.children[0].textContent, /notes\.txt \(\+2 −1\)/);
+  assert.equal(edit.children[1].tagName, "PRE");
+  assert.equal(edit.children[1].textContent, "@@ -1 +1,2 @@\n-old\n+new\n+line");
+});
+
+test("unknown events render and do not stop later frames", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+
+  await client.emit(eventFrame("FutureEvent", { future_value: 7 }));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "still live" }));
+
+  const chat = document.getElementById("chat");
+  assert.equal(chat.children.length, 2);
+  assert.equal(chat.children[0].className, "unknown-event");
+  assert.match(chat.children[0].textContent, /FutureEvent/);
+  assert.equal(chat.children[1].textContent, "still live");
+});
+
+test("each render replaces the chat instead of duplicating prior entries", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+
+  await client.emit(eventFrame("PromptSubmitted", { text: "one", message_count: 1 }));
+  await client.emit(eventFrame("PromptSubmitted", { text: "two", message_count: 2 }));
+
+  const chat = document.getElementById("chat");
+  assert.equal(app.transcript.model.length, 2);
+  assert.equal(chat.children.length, 2);
+  assert.deepEqual(chat.children.map((child) => child.textContent), ["one", "two"]);
+});
+
+test("a failed prompt reports through the turn-state label", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async () => {
+    throw new Error("offline");
+  };
+  await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "retry me";
+
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.equal(document.getElementById("turn-state").textContent, "Prompt failed.");
+  assert.equal(document.getElementById("chat").children.length, 0);
 });
 
 test("render stays DOM-only and start does not read window", async () => {
@@ -257,12 +398,28 @@ test("render stays DOM-only and start does not read window", async () => {
     "utf8",
   );
   const appSource = await readFile(new URL("../src/app.js", import.meta.url), "utf8");
+  const cssSource = await readFile(new URL("../app.css", import.meta.url), "utf8");
   const indexSource = await readFile(new URL("../index.html", import.meta.url), "utf8");
 
   assert.ok(!/^\s*import\s/m.test(renderSource));
   assert.ok(!/\b(?:if|switch)\s*\(/.test(renderSource));
   assert.match(appSource, /export async function start\(\{ global, document, client \}\)/);
+  assert.ok(!appSource.includes("chatLine"));
   assert.ok(!start.toString().includes("window"));
+  for (const className of [
+    "prompt",
+    "activity",
+    "edit",
+    "question",
+    "compaction",
+    "gap",
+    "unknown-event",
+  ]) {
+    assert.match(cssSource, new RegExp(`\\.${className}\\b`));
+  }
+  assert.match(cssSource, /\.edit summary\s*{[^}]*cursor:\s*pointer/s);
+  assert.match(cssSource, /\.edit pre\s*{[^}]*overflow-x:\s*auto/s);
+  assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
   assert.equal((indexSource.match(/class="(?:roadmap|chat)-pane"/g) ?? []).length, 2);
   assert.equal((indexSource.match(/<!-- symphonai-handshake -->/g) ?? []).length, 1);
   assert.ok(!indexSource.includes("window.__symphonai"));
