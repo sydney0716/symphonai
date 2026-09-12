@@ -87,6 +87,10 @@ class HostRun:
         self._policy.approval_callback = self.approvals.callback
 
     @property
+    def policy(self) -> PermissionPolicy:
+        return self._policy
+
+    @property
     def active_run_id(self) -> str | None:
         with self._lock:
             return None if self._active is None else self._active.run_id

@@ -536,6 +536,82 @@ def check_file_route() -> None:
             host.close()
 
 
+@check("host_server.survey_route")
+def check_survey_route() -> None:
+    token = "survey-route-token"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "docs").mkdir()
+        (root / "tests").mkdir()
+        (root / "README.md").write_text("read me", encoding="utf-8")
+        (root / "docs" / "guide.md").write_text("guide", encoding="utf-8")
+        (root / "main.py").write_text("", encoding="utf-8")
+        host = _host(repo_root=root, token=token)
+        try:
+            for path in ("/survey", f"/survey?token={token}"):
+                connection, response = _request(host, "GET", path)
+                try:
+                    body = response.read()
+                    if response.status != 401 or body != b"":
+                        fail(f"survey route accepted unauthenticated path {path!r}")
+                finally:
+                    connection.close()
+
+            connection, response = _request(
+                host, "GET", "/survey", headers=_headers(host)
+            )
+            try:
+                body = response.read()
+                if response.status != 200:
+                    fail(f"authorized survey failed: {response.status}, {body!r}")
+                payload = json.loads(body)
+            finally:
+                connection.close()
+            survey = payload.get("survey", {})
+            expected_fields = {
+                "root",
+                "languages",
+                "by_directory",
+                "entry_points",
+                "docs",
+                "tests",
+                "tree_summary",
+                "stopped",
+                "file_count",
+            }
+            if set(survey) != expected_fields:
+                fail(f"survey route returned the wrong fields: {survey!r}")
+            if survey.get("root") != ".":
+                fail(f"survey root was not repository-relative: {survey!r}")
+            if survey.get("languages") != [[".md", 2], [".py", 1]]:
+                fail(f"survey route returned wrong languages: {survey!r}")
+            if survey.get("docs") != ["README.md", "docs/guide.md"]:
+                fail(f"survey route returned wrong documentation: {survey!r}")
+            if survey.get("tests") != ["tests"]:
+                fail(f"survey route returned wrong test directories: {survey!r}")
+            if survey.get("by_directory") != [
+                ["docs", [[".md", 1]]],
+                ["tests", []],
+            ]:
+                fail(f"survey route returned wrong directory counts: {survey!r}")
+            if survey.get("stopped") is not False or survey.get("file_count") != 3:
+                fail(f"survey route returned wrong truncation state: {survey!r}")
+
+            protocol = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text(
+                encoding="utf-8"
+            )
+            survey_paragraph = protocol.partition(
+                "An authenticated `GET /survey`"
+            )[2].partition("\n\n")[0]
+            missing = [
+                field for field in expected_fields if f"`{field}`" not in survey_paragraph
+            ]
+            if missing:
+                fail(f"survey protocol paragraph omitted fields: {missing!r}")
+        finally:
+            host.close()
+
+
 @check("host_server.app_routes")
 def check_app_routes() -> None:
     token = "browser-route-token"

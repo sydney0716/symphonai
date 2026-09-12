@@ -255,6 +255,10 @@ export function createClient({
       return request("GET", "/sessions");
     },
 
+    survey() {
+      return request("GET", "/survey");
+    },
+
     health() {
       return request("GET", "/health");
     },

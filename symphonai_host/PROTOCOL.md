@@ -127,6 +127,12 @@ reading it, and `SameSite=Strict` plus the loopback bind limits ambient use.
 The `?token=` exception remains confined to exact `/app`; the cookie is the only
 subresource exception.
 
+An authenticated `GET /survey` returns a bounded, permission-gated repository
+survey under the `survey` key. Its fields are `root`, `languages`,
+`by_directory`, `entry_points`, `docs`, `tests`, `tree_summary`, `stopped`, and
+`file_count`; paths are repository-relative strings. The route accepts only the
+ordinary bearer header; query tokens and app cookies do not authorize it.
+
 `GET /events` returns `text/event-stream`. Each event is one `data:` line
 whose content is an `event` frame containing the event payload above. A client
 that has fallen behind receives an `error` frame with `{"dropped": n}` before

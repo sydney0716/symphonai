@@ -17,6 +17,7 @@ from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.extensions import Extensions
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import SessionError, TranscriptError
+from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.protocol import (
@@ -379,6 +380,32 @@ class HostServer:
                     if not self._authorized():
                         return
                     self._serve_file()
+                    return
+                if request_path == "/survey":
+                    if not self._authorized():
+                        return
+                    survey = survey_repository(policy=host.run.policy)
+                    relative = lambda path: path.relative_to(  # noqa: E731
+                        survey.root
+                    ).as_posix()
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "survey": {
+                                "root": ".",
+                                "languages": survey.languages,
+                                "by_directory": survey.by_directory,
+                                "entry_points": [
+                                    relative(path) for path in survey.entry_points
+                                ],
+                                "docs": [relative(path) for path in survey.docs],
+                                "tests": [relative(path) for path in survey.tests],
+                                "tree_summary": survey.tree_summary,
+                                "stopped": survey.stopped,
+                                "file_count": survey.file_count,
+                            }
+                        },
+                    )
                     return
                 if self.path == "/approvals":
                     if not self._authorized():
