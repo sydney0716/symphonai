@@ -1,0 +1,8 @@
+{
+  "mod+enter": "submit",
+  "escape": "cancel",
+  "mod+.": "stop-run",
+  "mod+l": "focus-input",
+  "mod+shift+p": "command-palette",
+  "mod+k": "clear-chat"
+}

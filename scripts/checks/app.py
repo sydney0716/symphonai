@@ -19,6 +19,7 @@ NODE_TESTS = {
     "app.transcript": "transcript.test.js",
     "app.client": "client.test.js",
     "app.init_flow": "init_flow.test.js",
+    "app.keys": "keys.test.js",
     "app.turn": "turn.test.js",
     "app.roadmap": "roadmap.test.js",
     "app.spec_view": "spec_view.test.js",
@@ -97,6 +98,15 @@ def client() -> None:
 @check("app.init_flow")
 def init_flow() -> None:
     _run_node_test("init_flow.test.js")
+
+
+@check("app.keys")
+def keys() -> None:
+    environment = dict(os.environ)
+    environment["SYMPHONAI_KEYS_PATH"] = str(
+        REPO_ROOT / "symphonai_app" / "keys.default.json"
+    )
+    _run_node_test("keys.test.js", environment=environment)
 
 
 @check("app.turn")

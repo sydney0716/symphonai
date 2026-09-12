@@ -397,6 +397,7 @@ def main() -> None:
         "app.transcript",
         "app.client",
         "app.init_flow",
+        "app.keys",
         "app.turn",
         "app.roadmap",
         "app.spec_view",
