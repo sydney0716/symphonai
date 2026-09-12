@@ -413,6 +413,7 @@ def main() -> None:
         "packaging.app_seam",
         "packaging.bundle_input",
         "packaging.page_assets",
+        "packaging.page_tracked",
         "roadmap_data.schema",
         "roadmap_data.spec_bindings",
         "survey.languages",

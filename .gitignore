@@ -1,5 +1,6 @@
 # Generated reports -- rendered from docs/*.json, never edited by hand
-*.html
+/docs/roadmap.html
+/roadmap.html
 
 # Python
 __pycache__/

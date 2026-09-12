@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
@@ -45,6 +46,27 @@ def _page_asset_failures(app_root: Path, source: str) -> list[str]:
         if not (app_root / reference).is_file():
             failures.append(f"missing page asset: {reference!r}")
     return failures
+
+
+def _run_git(*arguments: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ("git", *arguments),
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        fail(f"could not run git to inspect page assets: {exc}")
+
+
+def _page_paths() -> list[Path]:
+    app_root = ROOT / "symphonai_app"
+    index = app_root / "index.html"
+    parser = _PageReferences()
+    parser.feed(index.read_text(encoding="utf-8"))
+    return [index, *(app_root / reference for reference in parser.references)]
 
 
 def _rust() -> str:
@@ -184,3 +206,26 @@ def check_page_assets() -> None:
         )
         if not any("missing page asset" in item for item in missing):
             fail("page asset validation accepted a missing reference")
+
+
+@check("packaging.page_tracked")
+def check_page_tracked() -> None:
+    for path in _page_paths():
+        try:
+            relative = path.relative_to(ROOT).as_posix()
+        except ValueError:
+            fail(f"page asset resolved outside the repository: {path}")
+
+        tracked = _run_git("ls-files", "--error-unmatch", "--", relative)
+        if tracked.returncode == 1:
+            fail(f"page asset is not tracked: {relative}")
+        if tracked.returncode != 0:
+            detail = tracked.stderr.strip() or f"exit code {tracked.returncode}"
+            fail(f"git could not inspect tracked page assets: {detail}")
+
+        ignored = _run_git("check-ignore", "--no-index", "--quiet", "--", relative)
+        if ignored.returncode == 0:
+            fail(f"page asset is ignored: {relative}")
+        if ignored.returncode != 1:
+            detail = ignored.stderr.strip() or f"exit code {ignored.returncode}"
+            fail(f"git could not inspect ignored page assets: {detail}")
