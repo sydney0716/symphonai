@@ -401,6 +401,7 @@ class HostServer:
                                 "docs": [relative(path) for path in survey.docs],
                                 "tests": [relative(path) for path in survey.tests],
                                 "tree_summary": survey.tree_summary,
+                                "truncated_directories": survey.truncated_directories,
                                 "stopped": survey.stopped,
                                 "file_count": survey.file_count,
                             }

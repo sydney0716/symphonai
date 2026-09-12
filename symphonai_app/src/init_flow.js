@@ -20,14 +20,23 @@ function renderSurvey(survey) {
         : String(item)
     ))
     : [];
+  const truncatedDirectories = new Set(
+    Array.isArray(survey.truncated_directories)
+      ? survey.truncated_directories.map(String)
+      : [],
+  );
   const byDirectory = Array.isArray(survey.by_directory)
     ? survey.by_directory.map((item) => {
       if (!Array.isArray(item) || item.length !== 2 || !Array.isArray(item[1])) {
         return String(item);
       }
-      const counts = item[1].map((count) => (
-        Array.isArray(count) ? `${count[0]}: ${count[1]}` : String(count)
-      ));
+      const lowerBound = truncatedDirectories.has(String(item[0]));
+      const counts = item[1].map((count) => {
+        if (!Array.isArray(count)) {
+          return String(count);
+        }
+        return `${count[0]}: ${lowerBound ? "at least " : ""}${count[1]}`;
+      });
       return `${item[0]} — ${counts.length > 0 ? counts.join(", ") : "no extensions"}`;
     })
     : [];

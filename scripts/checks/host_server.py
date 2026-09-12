@@ -576,6 +576,7 @@ def check_survey_route() -> None:
                 "docs",
                 "tests",
                 "tree_summary",
+                "truncated_directories",
                 "stopped",
                 "file_count",
             }

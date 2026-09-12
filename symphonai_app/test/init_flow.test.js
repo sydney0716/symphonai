@@ -13,6 +13,7 @@ const SURVEY = {
   docs: ["README.md", "docs/design.md"],
   tests: ["tests"],
   tree_summary: ".\n  docs/\n    design.md\n  src/\n    main.py",
+  truncated_directories: ["src"],
   stopped: true,
   file_count: 4,
 };
@@ -55,7 +56,8 @@ test("init surveys the client and sends one conversational opening", async () =>
   for (const expected of [
     ".py: 3 files",
     "Files surveyed: 4 (truncated)",
-    "src — .py: 3",
+    "src — .py: at least 3",
+    "web — .js: 1",
     "pyproject.toml",
     "docs/design.md",
     "Propose a roadmap",

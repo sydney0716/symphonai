@@ -37,6 +37,7 @@ class Survey:
     docs: tuple[Path, ...]
     tests: tuple[Path, ...]
     tree_summary: str
+    truncated_directories: tuple[str, ...]
     stopped: bool
     file_count: int
 
@@ -141,7 +142,6 @@ def survey_repository(
     directory_languages: dict[str, Counter[str]] = {}
     directory_file_counts: dict[str, int] = {}
     file_count = 0
-    stopped = False
 
     def classify(entry):  # noqa: ANN001, ANN202
         try:
@@ -186,12 +186,8 @@ def survey_repository(
 
     for path in root_files:
         if file_count >= max_files:
-            stopped = True
             break
         count_file(path, None)
-        if file_count >= max_files:
-            stopped = True
-            break
 
     top_level_count = len(root_directories)
     directory_budget = (
@@ -203,39 +199,77 @@ def survey_repository(
         directory_languages[directory.name] = Counter()
         directory_file_counts[directory.name] = 0
 
-    directories = deque((directory, directory.name) for directory in root_directories)
-    saturated: set[str] = set()
-    while directories and file_count < max_files:
-        directory, bucket = directories.popleft()
-        if bucket in saturated:
-            continue
-        for entry in _entries(policy, directory):
-            path = Path(entry.path)
-            is_directory, is_file = classify(entry)
-            if not is_directory and not is_file:
-                continue
-            relative = path.relative_to(root)
-            if len(relative.parts) <= 2:
-                children.setdefault(path.parent, []).append(
-                    (path.name, is_directory)
-                )
-            if is_directory:
-                if path.name.casefold() in _TEST_DIRECTORY_NAMES:
-                    tests.add(path)
-                directories.append((path, bucket))
-                continue
-            if directory_file_counts[bucket] >= directory_budget:
-                saturated.add(bucket)
-                stopped = True
+    def directory_files(start: Path):  # noqa: ANN202
+        directories = deque([start])
+        while directories:
+            directory = directories.popleft()
+            for entry in _entries(policy, directory):
+                path = Path(entry.path)
+                is_directory, is_file = classify(entry)
+                if not is_directory and not is_file:
+                    continue
+                relative = path.relative_to(root)
+                if len(relative.parts) <= 2:
+                    children.setdefault(path.parent, []).append(
+                        (path.name, is_directory)
+                    )
+                if is_directory:
+                    if path.name.casefold() in _TEST_DIRECTORY_NAMES:
+                        tests.add(path)
+                    directories.append(path)
+                else:
+                    yield path
+
+    walkers = {
+        directory.name: iter(directory_files(directory))
+        for directory in root_directories
+    }
+    exhausted: set[str] = set()
+    pending: dict[str, Path] = {}
+
+    def next_file(bucket: str) -> Path | None:
+        if bucket in pending:
+            return pending.pop(bucket)
+        try:
+            return next(walkers[bucket])
+        except StopIteration:
+            exhausted.add(bucket)
+            return None
+
+    bucket_names = sorted(walkers, key=lambda name: (name.casefold(), name))
+    for bucket in bucket_names:
+        while (
+            file_count < max_files
+            and directory_file_counts[bucket] < directory_budget
+        ):
+            path = next_file(bucket)
+            if path is None:
                 break
             count_file(path, bucket)
+
+    refill = [name for name in bucket_names if name not in exhausted]
+    while file_count < max_files and refill:
+        next_refill: list[str] = []
+        for bucket in refill:
+            path = next_file(bucket)
+            if path is None:
+                continue
+            count_file(path, bucket)
+            next_refill.append(bucket)
             if file_count >= max_files:
-                stopped = True
                 break
-            if directory_file_counts[bucket] >= directory_budget:
-                saturated.add(bucket)
-                stopped = True
-                break
+        refill = next_refill
+
+    truncated: list[str] = []
+    for bucket in bucket_names:
+        if bucket in exhausted:
+            continue
+        path = next_file(bucket)
+        if path is not None:
+            pending[bucket] = path
+            truncated.append(bucket)
+
+    stopped = file_count == max_files
 
     language_counts = tuple(
         sorted(languages.items(), key=lambda item: (-item[1], item[0]))
@@ -271,6 +305,7 @@ def survey_repository(
             stopped=stopped,
             file_count=file_count,
         ),
+        truncated_directories=tuple(truncated),
         stopped=stopped,
         file_count=file_count,
     )

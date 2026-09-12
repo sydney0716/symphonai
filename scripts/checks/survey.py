@@ -54,11 +54,18 @@ def check_languages() -> None:
 def check_deterministic() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary).resolve()
-        bucket = root / "bucket"
-        bucket.mkdir()
+        first_bucket = root / "a-bucket"
+        small_bucket = root / "m-small"
+        second_bucket = root / "z-bucket"
+        for bucket in (first_bucket, small_bucket, second_bucket):
+            bucket.mkdir()
         for index in range(125):
-            (bucket / f"a-{index:03}.py").write_text("", encoding="utf-8")
-            (bucket / f"z-{index:03}.js").write_text("", encoding="utf-8")
+            (first_bucket / f"a-{index:03}.py").write_text("", encoding="utf-8")
+            (first_bucket / f"z-{index:03}.js").write_text("", encoding="utf-8")
+            (second_bucket / f"a-{index:03}.ts").write_text("", encoding="utf-8")
+            (second_bucket / f"z-{index:03}.md").write_text("", encoding="utf-8")
+        for index in range(10):
+            (small_bucket / f"small-{index:02}.txt").write_text("", encoding="utf-8")
 
         original_scandir = survey_module.os.scandir
         visits: dict[Path, int] = {}
@@ -77,12 +84,21 @@ def check_deterministic() -> None:
             "scandir",
             side_effect=alternating_scandir,
         ):
-            first = survey_repository(policy=_policy(root), max_files=200)
-            second = survey_repository(policy=_policy(root), max_files=200)
+            first = survey_repository(policy=_policy(root), max_files=450)
+            second = survey_repository(policy=_policy(root), max_files=450)
 
-        fields = ("languages", "entry_points", "docs", "tests", "by_directory")
+        fields = (
+            "languages",
+            "entry_points",
+            "docs",
+            "tests",
+            "by_directory",
+            "truncated_directories",
+        )
         if any(getattr(first, name) != getattr(second, name) for name in fields):
             fail(f"directory iteration order changed the survey: {first!r}, {second!r}")
+        if first.truncated_directories != ("a-bucket", "z-bucket"):
+            fail(f"deterministic fixture did not reach the second pass: {first!r}")
 
 
 @check("survey.breadth_first")
@@ -137,12 +153,16 @@ def check_directory_budgets() -> None:
         buckets = dict(result.by_directory)
         if tuple(buckets) != ("a-heavy", "b-python", "c-javascript"):
             fail(f"directory buckets were missing or unordered: {result.by_directory!r}")
-        if buckets["a-heavy"] != ((".ts", 200),):
-            fail(f"dominant directory exceeded its share: {result.by_directory!r}")
+        if buckets["a-heavy"] != ((".ts", 580),):
+            fail(f"dominant directory did not receive the remainder: {result.by_directory!r}")
         if buckets["b-python"] != ((".py", 10),):
             fail(f"Python directory did not contribute: {result.by_directory!r}")
         if buckets["c-javascript"] != ((".js", 10),):
             fail(f"JavaScript directory did not contribute: {result.by_directory!r}")
+        if result.file_count != 600 or not result.stopped:
+            fail(f"survey did not spend its whole file budget: {result!r}")
+        if result.truncated_directories != ("a-heavy",):
+            fail(f"truncated directories were wrong: {result!r}")
         totals = dict(result.languages)
         for counts in buckets.values():
             for extension, count in counts:
@@ -162,6 +182,63 @@ def check_structured_truncation() -> None:
             fail(f"complete survey reported wrong bounds: {complete!r}")
         if not stopped.stopped or stopped.file_count != 1:
             fail(f"truncated survey reported wrong bounds: {stopped!r}")
+        if complete.truncated_directories or stopped.truncated_directories:
+            fail(f"root files were reported as truncated directories: {stopped!r}")
+
+
+@check("survey.exhausts_under_budget")
+def check_exhausts_under_budget() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        directories = [root / f"bucket-{index}" for index in range(10)]
+        for directory in directories:
+            directory.mkdir()
+        for index in range(500):
+            (directories[0] / f"large-{index:03}.py").write_text("", encoding="utf-8")
+        for directory in directories[1:]:
+            for index in range(10):
+                (directory / f"small-{index:02}.js").write_text("", encoding="utf-8")
+
+        result = survey_repository(policy=_policy(root), max_files=1000)
+        if result.file_count != 590:
+            fail(f"under-budget survey did not exhaust the repository: {result!r}")
+        if result.stopped:
+            fail(f"first-pass saturation was reported as a stop: {result!r}")
+        if result.truncated_directories:
+            fail(f"complete directory counts were marked as lower bounds: {result!r}")
+        if dict(result.by_directory)["bucket-0"] != ((".py", 500),):
+            fail(f"large directory remainder was not counted: {result!r}")
+
+
+@check("survey.round_robin_remainder")
+def check_round_robin_remainder() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        first = root / "a-large"
+        small = root / "m-small"
+        second = root / "z-large"
+        for directory in (first, small, second):
+            directory.mkdir()
+        for index in range(1000):
+            (first / f"first-{index:04}.py").write_text("", encoding="utf-8")
+            (second / f"second-{index:04}.js").write_text("", encoding="utf-8")
+        for index in range(10):
+            (small / f"small-{index:02}.md").write_text("", encoding="utf-8")
+
+        result = survey_repository(policy=_policy(root), max_files=1000)
+        buckets = dict(result.by_directory)
+        first_total = sum(count for _, count in buckets["a-large"])
+        second_total = sum(count for _, count in buckets["z-large"])
+        if result.file_count != 1000 or not result.stopped:
+            fail(f"round-robin fixture did not spend its budget: {result!r}")
+        if first_total <= 333 or second_total <= 333:
+            fail(f"the second-pass remainder was not distributed: {result!r}")
+        if abs(first_total - second_total) > 1:
+            fail(f"second-pass directories were visited sequentially: {result!r}")
+        if result.truncated_directories != ("a-large", "z-large"):
+            fail(f"truncated directories were not exact and sorted: {result!r}")
+        if any("/" in name for name in result.truncated_directories):
+            fail(f"truncation named something below the top level: {result!r}")
 
 
 @check("survey.host_policy_accessor")

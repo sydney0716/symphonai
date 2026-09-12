@@ -411,6 +411,8 @@ def main() -> None:
         "survey.breadth_first",
         "survey.directory_budgets",
         "survey.structured_truncation",
+        "survey.exhausts_under_budget",
+        "survey.round_robin_remainder",
         "survey.host_policy_accessor",
         "survey.categories",
         "survey.policy_boundary",
