@@ -38,6 +38,24 @@ function normalizeChord(value) {
 }
 
 
+function chordSpellings(chord) {
+  const normalized = normalizeChord(chord);
+  const parts = normalized.split("+");
+  if (!parts.includes("mod")) {
+    return new Set([normalized]);
+  }
+  return new Set(["ctrl", "meta"].map((primary) => normalizeChord(
+    parts.map((part) => part === "mod" ? primary : part).join("+"),
+  )));
+}
+
+
+function chordsConflict(first, second) {
+  const secondSpellings = chordSpellings(second);
+  return [...chordSpellings(first)].some((spelling) => secondSpellings.has(spelling));
+}
+
+
 function skipWhitespace(text, start) {
   let cursor = start;
   while (/\s/.test(text[cursor] ?? "")) {
@@ -137,6 +155,7 @@ export function parseKeymap(text) {
   }
 
   const bindings = new Map();
+  const sourceChords = new Map();
   for (const [rawChord, action] of objectEntries(text)) {
     if (typeof action !== "string" && action !== null) {
       throw new KeymapError(
@@ -144,13 +163,17 @@ export function parseKeymap(text) {
       );
     }
     const chord = normalizeChord(rawChord);
-    if (bindings.has(chord)) {
-      const previous = bindings.get(chord);
+    const conflict = [...bindings].find(([existing]) => (
+      chordsConflict(existing, chord)
+    ));
+    if (conflict) {
+      const [existing, previous] = conflict;
       throw new KeymapError(
-        `chord ${JSON.stringify(chord)} binds both ${JSON.stringify(previous)} and ${JSON.stringify(action)}`,
+        `chords ${JSON.stringify(sourceChords.get(existing))} and ${JSON.stringify(rawChord)} bind both ${JSON.stringify(previous)} and ${JSON.stringify(action)}`,
       );
     }
     bindings.set(chord, action);
+    sourceChords.set(chord, rawChord);
   }
   return bindings;
 }
@@ -161,9 +184,30 @@ export function mergeKeymap(defaults, user) {
   const rejected = [];
   for (const [rawChord, action] of user) {
     const chord = normalizeChord(rawChord);
-    if (RESERVED_REASONS.has(chord)) {
-      rejected.push({ chord, action, reason: RESERVED_REASONS.get(chord) });
-    } else if (action === null) {
+    const reserved = RESERVED.find((candidate) => chordsConflict(candidate, chord));
+    if (reserved) {
+      rejected.push({
+        chord,
+        action,
+        reason: `collides with reserved chord ${reserved}: ${RESERVED_REASONS.get(reserved)}`,
+      });
+      continue;
+    }
+    if (!bindings.has(chord)) {
+      const conflict = [...bindings].find(([existing]) => (
+        chordsConflict(existing, chord)
+      ));
+      if (conflict) {
+        const [existing, existingAction] = conflict;
+        rejected.push({
+          chord,
+          action,
+          reason: `collides with ${existing}, bound to ${existingAction}`,
+        });
+        continue;
+      }
+    }
+    if (action === null) {
       bindings.delete(chord);
     } else {
       bindings.set(chord, action);

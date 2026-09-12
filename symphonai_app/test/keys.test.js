@@ -11,6 +11,9 @@ import {
   primaryModifier,
 } from "../src/keys.js";
 
+const DEFAULT_KEYMAP_PATH = process.env.SYMPHONAI_KEYS_PATH
+  ?? new URL("../keys.default.json", import.meta.url);
+
 
 async function loadKeymap(path) {
   return parseKeymap(await readFile(path, "utf8"));
@@ -18,8 +21,7 @@ async function loadKeymap(path) {
 
 
 test("the configured default file returns every binding", async () => {
-  const path = process.env.SYMPHONAI_KEYS_PATH;
-  assert.ok(path, "the default keymap path was not passed to the test");
+  const path = DEFAULT_KEYMAP_PATH;
   const text = await readFile(path, "utf8");
   const bindings = await loadKeymap(path);
 
@@ -32,7 +34,7 @@ test("the configured default file returns every binding", async () => {
 
 
 test("merging changes one leaf, preserves the rest, and adds new actions", async () => {
-  const defaults = await loadKeymap(process.env.SYMPHONAI_KEYS_PATH);
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
   const rebound = mergeKeymap(defaults, parseKeymap('{"mod+enter":"send"}'));
 
   assert.equal(rebound.bindings.size, defaults.size);
@@ -50,7 +52,7 @@ test("merging changes one leaf, preserves the rest, and adds new actions", async
 
 
 test("null unbinds a chord and lookup no longer finds it", async () => {
-  const defaults = await loadKeymap(process.env.SYMPHONAI_KEYS_PATH);
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
   const { bindings, rejected } = mergeKeymap(
     defaults,
     parseKeymap('{"mod+k":null}'),
@@ -66,7 +68,7 @@ test("null unbinds a chord and lookup no longer finds it", async () => {
 
 
 test("every reserved chord is rejected, reported, and preserved", async () => {
-  const defaults = await loadKeymap(process.env.SYMPHONAI_KEYS_PATH);
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
   const user = new Map(
     RESERVED.map((chord, index) => [chord, `take-reserved-${index}`]),
   );
@@ -83,23 +85,87 @@ test("every reserved chord is rejected, reported, and preserved", async () => {
 });
 
 
+test("explicit primary modifiers collide with the portable reserved chord", async () => {
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
+  for (const chord of ["ctrl+l", "meta+l", "mod+l", "MOD+L"]) {
+    const { bindings, rejected } = mergeKeymap(
+      defaults,
+      parseKeymap(JSON.stringify({ [chord]: "open-links" })),
+    );
+    assert.equal(rejected.length, 1, `${chord} was not rejected`);
+    assert.equal(
+      rejected[0].reason,
+      "collides with reserved chord mod+l: focus input must always remain reachable",
+    );
+    assert.equal(bindings.get("mod+l"), "focus-input");
+    assert.equal(bindings.has(chord.toLowerCase()), chord.toLowerCase() === "mod+l");
+    assert.equal(
+      lookup(bindings, { key: "l", ctrlKey: true }, { platform: "linux" }),
+      "focus-input",
+    );
+    assert.equal(
+      lookup(bindings, { key: "l", metaKey: true }, { platform: "darwin" }),
+      "focus-input",
+    );
+  }
+});
+
+
 test("duplicate chords name the chord and both actions in either file", () => {
   const cases = [
     '{"mod+shift+x":"first-default","shift+mod+x":"second-default"}',
     '{"ctrl+x":"first-user","ctrl+x":"second-user"}',
+    '{"mod+k":"portable-control","ctrl+k":"explicit-control"}',
+    '{"mod+k":"portable-meta","meta+k":"explicit-meta"}',
   ];
-  for (const [index, text] of cases.entries()) {
+  for (const text of cases) {
+    const [[firstChord, firstAction], [secondChord, secondAction]] = (() => {
+      const matches = [...text.matchAll(/"([^"]+)":"([^"]+)"/g)];
+      return matches.map((match) => [match[1], match[2]]);
+    })();
     assert.throws(
       () => parseKeymap(text),
       (error) => {
         assert.ok(error instanceof KeymapError);
-        assert.match(error.message, /x/);
-        assert.match(error.message, new RegExp(`first-${index === 0 ? "default" : "user"}`));
-        assert.match(error.message, new RegExp(`second-${index === 0 ? "default" : "user"}`));
+        assert.ok(error.message.includes(firstChord));
+        assert.ok(error.message.includes(secondChord));
+        assert.ok(error.message.includes(firstAction));
+        assert.ok(error.message.includes(secondAction));
         return true;
       },
     );
   }
+});
+
+
+test("explicit non-primary chords do not acquire portable spellings", () => {
+  const bindings = parseKeymap('{"ctrl+k":"control","alt+k":"alternate"}');
+  assert.equal(bindings.size, 2);
+  assert.equal(bindings.get("ctrl+k"), "control");
+  assert.equal(bindings.get("alt+k"), "alternate");
+});
+
+
+test("canonical user chords replace defaults but spelling collisions do not", () => {
+  const defaults = parseKeymap(JSON.stringify({
+    "mod+shift+p": "palette",
+    "mod+k": "clear-chat",
+  }));
+  const replacement = mergeKeymap(
+    defaults,
+    parseKeymap('{"shift+mod+p":"new-palette"}'),
+  );
+  assert.deepEqual(replacement.rejected, []);
+  assert.equal(replacement.bindings.get("shift+mod+p"), "new-palette");
+
+  const collision = mergeKeymap(
+    defaults,
+    parseKeymap('{"ctrl+k":"kill-line"}'),
+  );
+  assert.equal(collision.rejected.length, 1);
+  assert.match(collision.rejected[0].reason, /mod\+k/);
+  assert.equal(collision.bindings.get("mod+k"), "clear-chat");
+  assert.equal(collision.bindings.has("ctrl+k"), false);
 });
 
 
@@ -146,6 +212,7 @@ test("the caller-provided platform resolves the primary modifier", async () => {
   const source = await readFile(new URL("../src/keys.js", import.meta.url), "utf8");
   assert.equal(source.includes("navigator"), false);
   assert.equal(source.includes("globalThis"), false);
+  assert.ok(source.includes("function chordSpellings(chord)"));
 });
 
 
