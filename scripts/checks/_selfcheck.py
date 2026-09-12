@@ -7,6 +7,7 @@ import io
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -14,6 +15,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.checks.harness import check, fail, ok, run  # noqa: E402
+
+
+EXPECTED_REPOSITORY_CHECKS = (
+    "app.roadmap",
+    "app.spec_view",
+    "packaging.bundle_input",
+    "packaging.page_tracked",
+    "roadmap_data.schema",
+    "roadmap_data.spec_bindings",
+    "plugins.manifest_validation",
+)
 
 
 @check("selfcheck.pass")
@@ -46,6 +58,101 @@ def invoke_check(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _copy_harness(root: Path) -> None:
+    checks = root / "scripts" / "checks"
+    checks.mkdir(parents=True)
+    (root / "scripts" / "__init__.py").touch()
+    (checks / "__init__.py").touch()
+    shutil.copy2(REPO_ROOT / "scripts" / "checks" / "harness.py", checks)
+
+
+def _run_fixture(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "scripts.check"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _write_skip_fixture(root: Path) -> None:
+    _copy_harness(root)
+    definitions = []
+    for index, name in enumerate(EXPECTED_REPOSITORY_CHECKS):
+        definitions.append(
+            f'@check({name!r}, needs_repository=True)\n'
+            f"def repository_check_{index}() -> None:\n"
+            '    fail("repository-only check executed")'
+        )
+    source = (
+        "from scripts.checks.harness import check, fail, run\n\n"
+        + "\n\n".join(definitions)
+        + "\n\nraise SystemExit(run())\n"
+    )
+    (root / "scripts" / "check.py").write_text(source, encoding="utf-8")
+
+
+def _write_repository_fixture(root: Path) -> Path:
+    _copy_harness(root)
+    shutil.copy2(
+        REPO_ROOT / "scripts" / "checks" / "roadmap_data.py",
+        root / "scripts" / "checks" / "roadmap_data.py",
+    )
+    docs = root / "docs"
+    docs.mkdir()
+    for name in ("roadmap.json", "roadmap.schema.json"):
+        shutil.copy2(REPO_ROOT / "docs" / name, docs / name)
+    (root / ".git").mkdir()
+    (root / "scripts" / "check.py").write_text(
+        "from scripts.checks import roadmap_data\n"
+        "from scripts.checks.harness import run\n"
+        'raise SystemExit(run("roadmap_data.schema"))\n',
+        encoding="utf-8",
+    )
+    return docs / "roadmap.schema.json"
+
+
+def _publish_verification_block() -> str:
+    source = (REPO_ROOT / "publish.sh").read_text(encoding="utf-8")
+    begin_marker = "# BEGIN published snapshot verification"
+    end_marker = "# END published snapshot verification"
+    try:
+        begin = source.index(begin_marker) + len(begin_marker)
+        end = source.index(end_marker, begin)
+    except ValueError:
+        raise RuntimeError("publish.sh omitted the snapshot verification block") from None
+    return source[begin:end].strip()
+
+
+def _write_publish_check(root: Path, skipped: tuple[str, ...], exit_code: int) -> None:
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    source = ["import sys"]
+    source.extend(
+        f'print("SKIP  {name}: needs the working repository")'
+        for name in skipped
+    )
+    source.extend(
+        (
+            'print("650 passed, 0 failed, 7 skipped, 657 selected of 657 registered")',
+            f"raise SystemExit({exit_code})",
+        )
+    )
+    (scripts / "check.py").write_text("\n".join(source) + "\n", encoding="utf-8")
+
+
+def _run_publish_verification(root: Path) -> subprocess.CompletedProcess[str]:
+    command = f"set -eu\nwork=$1\n{_publish_verification_block()}"
+    return subprocess.run(
+        ["sh", "-c", command, "publish-selfcheck", str(root)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def main() -> None:
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
@@ -63,7 +170,7 @@ def main() -> None:
         f"unexpected exception line: {lines!r}",
     )
     require(
-        lines[-1] == "1 passed, 2 failed, 3 selected of 3 registered",
+        lines[-1] == "1 passed, 2 failed, 0 skipped, 3 selected of 3 registered",
         f"unexpected selfcheck summary: {lines!r}",
     )
 
@@ -73,6 +180,71 @@ def main() -> None:
         pass
     else:
         raise RuntimeError("duplicate check name was accepted")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        no_git = root / "no-git"
+        _write_skip_fixture(no_git)
+        skipped = _run_fixture(no_git)
+        expected_skip_lines = [
+            f"SKIP  {name}: needs the working repository"
+            for name in EXPECTED_REPOSITORY_CHECKS
+        ]
+        require(skipped.returncode == 0, f"skip-only run failed: {skipped.stdout!r}")
+        require(
+            skipped.stdout.splitlines()
+            == [
+                *expected_skip_lines,
+                "0 passed, 0 failed, 7 skipped, 7 selected of 7 registered",
+            ],
+            f"no-git skips were wrong: {skipped.stdout!r}",
+        )
+
+        working = root / "working"
+        schema = _write_repository_fixture(working)
+        present = _run_fixture(working)
+        require(
+            present.returncode == 0 and "SKIP  " not in present.stdout,
+            f"working-repository check was skipped or failed: {present.stdout!r}",
+        )
+        schema.rename(schema.with_suffix(".hidden"))
+        hidden = _run_fixture(working)
+        require(hidden.returncode == 1, "broken repository check exited successfully")
+        require(
+            "FAIL  roadmap_data.schema:" in hidden.stdout,
+            f"broken repository check did not fail normally: {hidden.stdout!r}",
+        )
+
+        publish_root = root / "publish"
+        _write_publish_check(publish_root, tuple(sorted(EXPECTED_REPOSITORY_CHECKS)), 1)
+        broken = _run_publish_verification(publish_root)
+        require(broken.returncode != 0, "broken published snapshot was accepted")
+        require(
+            "REFUSING: the published snapshot fails its own checks; nothing was pushed"
+            in broken.stdout,
+            f"broken snapshot omitted the refusal: {broken.stdout!r}",
+        )
+
+        exact_root = root / "exact"
+        expected_sorted = tuple(sorted(EXPECTED_REPOSITORY_CHECKS))
+        _write_publish_check(exact_root, expected_sorted, 0)
+        exact = _run_publish_verification(exact_root)
+        require(exact.returncode == 0, f"exact publish skips were refused: {exact.stdout!r}")
+
+        for label, names in (
+            ("missing", expected_sorted[:-1]),
+            ("extra", (*expected_sorted, "unexpected.eighth")),
+        ):
+            mismatch_root = root / label
+            _write_publish_check(mismatch_root, names, 0)
+            mismatch = _run_publish_verification(mismatch_root)
+            require(mismatch.returncode != 0, f"{label} publish skips were accepted")
+            require(
+                "REFUSING: the published snapshot skipped an unexpected set of checks; "
+                "nothing was pushed" in mismatch.stdout,
+                f"{label} skip mismatch omitted the refusal: {mismatch.stdout!r}",
+            )
 
     expected_names = [
         "shell.classify_table",
@@ -733,12 +905,33 @@ def main() -> None:
         "plan.command_decisions",
         "plan.real_tools",
     ]
+    marked = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import scripts.check; "
+                "from scripts.checks.harness import repository_names; "
+                "print('\\n'.join(repository_names()))"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    require(marked.returncode == 0, f"repository check listing failed: {marked.stderr!r}")
+    require(
+        marked.stdout.splitlines() == list(EXPECTED_REPOSITORY_CHECKS),
+        f"repository-dependent check set was wrong: {marked.stdout!r}",
+    )
+
     full_run = invoke_check()
     require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
     require(
         full_run.stdout.splitlines()[-1]
         == (
-            f"{len(expected_names)} passed, 0 failed, "
+            f"{len(expected_names)} passed, 0 failed, 0 skipped, "
             f"{len(expected_names)} selected of {len(expected_names)} registered"
         ),
         f"unexpected full-run summary: {full_run.stdout!r}",
@@ -787,7 +980,8 @@ def main() -> None:
         require(
             selected_alone_lines[-1]
             == (
-                f"{selected_count} passed, 0 failed, {selected_count} selected "
+                f"{selected_count} passed, 0 failed, 0 skipped, "
+                f"{selected_count} selected "
                 f"of {len(expected_names)} registered"
             ),
             f"standalone check selected an unexpected count: {selected_alone.stdout!r}",
@@ -825,7 +1019,7 @@ def main() -> None:
         require(
             selected_lines[-1]
             == (
-                f"{len(shell_selected)} passed, 0 failed, "
+                f"{len(shell_selected)} passed, 0 failed, 0 skipped, "
                 f"{len(shell_selected)} selected of {len(expected_names)} registered"
             ),
             f"unexpected selector summary: {selected.stdout!r}",

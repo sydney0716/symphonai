@@ -166,7 +166,7 @@ def check_app_seam() -> None:
         fail("app.js still read the page handshake directly")
 
 
-@check("packaging.bundle_input")
+@check("packaging.bundle_input", needs_repository=True)
 def check_bundle_input() -> None:
     bundle = ROOT / "dist" / SIDECAR_NAME
     executable = bundle / SIDECAR_NAME
@@ -208,7 +208,7 @@ def check_page_assets() -> None:
             fail("page asset validation accepted a missing reference")
 
 
-@check("packaging.page_tracked")
+@check("packaging.page_tracked", needs_repository=True)
 def check_page_tracked() -> None:
     for path in _page_paths():
         try:

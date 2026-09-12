@@ -201,7 +201,7 @@ def optional_members() -> None:
             fail(f"manifest-only plugin was not empty: {loaded_empty!r}")
 
 
-@check("plugins.manifest_validation")
+@check("plugins.manifest_validation", needs_repository=True)
 def manifest_validation() -> None:
     fields = ("name", "version", "description")
     with tempfile.TemporaryDirectory() as temporary:

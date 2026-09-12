@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import NoReturn
 
 
@@ -11,7 +12,9 @@ class CheckFailed(Exception):
 
 
 REGISTRY: dict[str, Callable[[], None]] = {}
+NEEDS_REPOSITORY: set[str] = set()
 _CURRENT_LABELS: list[str] | None = None
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def fail(msg: str) -> NoReturn:
@@ -26,13 +29,19 @@ def ok(msg: str) -> None:
     _CURRENT_LABELS.append(msg)
 
 
-def check(name: str) -> Callable[[Callable[[], None]], Callable[[], None]]:
+def check(
+    name: str,
+    *,
+    needs_repository: bool = False,
+) -> Callable[[Callable[[], None]], Callable[[], None]]:
     """Register a zero-argument check function under `name`."""
 
     def register(function: Callable[[], None]) -> Callable[[], None]:
         if name in REGISTRY:
             raise ValueError(f"duplicate check name: {name!r}")
         REGISTRY[name] = function
+        if needs_repository:
+            NEEDS_REPOSITORY.add(name)
         return function
 
     return register
@@ -41,6 +50,11 @@ def check(name: str) -> Callable[[Callable[[], None]], Callable[[], None]]:
 def names() -> list[str]:
     """Every registered check name, in registration order."""
     return list(REGISTRY)
+
+
+def repository_names() -> list[str]:
+    """Return repository-dependent checks in registration order."""
+    return [name for name in REGISTRY if name in NEEDS_REPOSITORY]
 
 
 def run(selector: str | None = None) -> int:
@@ -63,10 +77,17 @@ def run(selector: str | None = None) -> int:
         print("refusing to mix selfcheck fixtures with real checks")
         return 1
 
+    repository_present = (REPOSITORY_ROOT / ".git").is_dir()
+
     global _CURRENT_LABELS
     passed = 0
     failed = 0
+    skipped = 0
     for name, function in selected:
+        if not repository_present and name in NEEDS_REPOSITORY:
+            skipped += 1
+            print(f"SKIP  {name}: needs the working repository")
+            continue
         labels: list[str] = []
         _CURRENT_LABELS = labels
         failure: str | None = None
@@ -89,7 +110,7 @@ def run(selector: str | None = None) -> int:
             print(f"  OK:   {label}")
 
     print(
-        f"{passed} passed, {failed} failed, {len(selected)} selected of "
-        f"{len(REGISTRY)} registered"
+        f"{passed} passed, {failed} failed, {skipped} skipped, "
+        f"{len(selected)} selected of {len(REGISTRY)} registered"
     )
     return 1 if failed else 0

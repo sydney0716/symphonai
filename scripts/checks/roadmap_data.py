@@ -77,7 +77,7 @@ def _load(path: Path):  # noqa: ANN202
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-@check("roadmap_data.schema")
+@check("roadmap_data.schema", needs_repository=True)
 def schema_validation() -> None:
     schema = _load(REPO_ROOT / "docs" / "roadmap.schema.json")
     roadmap = _load(REPO_ROOT / "docs" / "roadmap.json")
@@ -194,7 +194,7 @@ def _binding_errors(
     return _binding_status(roadmap, root, unbound_by_design)[0]
 
 
-@check("roadmap_data.spec_bindings")
+@check("roadmap_data.spec_bindings", needs_repository=True)
 def spec_bindings() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)

@@ -120,14 +120,14 @@ def turn() -> None:
     _run_node_test("turn.test.js")
 
 
-@check("app.roadmap")
+@check("app.roadmap", needs_repository=True)
 def roadmap() -> None:
     environment = dict(os.environ)
     environment["SYMPHONAI_ROADMAP_PATH"] = str(REPO_ROOT / "docs" / "roadmap.json")
     _run_node_test("roadmap.test.js", environment=environment)
 
 
-@check("app.spec_view")
+@check("app.spec_view", needs_repository=True)
 def spec_view() -> None:
     _run_node_test("spec_view.test.js")
 
