@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 from typing import get_args, get_type_hints
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 from unittest import mock
 
 import symphonai_api.agent_loop as agent_loop
@@ -626,9 +626,9 @@ def check_app_routes() -> None:
         (decoy / "index.html").write_text(
             "<!doctype html><html><head>"
             f"{host_server_module.APP_HANDSHAKE_MARKER}"
-            '<link rel="stylesheet" href="/app/app.css">'
+            '<link rel="stylesheet" href="app.css">'
             "</head><body><main>decoy</main>"
-            '<script type="module" src="/app/src/app.js"></script>'
+            '<script type="module" src="src/app.js"></script>'
             "</body></html>",
             encoding="utf-8",
         )
@@ -685,11 +685,27 @@ def check_app_routes() -> None:
 
         host = _host(repo_root=project_root, token=token)
         try:
+            for path, location in (
+                ("/app", "/app/"),
+                (f"/app?token={token}", f"/app/?token={token}"),
+            ):
+                status, headers, body = get(host, path)
+                if (
+                    status != 302
+                    or header_values(headers, "Location") != [location]
+                    or header_values(headers, "Set-Cookie")
+                    or body != b""
+                ):
+                    fail(
+                        "app canonical redirect was wrong: "
+                        f"{path!r}, {status}, {headers!r}, {body!r}"
+                    )
+
             served_html = None
             cookie_header = None
             for path, request_headers in (
-                ("/app", _headers(host)),
-                (f"/app?token={token}", None),
+                ("/app/", _headers(host)),
+                (f"/app/?token={token}", None),
             ):
                 status, headers, body = get(host, path, headers=request_headers)
                 content_types = header_values(headers, "Content-Type")
@@ -722,17 +738,29 @@ def check_app_routes() -> None:
 
             if served_html is None or cookie_header is None:
                 fail("app index did not yield browser credentials")
+            status, _, body = get(host, "/app/")
+            if status != 401 or body != b"":
+                fail("app page loaded without credentials")
+            status, _, body = get(
+                host,
+                "/app/",
+                headers={"Cookie": cookie_header},
+            )
+            if status != 200 or b"window.__symphonai = " not in body:
+                fail("app cookie did not reload the page route")
+
             references = re.findall(r'(?:src|href)="([^"]+)"', served_html)
             if not references:
                 fail("app index contained no browser subresource references")
             for reference in references:
+                asset_path = urljoin("/app/", reference)
                 status, _, _ = get(
                     host,
-                    reference,
+                    asset_path,
                     headers={"Cookie": cookie_header},
                 )
                 if status != 200:
-                    fail(f"browser cookie did not load app resource {reference!r}: {status}")
+                    fail(f"browser cookie did not load app resource {asset_path!r}: {status}")
 
             for request_headers, label in (
                 ({"Cookie": cookie_header}, "cookie"),
@@ -764,7 +792,7 @@ def check_app_routes() -> None:
                     fail(f"app route accepted traversal fixture {path!r}: {status}")
 
             for path in (
-                f"/app?token=wrong-{token}",
+                f"/app/?token=wrong-{token}",
                 f"/app/src/app.js?token={token}",
                 f"/file?path=docs/roadmap.json&token={token}",
             ):
@@ -838,7 +866,7 @@ def check_app_routes() -> None:
         ):
             host = _host(repo_root=project_root, token=token)
             try:
-                status, headers, body = get(host, f"/app?token={token}")
+                status, headers, body = get(host, f"/app/?token={token}")
                 if (
                     status != 404
                     or json.loads(body) != {"error": "app is not installed"}
@@ -859,19 +887,24 @@ def check_app_routes() -> None:
             response_text = repr(headers) + body.decode("utf-8", errors="replace")
             if any(protected in response_text for protected in protected_paths):
                 fail(f"app response exposed an absolute path: {method} {path}")
-            exact_app = method == "GET" and urlsplit(path).path == "/app"
-            if token in body.decode("utf-8", errors="replace") and not exact_app:
+            request_path = urlsplit(path).path
+            app_redirect = method == "GET" and request_path == "/app"
+            app_page = method == "GET" and request_path == "/app/"
+            if token in body.decode("utf-8", errors="replace") and not app_page:
                 fail(f"app response body exposed the token: {method} {path}")
             token_headers = [
                 (name, value)
                 for name, value in headers
                 if token in value
             ]
-            if token_headers and (
-                not exact_app
-                or [name.casefold() for name, _ in token_headers] != ["set-cookie"]
-            ):
-                fail(f"app response header exposed the token: {method} {path}")
+            if token_headers:
+                names = [name.casefold() for name, _ in token_headers]
+                allowed = (
+                    (app_redirect and names == ["location"])
+                    or (app_page and names == ["set-cookie"])
+                )
+                if not allowed:
+                    fail(f"app response header exposed the token: {method} {path}")
 
 
 @check("host_server.event_stream_delivers")

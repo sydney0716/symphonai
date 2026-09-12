@@ -354,7 +354,8 @@ class HostServer:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
             def do_GET(self) -> None:
-                request_path = urlsplit(self.path).path
+                request_url = urlsplit(self.path)
+                request_path = request_url.path
                 if self.path == "/health":
                     self._json(
                         HTTPStatus.OK,
@@ -367,7 +368,19 @@ class HostServer:
                     )
                     return
                 if request_path == "/app":
-                    if not self._authorized(allow_app_query=True):
+                    location = "/app/"
+                    if request_url.query:
+                        location = f"{location}?{request_url.query}"
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if request_path == "/app/":
+                    if not self._authorized(
+                        allow_app_query=True,
+                        allow_app_cookie=True,
+                    ):
                         return
                     self._serve_app_index()
                     return

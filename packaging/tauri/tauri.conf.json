@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SymphonAI",
+  "version": "0.1.0",
+  "identifier": "com.symphonai.app",
+  "build": {
+    "frontendDist": "../../symphonai_app"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "resources": {
+      "../../dist/SymphonAI-host-aarch64-apple-darwin": "SymphonAI-host-aarch64-apple-darwin"
+    }
+  }
+}

@@ -20,6 +20,7 @@ NODE_TESTS = {
     "app.client": "client.test.js",
     "app.init_flow": "init_flow.test.js",
     "app.keys": "keys.test.js",
+    "app.host_handle": "host_handle.test.js",
     "app.turn": "turn.test.js",
     "app.roadmap": "roadmap.test.js",
     "app.spec_view": "spec_view.test.js",
@@ -107,6 +108,11 @@ def keys() -> None:
         REPO_ROOT / "symphonai_app" / "keys.default.json"
     )
     _run_node_test("keys.test.js", environment=environment)
+
+
+@check("app.host_handle")
+def host_handle() -> None:
+    _run_node_test("host_handle.test.js")
 
 
 @check("app.turn")

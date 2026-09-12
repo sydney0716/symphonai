@@ -96,6 +96,25 @@ host serves the app from the sibling `symphonai_app/` directory. Installed
 without it, it returns `app is not installed` rather than files from your
 project.
 
+### Desktop shell
+
+The macOS Tauri shell uses the same files as the browser app and starts the
+frozen host as a sidecar. Build the existing onedir host first, then build or
+run the shell:
+
+```bash
+python3 scripts/build_host.py
+cd packaging/tauri
+cargo tauri build
+# or, during shell development
+cargo tauri dev
+```
+
+The Tauri bundle copies the complete target-suffixed host directory from
+`dist/`; the executable and `_internal/` must remain together. The resulting
+application launches without a system Python installation. Its shell receives
+the bearer token through the piped handshake and owns the sidecar until exit.
+
 ## How it was built
 
 The same way it describes. Claude Code writes the specs and reviews the diffs,

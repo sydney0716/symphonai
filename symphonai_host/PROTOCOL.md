@@ -104,27 +104,32 @@ the handshake JSON and the parent is responsible for terminating the sidecar.
 
 The reference host binds only to `127.0.0.1` on an ephemeral port. On startup
 it prints exactly one JSON line containing `port` and the process-local token.
-All routes except `GET /health` require `Authorization: Bearer <token>`;
-missing or invalid credentials receive `401` with an empty body. The sole
-exception is the browser's initial `GET /app?token=<token>` navigation, which
-cannot set a request header. Query authentication is accepted only on exact
-`GET /app`, never on `/app/<path>`, `/file`, `/events`, or any POST. The host
-does not log request URLs.
+All routes except `GET /health` and the canonicalizing `GET /app` redirect
+require credentials; missing or invalid credentials receive `401` with an
+empty body. `GET /app` redirects to `/app/` without authenticating and preserves
+the query string exactly, so `/app?token=<token>` redirects to
+`/app/?token=<token>`. The browser's initial `GET /app/?token=<token>` page
+navigation cannot set a request header. `GET /app` and `GET /app/` are the only
+query-token routes: the former preserves the query during the redirect and the
+latter authenticates it. Query authentication is never accepted on
+`/app/<asset path>`, `/file`, `/events`, or any POST. The host does not log
+request URLs.
 
-An authenticated `GET /app` response sets exactly one development session
+An authenticated `GET /app/` response sets exactly one development session
 cookie:
 
 ```text
 Set-Cookie: symphonai_app=<token>; Path=/app/; HttpOnly; SameSite=Strict
 ```
 
-It has no `Max-Age` or `Expires`. `GET /app/<path>` accepts that cookie or the
-ordinary bearer header so native browser stylesheet and module requests can
-load. No other route accepts the cookie: `/file`, `/events`, `/health`, and all
-POST requests retain their existing authentication behavior. `Path=/app/`
-limits where the browser sends it, `HttpOnly` prevents app JavaScript from
-reading it, and `SameSite=Strict` plus the loopback bind limits ambient use.
-The `?token=` exception remains confined to exact `/app`; the cookie is the only
+It has no `Max-Age` or `Expires`. `GET /app/` accepts that cookie on later page
+loads. `GET /app/<asset path>` accepts the cookie or the ordinary bearer header
+so native browser stylesheet and module requests can load. No other route
+accepts the cookie: `/file`, `/events`, `/health`, and all POST requests retain
+their existing authentication behavior. `Path=/app/` limits where the browser
+sends it, `HttpOnly` prevents app JavaScript from reading it, and
+`SameSite=Strict` plus the loopback bind limits ambient use. The `?token=`
+authentication exception is confined to exact `/app/`; the cookie is the only
 subresource exception.
 
 An authenticated `GET /survey` returns a bounded, permission-gated repository
@@ -156,9 +161,9 @@ receive `415`, and files larger than 1 MiB receive `413`. The route requires the
 same bearer token as every non-health endpoint and never returns the token or an
 absolute filesystem path.
 
-`GET /app` returns the browser shell with one inline handshake script setting
+`GET /app/` returns the browser shell with one inline handshake script setting
 `window.__symphonai` to the running host's `port` and `token`. `GET
-/app/<path>` serves only `.js`, `.css`, and `.html` files resolved beneath
+/app/<asset path>` serves only `.js`, `.css`, and `.html` files resolved beneath
 `symphonai_app/`; other extensions, absolute paths, traversal, and escaping
 symlinks receive `403` with an empty body. JavaScript is served as
 `text/javascript`, CSS as `text/css`, and HTML as `text/html`. Static assets do
@@ -166,6 +171,6 @@ not contain the token or absolute filesystem paths.
 
 The app directory is resolved beside the installed host package, not beneath
 the repository selected by `--repo-root`. If that sibling `symphonai_app/`
-directory is absent, `/app` returns `404` with
+directory is absent, `/app/` returns `404` with
 `{"error": "app is not installed"}` and never falls back to a directory in the
 user's repository.

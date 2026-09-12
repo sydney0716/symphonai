@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SymphonAI</title>
+    <link rel="stylesheet" href="app.css">
+    <!-- symphonai-handshake -->
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="roadmap-pane" aria-label="Roadmap pane">
+        <header><h1>SymphonAI</h1></header>
+        <div id="roadmap"></div>
+        <article id="spec" class="spec-view" aria-live="polite"></article>
+      </aside>
+      <main class="chat-pane" aria-label="Chat pane">
+        <header>
+          <h2>Chat</h2>
+          <span id="turn-state" class="turn-state">idle</span>
+        </header>
+        <div id="chat" class="chat-log" aria-live="polite"></div>
+        <div id="approvals" class="approvals" aria-live="polite"></div>
+        <form id="prompt-form" class="prompt-form">
+          <label for="prompt">Message</label>
+          <textarea id="prompt" rows="3" required></textarea>
+          <button type="submit">Send</button>
+        </form>
+      </main>
+    </div>
+    <script type="module" src="src/app.js"></script>
+  </body>
+</html>

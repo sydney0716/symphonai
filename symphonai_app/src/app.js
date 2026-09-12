@@ -1,5 +1,6 @@
 import { createApprovals } from "./approvals.js";
 import { createClient } from "./client.js";
+import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
@@ -15,7 +16,7 @@ function clientFor(global, supplied) {
   if (supplied) {
     return supplied;
   }
-  const handshake = global.__symphonai;
+  const handshake = resolveHost(global);
   return createClient({
     port: handshake.port,
     token: handshake.token,
