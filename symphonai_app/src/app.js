@@ -4,6 +4,7 @@ import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
+import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
@@ -24,15 +25,41 @@ function clientFor(global, supplied) {
   });
 }
 
+const ROUTE_KEY = "symphonai.route";
+
+function storedRoute(global) {
+  try {
+    const fragment = global.localStorage?.getItem(ROUTE_KEY);
+    return fragment ? parseRoute(fragment) : DEFAULT_ROUTE;
+  } catch {
+    return DEFAULT_ROUTE;
+  }
+}
+
+function rememberRoute(global, route) {
+  try {
+    global.localStorage?.setItem(ROUTE_KEY, formatRoute(route));
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
+  }
+}
+
 export async function start({ global, document, client }) {
   const boundary = clientFor(global, client);
+  const shell = document.getElementById("app-shell");
+  const sidebar = document.getElementById("sidebar");
+  const sidebarToggle = document.getElementById("sidebar-toggle");
+  const pageLinks = document.getElementById("page-links");
+  const pageRoot = document.getElementById("page");
+  const roadmapPane = document.getElementById("roadmap-pane");
+  const chatPane = document.getElementById("chat-pane");
   const roadmapRoot = document.getElementById("roadmap");
   const specRoot = document.getElementById("spec");
   const chatRoot = document.getElementById("chat");
   const approvalsRoot = document.getElementById("approvals");
   const form = document.getElementById("prompt-form");
   const input = document.getElementById("prompt");
-  const stateLabel = document.getElementById("turn-state");
+  const promptError = document.getElementById("prompt-error");
   const turn = createTurnState();
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
@@ -42,10 +69,58 @@ export async function start({ global, document, client }) {
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
   );
+  const settingsPane = element(document, "section", { className: "settings-pane" });
+  append(settingsPane, element(document, "h1", { text: "Settings" }));
   let promptFailure = "";
+  let route;
 
-  function showState() {
-    stateLabel.textContent = promptFailure || turn.state;
+  function showPage(nextRoute) {
+    route = nextRoute;
+    const pane = route.page === "roadmap"
+      ? roadmapPane
+      : route.page === "settings" ? settingsPane : chatPane;
+    replace(pageRoot, pane);
+  }
+
+  function navigate(nextRoute, { updateFragment = true } = {}) {
+    const next = parseRoute(formatRoute(nextRoute));
+    showPage(next);
+    rememberRoute(global, next);
+    if (updateFragment && global.location) {
+      global.location.hash = formatRoute(next);
+    }
+  }
+
+  const links = PAGES.map((page) => {
+    const pageRoute = { page, section: "" };
+    const link = element(document, "a", {
+      text: page[0].toUpperCase() + page.slice(1),
+    });
+    link.href = formatRoute(pageRoute);
+    listen(link, "click", (event) => {
+      event.preventDefault();
+      navigate(pageRoute);
+    });
+    return link;
+  });
+  replace(pageLinks, ...links);
+
+  listen(sidebarToggle, "click", () => {
+    const folded = shell.className.includes("sidebar-folded");
+    shell.className = folded ? "app-shell" : "app-shell sidebar-folded";
+    sidebarToggle.textContent = folded ? "Hide sidebar" : "Show sidebar";
+  });
+
+  const fragment = typeof global.location?.hash === "string" ? global.location.hash : "";
+  showPage(fragment ? parseRoute(fragment) : storedRoute(global));
+  if (typeof global.addEventListener === "function") {
+    global.addEventListener("hashchange", () => {
+      navigate(parseRoute(global.location?.hash ?? ""), { updateFragment: false });
+    });
+  }
+
+  function showPromptError() {
+    promptError.textContent = promptFailure;
   }
 
   function showSpec(result) {
@@ -82,17 +157,16 @@ export async function start({ global, document, client }) {
     return button;
   }
 
-  const roadmapChildren = [
-    element(document, "p", { className: "roadmap-goal", text: roadmap.goal }),
-  ];
+  const roadmapChildren = [];
+  let openedCurrentPhase = false;
   for (const phase of roadmap.phases) {
-    const section = element(document, "section", { className: "roadmap-phase" });
+    const section = element(document, "details", { className: "roadmap-phase" });
+    section.open = !openedCurrentPhase && phase.status !== "done";
+    openedCurrentPhase ||= section.open;
     append(
       section,
-      element(document, "h2", { text: `${phase.id} · ${phase.name}` }),
-      element(document, "p", {
-        className: "phase-progress",
-        text: `${phase.progress.done}/${phase.progress.total} · ${phase.status}`,
+      element(document, "summary", {
+        text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total} · ${phase.status}`,
       }),
       ...phase.items.map(roadmapItem),
     );
@@ -152,7 +226,7 @@ export async function start({ global, document, client }) {
         await boundary.stop("");
       }
     }
-    showState();
+    showPromptError();
   }
 
   listen(form, "submit", (event) => {
@@ -161,7 +235,7 @@ export async function start({ global, document, client }) {
     input.value = "";
     promptFailure = "";
     const actions = turn.submit(text);
-    showState();
+    showPromptError();
     return perform(actions);
   });
 
@@ -187,11 +261,13 @@ export async function start({ global, document, client }) {
   }
 
   const subscription = boundary.events((frame) => onFrame(frame));
-  showState();
+  showPromptError();
   return {
     approvals,
     client: boundary,
     onFrame,
+    route: () => route,
+    sidebar,
     specPaths: allSpecPaths,
     specView,
     subscription,

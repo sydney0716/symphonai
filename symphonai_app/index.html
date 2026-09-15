@@ -8,25 +8,27 @@
     <!-- symphonai-handshake -->
   </head>
   <body>
-    <div class="app-shell">
-      <aside class="roadmap-pane" aria-label="Roadmap pane">
-        <header><h1>SymphonAI</h1></header>
-        <div id="roadmap"></div>
-        <article id="spec" class="spec-view" aria-live="polite"></article>
-      </aside>
-      <main class="chat-pane" aria-label="Chat pane">
-        <header>
-          <h2>Chat</h2>
-          <span id="turn-state" class="turn-state">idle</span>
-        </header>
-        <div id="chat" class="chat-log" aria-live="polite"></div>
-        <div id="approvals" class="approvals" aria-live="polite"></div>
-        <form id="prompt-form" class="prompt-form">
-          <label for="prompt">Message</label>
-          <textarea id="prompt" rows="3" required></textarea>
-          <button type="submit">Send</button>
-        </form>
-      </main>
+    <div id="app-shell" class="app-shell">
+      <nav id="sidebar" aria-label="Pages">
+        <h1>SymphonAI</h1>
+        <div id="page-links"></div>
+      </nav>
+      <button id="sidebar-toggle" class="sidebar-toggle" type="button">Hide sidebar</button>
+      <div id="page">
+        <aside id="roadmap-pane" class="roadmap-pane" aria-label="Roadmap pane">
+          <div id="roadmap"></div>
+          <article id="spec" class="spec-view" aria-live="polite"></article>
+        </aside>
+        <main id="chat-pane" class="chat-pane" aria-label="Chat pane">
+          <div id="chat" class="chat-log" aria-live="polite"></div>
+          <div id="approvals" class="approvals" aria-live="polite"></div>
+          <form id="prompt-form" class="prompt-form">
+            <textarea id="prompt" rows="3" required aria-label="Message"></textarea>
+            <p id="prompt-error" class="prompt-error" aria-live="polite"></p>
+            <button type="submit">Send</button>
+          </form>
+        </main>
+      </div>
     </div>
     <script type="module" src="src/app.js"></script>
   </body>

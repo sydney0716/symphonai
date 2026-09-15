@@ -8,6 +8,8 @@ import { DISPATCHING, RUNNING } from "../src/turn.js";
 const BASE = "specs/18/18a-a-client-for-the-boundary.md";
 const FOLLOW_UP = "specs/18/18aF-a-double-more-capable-than-the-real-thing.md";
 const REPORT = "specs/report/18/18a-a-client-for-the-boundary-report.md";
+const OPEN_BASE = "specs/18/18b-three-states-and-a-queue.md";
+const OPEN_REPORT = "specs/report/18/18b-three-states-and-a-queue-report.md";
 
 class FakeElement {
   constructor(tagName, id = "") {
@@ -15,6 +17,7 @@ class FakeElement {
     this.id = id;
     this.children = [];
     this.className = "";
+    this.open = false;
     this.textContent = "";
     this.type = "";
     this.value = "";
@@ -45,11 +48,47 @@ class FakeElement {
 
 class FakeDocument {
   constructor() {
+    const tags = {
+      "app-shell": "div",
+      sidebar: "nav",
+      "sidebar-toggle": "button",
+      "page-links": "div",
+      page: "div",
+      "roadmap-pane": "aside",
+      "chat-pane": "main",
+      "prompt-form": "form",
+      prompt: "textarea",
+    };
     this.elements = new Map(
-      ["roadmap", "spec", "chat", "approvals", "prompt-form", "prompt", "turn-state"]
-        .map((id) => [id, new FakeElement(id === "prompt-form" ? "form" : "div", id)]),
+      [
+        "app-shell",
+        "sidebar",
+        "sidebar-toggle",
+        "page-links",
+        "page",
+        "roadmap-pane",
+        "chat-pane",
+        "roadmap",
+        "spec",
+        "chat",
+        "approvals",
+        "prompt-form",
+        "prompt",
+        "prompt-error",
+      ].map((id) => [id, new FakeElement(tags[id] ?? "div", id)]),
     );
+    const get = (id) => this.elements.get(id);
+    get("app-shell").className = "app-shell";
+    get("roadmap-pane").className = "roadmap-pane";
+    get("chat-pane").className = "chat-pane";
+    get("sidebar").append(get("page-links"));
+    get("roadmap-pane").append(get("roadmap"), get("spec"));
+    get("prompt-form").append(get("prompt"), get("prompt-error"));
+    get("chat-pane").append(get("chat"), get("approvals"), get("prompt-form"));
+    get("page").append(get("roadmap-pane"), get("chat-pane"));
+    get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"));
     this.body = new FakeElement("body", "body");
+    this.body.append(get("app-shell"));
   }
 
   createElement(tagName) {
@@ -59,6 +98,39 @@ class FakeDocument {
   getElementById(id) {
     return this.elements.get(id) ?? null;
   }
+}
+
+function fakeGlobal({ fragment = "", stored = null, storageThrows = false } = {}) {
+  const listeners = new Map();
+  const writes = [];
+  const global = {
+    location: { hash: fragment },
+    localStorage: {
+      getItem(key) {
+        if (storageThrows) {
+          throw new Error("storage read failed");
+        }
+        assert.equal(key, "symphonai.route");
+        return stored;
+      },
+      setItem(key, value) {
+        if (storageThrows) {
+          throw new Error("storage write failed");
+        }
+        writes.push([key, value]);
+      },
+    },
+    addEventListener(type, listener) {
+      listeners.set(type, listener);
+    },
+  };
+  return {
+    global,
+    writes,
+    dispatch(type) {
+      return listeners.get(type)?.();
+    },
+  };
 }
 
 function walk(root) {
@@ -73,24 +145,33 @@ function find(root, predicate) {
   return walk(root).find(predicate);
 }
 
-function fixtureRoadmap() {
+function fixtureRoadmap({ allDone = false } = {}) {
   return JSON.stringify({
     goal: "Ship a visible app",
     phases: [
       {
+        id: "17",
+        name: "Host process",
+        status: "done",
+        items: [{ title: "Boundary", spec: BASE, done: true }],
+      },
+      {
         id: "18",
         name: "Desktop app",
-        status: "next",
-        items: [
-          { title: "Boundary", spec: BASE, done: true },
-          { title: "Boundary finding", spec: FOLLOW_UP },
-        ],
+        status: allDone ? "done" : "in_progress",
+        items: [{ title: "Open boundary", spec: OPEN_BASE }],
+      },
+      {
+        id: "20",
+        name: "Readable app",
+        status: allDone ? "done" : "next",
+        items: [{ title: "Later phase", spec: FOLLOW_UP }],
       },
     ],
   });
 }
 
-function fakeClient() {
+function fakeClient(roadmapText = fixtureRoadmap()) {
   const calls = { approve: [], file: [], prompt: [] };
   let eventCallback;
   let resolvePrompt;
@@ -98,9 +179,11 @@ function fakeClient() {
     resolvePrompt = resolve;
   });
   const files = new Map([
-    ["docs/roadmap.json", { path: "docs/roadmap.json", text: fixtureRoadmap() }],
+    ["docs/roadmap.json", { path: "docs/roadmap.json", text: roadmapText }],
     [BASE, { path: BASE, text: "base spec text" }],
     [REPORT, { path: REPORT, text: "base report text" }],
+    [OPEN_BASE, { path: OPEN_BASE, text: "open spec text" }],
+    [OPEN_REPORT, { path: OPEN_REPORT, text: "open report text" }],
   ]);
   return {
     calls,
@@ -176,23 +259,138 @@ function toolFinished(id, name, fields = {}) {
   });
 }
 
-test("start renders both panes from injected dependencies", async () => {
+test("start renders the chat page and prepares the roadmap", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   const app = await start({ global: {}, document, client });
   const roadmap = document.getElementById("roadmap");
+  const page = document.getElementById("page");
 
-  assert.match(visibleText(roadmap), /Ship a visible app/);
+  assert.deepEqual(page.children, [document.getElementById("chat-pane")]);
+  assert.equal(app.route().page, "chat");
+  assert.ok(!visibleText(roadmap).includes("Ship a visible app"));
+  assert.equal(find(roadmap, (value) => value.className === "roadmap-goal"), undefined);
   assert.match(visibleText(roadmap), /18 · Desktop app/);
-  assert.match(visibleText(roadmap), /1\/2 · next/);
+  assert.match(visibleText(roadmap), /0\/1 · in_progress/);
+  assert.equal(roadmap.children.length, 3);
+  assert.ok(roadmap.children.every((phase) => phase.tagName === "DETAILS"));
+  assert.deepEqual(roadmap.children.map((phase) => phase.open), [false, true, false]);
+  assert.deepEqual(
+    roadmap.children.map((phase) => phase.children[0].textContent),
+    [
+      "17 · Host process — 1/1 · done",
+      "18 · Desktop app — 0/1 · in_progress",
+      "20 · Readable app — 0/1 · next",
+    ],
+  );
+  for (const phase of roadmap.children) {
+    const [summary, ...items] = phase.children;
+    assert.equal(summary.tagName, "SUMMARY");
+    assert.ok(!summary.textContent.includes("Boundary"));
+    assert.ok(items.every((item) => item.tagName === "BUTTON"));
+    assert.equal(summary.children.length, 0);
+  }
   assert.ok(document.getElementById("chat"));
-  assert.equal(document.getElementById("turn-state").textContent, "idle");
+  assert.equal(document.getElementById("turn-state"), null);
+  assert.equal(document.getElementById("prompt-error").textContent, "");
   assert.equal(app.client, client);
   assert.ok(app.transcript);
   assert.deepEqual(app.transcript.model, []);
 });
 
-test("selecting an item opens its spec, report, and follow-up names", async () => {
+test("page navigation preserves the rendered transcript and stores the route", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  const app = await start({ global: browser.global, document, client });
+  const page = document.getElementById("page");
+  const links = document.getElementById("page-links");
+  const chatPane = document.getElementById("chat-pane");
+
+  await client.emit(eventFrame("AssistantTextDelta", { text: "still here" }));
+  await find(links, (value) => value.textContent === "Roadmap").dispatch("click");
+  assert.deepEqual(page.children, [document.getElementById("roadmap-pane")]);
+  assert.equal(app.route().page, "roadmap");
+  assert.equal(browser.global.location.hash, "#/roadmap");
+  assert.deepEqual(browser.writes.at(-1), ["symphonai.route", "#/roadmap"]);
+
+  await find(links, (value) => value.textContent === "Chat").dispatch("click");
+  assert.deepEqual(page.children, [chatPane]);
+  assert.equal(document.getElementById("chat").children[0].textContent, "still here");
+});
+
+test("stored routes reopen, but a URL fragment wins", async () => {
+  const storedDocument = new FakeDocument();
+  const stored = fakeGlobal({ stored: "#/roadmap" });
+  await start({ global: stored.global, document: storedDocument, client: fakeClient() });
+  assert.deepEqual(
+    storedDocument.getElementById("page").children,
+    [storedDocument.getElementById("roadmap-pane")],
+  );
+
+  const fragmentDocument = new FakeDocument();
+  const fragment = fakeGlobal({ fragment: "#/settings/mcp", stored: "#/roadmap" });
+  const app = await start({
+    global: fragment.global,
+    document: fragmentDocument,
+    client: fakeClient(),
+  });
+  assert.equal(app.route().page, "settings");
+  assert.equal(app.route().section, "mcp");
+  assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
+});
+
+test("throwing local storage cannot stop startup or navigation", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ storageThrows: true });
+  const app = await start({ global: browser.global, document, client: fakeClient() });
+
+  assert.deepEqual(
+    document.getElementById("page").children,
+    [document.getElementById("chat-pane")],
+  );
+  await find(
+    document.getElementById("page-links"),
+    (value) => value.textContent === "Roadmap",
+  ).dispatch("click");
+  assert.equal(app.route().page, "roadmap");
+});
+
+test("frames accumulate while settings is open", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  await start({ global: browser.global, document, client });
+  const links = document.getElementById("page-links");
+
+  await find(links, (value) => value.textContent === "Settings").dispatch("click");
+  await client.emit(eventFrame("AssistantTextDelta", { text: "while " }));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "away" }));
+  await find(links, (value) => value.textContent === "Chat").dispatch("click");
+
+  assert.equal(document.getElementById("chat").children[0].textContent, "while away");
+});
+
+test("folding the sidebar leaves the current page in place", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const shell = document.getElementById("app-shell");
+  const toggle = document.getElementById("sidebar-toggle");
+  const page = document.getElementById("page");
+  const currentPane = page.children[0];
+
+  await toggle.dispatch("click");
+  assert.equal(shell.className, "app-shell sidebar-folded");
+  assert.equal(toggle.textContent, "Show sidebar");
+  assert.equal(page.children[0], currentPane);
+
+  await toggle.dispatch("click");
+  assert.equal(shell.className, "app-shell");
+  assert.equal(toggle.textContent, "Hide sidebar");
+  assert.equal(page.children[0], currentPane);
+});
+
+test("items in folded and open phases open their specs and reports", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   const app = await start({ global: {}, document, client });
@@ -202,20 +400,69 @@ test("selecting an item opens its spec, report, and follow-up names", async () =
     calls.push(arguments_);
     return open(...arguments_);
   };
-  const button = find(
-    document.getElementById("roadmap"),
-    (value) => value.tagName === "BUTTON" && value.textContent === "Boundary",
+  for (const [title, specText, reportText] of [
+    ["Boundary", "base spec text", "base report text"],
+    ["Open boundary", "open spec text", "open report text"],
+  ]) {
+    const button = find(
+      document.getElementById("roadmap"),
+      (value) => value.tagName === "BUTTON" && value.textContent === title,
+    );
+    await button.dispatch("click");
+    const text = visibleText(document.getElementById("spec"));
+    assert.match(text, new RegExp(specText));
+    assert.match(text, new RegExp(reportText));
+  }
+
+  assert.deepEqual(calls.map(([item]) => item.title), ["Boundary", "Open boundary"]);
+  assert.deepEqual(calls[0][1], { specPaths: [BASE, OPEN_BASE, FOLLOW_UP] });
+});
+
+test("an all-done roadmap leaves every phase folded", async () => {
+  const document = new FakeDocument();
+  await start({
+    global: {},
+    document,
+    client: fakeClient(fixtureRoadmap({ allDone: true })),
+  });
+
+  assert.ok(document.getElementById("roadmap").children.every((phase) => !phase.open));
+});
+
+test("the real roadmap opens phase 18 and no other phase", async () => {
+  const roadmapText = await readFile(
+    new URL("../../docs/roadmap.json", import.meta.url),
+    "utf8",
   );
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient(roadmapText) });
+  const phases = document.getElementById("roadmap").children;
+  const open = phases.filter((phase) => phase.open);
+  const phase20 = phases.find((phase) => phase.children[0].textContent.startsWith("20 ·"));
 
-  await button.dispatch("click");
+  assert.equal(phases.length, JSON.parse(roadmapText).phases.length);
+  assert.equal(open.length, 1);
+  assert.match(open[0].children[0].textContent, /^18 · App —/);
+  assert.equal(phase20.open, false);
+});
 
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][0].title, "Boundary");
-  assert.deepEqual(calls[0][1], { specPaths: [BASE, FOLLOW_UP] });
-  const text = visibleText(document.getElementById("spec"));
-  assert.match(text, /base spec text/);
-  assert.match(text, /base report text/);
-  assert.match(text, /18aF-a-double-more-capable-than-the-real-thing/);
+test("an additional fixture phase renders without a copied count", async () => {
+  const roadmap = JSON.parse(fixtureRoadmap());
+  roadmap.phases.push({
+    id: "22",
+    name: "Fixture phase",
+    status: "planned",
+    items: [],
+  });
+  const document = new FakeDocument();
+
+  await start({
+    global: {},
+    document,
+    client: fakeClient(JSON.stringify(roadmap)),
+  });
+
+  assert.equal(document.getElementById("roadmap").children.length, roadmap.phases.length);
 });
 
 test("submit dispatches once and assistant deltas render in order", async () => {
@@ -377,22 +624,39 @@ test("each render replaces the chat instead of duplicating prior entries", async
   assert.deepEqual(chat.children.map((child) => child.textContent), ["one", "two"]);
 });
 
-test("a failed prompt reports through the turn-state label", async () => {
+test("a failed prompt uses its error region and the next submit clears it", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
+  let shouldFail = true;
   client.prompt = async () => {
-    throw new Error("offline");
+    if (shouldFail) {
+      shouldFail = false;
+      throw new Error("offline");
+    }
+    return { accepted: true, run_id: "run-2" };
   };
   await start({ global: {}, document, client });
   document.getElementById("prompt").value = "retry me";
 
   await document.getElementById("prompt-form").dispatch("submit");
 
-  assert.equal(document.getElementById("turn-state").textContent, "Prompt failed.");
-  assert.equal(document.getElementById("chat").children.length, 0);
+  const promptError = document.getElementById("prompt-error");
+  const chat = document.getElementById("chat");
+  assert.equal(promptError.textContent, "Prompt failed.");
+  assert.equal(chat.textContent, "");
+  assert.equal(chat.children.length, 0);
+
+  document.getElementById("prompt").value = "try again";
+  const retrying = document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(promptError.textContent, "");
+  assert.equal(chat.textContent, "");
+  assert.equal(chat.children.length, 0);
+  await retrying;
+  assert.equal(promptError.textContent, "");
 });
 
 test("render stays DOM-only and start does not read window", async () => {
+  const appTestSource = await readFile(new URL("./app.test.js", import.meta.url), "utf8");
   const renderSource = await readFile(
     new URL("../src/render.js", import.meta.url),
     "utf8",
@@ -405,6 +669,8 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.ok(!/\b(?:if|switch)\s*\(/.test(renderSource));
   assert.match(appSource, /export async function start\(\{ global, document, client \}\)/);
   assert.ok(!appSource.includes("chatLine"));
+  assert.ok(!appSource.includes("roadmap.goal"));
+  assert.ok(!appSource.includes('getElementById("turn-state")'));
   assert.ok(!start.toString().includes("window"));
   for (const className of [
     "prompt",
@@ -422,5 +688,17 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
   assert.equal((indexSource.match(/class="(?:roadmap|chat)-pane"/g) ?? []).length, 2);
   assert.equal((indexSource.match(/<!-- symphonai-handshake -->/g) ?? []).length, 1);
+  assert.ok(!indexSource.includes("<h2>Chat</h2>"));
+  assert.ok(!indexSource.includes('id="turn-state"'));
+  assert.ok(!/<label\b/.test(indexSource));
+  assert.match(indexSource, /<textarea[^>]*aria-label="Message"/);
+  assert.match(
+    indexSource,
+    /<p id="prompt-error" class="prompt-error" aria-live="polite"><\/p>/,
+  );
   assert.ok(!indexSource.includes("window.__symphonai"));
+  assert.match(indexSource, /<nav id="sidebar"[^>]*>/);
+  assert.ok(indexSource.indexOf('id="sidebar"') < indexSource.indexOf('id="page"'));
+  assert.match(cssSource, /\.app-shell\.sidebar-folded\s*{[^}]*grid-template-columns:\s*0/s);
+  assert.ok(!/assert\.equal\(phases\.length,\s*\d+\)/.test(appTestSource));
 });

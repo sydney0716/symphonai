@@ -20,46 +20,85 @@ textarea {
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(18rem, 34%) 1fr;
+  grid-template-columns: 14rem minmax(0, 1fr);
   min-height: 100vh;
 }
 
+#sidebar {
+  grid-column: 1;
+  grid-row: 1;
+  padding: 3.5rem 1rem 1rem;
+  overflow: hidden;
+  border-right: 1px solid #394150;
+  background: #171d26;
+}
+
+#sidebar a {
+  display: block;
+  padding: 0.5rem 0;
+  color: inherit;
+}
+
+.sidebar-toggle {
+  position: fixed;
+  z-index: 1;
+  top: 0.75rem;
+  left: 0.75rem;
+}
+
+#page {
+  grid-column: 2;
+  min-width: 0;
+}
+
+.app-shell.sidebar-folded {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.app-shell.sidebar-folded #sidebar {
+  width: 0;
+  padding: 0;
+  border: 0;
+}
+
 .roadmap-pane,
-.chat-pane {
+.chat-pane,
+.settings-pane {
+  min-height: 100vh;
   padding: 1rem;
   overflow: auto;
 }
 
 .roadmap-pane {
-  border-right: 1px solid #394150;
   background: #171d26;
 }
 
 .chat-pane {
   display: grid;
-  grid-template-rows: auto 1fr auto auto;
+  grid-template-rows: 1fr auto auto;
   gap: 1rem;
 }
 
-.chat-pane > header,
 .prompt-form {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto;
   align-items: center;
   gap: 0.75rem;
 }
 
-.turn-state,
-.phase-progress {
+.roadmap-phase > summary {
   color: #9aa7b8;
+  cursor: pointer;
 }
 
 .roadmap-phase {
-  display: grid;
-  gap: 0.4rem;
   margin: 1rem 0;
 }
 
 .roadmap-item {
+  display: block;
+  width: 100%;
+  margin-top: 0.4rem;
   padding: 0.55rem;
   text-align: left;
 }
@@ -100,7 +139,8 @@ textarea {
 }
 
 .gap,
-.error {
+.error,
+.prompt-error {
   color: #ffbd66;
 }
 
@@ -109,17 +149,28 @@ textarea {
 }
 
 .prompt-form textarea {
-  flex: 1;
+  grid-column: 1;
+  grid-row: 1;
   resize: vertical;
+}
+
+.prompt-form button {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.prompt-error {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  margin: 0;
+}
+
+.prompt-error:empty {
+  display: none;
 }
 
 @media (max-width: 760px) {
   .app-shell {
-    grid-template-columns: 1fr;
-  }
-
-  .roadmap-pane {
-    border-right: 0;
-    border-bottom: 1px solid #394150;
+    grid-template-columns: 11rem minmax(0, 1fr);
   }
 }

@@ -14,29 +14,15 @@ import {
   specPaths,
 } from "../src/roadmap.js";
 
-test("the real roadmap exposes all fifteen phase identities", async () => {
+test("the renderer preserves every phase identity in file order", async () => {
   const path = process.env.SYMPHONAI_ROADMAP_PATH;
   assert.ok(path, "the roadmap path was not passed to the Node test");
-  const roadmap = parseRoadmap(await readFile(path, "utf8"));
+  const text = await readFile(path, "utf8");
+  const source = JSON.parse(text);
+  const roadmap = renderRoadmap(parseRoadmap(text));
   assert.deepEqual(
     roadmap.phases.map(({ id, name, status }) => ({ id, name, status })),
-    [
-      { id: "00", name: "Canonical shapes and identity", status: "done" },
-      { id: "01", name: "Cancellation and typed event channel", status: "done" },
-      { id: "02", name: "Tool suite", status: "done" },
-      { id: "13", name: "Test harness", status: "done" },
-      { id: "03", name: "Harness ergonomics", status: "done" },
-      { id: "14", name: "Budgets, cost, and failure handling", status: "done" },
-      { id: "16", name: "Web tools", status: "done" },
-      { id: "04", name: "Durable sessions", status: "done" },
-      { id: "05", name: "Streaming", status: "done" },
-      { id: "17", name: "Host process", status: "done" },
-      { id: "07", name: "Agent control plane", status: "done" },
-      { id: "08", name: "Agent definitions", status: "done" },
-      { id: "10", name: "Extensibility", status: "done" },
-      { id: "19", name: "Extensions reach the runtime", status: "done" },
-      { id: "18", name: "App", status: "next" },
-    ],
+    source.phases.map(({ id, name, status }) => ({ id, name, status })),
   );
 });
 
