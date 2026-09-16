@@ -56,81 +56,6 @@ function chordsConflict(first, second) {
 }
 
 
-function skipWhitespace(text, start) {
-  let cursor = start;
-  while (/\s/.test(text[cursor] ?? "")) {
-    cursor += 1;
-  }
-  return cursor;
-}
-
-
-function stringEnd(text, start) {
-  let escaped = false;
-  for (let cursor = start + 1; cursor < text.length; cursor += 1) {
-    if (!escaped && text[cursor] === '"') {
-      return cursor + 1;
-    }
-    if (!escaped && text[cursor] === "\\") {
-      escaped = true;
-    } else {
-      escaped = false;
-    }
-  }
-  return text.length;
-}
-
-
-function objectEntries(text) {
-  const entries = [];
-  let cursor = skipWhitespace(text, 0) + 1;
-  while (cursor < text.length) {
-    cursor = skipWhitespace(text, cursor);
-    if (text[cursor] === "}") {
-      break;
-    }
-    const keyStart = cursor;
-    const keyEnd = stringEnd(text, keyStart);
-    const key = JSON.parse(text.slice(keyStart, keyEnd));
-    cursor = skipWhitespace(text, keyEnd) + 1;
-    const valueStart = skipWhitespace(text, cursor);
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    let valueEnd = valueStart;
-    for (; valueEnd < text.length; valueEnd += 1) {
-      const character = text[valueEnd];
-      if (inString) {
-        if (!escaped && character === '"') {
-          inString = false;
-        }
-        if (!escaped && character === "\\") {
-          escaped = true;
-        } else {
-          escaped = false;
-        }
-        continue;
-      }
-      if (character === '"') {
-        inString = true;
-      } else if (character === "[" || character === "{") {
-        depth += 1;
-      } else if (character === "]" || character === "}") {
-        if (character === "}" && depth === 0) {
-          break;
-        }
-        depth -= 1;
-      } else if (character === "," && depth === 0) {
-        break;
-      }
-    }
-    entries.push([key, JSON.parse(text.slice(valueStart, valueEnd))]);
-    cursor = text[valueEnd] === "," ? valueEnd + 1 : valueEnd;
-  }
-  return entries;
-}
-
-
 export const RESERVED = Object.freeze(["escape", "mod+.", "mod+l"]);
 
 const RESERVED_REASONS = new Map([
@@ -156,7 +81,7 @@ export function parseKeymap(text) {
 
   const bindings = new Map();
   const sourceChords = new Map();
-  for (const [rawChord, action] of objectEntries(text)) {
+  for (const [rawChord, action] of Object.entries(parsed)) {
     if (typeof action !== "string" && action !== null) {
       throw new KeymapError(
         `binding ${JSON.stringify(rawChord)} must name an action or be null`,

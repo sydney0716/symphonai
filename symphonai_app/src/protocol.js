@@ -1,3 +1,5 @@
+import { isObject } from "./json.js";
+
 export const PROTOCOL_VERSION = 1;
 
 export const KNOWN_EVENT_TYPES = Object.freeze([
@@ -33,10 +35,6 @@ export class ProtocolError extends Error {
     super(message);
     this.name = "ProtocolError";
   }
-}
-
-function isObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function decodeFrame(text) {

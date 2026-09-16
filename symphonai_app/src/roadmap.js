@@ -1,12 +1,10 @@
+import { isObject } from "./json.js";
+
 export class RoadmapError extends Error {
   constructor(message) {
     super(message);
     this.name = "RoadmapError";
   }
-}
-
-function isObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function phaseLabel(phase, index) {

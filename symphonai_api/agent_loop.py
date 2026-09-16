@@ -86,15 +86,12 @@ def _tool_result_event_fields(result: ToolResult) -> dict[str, str | int | bool]
     payload = result.payload
     if not result.ok or not isinstance(payload, dict):
         return defaults
-    try:
-        if payload.get("kind") != "file_diff":
-            return defaults
-        path = payload.get("path")
-        lines_added = payload.get("lines_added")
-        lines_removed = payload.get("lines_removed")
-        truncated = payload.get("truncated")
-    except Exception:
+    if payload.get("kind") != "file_diff":
         return defaults
+    path = payload.get("path")
+    lines_added = payload.get("lines_added")
+    lines_removed = payload.get("lines_removed")
+    truncated = payload.get("truncated")
     return {
         "result_kind": "file_diff",
         "result_path": path if isinstance(path, str) else "",

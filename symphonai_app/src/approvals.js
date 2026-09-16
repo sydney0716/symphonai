@@ -1,8 +1,6 @@
-const STALE_REASON = "This approval expired or was answered elsewhere.";
+import { isObject } from "./json.js";
 
-function isObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
+const STALE_REASON = "This approval expired or was answered elsewhere.";
 
 function payloadOf(frame) {
   return isObject(frame?.payload) ? frame.payload : frame;

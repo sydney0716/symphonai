@@ -1,6 +1,4 @@
-function isObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
+import { isObject } from "./json.js";
 
 function renderList(title, values) {
   const rows = Array.isArray(values) && values.length > 0

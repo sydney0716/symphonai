@@ -31,13 +31,16 @@ def _argv_program(argv: list) -> str:
 def _url_origin(url: object) -> str:
     if not isinstance(url, str):
         return ""
-    parsed = urlsplit(url)
-    if not parsed.scheme or not parsed.hostname:
+    try:
+        parsed = urlsplit(url)
+        if not parsed.scheme or not parsed.hostname:
+            return ""
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
         return ""
-    host = parsed.hostname
     if ":" in host:
         host = f"[{host}]"
-    port = parsed.port
     if port is not None:
         host = f"{host}:{port}"
     return f"{parsed.scheme}://{host}"
@@ -59,20 +62,17 @@ _TARGET_KEYS = {
 
 def call_target(tool_name: str, arguments: dict) -> str:
     """Return a bounded display target derived safely for one known tool."""
-    if not isinstance(arguments, dict):
+    if not isinstance(tool_name, str) or not isinstance(arguments, dict):
         return ""
-    try:
-        target_rule = _TARGET_KEYS.get(tool_name)
-        if target_rule is None:
-            return ""
-        key, reduce_target = target_rule
-        value = arguments.get(key)
-        if not isinstance(value, (str, list)) or not value:
-            return ""
-        target = reduce_target(value)
-        return target[:TARGET_LIMIT]
-    except Exception:
+    target_rule = _TARGET_KEYS.get(tool_name)
+    if target_rule is None:
         return ""
+    key, reduce_target = target_rule
+    value = arguments.get(key)
+    if not value:
+        return ""
+    target = reduce_target(value)
+    return target[:TARGET_LIMIT]
 
 
 class ToolEffect(str, Enum):

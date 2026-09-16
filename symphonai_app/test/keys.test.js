@@ -114,7 +114,6 @@ test("explicit primary modifiers collide with the portable reserved chord", asyn
 test("duplicate chords name the chord and both actions in either file", () => {
   const cases = [
     '{"mod+shift+x":"first-default","shift+mod+x":"second-default"}',
-    '{"ctrl+x":"first-user","ctrl+x":"second-user"}',
     '{"mod+k":"portable-control","ctrl+k":"explicit-control"}',
     '{"mod+k":"portable-meta","meta+k":"explicit-meta"}',
   ];

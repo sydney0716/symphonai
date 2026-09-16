@@ -4,10 +4,7 @@ import {
   decodeFrame,
   encodeRequest,
 } from "./protocol.js";
-
-function isObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
+import { isObject } from "./json.js";
 
 export function parseHandshake(line) {
   let handshake;

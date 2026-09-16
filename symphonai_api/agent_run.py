@@ -225,7 +225,7 @@ def read_run_graph(store: SessionStore) -> tuple[RunNode, ...]:
     order: list[str] = []
     try:
         paths = sorted(store.directory.glob("*.jsonl"))
-    except Exception:
+    except OSError:
         return ()
     for path in paths:
         try:
