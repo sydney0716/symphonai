@@ -85,9 +85,10 @@ test("all eight calls authorize by header and never by URL", async () => {
   const records = [];
   const fetch = async (url, options) => {
     records.push({ url, options });
-    return new URL(url).pathname === "/events"
+    const path = new URL(url).pathname;
+    return path === "/events"
       ? streamResponse([])
-      : response(200, { ok: true });
+      : response(200, path === "/sessions" ? [] : { ok: true });
   };
   const client = createClient({ port: 4312, token: TOKEN, fetch });
   const subscription = client.events(() => {});
@@ -119,6 +120,37 @@ test("all eight calls authorize by header and never by URL", async () => {
     assert.ok(!url.includes(TOKEN));
     assert.equal(new URL(url).search, "");
   }
+});
+
+test("sessions accepts only an array while other routes still require objects", async () => {
+  const sessions = [{ run_id: "run-one" }];
+  const paths = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url) => {
+      paths.push(new URL(url).pathname + new URL(url).search);
+      return response(200, sessions);
+    },
+  });
+  assert.deepEqual(await client.sessions(200), sessions);
+  assert.deepEqual(paths, ["/sessions?limit=200"]);
+  await assert.rejects(client.health(), (error) => {
+    assert.ok(error instanceof ProtocolError);
+    assert.match(error.message, /must be an object/);
+    return true;
+  });
+
+  const invalidClient = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => response(200, { sessions }),
+  });
+  await assert.rejects(invalidClient.sessions(), (error) => {
+    assert.ok(error instanceof ProtocolError);
+    assert.match(error.message, /must be an array/);
+    return true;
+  });
 });
 
 test("file encodes every significant query character and returns the reply", async () => {

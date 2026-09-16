@@ -116,7 +116,11 @@ class HostRun:
             run_id = new_id("run")
             cancel = CancellationToken()
             agent_ref = new_agent_ref("agent")
-            session = SessionStore(self._sessions_root, run_id)
+            session = SessionStore(
+                self._sessions_root,
+                run_id,
+                repo_root=self._policy.repo_root,
+            )
             opened = self._opened
             self._opened = None
             if opened is None:

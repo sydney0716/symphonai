@@ -613,6 +613,53 @@ def check_survey_route() -> None:
             host.close()
 
 
+@check("host_server.project_route")
+def check_project_route() -> None:
+    token = "project-route-token"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "named-project"
+        root.mkdir()
+        host = _host(repo_root=root, token=token)
+        try:
+            for path in ("/project", f"/project?token={token}"):
+                connection, response = _request(host, "GET", path)
+                try:
+                    body = response.read()
+                    if response.status != 401 or body != b"":
+                        fail(f"project route accepted unauthenticated path {path!r}")
+                finally:
+                    connection.close()
+
+            connection, response = _request(
+                host, "GET", "/project", headers={"Cookie": f"symphonai_app={token}"}
+            )
+            try:
+                body = response.read()
+                if response.status != 401 or body != b"":
+                    fail("project route accepted an app cookie")
+            finally:
+                connection.close()
+
+            connection, response = _request(
+                host, "GET", "/project", headers=_headers(host)
+            )
+            try:
+                body = response.read()
+                expected = {
+                    "repo_root": str(root.resolve()),
+                    "name": root.resolve().name,
+                }
+                if response.status != 200 or json.loads(body) != expected:
+                    fail(
+                        f"authorized project response was wrong: "
+                        f"{response.status}, {body!r}"
+                    )
+            finally:
+                connection.close()
+        finally:
+            host.close()
+
+
 @check("host_server.app_routes")
 def check_app_routes() -> None:
     token = "browser-route-token"

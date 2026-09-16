@@ -421,15 +421,31 @@ class HostServer:
                         },
                     )
                     return
+                if request_path == "/project":
+                    if not self._authorized():
+                        return
+                    repo_root = host._repo_root.resolve()
+                    self._json(
+                        HTTPStatus.OK,
+                        {"repo_root": str(repo_root), "name": repo_root.name},
+                    )
+                    return
                 if self.path == "/approvals":
                     if not self._authorized():
                         return
                     self._json(HTTPStatus.OK, {"pending": host.pending_approvals()})
                     return
-                if self.path == "/sessions":
+                if request_path == "/sessions":
                     if not self._authorized():
                         return
-                    self._json(HTTPStatus.OK, list_sessions(host.run.sessions_root))
+                    values = parse_qs(request_url.query, keep_blank_values=True).get("limit", [])
+                    try:
+                        limit = int(values[0]) if len(values) == 1 else None
+                    except ValueError:
+                        limit = None
+                    if limit is not None and limit <= 0:
+                        limit = None
+                    self._json(HTTPStatus.OK, list_sessions(host.run.sessions_root, limit=limit))
                     return
                 if self.path != "/events":
                     self._not_found()

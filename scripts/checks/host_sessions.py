@@ -8,6 +8,8 @@ import threading
 import time
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from symphonai_api.events import RunFinished
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
@@ -17,7 +19,7 @@ from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
 from symphonai_host.server import HostServer
 from symphonai_host.sessions import list_sessions
-from scripts.checks.host_server import _await_sse, _subscribed_stream
+from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
 
 
@@ -46,6 +48,18 @@ def _finished_session(root: Path) -> tuple[HostServer, HostClient, str]:
     return host, client, reply["run_id"]
 
 
+def _listing_fixture(root: Path) -> None:
+    sessions_root = root / "sessions"
+    for index, run_id in enumerate(("oldest", "third", "second", "newest")):
+        directory = sessions_root / run_id
+        directory.mkdir(parents=True)
+        (directory / "meta.json").write_text(
+            json.dumps({"run_id": run_id, "updated_at": f"2026-01-0{index + 1}T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        (directory / "run.jsonl").write_text("not a transcript", encoding="utf-8")
+
+
 @check("host_sessions.list_order_and_fields")
 def check_list_order_and_fields() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -53,7 +67,16 @@ def check_list_order_and_fields() -> None:
         host, client, run_id = _finished_session(root)
         try:
             sessions = client.list_sessions()
-            if sessions[0]["run_id"] != run_id or set(sessions[0]) != {"run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "state", "message_count"}:
+            expected_fields = {"run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "repo_root", "state", "message_count"}
+            meta = json.loads(
+                (root / "sessions" / run_id / "meta.json").read_text(encoding="utf-8")
+            )
+            if (
+                sessions[0]["run_id"] != run_id
+                or set(sessions[0]) != expected_fields
+                or sessions[0]["repo_root"] != str(root.resolve())
+                or meta.get("repo_root") != str(root.resolve())
+            ):
                 fail(f"unexpected sessions response: {sessions!r}")
         finally:
             host.close()
@@ -66,8 +89,27 @@ def check_damaged_session_listed() -> None:
         damaged = root / "sessions" / "broken"
         damaged.mkdir(parents=True)
         (damaged / "meta.json").write_text("{", encoding="utf-8")
-        result = list_sessions(root / "sessions")
-        if result != [{"run_id": "broken", "title": None, "created_at": None, "updated_at": None, "stopped_reason": None, "parent_run_id": None, "state": "unreadable", "message_count": 0}]:
+        legacy = root / "sessions" / "legacy"
+        legacy.mkdir()
+        (legacy / "meta.json").write_text(
+            json.dumps({"run_id": "legacy"}), encoding="utf-8"
+        )
+        result = {item["run_id"]: item for item in list_sessions(root / "sessions")}
+        expected = {
+            run_id: {
+                "run_id": run_id,
+                "title": None,
+                "created_at": None,
+                "updated_at": None,
+                "stopped_reason": None,
+                "parent_run_id": None,
+                "repo_root": "",
+                "state": "unreadable",
+                "message_count": 0,
+            }
+            for run_id in ("broken", "legacy")
+        }
+        if result != expected:
             fail(f"damaged session was omitted or misclassified: {result!r}")
 
 
@@ -76,6 +118,66 @@ def check_empty_root() -> None:
     with tempfile.TemporaryDirectory() as directory:
         if list_sessions(Path(directory) / "missing") != []:
             fail("missing sessions root was not empty")
+
+
+@check("host_sessions.limited_listing")
+def check_limited_listing() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _listing_fixture(root)
+        loaded = []
+        classified = []
+
+        def load_selected(store):
+            if store.run_id not in ("newest", "second"):
+                raise AssertionError(f"unreturned transcript was loaded: {store.run_id}")
+            loaded.append(store.run_id)
+            return SimpleNamespace(messages=[Message(Role.USER, store.run_id)])
+
+        def read_selected(path):
+            if path.parent.name not in ("newest", "second"):
+                raise AssertionError(f"unreturned run.jsonl was read: {path}")
+            return [], 0
+
+        def classify_selected(loaded_run, records):
+            classified.append(loaded_run.messages[0].text)
+            return SimpleNamespace(state=SimpleNamespace(value="completed"))
+
+        with (
+            mock.patch("symphonai_host.sessions.load_run", side_effect=load_selected),
+            mock.patch("symphonai_host.sessions.read_records", side_effect=read_selected),
+            mock.patch("symphonai_host.sessions.classify_run", side_effect=classify_selected),
+        ):
+            result = list_sessions(root / "sessions", limit=2)
+        if [item["run_id"] for item in result] != ["newest", "second"]:
+            fail(f"limited listing selected the wrong sessions: {result!r}")
+        if loaded != ["newest", "second"] or classified != loaded:
+            fail(f"limited listing classified the wrong sessions: {loaded!r}, {classified!r}")
+        if [item["state"] for item in result] != ["completed", "completed"]:
+            fail(f"limited listing did not classify returned sessions: {result!r}")
+
+
+@check("host_sessions.limit_route")
+def check_limit_route() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _listing_fixture(root)
+        host, client = _host(root)
+        try:
+            limited = client.list_sessions(limit=2)
+            if not isinstance(limited, list) or [item["run_id"] for item in limited] != ["newest", "second"]:
+                fail(f"Python client did not receive a bare limited array: {limited!r}")
+            for path in ("/sessions", "/sessions?limit=", "/sessions?limit=abc", "/sessions?limit=0", "/sessions?limit=-1"):
+                connection, response = _request(host, "GET", path, headers=_headers(host))
+                try:
+                    body = response.read()
+                    items = json.loads(body)
+                    if response.status != 200 or not isinstance(items, list) or len(items) != 4:
+                        fail(f"sessions query failed open listing for {path!r}: {response.status}, {body!r}")
+                finally:
+                    connection.close()
+        finally:
+            host.close()
 
 
 @check("host_sessions.open_unknown_404")

@@ -13,6 +13,36 @@ function filename(path) {
   return path.split("/").at(-1).replace(/\.md$/, "");
 }
 
+function projectGroups(sessions, currentRoot) {
+  const groups = new Map();
+  for (const session of sessions) {
+    const root = typeof session.repo_root === "string" ? session.repo_root : "";
+    if (!groups.has(root)) {
+      groups.set(root, { root, sessions: [], updatedAt: "" });
+    }
+    const group = groups.get(root);
+    group.sessions.push(session);
+    group.updatedAt = [group.updatedAt, session.updated_at ?? ""].sort().at(-1);
+  }
+  if (!groups.has(currentRoot)) {
+    groups.set(currentRoot, { root: currentRoot, sessions: [], updatedAt: "" });
+  }
+  for (const group of groups.values()) {
+    group.sessions.sort((left, right) =>
+      (right.updated_at ?? "").localeCompare(left.updated_at ?? "")
+    );
+  }
+  return [...groups.values()].sort((left, right) => {
+    if (left.root === currentRoot) return -1;
+    if (right.root === currentRoot) return 1;
+    return right.updatedAt.localeCompare(left.updatedAt) || left.root.localeCompare(right.root);
+  });
+}
+
+function projectName(root) {
+  return root === "" ? "Unknown project" : root.split("/").filter(Boolean).at(-1);
+}
+
 function clientFor(global, supplied) {
   if (supplied) {
     return supplied;
@@ -26,6 +56,7 @@ function clientFor(global, supplied) {
 }
 
 const ROUTE_KEY = "symphonai.route";
+const SIDEBAR_SESSION_LIMIT = 200;
 
 function storedRoute(global) {
   try {
@@ -64,7 +95,11 @@ export async function start({ global, document, client }) {
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
-  const roadmapReply = await boundary.file("docs/roadmap.json");
+  const [project, sessions, roadmapReply] = await Promise.all([
+    boundary.project(),
+    boundary.sessions(SIDEBAR_SESSION_LIMIT),
+    boundary.file("docs/roadmap.json"),
+  ]);
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
@@ -104,6 +139,61 @@ export async function start({ global, document, client }) {
     return link;
   });
   replace(pageLinks, ...links);
+
+  const projectsRoot = element(document, "section", { className: "projects" });
+  if (sessions.length >= SIDEBAR_SESSION_LIMIT) {
+    append(projectsRoot, element(document, "p", {
+      className: "session-limit",
+      text: `Showing the ${SIDEBAR_SESSION_LIMIT} most recent sessions.`,
+    }));
+  }
+  for (const group of projectGroups(sessions, project.repo_root)) {
+    const current = group.root === project.repo_root;
+    const section = element(document, "details", {
+      className: `project ${current ? "openable" : "unavailable"}`,
+    });
+    section.open = current;
+    append(
+      section,
+      element(document, "summary", {
+        text: current ? project.name : projectName(group.root),
+      }),
+    );
+    if (!current) {
+      append(section, element(document, "p", {
+        className: "project-status",
+        text: "Not openable from this host.",
+      }));
+    }
+    if (current && group.sessions.length === 0) {
+      append(section, element(document, "p", {
+        className: "project-empty",
+        text: "No chats yet.",
+      }));
+    }
+    for (const session of group.sessions) {
+      const label = session.title || session.run_id;
+      if (!current) {
+        append(section, element(document, "p", {
+          className: "session-link unavailable",
+          text: label,
+        }));
+        continue;
+      }
+      const button = element(document, "button", {
+        className: "session-link",
+        text: label,
+      });
+      button.type = "button";
+      listen(button, "click", async () => {
+        await boundary.openSession(session.run_id);
+        navigate({ page: "chat", section: "" });
+      });
+      append(section, button);
+    }
+    append(projectsRoot, section);
+  }
+  replace(sidebar, projectsRoot, pageLinks);
 
   listen(sidebarToggle, "click", () => {
     const folded = shell.className.includes("sidebar-folded");

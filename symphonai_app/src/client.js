@@ -110,7 +110,20 @@ export function createClient({
     return value;
   }
 
-  async function request(method, path, body) {
+  async function readListReply(response) {
+    let value;
+    try {
+      value = await response.json();
+    } catch {
+      throw new ProtocolError("host reply is not valid JSON");
+    }
+    if (!Array.isArray(value)) {
+      throw new ProtocolError("host reply must be an array");
+    }
+    return value;
+  }
+
+  async function request(method, path, body, read = readReply) {
     const options = { method, headers: headers() };
     if (body !== undefined) {
       options.headers = headers({ "Content-Type": "application/json" });
@@ -129,7 +142,7 @@ export function createClient({
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`host request failed with status ${response.status}`);
     }
-    return readReply(response);
+    return read(response);
   }
 
   async function post(kind, payload) {
@@ -248,8 +261,17 @@ export function createClient({
       return request("GET", "/approvals");
     },
 
-    sessions() {
-      return request("GET", "/sessions");
+    sessions(limit) {
+      return request(
+        "GET",
+        limit === undefined ? "/sessions" : `/sessions?limit=${limit}`,
+        undefined,
+        readListReply,
+      );
+    },
+
+    project() {
+      return request("GET", "/project");
     },
 
     survey() {

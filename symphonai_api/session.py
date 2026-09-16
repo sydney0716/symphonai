@@ -195,6 +195,7 @@ class SessionStore:
         *,
         create: bool = True,
         events: EventSink | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self._run_id = run_id
         self._root = Path(root)
@@ -229,6 +230,7 @@ class SessionStore:
                     "title": None,
                     "parent_run_id": None,
                     "stopped_reason": None,
+                    "repo_root": "" if repo_root is None else str(Path(repo_root).resolve()),
                 }
             )
         emit(

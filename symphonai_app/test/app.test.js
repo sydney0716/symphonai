@@ -171,8 +171,11 @@ function fixtureRoadmap({ allDone = false } = {}) {
   });
 }
 
-function fakeClient(roadmapText = fixtureRoadmap()) {
-  const calls = { approve: [], file: [], prompt: [] };
+function fakeClient(
+  roadmapText = fixtureRoadmap(),
+  { project = { repo_root: "/work/current", name: "current" }, sessions = [] } = {},
+) {
+  const calls = { approve: [], file: [], openSession: [], prompt: [], sessions: [] };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -218,6 +221,17 @@ function fakeClient(roadmapText = fixtureRoadmap()) {
     },
     async approvals() {
       return { pending: [] };
+    },
+    async project() {
+      return project;
+    },
+    async sessions(limit) {
+      calls.sessions.push(limit);
+      return sessions;
+    },
+    async openSession(runId) {
+      calls.openSession.push(runId);
+      return { run_id: runId };
     },
   };
 }
@@ -296,6 +310,79 @@ test("start renders the chat page and prepares the roadmap", async () => {
   assert.equal(app.client, client);
   assert.ok(app.transcript);
   assert.deepEqual(app.transcript.model, []);
+});
+
+test("sidebar groups sessions and keeps only the current project openable", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    project: { repo_root: "/work/current", name: "Current project" },
+    sessions: [
+      { run_id: "current-old", title: "Current chat", repo_root: "/work/current", updated_at: "2026-01-01" },
+      { run_id: "other-new", title: "Other chat", repo_root: "/work/other", updated_at: "2026-03-01" },
+      { run_id: "legacy", title: null, repo_root: "", updated_at: "2026-02-01" },
+    ],
+  });
+
+  await start({ global: {}, document, client });
+  const projects = find(document.getElementById("sidebar"), (value) =>
+    value.className === "projects"
+  );
+  const groups = projects.children;
+
+  assert.deepEqual(groups.map((group) => group.children[0].textContent), [
+    "Current project",
+    "other",
+    "Unknown project",
+  ]);
+  assert.deepEqual(groups.map((group) => group.open), [true, false, false]);
+  assert.match(visibleText(groups[1]), /Not openable from this host\./);
+  assert.match(visibleText(groups[2]), /legacy/);
+  assert.equal(find(groups[1], (value) => value.tagName === "BUTTON"), undefined);
+
+  await find(groups[0], (value) => value.tagName === "BUTTON").dispatch("click");
+  assert.deepEqual(client.calls.openSession, ["current-old"]);
+});
+
+test("sidebar shows the current project when it has no sessions", async () => {
+  const document = new FakeDocument();
+  await start({
+    global: {},
+    document,
+    client: fakeClient(fixtureRoadmap(), {
+      project: { repo_root: "/work/empty", name: "empty" },
+      sessions: [],
+    }),
+  });
+
+  const projects = find(document.getElementById("sidebar"), (value) =>
+    value.className === "projects"
+  );
+  assert.equal(projects.children.length, 1);
+  assert.equal(projects.children[0].open, true);
+  assert.equal(projects.children[0].children[0].textContent, "empty");
+  assert.match(visibleText(projects.children[0]), /No chats yet\./);
+});
+
+test("sidebar requests 200 sessions and discloses a full page", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: Array.from({ length: 200 }, (_, index) => ({
+      run_id: `run-${index}`,
+      repo_root: "/work/current",
+      updated_at: `2026-01-01T00:00:${String(index).padStart(2, "0")}Z`,
+    })),
+  });
+  await start({ global: {}, document, client });
+
+  assert.deepEqual(client.calls.sessions, [200]);
+  assert.match(visibleText(document.getElementById("sidebar")), /Showing the 200 most recent sessions\./);
+
+  const shorterDocument = new FakeDocument();
+  const shorterClient = fakeClient(fixtureRoadmap(), {
+    sessions: [{ run_id: "one", repo_root: "/work/current", updated_at: "2026-01-01" }],
+  });
+  await start({ global: {}, document: shorterDocument, client: shorterClient });
+  assert.doesNotMatch(visibleText(shorterDocument.getElementById("sidebar")), /Showing the 200 most recent/);
 });
 
 test("page navigation preserves the rendered transcript and stores the route", async () => {

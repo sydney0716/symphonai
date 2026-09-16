@@ -68,8 +68,9 @@ class HostClient:
             raise HostClientError("/approvals returned an invalid response")
         return response["pending"]
 
-    def list_sessions(self) -> list[dict]:
-        response = self._request("GET", "/sessions")
+    def list_sessions(self, limit: int | None = None) -> list[dict]:
+        path = "/sessions" if limit is None else f"/sessions?limit={limit}"
+        response = self._request("GET", path)
         if not isinstance(response, list):
             raise HostClientError("/sessions returned an invalid response")
         return response

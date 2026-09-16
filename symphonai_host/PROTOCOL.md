@@ -90,7 +90,10 @@ Receive the handshake through a pipe or stdin, never on a command line.
 
 ## Sessions
 
-`GET /sessions` returns persisted session metadata newest first. `POST
+`GET /sessions` returns a bare array of persisted session metadata newest first.
+An optional positive `limit` query parameter bounds the entries returned and
+classified; missing, empty, non-numeric, zero, and negative values return the
+full listing. `POST
 /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
 its reply, and holds that conversation for the next prompt. The continuation
 is written as a new descendant session; the opened transcript is never changed.
@@ -138,6 +141,10 @@ survey under the `survey` key. Its fields are `root`, `languages`,
 `truncated_directories`, `stopped`, and `file_count`; paths are
 repository-relative strings. The route accepts only the
 ordinary bearer header; query tokens and app cookies do not authorize it.
+
+An authenticated `GET /project` returns the host repository's absolute,
+resolved path as `repo_root` and its basename as `name`. It accepts only the
+ordinary bearer header; an app query token or app cookie does not authorize it.
 
 `GET /events` returns `text/event-stream`. Each event is one `data:` line
 whose content is an `event` frame containing the event payload above. A client

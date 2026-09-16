@@ -13,12 +13,12 @@ from symphonai_api.session import (
 )
 
 
-def list_sessions(root: Path) -> list[dict]:
+def list_sessions(root: Path, *, limit: int | None = None) -> list[dict]:
     """List every session directory, retaining damaged entries for recovery."""
     root = Path(root)
     if not root.is_dir():
         return []
-    sessions: list[dict] = []
+    sessions: list[tuple[dict, SessionStore | None]] = []
     for directory in root.iterdir():
         if not directory.is_dir():
             continue
@@ -29,9 +29,11 @@ def list_sessions(root: Path) -> list[dict]:
             "updated_at": None,
             "stopped_reason": None,
             "parent_run_id": None,
+            "repo_root": "",
             "state": "unreadable",
             "message_count": 0,
         }
+        store = None
         try:
             store = SessionStore.open(root, directory.name)
             meta = store.read_meta()
@@ -39,11 +41,21 @@ def list_sessions(root: Path) -> list[dict]:
                 key: meta.get(key)
                 for key in ("run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id")
             })
+            repo_root = meta.get("repo_root")
+            item["repo_root"] = repo_root if isinstance(repo_root, str) else ""
+        except (OSError, TranscriptError, ValueError, KeyError, TypeError):
+            store = None
+        sessions.append((item, store))
+    sessions.sort(key=lambda entry: entry[0]["updated_at"] or "", reverse=True)
+    selected = sessions if limit is None else sessions[:limit]
+    for item, store in selected:
+        if store is None:
+            continue
+        try:
             loaded = load_run(store)
             records, _ = read_records(store.directory / "run.jsonl")
             item["state"] = classify_run(loaded, records).state.value
             item["message_count"] = len(loaded.messages)
         except (OSError, TranscriptError, ValueError, KeyError, TypeError):
             pass
-        sessions.append(item)
-    return sorted(sessions, key=lambda item: item["updated_at"] or "", reverse=True)
+    return [item for item, _ in selected]

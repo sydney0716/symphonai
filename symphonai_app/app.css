@@ -39,6 +39,38 @@ textarea {
   color: inherit;
 }
 
+.projects {
+  margin-bottom: 1rem;
+}
+
+.project {
+  margin: 0.5rem 0;
+}
+
+.project > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.project-status,
+.project-empty,
+.session-link {
+  margin: 0.4rem 0 0 1rem;
+}
+
+.project-status,
+.project-empty,
+.session-link.unavailable {
+  color: #9aa7b8;
+}
+
+button.session-link {
+  display: block;
+  width: calc(100% - 1rem);
+  padding: 0.35rem;
+  text-align: left;
+}
+
 .sidebar-toggle {
   position: fixed;
   z-index: 1;
