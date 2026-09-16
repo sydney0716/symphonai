@@ -73,6 +73,7 @@ class HostRun:
         self._system_prompt = system_prompt
         self._max_turns = max_turns
         self._model = model
+        self._extensions = extensions
         self._hooks = (
             None
             if extensions is None
@@ -89,6 +90,10 @@ class HostRun:
     @property
     def policy(self) -> PermissionPolicy:
         return self._policy
+
+    @property
+    def extensions(self) -> Extensions | None:
+        return self._extensions
 
     @property
     def active_run_id(self) -> str | None:

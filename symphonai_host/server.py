@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import shlex
 import threading
 from collections.abc import Mapping
 from http.cookies import CookieError, SimpleCookie
@@ -16,6 +18,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.extensions import Extensions
 from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR
 from symphonai_api.session import SessionError, TranscriptError
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
@@ -70,6 +75,7 @@ class HostServer:
             raise ValueError("keepalive_seconds must be greater than 0")
         self.token = token or secrets.token_urlsafe(32)
         self._repo_root = policy.repo_root
+        self._mcp_started = mcp_tools is not None
         self.broker = broker or EventBroker()
         self.run = HostRun(
             provider,
@@ -429,6 +435,78 @@ class HostServer:
                         HTTPStatus.OK,
                         {"repo_root": str(repo_root), "name": repo_root.name},
                     )
+                    return
+                if request_path == "/settings":
+                    if not self._authorized():
+                        return
+                    extensions = host.run.extensions
+                    root = host.run.policy.repo_root.resolve()
+
+                    def display_directory(directory: Path) -> str:
+                        resolved = directory.resolve()
+                        return (
+                            resolved.relative_to(root).as_posix()
+                            if resolved.is_relative_to(root)
+                            else str(resolved)
+                        )
+
+                    ceiling = None if extensions is None else extensions.ceiling
+                    settings = {
+                        "config": [] if extensions is None else [
+                            {
+                                "key": key,
+                                "value": value,
+                                "scope": extensions.config.provenance[key].scope.value,
+                            }
+                            for key, value in sorted(extensions.config.values.items())
+                        ],
+                        "ceiling": {
+                            "allowed_write_scope": None if ceiling is None or ceiling.allowed_write_scope is None else [str(path) for path in ceiling.allowed_write_scope],
+                            "shell_enabled": None if ceiling is None else ceiling.shell_enabled,
+                            "shell_allowlist": None if ceiling is None or ceiling.shell_allowlist is None else [list(command) for command in ceiling.shell_allowlist],
+                            "fetch_enabled": None if ceiling is None else ceiling.fetch_enabled,
+                            "fetch_allowlist": None if ceiling is None or ceiling.fetch_allowlist is None else list(ceiling.fetch_allowlist),
+                            "modes": None if ceiling is None or ceiling.modes is None else list(ceiling.modes),
+                        },
+                        "trust": [] if extensions is None else [
+                            {"root": str(entry.root), "allow": sorted(entry.allow)}
+                            for entry in sorted(extensions.trust.entries, key=lambda entry: str(entry.root))
+                        ],
+                        "hooks": [] if extensions is None else [
+                            {"event": event, "command": shlex.join(hook.command)}
+                            for hook in extensions.hooks
+                            for event in hook.events
+                        ],
+                        "mcp_servers": [] if extensions is None else [
+                            {"name": spec.name, "command": shlex.join(spec.command), "running": spec.enabled and host._mcp_started}
+                            for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)
+                        ],
+                        "agents": [] if extensions is None else sorted(extensions.agents),
+                        "skills": [] if extensions is None else sorted(extensions.skills),
+                        "plugins": [] if extensions is None else sorted(extensions.plugins),
+                        "withheld": [] if extensions is None else [
+                            {
+                                "scope": offered.scope.value,
+                                "directory": display_directory(offered.directory),
+                                "names": sorted(offered.names),
+                                "reason": f"repository not trusted for {offered.directory.name}",
+                            }
+                            for offered in sorted(extensions.withheld, key=lambda offered: (offered.scope.value, str(offered.directory)))
+                        ],
+                        "providers": [
+                            {
+                                "name": name,
+                                "env_var": variable,
+                                "key_present": bool(os.environ.get(variable, "").strip()),
+                            }
+                            for name, variable in (
+                                ("anthropic", ANTHROPIC_KEY_ENV_VAR),
+                                ("gemini", GEMINI_KEY_ENV_VAR),
+                                ("openai", OPENAI_KEY_ENV_VAR),
+                            )
+                        ],
+                    }
+                    self._json(HTTPStatus.OK, {"settings": settings})
                     return
                 if self.path == "/approvals":
                     if not self._authorized():

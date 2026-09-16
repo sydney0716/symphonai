@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -658,6 +659,161 @@ def check_project_route() -> None:
                 connection.close()
         finally:
             host.close()
+
+
+@check("host_server.settings_route")
+def check_settings_route() -> None:
+    token = "settings-route-token"
+    secret = "recognisable-settings-secret-84f1"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        trusted_other = Path(temporary) / "other"
+        project_config = root / ".symphonai"
+        user_config = home / ".symphonai"
+        project_config.mkdir(parents=True)
+        user_config.mkdir(parents=True)
+        (project_config / "skills").mkdir()
+        (project_config / "skills" / "blocked.md").write_text("offered", encoding="utf-8")
+        (project_config / "config.toml").write_text(
+            "[agents.ceiling]\nfetch_enabled = false\n", encoding="utf-8"
+        )
+        mcp_script = _write_host_mcp(Path(temporary))
+        mcp_command = [
+            sys.executable,
+            str(mcp_script),
+            str(Path(temporary) / "settings-mcp.pid"),
+            "-",
+        ]
+        shown_command = shlex.join(mcp_command)
+        (user_config / "config.toml").write_text(
+            "[agents.ceiling]\nshell_enabled = false\n"
+            "[[hooks]]\non = [\"RunStarted\"]\ncommand = [\"echo\", \"observed\"]\n"
+            f"[[mcp.servers]]\nname = \"sample\"\ncommand = {json.dumps(mcp_command)}\nenabled = true\n"
+            f"[[trust.repositories]]\nroot = {json.dumps(str(trusted_other))}\nallow = [\"skills\"]\n",
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        host = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(repo_root=root),
+            token=token,
+            sessions_root=root / "sessions",
+            extensions=extensions,
+        )
+        host.start()
+        try:
+            if host.run.extensions is not extensions:
+                fail("host run did not retain the resolved extensions")
+            for path in ("/settings", f"/settings?token={token}"):
+                connection, response = _request(host, "GET", path)
+                try:
+                    body = response.read()
+                    if response.status != 401 or body != b"":
+                        fail(f"settings route accepted unauthenticated path {path!r}")
+                finally:
+                    connection.close()
+
+            with mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": secret, "ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": " "},
+            ):
+                connection, response = _request(
+                    host, "GET", "/settings", headers=_headers(host)
+                )
+                try:
+                    body = response.read()
+                    if response.status != 200 or secret.encode() in body:
+                        fail(f"authorized settings status or secret disclosure: {response.status}")
+                    payload = json.loads(body)
+                finally:
+                    connection.close()
+            if set(payload) != {"settings"}:
+                fail(f"settings envelope changed: {payload!r}")
+            settings = payload["settings"]
+            expected_fields = {
+                "config", "ceiling", "trust", "hooks", "mcp_servers",
+                "agents", "skills", "plugins", "withheld", "providers",
+            }
+            if set(settings) != expected_fields:
+                fail(f"settings route returned the wrong fields: {settings!r}")
+            config = {entry["key"]: entry for entry in settings["config"]}
+            if (
+                any(set(entry) != {"key", "value", "scope"} for entry in settings["config"])
+                or config["agents.ceiling.shell_enabled"] != {
+                    "key": "agents.ceiling.shell_enabled", "value": False, "scope": "user"
+                }
+                or config["agents.ceiling.fetch_enabled"] != {
+                    "key": "agents.ceiling.fetch_enabled", "value": False, "scope": "project"
+                }
+            ):
+                fail(f"settings config lost per-value provenance: {config!r}")
+            if set(settings["ceiling"]) != {
+                "allowed_write_scope", "shell_enabled", "shell_allowlist",
+                "fetch_enabled", "fetch_allowlist", "modes",
+            } or settings["ceiling"]["shell_enabled"] is not False:
+                fail(f"settings ceiling is not resolved: {settings['ceiling']!r}")
+            if settings["trust"] != [{"root": str(trusted_other.resolve()), "allow": ["skills"]}]:
+                fail(f"settings trust listing changed: {settings['trust']!r}")
+            if settings["hooks"] != [{"event": "RunStarted", "command": "echo observed"}]:
+                fail(f"settings hooks changed: {settings['hooks']!r}")
+            if settings["mcp_servers"] != [{"name": "sample", "command": shown_command, "running": False}]:
+                fail(f"settings MCP listing changed: {settings['mcp_servers']!r}")
+            if settings["withheld"] != [{
+                "scope": "project",
+                "directory": ".symphonai/skills",
+                "names": ["blocked"],
+                "reason": "repository not trusted for skills",
+            }]:
+                fail(f"settings withheld diagnostics changed: {settings['withheld']!r}")
+            if settings["agents"] != [] or settings["skills"] != [] or settings["plugins"] != []:
+                fail("settings exposed untrusted extension names as loaded")
+            providers = settings["providers"]
+            if providers != [
+                {"name": "anthropic", "env_var": "ANTHROPIC_API_KEY", "key_present": False},
+                {"name": "gemini", "env_var": "GEMINI_API_KEY", "key_present": False},
+                {"name": "openai", "env_var": "OPENAI_API_KEY", "key_present": True},
+            ]:
+                fail(f"settings provider presence changed: {providers!r}")
+
+            protocol = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text(
+                encoding="utf-8"
+            )
+            paragraph = protocol.partition("An authenticated `GET /settings`")[2].partition("\n\n")[0]
+            if any(f"`{field}`" not in paragraph for field in expected_fields):
+                fail("settings protocol paragraph omitted a response field")
+        finally:
+            host.close()
+
+        pool = McpPool(extensions.mcp_servers, cwd=root)
+        try:
+            mcp_tools = pool.start()
+            if "mcp__sample__search" not in mcp_tools:
+                fail("settings MCP fixture did not start its server")
+            started_host = HostServer(
+                FakeModelProvider(),
+                PermissionPolicy(repo_root=root),
+                sessions_root=root / "sessions",
+                extensions=extensions,
+                mcp_tools=mcp_tools,
+            )
+            started_host.start()
+            try:
+                connection, response = _request(
+                    started_host, "GET", "/settings", headers=_headers(started_host)
+                )
+                try:
+                    settings = json.loads(response.read())["settings"]
+                    if response.status != 200 or settings["mcp_servers"] != [
+                        {"name": "sample", "command": shown_command, "running": True}
+                    ]:
+                        fail(f"settings did not report a started MCP server: {settings!r}")
+                finally:
+                    connection.close()
+            finally:
+                started_host.close()
+        finally:
+            pool.close()
 
 
 @check("host_server.app_routes")

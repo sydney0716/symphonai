@@ -274,6 +274,10 @@ export function createClient({
       return request("GET", "/project");
     },
 
+    settings() {
+      return request("GET", "/settings");
+    },
+
     survey() {
       return request("GET", "/survey");
     },

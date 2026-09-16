@@ -146,6 +146,15 @@ An authenticated `GET /project` returns the host repository's absolute,
 resolved path as `repo_root` and its basename as `name`. It accepts only the
 ordinary bearer header; an app query token or app cookie does not authorize it.
 
+An authenticated `GET /settings` returns a `settings` object with `config`
+entries (`key`, `value`, `scope`), `ceiling`, `trust`, `hooks` (`event`, `command`),
+`mcp_servers` (`name`, `command`, `running`), sorted `agents`, `skills`, and
+`plugins` names, `withheld` entries (`scope`, `directory`, `names`, `reason`),
+and `providers` entries (`name`, `env_var`, `key_present`). A withheld
+`directory` is repository-relative within the repository and absolute
+otherwise. Provider key presence is a boolean; key values never appear in the
+response. Only the ordinary bearer header authorizes this route.
+
 `GET /events` returns `text/event-stream`. Each event is one `data:` line
 whose content is an `event` frame containing the event payload above. A client
 that has fallen behind receives an `error` frame with `{"dropped": n}` before
