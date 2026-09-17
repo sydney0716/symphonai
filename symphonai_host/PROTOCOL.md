@@ -148,7 +148,7 @@ ordinary bearer header; an app query token or app cookie does not authorize it.
 
 An authenticated `GET /settings` returns a `settings` object with `config`
 entries (`key`, `value`, `scope`), `ceiling`, `trust`, `hooks` (`event`, `command`),
-`mcp_servers` (`name`, `command`, `running`), sorted `agents`, `skills`, and
+`mcp_servers` (`name`, `command`, `started`), sorted `agents`, `skills`, and
 `plugins` names, `withheld` entries (`scope`, `directory`, `names`, `reason`),
 and `providers` entries (`name`, `env_var`, `key_present`). A withheld
 `directory` is repository-relative within the repository and absolute

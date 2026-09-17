@@ -5,7 +5,7 @@ import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
-import { generalRows, modelRows } from "./settings.js";
+import { generalRows, inventoryRows, modelRows, rosterRows, serverRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
@@ -138,6 +138,42 @@ export async function start({ global, document, client }) {
       );
       return;
     }
+    if (section === "mcp") {
+      const rows = serverRows(settingsReply).map(({ name, command, started }) => [
+        name, command, started ? "started" : "not started",
+      ]);
+      replace(
+        settingsContent,
+        element(document, "h2", { text: "MCP servers" }),
+        settingsTable(["Server", "Command", "Started"], rows),
+      );
+      return;
+    }
+    if (section === "skills" || section === "plugins") {
+      const list = element(document, "ul", { className: "settings-roster" });
+      for (const name of rosterRows(settingsReply, section)) {
+        append(list, element(document, "li", { text: name }));
+      }
+      replace(
+        settingsContent,
+        element(document, "h2", { text: section === "skills" ? "Skills" : "Plugins" }),
+        list,
+      );
+      return;
+    }
+    if (section === "inventory") {
+      const rows = inventoryRows(settingsReply).map(({ scope, directory, names, reason }) => [
+        scope, directory, names.join(", "), reason,
+      ]);
+      replace(
+        settingsContent,
+        element(document, "h2", { text: "Inventory" }),
+        rows.length === 0
+          ? element(document, "p", { text: "Nothing was withheld." })
+          : settingsTable(["Scope", "Directory", "Names", "Reason"], rows),
+      );
+      return;
+    }
     const rows = generalRows(settingsReply).map(({ key, value, scope }) => [
       key, value, scope,
     ]);
@@ -168,7 +204,7 @@ export async function start({ global, document, client }) {
     }
   }
 
-  const sectionLinks = ["general", "models"].map((section) => {
+  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "inventory"].map((section) => {
     const link = element(document, "a", {
       text: section[0].toUpperCase() + section.slice(1),
     });

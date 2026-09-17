@@ -38,3 +38,25 @@ export function modelRows(reply) {
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
+
+export function serverRows(reply) {
+  return section(reply, "mcp_servers")
+    .map(({ name, command, started }) => ({ name, command, started }));
+}
+
+export function rosterRows(reply, kind) {
+  if (!["skills", "plugins", "agents"].includes(kind)) {
+    return [];
+  }
+  return [...section(reply, kind)].sort((left, right) => left.localeCompare(right));
+}
+
+export function inventoryRows(reply) {
+  return section(reply, "withheld")
+    .map(({ scope, directory, names, reason }) => ({
+      scope,
+      directory,
+      names,
+      reason: reason || "This scope offered nothing.",
+    }));
+}

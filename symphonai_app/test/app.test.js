@@ -484,6 +484,66 @@ test("settings routes render general origins, model presence, and unknown fallba
   assert.equal(rowCells().length, 3);
 });
 
+test("extension settings routes show startup state, complete commands, and withheld reasons", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/mcp" });
+  const document = new FakeDocument();
+  const command = `python -m ${"example.".repeat(600)}server`;
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: {
+      mcp_servers: [
+        { name: "live-at-startup", command, started: true },
+        { name: "offline-at-startup", command: "python -m offline", started: false },
+      ],
+      skills: ["zeta", "alpha"],
+      plugins: ["west", "east"],
+      withheld: [
+        { scope: "project", directory: ".symphonai/skills", names: ["blocked"], reason: "repository not trusted" },
+        { scope: "user", directory: "/users/example/plugins", names: [] },
+      ],
+    } },
+  });
+  await start({ global: browser.global, document, client });
+  const pane = document.getElementById("page").children[0];
+  const content = find(pane, (value) => value.className === "settings-content");
+  const rowCells = () => walk(content)
+    .filter((value) => value.className === "settings-row")
+    .map((row) => row.children.map((cell) => cell.textContent));
+  const open = async (name) => {
+    const link = find(pane, (value) => value.tagName === "A" && value.textContent === name);
+    await link.dispatch("click");
+    assert.equal(browser.global.location.hash, `#/settings/${name.toLowerCase()}`);
+  };
+
+  assert.deepEqual(rowCells(), [
+    ["live-at-startup", command, "started"],
+    ["offline-at-startup", "python -m offline", "not started"],
+  ]);
+  assert.match(visibleText(content), /Started/);
+  assert.doesNotMatch(visibleText(content), /running/i);
+
+  await open("Skills");
+  assert.deepEqual(walk(content).filter((value) => value.tagName === "LI").map((value) => value.textContent), ["alpha", "zeta"]);
+
+  await open("Plugins");
+  assert.deepEqual(walk(content).filter((value) => value.tagName === "LI").map((value) => value.textContent), ["east", "west"]);
+
+  await open("Inventory");
+  assert.deepEqual(rowCells(), [
+    ["project", ".symphonai/skills", "blocked", "repository not trusted"],
+    ["user", "/users/example/plugins", "", "This scope offered nothing."],
+  ]);
+});
+
+test("an empty extension inventory says nothing was withheld", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/settings/inventory" });
+  await start({ global: browser.global, document, client: fakeClient() });
+  const content = find(document.getElementById("page"), (value) => value.className === "settings-content");
+
+  assert.match(visibleText(content), /Nothing was withheld\./);
+  assert.equal(walk(content).filter((value) => value.className === "settings-row").length, 0);
+});
+
 test("throwing local storage cannot stop startup or navigation", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ storageThrows: true });

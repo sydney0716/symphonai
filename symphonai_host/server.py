@@ -478,7 +478,7 @@ class HostServer:
                             for event in hook.events
                         ],
                         "mcp_servers": [] if extensions is None else [
-                            {"name": spec.name, "command": shlex.join(spec.command), "running": spec.enabled and host._mcp_started}
+                            {"name": spec.name, "command": shlex.join(spec.command), "started": spec.enabled and host._mcp_started}
                             for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)
                         ],
                         "agents": [] if extensions is None else sorted(extensions.agents),

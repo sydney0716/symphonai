@@ -757,7 +757,7 @@ def check_settings_route() -> None:
                 fail(f"settings trust listing changed: {settings['trust']!r}")
             if settings["hooks"] != [{"event": "RunStarted", "command": "echo observed"}]:
                 fail(f"settings hooks changed: {settings['hooks']!r}")
-            if settings["mcp_servers"] != [{"name": "sample", "command": shown_command, "running": False}]:
+            if settings["mcp_servers"] != [{"name": "sample", "command": shown_command, "started": False}]:
                 fail(f"settings MCP listing changed: {settings['mcp_servers']!r}")
             if settings["withheld"] != [{
                 "scope": "project",
@@ -805,7 +805,7 @@ def check_settings_route() -> None:
                 try:
                     settings = json.loads(response.read())["settings"]
                     if response.status != 200 or settings["mcp_servers"] != [
-                        {"name": "sample", "command": shown_command, "running": True}
+                        {"name": "sample", "command": shown_command, "started": True}
                     ]:
                         fail(f"settings did not report a started MCP server: {settings!r}")
                 finally:
