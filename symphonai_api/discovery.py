@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeVar
@@ -21,6 +21,9 @@ class DiscoveryError(ValueError):
     """Two scopes offering the same name, or a member that failed to load."""
 
 
+_T = TypeVar("_T")
+
+
 @dataclass(frozen=True)
 class Offered:
     """What a scope has, whether or not it was allowed."""
@@ -28,6 +31,24 @@ class Offered:
     scope: Scope
     directory: Path
     names: tuple[str, ...]
+    paths: tuple[Path, ...] = field(default=(), compare=False)
+
+
+class LocatedMapping(Mapping[str, _T]):
+    """Loaded members and the source paths discovery observed for them."""
+
+    def __init__(self, members: dict[str, _T], paths: dict[str, Path]) -> None:
+        self._members = MappingProxyType(members)
+        self.paths = MappingProxyType(paths)
+
+    def __getitem__(self, name: str) -> _T:
+        return self._members[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._members)
+
+    def __len__(self) -> int:
+        return len(self._members)
 
 
 @dataclass(frozen=True)
@@ -36,9 +57,6 @@ class Discovered:
     skills: Mapping[str, Skill]
     plugins: Mapping[str, Plugin]
     withheld: tuple[Offered, ...]
-
-
-_T = TypeVar("_T")
 
 
 def _load(
@@ -58,21 +76,21 @@ def _load(
         ) from exc
 
 
-def _offered_names(directory: Path, kind: str) -> tuple[str, ...]:
+def _offered_names(directory: Path, kind: str) -> tuple[tuple[str, Path], ...]:
     if kind == "agents":
         return tuple(
-            path.stem
+            (path.stem, path)
             for path in sorted(directory.glob("*.toml"))
             if path.is_file()
         )
     if kind == "skills":
         return tuple(
-            path.stem
+            (path.stem, path)
             for path in sorted(directory.glob("*.md"))
             if path.is_file()
         )
     return tuple(
-        path.name for path in sorted(directory.iterdir()) if path.is_dir()
+        (path.name, path) for path in sorted(directory.iterdir()) if path.is_dir()
     )
 
 
@@ -83,6 +101,8 @@ def _combine(
     kind: str,
     user_directory: Path,
     project_directory: Path,
+    user_paths: Mapping[str, Path],
+    project_paths: Mapping[str, Path],
 ) -> Mapping[str, _T]:
     duplicate = next((name for name in user if name in project), None)
     if duplicate is not None:
@@ -90,7 +110,9 @@ def _combine(
             f"{kind} {duplicate!r} is offered by user scope at "
             f"{user_directory} and project scope at {project_directory}"
         )
-    return MappingProxyType({**user, **project})
+    members = {**user, **project}
+    paths = {name: path for name, path in {**user_paths, **project_paths}.items() if name in members}
+    return LocatedMapping(members, paths)
 
 
 def discover(
@@ -142,6 +164,7 @@ def discover(
             kind=kind,
             errors=errors,
         )
+        user_paths = dict(_offered_names(user_directory, kind)) if user_directory.exists() else {}
         if trust is not None and trust.allows(root, kind):
             project_members = _load(
                 loader,
@@ -150,14 +173,18 @@ def discover(
                 kind=kind,
                 errors=errors,
             )
+            project_paths = dict(_offered_names(project_directory, kind)) if project_directory.exists() else {}
         else:
             project_members = {}
+            project_paths = {}
             if project_directory.exists():
+                offered = _offered_names(project_directory, kind)
                 withheld.append(
                     Offered(
                         scope=Scope.PROJECT,
                         directory=project_directory,
-                        names=_offered_names(project_directory, kind),
+                        names=tuple(name for name, _ in offered),
+                        paths=tuple(path for _, path in offered),
                     )
                 )
         combined[kind] = _combine(
@@ -166,6 +193,8 @@ def discover(
             kind=kind,
             user_directory=user_directory,
             project_directory=project_directory,
+            user_paths=user_paths,
+            project_paths=project_paths,
         )
     return Discovered(
         agents=combined["agents"],

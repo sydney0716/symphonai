@@ -180,15 +180,21 @@ export async function start({ global, document, client }) {
       );
       return;
     }
-    if (section === "skills" || section === "plugins") {
-      const list = element(document, "ul", { className: "settings-roster" });
-      for (const name of rosterRows(settingsReply, section)) {
-        append(list, element(document, "li", { text: name }));
+    if (section === "skills" || section === "plugins" || section === "agents") {
+      const rows = rosterRows(settingsReply, section);
+      const table = settingsTable(["Name", "Path"], rows.map(({ name, path }) => [name, path]));
+      for (const [index, { path }] of rows.entries()) {
+        if (path) {
+          const copy = element(document, "button", { text: "Copy" });
+          copy.type = "button";
+          listen(copy, "click", () => global.navigator?.clipboard?.writeText?.(path));
+          append(table.children[index + 1].children[1], copy);
+        }
       }
       replace(
         settingsContent,
-        element(document, "h2", { text: section === "skills" ? "Skills" : "Plugins" }),
-        list,
+        element(document, "h2", { text: section[0].toUpperCase() + section.slice(1) }),
+        table,
       );
       return;
     }
@@ -235,7 +241,7 @@ export async function start({ global, document, client }) {
     }
   }
 
-  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "inventory"].map((section) => {
+  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "inventory"].map((section) => {
     const link = element(document, "a", {
       text: section[0].toUpperCase() + section.slice(1),
     });

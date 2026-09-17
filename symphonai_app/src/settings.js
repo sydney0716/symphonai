@@ -48,7 +48,9 @@ export function rosterRows(reply, kind) {
   if (!["skills", "plugins", "agents"].includes(kind)) {
     return [];
   }
-  return [...section(reply, kind)].sort((left, right) => left.localeCompare(right));
+  return section(reply, kind)
+    .map(({ name, path }) => ({ name, path }))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 export function inventoryRows(reply) {

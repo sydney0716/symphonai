@@ -126,6 +126,10 @@ button.session-link {
   overflow-wrap: anywhere;
 }
 
+.settings-table td button {
+  margin-left: 0.75rem;
+}
+
 .chat-pane {
   display: grid;
   grid-template-rows: 1fr auto auto;

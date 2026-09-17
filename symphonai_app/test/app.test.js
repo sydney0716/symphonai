@@ -541,6 +541,8 @@ test("credential client sends the value only in an authenticated POST body", asy
 
 test("extension settings routes show startup state, complete commands, and withheld reasons", async () => {
   const browser = fakeGlobal({ fragment: "#/settings/mcp" });
+  const copied = [];
+  browser.global.navigator = { clipboard: { writeText: async (path) => copied.push(path) } };
   const document = new FakeDocument();
   const command = `python -m ${"example.".repeat(600)}server`;
   const client = fakeClient(fixtureRoadmap(), {
@@ -549,8 +551,18 @@ test("extension settings routes show startup state, complete commands, and withh
         { name: "live-at-startup", command, started: true },
         { name: "offline-at-startup", command: "python -m offline", started: false },
       ],
-      skills: ["zeta", "alpha"],
-      plugins: ["west", "east"],
+      skills: [
+        { name: "zeta", path: "/home/example/.symphonai/skills/zeta.md" },
+        { name: "alpha", path: ".symphonai/skills/alpha.md" },
+      ],
+      plugins: [
+        { name: "west", path: "/home/example/.symphonai/plugins/west" },
+        { name: "east", path: ".symphonai/plugins/east" },
+      ],
+      agents: [
+        { name: "reviewer", path: "" },
+        { name: "builder", path: ".symphonai/agents/builder.toml" },
+      ],
       withheld: [
         { scope: "project", directory: ".symphonai/skills", names: ["blocked"], reason: "repository not trusted" },
         { scope: "user", directory: "/users/example/plugins", names: [] },
@@ -577,16 +589,40 @@ test("extension settings routes show startup state, complete commands, and withh
   assert.doesNotMatch(visibleText(content), /running/i);
 
   await open("Skills");
-  assert.deepEqual(walk(content).filter((value) => value.tagName === "LI").map((value) => value.textContent), ["alpha", "zeta"]);
+  assert.deepEqual(rowCells(), [
+    ["alpha", ".symphonai/skills/alpha.md"],
+    ["zeta", "/home/example/.symphonai/skills/zeta.md"],
+  ]);
+  await find(content, (value) => value.tagName === "BUTTON" && value.textContent === "Copy").dispatch("click");
+  assert.deepEqual(copied, [".symphonai/skills/alpha.md"]);
 
   await open("Plugins");
-  assert.deepEqual(walk(content).filter((value) => value.tagName === "LI").map((value) => value.textContent), ["east", "west"]);
+  assert.deepEqual(rowCells(), [
+    ["east", ".symphonai/plugins/east"],
+    ["west", "/home/example/.symphonai/plugins/west"],
+  ]);
+  delete browser.global.navigator;
+  await find(content, (value) => value.tagName === "BUTTON" && value.textContent === "Copy").dispatch("click");
+  assert.deepEqual(copied, [".symphonai/skills/alpha.md"]);
+
+  await open("Agents");
+  assert.deepEqual(rowCells(), [
+    ["builder", ".symphonai/agents/builder.toml"],
+    ["reviewer", ""],
+  ]);
 
   await open("Inventory");
   assert.deepEqual(rowCells(), [
     ["project", ".symphonai/skills", "blocked", "repository not trusted"],
     ["user", "/users/example/plugins", "", "No reason recorded."],
   ]);
+});
+
+test("definition settings offer no file-write call", async () => {
+  const source = await readFile(new URL("../src/client.js", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../src/app.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /request\("POST",\s*"\/file"/);
+  assert.doesNotMatch(appSource, /storeDefinition|writeDefinition|editDefinition/);
 });
 
 test("an empty extension inventory says nothing was withheld", async () => {

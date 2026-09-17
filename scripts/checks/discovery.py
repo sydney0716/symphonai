@@ -88,6 +88,10 @@ def user_missing_and_safe_default() -> None:
         for kind in KINDS:
             if tuple(_mapping(loaded, kind)) != (f"user_{kind}",):
                 fail(f"trust=None did not load only user {kind}: {loaded!r}")
+            suffix = ".toml" if kind == "agents" else ".md" if kind == "skills" else ""
+            expected_path = user_root / kind / f"user_{kind}{suffix}"
+            if _mapping(loaded, kind).paths != {f"user_{kind}": expected_path}:
+                fail(f"user {kind} lost its source path")
         expected_withheld = tuple(
             Offered(
                 Scope.PROJECT,
@@ -98,6 +102,10 @@ def user_missing_and_safe_default() -> None:
         )
         if loaded.withheld != expected_withheld:
             fail(f"trust=None did not report every repository offer: {loaded!r}")
+        for offered in loaded.withheld:
+            suffix = ".toml" if offered.directory.name == "agents" else ".md" if offered.directory.name == "skills" else ""
+            if offered.paths != (offered.directory / f"repo_{offered.directory.name}{suffix}",):
+                fail("withheld offer lost its source path")
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "repo"
@@ -129,6 +137,10 @@ def trust_matrix() -> None:
                 members = _mapping(loaded, kind)
                 if ("repo_member" in members) is not accepted:
                     fail(f"{kind} {label} trust result was wrong: {loaded!r}")
+                if accepted:
+                    suffix = ".toml" if kind == "agents" else ".md" if kind == "skills" else ""
+                    if members.paths != {"repo_member": root / ".symphonai" / kind / f"repo_member{suffix}"}:
+                        fail(f"trusted {kind} lost its source path")
                 offered = [item for item in loaded.withheld if item.directory.name == kind]
                 if accepted and offered:
                     fail(f"trusted {kind} was still reported withheld: {offered!r}")
@@ -190,6 +202,10 @@ def withheld_without_loading() -> None:
         )
         if loaded.withheld != expected:
             fail(f"withheld filename listing was incomplete: {loaded.withheld!r}")
+        for offered in loaded.withheld:
+            suffix = ".toml" if offered.directory.name == "agents" else ".md" if offered.directory.name == "skills" else ""
+            if offered.paths != (offered.directory / f"listed_{offered.directory.name}{suffix}",):
+                fail("withheld filename path was incomplete")
 
 
 @check("discovery.cross_scope_collisions")

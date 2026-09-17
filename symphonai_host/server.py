@@ -451,6 +451,20 @@ class HostServer:
                             else str(resolved)
                         )
 
+                    def roster(kind: str) -> list[dict[str, str]]:
+                        if extensions is None:
+                            return []
+                        members = getattr(extensions, kind)
+                        paths = getattr(members, "paths", {})
+                        return [
+                            {
+                                "name": name,
+                                "path": display_directory(source) if source is not None else "",
+                            }
+                            for name in sorted(members)
+                            for source in (paths.get(name, getattr(members[name], "path", None)),)
+                        ]
+
                     ceiling = None if extensions is None else extensions.ceiling
                     settings = {
                         "config": [] if extensions is None else [
@@ -482,9 +496,9 @@ class HostServer:
                             {"name": spec.name, "command": shlex.join(spec.command), "started": spec.enabled and host._mcp_started}
                             for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)
                         ],
-                        "agents": [] if extensions is None else sorted(extensions.agents),
-                        "skills": [] if extensions is None else sorted(extensions.skills),
-                        "plugins": [] if extensions is None else sorted(extensions.plugins),
+                        "agents": roster("agents"),
+                        "skills": roster("skills"),
+                        "plugins": roster("plugins"),
                         "withheld": [] if extensions is None else [
                             {
                                 "scope": offered.scope.value,

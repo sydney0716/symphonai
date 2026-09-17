@@ -55,17 +55,26 @@ test("server rows retain the full command and startup state", () => {
 
 test("rosters sort each extension kind and ignore unknown kinds", () => {
   const reply = { settings: {
-    skills: ["zeta", "alpha"],
-    plugins: ["west", "east"],
-    agents: ["reviewer", "builder"],
+    skills: [{ name: "zeta", path: "/home/skills/zeta.md" }, { name: "alpha", path: ".symphonai/skills/alpha.md" }],
+    plugins: [{ name: "west", path: "/home/plugins/west" }, { name: "east", path: ".symphonai/plugins/east" }],
+    agents: [{ name: "reviewer", path: "" }, { name: "builder", path: ".symphonai/agents/builder.toml" }],
   } };
 
-  assert.deepEqual(rosterRows(reply, "skills"), ["alpha", "zeta"]);
-  assert.deepEqual(rosterRows(reply, "plugins"), ["east", "west"]);
-  assert.deepEqual(rosterRows(reply, "agents"), ["builder", "reviewer"]);
+  assert.deepEqual(rosterRows(reply, "skills"), [
+    { name: "alpha", path: ".symphonai/skills/alpha.md" },
+    { name: "zeta", path: "/home/skills/zeta.md" },
+  ]);
+  assert.deepEqual(rosterRows(reply, "plugins"), [
+    { name: "east", path: ".symphonai/plugins/east" },
+    { name: "west", path: "/home/plugins/west" },
+  ]);
+  assert.deepEqual(rosterRows(reply, "agents"), [
+    { name: "builder", path: ".symphonai/agents/builder.toml" },
+    { name: "reviewer", path: "" },
+  ]);
   assert.deepEqual(rosterRows(reply, "unknown"), []);
   assert.deepEqual(rosterRows({ settings: {} }, "skills"), []);
-  assert.deepEqual(reply.settings.skills, ["zeta", "alpha"]);
+  assert.equal(reply.settings.skills[0].name, "zeta");
 });
 
 test("inventory rows retain withheld details and explain an absent reason", () => {

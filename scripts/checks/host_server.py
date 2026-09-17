@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import get_args, get_type_hints
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -766,7 +767,8 @@ def check_settings_route() -> None:
                 "reason": "repository not trusted for skills",
             }]:
                 fail(f"settings withheld diagnostics changed: {settings['withheld']!r}")
-            if settings["agents"] != [] or settings["skills"] != [] or settings["plugins"] != []:
+            empty_rosters = {"agents": [], "skills": [], "plugins": []}
+            if {kind: settings[kind] for kind in empty_rosters} != empty_rosters:
                 fail("settings exposed untrusted extension names as loaded")
             providers = settings["providers"]
             if providers != [
@@ -814,6 +816,88 @@ def check_settings_route() -> None:
                 started_host.close()
         finally:
             pool.close()
+
+
+@check("host_server.settings_roster_paths")
+def check_settings_roster_paths() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        root.mkdir()
+        user_base = home / ".symphonai"
+        project_base = root / ".symphonai"
+
+        def write_members(base: Path, name: str) -> None:
+            agents = base / "agents"
+            skills = base / "skills"
+            plugin = base / "plugins" / name
+            agents.mkdir(parents=True)
+            skills.mkdir()
+            plugin.mkdir(parents=True)
+            (agents / f"{name}.toml").write_text(
+                f'prompt = "{name}"\n[model]\nprovider = "fake"\n', encoding="utf-8"
+            )
+            (skills / f"{name}.md").write_text(
+                "+++\n" f'name = "{name}"\n' f'description = "{name}"\n'
+                f'when_to_use = "{name}"\n' "+++\nbody\n",
+                encoding="utf-8",
+            )
+            (plugin / "plugin.toml").write_text(
+                f'name = "{name}"\nversion = "1"\ndescription = "{name}"\n',
+                encoding="utf-8",
+            )
+
+        write_members(user_base, "zeta")
+        write_members(project_base, "alpha")
+        (user_base / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\n'
+            'allow = ["agents", "skills", "plugins"]\n',
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        host = HostServer(
+            FakeModelProvider(), PermissionPolicy(repo_root=root),
+            sessions_root=root / "sessions", extensions=extensions,
+        )
+        host.start()
+        try:
+            connection, response = _request(host, "GET", "/settings", headers=_headers(host))
+            try:
+                settings = json.loads(response.read())["settings"]
+                if response.status != 200:
+                    fail("settings roster route did not respond successfully")
+            finally:
+                connection.close()
+            for kind, suffix in (("agents", ".toml"), ("skills", ".md"), ("plugins", "")):
+                expected = [
+                    {"name": "alpha", "path": f".symphonai/{kind}/alpha{suffix}"},
+                    {"name": "zeta", "path": str((user_base / kind / f"zeta{suffix}").resolve())},
+                ]
+                if settings[kind] != expected:
+                    fail(f"settings {kind} roster lost sorted names or source paths: {settings[kind]!r}")
+        finally:
+            host.close()
+
+        unknown_source = replace(extensions, agents={"orphan": extensions.agents["alpha"]})
+        unknown_host = HostServer(
+            FakeModelProvider(), PermissionPolicy(repo_root=root),
+            sessions_root=root / "other-sessions", extensions=unknown_source,
+        )
+        unknown_host.start()
+        try:
+            connection, response = _request(unknown_host, "GET", "/settings", headers=_headers(unknown_host))
+            try:
+                settings = json.loads(response.read())["settings"]
+                if response.status != 200 or settings["agents"] != [{"name": "orphan", "path": ""}]:
+                    fail("settings dropped an agent with unknown source path")
+            finally:
+                connection.close()
+        finally:
+            unknown_host.close()
+
+    source = Path(host_server_module.__file__ or "").read_text(encoding="utf-8")
+    if '"/file"' in source.partition("def do_POST")[2]:
+        fail("host POST handler offers a file write route")
 
 
 @check("host_server.app_routes")

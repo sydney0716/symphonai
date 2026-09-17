@@ -149,10 +149,11 @@ ordinary bearer header; an app query token or app cookie does not authorize it.
 An authenticated `GET /settings` returns a `settings` object with `config`
 entries (`key`, `value`, `scope`), `ceiling`, `trust`, `hooks` (`event`, `command`),
 `mcp_servers` (`name`, `command`, `started`), sorted `agents`, `skills`, and
-`plugins` names, `withheld` entries (`scope`, `directory`, `names`, `reason`),
+`plugins` entries (`name`, `path`), `withheld` entries (`scope`, `directory`, `names`, `reason`),
 and `providers` entries (`name`, `env_var`, `key_present`). A withheld
-`directory` is repository-relative within the repository and absolute
-otherwise. Provider key presence is a boolean; key values never appear in the
+`directory` and roster `path` are repository-relative within the repository
+and absolute otherwise; an unknown roster path is `""`. Provider key presence
+is a boolean; key values never appear in the
 response. Only the ordinary bearer header authorizes this route.
 
 Provider keys can be stored with authenticated `POST /credentials` and a JSON
