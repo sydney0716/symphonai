@@ -25,6 +25,7 @@ from symphonai_api.session import SessionError, TranscriptError
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_host.broker import EventBroker, Subscription
+from symphonai_host.credentials import CredentialError, apply_to_environment, store
 from symphonai_host.protocol import (
     ApprovalRequested,
     HistoryMessage,
@@ -567,10 +568,36 @@ class HostServer:
                 self.wfile.flush()
 
             def do_POST(self) -> None:
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open"):
+                credential_route = urlsplit(self.path).path == "/credentials"
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
+                    return
+                if credential_route:
+                    try:
+                        payload = self._read_object()
+                    except ProtocolError:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid credential request"})
+                        return
+                    name = payload.get("name")
+                    value = payload.get("value")
+                    if name not in (ANTHROPIC_KEY_ENV_VAR, GEMINI_KEY_ENV_VAR, OPENAI_KEY_ENV_VAR):
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "unknown credential name"})
+                        return
+                    if not isinstance(value, str):
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": f"invalid value for {name}"})
+                        return
+                    try:
+                        store(name, value)
+                    except CredentialError:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"credential store unavailable for {name}"})
+                        return
+                    if value:
+                        apply_to_environment(os.environ, {name: value})
+                    else:
+                        os.environ.pop(name, None)
+                    self._json(HTTPStatus.OK, {"stored": True, "name": name})
                     return
                 kind = self.path.removeprefix("/")
                 try:

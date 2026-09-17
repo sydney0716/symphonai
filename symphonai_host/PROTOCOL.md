@@ -155,6 +155,16 @@ and `providers` entries (`name`, `env_var`, `key_present`). A withheld
 otherwise. Provider key presence is a boolean; key values never appear in the
 response. Only the ordinary bearer header authorizes this route.
 
+Provider keys can be stored with authenticated `POST /credentials` and a JSON
+body containing `name` and `value`. `name` must be one of the host's known
+`API_KEY_ENV_VAR` names. An empty `value` deletes the stored entry and unsets
+the process variable. A successful response is `{"stored": true, "name":
+<name>}` and never includes the value. Query tokens and app cookies do not
+authorize this route. The host loads `~/.symphonai/credentials.json` at startup
+(or `SYMPHONAI_CREDENTIALS_FILE` when set); a non-empty launch environment
+value takes precedence over the stored value. The file is private to the OS
+user and a file wider than mode `0600` prevents startup.
+
 `GET /events` returns `text/event-stream`. Each event is one `data:` line
 whose content is an `event` frame containing the event payload above. A client
 that has fallen behind receives an `error` frame with `{"dropped": n}` before

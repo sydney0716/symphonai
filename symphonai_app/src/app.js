@@ -128,13 +128,44 @@ export async function start({ global, document, client }) {
 
   function showSettings(section) {
     if (section === "models") {
-      const rows = modelRows(settingsReply).map(({ name, envVar, present }) => [
+      const models = modelRows(settingsReply);
+      const rows = models.map(({ name, envVar, present }) => [
         name, envVar, present ? "present" : "absent",
       ]);
+      const table = settingsTable(["Provider", "Environment variable", "Status"], rows);
+      const controls = element(document, "div", { className: "credential-controls" });
+      for (const [index, { envVar }] of models.entries()) {
+        const row = element(document, "div");
+        const label = element(document, "label", { text: `${envVar}: ` });
+        const input = element(document, "input");
+        input.type = "password";
+        input.autocomplete = "off";
+        const save = element(document, "button", { text: "Save" });
+        save.type = "button";
+        const remove = element(document, "button", { text: "Remove" });
+        remove.type = "button";
+        const notice = element(document, "span");
+        async function write(value) {
+          input.value = "";
+          try {
+            await boundary.storeCredential(envVar, value);
+            table.children[index + 1].children[2].textContent = value ? "present" : "absent";
+            notice.textContent = value ? "Key stored." : "Key removed.";
+          } catch {
+            notice.textContent = "Could not update key.";
+          }
+        }
+        listen(save, "click", () => write(input.value));
+        listen(remove, "click", () => write(""));
+        append(label, input);
+        append(row, label, save, remove, notice);
+        append(controls, row);
+      }
       replace(
         settingsContent,
         element(document, "h2", { text: "Models" }),
-        settingsTable(["Provider", "Environment variable", "Status"], rows),
+        table,
+        controls,
       );
       return;
     }

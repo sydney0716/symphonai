@@ -76,7 +76,7 @@ test("inventory rows retain withheld details and explain an absent reason", () =
 
   assert.deepEqual(inventoryRows(reply), [
     { scope: "project", directory: ".symphonai/skills", names: ["blocked"], reason: "repository not trusted" },
-    { scope: "user", directory: "/users/example/plugins", names: [], reason: "This scope offered nothing." },
+    { scope: "user", directory: "/users/example/plugins", names: [], reason: "No reason recorded." },
   ]);
   assert.deepEqual(inventoryRows({ settings: {} }), []);
 });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 import { start } from "../src/app.js";
+import { createClient } from "../src/client.js";
 import { DISPATCHING, RUNNING } from "../src/turn.js";
 
 const BASE = "specs/18/18a-a-client-for-the-boundary.md";
@@ -179,7 +180,7 @@ function fakeClient(
     settings = { settings: {} },
   } = {},
 ) {
-  const calls = { approve: [], file: [], openSession: [], prompt: [], sessions: [], settings: 0 };
+  const calls = { approve: [], credentials: [], file: [], openSession: [], prompt: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -232,6 +233,10 @@ function fakeClient(
     async settings() {
       calls.settings += 1;
       return settings;
+    },
+    async storeCredential(name, value) {
+      calls.credentials.push({ name, value });
+      return { stored: true, name };
     },
     async sessions(limit) {
       calls.sessions.push(limit);
@@ -484,6 +489,56 @@ test("settings routes render general origins, model presence, and unknown fallba
   assert.equal(rowCells().length, 3);
 });
 
+test("model settings save and remove a key without displaying its value", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/settings/models" });
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { providers: [
+      { name: "openai", env_var: "OPENAI_API_KEY", key_present: false },
+    ] } },
+  });
+  await start({ global: browser.global, document, client });
+  const content = find(document.getElementById("page"), (value) => value.className === "settings-content");
+  const controls = find(content, (value) => value.className === "credential-controls");
+  const input = find(controls, (value) => value.tagName === "INPUT");
+  const status = find(content, (value) => value.className === "settings-row").children[2];
+  const secret = "recognisable-app-key-fixture";
+
+  assert.equal(input.type, "password");
+  input.value = secret;
+  await find(controls, (value) => value.tagName === "BUTTON" && value.textContent === "Save").dispatch("click");
+  assert.deepEqual(client.calls.credentials, [{ name: "OPENAI_API_KEY", value: secret }]);
+  assert.equal(input.value, "");
+  assert.equal(status.textContent, "present");
+  assert.ok(!visibleText(content).includes(secret));
+
+  await find(controls, (value) => value.tagName === "BUTTON" && value.textContent === "Remove").dispatch("click");
+  assert.deepEqual(client.calls.credentials.at(-1), { name: "OPENAI_API_KEY", value: "" });
+  assert.equal(status.textContent, "absent");
+});
+
+test("credential client sends the value only in an authenticated POST body", async () => {
+  let request;
+  const client = createClient({
+    port: 4312,
+    token: "fixture-token",
+    fetch: async (url, options) => {
+      request = { url, options };
+      return { status: 200, json: async () => ({ stored: true, name: "OPENAI_API_KEY" }) };
+    },
+  });
+  const reply = await client.storeCredential("OPENAI_API_KEY", "recognisable-client-fixture");
+
+  assert.deepEqual(reply, { stored: true, name: "OPENAI_API_KEY" });
+  assert.equal(request.url, "http://127.0.0.1:4312/credentials");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.headers.Authorization, "Bearer fixture-token");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    name: "OPENAI_API_KEY", value: "recognisable-client-fixture",
+  });
+  assert.ok(!request.url.includes("recognisable-client-fixture"));
+});
+
 test("extension settings routes show startup state, complete commands, and withheld reasons", async () => {
   const browser = fakeGlobal({ fragment: "#/settings/mcp" });
   const document = new FakeDocument();
@@ -530,7 +585,7 @@ test("extension settings routes show startup state, complete commands, and withh
   await open("Inventory");
   assert.deepEqual(rowCells(), [
     ["project", ".symphonai/skills", "blocked", "repository not trusted"],
-    ["user", "/users/example/plugins", "", "This scope offered nothing."],
+    ["user", "/users/example/plugins", "", "No reason recorded."],
   ]);
 });
 

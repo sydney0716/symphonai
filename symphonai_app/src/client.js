@@ -278,6 +278,10 @@ export function createClient({
       return request("GET", "/settings");
     },
 
+    storeCredential(name, value) {
+      return request("POST", "/credentials", { name, value });
+    },
+
     survey() {
       return request("GET", "/survey");
     },

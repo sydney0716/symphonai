@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -19,6 +20,7 @@ from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.runner import standard_tool_registry
 from symphonai_host.server import HostServer
+from symphonai_host.credentials import CredentialError, apply_to_environment, load
 
 
 def _provider(name: str, model: str | None, base_url: str | None):
@@ -53,6 +55,11 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = _arguments(argv)
+    try:
+        apply_to_environment(os.environ, load())
+    except CredentialError as exc:
+        print(f"credential error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     try:
         extensions = load_extensions(repo_root=arguments.repo_root)
     except ConfigError as exc:

@@ -33,6 +33,7 @@ from scripts.checks import hooks  # noqa: E402, F401
 from scripts.checks import skills  # noqa: E402, F401
 from scripts.checks import host_protocol  # noqa: E402, F401
 from scripts.checks import host_server  # noqa: E402, F401
+from scripts.checks import credentials  # noqa: E402, F401
 from scripts.checks import host_approvals  # noqa: E402, F401
 from scripts.checks import host_client  # noqa: E402, F401
 from scripts.checks import host_sessions  # noqa: E402, F401

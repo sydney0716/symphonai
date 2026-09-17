@@ -57,6 +57,6 @@ export function inventoryRows(reply) {
       scope,
       directory,
       names,
-      reason: reason || "This scope offered nothing.",
+      reason: reason || "No reason recorded.",
     }));
 }
