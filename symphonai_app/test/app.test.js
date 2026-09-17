@@ -173,9 +173,13 @@ function fixtureRoadmap({ allDone = false } = {}) {
 
 function fakeClient(
   roadmapText = fixtureRoadmap(),
-  { project = { repo_root: "/work/current", name: "current" }, sessions = [] } = {},
+  {
+    project = { repo_root: "/work/current", name: "current" },
+    sessions = [],
+    settings = { settings: {} },
+  } = {},
 ) {
-  const calls = { approve: [], file: [], openSession: [], prompt: [], sessions: [] };
+  const calls = { approve: [], file: [], openSession: [], prompt: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -224,6 +228,10 @@ function fakeClient(
     },
     async project() {
       return project;
+    },
+    async settings() {
+      calls.settings += 1;
+      return settings;
     },
     async sessions(limit) {
       calls.sessions.push(limit);
@@ -425,6 +433,55 @@ test("stored routes reopen, but a URL fragment wins", async () => {
   assert.equal(app.route().page, "settings");
   assert.equal(app.route().section, "mcp");
   assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
+});
+
+test("settings routes render general origins, model presence, and unknown fallback", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/general" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: {
+      config: [
+        { key: "z.list", value: ["one", "two"], scope: "project" },
+        { key: "a.enabled", value: false, scope: "user" },
+        { key: "private.marker", value: "config-only-marker", scope: "private" },
+      ],
+      providers: [
+        { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
+        { name: "gemini", env_var: "GEMINI_API_KEY", key_present: false },
+      ],
+    } },
+  });
+  const app = await start({ global: browser.global, document, client });
+  const pane = document.getElementById("page").children[0];
+  const content = find(pane, (value) => value.className === "settings-content");
+  const rowCells = () => walk(content)
+    .filter((value) => value.className === "settings-row")
+    .map((row) => row.children.map((cell) => cell.textContent));
+
+  assert.equal(client.calls.settings, 1);
+  assert.equal(app.route().section, "general");
+  assert.deepEqual(rowCells(), [
+    ["a.enabled", "off", "user"],
+    ["private.marker", "config-only-marker", "private"],
+    ["z.list", "one, two", "project"],
+  ]);
+
+  const modelsLink = find(pane, (value) => value.tagName === "A" && value.textContent === "Models");
+  await modelsLink.dispatch("click");
+  assert.equal(browser.global.location.hash, "#/settings/models");
+  assert.deepEqual(rowCells(), [
+    ["gemini", "GEMINI_API_KEY", "absent"],
+    ["openai", "OPENAI_API_KEY", "present"],
+  ]);
+  const modelText = visibleText(content);
+  assert.ok(!modelText.includes("config-only-marker"));
+  assert.doesNotMatch(modelText, /\bkey\s*[:=]\s*\S+/i);
+
+  browser.global.location.hash = "#/settings/unknown";
+  browser.dispatch("hashchange");
+  assert.equal(app.route().section, "unknown");
+  assert.equal(content.children[0].textContent, "General");
+  assert.equal(rowCells().length, 3);
 });
 
 test("throwing local storage cannot stop startup or navigation", async () => {

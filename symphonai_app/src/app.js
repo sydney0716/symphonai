@@ -5,6 +5,7 @@ import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
+import { generalRows, modelRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
@@ -95,22 +96,63 @@ export async function start({ global, document, client }) {
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
-  const [project, sessions, roadmapReply] = await Promise.all([
+  const [project, sessions, roadmapReply, settingsReply] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
+    boundary.settings(),
   ]);
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
   );
   const settingsPane = element(document, "section", { className: "settings-pane" });
-  append(settingsPane, element(document, "h1", { text: "Settings" }));
+  const settingsSections = element(document, "nav", { className: "settings-sections" });
+  const settingsContent = element(document, "div", { className: "settings-content" });
+  append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
   let promptFailure = "";
   let route;
 
+  function settingsTable(headings, rows) {
+    const table = element(document, "table", { className: "settings-table" });
+    const heading = element(document, "tr");
+    append(heading, ...headings.map((text) => element(document, "th", { text })));
+    append(table, heading);
+    for (const cells of rows) {
+      const row = element(document, "tr", { className: "settings-row" });
+      append(row, ...cells.map((text) => element(document, "td", { text })));
+      append(table, row);
+    }
+    return table;
+  }
+
+  function showSettings(section) {
+    if (section === "models") {
+      const rows = modelRows(settingsReply).map(({ name, envVar, present }) => [
+        name, envVar, present ? "present" : "absent",
+      ]);
+      replace(
+        settingsContent,
+        element(document, "h2", { text: "Models" }),
+        settingsTable(["Provider", "Environment variable", "Status"], rows),
+      );
+      return;
+    }
+    const rows = generalRows(settingsReply).map(({ key, value, scope }) => [
+      key, value, scope,
+    ]);
+    replace(
+      settingsContent,
+      element(document, "h2", { text: "General" }),
+      settingsTable(["Setting", "Value", "Scope"], rows),
+    );
+  }
+
   function showPage(nextRoute) {
     route = nextRoute;
+    if (route.page === "settings") {
+      showSettings(route.section);
+    }
     const pane = route.page === "roadmap"
       ? roadmapPane
       : route.page === "settings" ? settingsPane : chatPane;
@@ -125,6 +167,19 @@ export async function start({ global, document, client }) {
       global.location.hash = formatRoute(next);
     }
   }
+
+  const sectionLinks = ["general", "models"].map((section) => {
+    const link = element(document, "a", {
+      text: section[0].toUpperCase() + section.slice(1),
+    });
+    link.href = formatRoute({ page: "settings", section });
+    listen(link, "click", (event) => {
+      event.preventDefault();
+      navigate({ page: "settings", section });
+    });
+    return link;
+  });
+  replace(settingsSections, ...sectionLinks);
 
   const links = PAGES.map((page) => {
     const pageRoute = { page, section: "" };

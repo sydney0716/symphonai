@@ -105,6 +105,27 @@ button.session-link {
   background: #171d26;
 }
 
+.settings-sections a {
+  display: inline-block;
+  margin-right: 1rem;
+  color: inherit;
+}
+
+.settings-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.settings-table th,
+.settings-table td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #394150;
+  text-align: left;
+  vertical-align: top;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .chat-pane {
   display: grid;
   grid-template-rows: 1fr auto auto;

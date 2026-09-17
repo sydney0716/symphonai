@@ -25,6 +25,7 @@ NODE_TESTS = {
     "app.roadmap": "roadmap.test.js",
     "app.route": "route.test.js",
     "app.spec_view": "spec_view.test.js",
+    "app.settings": "settings.test.js",
     "app.approvals": "approvals.test.js",
     "app.page": "app.test.js",
 }
@@ -136,6 +137,11 @@ def route() -> None:
 @check("app.spec_view", needs_repository=True)
 def spec_view() -> None:
     _run_node_test("spec_view.test.js")
+
+
+@check("app.settings")
+def settings() -> None:
+    _run_node_test("settings.test.js")
 
 
 @check("app.approvals")
