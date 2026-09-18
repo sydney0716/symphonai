@@ -1,7 +1,7 @@
 """The Leader: digests a user goal and dispatches/reuses named subagents.
 
-The leader is itself an `ApiAgent`, but with exactly one tool available:
-`dispatch_subagent`. Calling it with a new `subagent_name` creates a fresh
+The leader is itself an `ApiAgent` with standard tools and
+`dispatch_subagent`. Calling dispatch with a new `subagent_name` creates a fresh
 subagent (its own `ApiAgent`, backed by the one configured subagent
 provider, with capabilities and limits taken from its `AgentSpec`); calling it
 again with the same name continues that subagent's existing conversation
@@ -189,7 +189,7 @@ class SubagentRecord:
 
 
 class DispatchSubagentTool(LocalTool):
-    """The leader's only tool: create-or-reuse a named subagent and run it.
+    """Create-or-reuse a named subagent and run it.
 
     A child's effective policy is the meet of the leader policy and its
     `AgentSpec` ceiling. Its first dispatch seeds context according to the
@@ -214,6 +214,7 @@ class DispatchSubagentTool(LocalTool):
         parent_run: AgentRun | None = None,
         dispatching_depth: int = -1,
         hooks: HookRunner | None = None,
+        stream: bool = False,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -234,6 +235,7 @@ class DispatchSubagentTool(LocalTool):
         self._parent_messages: list[Message] = []
         self._dispatching_depth = dispatching_depth
         self._hooks = hooks
+        self._stream = stream
         self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
@@ -413,6 +415,7 @@ class DispatchSubagentTool(LocalTool):
                     tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
                     agent_ref=agent_ref,
                     events=self._events,
+                    stream=self._stream,
                     budget=spec.budget,
                     call_class=spec.call_class,
                     transcript=(
@@ -586,6 +589,7 @@ class LeaderConfig:
     max_consecutive_compaction_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
     max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
     extensions: Extensions | None = None
+    stream: bool = False
 
 
 @dataclass
@@ -660,16 +664,27 @@ class Leader:
             subagent_specs=config.subagent_specs,
             leases=self._leases,
             hooks=self._hook_runner,
+            stream=config.stream,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
+        leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
+        standard_tools = standard_tool_registry()
+        leader_tools.update(standard_tools)
         self._agent = ApiAgent(
             provider=config.leader_provider,
-            tools={DISPATCH_TOOL_NAME: self._dispatch_tool},
+            tools=leader_tools,
             policy=leader_policy,
             max_turns=config.max_leader_turns,
-            tool_schemas=[dispatch_subagent_tool_schema(config.leader_provider.wire_format)],
+            tool_schemas=[
+                dispatch_subagent_tool_schema(config.leader_provider.wire_format),
+                *tool_registry_schemas(
+                    standard_tools,
+                    config.leader_provider.wire_format,
+                ),
+            ],
             agent_ref=self._agent_ref,
             events=self._event_sink,
+            stream=config.stream,
             call_class=CallClass.FOREGROUND,
             transcript=(
                 None
@@ -775,6 +790,11 @@ class Leader:
         self._chat_messages.clear()
         self._automatic_compaction_breaker.reset()
         return self.clear_subagents()
+
+    def seed_chat(self, messages: Sequence[Message]) -> None:
+        """Set the history used by the next chat without changing subagents."""
+
+        self._chat_messages = list(messages)
 
     def clear_subagents(self) -> int:
         """Clear all dispatched subagents and return how many were removed."""

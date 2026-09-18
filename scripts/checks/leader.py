@@ -24,6 +24,7 @@ from symphonai_api.cancellation import (
     OperationCancelled,
 )
 from symphonai_api.events import (
+    AssistantTextDelta,
     CollectingSink,
     CompactionApplied,
     RunFailed,
@@ -56,6 +57,7 @@ from symphonai_api.providers.openai_provider import (
 )
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import SessionStore
+from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import (
     InterruptBehavior,
@@ -1272,6 +1274,96 @@ def check_chat_history() -> None:
         contents = [m.text for m in second.leader_messages]
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
+
+
+@check("leader.standard_tools")
+def check_leader_standard_tools() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                ToolCall("read", "read_file", {"path": "existing.txt"}),
+                ToolCall("denied", "read_file", {"path": str(ws.outside / "outside.txt")}),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "finished")),
+        ])
+        leader = Leader(LeaderConfig(provider, FakeModelProvider(), str(ws.root)))
+        result = leader.run("read existing.txt")
+        tool_results = {
+            message.tool_result.tool_call_id: message.tool_result
+            for message in result.leader_messages
+            if message.tool_result is not None
+        }
+        if result.final_answer != "finished" or result.subagents:
+            fail("leader did not finish the direct tool run without subagents")
+        if not tool_results.get("read") or not tool_results["read"].ok or "hello from disk" not in tool_results["read"].content:
+            fail(f"leader did not read the file with its standard tool: {tool_results!r}")
+        if not tool_results.get("denied") or tool_results["denied"].ok:
+            fail(f"leader tool escaped its workspace policy: {tool_results!r}")
+        if "dispatch_subagent" not in leader._agent._tools or "read_file" not in leader._agent._tools:
+            fail("leader execution registry omitted dispatch or a standard tool")
+        sent_tools = provider.requests[0].tools
+        if [schema.get("name") for schema in sent_tools] != list(leader._agent._tools):
+            fail(f"leader model tool list did not match its execution registry: {sent_tools!r}")
+
+
+@check("leader.streaming")
+def check_leader_streaming() -> None:
+    with workspace() as ws:
+        sink = CollectingSink()
+        leader_provider = FakeModelProvider(streams=[
+            [StreamCompleted(ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                _dispatch("worker", "answer", "stream-dispatch")
+            ])))],
+            [TextDelta("lead"), TextDelta("er"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
+        ])
+        child_provider = FakeModelProvider(streams=[
+            [TextDelta("chi"), TextDelta("ld"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
+        ])
+        leader = Leader(LeaderConfig(leader_provider, child_provider, str(ws.root), events=sink, stream=True))
+        result = leader.run("delegate")
+        child = result.subagents.get("worker")
+        if child is None or "dispatch_subagent" in child.agent._tools:
+            fail("spawned subagent was missing or could delegate recursively")
+        deltas = sink.of_type(AssistantTextDelta)
+        leader_text = "".join(event.text for event in deltas if event.agent_id == result.agent.agent_id)
+        child_text = "".join(event.text for event in deltas if event.agent_id == child.agent_ref.agent_id)
+        if result.final_answer != "leader" or leader_text != "leader":
+            fail(f"leader streamed text did not match its reply: {leader_text!r}")
+        if child_text != "child" or child.messages[-1].text != "child":
+            fail(f"subagent streamed text did not match its reply: {child_text!r}")
+        if LeaderConfig(FakeModelProvider(), FakeModelProvider(), str(ws.root)).stream is not False:
+            fail("leader streaming default changed")
+
+
+@check("leader.seeded_chat")
+def check_leader_seeded_chat() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("worker", "start")])),
+            ModelResponse(Message(Role.ASSISTANT, "first run")),
+            ModelResponse(Message(Role.ASSISTANT, "third reply")),
+        ])
+        sink = CollectingSink()
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "child"))]),
+            str(ws.root),
+            events=sink,
+        ))
+        leader.run("start")
+        existing_child = leader.subagents["worker"]
+        event_count = len(sink.events)
+        call_count = provider.call_count
+        seeded = [Message(Role.USER, "first"), Message(Role.ASSISTANT, "second")]
+        leader.seed_chat(seeded)
+        if len(sink.events) != event_count or provider.call_count != call_count:
+            fail("seeding chat started a run")
+        if leader.subagents.get("worker") is not existing_child:
+            fail("seeding chat changed the subagent pool")
+        leader.chat("third")
+        sent = [(message.role, message.text) for message in provider.requests[-1].messages]
+        if sent != [(Role.USER, "first"), (Role.ASSISTANT, "second"), (Role.USER, "third")]:
+            fail(f"seeded history did not reach the next model request: {sent!r}")
 
 
 @check("leader.anthropic_leader_tool_schema")
