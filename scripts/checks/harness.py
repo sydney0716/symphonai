@@ -77,7 +77,13 @@ def run(selector: str | None = None) -> int:
         print("refusing to mix selfcheck fixtures with real checks")
         return 1
 
-    repository_present = (REPOSITORY_ROOT / ".git").is_dir()
+    # A clone of the published repository has .git and none of the documents
+    # these checks read, so .git was the wrong question: it made six checks
+    # fail for anyone who cloned, while the archive publish.sh verifies has no
+    # .git and skipped them. docs/roadmap.json is present in the working
+    # repository and stripped from every published tree, which is the real
+    # distinction.
+    repository_present = (REPOSITORY_ROOT / "docs" / "roadmap.json").is_file()
 
     global _CURRENT_LABELS
     passed = 0

@@ -20,6 +20,7 @@ from scripts.checks.harness import check, fail, ok, run  # noqa: E402
 EXPECTED_REPOSITORY_CHECKS = (
     "app.roadmap",
     "app.spec_view",
+    "app.real_roadmap",
     "packaging.bundle_input",
     "packaging.page_tracked",
     "roadmap_data.schema",
@@ -196,7 +197,12 @@ def main() -> None:
             skipped.stdout.splitlines()
             == [
                 *expected_skip_lines,
-                "0 passed, 0 failed, 7 skipped, 7 selected of 7 registered",
+                # Derived, not copied: a count typed beside a list it describes
+                # goes stale the moment the list grows, which is how this
+                # assertion came to say seven of an eight-name set.
+                f"0 passed, 0 failed, {len(EXPECTED_REPOSITORY_CHECKS)} skipped, "
+                f"{len(EXPECTED_REPOSITORY_CHECKS)} selected of "
+                f"{len(EXPECTED_REPOSITORY_CHECKS)} registered",
             ],
             f"no-git skips were wrong: {skipped.stdout!r}",
         )

@@ -28,6 +28,7 @@ NODE_TESTS = {
     "app.settings": "settings.test.js",
     "app.approvals": "approvals.test.js",
     "app.page": "app.test.js",
+    "app.real_roadmap": "app_roadmap.test.js",
 }
 APP_SOURCE_EXTENSIONS = frozenset({".js", ".mjs", ".json", ".html", ".css"})
 
@@ -152,6 +153,11 @@ def approvals() -> None:
 @check("app.page")
 def page() -> None:
     _run_node_test("app.test.js")
+
+
+@check("app.real_roadmap", needs_repository=True)
+def page_roadmap() -> None:
+    _run_node_test("app_roadmap.test.js")
 
 
 @check("app.test_registration")

@@ -47,7 +47,7 @@ class FakeElement {
   }
 }
 
-class FakeDocument {
+export class FakeDocument {
   constructor() {
     const tags = {
       "app-shell": "div",
@@ -172,7 +172,7 @@ function fixtureRoadmap({ allDone = false } = {}) {
   });
 }
 
-function fakeClient(
+export function fakeClient(
   roadmapText = fixtureRoadmap(),
   {
     project = { repo_root: "/work/current", name: "current" },
@@ -722,23 +722,6 @@ test("an all-done roadmap leaves every phase folded", async () => {
   });
 
   assert.ok(document.getElementById("roadmap").children.every((phase) => !phase.open));
-});
-
-test("the real roadmap opens phase 18 and no other phase", async () => {
-  const roadmapText = await readFile(
-    new URL("../../docs/roadmap.json", import.meta.url),
-    "utf8",
-  );
-  const document = new FakeDocument();
-  await start({ global: {}, document, client: fakeClient(roadmapText) });
-  const phases = document.getElementById("roadmap").children;
-  const open = phases.filter((phase) => phase.open);
-  const phase20 = phases.find((phase) => phase.children[0].textContent.startsWith("20 ·"));
-
-  assert.equal(phases.length, JSON.parse(roadmapText).phases.length);
-  assert.equal(open.length, 1);
-  assert.match(open[0].children[0].textContent, /^18 · App —/);
-  assert.equal(phase20.open, false);
 });
 
 test("an additional fixture phase renders without a copied count", async () => {
