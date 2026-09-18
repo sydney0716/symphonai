@@ -194,7 +194,7 @@ def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
 # Captured from commit c11c7c3 -- the last tree before leader control-plane
 # wiring -- by running the probe below. Frozen rather than recomputed from
 # repository history: that would compare this change with itself once
-# committed, and fails outright in the .git-less tree publish.sh validates.
+# committed, and that commit is not in this repository's history at all.
 _DEFAULT_SPECS_PRE_07G_OUTPUT = json.loads(
     r'''
 {

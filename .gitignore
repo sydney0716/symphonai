@@ -22,3 +22,15 @@ build/
 .symphonai/config.local.toml
 
 ref/
+
+# The working documents. This repository is the published one: specs, roadmap,
+# and agent instructions stay on disk and are never committed, which is what
+# replaced publish.sh and its rebuilt-tree branch. Their history up to the
+# migration lives on the local `archive` branch.
+/specs/
+/docs/
+/CLAUDE.md
+/AGENTS.md
+/scripts/roadmap.py
+/scripts/spec_claims.sh
+/configs/agents.example.yaml

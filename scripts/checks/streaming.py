@@ -840,8 +840,8 @@ def check_stream_flag_present() -> None:
 # Captured from commit 9d5b88d -- the last tree before streaming existed -- by
 # running each provider's create_response against the bodies below. Frozen
 # rather than recomputed from `git archive HEAD`: that would compare this
-# change with itself once committed, and fails outright in a tree with no .git,
-# which is exactly what publish.sh checks before pushing.
+# change with itself once committed, and that commit is not in this
+# repository's history at all.
 _NON_STREAMING_BEFORE_05 = """
 {
   "anthropic": {"stop_reason": "tool_use", "usage": [3, 5]},

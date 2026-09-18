@@ -114,46 +114,6 @@ def _write_repository_fixture(root: Path) -> Path:
     return docs / "roadmap.schema.json"
 
 
-def _publish_verification_block() -> str:
-    source = (REPO_ROOT / "publish.sh").read_text(encoding="utf-8")
-    begin_marker = "# BEGIN published snapshot verification"
-    end_marker = "# END published snapshot verification"
-    try:
-        begin = source.index(begin_marker) + len(begin_marker)
-        end = source.index(end_marker, begin)
-    except ValueError:
-        raise RuntimeError("publish.sh omitted the snapshot verification block") from None
-    return source[begin:end].strip()
-
-
-def _write_publish_check(root: Path, skipped: tuple[str, ...], exit_code: int) -> None:
-    scripts = root / "scripts"
-    scripts.mkdir(parents=True)
-    source = ["import sys"]
-    source.extend(
-        f'print("SKIP  {name}: needs the working repository")'
-        for name in skipped
-    )
-    source.extend(
-        (
-            'print("650 passed, 0 failed, 7 skipped, 657 selected of 657 registered")',
-            f"raise SystemExit({exit_code})",
-        )
-    )
-    (scripts / "check.py").write_text("\n".join(source) + "\n", encoding="utf-8")
-
-
-def _run_publish_verification(root: Path) -> subprocess.CompletedProcess[str]:
-    command = f"set -eu\nwork=$1\n{_publish_verification_block()}"
-    return subprocess.run(
-        ["sh", "-c", command, "publish-selfcheck", str(root)],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-
 def main() -> None:
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
@@ -221,36 +181,6 @@ def main() -> None:
             "FAIL  roadmap_data.schema:" in hidden.stdout,
             f"broken repository check did not fail normally: {hidden.stdout!r}",
         )
-
-        publish_root = root / "publish"
-        _write_publish_check(publish_root, tuple(sorted(EXPECTED_REPOSITORY_CHECKS)), 1)
-        broken = _run_publish_verification(publish_root)
-        require(broken.returncode != 0, "broken published snapshot was accepted")
-        require(
-            "REFUSING: the published snapshot fails its own checks; nothing was pushed"
-            in broken.stdout,
-            f"broken snapshot omitted the refusal: {broken.stdout!r}",
-        )
-
-        exact_root = root / "exact"
-        expected_sorted = tuple(sorted(EXPECTED_REPOSITORY_CHECKS))
-        _write_publish_check(exact_root, expected_sorted, 0)
-        exact = _run_publish_verification(exact_root)
-        require(exact.returncode == 0, f"exact publish skips were refused: {exact.stdout!r}")
-
-        for label, names in (
-            ("missing", expected_sorted[:-1]),
-            ("extra", (*expected_sorted, "unexpected.eighth")),
-        ):
-            mismatch_root = root / label
-            _write_publish_check(mismatch_root, names, 0)
-            mismatch = _run_publish_verification(mismatch_root)
-            require(mismatch.returncode != 0, f"{label} publish skips were accepted")
-            require(
-                "REFUSING: the published snapshot skipped an unexpected set of checks; "
-                "nothing was pushed" in mismatch.stdout,
-                f"{label} skip mismatch omitted the refusal: {mismatch.stdout!r}",
-            )
 
     # The registry's names come from the registry. A hand-maintained copy of
     # them forced an edit in 61 reports, produced two false failures when it
