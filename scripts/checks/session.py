@@ -132,6 +132,18 @@ class _RecordingProvider(FakeModelProvider):
         return super().create_response(request, cancel=cancel)
 
 
+@check("session.harness_isolates_sessions_root")
+def check_harness_isolates_sessions_root() -> None:
+    value = os.environ.get("SYMPHONAI_SESSIONS_DIR")
+    if not value:
+        fail("check harness did not set the sessions root")
+    root = Path(value).expanduser().resolve()
+    if root.is_relative_to(Path.home().resolve()):
+        fail("check sessions root points inside the user's home directory")
+    if root.exists():
+        fail("check sessions root already exists")
+
+
 @check("session.no_transcript_no_files")
 def check_no_transcript_no_files() -> None:
     with tempfile.TemporaryDirectory() as temporary:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
@@ -87,31 +89,40 @@ def run(selector: str | None = None) -> int:
     passed = 0
     failed = 0
     skipped = 0
-    for name, function in selected:
-        if not repository_present and name in NEEDS_REPOSITORY:
-            skipped += 1
-            print(f"SKIP  {name}: needs the working repository")
-            continue
-        labels: list[str] = []
-        _CURRENT_LABELS = labels
-        failure: str | None = None
+    previous_sessions_root = os.environ.get("SYMPHONAI_SESSIONS_DIR")
+    with tempfile.TemporaryDirectory() as temporary:
+        os.environ["SYMPHONAI_SESSIONS_DIR"] = str(Path(temporary) / "sessions")
         try:
-            function()
-        except CheckFailed as exc:
-            failure = str(exc)
-        except Exception as exc:
-            failure = f"{type(exc).__name__}: {exc}"
-        finally:
-            _CURRENT_LABELS = None
+            for name, function in selected:
+                if not repository_present and name in NEEDS_REPOSITORY:
+                    skipped += 1
+                    print(f"SKIP  {name}: needs the working repository")
+                    continue
+                labels: list[str] = []
+                _CURRENT_LABELS = labels
+                failure: str | None = None
+                try:
+                    function()
+                except CheckFailed as exc:
+                    failure = str(exc)
+                except Exception as exc:
+                    failure = f"{type(exc).__name__}: {exc}"
+                finally:
+                    _CURRENT_LABELS = None
 
-        if failure is None:
-            passed += 1
-            print(f"PASS  {name}")
-        else:
-            failed += 1
-            print(f"FAIL  {name}: {failure}")
-        for label in labels:
-            print(f"  OK:   {label}")
+                if failure is None:
+                    passed += 1
+                    print(f"PASS  {name}")
+                else:
+                    failed += 1
+                    print(f"FAIL  {name}: {failure}")
+                for label in labels:
+                    print(f"  OK:   {label}")
+        finally:
+            if previous_sessions_root is None:
+                os.environ.pop("SYMPHONAI_SESSIONS_DIR", None)
+            else:
+                os.environ["SYMPHONAI_SESSIONS_DIR"] = previous_sessions_root
 
     print(
         f"{passed} passed, {failed} failed, {skipped} skipped, "
