@@ -1,5 +1,6 @@
 export function createAgentBoard() {
   const rows = [];
+  const subagents = new Set();
 
   function apply(frame) {
     if (frame?.kind !== "event" || !frame.payload) return;
@@ -9,11 +10,16 @@ export function createAgentBoard() {
       if (row) {
         Object.assign(row, { name: agent_name || "agent", state: "running", tool: "" });
       } else {
+        if (!subagents.has(agent_id)) {
+          rows.length = 0;
+          subagents.clear();
+        }
         rows.unshift({ agentId: agent_id, name: agent_name || "agent", state: "running", tool: "" });
       }
       return;
     }
     if (type === "SubagentSpawned") {
+      subagents.add(subagent_agent_id);
       rows.push({ agentId: subagent_agent_id, name: subagent_name, state: "running", tool: "" });
       return;
     }
