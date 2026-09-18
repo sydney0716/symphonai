@@ -381,7 +381,7 @@ test("sidebar shows the current project when it has no sessions", async () => {
   assert.match(visibleText(projects.children[0]), /No chats yet\./);
 });
 
-test("sidebar requests 200 sessions and discloses a full page", async () => {
+test("sidebar requests 200 sessions without a limit notice", async () => {
   const document = new FakeDocument();
   const client = fakeClient(fixtureRoadmap(), {
     sessions: Array.from({ length: 200 }, (_, index) => ({
@@ -393,14 +393,7 @@ test("sidebar requests 200 sessions and discloses a full page", async () => {
   await start({ global: {}, document, client });
 
   assert.deepEqual(client.calls.sessions, [200]);
-  assert.match(visibleText(document.getElementById("sidebar")), /Showing the 200 most recent sessions\./);
-
-  const shorterDocument = new FakeDocument();
-  const shorterClient = fakeClient(fixtureRoadmap(), {
-    sessions: [{ run_id: "one", repo_root: "/work/current", updated_at: "2026-01-01" }],
-  });
-  await start({ global: {}, document: shorterDocument, client: shorterClient });
-  assert.doesNotMatch(visibleText(shorterDocument.getElementById("sidebar")), /Showing the 200 most recent/);
+  assert.doesNotMatch(visibleText(document.getElementById("sidebar")), /Showing the .* most recent sessions/);
 });
 
 test("page navigation preserves the rendered transcript and stores the route", async () => {
@@ -1021,6 +1014,22 @@ test("prompt and edit entries render from wire fields", async () => {
   assert.equal(edit.children[1].textContent, "@@ -1 +1,2 @@\n-old\n+new\n+line");
 });
 
+test("person and agent messages render as separate chat classes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+
+  await client.emit(eventFrame("PromptSubmitted", { text: "person", message_count: 1 }));
+  await client.emit(eventFrame("AssistantTextDelta", { text: "agent" }));
+
+  const chat = document.getElementById("chat");
+  const prompts = chat.children.filter((child) => child.className === "prompt");
+  const assistants = chat.children.filter((child) => child.className === "assistant");
+  assert.equal(prompts.length, 1);
+  assert.equal(assistants.length, 1);
+  assert.notEqual(prompts[0], assistants[0]);
+});
+
 test("unknown events render and do not stop later frames", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -1091,6 +1100,46 @@ test("render stays DOM-only and start does not read window", async () => {
   const cssSource = await readFile(new URL("../app.css", import.meta.url), "utf8");
   const indexSource = await readFile(new URL("../index.html", import.meta.url), "utf8");
 
+  function chatPaneChildIds(markup) {
+    const content = markup.match(/<main id="chat-pane"[^>]*>([\s\S]*?)<\/main>/)?.[1];
+    assert.ok(content);
+    const ids = [];
+    let depth = 0;
+    for (const [, closing, attributes] of content.matchAll(/<(\/?)[a-z][\w-]*([^>]*)>/gi)) {
+      if (closing) {
+        depth -= 1;
+      } else {
+        if (depth === 0) {
+          ids.push(attributes.match(/\bid="([^"]+)"/)?.[1] ?? null);
+        }
+        depth += 1;
+      }
+    }
+    assert.equal(depth, 0);
+    return ids;
+  }
+  const expectedChatChildren = ["run-notice", "chat", "approvals", "prompt-form"];
+  assert.deepEqual(chatPaneChildIds(indexSource), expectedChatChildren);
+  const withExtraChild = indexSource.replace(
+    /(<main id="chat-pane"[^>]*>)/,
+    '$1<div id="extra"></div>',
+  );
+  assert.throws(
+    () => assert.deepEqual(chatPaneChildIds(withExtraChild), expectedChatChildren),
+    { name: "AssertionError" },
+  );
+
+  const chatPaneRule = cssSource.match(/(?:^|\n)\.chat-pane\s*\{([^}]*)\}/)?.[1];
+  assert.ok(chatPaneRule);
+  assert.deepEqual(
+    chatPaneRule.match(/grid-template-rows:\s*([^;]+);/)?.[1].trim().split(/\s+/),
+    ["auto", "1fr", "auto", "auto"],
+  );
+  const sharedPaneRule = cssSource.match(
+    /\.roadmap-pane,\s*\.chat-pane,\s*\.settings-pane\s*\{([^}]*)\}/,
+  )?.[1];
+  assert.match(sharedPaneRule, /(?:^|;)\s*overflow:\s*auto\s*;/);
+
   assert.ok(!/^\s*import\s/m.test(renderSource));
   assert.ok(!/\b(?:if|switch)\s*\(/.test(renderSource));
   assert.match(appSource, /export async function start\(\{ global, document, client \}\)/);
@@ -1109,6 +1158,30 @@ test("render stays DOM-only and start does not read window", async () => {
   ]) {
     assert.match(cssSource, new RegExp(`\\.${className}\\b`));
   }
+  function backgroundFor(className) {
+    let background;
+    for (const [, selectors, declarations] of cssSource.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
+      if (selectors.split(",").map((selector) => selector.trim()).includes(`.${className}`)) {
+        const match = declarations.match(/(?:^|;)\s*background:\s*(#[0-9a-f]{6})\s*;/i);
+        if (match) {
+          background = match[1].toLowerCase();
+        }
+      }
+    }
+    return background;
+  }
+  const neutral = backgroundFor("activity");
+  const promptBackground = backgroundFor("prompt");
+  const assistantBackground = backgroundFor("assistant");
+  assert.ok(neutral);
+  assert.ok(promptBackground);
+  assert.ok(assistantBackground);
+  for (const className of ["edit", "question", "compaction", "gap", "unknown-event", "approval"]) {
+    assert.equal(backgroundFor(className), neutral);
+  }
+  assert.notEqual(promptBackground, neutral);
+  assert.notEqual(assistantBackground, neutral);
+  assert.notEqual(promptBackground, assistantBackground);
   assert.match(cssSource, /\.edit summary\s*{[^}]*cursor:\s*pointer/s);
   assert.match(cssSource, /\.edit pre\s*{[^}]*overflow-x:\s*auto/s);
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));

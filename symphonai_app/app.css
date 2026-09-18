@@ -132,7 +132,7 @@ button.session-link {
 
 .chat-pane {
   display: grid;
-  grid-template-rows: 1fr auto auto;
+  grid-template-rows: auto 1fr auto auto;
   gap: 1rem;
 }
 
@@ -169,6 +169,8 @@ button.session-link {
 }
 
 .chat-log {
+  display: flex;
+  flex-direction: column;
   min-height: 12rem;
 }
 
@@ -183,7 +185,28 @@ button.session-link {
 .approval {
   padding: 0.65rem;
   border-radius: 0.4rem;
+}
+
+.activity,
+.edit,
+.question,
+.compaction,
+.gap,
+.unknown-event,
+.approval {
   background: #1d2530;
+}
+
+.prompt {
+  margin-left: auto;
+  max-width: 80%;
+  background: #2f4864;
+}
+
+.assistant {
+  margin-right: auto;
+  max-width: 80%;
+  background: #23483c;
 }
 
 .edit summary {

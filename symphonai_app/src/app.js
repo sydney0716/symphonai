@@ -271,12 +271,6 @@ export async function start({ global, document, client }) {
   replace(pageLinks, ...links);
 
   const projectsRoot = element(document, "section", { className: "projects" });
-  if (sessions.length >= SIDEBAR_SESSION_LIMIT) {
-    append(projectsRoot, element(document, "p", {
-      className: "session-limit",
-      text: `Showing the ${SIDEBAR_SESSION_LIMIT} most recent sessions.`,
-    }));
-  }
   for (const group of projectGroups(sessions, project.repo_root)) {
     const current = group.root === project.repo_root;
     const section = element(document, "details", {
