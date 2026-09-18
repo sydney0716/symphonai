@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 
 from symphonai_api.config import ConfigError
@@ -19,8 +20,10 @@ from symphonai_api.providers.anthropic_provider import AnthropicProvider
 from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.runner import standard_tool_registry
+from symphonai_api.session import default_sessions_root
 from symphonai_host.server import HostServer
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
+from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
 
 
 def _provider(name: str, model: str | None, base_url: str | None):
@@ -65,6 +68,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
+    try:
+        period = extensions.config.values.get(
+            "sessions.cleanup_period_days", DEFAULT_CLEANUP_PERIOD_DAYS
+        )
+        prune_sessions(default_sessions_root(), period_days=period, now=datetime.now(timezone.utc))
+    except Exception:
+        pass
     pool = McpPool(
         extensions.mcp_servers,
         cwd=arguments.repo_root,

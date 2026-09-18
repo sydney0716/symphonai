@@ -66,7 +66,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions")
 _VALID_MODES = {"auto", "prompt", "plan", "accept_edits"}
 
 
@@ -119,6 +119,13 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    sessions = _table(source, values, "sessions")
+    if sessions is not None:
+        _unknown_keys(source, "sessions", sessions, {"cleanup_period_days"})
+        if "cleanup_period_days" in sessions:
+            period = sessions["cleanup_period_days"]
+            if type(period) is not int or period < 0:
+                _raise(source, "sessions.cleanup_period_days", "must be a non-negative integer")
     agents = _table(source, values, "agents")
     if agents is None:
         return

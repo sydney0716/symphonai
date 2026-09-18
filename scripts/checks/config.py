@@ -925,3 +925,35 @@ def sections_hold_any_shape() -> None:
                 fail(f"unknown session key lacked source or key: {exc!r}")
         else:
             fail("unknown top-level session key was accepted")
+
+
+@check("config.sessions_cleanup")
+def sessions_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        _write(source, "[sessions]\ncleanup_period_days = 7\n")
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("sessions.cleanup_period_days") != 7:
+            fail("session cleanup period did not resolve")
+        if resolved.provenance.get("sessions.cleanup_period_days") != Provenance(
+            "sessions.cleanup_period_days", Scope.PROJECT, source
+        ):
+            fail("session cleanup period lost its project scope")
+
+        invalid = (
+            ('"7"', "sessions.cleanup_period_days"),
+            ("7.5", "sessions.cleanup_period_days"),
+            ("true", "sessions.cleanup_period_days"),
+            ("-1", "sessions.cleanup_period_days"),
+            ("7\nunknown = 1", "sessions.unknown"),
+        )
+        for value, key in invalid:
+            _write(source, f"[sessions]\ncleanup_period_days = {value}\n")
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError as exc:
+                if str(source) not in str(exc) or key not in str(exc):
+                    fail(f"invalid session setting lacked source or key: {exc}")
+            else:
+                fail(f"invalid session setting was accepted: {value!r}")

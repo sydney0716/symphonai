@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import contextlib
+import io
+import shutil
 import tempfile
 import threading
 import time
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -15,10 +19,11 @@ from symphonai_api.events import RunFinished
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
+import symphonai_host.__main__ as host_main
 from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
 from symphonai_host.server import HostServer
-from symphonai_host.sessions import list_sessions
+from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prune_sessions
 from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
 
@@ -365,3 +370,122 @@ def check_client_session_calls() -> None:
                 fail("client session calls did not round-trip")
         finally:
             host.close()
+
+
+def _prune_fixture(root: Path, name: str, updated_at: str | None) -> None:
+    directory = root / name
+    directory.mkdir()
+    meta = {"run_id": name}
+    if updated_at is not None:
+        meta["updated_at"] = updated_at
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+@check("host_sessions.prune_selective")
+def check_prune_selective() -> None:
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "sessions"
+        root.mkdir()
+        _prune_fixture(root, "old", (now - timedelta(days=31)).isoformat())
+        _prune_fixture(root, "recent", (now - timedelta(days=29)).isoformat())
+        _prune_fixture(root, "undated", None)
+        _prune_fixture(root, "unparseable", "not a timestamp")
+        broken = root / "invalid-json"
+        broken.mkdir()
+        (broken / "meta.json").write_text("{", encoding="utf-8")
+        (root / "loose-file").write_text("not a session", encoding="utf-8")
+
+        if prune_sessions(root, period_days=30, now=now) != 1:
+            fail("pruning did not remove exactly one dated old session")
+        if {path.name for path in root.iterdir()} != {
+            "recent", "undated", "unparseable", "invalid-json", "loose-file"
+        }:
+            fail("pruning removed a recent or undated entry")
+
+
+@check("host_sessions.prune_boundaries")
+def check_prune_boundaries() -> None:
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    cutoff = now - timedelta(days=30)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "sessions"
+        root.mkdir()
+        _prune_fixture(root, "exact", cutoff.isoformat())
+        _prune_fixture(root, "older", (cutoff - timedelta(seconds=1)).isoformat())
+        _prune_fixture(root, "stuck", (cutoff - timedelta(days=1)).isoformat())
+        if prune_sessions(root, period_days=0, now=now) != 0:
+            fail("disabled pruning removed a session")
+        if {path.name for path in root.iterdir()} != {"exact", "older", "stuck"}:
+            fail("disabled pruning changed the session set")
+
+        actual_remove = shutil.rmtree
+
+        def remove(directory: Path) -> None:
+            if directory.name == "stuck":
+                raise OSError("fixture refuses removal")
+            actual_remove(directory)
+
+        with mock.patch("symphonai_host.sessions.shutil.rmtree", side_effect=remove):
+            removed = prune_sessions(root, period_days=30, now=now)
+        if removed != 1 or {path.name for path in root.iterdir()} != {"exact", "stuck"}:
+            fail("cutoff or unremovable-directory handling was wrong")
+        absent = Path(temporary) / "missing"
+        if prune_sessions(absent, period_days=30, now=now) != 0 or absent.exists():
+            fail("missing sessions root was created or failed pruning")
+
+
+@check("host_sessions.prune_startup")
+def check_prune_startup() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo = Path(temporary) / "repo"
+        repo.mkdir()
+        sessions = Path(temporary) / "sessions"
+        for values, expected, raises in (
+            ({"sessions.cleanup_period_days": 7}, 7, False),
+            ({}, DEFAULT_CLEANUP_PERIOD_DAYS, False),
+            ({"sessions.cleanup_period_days": 7}, 7, True),
+        ):
+            events: list[str] = []
+            observed: list[tuple[Path, int, datetime]] = []
+            extensions = SimpleNamespace(
+                config=SimpleNamespace(values=values), mcp_servers=()
+            )
+            host = mock.Mock()
+            host.print_handshake.side_effect = lambda: (events.append("handshake"), print("handshake"))
+            host.serve_forever.side_effect = lambda: events.append("serve")
+            pool = mock.Mock()
+            pool.start.return_value = {}
+
+            def prune(root: Path, *, period_days: int, now: datetime) -> int:
+                events.append("prune")
+                observed.append((root, period_days, now))
+                if raises:
+                    raise OSError("fixture pruning failure")
+                return 0
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(host_main, "load", return_value={}),
+                mock.patch.object(host_main, "load_extensions", return_value=extensions),
+                mock.patch.object(host_main, "default_sessions_root", return_value=sessions),
+                mock.patch.object(host_main, "prune_sessions", side_effect=prune),
+                mock.patch.object(host_main, "McpPool", return_value=pool),
+                mock.patch.object(host_main, "HostServer", return_value=host),
+                mock.patch.object(host_main, "_provider"),
+                mock.patch.object(host_main, "standard_tool_registry", return_value={}),
+                mock.patch.object(host_main.signal, "signal"),
+                contextlib.redirect_stdout(output),
+            ):
+                host_main.main(["--repo-root", str(repo)])
+            if events != ["prune", "handshake", "serve"]:
+                fail(f"startup pruning or handshake order changed: {events!r}")
+            if output.getvalue().splitlines()[0] != "handshake":
+                fail("handshake was not the first stdout line")
+            if (
+                len(observed) != 1
+                or observed[0][0] != sessions
+                or observed[0][1] != expected
+                or observed[0][2].tzinfo is None
+            ):
+                fail(f"startup pruning arguments were wrong: {observed!r}")

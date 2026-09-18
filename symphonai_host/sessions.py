@@ -1,7 +1,10 @@
-"""Read-only session discovery for the loopback host."""
+"""Session discovery and retention for the loopback host."""
 
 from __future__ import annotations
 
+import json
+import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from symphonai_api.session import (
@@ -11,6 +14,43 @@ from symphonai_api.session import (
     load_run,
     read_records,
 )
+
+
+DEFAULT_CLEANUP_PERIOD_DAYS = 30
+
+
+def prune_sessions(root: Path, *, period_days: int, now: datetime) -> int:
+    """Remove dated session directories strictly older than the cutoff."""
+    if period_days <= 0:
+        return 0
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    cutoff = now - timedelta(days=period_days)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    try:
+        directories = list(root.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    for directory in directories:
+        try:
+            if not directory.is_dir():
+                continue
+            meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+            updated_at = meta.get("updated_at") if isinstance(meta, dict) else None
+            if not isinstance(updated_at, str):
+                continue
+            updated = datetime.fromisoformat(updated_at)
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            if updated < cutoff:
+                shutil.rmtree(directory)
+                removed += 1
+        except (OSError, ValueError, TypeError, UnicodeError):
+            continue
+    return removed
 
 
 def list_sessions(root: Path, *, limit: int | None = None) -> list[dict]:
