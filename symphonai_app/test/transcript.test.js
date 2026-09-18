@@ -16,6 +16,12 @@ function event(type, fields = {}) {
   return { kind: "event", payload: { type, ...BASE, ...fields } };
 }
 
+function history(role, text, tool_calls = []) {
+  return { kind: "event", payload: {
+    type: "HistoryMessage", role, text, tool_calls, turn_id: "turn-1",
+  } };
+}
+
 function call(type, id, fields = {}) {
   return event(type, {
     tool_name: fields.tool_name ?? "read_file",
@@ -50,6 +56,7 @@ const RECORDED_EVENTS = Object.freeze({
     truncated: false,
   }),
   PromptSubmitted: event("PromptSubmitted", { text: "hello", message_count: 1 }),
+  HistoryMessage: history("assistant", "replayed"),
   ToolCallFailed: call("ToolCallFailed", "recorded-call", { error: "broken" }),
   PermissionRequested: call("PermissionRequested", "recorded-call", { mode: "prompt" }),
   PermissionDenied: call("PermissionDenied", "recorded-call", { reason: "no" }),
@@ -155,6 +162,36 @@ test("a prompt retains the submitted text", () => {
       text: "Explain this",
       messageCount: 7,
     },
+  ]);
+});
+
+test("history reuses live prompt and assistant text entries", () => {
+  const live = applyAll([
+    event("PromptSubmitted", { text: "question", message_count: 1 }),
+    event("AssistantTextDelta", { text: "answer" }),
+  ]).model;
+  const replay = applyAll([
+    history("user", "question"),
+    history("assistant", "answer"),
+  ]).model;
+
+  assert.deepEqual(replay.map(({ type, text }) => ({ type, text })),
+    live.map(({ type, text }) => ({ type, text })));
+  assert.deepEqual(replay.map(({ type }) => type), ["prompt", "text"]);
+});
+
+test("tool-call-only history adds no prose and replay keeps message order", () => {
+  const replay = applyAll([
+    history("user", "first"),
+    history("assistant", "", [{ id: "call-1", name: "read_file" }]),
+    history("assistant", "second"),
+    history("assistant", "third"),
+  ]).model;
+
+  assert.deepEqual(replay.map(({ type, text }) => ({ type, text })), [
+    { type: "prompt", text: "first" },
+    { type: "text", text: "second" },
+    { type: "text", text: "third" },
   ]);
 });
 
@@ -512,7 +549,7 @@ test("each dropped frame inserts a positional gap", () => {
 });
 
 test("all documented event recordings are covered and unknown events survive", () => {
-  assert.equal(KNOWN_EVENT_TYPES.length, 17);
+  assert.equal(KNOWN_EVENT_TYPES.length, 18);
   assert.deepEqual(Object.keys(RECORDED_EVENTS), KNOWN_EVENT_TYPES);
   for (const frame of Object.values(RECORDED_EVENTS)) {
     const transcript = createTranscript();

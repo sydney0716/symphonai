@@ -40,7 +40,7 @@ test("decodeFrame enumerates malformed frames", () => {
   }
 });
 
-test("decodeEvent recognizes all seventeen documented event types", () => {
+test("decodeEvent recognizes all eighteen documented event types", () => {
   const documented = [
     "RunStarted",
     "RunFinished",
@@ -51,6 +51,7 @@ test("decodeEvent recognizes all seventeen documented event types", () => {
     "ToolCallStarted",
     "ToolCallFinished",
     "PromptSubmitted",
+    "HistoryMessage",
     "ToolCallFailed",
     "PermissionRequested",
     "PermissionDenied",
@@ -60,7 +61,7 @@ test("decodeEvent recognizes all seventeen documented event types", () => {
     "SubagentStopped",
     "CompactionApplied",
   ];
-  assert.equal(documented.length, 17);
+  assert.equal(documented.length, 18);
   assert.deepEqual(KNOWN_EVENT_TYPES, documented);
   for (const type of documented) {
     assert.deepEqual(decodeEvent({ type, marker: type }), {
@@ -69,6 +70,15 @@ test("decodeEvent recognizes all seventeen documented event types", () => {
       fields: { marker: type },
     });
   }
+});
+
+test("decodeEvent accepts replayed history as a known event", () => {
+  const payload = { type: "HistoryMessage", role: "user", text: "hello", tool_calls: [], turn_id: "turn-1" };
+  assert.deepEqual(decodeEvent(payload), {
+    type: "HistoryMessage",
+    known: true,
+    fields: { role: "user", text: "hello", tool_calls: [], turn_id: "turn-1" },
+  });
 });
 
 test("decodeEvent preserves unknown event types", () => {

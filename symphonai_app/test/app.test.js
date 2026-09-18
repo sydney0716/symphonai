@@ -1179,6 +1179,26 @@ test("person and agent messages render as separate chat classes", async () => {
   assert.notEqual(prompts[0], assistants[0]);
 });
 
+test("session history renders as the original conversation", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "What changed?", tool_calls: [], turn_id: "turn-1",
+  } });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "assistant", text: "The config changed.", tool_calls: [], turn_id: "turn-1",
+  } });
+
+  const chat = document.getElementById("chat");
+  assert.deepEqual(chat.children.map((child) => [child.className, child.textContent]), [
+    ["prompt", "What changed?"],
+    ["assistant", "The config changed."],
+  ]);
+  assert.doesNotMatch(visibleText(chat), /Received HistoryMessage\./);
+});
+
 test("unknown events render and do not stop later frames", async () => {
   const document = new FakeDocument();
   const client = fakeClient();

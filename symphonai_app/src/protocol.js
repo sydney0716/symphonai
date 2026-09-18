@@ -12,6 +12,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "ToolCallStarted",
   "ToolCallFinished",
   "PromptSubmitted",
+  "HistoryMessage",
   "ToolCallFailed",
   "PermissionRequested",
   "PermissionDenied",

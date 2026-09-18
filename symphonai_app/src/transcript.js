@@ -129,6 +129,27 @@ export function createTranscript() {
 
   function applyEvent(event) {
     const { type, fields } = event;
+    if (type === "HistoryMessage") {
+      if (!fields.text) {
+        return;
+      }
+      if (fields.role === "user") {
+        model.push({
+          type: "prompt",
+          agentId: fields.agent_id,
+          text: fields.text,
+          messageCount: fields.message_count,
+        });
+      } else if (fields.role === "assistant") {
+        model.push({
+          type: "text",
+          agentId: fields.agent_id,
+          runId: fields.run_id,
+          text: fields.text,
+        });
+      }
+      return;
+    }
     if (type === "PromptSubmitted") {
       model.push({
         type: "prompt",
