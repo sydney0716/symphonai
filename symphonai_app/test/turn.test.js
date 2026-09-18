@@ -11,7 +11,8 @@ import {
 function running(text = "first", runId = "run-1") {
   const turn = createTurnState();
   turn.submit(text);
-  turn.accepted(runId);
+  turn.accepted();
+  turn.event({ type: "RunStarted", run_id: runId });
   return turn;
 }
 
@@ -44,12 +45,41 @@ test("submit queues in dispatching and running without changing state", () => {
   assert.equal(active.queue[0].text, "second");
 });
 
-test("accepted records the active run and enters running", () => {
+test("accepted enters running and RunStarted latches the runtime id", () => {
   const turn = createTurnState();
   turn.submit("first");
-  assert.deepEqual(turn.accepted("run-1"), []);
+  assert.deepEqual(turn.accepted(), []);
   assert.equal(turn.state, RUNNING);
-  assert.equal(turn.activeRunId, "run-1");
+  assert.equal(turn.activeRunId, null);
+  assert.deepEqual(turn.event({ type: "RunStarted", run_id: "run-runtime" }), []);
+  assert.equal(turn.activeRunId, "run-runtime");
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-runtime" }), []);
+  assert.equal(turn.state, IDLE);
+});
+
+test("a host id cannot end or drain a runtime turn", () => {
+  const turn = createTurnState();
+  turn.submit("first");
+  turn.accepted();
+  turn.event({ type: "RunStarted", run_id: "run-runtime" });
+  assert.equal(turn.activeRunId, "run-runtime");
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-host" }), []);
+  assert.equal(turn.state, RUNNING);
+  assert.deepEqual(turn.submit("second"), []);
+  assert.deepEqual(turn.queue.map(({ text }) => text), ["second"]);
+});
+
+test("a subagent run cannot capture or end the root turn", () => {
+  const turn = createTurnState();
+  turn.submit("first");
+  turn.accepted();
+  turn.event({ type: "RunStarted", run_id: "run-root" });
+  turn.event({ type: "RunStarted", run_id: "run-child" });
+  assert.equal(turn.activeRunId, "run-root");
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-child" }), []);
+  assert.equal(turn.state, RUNNING);
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-root" }), []);
+  assert.equal(turn.state, IDLE);
 });
 
 test("only matching terminal events end a running turn", () => {
@@ -72,6 +102,81 @@ test("rejection restores the in-flight text to the queue front", () => {
   assert.deepEqual(turn.queue.map(({ text }) => text), ["first", "second"]);
   assert.equal(turn.inFlight, null);
   assert.deepEqual(actions, [{ kind: "rejected", error: "offline" }]);
+});
+
+test("submit dispatches a queued message before a newly typed one", () => {
+  const turn = createTurnState();
+  turn.submit("first");
+  turn.rejected("x");
+  assert.equal(turn.state, IDLE);
+  assert.deepEqual(turn.queue.map(({ text }) => text), ["first"]);
+
+  assert.deepEqual(turn.submit("second"), [
+    { kind: "prompt", id: turn.inFlight.id, text: "first" },
+  ]);
+  assert.deepEqual(turn.queue.map(({ text }) => text), ["second"]);
+
+  turn.accepted();
+  turn.event({ type: "RunStarted", run_id: "run-first" });
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-first" }), [
+    { kind: "prompt", id: turn.inFlight.id, text: "second" },
+  ]);
+  assert.deepEqual(turn.queue, []);
+});
+
+test("adopted restores the in-flight text ahead of queued messages", () => {
+  const turn = createTurnState();
+  turn.submit("first");
+  turn.submit("second");
+  assert.deepEqual(turn.adopted("run-active"), []);
+  assert.equal(turn.state, RUNNING);
+  assert.equal(turn.activeRunId, "run-active");
+  assert.equal(turn.inFlight, null);
+  assert.deepEqual(turn.queue.map(({ text }) => text), ["first", "second"]);
+});
+
+test("adopted waits for RunStarted when the runtime id is missing", () => {
+  for (const runId of [null, ""]) {
+    const turn = createTurnState();
+    turn.submit("first");
+    assert.deepEqual(turn.adopted(runId), []);
+    assert.equal(turn.activeRunId, null);
+    assert.deepEqual(turn.event({ type: "RunStarted", run_id: "run-active" }), []);
+    assert.equal(turn.activeRunId, "run-active");
+  }
+});
+
+test("adopted is inert outside dispatching", () => {
+  const idle = createTurnState();
+  assert.deepEqual(idle.adopted("run-active"), []);
+  assert.equal(idle.state, IDLE);
+  assert.equal(idle.activeRunId, null);
+  assert.deepEqual(idle.queue, []);
+
+  const active = running();
+  active.submit("second");
+  const before = active.queue;
+  assert.deepEqual(active.adopted("run-other"), []);
+  assert.equal(active.state, RUNNING);
+  assert.equal(active.activeRunId, "run-1");
+  assert.deepEqual(active.queue, before);
+});
+
+test("a foreign subagent cannot drain messages queued behind an adopted run", () => {
+  const turn = createTurnState();
+  turn.submit("first");
+  turn.adopted("run-active");
+  turn.submit("second");
+  assert.deepEqual(turn.event({ type: "RunStarted", run_id: "run-child" }), []);
+  assert.equal(turn.activeRunId, "run-active");
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-child" }), []);
+  assert.equal(turn.state, RUNNING);
+  assert.deepEqual(turn.queue.map(({ text }) => text), ["first", "second"]);
+  assert.deepEqual(turn.event({ type: "RunFinished", run_id: "run-active" }), [
+    { kind: "prompt", id: turn.inFlight.id, text: "first" },
+  ]);
+  assert.equal(turn.state, DISPATCHING);
+  assert.deepEqual(turn.queue.map(({ text }) => text), ["second"]);
 });
 
 test("only queued messages can be edited or withdrawn", () => {
@@ -110,13 +215,14 @@ test("terminal events drain three queued messages one at a time", () => {
     ["run-2", "third", 1],
     ["run-3", "fourth", 0],
   ]) {
+    turn.event({ type: "RunStarted", run_id: runId });
     const actions = turn.event({ type: "RunFinished", run_id: runId });
     assert.deepEqual(actions, [
       { kind: "prompt", id: turn.inFlight.id, text },
     ]);
     assert.equal(turn.state, DISPATCHING);
     assert.equal(turn.queue.length, remaining);
-    turn.accepted(`run-${Number(runId.at(-1)) + 1}`);
+    turn.accepted();
   }
 });
 
@@ -125,11 +231,20 @@ test("stop in the dispatch gap cancels acceptance and waits for termination", ()
   turn.submit("first");
   assert.deepEqual(turn.stop(), []);
   assert.equal(turn.inFlight.cancelled, true);
-  assert.deepEqual(turn.accepted("run-1"), [{ kind: "stop" }]);
+  assert.deepEqual(turn.accepted(), [{ kind: "stop" }]);
   assert.equal(turn.state, DISPATCHING);
+  assert.equal(turn.activeRunId, null);
+  turn.event({ type: "RunStarted", run_id: "run-1" });
   assert.equal(turn.activeRunId, "run-1");
   turn.event({ type: "RunFinished", run_id: "run-1" });
   assert.equal(turn.state, IDLE);
+});
+
+test("accepted is inert from idle", () => {
+  const turn = createTurnState();
+  assert.deepEqual(turn.accepted(), []);
+  assert.equal(turn.state, IDLE);
+  assert.equal(turn.activeRunId, null);
 });
 
 test("stop is inert when idle and waits for a terminal event when running", () => {
@@ -147,7 +262,8 @@ test("stop is inert when idle and waits for a terminal event when running", () =
 test("a terminal event needs no preceding turn event", () => {
   const turn = createTurnState();
   turn.submit("first");
-  turn.accepted("run-1");
+  turn.accepted();
+  turn.event({ type: "RunStarted", run_id: "run-1" });
   turn.event({ type: "RunFinished", run_id: "run-1" });
   assert.equal(turn.state, IDLE);
 });
@@ -188,7 +304,7 @@ function machineFor(state) {
   if (state === IDLE) {
     turn.rejected("fixture");
   } else if (state === RUNNING) {
-    turn.accepted("run-1");
+    turn.accepted();
   }
   assert.equal(turn.state, state);
   return turn;
@@ -201,7 +317,7 @@ test("the complete seven-intent by three-state table is exercised", () => {
     ["edit", (turn) => turn.edit(turn.queue[0].id, "edited")],
     ["withdraw", (turn) => turn.withdraw(turn.queue[0].id)],
     ["stop", (turn) => turn.stop()],
-    ["accepted", (turn) => turn.accepted("accepted-run")],
+    ["accepted", (turn) => turn.accepted()],
     ["rejected", (turn) => turn.rejected("rejected")],
     ["event", (turn) => turn.event({ type: "FutureEvent", known: false })],
   ];

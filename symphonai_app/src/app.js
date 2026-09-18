@@ -87,6 +87,7 @@ export async function start({ global, document, client }) {
   const chatPane = document.getElementById("chat-pane");
   const roadmapRoot = document.getElementById("roadmap");
   const specRoot = document.getElementById("spec");
+  const runNotice = document.getElementById("run-notice");
   const chatRoot = document.getElementById("chat");
   const approvalsRoot = document.getElementById("approvals");
   const form = document.getElementById("prompt-form");
@@ -96,11 +97,12 @@ export async function start({ global, document, client }) {
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
-  const [project, sessions, roadmapReply, settingsReply] = await Promise.all([
+  const [project, sessions, roadmapReply, settingsReply, healthReply] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
     boundary.settings(),
+    boundary.health().catch(() => null),
   ]);
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
@@ -331,6 +333,9 @@ export async function start({ global, document, client }) {
 
   const fragment = typeof global.location?.hash === "string" ? global.location.hash : "";
   showPage(fragment ? parseRoute(fragment) : storedRoute(global));
+  runNotice.textContent = healthReply?.state === "active"
+    ? "A run started before this page was opened is still in progress."
+    : "";
   if (typeof global.addEventListener === "function") {
     global.addEventListener("hashchange", () => {
       navigate(parseRoute(global.location?.hash ?? ""), { updateFragment: false });
@@ -428,13 +433,33 @@ export async function start({ global, document, client }) {
     replace(approvalsRoot, ...children);
   }
 
+  async function activeRuntimeRun() {
+    try {
+      const reply = await boundary.health();
+      return reply?.state === "active" ? { runId: reply.runtime_run_id } : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function perform(actions) {
     for (const action of actions) {
       if (action.kind === "prompt") {
         try {
           const reply = await boundary.prompt(action.text);
-          promptFailure = "";
-          await perform(turn.accepted(reply.run_id));
+          if (reply?.conflict === true) {
+            const active = await activeRuntimeRun();
+            if (active) {
+              promptFailure = "A run is already in progress.";
+              await perform(turn.adopted(active.runId));
+            } else {
+              turn.rejected("the host refused a prompt it is no longer running");
+              promptFailure = "The message was not sent. Send it again.";
+            }
+          } else {
+            promptFailure = "";
+            await perform(turn.accepted());
+          }
         } catch (error) {
           turn.rejected(String(error));
           promptFailure = "Prompt failed.";
@@ -475,6 +500,15 @@ export async function start({ global, document, client }) {
       return;
     }
     const event = decodeEvent(frame.payload);
+    if (
+      (event.type === "RunFinished" || event.type === "RunFailed") &&
+      (healthReply?.runtime_run_id === null ||
+        (typeof healthReply?.runtime_run_id === "string" &&
+          healthReply.runtime_run_id.length > 0 &&
+          healthReply.runtime_run_id === event.fields.run_id))
+    ) {
+      runNotice.textContent = "";
+    }
     await perform(turn.event({ ...event, ...event.fields }));
   }
 

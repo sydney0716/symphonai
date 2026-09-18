@@ -227,6 +227,7 @@ class HostRun:
             tool_schemas=tool_registry_schemas(tools, self._provider.wire_format),
             agent_ref=agent_ref,
             events=events,
+            stream=True,
             result_store=result_store,
             transcript=session.writer_for(agent_ref.agent_id, is_root=True),
         )

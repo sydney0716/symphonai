@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 
 import { start } from "../src/app.js";
 import { createClient } from "../src/client.js";
-import { DISPATCHING, RUNNING } from "../src/turn.js";
+import { DISPATCHING, IDLE, RUNNING } from "../src/turn.js";
 
 const BASE = "specs/18/18a-a-client-for-the-boundary.md";
 const FOLLOW_UP = "specs/18/18aF-a-double-more-capable-than-the-real-thing.md";
@@ -71,6 +71,7 @@ export class FakeDocument {
         "chat-pane",
         "roadmap",
         "spec",
+        "run-notice",
         "chat",
         "approvals",
         "prompt-form",
@@ -85,7 +86,7 @@ export class FakeDocument {
     get("sidebar").append(get("page-links"));
     get("roadmap-pane").append(get("roadmap"), get("spec"));
     get("prompt-form").append(get("prompt"), get("prompt-error"));
-    get("chat-pane").append(get("chat"), get("approvals"), get("prompt-form"));
+    get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
     get("page").append(get("roadmap-pane"), get("chat-pane"));
     get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"));
     this.body = new FakeElement("body", "body");
@@ -178,6 +179,7 @@ export function fakeClient(
     project = { repo_root: "/work/current", name: "current" },
     sessions = [],
     settings = { settings: {} },
+    health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
   } = {},
 ) {
   const calls = { approve: [], credentials: [], file: [], openSession: [], prompt: [], sessions: [], settings: 0 };
@@ -233,6 +235,9 @@ export function fakeClient(
     async settings() {
       calls.settings += 1;
       return settings;
+    },
+    async health() {
+      return health;
     },
     async storeCredential(name, value) {
       calls.credentials.push({ name, value });
@@ -753,16 +758,159 @@ test("submit dispatches once and assistant deltas render in order", async () => 
   const submitting = document.getElementById("prompt-form").dispatch("submit");
   assert.equal(app.turn.state, DISPATCHING);
   assert.deepEqual(client.calls.prompt, ["hello"]);
-  client.resolvePrompt({ accepted: true, run_id: "run-1" });
+  client.resolvePrompt({ accepted: true, run_id: "run-host" });
   await submitting;
   assert.equal(app.turn.state, RUNNING);
+  assert.equal(app.turn.activeRunId, null);
 
+  await client.emit(eventFrame("RunStarted", { run_id: "run-runtime" }));
+  assert.equal(app.turn.activeRunId, "run-runtime");
   await client.emit(eventFrame("AssistantTextDelta", { text: "hello " }));
   await client.emit(eventFrame("AssistantTextDelta", { text: "world" }));
   const chat = document.getElementById("chat");
   assert.equal(chat.children.length, 1);
   assert.equal(chat.children[0].className, "assistant");
   assert.equal(chat.children[0].textContent, "hello world");
+  await client.emit(eventFrame("RunFinished", { run_id: "run-runtime" }));
+  assert.equal(app.turn.state, "idle");
+});
+
+test("a prompt conflict adopts the active runtime run and keeps the message", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(undefined, {
+    health: { state: "active", run_id: "run-host", runtime_run_id: "run-active" },
+  });
+  client.prompt = async () => ({ accepted: false, conflict: true, run_id: "run-host" });
+  const app = await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "first";
+
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.equal(app.turn.state, RUNNING);
+  assert.equal(app.turn.activeRunId, "run-active");
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), ["first"]);
+  assert.equal(document.getElementById("prompt-error").textContent, "A run is already in progress.");
+});
+
+test("an idle host after a prompt conflict leaves the message ready to resend", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return client.calls.prompt.length === 1
+      ? { accepted: false, conflict: true, run_id: "run-host" }
+      : { accepted: true, run_id: "run-next" };
+  };
+  const app = await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "first";
+
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.equal(app.turn.state, IDLE);
+  assert.equal(app.turn.activeRunId, null);
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), ["first"]);
+  assert.equal(document.getElementById("prompt-error").textContent, "The message was not sent. Send it again.");
+
+  document.getElementById("prompt").value = "second";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, ["first", "first"]);
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), ["second"]);
+
+  await client.emit(eventFrame("RunStarted", { run_id: "run-retry" }));
+  await client.emit(eventFrame("RunFinished", { run_id: "run-retry" }));
+  assert.deepEqual(client.calls.prompt, ["first", "first", "second"]);
+});
+
+test("a failed health request after a conflict leaves the message ready to resend", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.health = async () => { throw new Error("offline"); };
+  client.prompt = async () => ({ accepted: false, conflict: true, run_id: "run-host" });
+  const app = await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "first";
+
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.equal(app.turn.state, IDLE);
+  assert.equal(app.turn.activeRunId, null);
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), ["first"]);
+  assert.equal(document.getElementById("prompt-error").textContent, "The message was not sent. Send it again.");
+});
+
+test("an active run without a published id drains after RunStarted and RunFinished", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(undefined, {
+    health: { state: "active", run_id: "run-host", runtime_run_id: null },
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return client.calls.prompt.length === 1
+      ? { accepted: false, conflict: true, run_id: "run-host" }
+      : { accepted: true, run_id: "run-next" };
+  };
+  const app = await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "first";
+
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(app.turn.state, RUNNING);
+  assert.equal(app.turn.activeRunId, null);
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), ["first"]);
+
+  await client.emit(eventFrame("RunStarted", { run_id: "run-active" }));
+  assert.equal(app.turn.activeRunId, "run-active");
+  await client.emit(eventFrame("RunFinished", { run_id: "run-active" }));
+  assert.deepEqual(client.calls.prompt, ["first", "first"]);
+  assert.equal(app.turn.inFlight.text, "first");
+  assert.deepEqual(app.turn.queue, []);
+});
+
+test("startup shows an active run notice and tolerates failed health", async () => {
+  const notice = "A run started before this page was opened is still in progress.";
+  const activeDocument = new FakeDocument();
+  const activeClient = fakeClient(undefined, {
+    health: { state: "active", run_id: "run-host", runtime_run_id: "run-active" },
+  });
+  await start({
+    global: {},
+    document: activeDocument,
+    client: activeClient,
+  });
+  assert.equal(activeDocument.getElementById("run-notice").textContent, notice);
+  await activeClient.emit(eventFrame("AssistantTextDelta", { text: "still working" }));
+  assert.equal(activeDocument.getElementById("chat").children[0].textContent, "still working");
+  assert.ok(visibleText(activeDocument.getElementById("chat-pane")).includes(notice));
+  await activeClient.emit(eventFrame("RunFinished", { run_id: "run-other" }));
+  assert.equal(activeDocument.getElementById("run-notice").textContent, notice);
+  await activeClient.emit(eventFrame("RunFinished", { run_id: "run-active" }));
+  assert.equal(activeDocument.getElementById("run-notice").textContent, "");
+
+  const idleDocument = new FakeDocument();
+  await start({ global: {}, document: idleDocument, client: fakeClient() });
+  assert.equal(idleDocument.getElementById("run-notice").textContent, "");
+
+  const failedDocument = new FakeDocument();
+  const client = fakeClient();
+  client.health = async () => { throw new Error("offline"); };
+  await start({ global: {}, document: failedDocument, client });
+  assert.deepEqual(failedDocument.getElementById("page").children, [
+    failedDocument.getElementById("chat-pane"),
+  ]);
+  assert.equal(failedDocument.getElementById("run-notice").textContent, "");
+});
+
+test("a startup notice without a runtime id clears on the first terminal event", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(undefined, {
+    health: { state: "active", run_id: "run-host", runtime_run_id: null },
+  });
+  await start({ global: {}, document, client });
+  assert.equal(
+    document.getElementById("run-notice").textContent,
+    "A run started before this page was opened is still in progress.",
+  );
+
+  await client.emit(eventFrame("RunFinished", { run_id: "run-any" }));
+  assert.equal(document.getElementById("run-notice").textContent, "");
 });
 
 test("two tool calls in one turn render as one activity", async () => {

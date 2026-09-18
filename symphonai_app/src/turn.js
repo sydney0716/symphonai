@@ -61,12 +61,8 @@ export function createTurnState() {
     },
 
     submit(text) {
-      const value = message(text);
-      if (state === IDLE) {
-        return dispatch(value);
-      }
-      queue.push(value);
-      return [];
+      queue.push(message(text));
+      return drainOne();
     },
 
     edit(id, text) {
@@ -97,14 +93,24 @@ export function createTurnState() {
       return [];
     },
 
-    accepted(runId) {
+    accepted() {
       if (state !== DISPATCHING || inFlight === null) {
         return [];
       }
-      activeRunId = runId;
       if (inFlight.cancelled) {
         return [{ kind: "stop" }];
       }
+      state = RUNNING;
+      return [];
+    },
+
+    adopted(runId) {
+      if (state !== DISPATCHING || inFlight === null) {
+        return [];
+      }
+      queue.unshift({ id: inFlight.id, text: inFlight.text });
+      inFlight = null;
+      activeRunId = typeof runId === "string" && runId.length > 0 ? runId : null;
       state = RUNNING;
       return [];
     },
@@ -122,6 +128,16 @@ export function createTurnState() {
     },
 
     event(value) {
+      if (
+        activeRunId === null &&
+        (state === DISPATCHING || state === RUNNING) &&
+        value?.known !== false &&
+        value?.type === "RunStarted" &&
+        typeof value.run_id === "string"
+      ) {
+        activeRunId = value.run_id;
+        return [];
+      }
       if (!terminalEvent(value)) {
         return [];
       }

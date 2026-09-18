@@ -30,7 +30,7 @@ import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import RunFinished, RunStarted
+from symphonai_api.events import AssistantTextDelta, RunFinished, RunStarted
 from symphonai_api.extensions import Extensions, load_extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import RunRef, new_agent_ref
@@ -42,6 +42,7 @@ from symphonai_api.providers.base import ModelProvider
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore, load_run_for_resume
+from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_host.broker import EventBroker
@@ -1328,6 +1329,50 @@ def check_prompt_starts_run() -> None:
             connection.close()
     finally:
         host.close()
+
+
+@check("host_server.assistant_text_reaches_the_stream")
+def check_assistant_text_reaches_the_stream() -> None:
+    reply = "ping"
+    provider = FakeModelProvider(streams=[(
+        TextDelta("pi"),
+        TextDelta("ng"),
+        StreamCompleted(ModelResponse(Message(Role.ASSISTANT, reply))),
+    )])
+    with tempfile.TemporaryDirectory() as temporary:
+        with mock.patch.dict(os.environ, {"SYMPHONAI_SESSIONS_DIR": str(Path(temporary) / "sessions")}):
+            host = _host(provider)
+            try:
+                connection, response = _subscribed_stream(host)
+                try:
+                    prompt_connection, prompt = _request(
+                        host, "POST", "/prompt", body={"prompt": "say ping"}, headers=_headers(host)
+                    )
+                    try:
+                        prompt.read()
+                    finally:
+                        prompt_connection.close()
+                    if prompt.status != 200:
+                        fail(f"prompt was not accepted: {prompt.status}")
+                    deltas = []
+                    while True:
+                        frame = _await_sse(
+                            connection,
+                            response,
+                            lambda candidate: isinstance(candidate, tuple) and candidate[0] == "event",
+                            what="run event",
+                        )
+                        event = decode_event(frame[1])
+                        if isinstance(event, AssistantTextDelta):
+                            deltas.append(event.text)
+                        if isinstance(event, RunFinished):
+                            break
+                    if not deltas or "".join(deltas) != reply:
+                        fail(f"assistant text did not reach the event stream: {deltas!r}")
+                finally:
+                    connection.close()
+            finally:
+                host.close()
 
 
 class _WaitingProvider(ModelProvider):
