@@ -532,6 +532,93 @@ test("settings routes render general origins, model presence, and unknown fallba
   assert.equal(rowCells().length, 3);
 });
 
+test("settings navigation renders hooks, ceiling, and trust before inventory", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/hooks" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: {
+      config: [{ key: "visible.setting", value: true, scope: "user" }],
+      hooks: [
+        { event: "turn", command: "z-hook" },
+        { event: "prompt", command: "p-hook" },
+        { event: "turn", command: "a-hook" },
+      ],
+      ceiling: { allowed_write_scope: [], modes: ["plan", "auto"] },
+      trust: [
+        { root: "/z", allow: [] },
+        { root: "/a", allow: ["agents", "skills"] },
+      ],
+    } },
+  });
+  await start({ global: browser.global, document, client });
+  const pane = document.getElementById("page").children[0];
+  const sections = find(pane, (value) => value.className === "settings-sections");
+  const content = find(pane, (value) => value.className === "settings-content");
+  const rowCells = () => walk(content)
+    .filter((value) => value.className === "settings-row")
+    .map((row) => row.children.map((cell) => cell.textContent));
+  const open = async (name) => {
+    await find(sections, (value) => value.textContent === name).dispatch("click");
+    assert.equal(browser.global.location.hash, `#/settings/${name.toLowerCase()}`);
+  };
+
+  assert.deepEqual(sections.children.map((link) => link.textContent), [
+    "General", "Models", "Mcp", "Skills", "Plugins", "Agents",
+    "Hooks", "Ceiling", "Trust", "Inventory",
+  ]);
+  assert.equal(content.children[0].textContent, "Hooks");
+  assert.deepEqual(rowCells(), [
+    ["prompt", "p-hook"], ["turn", "a-hook"], ["turn", "z-hook"],
+  ]);
+
+  await open("Ceiling");
+  assert.equal(content.children[0].textContent, "Ceiling");
+  assert.equal(content.children[1].textContent,
+    'The most any agent may be granted. "not set" means the ceiling does not limit this.');
+  assert.deepEqual(rowCells(), [
+    ["allowed_write_scope", "none"],
+    ["fetch_allowlist", "not set"],
+    ["fetch_enabled", "not set"],
+    ["modes", "plan, auto"],
+    ["shell_allowlist", "not set"],
+    ["shell_enabled", "not set"],
+  ]);
+
+  await open("Trust");
+  assert.equal(content.children[0].textContent, "Trust");
+  assert.deepEqual(rowCells(), [["/a", "agents, skills"], ["/z", "nothing"]]);
+
+  browser.global.location.hash = "#/settings/unknown";
+  browser.dispatch("hashchange");
+  assert.equal(content.children[0].textContent, "General");
+  assert.deepEqual(rowCells(), [["visible.setting", "on", "user"]]);
+});
+
+test("empty hooks and trust show messages while an empty ceiling keeps six rows", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/hooks" });
+  const document = new FakeDocument();
+  await start({
+    global: browser.global,
+    document,
+    client: fakeClient(fixtureRoadmap(), {
+      settings: { settings: { hooks: [], trust: [], ceiling: {} } },
+    }),
+  });
+  const pane = document.getElementById("page").children[0];
+  const sections = find(pane, (value) => value.className === "settings-sections");
+  const content = find(pane, (value) => value.className === "settings-content");
+  const tables = () => walk(content).filter((value) => value.tagName === "TABLE");
+
+  assert.match(visibleText(content), /No hooks are configured\./);
+  assert.equal(tables().length, 0);
+  await find(sections, (value) => value.textContent === "Trust").dispatch("click");
+  assert.match(visibleText(content), /No directories are trusted\./);
+  assert.equal(tables().length, 0);
+  await find(sections, (value) => value.textContent === "Ceiling").dispatch("click");
+  assert.equal(tables().length, 1);
+  assert.equal(walk(content).filter((value) => value.className === "settings-row").length, 6);
+});
+
 test("model settings save and remove a key without displaying its value", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/models" });

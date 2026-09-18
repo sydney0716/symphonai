@@ -6,7 +6,7 @@ import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
-import { generalRows, inventoryRows, modelRows, rosterRows, serverRows } from "./settings.js";
+import { ceilingRows, generalRows, hookRows, inventoryRows, modelRows, rosterRows, serverRows, trustRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
@@ -204,6 +204,40 @@ export async function start({ global, document, client }) {
       );
       return;
     }
+    if (section === "hooks") {
+      const rows = hookRows(settingsReply).map(({ event, command }) => [event, command]);
+      replace(
+        settingsContent,
+        element(document, "h2", { text: "Hooks" }),
+        rows.length === 0
+          ? element(document, "p", { text: "No hooks are configured." })
+          : settingsTable(["Event", "Command"], rows),
+      );
+      return;
+    }
+    if (section === "ceiling") {
+      const rows = ceilingRows(settingsReply).map(({ capability, value }) => [capability, value]);
+      replace(
+        settingsContent,
+        element(document, "h2", { text: "Ceiling" }),
+        element(document, "p", { text: 'The most any agent may be granted. "not set" means the ceiling does not limit this.' }),
+        settingsTable(["Capability", "Value"], rows),
+      );
+      return;
+    }
+    if (section === "trust") {
+      const rows = trustRows(settingsReply).map(({ root, allow }) => [
+        root, allow.length === 0 ? "nothing" : allow.join(", "),
+      ]);
+      replace(
+        settingsContent,
+        element(document, "h2", { text: "Trust" }),
+        rows.length === 0
+          ? element(document, "p", { text: "No directories are trusted." })
+          : settingsTable(["Root", "Allows"], rows),
+      );
+      return;
+    }
     if (section === "inventory") {
       const rows = inventoryRows(settingsReply).map(({ scope, directory, names, reason }) => [
         scope, directory, names.join(", "), reason,
@@ -245,7 +279,7 @@ export async function start({ global, document, client }) {
     }
   }
 
-  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "inventory"].map((section) => {
+  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "hooks", "ceiling", "trust", "inventory"].map((section) => {
     const link = element(document, "a", {
       text: section[0].toUpperCase() + section.slice(1),
     });

@@ -5,11 +5,15 @@ export class SettingsError extends Error {
   }
 }
 
-function section(reply, name) {
+function settings(reply) {
   if (reply === null || typeof reply !== "object" || Array.isArray(reply)) {
     throw new SettingsError("settings reply must be an object");
   }
-  const entries = reply.settings?.[name];
+  return reply.settings;
+}
+
+function section(reply, name) {
+  const entries = settings(reply)?.[name];
   return Array.isArray(entries) ? entries : [];
 }
 
@@ -61,4 +65,40 @@ export function inventoryRows(reply) {
       names,
       reason: reason || "No reason recorded.",
     }));
+}
+
+export function ceilingRows(reply) {
+  const ceiling = settings(reply)?.ceiling ?? {};
+  const capabilities = [
+    "allowed_write_scope", "fetch_allowlist", "fetch_enabled", "modes",
+    "shell_allowlist", "shell_enabled",
+  ];
+  return capabilities.map((capability) => {
+    const entry = ceiling[capability];
+    let value;
+    if (entry == null) {
+      value = "not set";
+    } else if (Array.isArray(entry)) {
+      value = entry.length === 0
+        ? "none"
+        : entry.map((item) => Array.isArray(item) ? item.join(" ") : item).join(", ");
+    } else {
+      value = formatValue(entry);
+    }
+    return { capability, value };
+  });
+}
+
+export function trustRows(reply) {
+  return section(reply, "trust")
+    .map(({ root, allow }) => ({ root, allow }))
+    .sort((left, right) => left.root.localeCompare(right.root));
+}
+
+export function hookRows(reply) {
+  return section(reply, "hooks")
+    .map(({ event, command }) => ({ event, command }))
+    .sort((left, right) =>
+      left.event.localeCompare(right.event) || left.command.localeCompare(right.command)
+    );
 }
