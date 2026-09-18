@@ -23,6 +23,7 @@ NODE_TESTS = {
     "app.host_handle": "host_handle.test.js",
     "app.turn": "turn.test.js",
     "app.roadmap": "roadmap.test.js",
+    "app.agents": "agents.test.js",
     "app.route": "route.test.js",
     "app.spec_view": "spec_view.test.js",
     "app.settings": "settings.test.js",
@@ -133,6 +134,11 @@ def roadmap() -> None:
 @check("app.route")
 def route() -> None:
     _run_node_test("route.test.js")
+
+
+@check("app.agents")
+def agents() -> None:
+    _run_node_test("agents.test.js")
 
 
 @check("app.spec_view", needs_repository=True)

@@ -1,4 +1,4 @@
-export const PAGES = Object.freeze(["chat", "settings", "roadmap"]);
+export const PAGES = Object.freeze(["chat", "settings"]);
 export const DEFAULT_ROUTE = Object.freeze({ page: "chat", section: "" });
 
 const MEMBER = /^[a-z][a-z0-9-]*$/;

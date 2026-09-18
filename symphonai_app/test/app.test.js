@@ -52,10 +52,12 @@ export class FakeDocument {
     const tags = {
       "app-shell": "div",
       sidebar: "nav",
+      "home-link": "h1",
       "sidebar-toggle": "button",
+      "rail-toggle": "button",
       "page-links": "div",
       page: "div",
-      "roadmap-pane": "aside",
+      "status-rail": "aside",
       "chat-pane": "main",
       "prompt-form": "form",
       prompt: "textarea",
@@ -64,10 +66,13 @@ export class FakeDocument {
       [
         "app-shell",
         "sidebar",
+        "home-link",
         "sidebar-toggle",
+        "rail-toggle",
         "page-links",
         "page",
-        "roadmap-pane",
+        "status-rail",
+        "agents",
         "chat-pane",
         "roadmap",
         "spec",
@@ -81,14 +86,13 @@ export class FakeDocument {
     );
     const get = (id) => this.elements.get(id);
     get("app-shell").className = "app-shell";
-    get("roadmap-pane").className = "roadmap-pane";
     get("chat-pane").className = "chat-pane";
-    get("sidebar").append(get("page-links"));
-    get("roadmap-pane").append(get("roadmap"), get("spec"));
+    get("sidebar").append(get("home-link"), get("page-links"));
+    get("status-rail").append(get("agents"), get("roadmap"), get("spec"));
     get("prompt-form").append(get("prompt"), get("prompt-error"));
     get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
-    get("page").append(get("roadmap-pane"), get("chat-pane"));
-    get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"));
+    get("page").append(get("chat-pane"));
+    get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"), get("status-rail"), get("rail-toggle"));
     this.body = new FakeElement("body", "body");
     this.body.append(get("app-shell"));
   }
@@ -406,24 +410,24 @@ test("page navigation preserves the rendered transcript and stores the route", a
   const chatPane = document.getElementById("chat-pane");
 
   await client.emit(eventFrame("AssistantTextDelta", { text: "still here" }));
-  await find(links, (value) => value.textContent === "Roadmap").dispatch("click");
-  assert.deepEqual(page.children, [document.getElementById("roadmap-pane")]);
-  assert.equal(app.route().page, "roadmap");
-  assert.equal(browser.global.location.hash, "#/roadmap");
-  assert.deepEqual(browser.writes.at(-1), ["symphonai.route", "#/roadmap"]);
+  await find(links, (value) => value.textContent === "Settings").dispatch("click");
+  assert.equal(page.children[0].className, "settings-pane");
+  assert.equal(app.route().page, "settings");
+  assert.equal(browser.global.location.hash, "#/settings");
+  assert.deepEqual(browser.writes.at(-1), ["symphonai.route", "#/settings"]);
 
-  await find(links, (value) => value.textContent === "Chat").dispatch("click");
+  await document.getElementById("home-link").dispatch("click");
   assert.deepEqual(page.children, [chatPane]);
   assert.equal(document.getElementById("chat").children[0].textContent, "still here");
 });
 
-test("stored routes reopen, but a URL fragment wins", async () => {
+test("old stored roadmap routes fall back to chat, but a URL fragment wins", async () => {
   const storedDocument = new FakeDocument();
   const stored = fakeGlobal({ stored: "#/roadmap" });
   await start({ global: stored.global, document: storedDocument, client: fakeClient() });
   assert.deepEqual(
     storedDocument.getElementById("page").children,
-    [storedDocument.getElementById("roadmap-pane")],
+    [storedDocument.getElementById("chat-pane")],
   );
 
   const fragmentDocument = new FakeDocument();
@@ -436,6 +440,47 @@ test("stored routes reopen, but a URL fragment wins", async () => {
   assert.equal(app.route().page, "settings");
   assert.equal(app.route().section, "mcp");
   assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
+});
+
+test("sidebar keeps projects, a single settings link, and a home link", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/settings/general" });
+  await start({ global: browser.global, document, client: fakeClient() });
+  const sidebar = document.getElementById("sidebar");
+  const links = document.getElementById("page-links");
+
+  assert.deepEqual(links.children.map((link) => link.textContent), ["Settings"]);
+  assert.doesNotMatch(visibleText(sidebar), /Roadmap|Chat/);
+  assert.equal(sidebar.children[0], document.getElementById("home-link"));
+  await document.getElementById("home-link").dispatch("click");
+  assert.equal(browser.global.location.hash, "#/chat");
+  assert.deepEqual(document.getElementById("page").children, [document.getElementById("chat-pane")]);
+});
+
+test("status rail keeps the roadmap beside settings and renders live agents", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/settings/general" });
+  const client = fakeClient();
+  await start({ global: browser.global, document, client });
+  const rail = document.getElementById("status-rail");
+  const agents = document.getElementById("agents");
+
+  assert.deepEqual(rail.children, [agents, document.getElementById("roadmap"), document.getElementById("spec")]);
+  assert.equal(document.getElementById("page").children[0].className, "settings-pane");
+  assert.equal(document.getElementById("page").children.length, 1);
+  assert.equal(document.getElementById("roadmap").children.length, 3);
+  assert.match(visibleText(rail), /18 · Desktop app/);
+  assert.equal(visibleText(agents), "\nNothing is running.");
+
+  await client.emit(eventFrame("RunStarted", { agent_name: "leader" }));
+  await client.emit(eventFrame("ToolCallStarted", { tool_name: "read", tool_call_id: "one" }));
+  await client.emit(eventFrame("SubagentSpawned", {
+    subagent_agent_id: "agent-2", subagent_name: "worker",
+  }));
+  assert.deepEqual(agents.children.map((row) => row.className), ["agent-row", "agent-row"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), [
+    "leader · running · read", "worker · running",
+  ]);
 });
 
 test("settings routes render general origins, model presence, and unknown fallback", async () => {
@@ -644,9 +689,9 @@ test("throwing local storage cannot stop startup or navigation", async () => {
   );
   await find(
     document.getElementById("page-links"),
-    (value) => value.textContent === "Roadmap",
+    (value) => value.textContent === "Settings",
   ).dispatch("click");
-  assert.equal(app.route().page, "roadmap");
+  assert.equal(app.route().page, "settings");
 });
 
 test("frames accumulate while settings is open", async () => {
@@ -659,7 +704,7 @@ test("frames accumulate while settings is open", async () => {
   await find(links, (value) => value.textContent === "Settings").dispatch("click");
   await client.emit(eventFrame("AssistantTextDelta", { text: "while " }));
   await client.emit(eventFrame("AssistantTextDelta", { text: "away" }));
-  await find(links, (value) => value.textContent === "Chat").dispatch("click");
+  await document.getElementById("home-link").dispatch("click");
 
   assert.equal(document.getElementById("chat").children[0].textContent, "while away");
 });
@@ -681,6 +726,23 @@ test("folding the sidebar leaves the current page in place", async () => {
   assert.equal(shell.className, "app-shell");
   assert.equal(toggle.textContent, "Hide sidebar");
   assert.equal(page.children[0], currentPane);
+});
+
+test("status and sidebar folds are independent", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const shell = document.getElementById("app-shell");
+  const railToggle = document.getElementById("rail-toggle");
+  const sidebarToggle = document.getElementById("sidebar-toggle");
+
+  await railToggle.dispatch("click");
+  assert.equal(shell.className, "app-shell rail-folded");
+  assert.equal(railToggle.textContent, "Show status");
+  await sidebarToggle.dispatch("click");
+  assert.equal(shell.className, "app-shell rail-folded sidebar-folded");
+  await railToggle.dispatch("click");
+  assert.equal(shell.className, "app-shell sidebar-folded");
+  assert.equal(railToggle.textContent, "Hide status");
 });
 
 test("items in folded and open phases open their specs and reports", async () => {
@@ -1136,7 +1198,7 @@ test("render stays DOM-only and start does not read window", async () => {
     ["auto", "1fr", "auto", "auto"],
   );
   const sharedPaneRule = cssSource.match(
-    /\.roadmap-pane,\s*\.chat-pane,\s*\.settings-pane\s*\{([^}]*)\}/,
+    /#status-rail,\s*\.chat-pane,\s*\.settings-pane\s*\{([^}]*)\}/,
   )?.[1];
   assert.match(sharedPaneRule, /(?:^|;)\s*overflow:\s*auto\s*;/);
 
@@ -1185,7 +1247,8 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.match(cssSource, /\.edit summary\s*{[^}]*cursor:\s*pointer/s);
   assert.match(cssSource, /\.edit pre\s*{[^}]*overflow-x:\s*auto/s);
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
-  assert.equal((indexSource.match(/class="(?:roadmap|chat)-pane"/g) ?? []).length, 2);
+  assert.equal((indexSource.match(/class="chat-pane"/g) ?? []).length, 1);
+  assert.equal((indexSource.match(/id="status-rail"/g) ?? []).length, 1);
   assert.equal((indexSource.match(/<!-- symphonai-handshake -->/g) ?? []).length, 1);
   assert.ok(!indexSource.includes("<h2>Chat</h2>"));
   assert.ok(!indexSource.includes('id="turn-state"'));

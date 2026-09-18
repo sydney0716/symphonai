@@ -1,4 +1,5 @@
 import { createApprovals } from "./approvals.js";
+import { createAgentBoard } from "./agents.js";
 import { createClient } from "./client.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
@@ -80,11 +81,13 @@ export async function start({ global, document, client }) {
   const boundary = clientFor(global, client);
   const shell = document.getElementById("app-shell");
   const sidebar = document.getElementById("sidebar");
+  const homeLink = document.getElementById("home-link");
   const sidebarToggle = document.getElementById("sidebar-toggle");
+  const railToggle = document.getElementById("rail-toggle");
   const pageLinks = document.getElementById("page-links");
   const pageRoot = document.getElementById("page");
-  const roadmapPane = document.getElementById("roadmap-pane");
   const chatPane = document.getElementById("chat-pane");
+  const agentsRoot = document.getElementById("agents");
   const roadmapRoot = document.getElementById("roadmap");
   const specRoot = document.getElementById("spec");
   const runNotice = document.getElementById("run-notice");
@@ -97,6 +100,7 @@ export async function start({ global, document, client }) {
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
+  const board = createAgentBoard();
   const [project, sessions, roadmapReply, settingsReply, healthReply] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
@@ -228,9 +232,7 @@ export async function start({ global, document, client }) {
     if (route.page === "settings") {
       showSettings(route.section);
     }
-    const pane = route.page === "roadmap"
-      ? roadmapPane
-      : route.page === "settings" ? settingsPane : chatPane;
+    const pane = route.page === "settings" ? settingsPane : chatPane;
     replace(pageRoot, pane);
   }
 
@@ -256,7 +258,7 @@ export async function start({ global, document, client }) {
   });
   replace(settingsSections, ...sectionLinks);
 
-  const links = PAGES.map((page) => {
+  const links = PAGES.filter((page) => page === "settings").map((page) => {
     const pageRoute = { page, section: "" };
     const link = element(document, "a", {
       text: page[0].toUpperCase() + page.slice(1),
@@ -269,6 +271,7 @@ export async function start({ global, document, client }) {
     return link;
   });
   replace(pageLinks, ...links);
+  listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
   for (const group of projectGroups(sessions, project.repo_root)) {
@@ -317,13 +320,21 @@ export async function start({ global, document, client }) {
     }
     append(projectsRoot, section);
   }
-  replace(sidebar, projectsRoot, pageLinks);
+  replace(sidebar, homeLink, projectsRoot, pageLinks);
+
+  function toggleFold(className, button, label) {
+    const classes = shell.className.split(" ");
+    const folded = classes.includes(className);
+    shell.className = folded
+      ? classes.filter((name) => name !== className).join(" ")
+      : [...classes, className].join(" ");
+    button.textContent = folded ? `Hide ${label}` : `Show ${label}`;
+  }
 
   listen(sidebarToggle, "click", () => {
-    const folded = shell.className.includes("sidebar-folded");
-    shell.className = folded ? "app-shell" : "app-shell sidebar-folded";
-    sidebarToggle.textContent = folded ? "Hide sidebar" : "Show sidebar";
+    toggleFold("sidebar-folded", sidebarToggle, "sidebar");
   });
+  listen(railToggle, "click", () => toggleFold("rail-folded", railToggle, "status"));
 
   const fragment = typeof global.location?.hash === "string" ? global.location.hash : "";
   showPage(fragment ? parseRoute(fragment) : storedRoute(global));
@@ -390,6 +401,18 @@ export async function start({ global, document, client }) {
     roadmapChildren.push(section);
   }
   replace(roadmapRoot, ...roadmapChildren);
+
+  function showAgents() {
+    replace(agentsRoot, ...(
+      board.rows.length === 0
+        ? [element(document, "p", { text: "Nothing is running." })]
+        : board.rows.map(({ name, state, tool }) => element(document, "div", {
+          className: "agent-row",
+          text: [name, state, tool].filter(Boolean).join(" · "),
+        }))
+    ));
+  }
+  showAgents();
 
   function showApprovals() {
     const children = [];
@@ -478,6 +501,8 @@ export async function start({ global, document, client }) {
 
   async function onFrame(frame) {
     transcript.apply(frame);
+    board.apply(frame);
+    showAgents();
     renderTranscript(document, chatRoot, transcript.model);
     if (frame.kind === "approval_requested") {
       await approvals.onFrame(frame);

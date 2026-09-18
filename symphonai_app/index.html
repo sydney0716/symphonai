@@ -10,15 +10,11 @@
   <body>
     <div id="app-shell" class="app-shell">
       <nav id="sidebar" aria-label="Pages">
-        <h1>SymphonAI</h1>
+        <h1 id="home-link">SymphonAI</h1>
         <div id="page-links"></div>
       </nav>
       <button id="sidebar-toggle" class="sidebar-toggle" type="button">Hide sidebar</button>
       <div id="page">
-        <aside id="roadmap-pane" class="roadmap-pane" aria-label="Roadmap pane">
-          <div id="roadmap"></div>
-          <article id="spec" class="spec-view" aria-live="polite"></article>
-        </aside>
         <main id="chat-pane" class="chat-pane" aria-label="Chat pane">
           <p id="run-notice" class="run-notice" aria-live="polite"></p>
           <div id="chat" class="chat-log" aria-live="polite"></div>
@@ -30,6 +26,12 @@
           </form>
         </main>
       </div>
+      <aside id="status-rail" aria-label="Status">
+        <div id="agents"></div>
+        <div id="roadmap"></div>
+        <article id="spec" class="spec-view" aria-live="polite"></article>
+      </aside>
+      <button id="rail-toggle" class="rail-toggle" type="button">Hide status</button>
     </div>
     <script type="module" src="src/app.js"></script>
   </body>

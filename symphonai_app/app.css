@@ -20,7 +20,7 @@ textarea {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 14rem minmax(0, 1fr);
+  grid-template-columns: 14rem minmax(0, 1fr) 18rem;
   min-height: 100vh;
 }
 
@@ -78,13 +78,28 @@ button.session-link {
   left: 0.75rem;
 }
 
+.rail-toggle {
+  position: fixed;
+  z-index: 1;
+  top: 0.75rem;
+  right: 0.75rem;
+}
+
 #page {
   grid-column: 2;
   min-width: 0;
 }
 
 .app-shell.sidebar-folded {
-  grid-template-columns: 0 minmax(0, 1fr);
+  grid-template-columns: 0 minmax(0, 1fr) 18rem;
+}
+
+.app-shell.rail-folded {
+  grid-template-columns: 14rem minmax(0, 1fr) 0;
+}
+
+.app-shell.sidebar-folded.rail-folded {
+  grid-template-columns: 0 minmax(0, 1fr) 0;
 }
 
 .app-shell.sidebar-folded #sidebar {
@@ -93,7 +108,7 @@ button.session-link {
   border: 0;
 }
 
-.roadmap-pane,
+#status-rail,
 .chat-pane,
 .settings-pane {
   min-height: 100vh;
@@ -101,8 +116,16 @@ button.session-link {
   overflow: auto;
 }
 
-.roadmap-pane {
+#status-rail {
+  grid-column: 3;
+  grid-row: 1;
   background: #171d26;
+}
+
+.app-shell.rail-folded #status-rail {
+  width: 0;
+  padding: 0;
+  border: 0;
 }
 
 .settings-sections a {
@@ -251,6 +274,18 @@ button.session-link {
 
 @media (max-width: 760px) {
   .app-shell {
-    grid-template-columns: 11rem minmax(0, 1fr);
+    grid-template-columns: 11rem minmax(0, 1fr) 18rem;
+  }
+
+  .app-shell.sidebar-folded {
+    grid-template-columns: 0 minmax(0, 1fr) 18rem;
+  }
+
+  .app-shell.rail-folded {
+    grid-template-columns: 11rem minmax(0, 1fr) 0;
+  }
+
+  .app-shell.sidebar-folded.rail-folded {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
   }
 }
