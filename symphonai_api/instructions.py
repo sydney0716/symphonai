@@ -9,6 +9,7 @@ from enum import Enum
 from pathlib import Path
 
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.paths import symphonai_home
 from symphonai_api.tools.read_ledger import ReadLedger
 
 
@@ -225,7 +226,7 @@ def load_instructions(
             )
 
     selected_user_home = (
-        Path(user_home) if user_home is not None else Path.home() / ".symphonai"
+        Path(user_home) if user_home is not None else symphonai_home()
     ).resolve()
     user_file = selected_user_home / "CLAUDE.md"
     if user_file.is_file():

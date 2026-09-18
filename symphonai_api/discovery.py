@@ -13,6 +13,7 @@ from symphonai_api.agent_spec import AgentSpec, ModelSelector
 from symphonai_api.budgets import PriceTable
 from symphonai_api.config import CapabilityCeiling, Scope
 from symphonai_api.plugins import Plugin, PluginError, load_plugin_directory
+from symphonai_api.paths import symphonai_home
 from symphonai_api.skills import Skill, SkillError, load_skill_directory
 from symphonai_api.trust import TrustList
 
@@ -126,7 +127,7 @@ def discover(
 ) -> Discovered:
     """Discover two directory scopes, withholding untrusted repository content."""
     root = Path(repo_root)
-    user_root = (Path.home() if home is None else Path(home)) / ".symphonai"
+    user_root = symphonai_home(home)
     project_root = root / ".symphonai"
     withheld: list[Offered] = []
 

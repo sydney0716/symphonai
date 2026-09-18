@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Callable
 
 from symphonai_api.events import EventSink, SessionEnded, SessionStarted, emit
 from symphonai_api.identity import SCHEMA_VERSION, new_id
+from symphonai_api.paths import symphonai_home
 
 if TYPE_CHECKING:
     from symphonai_api.models import Message
@@ -102,7 +103,7 @@ def default_sessions_root() -> Path:
     override = os.environ.get("SYMPHONAI_SESSIONS_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".symphonai" / "sessions"
+    return symphonai_home() / "sessions"
 
 
 class TranscriptWriter:

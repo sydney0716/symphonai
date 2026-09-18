@@ -16,6 +16,7 @@ from symphonai_api.permissions import (
     _intersect_write_scopes,
     _is_prefix,
 )
+from symphonai_api.paths import symphonai_home
 
 
 class ConfigError(ValueError):
@@ -181,12 +182,11 @@ def load_config(
     session: Mapping[str, object] | None = None,
 ) -> ResolvedConfig:
     """Merge user, project, private, and session values by dotted leaf key."""
-    config_home = Path.home() if home is None else Path(home)
     root = Path(repo_root)
     sources: tuple[tuple[Scope, Path | None, Mapping[str, object] | None], ...] = (
         (
             Scope.USER,
-            config_home / ".symphonai" / "config.toml",
+            symphonai_home(home) / "config.toml",
             None,
         ),
         (

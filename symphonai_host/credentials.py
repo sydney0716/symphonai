@@ -10,6 +10,8 @@ import threading
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
+from symphonai_api.paths import symphonai_home
+
 
 class CredentialError(ValueError):
     """The credentials file cannot be used safely."""
@@ -22,7 +24,7 @@ def _path(path: Path | None) -> Path:
     if path is not None:
         return Path(path)
     override = os.environ.get("SYMPHONAI_CREDENTIALS_FILE")
-    return Path(override) if override else Path.home() / ".symphonai" / "credentials.json"
+    return Path(override) if override else symphonai_home() / "credentials.json"
 
 
 def load(path: Path | None = None) -> dict[str, str]:

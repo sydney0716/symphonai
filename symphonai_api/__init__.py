@@ -43,6 +43,7 @@ from symphonai_api.models import (
     Usage,
     wire_tool_call_ids,
 )
+from symphonai_api.paths import symphonai_home
 from symphonai_api.tools.metadata import (
     FAIL_CLOSED,
     InterruptBehavior,
@@ -200,6 +201,7 @@ __all__ = [
     "search_endpoint",
     "search_endpoints",
     "safe_metadata",
+    "symphonai_home",
     "sse_events",
     "read_records",
     "resume_run",
