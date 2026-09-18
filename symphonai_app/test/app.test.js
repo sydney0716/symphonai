@@ -1264,3 +1264,40 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.match(cssSource, /\.app-shell\.sidebar-folded\s*{[^}]*grid-template-columns:\s*0/s);
   assert.ok(!/assert\.equal\(phases\.length,\s*\d+\)/.test(appTestSource));
 });
+
+test("narrow columns leave room for chat and move the rail below it", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const [wide, narrow] = css.split("@media (max-width: 760px)");
+  assert.ok(narrow);
+
+  const wideColumns = Object.fromEntries(
+    [...wide.matchAll(/(?:^|\n)(\.app-shell(?:\.[\w-]+)*)\s*\{([^}]*)\}/g)]
+      .map(([, selector, rules]) => [selector, rules.match(/grid-template-columns:\s*([^;]+);/)?.[1]]),
+  );
+  assert.deepEqual(wideColumns, {
+    ".app-shell": "14rem minmax(0, 1fr) 18rem",
+    ".app-shell.sidebar-folded": "0 minmax(0, 1fr) 18rem",
+    ".app-shell.rail-folded": "14rem minmax(0, 1fr) 0",
+    ".app-shell.sidebar-folded.rail-folded": "0 minmax(0, 1fr) 0",
+  });
+
+  const narrowColumns = [...narrow.matchAll(/grid-template-columns:\s*([^;]+);/g)]
+    .map(([, columns]) => columns);
+  assert.equal(narrowColumns.length, 4);
+  for (const columns of narrowColumns) {
+    const fixedPixels = [...columns.matchAll(/(\d+(?:\.\d+)?)rem\b/g)]
+      .reduce((total, [, rem]) => total + Number(rem) * 16, 0);
+    assert.ok(fixedPixels < 760, columns);
+    assert.ok(500 - fixedPixels >= 300, columns);
+  }
+  assert.match(narrow, /grid-template-columns:\s*min\(11rem,\s*25vw\) minmax\(0,\s*1fr\)/);
+  assert.match(narrow, /#status-rail\s*\{[^}]*grid-column:\s*1\s*\/\s*-1;[^}]*grid-row:\s*2;/);
+  assert.match(narrow, /\.app-shell\.rail-folded #status-rail\s*\{[^}]*display:\s*none;/);
+});
+
+test("an empty run notice removes its row while a populated notice keeps the normal rows", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  assert.match(css, /#run-notice:empty\s*\{[^}]*display:\s*none;/);
+  assert.match(css, /\.chat-pane:has\(#run-notice:empty\)\s*\{[^}]*grid-template-rows:\s*1fr auto auto;/);
+  assert.doesNotMatch(css, /#run-notice\s*\{[^}]*display:\s*none;/);
+});
