@@ -37,6 +37,13 @@ class RunActiveError(RuntimeError):
         self.run_id = run_id
 
 
+CONVERSATION_TITLE_LIMIT = 80
+
+
+def _conversation_title(prompt: str) -> str:
+    return " ".join(prompt.split())[:CONVERSATION_TITLE_LIMIT]
+
+
 @dataclass
 class _ActiveRun:
     run_id: str
@@ -132,6 +139,9 @@ class HostRun:
                     raise
                 if self._system_prompt:
                     leader.seed_chat([Message(role=Role.SYSTEM, content=self._system_prompt)])
+                meta = session.read_meta()
+                meta["title"] = _conversation_title(prompt)
+                session.write_meta(meta)
                 self._conversation = (leader, session)
             else:
                 leader, _ = self._conversation

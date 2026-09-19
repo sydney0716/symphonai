@@ -39,6 +39,14 @@ textarea {
   color: inherit;
 }
 
+.new-chat {
+  display: block;
+  width: 100%;
+  margin: 0 0 1rem;
+  padding: 0.5rem;
+  font-weight: 600;
+}
+
 .projects {
   margin-bottom: 1rem;
 }

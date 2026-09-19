@@ -50,11 +50,26 @@ function clientFor(global, supplied) {
     return supplied;
   }
   const handshake = resolveHost(global);
-  return createClient({
+  const client = createClient({
     port: handshake.port,
     token: handshake.token,
     fetch: global.fetch.bind(global),
   });
+  client.newSession = async () => {
+    const response = await global.fetch(`http://127.0.0.1:${handshake.port}/session/new`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${handshake.token}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    if (!response || response.status < 200 || response.status >= 300) {
+      throw new Error(`host request failed with status ${response?.status}`);
+    }
+    return response.json();
+  };
+  return client;
 }
 
 const ROUTE_KEY = "symphonai.route";
@@ -82,6 +97,7 @@ export async function start({ global, document, client }) {
   const shell = document.getElementById("app-shell");
   const sidebar = document.getElementById("sidebar");
   const homeLink = document.getElementById("home-link");
+  const newChat = document.getElementById("new-chat");
   const sidebarToggle = document.getElementById("sidebar-toggle");
   const railToggle = document.getElementById("rail-toggle");
   const pageLinks = document.getElementById("page-links");
@@ -101,13 +117,14 @@ export async function start({ global, document, client }) {
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
   const board = createAgentBoard();
-  const [project, sessions, roadmapReply, settingsReply, healthReply] = await Promise.all([
+  const [project, initialSessions, roadmapReply, settingsReply, healthReply] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
     boundary.settings(),
     boundary.health().catch(() => null),
   ]);
+  let sessions = initialSessions;
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
@@ -308,53 +325,72 @@ export async function start({ global, document, client }) {
   listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
-  for (const group of projectGroups(sessions, project.repo_root)) {
-    const current = group.root === project.repo_root;
-    const section = element(document, "details", {
-      className: `project ${current ? "openable" : "unavailable"}`,
-    });
-    section.open = current;
-    append(
-      section,
-      element(document, "summary", {
-        text: current ? project.name : projectName(group.root),
-      }),
-    );
-    if (!current) {
-      append(section, element(document, "p", {
-        className: "project-status",
-        text: "Not openable from this host.",
-      }));
-    }
-    if (current && group.sessions.length === 0) {
-      append(section, element(document, "p", {
-        className: "project-empty",
-        text: "No chats yet.",
-      }));
-    }
-    for (const session of group.sessions) {
-      const label = session.title || session.run_id;
+  function showProjects() {
+    const groups = [];
+    for (const group of projectGroups(sessions, project.repo_root)) {
+      const current = group.root === project.repo_root;
+      const section = element(document, "details", {
+        className: `project ${current ? "openable" : "unavailable"}`,
+      });
+      section.open = current;
+      append(
+        section,
+        element(document, "summary", {
+          text: current ? project.name : projectName(group.root),
+        }),
+      );
       if (!current) {
         append(section, element(document, "p", {
-          className: "session-link unavailable",
-          text: label,
+          className: "project-status",
+          text: "Not openable from this host.",
         }));
-        continue;
       }
-      const button = element(document, "button", {
-        className: "session-link",
-        text: label,
-      });
-      button.type = "button";
-      listen(button, "click", async () => {
-        await boundary.openSession(session.run_id);
-        navigate({ page: "chat", section: "" });
-      });
-      append(section, button);
+      if (current && group.sessions.length === 0) {
+        append(section, element(document, "p", {
+          className: "project-empty",
+          text: "No chats yet.",
+        }));
+      }
+      for (const session of group.sessions) {
+        const label = session.title || session.run_id;
+        if (!current) {
+          append(section, element(document, "p", {
+            className: "session-link unavailable",
+            text: label,
+          }));
+          continue;
+        }
+        const button = element(document, "button", {
+          className: "session-link",
+          text: label,
+        });
+        button.type = "button";
+        listen(button, "click", async () => {
+          await boundary.openSession(session.run_id);
+          navigate({ page: "chat", section: "" });
+        });
+        append(section, button);
+      }
+      groups.push(section);
     }
-    append(projectsRoot, section);
+    replace(projectsRoot, ...groups);
   }
-  replace(sidebar, homeLink, projectsRoot, pageLinks);
+  showProjects();
+  listen(newChat, "click", async () => {
+    try {
+      await boundary.newSession();
+      transcript.model.length = 0;
+      renderTranscript(document, chatRoot, transcript.model);
+      promptFailure = "";
+      showPromptError();
+      navigate({ page: "chat", section: "" });
+      input.value = "";
+    } catch {
+      promptFailure = "Could not start a new chat.";
+      showPromptError();
+    }
+  });
+  replace(sidebar, homeLink, newChat, projectsRoot, pageLinks);
 
   function toggleFold(className, button, label) {
     const classes = shell.className.split(" ");
@@ -510,6 +546,12 @@ export async function start({ global, document, client }) {
           } else {
             promptFailure = "";
             await perform(turn.accepted());
+            try {
+              sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+              showProjects();
+            } catch {
+              // The accepted prompt remains valid if refreshing history fails.
+            }
           }
         } catch (error) {
           turn.rejected(String(error));

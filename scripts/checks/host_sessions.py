@@ -66,6 +66,50 @@ def _listing_fixture(root: Path) -> None:
         (directory / "run.jsonl").write_text("not a transcript", encoding="utf-8")
 
 
+@check("host_sessions.title_set_once")
+def check_conversation_title_set_once() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, client = _host(root, [
+            ModelResponse(Message(Role.ASSISTANT, "first answer")),
+            ModelResponse(Message(Role.ASSISTANT, "second answer")),
+        ])
+        try:
+            run_id = client.send_prompt("First conversation title")["run_id"]
+            _wait_idle(client)
+            meta_path = root / "sessions" / run_id / "meta.json"
+            first_title = json.loads(meta_path.read_text(encoding="utf-8"))["title"]
+            client.send_prompt("A later prompt must not rename it")
+            _wait_idle(client)
+            second_title = json.loads(meta_path.read_text(encoding="utf-8"))["title"]
+            if first_title != "First conversation title" or second_title != first_title:
+                fail(f"conversation title was missing or rewritten: {first_title!r}, {second_title!r}")
+        finally:
+            host.close()
+
+
+@check("host_sessions.title_normalized")
+def check_conversation_title_normalized() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, client = _host(root)
+        prompt = "  A title\nwith\tseveral   spaces " + "z" * 100
+        expected = " ".join(prompt.split())[:80]
+        try:
+            run_id = client.send_prompt(prompt)["run_id"]
+            _wait_idle(client)
+            meta = json.loads(
+                (root / "sessions" / run_id / "meta.json").read_text(encoding="utf-8")
+            )
+            listed = {session["run_id"]: session for session in client.list_sessions()}
+            if meta["title"] != expected or listed[run_id]["title"] != expected:
+                fail(f"normalized title did not reach metadata and listing: {meta!r}, {listed!r}")
+            if len(expected) != 80 or "\n" in expected or "\t" in expected:
+                fail(f"title was not normalized to the 80-character limit: {expected!r}")
+        finally:
+            host.close()
+
+
 @check("host_sessions.current_conversation")
 def check_current_conversation() -> None:
     class RecordingProvider(FakeModelProvider):

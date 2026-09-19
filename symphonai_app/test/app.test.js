@@ -53,6 +53,7 @@ export class FakeDocument {
       "app-shell": "div",
       sidebar: "nav",
       "home-link": "h1",
+      "new-chat": "button",
       "sidebar-toggle": "button",
       "rail-toggle": "button",
       "page-links": "div",
@@ -67,6 +68,7 @@ export class FakeDocument {
         "app-shell",
         "sidebar",
         "home-link",
+        "new-chat",
         "sidebar-toggle",
         "rail-toggle",
         "page-links",
@@ -87,7 +89,8 @@ export class FakeDocument {
     const get = (id) => this.elements.get(id);
     get("app-shell").className = "app-shell";
     get("chat-pane").className = "chat-pane";
-    get("sidebar").append(get("home-link"), get("page-links"));
+    get("new-chat").className = "new-chat";
+    get("sidebar").append(get("home-link"), get("new-chat"), get("page-links"));
     get("status-rail").append(get("agents"), get("roadmap"), get("spec"));
     get("prompt-form").append(get("prompt"), get("prompt-error"));
     get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
@@ -186,7 +189,7 @@ export function fakeClient(
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
   } = {},
 ) {
-  const calls = { approve: [], credentials: [], file: [], openSession: [], prompt: [], sessions: [], settings: 0 };
+  const calls = { approve: [], credentials: [], file: [], newSession: 0, openSession: [], prompt: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -254,6 +257,10 @@ export function fakeClient(
     async openSession(runId) {
       calls.openSession.push(runId);
       return { run_id: runId };
+    },
+    async newSession() {
+      calls.newSession += 1;
+      return { ended: true };
     },
   };
 }
@@ -360,9 +367,63 @@ test("sidebar groups sessions and keeps only the current project openable", asyn
   assert.match(visibleText(groups[1]), /Not openable from this host\./);
   assert.match(visibleText(groups[2]), /legacy/);
   assert.equal(find(groups[1], (value) => value.tagName === "BUTTON"), undefined);
+  const sessionLinks = walk(projects).filter((value) => value.className.includes("session-link"));
+  assert.deepEqual(sessionLinks.map((value) => value.textContent), [
+    "Current chat",
+    "Other chat",
+    "legacy",
+  ]);
+  assert.equal(document.getElementById("new-chat").className, "new-chat");
 
   await find(groups[0], (value) => value.tagName === "BUTTON").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["current-old"]);
+});
+
+test("new chat clears the transcript and the next prompt adds a session link", async () => {
+  const document = new FakeDocument();
+  const initial = {
+    run_id: "old-run",
+    title: "Old chat",
+    repo_root: "/work/current",
+    updated_at: "2026-01-01",
+  };
+  const added = {
+    run_id: "new-run",
+    title: "New chat title",
+    repo_root: "/work/current",
+    updated_at: "2026-02-01",
+  };
+  const client = fakeClient(fixtureRoadmap(), { sessions: [initial] });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "host-run" };
+  };
+  client.sessions = async (limit) => {
+    client.calls.sessions.push(limit);
+    return client.calls.sessions.length === 1 ? [initial] : [added, initial];
+  };
+  await start({ global: {}, document, client });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "assistant", text: "Old answer", tool_calls: [], turn_id: "turn-old",
+  } });
+  assert.equal(document.getElementById("chat").children.length, 1);
+
+  const sessionLinks = () => walk(document.getElementById("sidebar"))
+    .filter((value) => value.className === "session-link");
+  assert.deepEqual(sessionLinks().map((value) => value.textContent), ["Old chat"]);
+  await document.getElementById("new-chat").dispatch("click");
+  assert.equal(client.calls.newSession, 1);
+  assert.equal(document.getElementById("chat").children.length, 0);
+  assert.deepEqual(sessionLinks().map((value) => value.textContent), ["Old chat"]);
+
+  document.getElementById("prompt").value = "Start the next chat";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, ["Start the next chat"]);
+  assert.deepEqual(client.calls.sessions, [200, 200]);
+  assert.deepEqual(sessionLinks().map((value) => value.textContent), [
+    "New chat title",
+    "Old chat",
+  ]);
 });
 
 test("sidebar shows the current project when it has no sessions", async () => {
