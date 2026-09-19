@@ -58,6 +58,7 @@ from symphonai_api.providers.openai_provider import (
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import SessionStore
 from symphonai_api.streaming import StreamCompleted, TextDelta
+from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import (
     InterruptBehavior,
@@ -1364,6 +1365,46 @@ def check_leader_seeded_chat() -> None:
         sent = [(message.role, message.text) for message in provider.requests[-1].messages]
         if sent != [(Role.USER, "first"), (Role.ASSISTANT, "second"), (Role.USER, "third")]:
             fail(f"seeded history did not reach the next model request: {sent!r}")
+
+
+@check("leader.host_tools_and_compaction")
+def check_host_tools_and_compaction() -> None:
+    class ExtraTool(_CancellingSubagentTool):
+        @property
+        def name(self) -> str:
+            return "mcp__test__lookup"
+
+    with workspace() as ws:
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("worker", "inspect")])),
+            ModelResponse(Message(Role.ASSISTANT, "child")),
+            ModelResponse(Message(Role.ASSISTANT, "leader")),
+        ])
+        result_store = ToolResultStore(directory=ws.root / "results")
+        leader = Leader(LeaderConfig(
+            provider, provider, str(ws.root),
+            result_store=result_store,
+            extra_tools={"mcp__test__lookup": ExtraTool()},
+        ))
+        child = leader.run("delegate").subagents["worker"].agent
+        for agent in (leader._agent, child):
+            if not {"read_tool_result", "mcp__test__lookup"} <= agent._tools.keys():
+                fail(f"host tools did not reach both agent registries: {agent._tools!r}")
+            if agent._result_store is not result_store:
+                fail("host result store was not passed to both agents")
+
+        events = CollectingSink()
+        compact_provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "reply " + "y" * 40))])
+        compacting = Leader(LeaderConfig(
+            compact_provider, FakeModelProvider(), str(ws.root),
+            chat_token_budget=150, chat_recent_turns=1, events=events,
+        ))
+        for index in range(6):
+            result = compacting.chat(f"prompt {index} " + "x" * 80)
+        if result.final_answer != "reply " + "y" * 40 or compact_provider.call_count != 6:
+            fail("long conversation did not continue through compaction")
+        if not events.of_type(CompactionApplied) or len(compacting._chat_messages) >= 12:
+            fail("long conversation did not shrink after exceeding its token budget")
 
 
 @check("leader.anthropic_leader_tool_schema")

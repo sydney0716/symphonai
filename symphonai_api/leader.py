@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
+from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent, _message_digest
 from symphonai_api.agent_run import (
     AgentRun,
     RunNode,
@@ -69,9 +69,10 @@ from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import Message, Role, ToolCall, ToolResult
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
-from symphonai_api.runner import standard_tool_registry
+from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore
 from symphonai_api.tool_schema import tool_registry_schemas
+from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 
@@ -215,6 +216,8 @@ class DispatchSubagentTool(LocalTool):
         dispatching_depth: int = -1,
         hooks: HookRunner | None = None,
         stream: bool = False,
+        result_store: ToolResultStore | None = None,
+        extra_tools: Mapping[str, LocalTool] | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -236,6 +239,8 @@ class DispatchSubagentTool(LocalTool):
         self._dispatching_depth = dispatching_depth
         self._hooks = hooks
         self._stream = stream
+        self._result_store = result_store
+        self._extra_tools = extra_tools
         self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
@@ -391,7 +396,10 @@ class DispatchSubagentTool(LocalTool):
                         f"cannot create new subagent {subagent_name!r}"
                     ),
                 )
-            subagent_tools = standard_tool_registry(spec.tool_names)
+            subagent_tools = merge_tool_registry(
+                standard_tool_registry(spec.tool_names, result_store=self._result_store),
+                self._extra_tools,
+            )
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
             if self._events is not None:
                 if self._event_run_id is None:
@@ -416,6 +424,7 @@ class DispatchSubagentTool(LocalTool):
                     agent_ref=agent_ref,
                     events=self._events,
                     stream=self._stream,
+                    result_store=self._result_store,
                     budget=spec.budget,
                     call_class=spec.call_class,
                     transcript=(
@@ -590,6 +599,11 @@ class LeaderConfig:
     max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
     extensions: Extensions | None = None
     stream: bool = False
+    result_store: ToolResultStore | None = None
+    extra_tools: Mapping[str, LocalTool] | None = None
+    leader_policy: PermissionPolicy | None = None
+    leader_model: str | None = None
+    hook_runner: HookRunner | None = None
 
 
 @dataclass
@@ -619,7 +633,7 @@ class Leader:
         self._config = config
         self._session = session
         self._agent_ref = new_agent_ref("leader")
-        self._hook_runner = (
+        self._hook_runner = config.hook_runner or (
             None
             if config.extensions is None
             else config.extensions.hook_runner(cwd=Path(config.repo_root))
@@ -628,7 +642,7 @@ class Leader:
             fan_out(config.events, self._hook_runner)
         )
         self._last_run_id: str | None = None
-        leader_policy = PermissionPolicy(
+        leader_policy = config.leader_policy or PermissionPolicy(
             repo_root=config.repo_root,
             mode=config.permission_mode,
             approval_callback=config.approval_callback,
@@ -665,10 +679,15 @@ class Leader:
             leases=self._leases,
             hooks=self._hook_runner,
             stream=config.stream,
+            result_store=config.result_store,
+            extra_tools=config.extra_tools,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
-        standard_tools = standard_tool_registry()
+        standard_tools = merge_tool_registry(
+            standard_tool_registry(result_store=config.result_store),
+            config.extra_tools,
+        )
         leader_tools.update(standard_tools)
         self._agent = ApiAgent(
             provider=config.leader_provider,
@@ -685,6 +704,7 @@ class Leader:
             agent_ref=self._agent_ref,
             events=self._event_sink,
             stream=config.stream,
+            result_store=config.result_store,
             call_class=CallClass.FOREGROUND,
             transcript=(
                 None
@@ -701,6 +721,10 @@ class Leader:
     @property
     def subagents(self) -> dict[str, SubagentRecord]:
         return self._dispatch_tool.pool
+
+    @property
+    def agent_ref(self) -> AgentRef:
+        return self._agent_ref
 
     def _stopped_repairs(self) -> tuple[str, ...]:
         breakers = [
@@ -724,6 +748,7 @@ class Leader:
         try:
             result = self._agent.run(
                 messages,
+                model=self._config.leader_model,
                 cancel=cancel,
                 hooks=self._hook_runner,
             )
@@ -791,10 +816,14 @@ class Leader:
         self._automatic_compaction_breaker.reset()
         return self.clear_subagents()
 
-    def seed_chat(self, messages: Sequence[Message]) -> None:
+    def seed_chat(self, messages: Sequence[Message], *, persisted: bool = False) -> None:
         """Set the history used by the next chat without changing subagents."""
 
         self._chat_messages = list(messages)
+        if persisted:
+            self._agent._persisted_digests = [
+                _message_digest(message) for message in messages
+            ]
 
     def clear_subagents(self) -> int:
         """Clear all dispatched subagents and return how many were removed."""

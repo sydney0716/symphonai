@@ -155,7 +155,7 @@ class HostServer:
             if self._closed:
                 return
             self._closed = True
-        self.run.stop()
+        self.run.close()
         self.broker.close()
         if self._serving:
             self._httpd.shutdown()
@@ -583,7 +583,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/new") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -612,6 +612,20 @@ class HostServer:
                     else:
                         os.environ.pop(name, None)
                     self._json(HTTPStatus.OK, {"stored": True, "name": name})
+                    return
+                if self.path == "/session/new":
+                    try:
+                        if self._read_object():
+                            raise ProtocolError("session/new takes an empty object")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        host.run.end_conversation()
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    self._json(HTTPStatus.OK, {"ended": True})
                     return
                 kind = self.path.removeprefix("/")
                 try:

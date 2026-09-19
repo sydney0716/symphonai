@@ -95,8 +95,11 @@ An optional positive `limit` query parameter bounds the entries returned and
 classified; missing, empty, non-numeric, zero, and negative values return the
 full listing. `POST
 /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
-its reply, and holds that conversation for the next prompt. The continuation
-is written as a new descendant session; the opened transcript is never changed.
+its reply, and makes that conversation current. Later prompts append to the
+same session directory and transcript, while each prompt still has a distinct
+run id. `POST /session/new` takes an empty JSON object, ends the current
+conversation, and returns `{"ended": true}`. The next prompt creates a new
+session directory. It returns `409` if a run is active.
 
 ## Packaged sidecar
 

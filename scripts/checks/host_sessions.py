@@ -15,7 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from symphonai_api.events import RunFinished
+from symphonai_api.events import RunFinished, SessionEnded
+from symphonai_api.session import SessionStore, load_run, read_records
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
@@ -24,7 +25,7 @@ from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
 from symphonai_host.server import HostServer
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prune_sessions
-from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream
+from scripts.checks.host_server import _WaitingProvider, _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
 
 
@@ -63,6 +64,100 @@ def _listing_fixture(root: Path) -> None:
             encoding="utf-8",
         )
         (directory / "run.jsonl").write_text("not a transcript", encoding="utf-8")
+
+
+@check("host_sessions.current_conversation")
+def check_current_conversation() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self) -> None:
+            super().__init__([
+                ModelResponse(Message(Role.ASSISTANT, "first answer")),
+                ModelResponse(Message(Role.ASSISTANT, "second answer")),
+            ])
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):  # noqa: ANN001
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = RecordingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        subscription = host.broker.subscribe()
+        try:
+            first = HostClient(HostAddress(host.port, host.token)).send_prompt("first question")["run_id"]
+            client = HostClient(HostAddress(host.port, host.token))
+            _wait_idle(client)
+            second = client.send_prompt("second question")["run_id"]
+            _wait_idle(client)
+            if first == second or len(provider.requests) != 2:
+                fail("two prompts did not run separately in one conversation")
+            sent = [message.text for message in provider.requests[1].messages]
+            if sent != ["first question", "first answer", "second question"]:
+                fail(f"second provider request lost the first exchange: {sent!r}")
+            directories = [path for path in (root / "sessions").iterdir() if path.is_dir()]
+            records, _ = read_records(root / "sessions" / first / "run.jsonl")
+            loaded = load_run(SessionStore.open(root / "sessions", first))
+            if len(directories) != 1 or directories[0].name != first:
+                fail(f"two prompts did not share the first run's directory: {directories!r}")
+            if sum(record["type"] == "run_started" for record in records) != 2 or loaded.run_count != 2:
+                fail("conversation transcript did not contain two runs")
+            if [message.text for message in loaded.messages] != [
+                "first question", "first answer", "second question", "second answer"
+            ]:
+                fail(f"conversation transcript did not rebuild in order: {loaded.messages!r}")
+            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+            try:
+                if response.status != 200 or json.loads(response.read()) != {"ended": True}:
+                    fail("session/new did not end the current conversation")
+            finally:
+                connection.close()
+            events = []
+            while (event := subscription.get(timeout=0.01)) is not None:
+                events.append(event)
+            if sum(isinstance(event, SessionEnded) for event in events) != 1:
+                fail(f"SessionEnded was not emitted once per conversation: {events!r}")
+        finally:
+            subscription.close()
+            host.close()
+
+
+@check("host_sessions.new_conversation_route")
+def check_new_conversation_route() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = _WaitingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            first = client.send_prompt("first")["run_id"]
+            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+            try:
+                if response.status != 409 or json.loads(response.read()).get("run_id") != first:
+                    fail("session/new did not preserve the active-run conflict")
+            finally:
+                connection.close()
+            provider.release.set()
+            _wait_idle(client)
+            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+            try:
+                if response.status != 200 or json.loads(response.read()) != {"ended": True}:
+                    fail("session/new did not close the finished conversation")
+            finally:
+                connection.close()
+            second = client.send_prompt("second")["run_id"]
+            _wait_idle(client)
+            loaded = load_run(SessionStore.open(root / "sessions", second))
+            if second == first or len(list((root / "sessions").iterdir())) != 2:
+                fail("a new conversation did not create a second session directory")
+            if [message.text for message in loaded.messages] != ["second", "done"]:
+                fail(f"new conversation retained prior history: {loaded.messages!r}")
+        finally:
+            provider.release.set()
+            host.close()
 
 
 @check("host_sessions.list_order_and_fields")
@@ -322,18 +417,29 @@ def check_continuation_conversation() -> None:
         root = Path(directory)
         host, client, run_id = _finished_session(root)
         try:
-            opened = client.open_session(run_id)
-            continued = client.send_prompt("second")
-            _wait_idle(client)
+            client.open_session(run_id)
+            with mock.patch.object(
+                host.run._provider,
+                "create_response",
+                wraps=host.run._provider.create_response,
+            ) as response_spy:
+                continued = client.send_prompt("second")
+                _wait_idle(client)
+            sent = [message.text for message in response_spy.call_args.args[0].messages]
+            if sent != ["first", "done", "second"]:
+                fail(f"reopened conversation did not reach the provider: {sent!r}")
             sessions = {item["run_id"]: item for item in client.list_sessions()}
-            if continued["run_id"] == run_id or sessions[continued["run_id"]]["parent_run_id"] != opened["run_id"]:
-                fail(f"continuation did not create a child run: {sessions!r}")
+            loaded = load_run(SessionStore.open(root / "sessions", run_id))
+            if continued["run_id"] == run_id or set(sessions) != {run_id} or loaded.run_count != 2:
+                fail(f"continuation did not append a second run to the conversation: {sessions!r}")
+            if [message.text for message in loaded.messages] != ["first", "done", "second", "done"]:
+                fail(f"continued conversation did not rebuild in order: {loaded.messages!r}")
         finally:
             host.close()
 
 
-@check("host_sessions.original_untouched")
-def check_original_untouched() -> None:
+@check("host_sessions.reopened_appends_to_original")
+def check_reopened_appends_to_original() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         host, client, run_id = _finished_session(root)
@@ -342,8 +448,9 @@ def check_original_untouched() -> None:
             client.open_session(run_id)
             client.send_prompt("second")
             _wait_idle(client)
-            if (root / "sessions" / run_id / "run.jsonl").read_bytes() != original:
-                fail("continuation appended to opened transcript")
+            updated = (root / "sessions" / run_id / "run.jsonl").read_bytes()
+            if not updated.startswith(original) or len(updated) == len(original):
+                fail("continuation did not append to the opened transcript")
         finally:
             host.close()
 

@@ -1,4 +1,4 @@
-"""One threaded runtime run owned by a SymphonAI host process."""
+"""Threaded conversation runs owned by a SymphonAI host process."""
 
 from __future__ import annotations
 
@@ -7,24 +7,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent
+from symphonai_api.agent_loop import DEFAULT_MAX_TURNS
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.events import Event, RunStarted, fan_out
 from symphonai_api.extensions import Extensions
-from symphonai_api.identity import AgentRef, new_agent_ref, new_id
+from symphonai_api.identity import new_id
+from symphonai_api.leader import Leader, LeaderConfig
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
-from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import (
-    LoadedRun,
-    RunDiagnosis,
     SessionStore,
     default_sessions_root,
     load_run_for_resume,
     tool_result_search_path,
 )
-from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_host.broker import EventBroker
@@ -50,7 +47,7 @@ class _ActiveRun:
 
 
 class HostRun:
-    """Build and run one ApiAgent at a time without changing the runtime API."""
+    """Run one prompt at a time in a persistent Leader conversation."""
 
     def __init__(
         self,
@@ -81,7 +78,8 @@ class HostRun:
         )
         self._mcp_tools = mcp_tools
         self._active: _ActiveRun | None = None
-        self._opened: tuple[SessionStore, LoadedRun, RunDiagnosis, list[str]] | None = None
+        self._conversation: tuple[Leader, SessionStore] | None = None
+        self._closing = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
         self._lock = threading.Lock()
         self.approvals = ApprovalBroker(publish_approval or (lambda _: False), timeout=approval_timeout)
@@ -120,44 +118,83 @@ class HostRun:
                 raise RunActiveError(self._active.run_id)
             run_id = new_id("run")
             cancel = CancellationToken()
-            agent_ref = new_agent_ref("agent")
-            session = SessionStore(
-                self._sessions_root,
-                run_id,
-                repo_root=self._policy.repo_root,
-            )
-            opened = self._opened
-            self._opened = None
-            if opened is None:
-                messages = [Message(role=Role.USER, content=prompt)]
+            if self._conversation is None:
+                session = SessionStore(
+                    self._sessions_root,
+                    run_id,
+                    repo_root=self._policy.repo_root,
+                    events=fan_out(self._broker.publish, self._hooks),
+                )
+                try:
+                    leader = self._new_leader(session)
+                except Exception:
+                    session.close()
+                    raise
                 if self._system_prompt:
-                    messages.insert(0, Message(role=Role.SYSTEM, content=self._system_prompt))
-                parent_run_id = None
-                fallback_directories: tuple = ()
+                    leader.seed_chat([Message(role=Role.SYSTEM, content=self._system_prompt)])
+                self._conversation = (leader, session)
             else:
-                store, loaded, _, _ = opened
-                messages = [*loaded.messages, Message(role=Role.USER, content=prompt)]
-                parent_run_id = loaded.run_id
-                session.set_parent_session(store.run_id)
-                fallback_directories = tool_result_search_path(store)
+                leader, _ = self._conversation
             thread = threading.Thread(
                 target=self._run,
-                args=(run_id, agent_ref, messages, parent_run_id, session, fallback_directories, cancel),
+                args=(run_id, leader, prompt, cancel),
                 name=f"symphonai-host-{run_id}",
                 daemon=True,
             )
-            self._active = _ActiveRun(run_id, cancel, thread, agent_ref.agent_id)
+            self._active = _ActiveRun(run_id, cancel, thread, leader.agent_ref.agent_id)
             thread.start()
             return run_id
+
+    def _new_leader(self, session: SessionStore) -> Leader:
+        result_store = ToolResultStore(
+            directory=session.tool_results_directory,
+            fallback_directories=tool_result_search_path(session),
+        )
+        return Leader(
+            LeaderConfig(
+                leader_provider=self._provider,
+                subagent_provider=self._provider,
+                repo_root=str(self._policy.repo_root),
+                max_leader_turns=self._max_turns,
+                permission_mode=self._policy.mode,
+                approval_callback=self.approvals.callback,
+                events=lambda event: self._publish_active(event),
+                extensions=self._extensions,
+                stream=True,
+                result_store=result_store,
+                extra_tools=self._mcp_tools,
+                leader_policy=self._policy,
+                leader_model=self._model,
+                hook_runner=self._hooks,
+            ),
+            session=session,
+        )
+
+    def _publish_active(self, event: Event) -> None:
+        with self._lock:
+            active = self._active
+            run_id = None if active is None else active.run_id
+        if run_id is not None:
+            self._publish(run_id, event)
 
     def open_session(self, run_id: str) -> dict:
         """Load and replay a finished transcript without ever rewriting it."""
         with self._lock:
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
-            store = SessionStore.open(self._sessions_root, run_id)
-            loaded, diagnosis, repaired_ids = load_run_for_resume(store)
-            self._opened = (store, loaded, diagnosis, repaired_ids)
+            reader = SessionStore.open(self._sessions_root, run_id)
+            loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
+            reader.close()
+            if self._conversation is not None:
+                self._conversation[1].close()
+            store = SessionStore.open(
+                self._sessions_root,
+                run_id,
+                events=fan_out(self._broker.publish, self._hooks),
+            )
+            leader = self._new_leader(store)
+            leader.seed_chat(loaded.messages, persisted=True)
+            self._conversation = (leader, store)
         for message in loaded.messages:
             self._broker.publish(HistoryMessage(
                 role=message.role.value,
@@ -172,6 +209,25 @@ class HostRun:
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
         }
+
+    def end_conversation(self) -> None:
+        with self._lock:
+            if self._active is not None:
+                raise RunActiveError(self._active.run_id)
+            conversation = self._conversation
+            self._conversation = None
+        if conversation is not None:
+            conversation[1].close()
+
+    def close(self) -> None:
+        self._closing = True
+        self.stop()
+        with self._lock:
+            active = self._active
+        if active is not None:
+            active.thread.join(timeout=2)
+        if not self.active:
+            self.end_conversation()
 
     def stop(self) -> None:
         with self._lock:
@@ -197,50 +253,16 @@ class HostRun:
                 pass
         self._broker.publish(event)
 
-    def _run(
-        self,
-        run_id: str,
-        agent_ref: AgentRef,
-        messages: list[Message],
-        parent_run_id: str | None,
-        session: SessionStore,
-        fallback_directories: tuple,
-        cancel: CancellationToken,
-    ) -> None:
-        result_store = ToolResultStore(
-            directory=session.tool_results_directory,
-            fallback_directories=fallback_directories,
-        )
-        tools = merge_tool_registry(
-            standard_tool_registry(result_store=result_store),
-            self._mcp_tools,
-        )
-        events = fan_out(
-            lambda event: self._publish(run_id, event),
-            self._hooks,
-        )
-        agent = ApiAgent(
-            provider=self._provider,
-            tools=tools,
-            policy=self._policy,
-            max_turns=self._max_turns,
-            tool_schemas=tool_registry_schemas(tools, self._provider.wire_format),
-            agent_ref=agent_ref,
-            events=events,
-            stream=True,
-            result_store=result_store,
-            transcript=session.writer_for(agent_ref.agent_id, is_root=True),
-        )
+    def _run(self, run_id: str, leader: Leader, prompt: str, cancel: CancellationToken) -> None:
         try:
-            agent.run(
-                messages,
-                model=self._model,
-                parent_run_id=parent_run_id,
-                cancel=cancel,
-                hooks=self._hooks,
-            )
+            leader.chat(prompt, cancel=cancel)
         finally:
-            session.close()
+            conversation = None
             with self._lock:
                 if self._active is not None and self._active.run_id == run_id:
                     self._active = None
+                if self._closing:
+                    conversation = self._conversation
+                    self._conversation = None
+            if conversation is not None:
+                conversation[1].close()

@@ -24,16 +24,16 @@ from urllib.parse import urlencode, urljoin, urlsplit
 from unittest import mock
 
 import symphonai_api.agent_loop as agent_loop
+import symphonai_api.leader as leader_module
 import symphonai_api.mcp as mcp_module
 import symphonai_host.__main__ as host_main
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
-from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import AssistantTextDelta, RunFinished, RunStarted
+from symphonai_api.events import AssistantTextDelta, RunFinished, RunStarted, SubagentSpawned
 from symphonai_api.extensions import Extensions, load_extensions
 from symphonai_api.hooks import HookRunner
-from symphonai_api.identity import RunRef, new_agent_ref
+from symphonai_api.identity import RunRef
 from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
@@ -1321,9 +1321,10 @@ def check_prompt_starts_run() -> None:
                 )
                 if isinstance(frame, tuple) and frame[0] == "event":
                     events.append(decode_event(frame[1]))
-            if not isinstance(events[0], RunStarted) or not isinstance(events[-1], RunFinished):
+            run_events = [event for event in events if isinstance(event, (RunStarted, RunFinished))]
+            if not isinstance(run_events[0], RunStarted) or not isinstance(run_events[-1], RunFinished):
                 fail(f"run did not emit RunStarted through RunFinished: {events!r}")
-            if reply["run_id"] == events[0].run_id:
+            if reply["run_id"] == run_events[0].run_id:
                 fail(f"/prompt returned the runtime id rather than a host handle: {reply!r}")
         finally:
             connection.close()
@@ -1373,6 +1374,51 @@ def check_assistant_text_reaches_the_stream() -> None:
                     connection.close()
             finally:
                 host.close()
+
+
+@check("host_server.leader_delegates")
+def check_leader_delegates() -> None:
+    provider = FakeModelProvider(streams=[
+        [StreamCompleted(ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+            ToolCall("delegate", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"})
+        ])))],
+        [TextDelta("child"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
+        [TextDelta("leader"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
+    ])
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        subscription = host.broker.subscribe()
+        try:
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "delegate"}, headers=_headers(host))
+            try:
+                if response.status != 200:
+                    fail(f"host rejected delegation prompt: {response.status}")
+                response.read()
+            finally:
+                connection.close()
+            events = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                event = subscription.get(timeout=0.1)
+                if event is not None:
+                    events.append(event)
+                    if isinstance(event, RunFinished) and event.agent_name == "leader":
+                        break
+            spawned = [event for event in events if isinstance(event, SubagentSpawned)]
+            if len(spawned) != 1 or spawned[0].subagent_name != "worker":
+                fail(f"leader dispatch did not publish a subagent spawn: {events!r}")
+            leader_id = spawned[0].agent_id
+            text = "".join(
+                event.text for event in events
+                if isinstance(event, AssistantTextDelta) and event.agent_id == leader_id
+            )
+            if text != "leader":
+                fail(f"leader streamed text changed after delegation: {text!r}")
+        finally:
+            subscription.close()
+            host.close()
 
 
 class _WaitingProvider(ModelProvider):
@@ -1833,7 +1879,7 @@ def _host_run_snapshot(
         None,
     )
     snapshot = (
-        tuple(type(event).__name__ for event in events),
+        tuple(type(event).__name__ for event in events if type(event).__name__ != "SessionStarted"),
         tuple((message.role.value, message.text) for message in loaded.messages),
         terminal,
     )
@@ -1938,7 +1984,10 @@ def check_extensions_observe_and_veto() -> None:
                     json.loads(line)["type"]
                     for line in event_log.read_text(encoding="utf-8").splitlines()
                 )
-                broker_types = tuple(type(event).__name__ for event in received)
+                broker_types = tuple(
+                    type(event).__name__ for event in received
+                    if type(event).__name__ in hook_types
+                )
                 if hook_types != broker_types or not hook_types:
                     fail(
                         "hook and broker did not receive the same host events: "
@@ -1996,7 +2045,7 @@ def check_extensions_observe_and_veto() -> None:
         host.start()
         try:
             with mock.patch.object(
-                host_run_module,
+                leader_module,
                 "standard_tool_registry",
                 return_value={tool.name: tool},
             ):
@@ -2649,13 +2698,13 @@ def check_mcp_defaults_merge_and_protocol() -> None:
             mcp_tools={tool.name: tool},
         )
         with mock.patch.object(
-            host_run_module,
+            leader_module,
             "merge_tool_registry",
             wraps=merge_tool_registry,
         ) as merge_spy:
             _start_gated(host_run, provider, "schema", 0)
         if merge_spy.call_count != 1:
-            fail("HostRun copied the merge instead of calling merge_tool_registry")
+            fail("Leader copied the merge instead of calling merge_tool_registry")
         if not any(
             schema.get("name") == tool.name
             for schema in provider.requests[0].tools
@@ -2672,30 +2721,18 @@ def check_mcp_defaults_merge_and_protocol() -> None:
             sessions_root=root / "collision-sessions",
             mcp_tools={extra_tool.name: extra_tool},
         )
-        session = SessionStore(root / "collision-sessions", "host-collision")
-        try:
-            with mock.patch.object(
-                host_run_module,
-                "standard_tool_registry",
-                return_value=standard,
-            ):
-                try:
-                    collision_run._run(
-                        "host-collision",
-                        new_agent_ref("agent"),
-                        [Message(Role.USER, "collision")],
-                        None,
-                        session,
-                        (),
-                        CancellationToken(),
-                    )
-                except ValueError as exc:
-                    if standard_tool.name not in str(exc):
-                        fail(f"host collision omitted the tool name: {exc!r}")
-                else:
-                    fail("HostRun overwrote a colliding standard tool")
-        finally:
-            session.close()
+        with mock.patch.object(
+            leader_module,
+            "standard_tool_registry",
+            return_value=standard,
+        ):
+            try:
+                collision_run.start("collision")
+            except ValueError as exc:
+                if standard_tool.name not in str(exc):
+                    fail(f"host collision omitted the tool name: {exc!r}")
+            else:
+                fail("HostRun overwrote a colliding standard tool")
         if standard[standard_tool.name] is not standard_tool:
             fail("HostRun collision changed the standard binding")
 
