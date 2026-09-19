@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from symphonai_api.permissions import PermissionPolicy, _contains_path
+from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
+from symphonai_api.cost import PriceTable
 from symphonai_api.extensions import Extensions
+from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR
@@ -71,6 +73,9 @@ class HostServer:
         sessions_root: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
+        price_table: PriceTable | None = None,
+        chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+        chat_recent_turns: int = DEFAULT_RECENT_TURNS,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
@@ -90,6 +95,9 @@ class HostServer:
             sessions_root=sessions_root,
             extensions=extensions,
             mcp_tools=mcp_tools,
+            price_table=price_table,
+            chat_token_budget=chat_token_budget,
+            chat_recent_turns=chat_recent_turns,
         )
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
@@ -372,6 +380,14 @@ class HostServer:
                             "run_id": host.run.active_run_id,
                             "runtime_run_id": host.run.runtime_run_id,
                         },
+                    )
+                    return
+                if self.path == "/conversation":
+                    if not self._authorized():
+                        return
+                    self._json(
+                        HTTPStatus.OK,
+                        {"conversation": host.run.conversation_stats()},
                     )
                     return
                 if request_path == "/app":

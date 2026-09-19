@@ -55,20 +55,26 @@ function clientFor(global, supplied) {
     token: handshake.token,
     fetch: global.fetch.bind(global),
   });
-  client.newSession = async () => {
-    const response = await global.fetch(`http://127.0.0.1:${handshake.port}/session/new`, {
-      method: "POST",
+  async function request(path, options = {}) {
+    const { headers: extraHeaders = {}, ...requestOptions } = options;
+    const response = await global.fetch(`http://127.0.0.1:${handshake.port}${path}`, {
+      ...requestOptions,
       headers: {
         Authorization: `Bearer ${handshake.token}`,
-        "Content-Type": "application/json",
+        ...extraHeaders,
       },
-      body: "{}",
     });
     if (!response || response.status < 200 || response.status >= 300) {
       throw new Error(`host request failed with status ${response?.status}`);
     }
     return response.json();
-  };
+  }
+  client.newSession = () => request("/session/new", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  client.conversationStats = () => request("/conversation");
   return client;
 }
 
@@ -117,14 +123,16 @@ export async function start({ global, document, client }) {
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
   const board = createAgentBoard();
-  const [project, initialSessions, roadmapReply, settingsReply, healthReply] = await Promise.all([
+  const [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
     boundary.settings(),
     boundary.health().catch(() => null),
+    boundary.conversationStats().catch(() => ({ conversation: null })),
   ]);
   let sessions = initialSessions;
+  let conversation = conversationReply?.conversation ?? null;
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
@@ -135,6 +143,8 @@ export async function start({ global, document, client }) {
   append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
   let promptFailure = "";
   let route;
+  const conversationUsage = element(document, "p", { className: "conversation-usage" });
+  append(form, conversationUsage);
 
   function settingsTable(headings, rows) {
     const table = element(document, "table", { className: "settings-table" });
@@ -381,6 +391,9 @@ export async function start({ global, document, client }) {
       await boundary.newSession();
       transcript.model.length = 0;
       renderTranscript(document, chatRoot, transcript.model);
+      conversation = null;
+      showConversationUsage();
+      showAgents();
       promptFailure = "";
       showPromptError();
       navigate({ page: "chat", section: "" });
@@ -472,17 +485,64 @@ export async function start({ global, document, client }) {
   }
   replace(roadmapRoot, ...roadmapChildren);
 
+  function costText(cost) {
+    return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
+      ? `${cost.currency} ${cost.amount}`
+      : "";
+  }
+
+  function usageText(usage) {
+    if (!usage || !Number.isInteger(usage.total_tokens)) {
+      return "";
+    }
+    return [`${usage.total_tokens} tokens`, costText(usage.cost)].filter(Boolean).join(" · ");
+  }
+
+  function showConversationUsage() {
+    if (conversation === null) {
+      conversationUsage.textContent = "";
+      return;
+    }
+    const context = conversation.context;
+    conversationUsage.textContent = [
+      `Context ${context.used_tokens} / ${context.budget_tokens} tokens`,
+      usageText(conversation.usage),
+    ].filter(Boolean).join(" · ");
+  }
+
   function showAgents() {
+    const rows = [...board.rows];
+    for (const agent of conversation?.agents ?? []) {
+      if (!rows.some((row) => row.agentId === agent.agent_id)) {
+        rows.push({ agentId: agent.agent_id, name: agent.name, state: "done", tool: "" });
+      }
+    }
+    const usageByAgent = new Map(
+      (conversation?.agents ?? []).map((agent) => [agent.agent_id, agent]),
+    );
     replace(agentsRoot, ...(
-      board.rows.length === 0
+      rows.length === 0
         ? [element(document, "p", { text: "Nothing is running." })]
-        : board.rows.map(({ name, state, tool }) => element(document, "div", {
+        : rows.map(({ agentId, name, state, tool }) => element(document, "div", {
           className: "agent-row",
-          text: [name, state, tool].filter(Boolean).join(" · "),
+          text: [name, state, tool, usageText(usageByAgent.get(agentId))]
+            .filter(Boolean).join(" · "),
         }))
     ));
   }
+  showConversationUsage();
   showAgents();
+
+  async function refreshConversation() {
+    try {
+      const reply = await boundary.conversationStats();
+      conversation = reply?.conversation ?? null;
+      showConversationUsage();
+      showAgents();
+    } catch {
+      // A failed status refresh does not change the conversation itself.
+    }
+  }
 
   function showApprovals() {
     const children = [];
@@ -605,6 +665,9 @@ export async function start({ global, document, client }) {
       runNotice.textContent = "";
     }
     await perform(turn.event({ ...event, ...event.fields }));
+    if (event.type === "RunFinished" || event.type === "RunFailed") {
+      await refreshConversation();
+    }
   }
 
   const subscription = boundary.events((frame) => onFrame(frame));

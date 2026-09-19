@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import get_args, get_type_hints
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -30,13 +31,20 @@ import symphonai_host.__main__ as host_main
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
-from symphonai_api.events import AssistantTextDelta, RunFinished, RunStarted, SubagentSpawned
+from symphonai_api.events import (
+    AssistantTextDelta,
+    CompactionApplied,
+    RunFinished,
+    RunStarted,
+    SubagentSpawned,
+)
+from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.extensions import Extensions, load_extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import RunRef
 from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.providers.fake import FakeModelProvider
@@ -416,6 +424,12 @@ def check_auth_required() -> None:
         try:
             if host.token in response.read().decode("utf-8"):
                 fail("authentication response exposed the host token")
+        finally:
+            connection.close()
+        connection, response = _request(host, "GET", "/conversation")
+        try:
+            if response.status != 401 or response.read() != b"":
+                fail("unauthorized conversation request leaked a response body")
         finally:
             connection.close()
     finally:
@@ -1419,6 +1433,172 @@ def check_leader_delegates() -> None:
         finally:
             subscription.close()
             host.close()
+
+
+def _conversation_reply(host: HostServer) -> tuple[bytes, dict]:
+    connection, response = _request(host, "GET", "/conversation", headers=_headers(host))
+    try:
+        body = response.read()
+        if response.status != 200:
+            fail(f"conversation route returned {response.status}: {body!r}")
+        return body, json.loads(body)
+    finally:
+        connection.close()
+
+
+def _send_host_prompt(host: HostServer, prompt: str) -> None:
+    connection, response = _request(
+        host, "POST", "/prompt", body={"prompt": prompt}, headers=_headers(host)
+    )
+    try:
+        body = response.read()
+        if response.status != 200:
+            fail(f"host rejected usage prompt: {response.status}, {body!r}")
+    finally:
+        connection.close()
+    _wait_until(lambda: not host.run.active, "usage prompt did not finish")
+
+
+@check("host_server.conversation_usage")
+def check_conversation_usage() -> None:
+    secret = "fixture-secret-token-24f"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "recognisable-absolute-path-24f"
+        root.mkdir()
+        provider = FakeModelProvider([
+            ModelResponse(
+                Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    "dispatch", "dispatch_subagent",
+                    {"subagent_name": "researcher", "task": "inspect"},
+                )]),
+                usage=Usage(input_tokens=10, output_tokens=1),
+            ),
+            ModelResponse(Message(Role.ASSISTANT, "child"), usage=Usage(input_tokens=3, output_tokens=2)),
+            ModelResponse(Message(Role.ASSISTANT, "first"), usage=Usage(input_tokens=20, output_tokens=4)),
+            ModelResponse(Message(Role.ASSISTANT, "second"), usage=Usage(input_tokens=5, output_tokens=1)),
+        ])
+        provider.model = "metered"
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            token=secret,
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        terminal_stats = []
+        publish = host.broker.publish
+
+        def capture_terminal(event) -> None:  # noqa: ANN001
+            if isinstance(event, RunFinished) and event.agent_name == "leader":
+                terminal_stats.append(host.run.conversation_stats())
+            publish(event)
+
+        host.broker.publish = capture_terminal
+        try:
+            _, empty = _conversation_reply(host)
+            if empty != {"conversation": None}:
+                fail(f"unused host exposed conversation totals: {empty!r}")
+            _send_host_prompt(host, "first short prompt")
+            if not terminal_stats or terminal_stats[-1] is None:
+                fail("leader terminal event was published before conversation totals")
+            first_body, first = _conversation_reply(host)
+            _send_host_prompt(host, "second short prompt")
+            second_body, second = _conversation_reply(host)
+            first_stats = first["conversation"]
+            second_stats = second["conversation"]
+            if second_stats["context"]["used_tokens"] <= first_stats["context"]["used_tokens"]:
+                fail(f"context usage did not grow across prompts: {first_stats!r}, {second_stats!r}")
+            if second_stats["usage"]["total_tokens"] != 46:
+                fail(f"conversation usage did not accumulate across prompts: {second_stats!r}")
+            agents = {agent["name"]: agent for agent in second_stats["agents"]}
+            if set(agents) != {"leader", "researcher"}:
+                fail(f"per-agent usage did not name leader and child: {agents!r}")
+            if agents["leader"]["total_tokens"] != 41 or agents["researcher"]["total_tokens"] != 5:
+                fail(f"per-agent totals were wrong: {agents!r}")
+            if "cost" in second_stats["usage"] or any("cost" in agent for agent in agents.values()):
+                fail(f"missing price table rendered zero cost: {second_stats!r}")
+            encoded = first_body + second_body
+            if secret.encode() in encoded or str(root).encode() in encoded:
+                fail("conversation payload leaked a token or absolute repository path")
+        finally:
+            host.close()
+
+
+@check("host_server.conversation_cost_and_context")
+def check_conversation_cost_and_context() -> None:
+    table = PriceTable(
+        prices={"priced": ModelPrice(Decimal("1"), Decimal("2"))},
+        currency="USD",
+    )
+
+    def priced_payload(root: Path, model: str) -> dict:
+        provider = FakeModelProvider([
+            ModelResponse(
+                Message(Role.ASSISTANT, "priced reply"),
+                usage=Usage(input_tokens=1_000_000, output_tokens=2_000_000),
+            )
+        ])
+        provider.model = model
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            price_table=table,
+        )
+        host.start()
+        try:
+            _send_host_prompt(host, "price this")
+            return _conversation_reply(host)[1]["conversation"]
+        finally:
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        priced_root = base / "priced"
+        unknown_root = base / "unknown"
+        compact_root = base / "compact"
+        for root in (priced_root, unknown_root, compact_root):
+            root.mkdir()
+        priced = priced_payload(priced_root, "priced")
+        unknown = priced_payload(unknown_root, "unpriced")
+        expected_cost = {"amount": "5", "currency": "USD"}
+        if priced["usage"].get("cost") != expected_cost:
+            fail(f"priced model cost was missing or inexact: {priced!r}")
+        if "cost" in unknown["usage"] or any("cost" in agent for agent in unknown["agents"]):
+            fail(f"unpriced model produced a cost: {unknown!r}")
+
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "reply " + "y" * 40))
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(compact_root),
+            sessions_root=compact_root / "sessions",
+            chat_token_budget=170,
+            chat_recent_turns=1,
+        )
+        host.start()
+        subscription = host.broker.subscribe()
+        used = []
+        try:
+            for index in range(6):
+                _send_host_prompt(host, f"prompt {index} " + "x" * 80)
+                used.append(_conversation_reply(host)[1]["conversation"]["context"]["used_tokens"])
+            events = []
+            while (event := subscription.get(timeout=0.01)) is not None:
+                events.append(event)
+        finally:
+            subscription.close()
+            host.close()
+        compactions = [event for event in events if isinstance(event, CompactionApplied)]
+        if not compactions or not all(
+            event.after_tokens < event.before_tokens for event in compactions
+        ):
+            fail(f"runtime did not report a context reduction: {compactions!r}")
+        if used[-1] > 170:
+            fail(f"visible context exceeded its configured budget: {used!r}")
+        if used[-1] >= sum(used[:3]):
+            fail(f"visible context kept a cumulative total after compaction: {used!r}")
 
 
 class _WaitingProvider(ModelProvider):

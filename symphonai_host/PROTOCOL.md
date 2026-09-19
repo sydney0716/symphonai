@@ -101,6 +101,16 @@ run id. `POST /session/new` takes an empty JSON object, ends the current
 conversation, and returns `{"ended": true}`. The next prompt creates a new
 session directory. It returns `409` if a run is active.
 
+Authenticated `GET /conversation` returns `{"conversation": null}` before a
+conversation has completed a run. Otherwise `conversation` contains `context`
+(`used_tokens`, `budget_tokens`, `remaining_tokens`, and `by_source`), aggregate
+`usage`, and an `agents` array whose entries identify an agent by opaque id and
+name and report `input_tokens`, `output_tokens`, `calls`, and `total_tokens`.
+When every used model has a configured price, usage objects also contain
+`cost` with decimal-string `amount` and `currency`; `cost` is omitted when no
+price table exists or any used model is unpriced. The payload contains no
+repository paths, credentials, or model request content.
+
 ## Packaged sidecar
 
 The packaged host is launched directly by its parent; its first stdout line is

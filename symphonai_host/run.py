@@ -9,10 +9,13 @@ from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import Event, RunStarted, fan_out
+from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
+from symphonai_api.context_report import ContextReport, account_context
+from symphonai_api.cost import PriceTable, UsageTotals, total_cost
+from symphonai_api.events import Event, RunFailed, RunFinished, RunStarted, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.identity import new_id
-from symphonai_api.leader import Leader, LeaderConfig
+from symphonai_api.leader import Leader, LeaderConfig, LeaderRunResult
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -51,6 +54,7 @@ class _ActiveRun:
     thread: threading.Thread
     root_agent_id: str
     runtime_run_id: str | None = None
+    terminal_event: RunFinished | RunFailed | None = None
 
 
 class HostRun:
@@ -70,6 +74,9 @@ class HostRun:
         sessions_root: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
+        price_table: PriceTable | None = None,
+        chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+        chat_recent_turns: int = DEFAULT_RECENT_TURNS,
     ) -> None:
         self._provider = provider
         self._policy = policy
@@ -84,8 +91,13 @@ class HostRun:
             else extensions.hook_runner(cwd=policy.repo_root)
         )
         self._mcp_tools = mcp_tools
+        self._price_table = price_table
+        self._chat_token_budget = chat_token_budget
+        self._chat_recent_turns = chat_recent_turns
         self._active: _ActiveRun | None = None
         self._conversation: tuple[Leader, SessionStore] | None = None
+        self._context_report: ContextReport | None = None
+        self._usage_by_agent: dict[str, tuple[str, dict[str, UsageTotals]]] = {}
         self._closing = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
         self._lock = threading.Lock()
@@ -143,6 +155,8 @@ class HostRun:
                 meta["title"] = _conversation_title(prompt)
                 session.write_meta(meta)
                 self._conversation = (leader, session)
+                self._context_report = None
+                self._usage_by_agent.clear()
             else:
                 leader, _ = self._conversation
             thread = threading.Thread(
@@ -166,6 +180,8 @@ class HostRun:
                 subagent_provider=self._provider,
                 repo_root=str(self._policy.repo_root),
                 max_leader_turns=self._max_turns,
+                chat_token_budget=self._chat_token_budget,
+                chat_recent_turns=self._chat_recent_turns,
                 permission_mode=self._policy.mode,
                 approval_callback=self.approvals.callback,
                 events=lambda event: self._publish_active(event),
@@ -184,6 +200,13 @@ class HostRun:
         with self._lock:
             active = self._active
             run_id = None if active is None else active.run_id
+            if (
+                active is not None
+                and event.agent_id == active.root_agent_id
+                and isinstance(event, (RunFinished, RunFailed))
+            ):
+                active.terminal_event = event
+                return
         if run_id is not None:
             self._publish(run_id, event)
 
@@ -205,6 +228,8 @@ class HostRun:
             leader = self._new_leader(store)
             leader.seed_chat(loaded.messages, persisted=True)
             self._conversation = (leader, store)
+            self._context_report = None
+            self._usage_by_agent.clear()
         for message in loaded.messages:
             self._broker.publish(HistoryMessage(
                 role=message.role.value,
@@ -226,6 +251,8 @@ class HostRun:
                 raise RunActiveError(self._active.run_id)
             conversation = self._conversation
             self._conversation = None
+            self._context_report = None
+            self._usage_by_agent.clear()
         if conversation is not None:
             conversation[1].close()
 
@@ -246,6 +273,82 @@ class HostRun:
             active.cancel.cancel()
         self.approvals.cancel_all(reason="stopped")
 
+    @staticmethod
+    def _merge_usage(
+        current: dict[str, UsageTotals], incoming: Mapping[str, UsageTotals]
+    ) -> dict[str, UsageTotals]:
+        merged = dict(current)
+        for model, totals in incoming.items():
+            merged[model] = merged.get(model, UsageTotals()).merged(totals)
+        return merged
+
+    def _record_result(self, leader: Leader, result: LeaderRunResult) -> None:
+        root_id = result.agent.agent_id
+        root_current = self._usage_by_agent.get(root_id, (result.agent.name, {}))[1]
+        self._usage_by_agent[root_id] = (
+            result.agent.name,
+            self._merge_usage(root_current, result.usage_by_agent.get(root_id, {})),
+        )
+        for name, record in result.subagents.items():
+            self._usage_by_agent[record.agent_ref.agent_id] = (
+                name,
+                dict(record.usage_by_model),
+            )
+        self._context_report = account_context(
+            leader._chat_messages,
+            budget=self._chat_token_budget,
+        )
+
+    def conversation_stats(self) -> dict | None:
+        with self._lock:
+            report = self._context_report
+            usage_by_agent = {
+                agent_id: (name, dict(by_model))
+                for agent_id, (name, by_model) in self._usage_by_agent.items()
+            }
+        if report is None:
+            return None
+
+        def usage_fields(by_model: Mapping[str, UsageTotals]) -> dict:
+            totals = UsageTotals()
+            for usage in by_model.values():
+                totals = totals.merged(usage)
+            fields = {
+                "input_tokens": totals.input_tokens,
+                "output_tokens": totals.output_tokens,
+                "calls": totals.calls,
+                "total_tokens": totals.total_tokens,
+            }
+            cost = total_cost(by_model, self._price_table)
+            if cost is not None and self._price_table is not None:
+                fields["cost"] = {
+                    "amount": str(cost),
+                    "currency": self._price_table.currency,
+                }
+            return fields
+
+        all_models: dict[str, UsageTotals] = {}
+        agents = []
+        for agent_id, (name, by_model) in usage_by_agent.items():
+            all_models = self._merge_usage(all_models, by_model)
+            agents.append({
+                "agent_id": agent_id,
+                "name": name,
+                **usage_fields(by_model),
+            })
+        return {
+            "context": {
+                "used_tokens": report.total_tokens,
+                "budget_tokens": report.budget,
+                "remaining_tokens": report.remaining_tokens,
+                "by_source": {
+                    source.value: tokens for source, tokens in report.by_source().items()
+                },
+            },
+            "usage": usage_fields(all_models),
+            "agents": agents,
+        }
+
     def _publish(self, host_run_id: str, event: Event) -> None:
         if isinstance(event, RunStarted):
             try:
@@ -264,15 +367,22 @@ class HostRun:
         self._broker.publish(event)
 
     def _run(self, run_id: str, leader: Leader, prompt: str, cancel: CancellationToken) -> None:
+        terminal_event = None
         try:
-            leader.chat(prompt, cancel=cancel)
+            result = leader.chat(prompt, cancel=cancel)
+            with self._lock:
+                if self._conversation is not None and self._conversation[0] is leader:
+                    self._record_result(leader, result)
         finally:
             conversation = None
             with self._lock:
                 if self._active is not None and self._active.run_id == run_id:
+                    terminal_event = self._active.terminal_event
                     self._active = None
                 if self._closing:
                     conversation = self._conversation
                     self._conversation = None
             if conversation is not None:
                 conversation[1].close()
+            if terminal_event is not None:
+                self._publish(run_id, terminal_event)

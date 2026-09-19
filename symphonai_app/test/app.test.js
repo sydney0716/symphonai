@@ -187,9 +187,10 @@ export function fakeClient(
     sessions = [],
     settings = { settings: {} },
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
+    conversation = null,
   } = {},
 ) {
-  const calls = { approve: [], credentials: [], file: [], newSession: 0, openSession: [], prompt: [], sessions: [], settings: 0 };
+  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], newSession: 0, openSession: [], prompt: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -245,6 +246,10 @@ export function fakeClient(
     },
     async health() {
       return health;
+    },
+    async conversationStats() {
+      calls.conversationStats += 1;
+      return { conversation };
     },
     async storeCredential(name, value) {
       calls.credentials.push({ name, value });
@@ -339,6 +344,50 @@ test("start renders the chat page and prepares the roadmap", async () => {
   assert.equal(app.client, client);
   assert.ok(app.transcript);
   assert.deepEqual(app.transcript.model, []);
+  assert.equal(find(document.body, (value) => value.className === "conversation-usage").textContent, "");
+});
+
+test("conversation context and per-agent usage render and refresh after compaction", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const secret = "recognisable-conversation-secret-24f";
+  const absolutePath = "/recognisable/absolute/conversation/path-24f";
+  const snapshots = [
+    {
+      fixture_secret: secret,
+      repo_root: absolutePath,
+      context: { used_tokens: 120, budget_tokens: 160, remaining_tokens: 40, by_source: { user: 70, assistant: 50 } },
+      usage: { input_tokens: 30, output_tokens: 12, calls: 3, total_tokens: 42 },
+      agents: [
+        { agent_id: "leader-id", name: "leader", input_tokens: 20, output_tokens: 10, calls: 2, total_tokens: 30, cost: { amount: "0.004", currency: "USD" } },
+        { agent_id: "child-id", name: "researcher", input_tokens: 10, output_tokens: 2, calls: 1, total_tokens: 12 },
+      ],
+    },
+    {
+      context: { used_tokens: 65, budget_tokens: 160, remaining_tokens: 95, by_source: { user: 35, assistant: 30 } },
+      usage: { input_tokens: 35, output_tokens: 15, calls: 4, total_tokens: 50, cost: { amount: "0.007", currency: "USD" } },
+      agents: [
+        { agent_id: "leader-id", name: "leader", input_tokens: 25, output_tokens: 13, calls: 3, total_tokens: 38, cost: { amount: "0.005", currency: "USD" } },
+        { agent_id: "child-id", name: "researcher", input_tokens: 10, output_tokens: 2, calls: 1, total_tokens: 12 },
+      ],
+    },
+  ];
+  client.conversationStats = async () => {
+    client.calls.conversationStats += 1;
+    return { conversation: snapshots[Math.min(client.calls.conversationStats - 1, 1)] };
+  };
+  await start({ global: {}, document, client });
+
+  const usage = find(document.body, (value) => value.className === "conversation-usage");
+  assert.equal(usage.textContent, "Context 120 / 160 tokens · 42 tokens");
+  assert.doesNotMatch(usage.textContent, /USD|undefined/);
+  assert.match(visibleText(document.getElementById("agents")), /leader · done · 30 tokens · USD 0\.004/);
+  assert.match(visibleText(document.getElementById("agents")), /researcher · done · 12 tokens/);
+  assert.doesNotMatch(visibleText(document.body), new RegExp(`${secret}|${absolutePath}`));
+
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader-id" }));
+  assert.equal(usage.textContent, "Context 65 / 160 tokens · 50 tokens · USD 0.007");
+  assert.equal(client.calls.conversationStats, 2);
 });
 
 test("sidebar groups sessions and keeps only the current project openable", async () => {
