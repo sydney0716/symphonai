@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import unittest.mock as mock
+from pathlib import Path
 
 import symphonai_api.instructions as instructions
 from symphonai_api.instructions import InstructionScope, load_instructions
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import run_task, standard_tool_registry
 from symphonai_api.tools.read_ledger import ReadLedger
@@ -19,21 +21,27 @@ PARTIAL_VIEW_ERROR = (
     "only a processed view of this file has been read; "
     "read it with read_file before editing it"
 )
+INSTRUCTION_PATH = Path(".symphonai/INSTRUCTIONS.md")
+
+
+def _instruction_file(directory: Path) -> Path:
+    path = directory / INSTRUCTION_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 @check("instructions.scope_order")
 def check_scope_order() -> None:
     with workspace() as ws:
-        user_home = ws.root / "user-config"
-        user_home.mkdir()
-        (user_home / "CLAUDE.md").write_text("user rule")
-        (ws.root / "CLAUDE.md").write_text("project claude")
-        (ws.root / "AGENTS.md").write_text("project agents")
+        user_home = ws.root / "user-config" / ".symphonai"
+        user_home.mkdir(parents=True)
+        (user_home / INSTRUCTION_PATH.name).write_text("user rule")
+        _instruction_file(ws.root).write_text("project rule")
         nested = ws.root / "src"
         deep = nested / "package"
         deep.mkdir(parents=True)
-        (nested / "CLAUDE.md").write_text("directory claude")
-        (deep / "AGENTS.md").write_text("directory agents")
+        _instruction_file(nested).write_text("directory rule")
+        _instruction_file(deep).write_text("deep rule")
 
         loaded = load_instructions(
             ws.policy,
@@ -42,11 +50,10 @@ def check_scope_order() -> None:
             agent_instructions="agent rule",
         )
         expected = [
-            (InstructionScope.USER, user_home / "CLAUDE.md"),
-            (InstructionScope.PROJECT, ws.root / "CLAUDE.md"),
-            (InstructionScope.PROJECT, ws.root / "AGENTS.md"),
-            (InstructionScope.DIRECTORY, nested / "CLAUDE.md"),
-            (InstructionScope.DIRECTORY, deep / "AGENTS.md"),
+            (InstructionScope.USER, user_home / INSTRUCTION_PATH.name),
+            (InstructionScope.PROJECT, ws.root / INSTRUCTION_PATH),
+            (InstructionScope.DIRECTORY, nested / INSTRUCTION_PATH),
+            (InstructionScope.DIRECTORY, deep / INSTRUCTION_PATH),
             (InstructionScope.AGENT, None),
         ]
         actual = [(entry.scope, entry.path) for entry in loaded.entries]
@@ -62,11 +69,26 @@ def check_scope_order() -> None:
             working_dir=ws.root,
             user_home=ws.root / "missing-user-home",
         )
-        if [entry.scope for entry in root_only.entries] != [
-            InstructionScope.PROJECT,
-            InstructionScope.PROJECT,
-        ] or root_only.warnings:
+        if [entry.scope for entry in root_only.entries] != [InstructionScope.PROJECT] or root_only.warnings:
             fail(f"root or missing-user discovery changed: {root_only!r}")
+
+
+@check("instructions.legacy_files_ignored")
+def check_legacy_files_ignored() -> None:
+    with workspace() as ws:
+        user_home = ws.outside / ".symphonai"
+        user_home.mkdir()
+        (user_home / "CLAUDE.md").write_text("old user claude")
+        (user_home / "AGENTS.md").write_text("old user agents")
+        (ws.root / "CLAUDE.md").write_text("old project claude")
+        (ws.root / "AGENTS.md").write_text("old project agents")
+        nested = ws.root / "src"
+        nested.mkdir()
+        (nested / "CLAUDE.md").write_text("old directory claude")
+        (nested / "AGENTS.md").write_text("old directory agents")
+        loaded = load_instructions(ws.policy, working_dir=nested, user_home=user_home)
+        if loaded.entries or loaded.warnings or loaded.render():
+            fail(f"legacy convention files were still loaded: {loaded!r}")
 
 
 @check("instructions.outside_working_dir")
@@ -87,17 +109,17 @@ def check_outside_working_dir() -> None:
 @check("instructions.include_provenance")
 def check_include_provenance() -> None:
     with workspace() as ws:
-        docs = ws.root / "docs"
-        docs.mkdir()
-        project = ws.root / "CLAUDE.md"
-        agents = ws.root / "AGENTS.md"
+        docs = ws.root / ".symphonai" / "docs"
+        docs.mkdir(parents=True)
+        project = _instruction_file(ws.root)
         included = docs / "style.md"
-        project.write_text("parent before\n@docs/style.md\nparent after\n")
-        agents.write_text("@docs/style.md\nagents rule\n")
+        extra = docs / "extra.md"
+        project.write_text("parent before\n@docs/style.md\n@docs/extra.md\nparent after\n")
         included.write_text("style rule\n")
+        extra.write_text("@style.md\nextra rule\n")
 
         loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
-        if [entry.path for entry in loaded.entries] != [project, included, agents]:
+        if [entry.path for entry in loaded.entries] != [project, included, extra]:
             fail(f"included file order or deduplication changed: {loaded.entries!r}")
         child = loaded.entries[1]
         if child.parent != project or child.depth != 1 or child.scope != InstructionScope.PROJECT:
@@ -108,8 +130,8 @@ def check_include_provenance() -> None:
             fail(f"duplicate include did not warn once: {loaded.warnings!r}")
         rendered = loaded.render()
         if (
-            "# instructions: project CLAUDE.md\nparent before\nparent after" not in rendered
-            or "# instructions: project CLAUDE.md -> docs/style.md\nstyle rule" not in rendered
+            "# instructions: project .symphonai/INSTRUCTIONS.md\nparent before\nparent after" not in rendered
+            or "# instructions: project .symphonai/INSTRUCTIONS.md -> .symphonai/docs/style.md\nstyle rule" not in rendered
         ):
             fail(f"rendered provenance was wrong: {rendered!r}")
 
@@ -117,7 +139,9 @@ def check_include_provenance() -> None:
 @check("instructions.depth_cap")
 def check_depth_cap() -> None:
     with workspace() as ws:
-        paths = [ws.root / name for name in ("CLAUDE.md", "one.md", "two.md", "three.md")]
+        directory = ws.root / ".symphonai"
+        directory.mkdir()
+        paths = [directory / name for name in ("INSTRUCTIONS.md", "one.md", "two.md", "three.md")]
         paths[0].write_text("@one.md\nroot")
         paths[1].write_text("@two.md\none")
         paths[2].write_text("@three.md\ntwo")
@@ -139,10 +163,10 @@ def check_depth_cap() -> None:
 @check("instructions.cycle_detection")
 def check_cycle_detection() -> None:
     with workspace() as ws:
-        project = ws.root / "CLAUDE.md"
-        child = ws.root / "child.md"
+        project = _instruction_file(ws.root)
+        child = project.parent / "child.md"
         project.write_text("@child.md\nroot")
-        child.write_text("@CLAUDE.md\nchild")
+        child.write_text("@INSTRUCTIONS.md\nchild")
         loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
         if [entry.path for entry in loaded.entries] != [project, child]:
             fail(f"cycle loaded a file more than once: {loaded.entries!r}")
@@ -153,7 +177,7 @@ def check_cycle_detection() -> None:
 @check("instructions.forbidden_include")
 def check_forbidden_include() -> None:
     with workspace() as ws:
-        (ws.root / "CLAUDE.md").write_text("safe\n@.env\nstill safe\n")
+        _instruction_file(ws.root).write_text("safe\n@../.env\nstill safe\n")
         loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
         secret = "SECRET=do-not-read-me"
         if secret in loaded.render() or any(secret in entry.text for entry in loaded.entries):
@@ -166,11 +190,27 @@ def check_forbidden_include() -> None:
             fail(f"forbidden include warning was wrong: {loaded.warnings!r}")
 
 
+@check("instructions.owned_file_policy_gate")
+def check_owned_file_policy_gate() -> None:
+    with workspace() as ws:
+        path = _instruction_file(ws.root)
+        path.write_text("denied project rule")
+        policy = PermissionPolicy(
+            repo_root=ws.root,
+            forbidden_patterns=(*ws.policy.forbidden_patterns, ".symphonai/"),
+        )
+        loaded = load_instructions(policy, user_home=ws.root / "missing-user-home")
+        if loaded.entries or len(loaded.warnings) != 1:
+            fail(f"project instruction policy gate did not deny: {loaded!r}")
+        if str(path) not in loaded.warnings[0] or "denied" not in loaded.warnings[0]:
+            fail(f"project instruction denial lost its path and reason: {loaded.warnings!r}")
+
+
 @check("instructions.processing_and_size_warning")
 def check_processing_and_size_warning() -> None:
     with workspace() as ws:
         raw = "---\ntitle: hidden\n---\nVisible\n<!-- hidden\ncomment -->\nTail\n"
-        path = ws.root / "CLAUDE.md"
+        path = _instruction_file(ws.root)
         path.write_text(raw)
         with mock.patch.object(instructions, "MAX_INSTRUCTION_FILE_CHARS", 10):
             loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
@@ -190,7 +230,7 @@ def check_processing_and_size_warning() -> None:
 @check("instructions.ledger_partial_view")
 def check_ledger_partial_view() -> None:
     with workspace() as ws:
-        path = ws.root / "CLAUDE.md"
+        path = _instruction_file(ws.root)
         path.write_text("project rule")
         ledger = ws.tools["read_file"]._ledger
         loaded = load_instructions(
@@ -222,7 +262,7 @@ def check_ledger_partial_view() -> None:
 @check("instructions.run_task_wiring")
 def check_run_task_wiring() -> None:
     with workspace() as ws:
-        path = ws.root / "CLAUDE.md"
+        path = _instruction_file(ws.root)
         path.write_text("project rule")
         baseline = run_task(
             FakeModelProvider(),
@@ -254,7 +294,7 @@ def check_run_task_wiring() -> None:
                                 id="edit-instruction",
                                 name="edit_file",
                                 arguments={
-                                    "path": path.name,
+                                    "path": str(path.relative_to(ws.root)),
                                     "old_string": "project rule",
                                     "new_string": "changed",
                                 },
@@ -268,7 +308,7 @@ def check_run_task_wiring() -> None:
         wired = run_task(provider, ws.policy, "edit it", include_instructions=True)
         if (
             wired.messages[0].role != Role.SYSTEM
-            or "project CLAUDE.md" not in wired.messages[0].text
+            or "project .symphonai/INSTRUCTIONS.md" not in wired.messages[0].text
         ):
             fail(f"automatic instructions were not prepended: {wired.messages!r}")
         tool_results = [
@@ -292,7 +332,7 @@ def check_directive_boundaries() -> None:
             "@tilde_decorator\n"
             "~~~\n"
         )
-        path = ws.root / "CLAUDE.md"
+        path = _instruction_file(ws.root)
         path.write_text(raw)
         loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
         entry = loaded.entries[0]
@@ -318,7 +358,7 @@ def check_directive_boundaries() -> None:
 def check_fence_run_length() -> None:
     with workspace() as ws:
         raw = "````markdown\n```\n@inside-four-ticks\n```\n````\n"
-        (ws.root / "CLAUDE.md").write_text(raw)
+        _instruction_file(ws.root).write_text(raw)
         loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
         if "@inside-four-ticks" not in loaded.entries[0].text:
             fail(f"shorter nested fence exposed an @ line: {loaded.entries[0].text!r}")
@@ -331,7 +371,7 @@ def check_user_scope_include() -> None:
     with workspace() as ws:
         user_home = ws.outside / "user-home"
         user_home.mkdir()
-        user_file = user_home / "CLAUDE.md"
+        user_file = user_home / INSTRUCTION_PATH.name
         included = user_home / "style.md"
         user_file.write_text("user rule\n@style.md\n")
         included.write_text("user style\n")
@@ -361,7 +401,7 @@ def check_user_scope_guards() -> None:
         forbidden = user_home / ".env"
         escaped.write_text("escaped content")
         forbidden.write_text("USER_SECRET=do-not-read")
-        (user_home / "CLAUDE.md").write_text("@../elsewhere.md\n@.env\nuser rule\n")
+        (user_home / INSTRUCTION_PATH.name).write_text("@../elsewhere.md\n@.env\nuser rule\n")
         loaded = load_instructions(ws.policy, user_home=user_home)
         if len(loaded.entries) != 1:
             fail(f"denied user-scope includes loaded: {loaded.entries!r}")
@@ -380,7 +420,7 @@ def check_user_scope_relative_denylist() -> None:
     with workspace() as ws:
         user_home = ws.outside / "build" / ".symphonai"
         user_home.mkdir(parents=True)
-        user_file = user_home / "CLAUDE.md"
+        user_file = user_home / INSTRUCTION_PATH.name
         included = user_home / "style.md"
         forbidden = user_home / ".env"
         escaped = ws.outside / "elsewhere.md"
@@ -422,7 +462,7 @@ def check_symlinked_user_home() -> None:
         real_home = ws.outside / "real-user-home"
         linked_home = ws.outside / "linked-user-home"
         real_home.mkdir()
-        user_file = real_home / "CLAUDE.md"
+        user_file = real_home / INSTRUCTION_PATH.name
         included = real_home / "style.md"
         user_file.write_text("@style.md\nuser rule\n")
         included.write_text("symlinked user style\n")
@@ -447,9 +487,10 @@ def check_whitespace_only_entry() -> None:
     with workspace() as ws:
         user_home = ws.root / "user-home"
         user_home.mkdir()
-        (user_home / "CLAUDE.md").write_text("user rule")
-        (ws.root / "CLAUDE.md").write_text("   \n ")
-        (ws.root / "AGENTS.md").write_text("project rule")
+        (user_home / INSTRUCTION_PATH.name).write_text("user rule")
+        project = _instruction_file(ws.root)
+        project.write_text("   \n \n@project-rule.md")
+        (project.parent / "project-rule.md").write_text("project rule")
         loaded = load_instructions(ws.policy, user_home=user_home)
 
     whitespace_entry = loaded.entries[1]
@@ -459,9 +500,12 @@ def check_whitespace_only_entry() -> None:
     rendered = loaded.render()
     if loaded.render_entry(whitespace_entry) != "":
         fail(f"whitespace-only entry rendered a block: {whitespace_entry!r}")
-    if "# instructions: project CLAUDE.md" in rendered:
+    if "# instructions: project .symphonai/INSTRUCTIONS.md\n" in rendered:
         fail(f"whitespace-only instruction header survived: {rendered!r}")
-    if not project_block or project_block != "# instructions: project AGENTS.md\nproject rule":
+    if not project_block or project_block != (
+        "# instructions: project .symphonai/INSTRUCTIONS.md "
+        "-> .symphonai/project-rule.md\nproject rule"
+    ):
         fail(f"non-empty project block changed: {project_block!r}")
     if rendered != f"{user_block}\n\n{project_block}":
         fail(f"surrounding entries were not joined by one blank line: {rendered!r}")

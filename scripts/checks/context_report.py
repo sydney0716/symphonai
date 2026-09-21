@@ -46,7 +46,9 @@ def check_splits_instructions() -> None:
     with workspace() as ws:
         docs = ws.root / "docs"
         docs.mkdir()
-        (ws.root / "CLAUDE.md").write_text("project rule\n@docs/style.md")
+        instruction_file = ws.root / ".symphonai" / "INSTRUCTIONS.md"
+        instruction_file.parent.mkdir()
+        instruction_file.write_text("project rule\n@../docs/style.md")
         (docs / "style.md").write_text("included style")
         loaded = load_instructions(
             ws.policy,
@@ -73,13 +75,13 @@ def check_splits_instructions() -> None:
     if len(system_entries) != len(non_empty_instructions) + 1:
         fail(f"system message did not split into its real instruction parts: {report!r}")
     if [entry.label for entry in system_entries] != [
-        "CLAUDE.md",
+        ".symphonai/INSTRUCTIONS.md",
         "docs/style.md",
         "agent instructions",
         "system prompt",
     ]:
         fail(f"split labels lost instruction provenance: {system_entries!r}")
-    if system_entries[1].detail != "project, included by CLAUDE.md":
+    if system_entries[1].detail != "project, included by .symphonai/INSTRUCTIONS.md":
         fail(f"included instruction did not name its parent: {system_entries[1]!r}")
     if system_entries[-1].characters != len(caller_prompt):
         fail(f"caller prompt remainder was not isolated: {system_entries[-1]!r}")
@@ -138,8 +140,12 @@ def check_orphan_tool_warning() -> None:
 @check("context.mismatched_instructions")
 def check_mismatched_instructions() -> None:
     with workspace() as ws:
-        (ws.root / "AGENTS.md").write_text("loaded rule")
+        instruction_file = ws.root / ".symphonai" / "INSTRUCTIONS.md"
+        instruction_file.parent.mkdir()
+        instruction_file.write_text("loaded rule")
         loaded = load_instructions(ws.policy, user_home=ws.root / "missing-user-home")
+        if len(loaded.entries) != 1 or loaded.entries[0].text != "loaded rule":
+            fail(f"mismatch fixture did not load an instruction: {loaded!r}")
         messages = [Message(role=Role.SYSTEM, content="different system prompt")]
         report = account_context(messages, instructions=loaded)
     if len(report.entries) != 1 or report.entries[0].source != ContextSource.SYSTEM_PROMPT:
@@ -256,7 +262,9 @@ def check_split_covers_rendered_text() -> None:
     with workspace() as ws:
         docs = ws.root / "docs"
         docs.mkdir()
-        (ws.root / "CLAUDE.md").write_text("project rule\n@docs/style.md")
+        instruction_file = ws.root / ".symphonai" / "INSTRUCTIONS.md"
+        instruction_file.parent.mkdir()
+        instruction_file.write_text("project rule\n@../docs/style.md")
         (docs / "style.md").write_text("included style")
         loaded = load_instructions(
             ws.policy,

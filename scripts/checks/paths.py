@@ -65,7 +65,7 @@ def call_sites() -> None:
         (home / "config.toml").write_text(
             '[agents]\ndirectory = "from-app-home"\n', encoding="utf-8"
         )
-        user_instructions = home / "CLAUDE.md"
+        user_instructions = home / "INSTRUCTIONS.md"
         user_instructions.write_text("from app home", encoding="utf-8")
         with mock.patch.dict(os.environ, {
             "SYMPHONAI_HOME": str(home),

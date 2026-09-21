@@ -17,7 +17,7 @@ from symphonai_api.tools.read_ledger import ReadLedger
 # SymphonAI has not measured or tuned them independently.
 MAX_INSTRUCTION_FILE_CHARS = 40_000
 MAX_INCLUDE_DEPTH = 5
-INSTRUCTION_FILENAMES: tuple[str, ...] = ("CLAUDE.md", "AGENTS.md")
+INSTRUCTION_PATH = Path(".symphonai") / "INSTRUCTIONS.md"
 
 
 class InstructionScope(str, Enum):
@@ -228,7 +228,7 @@ def load_instructions(
     selected_user_home = (
         Path(user_home) if user_home is not None else symphonai_home()
     ).resolve()
-    user_file = selected_user_home / "CLAUDE.md"
+    user_file = selected_user_home / INSTRUCTION_PATH.name
     if user_file.is_file():
         load_file(
             user_file,
@@ -240,18 +240,17 @@ def load_instructions(
             include_root=selected_user_home,
         )
 
-    for name in INSTRUCTION_FILENAMES:
-        project_file = repo_root / name
-        if project_file.is_file():
-            load_file(
-                project_file,
-                scope=InstructionScope.PROJECT,
-                depth=0,
-                parent=None,
-                included=False,
-                policy_gated=True,
-                include_root=None,
-            )
+    project_file = repo_root / INSTRUCTION_PATH
+    if project_file.is_file():
+        load_file(
+            project_file,
+            scope=InstructionScope.PROJECT,
+            depth=0,
+            parent=None,
+            included=False,
+            policy_gated=True,
+            include_root=None,
+        )
 
     if working_dir is not None:
         resolved_working_dir = Path(working_dir).resolve()
@@ -266,18 +265,17 @@ def load_instructions(
             current = repo_root
             for part in relative_working_dir.parts:
                 current /= part
-                for name in INSTRUCTION_FILENAMES:
-                    directory_file = current / name
-                    if directory_file.is_file():
-                        load_file(
-                            directory_file,
-                            scope=InstructionScope.DIRECTORY,
-                            depth=0,
-                            parent=None,
-                            included=False,
-                            policy_gated=True,
-                            include_root=None,
-                        )
+                directory_file = current / INSTRUCTION_PATH
+                if directory_file.is_file():
+                    load_file(
+                        directory_file,
+                        scope=InstructionScope.DIRECTORY,
+                        depth=0,
+                        parent=None,
+                        included=False,
+                        policy_gated=True,
+                        include_root=None,
+                    )
 
     if agent_instructions is not None:
         entries.append(
