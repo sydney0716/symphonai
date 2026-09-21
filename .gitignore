@@ -27,7 +27,9 @@ ref/
 # and agent instructions stay on disk and are never committed, which is what
 # replaced publish.sh and its rebuilt-tree branch. Their history up to the
 # migration lives on the local `archive` branch.
-/specs/
+/specs/*
+!/specs/TEMPLATE.md
+!/specs/REPORT-TEMPLATE.md
 /docs/
 /CLAUDE.md
 /AGENTS.md
