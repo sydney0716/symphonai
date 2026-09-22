@@ -418,8 +418,11 @@ class DispatchSubagentTool(LocalTool):
                         f"cannot create new subagent {subagent_name!r}"
                     ),
                 )
+            tool_names = spec.tool_names
+            if tool_names is not None and self._result_store is not None:
+                tool_names = (*tool_names, "read_tool_result")
             subagent_tools = merge_tool_registry(
-                standard_tool_registry(spec.tool_names, result_store=self._result_store),
+                standard_tool_registry(tool_names, result_store=self._result_store),
                 self._extra_tools,
             )
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
@@ -700,9 +703,12 @@ class Leader:
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
+        tool_names = None if defined_leader is None else defined_leader.tool_names
+        if tool_names is not None and config.result_store is not None:
+            tool_names = (*tool_names, "read_tool_result")
         standard_tools = merge_tool_registry(
             standard_tool_registry(
-                None if defined_leader is None else defined_leader.tool_names,
+                tool_names,
                 result_store=config.result_store,
             ),
             config.extra_tools,

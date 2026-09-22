@@ -3115,6 +3115,12 @@ def check_builtin_roster_without_definitions() -> None:
                 leader.run("delegate")
                 if set(leader.subagents) != {"worker", "explorer"}:
                     fail(f"host could not dispatch built-ins with empty={empty_directory}: {leader.subagents!r}")
+                worker_tools = set(leader.subagents["worker"].agent._tools)
+                explorer_tools = set(leader.subagents["explorer"].agent._tools)
+                if worker_tools != set(standard_tool_registry()) | {"read_tool_result"}:
+                    fail(f"host worker lost its stored-result tool: {worker_tools!r}")
+                if explorer_tools != {"read_file", "glob", "grep", "list_files", "web_fetch", "read_tool_result"}:
+                    fail(f"host explorer registry was wrong: {explorer_tools!r}")
                 missing = leader._dispatch_tool.execute(ToolCall(
                     id="missing", name="dispatch_subagent",
                     arguments={"subagent_name": "missing", "task": "work"},
@@ -3167,7 +3173,7 @@ def check_defined_worker_reaches_pool() -> None:
             leader = run._new_leader(session)
             leader.run("delegate")
             record = leader.subagents.get("worker")
-            if record is None or set(record.agent._tools) != {"read_file"}:
+            if record is None or set(record.agent._tools) != {"read_file", "read_tool_result"}:
                 fail("worker definition did not replace the built-in tool registry")
             if not record.messages or record.messages[0].text != "defined worker prompt":
                 fail("worker definition prompt did not reach the spawned agent")
@@ -3243,7 +3249,7 @@ def check_defined_leader_provider_model_and_tools() -> None:
                 fail("leader definition model did not reach the provider request")
             if defined.requests[0].messages[0].text != "defined leader prompt":
                 fail("leader definition prompt did not reach the provider request")
-            if set(leader._agent._tools) != {"dispatch_subagent", "read_file"}:
+            if set(leader._agent._tools) != {"dispatch_subagent", "read_file", "read_tool_result"}:
                 fail("leader definition tools did not reach the actual registry")
             if set(leader._leader_spec.tool_names or ()) != set(leader._agent._tools):
                 fail("defined leader run spec did not report its actual registry")

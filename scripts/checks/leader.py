@@ -1385,6 +1385,7 @@ def check_host_tools_and_compaction() -> None:
             provider, provider, str(ws.root),
             result_store=result_store,
             extra_tools={"mcp__test__lookup": ExtraTool()},
+            subagent_specs=builtin_subagent_specs(provider, ws.policy),
         ))
         child = leader.run("delegate").subagents["worker"].agent
         for agent in (leader._agent, child):
@@ -2171,22 +2172,26 @@ def check_typed_subagent_output() -> None:
 @check("leader.builtin_roster_tool_registries")
 def check_builtin_roster_tool_registries() -> None:
     with workspace() as ws:
-        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
-        tool = DispatchSubagentTool(
-            provider, ws.policy,
-            subagent_specs=builtin_subagent_specs(provider, ws.policy),
-        )
-        for name in ("explorer", "worker"):
-            result = tool.execute(_dispatch(name, "inspect", name), ws.policy)
-            if not result.ok:
-                fail(f"built-in {name} could not dispatch: {result!r}")
         standard = set(standard_tool_registry())
-        explorer = set(tool.pool["explorer"].agent._tools)
-        worker = set(tool.pool["worker"].agent._tools)
-        if explorer != {"read_file", "glob", "grep", "list_files", "web_fetch"}:
-            fail(f"explorer's actual registry was not read-only: {explorer!r}")
-        if worker != standard or len(worker) != 9:
-            fail(f"worker's actual registry was not the standard nine: {worker!r}")
+        explorer_standard = {"read_file", "glob", "grep", "list_files", "web_fetch"}
+        for result_store in (None, ToolResultStore()):
+            provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            tool = DispatchSubagentTool(
+                provider, ws.policy,
+                subagent_specs=builtin_subagent_specs(provider, ws.policy),
+                result_store=result_store,
+            )
+            for name in ("explorer", "worker"):
+                result = tool.execute(_dispatch(name, "inspect", name), ws.policy)
+                if not result.ok:
+                    fail(f"built-in {name} could not dispatch: {result!r}")
+            stored_tool = {"read_tool_result"} if result_store is not None else set()
+            explorer = set(tool.pool["explorer"].agent._tools)
+            worker = set(tool.pool["worker"].agent._tools)
+            if explorer != explorer_standard | stored_tool:
+                fail(f"explorer's actual registry was wrong for store={result_store is not None}: {explorer!r}")
+            if worker != standard | stored_tool:
+                fail(f"worker's actual registry was wrong for store={result_store is not None}: {worker!r}")
 
 
 @check("leader.default_spec_reports_actual_tools")
