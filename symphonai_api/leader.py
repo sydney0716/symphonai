@@ -79,6 +79,28 @@ from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
 DEFAULT_SUBAGENT_MAX_TURNS = 5
+EXPLORER_TOOL_NAMES = ("read_file", "glob", "grep", "list_files", "web_fetch")
+
+
+def builtin_subagent_specs(provider: ModelProvider, policy: PermissionPolicy) -> dict[str, AgentSpec]:
+    selector = ModelSelector(
+        provider=getattr(provider, "name", None) or "unknown",
+        model=getattr(provider, "model", None),
+    )
+    return {
+        name: AgentSpec(
+            name=name,
+            prompt="",
+            model=selector,
+            policy_ceiling=policy,
+            tool_names=tools,
+            call_class=CallClass.BACKGROUND,
+        )
+        for name, tools in (
+            ("worker", tuple(standard_tool_registry())),
+            ("explorer", EXPLORER_TOOL_NAMES),
+        )
+    }
 
 class _LeaderEventSink:
     """Fan out events and preserve parent identity for subagent spawning."""
@@ -649,18 +671,12 @@ class Leader:
         )
         self._leader_policy = leader_policy
         self._leases = WorkspaceLeases(config.repo_root)
-        provider_name = getattr(config.leader_provider, "name", None) or "unknown"
-        self._leader_spec = AgentSpec(
-            name="leader",
-            prompt="",
-            model=ModelSelector(
-                provider=provider_name,
-                model=getattr(config.leader_provider, "model", None),
-            ),
-            policy_ceiling=leader_policy,
-            tool_names=(DISPATCH_TOOL_NAME,),
-            call_class=CallClass.FOREGROUND,
-            max_depth=0,
+        defined_leader = None if config.subagent_specs is None else config.subagent_specs.get("leader")
+        self._leader_prompt = "" if defined_leader is None else defined_leader.prompt
+        self._leader_model = (
+            config.leader_model
+            if defined_leader is None or defined_leader.model.model is None
+            else defined_leader.model.model
         )
         self._leader_run: AgentRun | None = None
         self._dispatch_tool = DispatchSubagentTool(
@@ -685,10 +701,30 @@ class Leader:
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
         standard_tools = merge_tool_registry(
-            standard_tool_registry(result_store=config.result_store),
+            standard_tool_registry(
+                None if defined_leader is None else defined_leader.tool_names,
+                result_store=config.result_store,
+            ),
             config.extra_tools,
         )
         leader_tools.update(standard_tools)
+        provider_name = getattr(config.leader_provider, "name", None) or "unknown"
+        self._leader_spec = AgentSpec(
+            name="leader",
+            prompt=self._leader_prompt,
+            model=ModelSelector(
+                provider=provider_name,
+                model=(
+                    self._leader_model
+                    if self._leader_model is not None
+                    else getattr(config.leader_provider, "model", None)
+                ),
+            ),
+            policy_ceiling=leader_policy,
+            tool_names=tuple(leader_tools),
+            call_class=CallClass.FOREGROUND,
+            max_depth=0,
+        )
         self._agent = ApiAgent(
             provider=config.leader_provider,
             tools=leader_tools,
@@ -712,7 +748,10 @@ class Leader:
                 else session.writer_for(self._agent_ref.agent_id, is_root=True)
             ),
         )
-        self._chat_messages: list[Message] = []
+        self._chat_messages: list[Message] = (
+            [Message(role=Role.SYSTEM, content=self._leader_prompt)]
+            if self._leader_prompt else []
+        )
         self._automatic_compaction_breaker = ConsecutiveFailureBreaker(
             "automatic compaction",
             max_consecutive_failures=config.max_consecutive_compaction_failures,
@@ -748,7 +787,7 @@ class Leader:
         try:
             result = self._agent.run(
                 messages,
-                model=self._config.leader_model,
+                model=self._leader_model,
                 cancel=cancel,
                 hooks=self._hook_runner,
             )
@@ -799,6 +838,8 @@ class Leader:
         """Run a single, one-shot task. Each call starts a fresh conversation."""
         self.clear_subagents()
         messages: list[Message] = []
+        if self._leader_prompt:
+            messages.append(Message(role=Role.SYSTEM, content=self._leader_prompt))
         if system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=system_prompt))
         messages.append(Message(role=Role.USER, content=goal))
@@ -812,7 +853,10 @@ class Leader:
         thereby clear the pool twice.
         """
 
-        self._chat_messages.clear()
+        self._chat_messages = (
+            [Message(role=Role.SYSTEM, content=self._leader_prompt)]
+            if self._leader_prompt else []
+        )
         self._automatic_compaction_breaker.reset()
         return self.clear_subagents()
 
@@ -820,6 +864,8 @@ class Leader:
         """Set the history used by the next chat without changing subagents."""
 
         self._chat_messages = list(messages)
+        if self._leader_prompt and not persisted:
+            self._chat_messages.insert(0, Message(role=Role.SYSTEM, content=self._leader_prompt))
         if persisted:
             self._agent._persisted_digests = [
                 _message_digest(message) for message in messages

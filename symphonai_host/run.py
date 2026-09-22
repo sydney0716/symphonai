@@ -17,7 +17,7 @@ from symphonai_api.events import Event, RunFailed, RunFinished, RunStarted, fan_
 from symphonai_api.extensions import Extensions
 from symphonai_api.identity import new_id
 from symphonai_api.instructions import load_instructions
-from symphonai_api.leader import Leader, LeaderConfig, LeaderRunResult
+from symphonai_api.leader import Leader, LeaderConfig, LeaderRunResult, builtin_subagent_specs
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -216,9 +216,26 @@ class HostRun:
             directory=session.tool_results_directory,
             fallback_directories=tool_result_search_path(session),
         )
+        roster = builtin_subagent_specs(self._provider, self._policy)
+        if self._extensions is not None:
+            roster.update(self._extensions.agents)
+        defined_leader = roster.get("leader")
+        leader_provider = self._provider
+        leader_model = self._model
+        if defined_leader is not None:
+            selector = defined_leader.model
+            if selector.provider != self._provider.name:
+                if self._provider_factory is None:
+                    raise ProviderSelectionError(f"leader provider {selector.provider!r} is unavailable")
+                leader_provider = self._provider_factory(selector.provider, selector.model, None)
+                if leader_provider is None:
+                    raise ProviderSelectionError(f"leader provider {selector.provider!r} is unavailable")
+                leader_model = selector.model
+            elif selector.model is not None:
+                leader_model = selector.model
         return Leader(
             LeaderConfig(
-                leader_provider=self._provider,
+                leader_provider=leader_provider,
                 subagent_provider=self._provider,
                 repo_root=str(self._policy.repo_root),
                 max_leader_turns=self._max_turns,
@@ -232,7 +249,8 @@ class HostRun:
                 result_store=result_store,
                 extra_tools=self._mcp_tools,
                 leader_policy=self._policy,
-                leader_model=self._model,
+                leader_model=leader_model,
+                subagent_specs=roster,
                 hook_runner=self._hooks,
             ),
             session=session,

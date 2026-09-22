@@ -1624,7 +1624,7 @@ def check_conversation_usage() -> None:
             ModelResponse(
                 Message(Role.ASSISTANT, tool_calls=[ToolCall(
                     "dispatch", "dispatch_subagent",
-                    {"subagent_name": "researcher", "task": "inspect"},
+                    {"subagent_name": "worker", "task": "inspect"},
                 )]),
                 usage=Usage(input_tokens=10, output_tokens=1),
             ),
@@ -1666,9 +1666,9 @@ def check_conversation_usage() -> None:
             if second_stats["usage"]["total_tokens"] != 46:
                 fail(f"conversation usage did not accumulate across prompts: {second_stats!r}")
             agents = {agent["name"]: agent for agent in second_stats["agents"]}
-            if set(agents) != {"leader", "researcher"}:
+            if set(agents) != {"leader", "worker"}:
                 fail(f"per-agent usage did not name leader and child: {agents!r}")
-            if agents["leader"]["total_tokens"] != 41 or agents["researcher"]["total_tokens"] != 5:
+            if agents["leader"]["total_tokens"] != 41 or agents["worker"]["total_tokens"] != 5:
                 fail(f"per-agent totals were wrong: {agents!r}")
             if "cost" in second_stats["usage"] or any("cost" in agent for agent in agents.values()):
                 fail(f"missing price table rendered zero cost: {second_stats!r}")
@@ -2150,6 +2150,7 @@ class _CountingExtensions:
     def __init__(self) -> None:
         self.calls = 0
         self.runners: list[_HookProbe] = []
+        self.agents = {}
 
     def hook_runner(self, *, cwd: Path) -> _HookProbe:
         self.calls += 1
@@ -3079,3 +3080,178 @@ def check_mcp_defaults_merge_and_protocol() -> None:
     )
     if actual_protocol != _FROZEN_PROTOCOL:
         fail(f"MCP host ownership changed the protocol: {actual_protocol!r}")
+
+
+@check("host_server.builtin_roster_without_definitions")
+def check_builtin_roster_without_definitions() -> None:
+    for empty_directory in (False, True):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "project"
+            home = Path(temporary) / "home"
+            root.mkdir()
+            if empty_directory:
+                (root / ".symphonai" / "agents").mkdir(parents=True)
+            extensions = load_extensions(repo_root=root, home=home)
+            if extensions.agents:
+                fail("empty project unexpectedly discovered agent definitions")
+            provider = FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    id="worker", name="dispatch_subagent",
+                    arguments={"subagent_name": "worker", "task": "work"},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "worker done")),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    id="explorer", name="dispatch_subagent",
+                    arguments={"subagent_name": "explorer", "task": "inspect"},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "explorer done")),
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+            ])
+            run = HostRun(provider, PermissionPolicy(root), EventBroker(),
+                          sessions_root=root / "sessions", extensions=extensions)
+            session = SessionStore(root / "sessions", "roster", repo_root=root)
+            try:
+                leader = run._new_leader(session)
+                leader.run("delegate")
+                if set(leader.subagents) != {"worker", "explorer"}:
+                    fail(f"host could not dispatch built-ins with empty={empty_directory}: {leader.subagents!r}")
+                missing = leader._dispatch_tool.execute(ToolCall(
+                    id="missing", name="dispatch_subagent",
+                    arguments={"subagent_name": "missing", "task": "work"},
+                ), PermissionPolicy(root))
+                error = missing.error or ""
+                if missing.ok or not all(name in error for name in ("missing", "worker", "explorer")):
+                    fail(f"undefined host dispatch omitted roster names: {missing!r}")
+                if set(leader.subagents) != {"worker", "explorer"}:
+                    fail("undefined host dispatch created pool state")
+            finally:
+                session.close()
+
+
+@check("host_server.defined_worker_reaches_pool")
+def check_defined_worker_reaches_pool() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        agents = root / ".symphonai" / "agents"
+        agents.mkdir(parents=True)
+        user_base = home / ".symphonai"
+        user_base.mkdir(parents=True)
+        (user_base / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        (agents / "worker.toml").write_text(
+            'prompt = "defined worker prompt"\n'
+            'tools = ["read_file"]\n'
+            'deadline_seconds = 5\n'
+            '[model]\nprovider = "fake"\n'
+            '[budget]\nmax_turns = 2\n',
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        if "worker" not in extensions.agents:
+            fail("trusted worker definition was not discovered")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id="worker", name="dispatch_subagent",
+                arguments={"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        run = HostRun(provider, PermissionPolicy(root), EventBroker(),
+                      sessions_root=root / "sessions", extensions=extensions)
+        session = SessionStore(root / "sessions", "defined-worker", repo_root=root)
+        try:
+            leader = run._new_leader(session)
+            leader.run("delegate")
+            record = leader.subagents.get("worker")
+            if record is None or set(record.agent._tools) != {"read_file"}:
+                fail("worker definition did not replace the built-in tool registry")
+            if not record.messages or record.messages[0].text != "defined worker prompt":
+                fail("worker definition prompt did not reach the spawned agent")
+            if record.agent._budget is None or record.agent._budget.max_turns != 2:
+                fail("worker definition budget did not reach the spawned agent")
+            if not record.runs or record.runs[0].spec.deadline_seconds != 5:
+                fail("worker definition deadline did not reach the child run")
+        finally:
+            session.close()
+
+
+@check("host_server.defined_leader_provider_model_and_tools")
+def check_defined_leader_provider_model_and_tools() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self, name, model, responses):  # noqa: ANN001
+            super().__init__(responses)
+            self._name = name
+            self.model = model
+            self.requests = []
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        def create_response(self, request, *, cancel=None):  # noqa: ANN001
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        agents = root / ".symphonai" / "agents"
+        agents.mkdir(parents=True)
+        user_base = home / ".symphonai"
+        user_base.mkdir(parents=True)
+        (user_base / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        (agents / "leader.toml").write_text(
+            'prompt = "defined leader prompt"\n'
+            'tools = ["read_file"]\n'
+            '[model]\nprovider = "defined"\nmodel = "defined-model"\n',
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        conversation = RecordingProvider("conversation", "app-model", [
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+        ])
+        defined = RecordingProvider("defined", "defined-model", [
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id="worker", name="dispatch_subagent",
+                arguments={"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        selections = []
+
+        def select(name, model, base_url):  # noqa: ANN001
+            selections.append((name, model, base_url))
+            return defined if name == "defined" else None
+
+        run = HostRun(conversation, PermissionPolicy(root), EventBroker(),
+                      sessions_root=root / "sessions", extensions=extensions,
+                      model="app-model", provider_factory=select)
+        session = SessionStore(root / "sessions", "defined-leader", repo_root=root)
+        try:
+            leader = run._new_leader(session)
+            leader.run("delegate")
+            if selections != [("defined", "defined-model", None)]:
+                fail(f"leader definition did not select its provider and model: {selections!r}")
+            if not defined.requests or defined.requests[0].model != "defined-model":
+                fail("leader definition model did not reach the provider request")
+            if defined.requests[0].messages[0].text != "defined leader prompt":
+                fail("leader definition prompt did not reach the provider request")
+            if set(leader._agent._tools) != {"dispatch_subagent", "read_file"}:
+                fail("leader definition tools did not reach the actual registry")
+            if set(leader._leader_spec.tool_names or ()) != set(leader._agent._tools):
+                fail("defined leader run spec did not report its actual registry")
+            if leader._leader_spec.model.provider != "defined" or leader._leader_spec.model.model != "defined-model":
+                fail("defined leader run spec did not report its actual provider and model")
+            if not conversation.requests or conversation.requests[0].model != "app-model":
+                fail("unmodeled worker did not retain the conversation provider and model")
+            if leader.subagents["worker"].agent._provider is not conversation:
+                fail("worker switched to the leader definition's provider")
+        finally:
+            session.close()

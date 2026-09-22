@@ -34,7 +34,7 @@ from symphonai_api.events import (
     ToolCallStarted,
 )
 import symphonai_api.leader as leader_module
-from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig
+from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig, builtin_subagent_specs
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import (
     Message,
@@ -2166,3 +2166,34 @@ def check_typed_subagent_output() -> None:
             fail(f"invalid typed output was accepted: {invalid!r}")
         if tool.pool["invalid"].breaker.consecutive_failures != 1:
             fail("typed-output validation failure did not advance the child breaker")
+
+
+@check("leader.builtin_roster_tool_registries")
+def check_builtin_roster_tool_registries() -> None:
+    with workspace() as ws:
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        tool = DispatchSubagentTool(
+            provider, ws.policy,
+            subagent_specs=builtin_subagent_specs(provider, ws.policy),
+        )
+        for name in ("explorer", "worker"):
+            result = tool.execute(_dispatch(name, "inspect", name), ws.policy)
+            if not result.ok:
+                fail(f"built-in {name} could not dispatch: {result!r}")
+        standard = set(standard_tool_registry())
+        explorer = set(tool.pool["explorer"].agent._tools)
+        worker = set(tool.pool["worker"].agent._tools)
+        if explorer != {"read_file", "glob", "grep", "list_files", "web_fetch"}:
+            fail(f"explorer's actual registry was not read-only: {explorer!r}")
+        if worker != standard or len(worker) != 9:
+            fail(f"worker's actual registry was not the standard nine: {worker!r}")
+
+
+@check("leader.default_spec_reports_actual_tools")
+def check_default_spec_reports_actual_tools() -> None:
+    with workspace() as ws:
+        leader = Leader(LeaderConfig(FakeModelProvider(), FakeModelProvider(), str(ws.root)))
+        actual = set(leader._agent._tools)
+        reported = set(leader._leader_spec.tool_names or ())
+        if actual != {"dispatch_subagent", *standard_tool_registry()} or reported != actual:
+            fail(f"leader spec did not report its actual dispatch and standard tools: {reported!r}, {actual!r}")
