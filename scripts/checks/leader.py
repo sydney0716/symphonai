@@ -10,6 +10,7 @@ import unittest.mock as mock
 from dataclasses import fields
 
 from symphonai_api.agent_run import RunPhase, new_agent_run
+from symphonai_api.budgets import RunBudget
 from symphonai_api.agent_spec import (
     AgentSpec,
     ContextInheritance,
@@ -1031,6 +1032,26 @@ def check_leader_max_turns() -> None:
                 "expected leader exhausted lifecycle, got "
                 f"{actual_exhausted_leader_events}"
             )
+
+
+@check("leader.configured_budget_overrides_turn_limit")
+def check_configured_budget_overrides_turn_limit() -> None:
+    with workspace() as ws:
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id="invalid", name="dispatch_subagent", arguments={},
+            )])),
+        ])
+        budget = RunBudget(max_turns=1, max_total_tokens=100)
+        leader = Leader(LeaderConfig(
+            provider, FakeModelProvider(), str(ws.root),
+            max_leader_turns=4, leader_budget=budget,
+        ))
+        result = leader.run("bounded")
+        if leader._agent._budget is not budget or leader._leader_spec.budget is not budget:
+            fail("leader budget did not reach the running agent and run spec")
+        if result.stopped_reason != "max_turns" or provider.call_count != 1:
+            fail(f"budget max_turns did not override the launch turn limit: {result.stopped_reason!r}")
 
 
 @check("leader.subagent_max_turns")

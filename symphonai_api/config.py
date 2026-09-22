@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+import math
 from pathlib import Path
 from types import MappingProxyType
 import tomllib
 
+from symphonai_api.budgets import RunBudget
+from symphonai_api.cost import PriceTable, load_price_table
 from symphonai_api.permissions import (
     PermissionPolicy,
     _contains_path,
@@ -66,8 +70,9 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets")
 _VALID_MODES = {"auto", "prompt", "plan", "accept_edits"}
+_BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
 
 
 def _raise(source: Path | None, key: str, detail: str) -> None:
@@ -119,6 +124,36 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    budgets = _table(source, values, "budgets")
+    if budgets is not None:
+        _unknown_keys(source, "budgets", budgets, {"leader", "subagent", "price_table"})
+        if "price_table" in budgets:
+            value = _string(source, "budgets.price_table", budgets["price_table"])
+            if not value.strip():
+                _raise(source, "budgets.price_table", "must be a non-empty path")
+        for role in ("leader", "subagent"):
+            limits = _table(source, budgets, role)
+            if limits is None:
+                continue
+            prefix = f"budgets.{role}"
+            _unknown_keys(source, prefix, limits, _BUDGET_KEYS)
+            for key in ("max_turns", "max_total_tokens"):
+                if key in limits and (type(limits[key]) is not int or limits[key] < 1):
+                    _raise(source, f"{prefix}.{key}", "must be a positive integer")
+            if "wall_seconds" in limits:
+                value = limits["wall_seconds"]
+                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                    _raise(source, f"{prefix}.wall_seconds", "must be a positive finite number")
+            if "max_cost" in limits:
+                value = limits["max_cost"]
+                if not isinstance(value, str):
+                    _raise(source, f"{prefix}.max_cost", "must be a quoted non-negative decimal")
+                try:
+                    cost = Decimal(value)
+                except InvalidOperation:
+                    _raise(source, f"{prefix}.max_cost", "must be a quoted non-negative decimal")
+                if not cost.is_finite() or cost < 0:
+                    _raise(source, f"{prefix}.max_cost", "must be a quoted non-negative decimal")
     sessions = _table(source, values, "sessions")
     if sessions is not None:
         _unknown_keys(source, "sessions", sessions, {"cleanup_period_days"})
@@ -239,6 +274,49 @@ def load_config(
         values=MappingProxyType(resolved),
         provenance=MappingProxyType(provenance),
         layers=tuple(layers),
+    )
+
+
+def resolve_run_budgets(
+    config: ResolvedConfig,
+    *,
+    repo_root: Path,
+    leader_max_turns: int,
+    subagent_max_turns: int,
+    price_table: PriceTable | None,
+) -> tuple[RunBudget | None, RunBudget | None, PriceTable | None]:
+    """Resolve configured limits before a conversation can start."""
+    table_key = "budgets.price_table"
+    if table_key in config.values:
+        origin = config.provenance[table_key].source
+        path = Path(config.values[table_key]).expanduser()
+        if not path.is_absolute():
+            path = (origin.parent if origin is not None else Path(repo_root)) / path
+        try:
+            price_table = load_price_table(path)
+        except ValueError as exc:
+            _raise(origin, table_key, str(exc))
+
+    def budget_for(role: str, default_turns: int) -> RunBudget | None:
+        prefix = f"budgets.{role}."
+        keys = {key.removeprefix(prefix) for key in config.values if key.startswith(prefix)}
+        if not keys:
+            return None
+        cost_key = prefix + "max_cost"
+        if cost_key in config.values and price_table is None:
+            _raise(config.provenance[cost_key].source, cost_key, "requires a price table")
+        return RunBudget(
+            max_turns=config.get(prefix + "max_turns", default_turns),
+            wall_seconds=config.get(prefix + "wall_seconds"),
+            max_total_tokens=config.get(prefix + "max_total_tokens"),
+            max_cost=Decimal(config.values[cost_key]) if cost_key in config.values else None,
+            price_table=price_table,
+        )
+
+    return (
+        budget_for("leader", leader_max_turns),
+        budget_for("subagent", subagent_max_turns),
+        price_table,
     )
 
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import itertools
+import json
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
@@ -17,7 +19,9 @@ from symphonai_api.config import (
     Provenance,
     Scope,
     load_config,
+    resolve_run_budgets,
 )
+from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.permissions import PermissionPolicy
 from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
@@ -957,3 +961,86 @@ def sessions_cleanup() -> None:
                     fail(f"invalid session setting lacked source or key: {exc}")
             else:
                 fail(f"invalid session setting was accepted: {value!r}")
+
+
+@check("config.budget_fields_and_price_table")
+def budget_fields_and_price_table() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        _write(source, (
+            '[budgets]\nprice_table = "prices.json"\n'
+            '[budgets.leader]\nmax_turns = 3\nwall_seconds = 1.5\n'
+            'max_total_tokens = 40\nmax_cost = "0.25"\n'
+            '[budgets.subagent]\nmax_turns = 2\nwall_seconds = 4\n'
+            'max_total_tokens = 20\nmax_cost = "0.10"\n'
+        ))
+        (source.parent / "prices.json").write_text(json.dumps({
+            "version": 1, "currency": "USD",
+            "models": {"priced": {"input": 1, "output": 2}},
+        }), encoding="utf-8")
+        resolved = load_config(repo_root=repo_root, home=home)
+        leader, child, prices = resolve_run_budgets(
+            resolved, repo_root=repo_root, leader_max_turns=9,
+            subagent_max_turns=5, price_table=None,
+        )
+        if leader is None or child is None or prices is None:
+            fail("configured budgets or price table were not resolved")
+        if (leader.max_turns, leader.wall_seconds, leader.max_total_tokens, leader.max_cost) != (3, 1.5, 40, Decimal("0.25")):
+            fail(f"leader budget fields were lost: {leader!r}")
+        if (child.max_turns, child.wall_seconds, child.max_total_tokens, child.max_cost) != (2, 4, 20, Decimal("0.10")):
+            fail(f"subagent budget fields were lost: {child!r}")
+        if leader.price_table is not prices or child.price_table is not prices or "priced" not in prices.prices:
+            fail("configured price table did not reach both budgets")
+        if resolved.provenance["budgets.leader.max_cost"] != Provenance("budgets.leader.max_cost", Scope.PROJECT, source):
+            fail("budget setting lost its project provenance")
+
+
+@check("config.budget_integer_validation")
+def budget_integer_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        for role in ("leader", "subagent"):
+            for key in ("max_turns", "max_total_tokens"):
+                for value in ('"2"', "-1", "true", "2.5"):
+                    _write(source, f"[budgets.{role}]\n{key} = {value}\n")
+                    try:
+                        load_config(repo_root=repo_root, home=home)
+                    except ConfigError as exc:
+                        if str(source) not in str(exc) or f"budgets.{role}.{key}" not in str(exc):
+                            fail(f"invalid budget lacked source and key: {exc}")
+                    else:
+                        fail(f"invalid {role} {key}={value} was accepted")
+
+
+@check("config.budget_cost_requires_price_table")
+def budget_cost_requires_price_table() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        _write(source, '[budgets.leader]\nmax_cost = "0.25"\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        try:
+            resolve_run_budgets(resolved, repo_root=repo_root,
+                                leader_max_turns=9, subagent_max_turns=5, price_table=None)
+        except ConfigError as exc:
+            if str(source) not in str(exc) or "budgets.leader.max_cost" not in str(exc):
+                fail(f"missing price table error lacked source and key: {exc}")
+        else:
+            fail("cost ceiling without a price table was accepted")
+        supplied = PriceTable({"priced": ModelPrice(Decimal(1), Decimal(2))}, "USD")
+        leader, child, prices = resolve_run_budgets(
+            resolved, repo_root=repo_root, leader_max_turns=9,
+            subagent_max_turns=5, price_table=supplied,
+        )
+        if leader is None or leader.max_cost != Decimal("0.25") or leader.price_table is not supplied or child is not None or prices is not supplied:
+            fail("host-supplied price table did not satisfy a cost ceiling")
+        _write(source, '[budgets.leader]\nwall_seconds = 2\nmax_total_tokens = 10\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        leader, _, _ = resolve_run_budgets(
+            resolved, repo_root=repo_root, leader_max_turns=9,
+            subagent_max_turns=5, price_table=None,
+        )
+        if leader is None or leader.wall_seconds != 2 or leader.max_total_tokens != 10:
+            fail("non-cost ceilings required a price table")

@@ -610,6 +610,7 @@ class LeaderConfig:
     subagent_provider: ModelProvider
     repo_root: str
     max_leader_turns: int = DEFAULT_MAX_TURNS
+    leader_budget: RunBudget | None = None
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
     subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
     subagent_budget: RunBudget | None = None
@@ -728,6 +729,7 @@ class Leader:
             ),
             policy_ceiling=leader_policy,
             tool_names=tuple(leader_tools),
+            budget=config.leader_budget,
             call_class=CallClass.FOREGROUND,
             max_depth=0,
         )
@@ -736,6 +738,7 @@ class Leader:
             tools=leader_tools,
             policy=leader_policy,
             max_turns=config.max_leader_turns,
+            budget=config.leader_budget,
             tool_schemas=[
                 dispatch_subagent_tool_schema(config.leader_provider.wire_format),
                 *tool_registry_schemas(

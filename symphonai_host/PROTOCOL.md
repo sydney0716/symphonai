@@ -111,6 +111,36 @@ host stderr with an `instruction warning:` prefix; a warned file can still be
 loaded in full. If the hierarchy is empty, no instruction message is added.
 `POST /session/open` restores the recorded messages and does not reload files.
 
+Scoped configuration can set per-run limits for the leader and each dispatched
+subagent:
+
+```toml
+[budgets]
+price_table = "prices.json"
+
+[budgets.leader]
+max_turns = 8
+wall_seconds = 60
+max_total_tokens = 100000
+max_cost = "1.50"
+
+[budgets.subagent]
+max_turns = 4
+```
+
+Each role may set any subset of the four limit keys. Turn and token limits are
+positive integers, wall time is a positive finite number of seconds, and cost
+is a quoted non-negative decimal. `price_table` names a version-1 JSON price
+table, relative to the config file containing that key (or the repository root
+for a session override). A host-supplied price table is used when no path is
+configured. A cost limit without either table is a configuration error. A
+subagent definition's own budget is narrowed by the configured subagent
+ceiling. The leader budget's `max_turns` takes precedence over the host's
+`--max-turns`; without a leader budget, the launch limit still applies.
+Limits reset for each prompt. `RunFinished.stopped_reason` reports `max_turns`,
+`budget_wall_time`, `budget_tokens`, or `budget_cost` when a limit ends a run;
+the conversation remains available for another prompt.
+
 Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
 "openai", "model": str?, "base_url": str?}` and returns `{"selected": true}`.
 `model` and `base_url` are optional non-empty strings. `openai` with a

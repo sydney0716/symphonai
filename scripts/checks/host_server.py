@@ -31,6 +31,7 @@ import symphonai_host.__main__ as host_main
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
+from symphonai_api.config import ConfigError, ResolvedConfig
 from symphonai_api.events import (
     AssistantTextDelta,
     CompactionApplied,
@@ -2151,6 +2152,7 @@ class _CountingExtensions:
         self.calls = 0
         self.runners: list[_HookProbe] = []
         self.agents = {}
+        self.config = ResolvedConfig({}, {})
 
     def hook_runner(self, *, cwd: Path) -> _HookProbe:
         self.calls += 1
@@ -3261,3 +3263,158 @@ def check_defined_leader_provider_model_and_tools() -> None:
                 fail("worker switched to the leader definition's provider")
         finally:
             session.close()
+
+
+@check("host_server.configured_conversation_and_subagent_budgets")
+def check_configured_conversation_and_subagent_budgets() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        root.mkdir()
+        plain = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "plain"))])
+        no_limits = HostRun(plain, PermissionPolicy(root), EventBroker(),
+                            max_turns=7, sessions_root=root / "plain-sessions",
+                            extensions=load_extensions(repo_root=root, home=home))
+        plain_session = SessionStore(root / "plain-sessions", "plain", repo_root=root)
+        try:
+            plain_leader = no_limits._new_leader(plain_session)
+            with mock.patch.object(plain, "create_response", wraps=plain.create_response) as sent:
+                plain_leader.run("plain prompt")
+            if plain_leader._agent._budget is not None or plain_leader._agent._max_turns != 7:
+                fail("omitting budgets changed the host launch turn limit")
+            if [(item.role, item.text) for item in sent.call_args.args[0].messages] != [(Role.USER, "plain prompt")]:
+                fail("omitting budgets changed the provider messages")
+        finally:
+            plain_session.close()
+
+        config_file = root / ".symphonai" / "config.toml"
+        config_file.parent.mkdir()
+        config_file.write_text(
+            '[budgets.leader]\nmax_turns = 3\nwall_seconds = 30\n'
+            'max_total_tokens = 100\nmax_cost = "0.50"\n'
+            '[budgets.subagent]\nmax_turns = 1\nwall_seconds = 20\n'
+            'max_total_tokens = 50\nmax_cost = "0.25"\n',
+            encoding="utf-8",
+        )
+        agents = root / ".symphonai" / "agents"
+        agents.mkdir()
+        (agents / "worker.toml").write_text(
+            'prompt = "worker"\n[model]\nprovider = "fake"\n'
+            '[budget]\nmax_turns = 2\n', encoding="utf-8",
+        )
+        user_base = home / ".symphonai"
+        user_base.mkdir(parents=True)
+        (user_base / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        table = PriceTable({"priced": ModelPrice(Decimal(1), Decimal(2))}, "USD")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id="worker", name="dispatch_subagent",
+                arguments={"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        provider.model = "priced"
+        run = HostRun(provider, PermissionPolicy(root), EventBroker(),
+                      max_turns=9, sessions_root=root / "limited-sessions",
+                      extensions=load_extensions(repo_root=root, home=home),
+                      price_table=table)
+        session = SessionStore(root / "limited-sessions", "limited", repo_root=root)
+        try:
+            leader = run._new_leader(session)
+            leader.run("delegate")
+            active = leader._agent._budget
+            child = leader.subagents["worker"].agent._budget
+            if active is None or (active.max_turns, active.wall_seconds, active.max_total_tokens, active.max_cost, active.price_table) != (3, 30, 100, Decimal("0.50"), table):
+                fail(f"configured leader budget did not reach the agent: {active!r}")
+            if leader._agent._max_turns != 3 or leader._leader_spec.budget is not active:
+                fail("configured leader max_turns did not override launch max_turns")
+            if child is None or (child.max_turns, child.wall_seconds, child.max_total_tokens, child.max_cost, child.price_table) != (1, 20, 50, Decimal("0.25"), table):
+                fail(f"configured subagent ceiling did not narrow its definition: {child!r}")
+            if leader.subagents["worker"].runs[0].spec.budget is not child:
+                fail("child run spec lost the configured ceiling")
+        finally:
+            session.close()
+        config_file.write_text('[budgets.subagent]\nwall_seconds = 20\n', encoding="utf-8")
+        partial_provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id="worker", name="dispatch_subagent",
+                arguments={"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        partial = HostRun(partial_provider, PermissionPolicy(root), EventBroker(),
+                          sessions_root=root / "partial-sessions",
+                          extensions=load_extensions(repo_root=root, home=home))
+        partial_session = SessionStore(root / "partial-sessions", "partial", repo_root=root)
+        try:
+            partial_leader = partial._new_leader(partial_session)
+            partial_leader.run("delegate")
+            child_budget = partial_leader.subagents["worker"].agent._budget
+            if child_budget is None or child_budget.max_turns != 2 or child_budget.wall_seconds != 20:
+                fail(f"partial ceiling changed an agent's explicit turn limit: {child_budget!r}")
+        finally:
+            partial_session.close()
+        config_file.write_text('[budgets.leader]\nmax_cost = "0.50"\n', encoding="utf-8")
+        try:
+            HostRun(FakeModelProvider(), PermissionPolicy(root), EventBroker(),
+                    sessions_root=root / "refused-sessions",
+                    extensions=load_extensions(repo_root=root, home=home))
+        except ConfigError as exc:
+            if str(config_file) not in str(exc) or "budgets.leader.max_cost" not in str(exc):
+                fail(f"host cost refusal lacked the config source and key: {exc}")
+        else:
+            fail("host accepted a cost ceiling without a price table")
+
+
+@check("host_server.budget_stop_survives_next_prompt")
+def check_budget_stop_survives_next_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        root.mkdir()
+        config_file = root / ".symphonai" / "config.toml"
+        config_file.parent.mkdir()
+        config_file.write_text('[budgets.leader]\nmax_total_tokens = 5\n', encoding="utf-8")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id="missing", name="missing_tool", arguments={},
+            )]), usage=Usage(input_tokens=8, output_tokens=0)),
+            ModelResponse(Message(Role.ASSISTANT, "second prompt succeeded"),
+                          usage=Usage(input_tokens=1, output_tokens=1)),
+        ])
+        host = HostServer(provider, PermissionPolicy(root),
+                          sessions_root=root / "sessions",
+                          extensions=load_extensions(repo_root=root, home=home))
+        host.start()
+        connection, response = _subscribed_stream(host)
+        try:
+            with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(home / ".symphonai")}):
+                _send_host_prompt(host, "first")
+                leader = host.run._conversation[0]
+                _, stopped = _await_sse(
+                    connection, response,
+                    lambda frame: frame[0] == "event" and frame[1].get("type") == "RunFinished"
+                    and frame[1].get("agent_name") == "leader",
+                    what="first budget stop",
+                )
+                if stopped.get("stopped_reason") != "budget_tokens":
+                    fail(f"budget stop reason did not reach the event stream: {stopped!r}")
+                _send_host_prompt(host, "second")
+                _, finished = _await_sse(
+                    connection, response,
+                    lambda frame: frame[0] == "event" and frame[1].get("type") == "RunFinished"
+                    and frame[1].get("agent_name") == "leader",
+                    what="second prompt finish",
+                )
+                if finished.get("stopped_reason") != "final_response" or provider.call_count != 2:
+                    fail(f"next prompt did not finish normally: {finished!r}")
+                if host.run._conversation[0] is not leader:
+                    fail("budget stop replaced the conversation")
+        finally:
+            connection.close()
+            host.close()

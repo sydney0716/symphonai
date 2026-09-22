@@ -9,15 +9,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS
+from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
+from symphonai_api.config import resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
 from symphonai_api.events import Event, RunFailed, RunFinished, RunStarted, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.identity import new_id
 from symphonai_api.instructions import load_instructions
-from symphonai_api.leader import Leader, LeaderConfig, LeaderRunResult, builtin_subagent_specs
+from symphonai_api.leader import (
+    DEFAULT_SUBAGENT_MAX_TURNS, Leader, LeaderConfig, LeaderRunResult,
+    builtin_subagent_specs,
+)
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -51,6 +56,35 @@ CONVERSATION_TITLE_LIMIT = 80
 
 def _conversation_title(prompt: str) -> str:
     return " ".join(prompt.split())[:CONVERSATION_TITLE_LIMIT]
+
+
+def _narrow_budget(
+    existing: RunBudget | None,
+    ceiling: RunBudget | None,
+    *,
+    turn_limit_configured: bool,
+) -> RunBudget | None:
+    if existing is None or ceiling is None:
+        return existing or ceiling
+
+    def tighter(left, right):  # noqa: ANN001
+        return right if left is None else left if right is None else min(left, right)
+
+    if (
+        existing.max_cost is not None and ceiling.max_cost is not None
+        and existing.price_table != ceiling.price_table
+    ):
+        raise ValueError("subagent cost budgets use different price tables")
+    return RunBudget(
+        max_turns=(
+            min(existing.max_turns, ceiling.max_turns)
+            if turn_limit_configured else existing.max_turns
+        ),
+        wall_seconds=tighter(existing.wall_seconds, ceiling.wall_seconds),
+        max_total_tokens=tighter(existing.max_total_tokens, ceiling.max_total_tokens),
+        max_cost=tighter(existing.max_cost, ceiling.max_cost),
+        price_table=ceiling.price_table if ceiling.max_cost is not None else existing.price_table,
+    )
 
 
 @dataclass
@@ -111,6 +145,18 @@ class HostRun:
         )
         self._mcp_tools = mcp_tools
         self._price_table = price_table
+        self._leader_budget = None
+        self._subagent_budget = None
+        self._subagent_turn_limit_configured = False
+        if extensions is not None:
+            self._subagent_turn_limit_configured = "budgets.subagent.max_turns" in extensions.config.values
+            self._leader_budget, self._subagent_budget, self._price_table = resolve_run_budgets(
+                extensions.config,
+                repo_root=policy.repo_root,
+                leader_max_turns=max_turns,
+                subagent_max_turns=DEFAULT_SUBAGENT_MAX_TURNS,
+                price_table=price_table,
+            )
         self._chat_token_budget = chat_token_budget
         self._chat_recent_turns = chat_recent_turns
         self._active: _ActiveRun | None = None
@@ -219,6 +265,16 @@ class HostRun:
         roster = builtin_subagent_specs(self._provider, self._policy)
         if self._extensions is not None:
             roster.update(self._extensions.agents)
+        if self._subagent_budget is not None:
+            roster = {
+                name: spec if name == "leader" else spec.with_overrides(
+                    budget=_narrow_budget(
+                        spec.budget, self._subagent_budget,
+                        turn_limit_configured=self._subagent_turn_limit_configured,
+                    )
+                )
+                for name, spec in roster.items()
+            }
         defined_leader = roster.get("leader")
         leader_provider = self._provider
         leader_model = self._model
@@ -239,6 +295,7 @@ class HostRun:
                 subagent_provider=self._provider,
                 repo_root=str(self._policy.repo_root),
                 max_leader_turns=self._max_turns,
+                leader_budget=self._leader_budget,
                 chat_token_budget=self._chat_token_budget,
                 chat_recent_turns=self._chat_recent_turns,
                 permission_mode=self._policy.mode,
@@ -251,6 +308,7 @@ class HostRun:
                 leader_policy=self._policy,
                 leader_model=leader_model,
                 subagent_specs=roster,
+                subagent_budget=self._subagent_budget,
                 hook_runner=self._hooks,
             ),
             session=session,
