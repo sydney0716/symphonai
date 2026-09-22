@@ -20,9 +20,9 @@ from symphonai_api.cost import PriceTable
 from symphonai_api.extensions import Extensions
 from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.providers.base import ModelProvider
-from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR
-from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR
-from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR
+from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR, AnthropicProvider
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR, GeminiProvider
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
 from symphonai_api.session import SessionError, TranscriptError
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
@@ -37,7 +37,7 @@ from symphonai_host.protocol import (
     encode_event,
     encode_frame,
 )
-from symphonai_host.run import HostRun, RunActiveError
+from symphonai_host.run import HostRun, ProviderSelectionError, RunActiveError
 from symphonai_host.sessions import list_sessions
 
 
@@ -49,6 +49,33 @@ APP_CONTENT_TYPES = {
 }
 APP_HANDSHAKE_MARKER = "<!-- symphonai-handshake -->"
 APP_COOKIE_NAME = "symphonai_app"
+PROVIDERS = (
+    ("anthropic", ANTHROPIC_KEY_ENV_VAR, AnthropicProvider),
+    ("gemini", GEMINI_KEY_ENV_VAR, GeminiProvider),
+    ("openai", OPENAI_KEY_ENV_VAR, OpenAIProvider),
+)
+
+
+def _provider(name: str | None = None, model: str | None = None, base_url: str | None = None) -> ModelProvider | None:
+    if name is None:
+        name = next((vendor for vendor, key, _ in PROVIDERS if os.environ.get(key, "").strip()), None)
+        if name is None:
+            return None
+    if not isinstance(name, str) or not any(vendor == name for vendor, _, _ in PROVIDERS):
+        raise ProviderSelectionError("unknown provider")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ProviderSelectionError("model must be a non-empty string")
+    if base_url is not None and (not isinstance(base_url, str) or not base_url.strip()):
+        raise ProviderSelectionError("base_url must be a non-empty string")
+    vendor, key, provider_class = next(row for row in PROVIDERS if row[0] == name)
+    if not os.environ.get(key, "").strip():
+        raise ProviderSelectionError(f"{vendor} has no API key")
+    options = {}
+    if model is not None:
+        options["model"] = model
+    if base_url is not None:
+        options["base_url"] = base_url
+    return provider_class(**options)
 
 
 def _app_root() -> Path:
@@ -60,7 +87,7 @@ class HostServer:
 
     def __init__(
         self,
-        provider: ModelProvider,
+        provider: ModelProvider | None,
         policy: PermissionPolicy,
         *,
         token: str | None = None,
@@ -90,6 +117,7 @@ class HostServer:
             system_prompt=system_prompt,
             max_turns=max_turns,
             model=model,
+            provider_factory=lambda name, selected_model, base_url: _provider(name, selected_model, base_url),
             publish_approval=self._publish_approval,
             approval_timeout=approval_timeout,
             sessions_root=sessions_root,
@@ -530,11 +558,7 @@ class HostServer:
                                 "env_var": variable,
                                 "key_present": bool(os.environ.get(variable, "").strip()),
                             }
-                            for name, variable in (
-                                ("anthropic", ANTHROPIC_KEY_ENV_VAR),
-                                ("gemini", GEMINI_KEY_ENV_VAR),
-                                ("openai", OPENAI_KEY_ENV_VAR),
-                            )
+                            for name, variable, _ in PROVIDERS
                         ],
                     }
                     self._json(HTTPStatus.OK, {"settings": settings})
@@ -599,7 +623,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/new") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/new", "/provider") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -643,6 +667,20 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, {"ended": True})
                     return
+                if self.path == "/provider":
+                    try:
+                        choice = self._read_object()
+                        if not isinstance(choice.get("name"), str) or set(choice) - {"name", "model", "base_url"}:
+                            raise ProviderSelectionError("unknown provider option")
+                        provider = _provider(choice.get("name"), choice.get("model"), choice.get("base_url"))
+                        if provider is None:
+                            raise ProviderSelectionError("choose a provider")
+                    except (ProtocolError, ProviderSelectionError) as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    host.run.select_provider(provider, choice.get("model"), choice)
+                    self._json(HTTPStatus.OK, {"selected": True})
+                    return
                 kind = self.path.removeprefix("/")
                 try:
                     request = decode_request(kind, self._read_object())
@@ -652,6 +690,9 @@ class HostServer:
                 if kind == "prompt":
                     try:
                         run_id = host.run.start(request.prompt)
+                    except ProviderSelectionError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
                     except RunActiveError as exc:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
                         return
@@ -675,6 +716,9 @@ class HostServer:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "session not found"})
                         return
                     except TranscriptError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except ProviderSelectionError as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
                     self._json(HTTPStatus.OK, reply)

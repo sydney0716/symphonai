@@ -1459,6 +1459,99 @@ def _send_host_prompt(host: HostServer, prompt: str) -> None:
     _wait_until(lambda: not host.run.active, "usage prompt did not finish")
 
 
+@check("host_server.provider_default_and_rejection")
+def check_provider_default_and_rejection() -> None:
+    keys = {"ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": "", "OPENAI_API_KEY": ""}
+    with mock.patch.dict(os.environ, keys), tempfile.TemporaryDirectory() as temporary:
+        if host_main._provider() is not None:
+            fail("a host without keys chose a default provider")
+        host = HostServer(None, PermissionPolicy(Path(temporary)), sessions_root=Path(temporary) / "sessions")
+        host.start()
+        try:
+            for path, body in (
+                ("/prompt", {"prompt": "must refuse"}),
+                ("/provider", {"name": "openai"}),
+                ("/provider", {"name": "unknown"}),
+                ("/provider", {}),
+            ):
+                connection, response = _request(host, "POST", path, body=body, headers=_headers(host))
+                try:
+                    if response.status != 400:
+                        fail(f"{path} accepted a missing-key or invalid choice: {response.status}")
+                    response.read()
+                finally:
+                    connection.close()
+            if host.run._conversation is not None:
+                fail("a refused prompt opened a conversation")
+        finally:
+            host.close()
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "fixture-key", "OPENAI_API_KEY": "fixture-key"}):
+            if host_main._provider().name != "gemini":
+                fail("the first keyed vendor in Settings order was not the default")
+    for flag in ("--provider", "--model", "--base-url"):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                host_main._arguments([flag, "openai"])
+            except SystemExit as exc:
+                if exc.code != 2:
+                    fail(f"removed launch flag {flag} exited with {exc.code!r}")
+            else:
+                fail(f"removed launch flag {flag} was accepted")
+
+
+@check("host_server.provider_choice_per_conversation")
+def check_provider_choice_per_conversation() -> None:
+    first = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "first"))])
+    second = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "second"))])
+    providers = {"anthropic": first, "gemini": second}
+    with tempfile.TemporaryDirectory() as temporary:
+        host = HostServer(None, PermissionPolicy(Path(temporary)), sessions_root=Path(temporary) / "sessions")
+        host.start()
+        try:
+            with mock.patch.object(host_server_module, "_provider", side_effect=lambda name, model, base_url: providers[name]):
+                def select(name: str) -> None:
+                    connection, response = _request(host, "POST", "/provider", body={"name": name}, headers=_headers(host))
+                    try:
+                        if response.status != 200:
+                            fail(f"provider {name} was not selected: {response.status}")
+                        response.read()
+                    finally:
+                        connection.close()
+
+                select("anthropic")
+                _send_host_prompt(host, "first prompt")
+                leader = host.run._conversation[0]
+                first_session_id = host.run._conversation[1].run_id
+                if leader._config.leader_provider is not first or leader._config.subagent_provider is not first:
+                    fail("first conversation did not use its provider for both Leader roles")
+                select("gemini")
+                _send_host_prompt(host, "same conversation")
+                if first.call_count != 2 or second.call_count != 0 or host.run._conversation[0] is not leader:
+                    fail("changing the choice altered the running conversation")
+                connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+                try:
+                    if response.status != 200:
+                        fail("new conversation was rejected")
+                    response.read()
+                finally:
+                    connection.close()
+                _send_host_prompt(host, "new conversation")
+                leader = host.run._conversation[0]
+                if second.call_count != 1 or leader._config.leader_provider is not second or leader._config.subagent_provider is not second:
+                    fail("next conversation did not use the new provider for both Leader roles")
+                connection, response = _request(host, "POST", "/session/open", body={"run_id": first_session_id}, headers=_headers(host))
+                try:
+                    if response.status != 200:
+                        fail(f"selected conversation could not be reopened: {response.status}")
+                    response.read()
+                finally:
+                    connection.close()
+                if host.run._conversation[0]._config.leader_provider is not first:
+                    fail("reopening a conversation changed its provider")
+        finally:
+            host.close()
+
+
 @check("host_server.conversation_usage")
 def check_conversation_usage() -> None:
     secret = "fixture-secret-token-24f"

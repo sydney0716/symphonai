@@ -182,6 +182,24 @@ button.session-link {
   gap: 0.75rem;
 }
 
+.provider-controls {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.provider-controls input {
+  min-width: 8rem;
+  flex: 1;
+}
+
+.provider-status {
+  width: 100%;
+  color: #ffbd66;
+}
+
 .conversation-usage {
   grid-column: 1 / -1;
   margin: 0;
@@ -280,18 +298,18 @@ button.session-link {
 
 .prompt-form textarea {
   grid-column: 1;
-  grid-row: 1;
+  grid-row: 2;
   resize: vertical;
 }
 
 .prompt-form button {
   grid-column: 2;
-  grid-row: 1;
+  grid-row: 2;
 }
 
 .prompt-error {
   grid-column: 1 / -1;
-  grid-row: 2;
+  grid-row: 3;
   margin: 0;
 }
 

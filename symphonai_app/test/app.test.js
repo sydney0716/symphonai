@@ -190,7 +190,7 @@ export function fakeClient(
     conversation = null,
   } = {},
 ) {
-  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], newSession: 0, openSession: [], prompt: [], sessions: [], settings: 0 };
+  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], newSession: 0, openSession: [], prompt: [], selectProvider: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -226,6 +226,10 @@ export function fakeClient(
     prompt(text) {
       calls.prompt.push(text);
       return promptReply;
+    },
+    async selectProvider(choice) {
+      calls.selectProvider.push(choice);
+      return { selected: true };
     },
     async stop() {
       return { accepted: true };
@@ -473,6 +477,31 @@ test("new chat clears the transcript and the next prompt adds a session link", a
     "New chat title",
     "Old chat",
   ]);
+});
+
+test("composer offers only keyed vendors and sends its model choice before the prompt", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { settings: { settings: { providers: [
+    { name: "anthropic", env_var: "ANTHROPIC_API_KEY", key_present: false },
+    { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
+  ] } } });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    assert.equal(client.calls.selectProvider.length, 1);
+    return { accepted: true, run_id: "run-provider" };
+  };
+  await start({ global: {}, document, client });
+  const controls = find(document.getElementById("prompt-form"), (node) => node.className === "provider-controls");
+  const select = find(controls, (node) => node.tagName === "SELECT");
+  assert.deepEqual(select.children.map((option) => option.value), ["openai"]);
+  controls.children[1].value = "custom-model";
+  controls.children[2].value = "http://127.0.0.1:9000/v1";
+  document.getElementById("prompt").value = "hello";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{
+    name: "openai", model: "custom-model", base_url: "http://127.0.0.1:9000/v1",
+  }]);
+  assert.deepEqual(client.calls.prompt, ["hello"]);
 });
 
 test("sidebar shows the current project when it has no sessions", async () => {
@@ -742,19 +771,27 @@ test("model settings save and remove a key without displaying its value", async 
   const controls = find(content, (value) => value.className === "credential-controls");
   const input = find(controls, (value) => value.tagName === "INPUT");
   const status = find(content, (value) => value.className === "settings-row").children[2];
+  const providerSelect = find(document.getElementById("prompt-form"), (value) => value.tagName === "SELECT");
   const secret = "recognisable-app-key-fixture";
 
   assert.equal(input.type, "password");
+  assert.deepEqual(providerSelect.children, []);
+  document.getElementById("prompt").value = "wait for a key";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, []);
+  assert.equal(document.getElementById("prompt").value, "wait for a key");
   input.value = secret;
   await find(controls, (value) => value.tagName === "BUTTON" && value.textContent === "Save").dispatch("click");
   assert.deepEqual(client.calls.credentials, [{ name: "OPENAI_API_KEY", value: secret }]);
   assert.equal(input.value, "");
   assert.equal(status.textContent, "present");
+  assert.deepEqual(providerSelect.children.map((option) => option.value), ["openai"]);
   assert.ok(!visibleText(content).includes(secret));
 
   await find(controls, (value) => value.tagName === "BUTTON" && value.textContent === "Remove").dispatch("click");
   assert.deepEqual(client.calls.credentials.at(-1), { name: "OPENAI_API_KEY", value: "" });
   assert.equal(status.textContent, "absent");
+  assert.deepEqual(providerSelect.children, []);
 });
 
 test("credential client sends the value only in an authenticated POST body", async () => {

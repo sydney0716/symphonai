@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +40,10 @@ class RunActiveError(RuntimeError):
         self.run_id = run_id
 
 
+class ProviderSelectionError(ValueError):
+    """A conversation cannot start with the requested provider."""
+
+
 CONVERSATION_TITLE_LIMIT = 80
 
 
@@ -62,13 +66,14 @@ class HostRun:
 
     def __init__(
         self,
-        provider: ModelProvider,
+        provider: ModelProvider | None,
         policy: PermissionPolicy,
         broker: EventBroker,
         *,
         system_prompt: str | None = None,
         max_turns: int = DEFAULT_MAX_TURNS,
         model: str | None = None,
+        provider_factory: Callable[[str | None, str | None, str | None], ModelProvider | None] | None = None,
         publish_approval=None,
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
@@ -84,6 +89,12 @@ class HostRun:
         self._system_prompt = system_prompt
         self._max_turns = max_turns
         self._model = model
+        self._provider_factory = provider_factory
+        self._provider_choice = (
+            {"name": provider.name, "model": model, "base_url": getattr(provider, "base_url", None)}
+            if provider is not None and provider.name in ("anthropic", "gemini", "openai")
+            else None
+        )
         self._extensions = extensions
         self._hooks = (
             None
@@ -131,6 +142,12 @@ class HostRun:
     def sessions_root(self):
         return self._sessions_root
 
+    def select_provider(self, provider: ModelProvider, model: str | None = None, choice: dict | None = None) -> None:
+        with self._lock:
+            self._provider = provider
+            self._model = model
+            self._provider_choice = choice
+
     def start(self, prompt: str) -> str:
         with self._lock:
             if self._active is not None:
@@ -138,6 +155,12 @@ class HostRun:
             run_id = new_id("run")
             cancel = CancellationToken()
             if self._conversation is None:
+                if self._provider is None and self._provider_factory is not None:
+                    self._provider = self._provider_factory(None, None, None)
+                    if self._provider is not None:
+                        self._provider_choice = {"name": self._provider.name}
+                if self._provider is None:
+                    raise ProviderSelectionError("no configured provider; add an API key in Settings")
                 session = SessionStore(
                     self._sessions_root,
                     run_id,
@@ -153,6 +176,8 @@ class HostRun:
                     leader.seed_chat([Message(role=Role.SYSTEM, content=self._system_prompt)])
                 meta = session.read_meta()
                 meta["title"] = _conversation_title(prompt)
+                if self._provider_choice is not None:
+                    meta["provider_choice"] = self._provider_choice
                 session.write_meta(meta)
                 self._conversation = (leader, session)
                 self._context_report = None
@@ -217,7 +242,19 @@ class HostRun:
                 raise RunActiveError(self._active.run_id)
             reader = SessionStore.open(self._sessions_root, run_id)
             loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
+            choice = reader.read_meta().get("provider_choice")
             reader.close()
+            if isinstance(choice, dict) and self._provider_factory is not None:
+                provider = self._provider_factory(choice.get("name"), choice.get("model"), choice.get("base_url"))
+                if provider is None:
+                    raise ProviderSelectionError("session provider is unavailable")
+                self._provider = provider
+                self._model = choice.get("model")
+                self._provider_choice = choice
+            elif self._provider is None and self._provider_factory is not None:
+                self._provider = self._provider_factory(None, None, None)
+                if self._provider is None:
+                    raise ProviderSelectionError("no configured provider; add an API key in Settings")
             if self._conversation is not None:
                 self._conversation[1].close()
             store = SessionStore.open(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import http.client
 import io
 import json
 import os
@@ -12,7 +13,7 @@ from unittest import mock
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from symphonai_api.models import Message, ModelRequest, ModelResponse, Role
+from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR
@@ -87,11 +88,13 @@ def check_connection_error() -> None:
 @check("host_client.base_url_reaches_provider")
 def check_base_url_reaches_provider() -> None:
     requests: list[tuple[str, dict]] = []
+    request_seen = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers["Content-Length"])
             requests.append((self.path, json.loads(self.rfile.read(length))))
+            request_seen.set()
             payload = json.dumps({
                 "choices": [{
                     "message": {"role": "assistant", "content": "loopback"},
@@ -118,22 +121,29 @@ def check_base_url_reaches_provider() -> None:
         # invalid fixture before provider construction can open any request.
         if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
             fail(f"base URL fixture is not loopback: {base_url!r}")
-        arguments = host_main._arguments(["--base-url", base_url])
         if host_main._arguments([]).permission_mode != "prompt":
             fail("host permission mode no longer defaults to prompt")
-        provider = host_main._provider(
-            arguments.provider, arguments.model, arguments.base_url
-        )
-        if provider.base_url != base_url:
-            fail(f"base URL argument did not reach the provider: {provider.base_url!r}")
         with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "loopback-test-key"}):
-            response = provider.create_response(
-                ModelRequest(messages=[Message(Role.USER, "hello")])
-            )
-        if response.message.text != "loopback":
-            fail(f"loopback provider response was not returned: {response!r}")
-        if requests != [("/v1/chat/completions", {"model": provider.model, "messages": [{"role": "user", "content": "hello"}]})]:
-            fail(f"base URL did not reach only the loopback provider: {requests!r}")
+            host = HostServer(None, PermissionPolicy(repo_root=ROOT))
+            host.start()
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", host.port, timeout=2)
+                connection.request("POST", "/provider", body=json.dumps({"name": "openai", "base_url": base_url}), headers={
+                    "Authorization": f"Bearer {host.token}", "Content-Type": "application/json",
+                })
+                response = connection.getresponse()
+                status = response.status
+                response.read()
+                connection.close()
+                if status != 200 or host.run._provider.base_url != base_url:
+                    fail("base URL selection did not reach the provider")
+                HostClient(HostAddress(host.port, host.token)).send_prompt("hello")
+                if not request_seen.wait(5):
+                    fail("selected OpenAI-compatible endpoint was not called")
+                if len(requests) != 1 or requests[0][0] != "/v1/chat/completions" or requests[0][1].get("model") != host.run._provider.model or requests[0][1].get("messages") != [{"role": "user", "content": "hello"}]:
+                    fail(f"base URL did not reach only the loopback provider: {requests!r}")
+            finally:
+                host.close()
     finally:
         server.shutdown()
         server.server_close()

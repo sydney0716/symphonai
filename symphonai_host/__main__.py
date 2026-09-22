@@ -16,36 +16,15 @@ from symphonai_api.extensions import load_extensions
 from symphonai_api.mcp import McpError
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.anthropic_provider import AnthropicProvider
-from symphonai_api.providers.gemini_provider import GeminiProvider
-from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import default_sessions_root
-from symphonai_host.server import HostServer
+from symphonai_host.server import HostServer, _provider
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
 
 
-def _provider(name: str, model: str | None, base_url: str | None):
-    providers = {
-        "anthropic": AnthropicProvider,
-        "gemini": GeminiProvider,
-        "openai": OpenAIProvider,
-    }
-    provider_class = providers[name]
-    options = {}
-    if model is not None:
-        options["model"] = model
-    if base_url is not None:
-        options["base_url"] = base_url
-    return provider_class(**options)
-
-
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", choices=("anthropic", "gemini", "openai"), default="openai")
-    parser.add_argument("--model")
-    parser.add_argument("--base-url")
     parser.add_argument(
         "--permission-mode",
         choices=("auto", "prompt", "plan", "accept_edits"),
@@ -88,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     host = None
     try:
         host = HostServer(
-            _provider(arguments.provider, arguments.model, arguments.base_url),
+            _provider(),
             PermissionPolicy(
                 repo_root=arguments.repo_root,
                 mode=arguments.permission_mode,

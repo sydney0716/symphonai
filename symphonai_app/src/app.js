@@ -131,6 +131,39 @@ export async function start({ global, document, client }) {
     boundary.health().catch(() => null),
     boundary.conversationStats().catch(() => ({ conversation: null })),
   ]);
+  const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
+  const providerControls = element(document, "div", { className: "provider-controls" });
+  const providerLabel = element(document, "label", { text: "Provider " });
+  const providerSelect = element(document, "select");
+  const modelInput = element(document, "input");
+  modelInput.placeholder = "Model (optional)";
+  modelInput.ariaLabel = "Model (optional)";
+  const baseUrlInput = element(document, "input");
+  baseUrlInput.placeholder = "Base URL (optional)";
+  baseUrlInput.ariaLabel = "Base URL (optional)";
+  const providerStatus = element(document, "span", { className: "provider-status" });
+  function showProviderChoices() {
+    const current = providerSelect.value;
+    const keyed = providerRows.filter((row) => row.key_present);
+    replace(providerSelect, ...keyed.map((row) => {
+      const option = element(document, "option", { text: row.name });
+      option.value = row.name;
+      return option;
+    }));
+    providerSelect.value = keyed.some((row) => row.name === current) ? current : (keyed[0]?.name ?? "");
+    providerSelect.disabled = keyed.length === 0;
+    providerStatus.textContent = keyed.length === 0
+      ? "Add an API key in Settings to choose a provider."
+      : "Changes to an active chat apply to the next chat.";
+  }
+  showProviderChoices();
+  listen(providerSelect, "change", () => {
+    modelInput.value = "";
+    baseUrlInput.value = "";
+  });
+  append(providerLabel, providerSelect);
+  append(providerControls, providerLabel, modelInput, baseUrlInput, providerStatus);
+  append(form, providerControls);
   let sessions = initialSessions;
   let conversation = conversationReply?.conversation ?? null;
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
@@ -183,6 +216,11 @@ export async function start({ global, document, client }) {
           try {
             await boundary.storeCredential(envVar, value);
             table.children[index + 1].children[2].textContent = value ? "present" : "absent";
+            const providerRow = providerRows.find((item) => item.env_var === envVar);
+            if (providerRow) {
+              providerRow.key_present = Boolean(value);
+              showProviderChoices();
+            }
             notice.textContent = value ? "Key stored." : "Key removed.";
           } catch {
             notice.textContent = "Could not update key.";
@@ -593,6 +631,12 @@ export async function start({ global, document, client }) {
     for (const action of actions) {
       if (action.kind === "prompt") {
         try {
+          if (providerSelect.value) {
+            const choice = { name: providerSelect.value };
+            if (modelInput.value.trim()) choice.model = modelInput.value.trim();
+            if (baseUrlInput.value.trim()) choice.base_url = baseUrlInput.value.trim();
+            await boundary.selectProvider(choice);
+          }
           const reply = await boundary.prompt(action.text);
           if (reply?.conflict === true) {
             const active = await activeRuntimeRun();
@@ -627,6 +671,11 @@ export async function start({ global, document, client }) {
 
   listen(form, "submit", (event) => {
     event.preventDefault();
+    if (providerRows.length > 0 && !providerSelect.value) {
+      promptFailure = "Add an API key in Settings before sending a message.";
+      showPromptError();
+      return;
+    }
     const text = input.value;
     input.value = "";
     promptFailure = "";

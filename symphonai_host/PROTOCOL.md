@@ -101,6 +101,19 @@ run id. `POST /session/new` takes an empty JSON object, ends the current
 conversation, and returns `{"ended": true}`. The next prompt creates a new
 session directory. It returns `409` if a run is active.
 
+Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
+"openai", "model": str?, "base_url": str?}` and returns `{"selected": true}`.
+`model` and `base_url` are optional non-empty strings. `openai` with a
+`base_url` selects an OpenAI-compatible endpoint. Unknown vendors, malformed
+options, and vendors without a configured API key return `400`. The selection
+applies when the next conversation starts; changing it while a conversation
+is running does not change that conversation. Reopening a selected conversation
+restores its provider choice from session metadata. Both Leader providers use the
+conversation's selected provider. When no selection was sent, the host uses
+the first vendor with a key in Settings order (anthropic, gemini, openai).
+If no vendor has a key, the first prompt returns `400` until a key is added or
+a valid selection is sent. Launch flags do not select a provider.
+
 Authenticated `GET /conversation` returns `{"conversation": null}` before a
 conversation has completed a run. Otherwise `conversation` contains `context`
 (`used_tokens`, `budget_tokens`, `remaining_tokens`, and `by_source`), aggregate
