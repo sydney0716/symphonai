@@ -42,6 +42,7 @@ from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.extensions import Extensions, load_extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import RunRef
+from symphonai_api.instructions import MAX_INSTRUCTION_FILE_CHARS
 from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
@@ -1457,6 +1458,67 @@ def _send_host_prompt(host: HostServer, prompt: str) -> None:
     finally:
         connection.close()
     _wait_until(lambda: not host.run.active, "usage prompt did not finish")
+
+
+@check("host_server.project_instructions_seeded")
+def check_project_instructions_seeded() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "CLAUDE.md").write_text("legacy rule must stay absent", encoding="utf-8")
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-user-home")}):
+            host = HostServer(provider, PermissionPolicy(root), system_prompt="host baseline", sessions_root=root / "sessions")
+            host.start()
+            try:
+                with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy:
+                    _send_host_prompt(host, "plain")
+                    plain = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
+                    if plain != [("system", "host baseline"), ("user", "plain")]:
+                        fail(f"empty hierarchy or CLAUDE.md changed the provider request: {plain!r}")
+                    host.run.end_conversation()
+                    instructions = root / ".symphonai" / "INSTRUCTIONS.md"
+                    instructions.parent.mkdir()
+                    instructions.write_text("project convention", encoding="utf-8")
+                    _send_host_prompt(host, "with instructions")
+                    sent = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
+                    if sent != [
+                        ("system", "host baseline"),
+                        ("system", "# instructions: project .symphonai/INSTRUCTIONS.md\nproject convention"),
+                        ("user", "with instructions"),
+                    ]:
+                        fail(f"project instructions or system prompt missed the first request: {sent!r}")
+            finally:
+                host.close()
+
+
+@check("host_server.instruction_scope_and_warning")
+def check_instruction_scope_and_warning() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        nested = root / "src"
+        for directory in (root, nested):
+            (directory / ".symphonai").mkdir(parents=True)
+        project_text = "project rule\n" + "x" * MAX_INSTRUCTION_FILE_CHARS
+        (root / ".symphonai" / "INSTRUCTIONS.md").write_text(project_text, encoding="utf-8")
+        (nested / ".symphonai" / "INSTRUCTIONS.md").write_text("directory rule", encoding="utf-8")
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-user-home")}):
+            host = HostServer(provider, PermissionPolicy(root), working_dir=nested, sessions_root=root / "sessions", chat_token_budget=1_000_000)
+            host.start()
+            try:
+                stderr = io.StringIO()
+                with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy, contextlib.redirect_stderr(stderr):
+                    _send_host_prompt(host, "check scopes")
+                sent = response_spy.call_args.args[0].messages
+                rendered = sent[0].text if sent and sent[0].role == Role.SYSTEM else ""
+                if len(sent) != 2 or "# instructions: project .symphonai/INSTRUCTIONS.md\n" not in rendered or project_text not in rendered:
+                    fail("project instruction text or scope did not reach the provider")
+                if "# instructions: directory src/.symphonai/INSTRUCTIONS.md\ndirectory rule" not in rendered:
+                    fail("directory instruction text or scope did not reach the provider")
+                if "instruction warning:" not in stderr.getvalue() or "loaded in full" not in stderr.getvalue() or provider.call_count != 1:
+                    fail("oversize warning was hidden or the run did not complete")
+            finally:
+                host.close()
 
 
 @check("host_server.provider_default_and_rejection")

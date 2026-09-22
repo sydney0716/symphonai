@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from symphonai_api.cost import PriceTable, UsageTotals, total_cost
 from symphonai_api.events import Event, RunFailed, RunFinished, RunStarted, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.identity import new_id
+from symphonai_api.instructions import load_instructions
 from symphonai_api.leader import Leader, LeaderConfig, LeaderRunResult
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
@@ -71,6 +73,7 @@ class HostRun:
         broker: EventBroker,
         *,
         system_prompt: str | None = None,
+        working_dir: Path | None = None,
         max_turns: int = DEFAULT_MAX_TURNS,
         model: str | None = None,
         provider_factory: Callable[[str | None, str | None, str | None], ModelProvider | None] | None = None,
@@ -87,6 +90,11 @@ class HostRun:
         self._policy = policy
         self._broker = broker
         self._system_prompt = system_prompt
+        if working_dir is None:
+            current = Path.cwd().resolve()
+            self._working_dir = current if current.is_relative_to(policy.repo_root) else policy.repo_root
+        else:
+            self._working_dir = Path(working_dir)
         self._max_turns = max_turns
         self._model = model
         self._provider_factory = provider_factory
@@ -172,8 +180,17 @@ class HostRun:
                 except Exception:
                     session.close()
                     raise
+                seeded = []
                 if self._system_prompt:
-                    leader.seed_chat([Message(role=Role.SYSTEM, content=self._system_prompt)])
+                    seeded.append(Message(role=Role.SYSTEM, content=self._system_prompt))
+                instructions = load_instructions(self._policy, working_dir=self._working_dir)
+                for warning in instructions.warnings:
+                    print(f"instruction warning: {warning}", file=sys.stderr)
+                rendered = instructions.render()
+                if rendered:
+                    seeded.append(Message(role=Role.SYSTEM, content=rendered))
+                if seeded:
+                    leader.seed_chat(seeded)
                 meta = session.read_meta()
                 meta["title"] = _conversation_title(prompt)
                 if self._provider_choice is not None:

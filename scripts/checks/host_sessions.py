@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import contextlib
 import io
+import os
 import shutil
 import tempfile
 import threading
@@ -480,6 +481,31 @@ def check_continuation_conversation() -> None:
                 fail(f"continued conversation did not rebuild in order: {loaded.messages!r}")
         finally:
             host.close()
+
+
+@check("host_sessions.instructions_not_reloaded")
+def check_instructions_not_reloaded() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instructions = root / ".symphonai" / "INSTRUCTIONS.md"
+        instructions.parent.mkdir()
+        instructions.write_text("original convention", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-user-home")}):
+            host, client = _host(root)
+            try:
+                run_id = client.send_prompt("first")["run_id"]
+                _wait_idle(client)
+                instructions.write_text("changed convention", encoding="utf-8")
+                client.open_session(run_id)
+                with mock.patch.object(host.run._provider, "create_response", wraps=host.run._provider.create_response) as response_spy:
+                    client.send_prompt("second")
+                    _wait_idle(client)
+                sent = response_spy.call_args.args[0].messages
+                system = [message.text for message in sent if message.role == Role.SYSTEM]
+                if len(system) != 1 or "original convention" not in system[0] or "changed convention" in system[0]:
+                    fail(f"reopening reloaded or duplicated instructions: {system!r}")
+            finally:
+                host.close()
 
 
 @check("host_sessions.reopened_appends_to_original")

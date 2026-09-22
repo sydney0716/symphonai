@@ -101,6 +101,16 @@ run id. `POST /session/new` takes an empty JSON object, ends the current
 conversation, and returns `{"ended": true}`. The next prompt creates a new
 session directory. It returns `409` if a run is active.
 
+At a new conversation's first prompt, the host loads the user, project, and
+working-directory `.symphonai/INSTRUCTIONS.md` hierarchy. It seeds the
+leader with the existing system prompt first, then a separate system message
+containing the loader's rendered instruction blocks. Each block names its
+scope and source path. The working directory is the host's current directory
+when it is inside `repo_root`, or `repo_root` otherwise. Loader warnings go to
+host stderr with an `instruction warning:` prefix; a warned file can still be
+loaded in full. If the hierarchy is empty, no instruction message is added.
+`POST /session/open` restores the recorded messages and does not reload files.
+
 Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
 "openai", "model": str?, "base_url": str?}` and returns `{"selected": true}`.
 `model` and `base_url` are optional non-empty strings. `openai` with a
