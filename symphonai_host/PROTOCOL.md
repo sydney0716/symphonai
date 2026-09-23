@@ -165,10 +165,23 @@ the first vendor with a key in Settings order (anthropic, gemini, openai).
 If no vendor has a key, the first prompt returns `400` until a key is added or
 a valid selection is sent. Launch flags do not select a provider.
 
+Authenticated `POST /mode` takes exactly `{"mode": "ask" | "plan" | "allow"}`
+and returns `{"mode": <current mode>}`. The available values are intersected
+with `agents.ceiling.modes`; an unknown or excluded value returns `400` with
+the permitted values and leaves the current mode unchanged. A successful
+change updates the open conversation immediately, so its next permission check
+and every later subagent dispatch use the new mode. A tool call already in
+progress continues, and an approval request already waiting remains pending;
+its eventual answer still resolves that request. A host starts in `ask`; if
+`agents.ceiling.modes` excludes ask, it starts in the tightest permitted mode,
+preferring `plan` to `allow`. An empty modes ceiling is a configuration error.
+Starting a new chat or reopening a session resets to that starting mode.
+
 Authenticated `GET /conversation` returns `{"conversation": null}` before a
 conversation is open. Otherwise `conversation` contains an `agents` array whose
 entries identify an agent by opaque id and name, plus `parent_agent_id` (an
-opaque id or `null` for a root). Each agent appears once; the first run in the
+opaque id or `null` for a root), and `mode` reports the mode currently in force.
+Each agent appears once; the first run in the
 timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,
 `remaining_tokens`, and `by_source`), aggregate `usage`, and per-agent
@@ -228,7 +241,8 @@ An authenticated `GET /project` returns the host repository's absolute,
 resolved path as `repo_root` and its basename as `name`. It accepts only the
 ordinary bearer header; an app query token or app cookie does not authorize it.
 
-An authenticated `GET /settings` returns a `settings` object with `config`
+An authenticated `GET /settings` returns a `settings` object with the current
+permission `mode`, `config`
 entries (`key`, `value`, `scope`), `ceiling`, `trust`, `hooks` (`event`, `command`),
 `mcp_servers` (`name`, `command`, `started`), sorted `agents`, `skills`, and
 `plugins` entries (`name`, `path`), `withheld` entries (`scope`, `directory`, `names`, `reason`),
@@ -236,7 +250,8 @@ and `providers` entries (`name`, `env_var`, `key_present`). A withheld
 `directory` and roster `path` are repository-relative within the repository
 and absolute otherwise; an unknown roster path is `""`. Provider key presence
 is a boolean; key values never appear in the
-response. Only the ordinary bearer header authorizes this route.
+response. It is assembled from already loaded host state and makes no network
+requests. Only the ordinary bearer header authorizes this route.
 
 Provider keys can be stored with authenticated `POST /credentials` and a JSON
 body containing `name` and `value`. `name` must be one of the host's known

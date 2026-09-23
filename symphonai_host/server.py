@@ -38,7 +38,7 @@ from symphonai_host.protocol import (
     encode_event,
     encode_frame,
 )
-from symphonai_host.run import HostRun, ProviderSelectionError, RunActiveError
+from symphonai_host.run import HostRun, ModeSelectionError, ProviderSelectionError, RunActiveError
 from symphonai_host.sessions import list_sessions
 
 
@@ -516,6 +516,7 @@ class HostServer:
                     search_key = None if extensions is None else extensions.config.get("search.endpoint")
                     configured_search = None if search_key is None else search_endpoint(search_key)
                     settings = {
+                        "mode": host.run.policy.mode,
                         "config": [] if extensions is None else [
                             {
                                 "key": key,
@@ -635,7 +636,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -724,6 +725,18 @@ class HostServer:
                         return
                     host.run.select_provider(provider, choice.get("model"), choice)
                     self._json(HTTPStatus.OK, {"selected": True})
+                    return
+                if self.path == "/mode":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"mode"}:
+                            permitted = ", ".join(host.run.permitted_modes()) or "none"
+                            raise ModeSelectionError(f"permitted modes: {permitted}")
+                        mode = host.run.select_mode(payload["mode"])
+                    except (ProtocolError, ModeSelectionError) as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {"mode": mode})
                     return
                 kind = self.path.removeprefix("/")
                 try:

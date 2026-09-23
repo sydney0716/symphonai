@@ -57,6 +57,13 @@ class ProviderSelectionError(ValueError):
     """A conversation cannot start with the requested provider."""
 
 
+class ModeSelectionError(ValueError):
+    """The requested permission mode is not available to this host."""
+
+
+PERMISSION_MODES = ("ask", "plan", "allow")
+
+
 @dataclass(frozen=True)
 class ForkableHistoryMessage(HistoryMessage):
     record_id: str
@@ -136,6 +143,12 @@ class HostRun:
     ) -> None:
         self._provider = provider
         self._policy = policy
+        self._extensions = extensions
+        permitted = self.permitted_modes()
+        if not permitted:
+            raise ModeSelectionError("agents.ceiling.modes must permit at least one mode")
+        self._starting_mode = "ask" if "ask" in permitted else permitted[0]
+        self._policy.mode = self._starting_mode
         self._broker = broker
         self._system_prompt = system_prompt
         if working_dir is None:
@@ -151,7 +164,6 @@ class HostRun:
             if provider is not None and provider.name in ("anthropic", "gemini", "openai")
             else None
         )
-        self._extensions = extensions
         endpoint_key = None if extensions is None else extensions.config.get("search.endpoint")
         self._search_backend = (
             None if endpoint_key is None else HttpJsonSearchBackend(search_endpoint(endpoint_key))
@@ -219,6 +231,23 @@ class HostRun:
             self._provider = provider
             self._model = model
             self._provider_choice = choice
+
+    def permitted_modes(self) -> tuple[str, ...]:
+        ceiling = None if self._extensions is None else getattr(self._extensions, "ceiling", None)
+        modes = None if ceiling is None else ceiling.modes
+        return tuple(
+            mode for mode in PERMISSION_MODES
+            if modes is None or mode in modes
+        )
+
+    def select_mode(self, mode: object) -> str:
+        with self._lock:
+            permitted = self.permitted_modes()
+            if mode not in permitted:
+                choices = ", ".join(permitted) or "none"
+                raise ModeSelectionError(f"permitted modes: {choices}")
+            self._policy.mode = mode
+            return mode
 
     def start(self, prompt: str) -> str:
         with self._lock:
@@ -365,6 +394,7 @@ class HostRun:
             finally:
                 reader.close()
             previous_provider = (self._provider, self._model, self._provider_choice)
+            previous_mode = self._policy.mode
             provider, model, provider_choice = previous_provider
             if isinstance(choice, dict) and self._provider_factory is not None:
                 provider = self._provider_factory(choice.get("name"), choice.get("model"), choice.get("base_url"))
@@ -383,10 +413,12 @@ class HostRun:
             )
             try:
                 self._provider, self._model, self._provider_choice = provider, model, provider_choice
+                self._policy.mode = self._starting_mode
                 leader = self._new_leader(store)
                 leader.seed_chat(loaded.messages, persisted=True)
             except Exception:
                 self._provider, self._model, self._provider_choice = previous_provider
+                self._policy.mode = previous_mode
                 store.close()
                 raise
             if self._conversation is not None:
@@ -452,6 +484,7 @@ class HostRun:
                 raise RunActiveError(self._active.run_id)
             conversation = self._conversation
             self._conversation = None
+            self._policy.mode = self._starting_mode
             self._context_report = None
             self._usage_by_agent.clear()
         if conversation is not None:
@@ -523,6 +556,7 @@ class HostRun:
                     ):
                         started_at.setdefault(record.get("run_id"), record["ts"])
             report = self._context_report
+            mode = self._policy.mode
             usage_by_agent = {
                 agent_id: (name, dict(by_model))
                 for agent_id, (name, by_model) in self._usage_by_agent.items()
@@ -578,7 +612,7 @@ class HostRun:
                     **(usage_fields(by_model) if report is not None else {}),
                 })
 
-        result = {"agents": agents}
+        result = {"agents": agents, "mode": mode}
         if report is None:
             return result
         all_models: dict[str, UsageTotals] = {}

@@ -19,27 +19,13 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import default_sessions_root
 from symphonai_host.server import HostServer, _provider
+from symphonai_host.run import ModeSelectionError
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
 
 
-def _permission_mode(value: str) -> str:
-    replacements = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
-    if value in replacements:
-        raise argparse.ArgumentTypeError(
-            f"permission mode {value!r} was renamed; use {replacements[value]!r} instead"
-        )
-    return value
-
-
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--permission-mode",
-        type=_permission_mode,
-        choices=("ask", "plan", "allow"),
-        default="ask",
-    )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--max-turns", type=int, default=20)
     return parser.parse_args(argv)
@@ -78,10 +64,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         host = HostServer(
             _provider(),
-            PermissionPolicy(
-                repo_root=arguments.repo_root,
-                mode=arguments.permission_mode,
-            ),
+            PermissionPolicy(repo_root=arguments.repo_root),
             max_turns=arguments.max_turns,
             extensions=extensions,
             mcp_tools=mcp_tools,
@@ -94,6 +77,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         signal.signal(signal.SIGTERM, shutdown)
         host.print_handshake()
         host.serve_forever()
+    except ModeSelectionError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     finally:
         if host is not None:
             host.close()

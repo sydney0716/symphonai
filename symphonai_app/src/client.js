@@ -286,6 +286,10 @@ export function createClient({
       return request("POST", "/provider", choice);
     },
 
+    selectMode(mode) {
+      return request("POST", "/mode", { mode });
+    },
+
     storeCredential(name, value) {
       return request("POST", "/credentials", { name, value });
     },

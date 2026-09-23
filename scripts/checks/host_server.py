@@ -897,7 +897,11 @@ def check_settings_route() -> None:
                 "config", "ceiling", "trust", "hooks", "mcp_servers",
                 "agents", "skills", "plugins", "withheld", "providers",
             }
-            if set(settings) != expected_fields | {"search"} or settings["search"] != []:
+            if (
+                set(settings) != expected_fields | {"search", "mode"}
+                or settings["search"] != []
+                or settings["mode"] != "ask"
+            ):
                 fail(f"settings route returned the wrong fields: {settings!r}")
             config = {entry["key"]: entry for entry in settings["config"]}
             if (
@@ -1759,6 +1763,189 @@ def check_provider_choice_per_conversation() -> None:
             host.close()
 
 
+@check("host_server.permission_mode_control")
+def check_permission_mode_control() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        extensions = load_extensions(repo_root=root, home=root / "home")
+        empty_modes = replace(
+            extensions,
+            ceiling=replace(extensions.ceiling, modes=()),
+        )
+        try:
+            HostServer(
+                FakeModelProvider(), PermissionPolicy(root),
+                sessions_root=root / "empty-sessions", extensions=empty_modes,
+            )
+        except host_run_module.ModeSelectionError as exc:
+            if "agents.ceiling.modes" not in str(exc):
+                fail(f"empty modes error omitted its configuration key: {exc}")
+        else:
+            fail("an empty modes ceiling started a host")
+        error = io.StringIO()
+        with (
+            mock.patch.object(host_main, "load_extensions", return_value=empty_modes),
+            mock.patch.object(host_main, "prune_sessions"),
+            mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
+            contextlib.redirect_stderr(error),
+        ):
+            try:
+                host_main.main(["--repo-root", str(root)])
+            except SystemExit as exc:
+                if exc.code != 2:
+                    fail(f"empty modes ceiling exited with {exc.code!r}")
+            else:
+                fail("the host entry point accepted an empty modes ceiling")
+        if (
+            "configuration error:" not in error.getvalue()
+            or "agents.ceiling.modes" not in error.getvalue()
+        ):
+            fail(f"empty modes startup error was unclear: {error.getvalue()!r}")
+
+        for modes, expected in (
+            (("plan",), "plan"),
+            (("allow", "plan"), "plan"),
+        ):
+            configured = replace(
+                extensions,
+                ceiling=replace(extensions.ceiling, modes=modes),
+            )
+            candidate = HostServer(
+                FakeModelProvider(), PermissionPolicy(root, mode="allow"),
+                sessions_root=root / f"sessions-{'-'.join(modes)}",
+                extensions=configured,
+            )
+            try:
+                if candidate.run.policy.mode != expected:
+                    fail(f"ceiling {modes!r} started in {candidate.run.policy.mode!r}")
+                if candidate.run.policy.mode not in candidate.run.permitted_modes():
+                    fail(f"ceiling {modes!r} started outside its permitted modes")
+                if modes == ("allow", "plan"):
+                    candidate.run.select_mode("allow")
+                    candidate.run.select_mode("plan")
+                    if candidate.run.policy.mode != "plan":
+                        fail("the starting mode became a one-way door")
+            finally:
+                candidate.close()
+
+        extensions = replace(
+            extensions,
+            ceiling=replace(extensions.ceiling, modes=("ask", "plan")),
+        )
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "conversation open")),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "mode-child", "dispatch_subagent", {
+                    "subagent_name": "worker", "task": "inspect",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        policy = PermissionPolicy(root, allowed_write_scope=[root], mode="ask")
+        host = HostServer(
+            provider,
+            policy,
+            sessions_root=root / "sessions",
+            extensions=extensions,
+        )
+        host.start()
+
+        def select(mode: object) -> tuple[int, dict]:
+            connection, response = _request(
+                host, "POST", "/mode", body={"mode": mode}, headers=_headers(host)
+            )
+            try:
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        try:
+            connection, response = _request(host, "POST", "/mode", body={"mode": "plan"})
+            try:
+                if response.status != 401 or response.read() != b"":
+                    fail("mode route accepted an unauthenticated request")
+            finally:
+                connection.close()
+
+            _send_host_prompt(host, "open a conversation")
+            leader, session = host.run._conversation
+            session_id = session.run_id
+
+            status, reply = select("plan")
+            if status != 200 or reply != {"mode": "plan"}:
+                fail(f"plan mode was not selected: {status}, {reply!r}")
+            denied = policy.check_write(root / "plan-denied.txt")
+            if denied.allowed or "plan mode" not in denied.reason:
+                fail(f"plan mode permitted a write: {denied!r}")
+
+            policy.approval_callback = lambda _: True
+            status, reply = select("ask")
+            if status != 200 or reply != {"mode": "ask"}:
+                fail(f"ask mode was not selected: {status}, {reply!r}")
+            if host.run._conversation[0] is not leader:
+                fail("changing mode rebuilt the active conversation")
+            allowed = policy.check_write(root / "ask-approved.txt")
+            if not allowed.allowed:
+                fail(f"ask mode did not permit an approved write: {allowed!r}")
+
+            for refused in ("unknown", "allow"):
+                status, reply = select(refused)
+                error = reply.get("error", "")
+                if (
+                    status != 400
+                    or "ask" not in error
+                    or "plan" not in error
+                    or policy.mode != "ask"
+                ):
+                    fail(f"mode {refused!r} was not refused atomically: {status}, {reply!r}")
+
+            connection, response = _request(
+                host, "POST", "/mode",
+                body={"mode": "plan", "extra": True}, headers=_headers(host),
+            )
+            try:
+                reply = json.loads(response.read())
+                if (
+                    response.status != 400
+                    or "ask" not in reply.get("error", "")
+                    or policy.mode != "ask"
+                ):
+                    fail(f"mode route accepted unknown fields: {response.status}, {reply!r}")
+            finally:
+                connection.close()
+
+            select("plan")
+            _send_host_prompt(host, "dispatch after changing mode")
+            child = leader.subagents.get("worker")
+            if child is None or child.agent._policy.mode != "plan":
+                fail(f"next subagent dispatch missed the live mode: {child!r}")
+
+            _, conversation = _conversation_reply(host)
+            if conversation.get("conversation", {}).get("mode") != "plan":
+                fail(f"conversation omitted its current mode: {conversation!r}")
+
+            connection, response = _request(
+                host, "POST", "/session/open",
+                body={"run_id": session_id}, headers=_headers(host),
+            )
+            try:
+                body = response.read()
+                if response.status != 200:
+                    fail(f"session did not reopen: {response.status}, {body!r}")
+            finally:
+                connection.close()
+            _, reopened = _conversation_reply(host)
+            if reopened.get("conversation", {}).get("mode") != "ask" or policy.mode != "ask":
+                fail(f"reopened session did not report the starting mode: {reopened!r}")
+            select("plan")
+            host.run.end_conversation()
+            if policy.mode != "ask" or host.run.conversation_stats() is not None:
+                fail("ending a conversation did not restore the starting mode")
+        finally:
+            host.close()
+
+
 @check("host_server.conversation_usage")
 def check_conversation_usage() -> None:
     secret = "fixture-secret-token-24f"
@@ -1873,7 +2060,7 @@ def check_conversation_reopened_parentage() -> None:
             finally:
                 connection.close()
             conversation = _conversation_reply(host)[1]["conversation"]
-            if conversation is None or set(conversation) != {"agents"}:
+            if conversation is None or set(conversation) != {"agents", "mode"}:
                 fail(f"reopened conversation did not report agents without usage: {conversation!r}")
             agents = {agent["name"]: agent for agent in conversation["agents"]}
             if set(agents) != {"leader", "worker"}:
@@ -3011,7 +3198,7 @@ def check_mcp_start_and_schema() -> None:
             mock.patch.object(host_main.signal, "signal"),
             contextlib.redirect_stdout(output),
         ):
-            host_main.main(["--repo-root", str(repo), "--permission-mode", "allow"])
+            host_main.main(["--repo-root", str(repo)])
         parent = int(parent_file.read_text(encoding="utf-8"))
         child = int(child_file.read_text(encoding="utf-8"))
         try:

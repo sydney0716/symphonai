@@ -77,6 +77,18 @@ test("provider choice uses an authenticated JSON request", async () => {
   });
 });
 
+test("permission mode uses an authenticated JSON request", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, { mode: "plan" });
+  } });
+  assert.deepEqual(await client.selectMode("plan"), { mode: "plan" });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/mode");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(JSON.parse(records[0].options.body), { mode: "plan" });
+});
+
 test("fork sends opaque session and record ids in the authenticated body", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {

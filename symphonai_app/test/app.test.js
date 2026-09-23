@@ -190,7 +190,7 @@ export function fakeClient(
     conversation = null,
   } = {},
 ) {
-  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], newSession: 0, openSession: [], prompt: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], newSession: 0, openSession: [], prompt: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -230,6 +230,10 @@ export function fakeClient(
     async selectProvider(choice) {
       calls.selectProvider.push(choice);
       return { selected: true };
+    },
+    async selectMode(mode) {
+      calls.selectMode.push(mode);
+      return { mode };
     },
     async stop() {
       return { accepted: true };
@@ -506,6 +510,43 @@ test("composer offers only keyed vendors and sends its model choice before the p
     name: "openai", model: "custom-model", base_url: "http://127.0.0.1:9000/v1",
   }]);
   assert.deepEqual(client.calls.prompt, ["hello"]);
+});
+
+test("composer shows the live permission mode and restores it after a refusal", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { mode: "ask", ceiling: { modes: ["ask", "plan"] } } },
+    conversation: { agents: [], mode: "plan" },
+  });
+  let refused = true;
+  client.selectMode = async (mode) => {
+    client.calls.selectMode.push(mode);
+    if (refused) {
+      refused = false;
+      throw new Error("permitted modes: ask, plan");
+    }
+    return { mode };
+  };
+  await start({ global: {}, document, client });
+  const controls = find(document.getElementById("prompt-form"), (node) =>
+    node.className.startsWith("mode-controls")
+  );
+  const select = find(controls, (node) => node.tagName === "SELECT");
+  const status = find(controls, (node) => node.className === "mode-status");
+  assert.equal(select.value, "plan");
+  assert.equal(select.children.find((option) => option.value === "plan").textContent, "plan · read only");
+  assert.equal(status.textContent, "Plan mode is read only.");
+
+  select.value = "ask";
+  await select.dispatch("change");
+  assert.equal(select.value, "plan");
+  assert.equal(status.textContent, "Mode change refused; still plan.");
+
+  select.value = "ask";
+  await select.dispatch("change");
+  assert.deepEqual(client.calls.selectMode, ["ask", "ask"]);
+  assert.equal(select.value, "ask");
+  assert.equal(status.textContent, "Ask before changes.");
 });
 
 test("sidebar shows the current project when it has no sessions", async () => {

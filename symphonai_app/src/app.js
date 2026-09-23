@@ -164,6 +164,56 @@ export async function start({ global, document, client }) {
   append(providerLabel, providerSelect);
   append(providerControls, providerLabel, modelInput, baseUrlInput, providerStatus);
   append(form, providerControls);
+  const allModes = ["ask", "plan", "allow"];
+  const ceilingModes = settingsReply?.settings?.ceiling?.modes;
+  const permittedModes = Array.isArray(ceilingModes)
+    ? allModes.filter((mode) => ceilingModes.includes(mode))
+    : allModes;
+  const configuredMode = settingsReply?.settings?.mode ?? "ask";
+  const launchMode = permittedModes.includes(configuredMode)
+    ? configuredMode
+    : (permittedModes[0] ?? "ask");
+  let currentMode = conversationReply?.conversation?.mode ?? launchMode;
+  const modeControls = element(document, "div", { className: "mode-controls" });
+  const modeLabel = element(document, "label", { text: "Mode " });
+  const modeSelect = element(document, "select");
+  const modeStatus = element(document, "span", { className: "mode-status" });
+  replace(modeSelect, ...permittedModes.map((mode) => {
+    const option = element(document, "option", {
+      text: mode === "plan" ? "plan · read only" : mode,
+    });
+    option.value = mode;
+    return option;
+  }));
+  function showMode(message = "") {
+    modeSelect.value = currentMode;
+    modeControls.className = currentMode === "plan" ? "mode-controls plan" : "mode-controls";
+    modeStatus.textContent = message || (
+      currentMode === "plan" ? "Plan mode is read only."
+        : currentMode === "ask" ? "Ask before changes."
+          : "Allow changes within configured limits."
+    );
+  }
+  listen(modeSelect, "change", async () => {
+    const requested = modeSelect.value;
+    modeSelect.disabled = true;
+    try {
+      const reply = await boundary.selectMode(requested);
+      if (!permittedModes.includes(reply?.mode)) {
+        throw new Error("host returned an invalid mode");
+      }
+      currentMode = reply.mode;
+      showMode();
+    } catch {
+      showMode(`Mode change refused; still ${currentMode}.`);
+    } finally {
+      modeSelect.disabled = false;
+    }
+  });
+  append(modeLabel, modeSelect);
+  append(modeControls, modeLabel, modeStatus);
+  append(form, modeControls);
+  showMode();
   let sessions = initialSessions;
   let currentSessionId = null;
   let conversation = conversationReply?.conversation ?? null;
@@ -490,6 +540,8 @@ export async function start({ global, document, client }) {
       currentSessionId = null;
       showTranscript();
       conversation = null;
+      currentMode = launchMode;
+      showMode();
       board.clear();
       showConversationUsage();
       showAgents();
@@ -654,6 +706,10 @@ export async function start({ global, document, client }) {
     try {
       const reply = await boundary.conversationStats();
       conversation = reply?.conversation ?? null;
+      if (permittedModes.includes(conversation?.mode)) {
+        currentMode = conversation.mode;
+        showMode();
+      }
       showConversationUsage();
       showAgents();
     } catch {
