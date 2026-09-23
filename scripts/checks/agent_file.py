@@ -226,7 +226,7 @@ allowed_write_scope = ["src", "tests"]
 shell_enabled = true
 shell_allowlist = [["git", "status"], ["git", "diff"]]
 fetch_enabled = false
-mode = "auto"
+mode = "allow"
 
 [io]
 output_schema = { type = "object", properties = { verdict = { type = "string" } } }
@@ -275,7 +275,7 @@ output_schema = { type = "object", properties = { verdict = { type = "string" } 
             or policy.shell_allowlist != [("git", "status"), ("git", "diff")]
             or not policy.shell_enabled
             or policy.fetch_enabled
-            or policy.mode != "auto"
+            or policy.mode != "allow"
         ):
             fail(f"full policy was not loaded: {policy!r}")
         output_schema = full_loaded.io.output_schema
@@ -458,6 +458,37 @@ def validation_errors_name_the_key() -> None:
         for value in ("default", "low", "medium", "high"):
             if value not in message:
                 fail(f"effort error omitted valid value {value!r}: {message!r}")
+        for mode in ("ask", "plan", "allow"):
+            path = _write(
+                directory,
+                f"mode-{mode}.toml",
+                f'prompt = "Review."\n[policy]\nmode = "{mode}"\n',
+            )
+            loaded = load_agent_file(
+                path,
+                repo_root=directory,
+                default_model=default_model,
+            )
+            if loaded.policy_ceiling.mode != mode:
+                fail(f"agent policy mode {mode!r} loaded as {loaded.policy_ceiling.mode!r}")
+        for old, replacement in (
+            ("prompt", "ask"),
+            ("auto", "allow"),
+            ("accept_edits", "ask, plan, or allow"),
+        ):
+            path = _write(
+                directory,
+                f"old-mode-{old}.toml",
+                f'prompt = "Review."\n[policy]\nmode = "{old}"\n',
+            )
+            message = _expect_error(
+                path,
+                "mode",
+                repo_root=directory,
+                default_model=default_model,
+            )
+            if replacement not in message:
+                fail(f"old agent mode error omitted {replacement!r}: {message!r}")
 
 
 @check("agent_file.directory_roster")

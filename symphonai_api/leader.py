@@ -633,7 +633,7 @@ class LeaderConfig:
     subagent_budget: RunBudget | None = None
     subagent_tool_names: Sequence[str] | None = None
     subagent_specs: Mapping[str, AgentSpec] | None = None
-    permission_mode: PermissionMode = "auto"
+    permission_mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
     chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
     chat_recent_turns: int = DEFAULT_RECENT_TURNS

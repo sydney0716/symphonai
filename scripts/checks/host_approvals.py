@@ -67,7 +67,7 @@ def check_request_published() -> None:
 def _prompted_write(broker: ApprovalBroker, tool_call_id: str | None):
     policy = PermissionPolicy(
         repo_root=ROOT,
-        mode="prompt",
+        mode="ask",
         approval_callback=broker.callback,
     )
     if tool_call_id is None:

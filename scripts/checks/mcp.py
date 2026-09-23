@@ -487,10 +487,10 @@ def policy_modes_fail_closed() -> None:
             client.start()
             tool = client.list_tools()[0]
             outcomes = {}
-            for mode in ("auto", "prompt", "plan", "accept_edits"):
+            for mode in ("allow", "ask", "plan"):
                 callback = (
                     (lambda request: True)
-                    if mode in ("prompt", "accept_edits")
+                    if mode == "ask"
                     else None
                 )
                 policy = PermissionPolicy(
@@ -502,25 +502,22 @@ def policy_modes_fail_closed() -> None:
                     ToolCall(id=f"call-{mode}", name=tool.name, arguments={"query": mode}),
                     policy,
                 )
-            if not outcomes["auto"].ok or not outcomes["prompt"].ok:
+            if not outcomes["allow"].ok or not outcomes["ask"].ok:
                 fail(f"trusted MCP modes did not proceed: {outcomes!r}")
             if outcomes["plan"].ok or "opaque" not in (outcomes["plan"].error or ""):
                 fail(f"plan mode did not refuse opaquely: {outcomes['plan']!r}")
-            if not outcomes["accept_edits"].ok:
-                fail(f"accept_edits did not use server trust: {outcomes['accept_edits']!r}")
-
             denied = tool._execute(
                 ToolCall(id="call-denied", name=tool.name, arguments={"query": "no"}),
                 PermissionPolicy(
                     repo_root=directory,
-                    mode="prompt",
+                    mode="ask",
                     approval_callback=lambda request: False,
                 ),
             )
             if denied.ok or "denied" not in (denied.error or ""):
-                fail(f"negative prompt approval was not a failed result: {denied!r}")
+                fail(f"negative ask approval was not a failed result: {denied!r}")
             calls = call_log.read_text(encoding="utf-8").splitlines()
-            if calls != ["call", "call", "call"]:
+            if calls != ["call", "call"]:
                 fail(f"refused MCP calls reached the server: {calls!r}")
         finally:
             client.close()
@@ -538,14 +535,12 @@ def refusals_are_observed() -> None:
             raise RuntimeError("approval broke")
 
         cases = (
-            ("auto", None, True, 0, 0),
-            ("prompt", lambda request: True, True, 1, 0),
-            ("prompt", lambda request: False, False, 1, 1),
+            ("allow", None, True, 0, 0),
+            ("ask", lambda request: True, True, 1, 0),
+            ("ask", lambda request: False, False, 1, 1),
             ("plan", None, False, 0, 1),
-            ("accept_edits", lambda request: False, False, 1, 1),
-            ("accept_edits", lambda request: True, True, 1, 0),
-            ("prompt", raises, False, 1, 1),
-            ("accept_edits", lambda request: "invalid", False, 1, 1),
+            ("ask", raises, False, 1, 1),
+            ("ask", lambda request: "invalid", False, 1, 1),
         )
         try:
             client.start()
@@ -589,7 +584,7 @@ def refusals_are_observed() -> None:
                     fail(f"MCP request/denial order differed: {sink.events!r}")
 
             calls = call_log.read_text(encoding="utf-8").splitlines()
-            if calls != ["call", "call", "call"]:
+            if calls != ["call", "call"]:
                 fail(f"refused MCP calls reached the fake server: {calls!r}")
         finally:
             client.close()

@@ -141,7 +141,7 @@ def load_real_config() -> None:
                     "[agents.ceiling]",
                     'allowed_write_scope = ["work"]',
                     "shell_enabled = false",
-                    'modes = ["auto"]',
+                    'modes = ["allow"]',
                     "[[hooks]]",
                     'on = ["RunFinished"]',
                     'command = ["./observe"]',
@@ -156,7 +156,7 @@ def load_real_config() -> None:
         expected_ceiling = CapabilityCeiling(
             allowed_write_scope=((root / "work").resolve(),),
             shell_enabled=False,
-            modes=("auto",),
+            modes=("allow",),
         )
         expected_trust = TrustList(
             (RepositoryTrust(root.resolve(), frozenset(("hooks", "mcp")), source),)

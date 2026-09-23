@@ -191,7 +191,7 @@ def check_permissions_typed_reasons() -> None:
 
         approval_decisions = [
             (
-                PermissionPolicy(repo_root=ws.root, mode="prompt").check_write(
+                PermissionPolicy(repo_root=ws.root, mode="ask").check_write(
                     "new.txt"
                 ),
                 "write_file requires approval, but no approval callback is configured",
@@ -200,7 +200,7 @@ def check_permissions_typed_reasons() -> None:
             (
                 PermissionPolicy(
                     repo_root=ws.root,
-                    mode="prompt",
+                    mode="ask",
                     approval_callback=raising_callback,
                 ).check_write("new.txt"),
                 "approval callback failed (RuntimeError): approval broke",
@@ -209,7 +209,7 @@ def check_permissions_typed_reasons() -> None:
             (
                 PermissionPolicy(
                     repo_root=ws.root,
-                    mode="prompt",
+                    mode="ask",
                     approval_callback=lambda request: False,
                 ).check_write("new.txt"),
                 "write_file denied by user",
@@ -218,7 +218,7 @@ def check_permissions_typed_reasons() -> None:
             (
                 PermissionPolicy(
                     repo_root=ws.root,
-                    mode="prompt",
+                    mode="ask",
                     approval_callback=lambda request: "invalid",
                 ).check_write("new.txt"),
                 "approval callback returned an invalid decision for write_file",
@@ -248,29 +248,40 @@ def check_permissions_typed_reasons() -> None:
 @check("permissions.named_modes_and_equality")
 def check_permissions_named_modes_and_equality() -> None:
     with workspace() as ws:
-        PermissionPolicy(repo_root=ws.root, mode="plan")
-        PermissionPolicy(repo_root=ws.root, mode="accept_edits")
-        try:
-            PermissionPolicy(repo_root=ws.root, mode="bogus")
-        except ValueError as exc:
-            expected = (
-                "unknown permission mode 'bogus'; expected "
-                "'auto', 'prompt', 'plan', or 'accept_edits'"
-            )
-            if str(exc) != expected:
-                fail(f"unknown-mode error did not name all modes: {exc!r}")
-        else:
-            fail("an unknown permission mode was accepted")
+        for mode in ("ask", "plan", "allow"):
+            PermissionPolicy(repo_root=ws.root, mode=mode)
+        requests = []
+        default = PermissionPolicy(
+            repo_root=ws.root,
+            allowed_write_scope=[ws.root],
+            approval_callback=lambda request: requests.append(request) or False,
+        )
+        if default.mode != "allow" or not default.check_write("default.txt").allowed or requests:
+            fail(f"PermissionPolicy's non-interactive default changed: {default!r}, {requests!r}")
+        invalid = {
+            "prompt": "ask",
+            "auto": "allow",
+            "accept_edits": "ask, plan, or allow",
+            "bogus": "'ask', 'plan', or 'allow'",
+        }
+        for mode, replacement in invalid.items():
+            try:
+                PermissionPolicy(repo_root=ws.root, mode=mode)
+            except ValueError as exc:
+                if mode not in str(exc) or replacement not in str(exc):
+                    fail(f"unknown-mode error omitted its replacement: {exc!r}")
+            else:
+                fail(f"unknown permission mode {mode!r} was accepted")
 
         first = PermissionPolicy(
             repo_root=ws.root,
             allowed_write_scope=[ws.root],
-            mode="prompt",
+            mode="ask",
         )
         second = PermissionPolicy(
             repo_root=ws.root,
             allowed_write_scope=[ws.root],
-            mode="prompt",
+            mode="ask",
         )
         if first != second:
             fail("matching PermissionPolicy instances stopped comparing equal")
@@ -278,8 +289,8 @@ def check_permissions_named_modes_and_equality() -> None:
             fail("the approval lock became a dataclass field")
 
 
-@check("permissions.accept_edits")
-def check_permissions_accept_edits() -> None:
+@check("permissions.allow_never_asks")
+def check_permissions_allow_never_asks() -> None:
     with workspace() as ws:
         scope = ws.root / "scope"
         scope.mkdir()
@@ -292,7 +303,7 @@ def check_permissions_accept_edits() -> None:
         policy = PermissionPolicy(
             repo_root=ws.root,
             allowed_write_scope=[scope],
-            mode="accept_edits",
+            mode="allow",
             approval_callback=approve,
         )
         write = ws.tools["write_file"].execute(
@@ -304,7 +315,7 @@ def check_permissions_accept_edits() -> None:
             policy,
         )
         if not write.ok or requests:
-            fail(f"accept_edits prompted for an in-scope write: {write!r}, {requests!r}")
+            fail(f"allow prompted for an in-scope write: {write!r}, {requests!r}")
 
         outside = policy.check_write("outside.txt")
         if (
@@ -313,11 +324,11 @@ def check_permissions_accept_edits() -> None:
             != "path is outside the explicit allowed write scope: 'outside.txt'"
             or outside.denial is not DenialReason.OUTSIDE_WRITE_SCOPE
         ):
-            fail(f"accept_edits allowed an out-of-scope write: {outside!r}")
+            fail(f"allow permitted an out-of-scope write: {outside!r}")
 
         shell = policy.check_shell(["ls"])
-        if not shell.allowed or len(requests) != 1 or requests[0].operation != "run_shell":
-            fail(f"accept_edits did not prompt for shell: {shell!r}, {requests!r}")
+        if shell.allowed or requests:
+            fail(f"allow prompted for or permitted disabled shell: {shell!r}, {requests!r}")
 
 
 @check("permissions.approval_serialization")
@@ -339,7 +350,7 @@ def check_permissions_approval_serialization() -> None:
 
         policy = PermissionPolicy(
             repo_root=ws.root,
-            mode="prompt",
+            mode="ask",
             approval_callback=approve,
         )
         decisions: list[PermissionDecision] = []
@@ -377,13 +388,13 @@ def check_narrow_returns_a_new_policy() -> None:
         parent = PermissionPolicy(
             repo_root=root,
             allowed_write_scope=[root],
-            mode="prompt",
+            mode="ask",
             approval_callback=parent_approval,
         )
         ceiling = PermissionPolicy(
             repo_root=root,
             allowed_write_scope=[root],
-            mode="prompt",
+            mode="ask",
             approval_callback=ceiling_approval,
         )
         child = parent.narrowed(ceiling)
@@ -415,8 +426,8 @@ def check_narrow_returns_a_new_policy() -> None:
             fail("child approval worker did not finish")
 
         fallback = PermissionPolicy(
-            repo_root=root, mode="prompt", approval_callback=parent_approval
-        ).narrowed(PermissionPolicy(repo_root=root, mode="prompt"))
+            repo_root=root, mode="ask", approval_callback=parent_approval
+        ).narrowed(PermissionPolicy(repo_root=root, mode="ask"))
         if fallback.approval_callback is not parent_approval:
             fail("narrowed policy did not retain a parent callback when ceiling lacked one")
 
@@ -537,19 +548,18 @@ def check_narrow_shell_and_fetch() -> None:
 def check_narrow_mode() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        parent = PermissionPolicy(repo_root=root, mode="auto")
-        if parent.narrowed(PermissionPolicy(repo_root=root, mode="auto")).mode != "auto":
-            fail("matching mode was not preserved")
-        if parent.narrowed(PermissionPolicy(repo_root=root, mode="plan")).mode != "plan":
-            fail("plan ceiling did not narrow the mode")
-        for ceiling_mode in ("prompt", "accept_edits"):
-            try:
-                parent.narrowed(PermissionPolicy(repo_root=root, mode=ceiling_mode))
-            except ValueError as exc:
-                if "auto" not in str(exc) or ceiling_mode not in str(exc):
-                    fail(f"incompatible-mode error did not name both modes: {exc!r}")
-            else:
-                fail(f"incompatible mode {ceiling_mode!r} was accepted")
+        order = ("plan", "ask", "allow")
+        for parent_mode in order:
+            for ceiling_mode in order:
+                child = PermissionPolicy(repo_root=root, mode=parent_mode).narrowed(
+                    PermissionPolicy(repo_root=root, mode=ceiling_mode)
+                )
+                expected = min((parent_mode, ceiling_mode), key=order.index)
+                if child.mode != expected:
+                    fail(
+                        "mode narrowing did not choose the tighter input: "
+                        f"parent={parent_mode!r}, ceiling={ceiling_mode!r}, child={child.mode!r}"
+                    )
 
 
 def _assert_never_widens(
@@ -858,7 +868,7 @@ def permission_event_order() -> None:
 
         policy = PermissionPolicy(
             root,
-            mode="prompt",
+            mode="ask",
             approval_callback=deny,
         )
         policy.attach_event_sink(
@@ -879,7 +889,7 @@ def permission_event_order() -> None:
             requested[0].agent_id != "agent-permission"
             or requested[0].run_id != "run-permission"
             or requested[0].tool_name != "write_file"
-            or requested[0].mode != "prompt"
+            or requested[0].mode != "ask"
             or denied[0].tool_name != "write_file"
             or not denied[0].reason
         ):
@@ -987,7 +997,7 @@ def _permission_cases(root: Path):
             "approval_false_denial",
             PermissionPolicy(
                 root,
-                mode="prompt",
+                mode="ask",
                 approval_callback=lambda request: False,
             ),
             lambda policy: policy.check_write("inside.txt"),
@@ -1072,7 +1082,7 @@ def opaque_tool_modes() -> None:
     )
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        for mode in ("auto", "prompt", "plan", "accept_edits"):
+        for mode in ("allow", "ask", "plan"):
             for callback_name, callback in callbacks:
                 sink = CollectingSink()
                 policy = PermissionPolicy(
@@ -1092,7 +1102,7 @@ def opaque_tool_modes() -> None:
                 )
                 requested = sink.of_type(PermissionRequested)
                 denied = sink.of_type(PermissionDenied)
-                if mode == "auto":
+                if mode == "allow":
                     expected = (True, None, 0, 0)
                 elif mode == "plan":
                     expected = (False, DenialReason.PLAN_MODE, 0, 1)

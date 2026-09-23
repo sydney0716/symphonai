@@ -113,7 +113,10 @@ class PermissionDecision:
         return cls(allowed=False, reason=reason, denial=denial)
 
 
-PermissionMode = Literal["auto", "prompt", "plan", "accept_edits"]
+PermissionMode = Literal["ask", "plan", "allow"]
+
+_MODE_ORDER = {"plan": 0, "ask": 1, "allow": 2}
+_RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 
 
 @dataclass(frozen=True)
@@ -139,9 +142,8 @@ class PermissionPolicy:
     `shell_enabled` and `shell_allowlist` gate `run_shell`; a command must
     pass both, and `ALWAYS_DENY_COMMANDS` overrides either.
 
-    `mode="auto"` uses only the static rules. `prompt` asks before writes or
-    shell calls, `plan` permits reads only, and `accept_edits` permits scoped
-    writes without asking while still prompting for shell calls.
+    `mode="allow"` uses only the static rules. `ask` asks before writes or
+    shell calls, and `plan` permits reads only.
     """
 
     repo_root: Path
@@ -153,7 +155,7 @@ class PermissionPolicy:
     fetch_allowlist: list[str] = field(default_factory=list)
     shell_timeout_seconds: float = 10.0
     shell_output_limit_chars: int = DEFAULT_SHELL_OUTPUT_CHARS
-    mode: PermissionMode = "auto"
+    mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
 
     def __post_init__(self) -> None:
@@ -166,10 +168,17 @@ class PermissionPolicy:
             MIN_SHELL_OUTPUT_CHARS,
             min(MAX_SHELL_OUTPUT_CHARS, int(self.shell_output_limit_chars)),
         )
-        if self.mode not in ("auto", "prompt", "plan", "accept_edits"):
+        if not isinstance(self.mode, str) or self.mode not in _MODE_ORDER:
+            replacement = (
+                _RENAMED_MODES.get(self.mode) if isinstance(self.mode, str) else None
+            )
+            if replacement is not None:
+                raise ValueError(
+                    f"unknown permission mode {self.mode!r}; use {replacement!r} instead"
+                )
             raise ValueError(
                 f"unknown permission mode {self.mode!r}; expected "
-                "'auto', 'prompt', 'plan', or 'accept_edits'"
+                "'ask', 'plan', or 'allow'"
             )
         self._approval_lock = threading.Lock()
         self._event_sink: EventSink | None = None
@@ -287,11 +296,6 @@ class PermissionPolicy:
                 raise ValueError(
                     f"cannot narrow to forbidden root {ceiling.repo_root!s}: {forbidden!r}"
                 )
-        if ceiling.mode != self.mode and ceiling.mode != "plan":
-            raise ValueError(
-                "cannot narrow permission mode "
-                f"{self.mode!r} with {ceiling.mode!r}"
-            )
         return PermissionPolicy(
             repo_root=ceiling.repo_root,
             allowed_write_scope=_intersect_write_scopes(
@@ -314,7 +318,7 @@ class PermissionPolicy:
             shell_output_limit_chars=min(
                 self.shell_output_limit_chars, ceiling.shell_output_limit_chars
             ),
-            mode=ceiling.mode,
+            mode=min((self.mode, ceiling.mode), key=_MODE_ORDER.__getitem__),
             approval_callback=(
                 ceiling.approval_callback
                 if ceiling.approval_callback is not None
@@ -382,7 +386,7 @@ class PermissionPolicy:
                 denial=DenialReason.PLAN_MODE,
                 tool_name="write_file",
             )
-        if self.mode == "prompt":
+        if self.mode == "ask":
             return self._ask_approval(
                 operation="write_file",
                 target=str(path),
@@ -445,7 +449,7 @@ class PermissionPolicy:
 
         if host in preapproved_domains() or host in self.fetch_allowlist:
             return PermissionDecision.allow()
-        if self.mode in ("prompt", "accept_edits"):
+        if self.mode == "ask":
             return self._ask_approval(
                 operation="web_fetch",
                 target=url,
@@ -482,7 +486,7 @@ class PermissionPolicy:
                 denial=DenialReason.PLAN_MODE,
                 tool_name="run_shell",
             )
-        if self.mode in ("prompt", "accept_edits"):
+        if self.mode == "ask":
             return self._ask_approval(
                 operation="run_shell",
                 target=" ".join(argv),
@@ -517,7 +521,7 @@ class PermissionPolicy:
                 denial=DenialReason.PLAN_MODE,
                 tool_name=tool_name,
             )
-        if self.mode in ("prompt", "accept_edits"):
+        if self.mode == "ask":
             return self._ask_approval(
                 operation=tool_name,
                 target=target,

@@ -1818,6 +1818,9 @@ def check_default_specs_match_old_behaviour() -> None:
             "default first dispatch did not seed exactly once: "
             f"calls={seed_messages_spy.call_count}"
         )
+    default_config = LeaderConfig(FakeModelProvider(), FakeModelProvider(), ".")
+    if default_config.permission_mode != "allow":
+        fail(f"LeaderConfig's non-interactive default changed: {default_config.permission_mode!r}")
 
 
 @check("leader.subagent_policy_is_narrowed")
@@ -1832,13 +1835,13 @@ def check_subagent_policy_is_narrowed() -> None:
         denied = PermissionPolicy(root)
         outside = PermissionPolicy(root.parent)
         forbidden = PermissionPolicy(root / ".git")
-        wrong_mode = PermissionPolicy(root, mode="prompt")
+        tighter_mode = PermissionPolicy(root, mode="ask")
         specs = {
             "ceiling-denies": _spec(root, "ceiling-denies", policy=denied),
             "leader-denies": _spec(root, "leader-denies", policy=allowed),
             "outside": _spec(root, "outside", policy=outside),
             "forbidden": _spec(root, "forbidden", policy=forbidden),
-            "wrong-mode": _spec(root, "wrong-mode", policy=wrong_mode),
+            "tighter-mode": _spec(root, "tighter-mode", policy=tighter_mode),
             "still-works": _spec(root, "still-works", policy=denied),
         }
         ceiling_tool = DispatchSubagentTool(
@@ -1851,7 +1854,11 @@ def check_subagent_policy_is_narrowed() -> None:
             fail("a child policy escaped its denying AgentSpec ceiling")
 
         leader_tool = DispatchSubagentTool(
-            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+            ]),
             denied,
             subagent_specs=specs,
         )
@@ -1861,11 +1868,13 @@ def check_subagent_policy_is_narrowed() -> None:
         for name, fragment in (
             ("outside", "outside root"),
             ("forbidden", "forbidden root"),
-            ("wrong-mode", "permission mode"),
         ):
             rejected = leader_tool.execute(_dispatch(name, "work", name), denied)
             if rejected.ok or fragment not in (rejected.error or "") or name in leader_tool.pool:
                 fail(f"invalid policy meet did not fail closed for {name!r}: {rejected!r}")
+        narrowed_mode = leader_tool.execute(_dispatch("tighter-mode", "work", "mode"), denied)
+        if not narrowed_mode.ok or leader_tool.pool["tighter-mode"].agent._policy.mode != "ask":
+            fail(f"tighter child mode was not accepted: {narrowed_mode!r}")
         continued = leader_tool.execute(_dispatch("still-works", "work"), denied)
         if not continued.ok:
             fail(f"leader could not continue after an invalid policy meet: {continued!r}")

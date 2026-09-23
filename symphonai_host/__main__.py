@@ -23,12 +23,22 @@ from symphonai_host.credentials import CredentialError, apply_to_environment, lo
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
 
 
+def _permission_mode(value: str) -> str:
+    replacements = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
+    if value in replacements:
+        raise argparse.ArgumentTypeError(
+            f"permission mode {value!r} was renamed; use {replacements[value]!r} instead"
+        )
+    return value
+
+
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--permission-mode",
-        choices=("auto", "prompt", "plan", "accept_edits"),
-        default="prompt",
+        type=_permission_mode,
+        choices=("ask", "plan", "allow"),
+        default="ask",
     )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--max-turns", type=int, default=20)

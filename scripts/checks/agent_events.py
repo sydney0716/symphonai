@@ -637,7 +637,7 @@ def new_sink_isolation() -> None:
 
         policy = PermissionPolicy(
             ws.root,
-            mode="prompt",
+            mode="ask",
             approval_callback=lambda request: False,
         )
         policy.attach_event_sink(

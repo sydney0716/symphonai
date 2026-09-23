@@ -150,6 +150,21 @@ def missing_and_malformed() -> None:
                     fail(f"malformed session error lacked source or key: {exc!r}")
             else:
                 fail("malformed session mapping was accepted")
+        project_path = _scope_path(Scope.PROJECT, repo_root, home)
+        for old, replacement in (
+            ("prompt", "ask"),
+            ("auto", "allow"),
+            ("accept_edits", "ask, plan, or allow"),
+        ):
+            _write(project_path, f'[agents.ceiling]\nmodes = ["{old}"]\n')
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError as exc:
+                if old not in str(exc) or replacement not in str(exc):
+                    fail(f"renamed mode error omitted its replacement: {exc!r}")
+            else:
+                fail(f"renamed configuration mode {old!r} was accepted")
+        project_path.unlink()
 
 
 @check("config.provenance")
@@ -244,7 +259,7 @@ def ceiling_refuses() -> None:
             (
                 "modes",
                 CapabilityCeiling(modes=("plan",)),
-                PermissionPolicy(repo_root, mode="auto"),
+                PermissionPolicy(repo_root, mode="allow"),
             ),
         )
         for field, ceiling, policy in cases:
@@ -255,7 +270,7 @@ def ceiling_refuses() -> None:
             shell_allowlist=(("python3",),),
             fetch_enabled=True,
             fetch_allowlist=("docs.example",),
-            modes=("accept_edits",),
+            modes=("ask",),
         )
         equal.refuse(
             PermissionPolicy(
@@ -265,7 +280,7 @@ def ceiling_refuses() -> None:
                 shell_allowlist=[("python3",)],
                 fetch_enabled=True,
                 fetch_allowlist=["DOCS.EXAMPLE."],
-                mode="accept_edits",
+                mode="ask",
             ),
             source=source,
         )
@@ -279,7 +294,7 @@ def _ceiling_toml() -> str:
         'shell_allowlist = [["python3", "scripts/check.py"]]\n'
         "fetch_enabled = true\n"
         'fetch_allowlist = ["Docs.Example."]\n'
-        'modes = ["auto", "plan"]\n'
+        'modes = ["allow", "plan"]\n'
     )
 
 
@@ -291,10 +306,9 @@ def empty_ceiling_refuses_nothing() -> None:
             PermissionPolicy(repo_root, allowed_write_scope=[repo_root.parent / "outside"]),
             PermissionPolicy(repo_root, shell_enabled=True, shell_allowlist=[("python3",)]),
             PermissionPolicy(repo_root, fetch_enabled=True, fetch_allowlist=["x.example"]),
-            PermissionPolicy(repo_root, mode="auto"),
-            PermissionPolicy(repo_root, mode="prompt"),
+            PermissionPolicy(repo_root, mode="allow"),
+            PermissionPolicy(repo_root, mode="ask"),
             PermissionPolicy(repo_root, mode="plan"),
-            PermissionPolicy(repo_root, mode="accept_edits"),
             PermissionPolicy(
                 repo_root,
                 allowed_write_scope=[repo_root.parent / "outside"],
@@ -302,7 +316,7 @@ def empty_ceiling_refuses_nothing() -> None:
                 shell_allowlist=[("make",)],
                 fetch_enabled=True,
                 fetch_allowlist=["wide.example"],
-                mode="accept_edits",
+                mode="ask",
             ),
         )
         unconstrained = CapabilityCeiling()
@@ -321,7 +335,7 @@ def empty_ceiling_refuses_nothing() -> None:
             shell_allowlist=(("python3", "scripts/check.py"),),
             fetch_enabled=True,
             fetch_allowlist=("docs.example",),
-            modes=("auto", "plan"),
+            modes=("allow", "plan"),
         )
         for scope in Scope:
             with tempfile.TemporaryDirectory() as scoped_temporary:
@@ -335,7 +349,7 @@ def empty_ceiling_refuses_nothing() -> None:
                                 "shell_allowlist": [["python3", "scripts/check.py"]],
                                 "fetch_enabled": True,
                                 "fetch_allowlist": ["Docs.Example."],
-                                "modes": ["auto", "plan"],
+                                "modes": ["allow", "plan"],
                             }
                         }
                     }
@@ -522,7 +536,7 @@ def ceiling_meet_is_the_tighter_side() -> None:
             CapabilityCeiling(
                 allowed_write_scope=(docs,),
                 shell_enabled=True,
-                modes=("auto", "plan"),
+                modes=("allow", "plan"),
             ),
         )
         unconstrained = CapabilityCeiling()
@@ -572,8 +586,8 @@ def ceiling_meet_is_the_tighter_side() -> None:
                 ),
             ),
             (
-                CapabilityCeiling(modes=("auto", "plan")),
-                CapabilityCeiling(modes=("plan", "prompt")),
+                CapabilityCeiling(modes=("allow", "plan")),
+                CapabilityCeiling(modes=("plan", "ask")),
                 CapabilityCeiling(modes=("plan",)),
             ),
         )
@@ -595,7 +609,7 @@ def _ceiling_values(*, tight: bool) -> dict[str, object]:
         "allowed_write_scope": ["."],
         "shell_enabled": True,
         "fetch_enabled": True,
-        "modes": ["auto", "prompt", "plan", "accept_edits"],
+        "modes": ["allow", "ask", "plan"],
     }
 
 

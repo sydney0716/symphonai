@@ -72,7 +72,8 @@ _CEILING_KEYS = {
     "modes",
 }
 _SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search")
-_VALID_MODES = {"auto", "prompt", "plan", "accept_edits"}
+_VALID_MODES = {"ask", "plan", "allow"}
+_RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
 
 
@@ -187,6 +188,13 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
             if key == "modes":
                 invalid = next((mode for mode in entries if mode not in _VALID_MODES), None)
                 if invalid is not None:
+                    replacement = _RENAMED_MODES.get(invalid)
+                    if replacement is not None:
+                        _raise(
+                            source,
+                            "agents.ceiling.modes",
+                            f"{invalid!r} was renamed; use {replacement!r} instead",
+                        )
                     valid = ", ".join(sorted(_VALID_MODES))
                     _raise(
                         source,
@@ -444,6 +452,13 @@ class CapabilityCeiling:
             parsed_modes = tuple(_strings(source, prefix + "modes", raw_modes))
             invalid = next((mode for mode in parsed_modes if mode not in _VALID_MODES), None)
             if invalid is not None:
+                replacement = _RENAMED_MODES.get(invalid)
+                if replacement is not None:
+                    _raise(
+                        source,
+                        prefix + "modes",
+                        f"{invalid!r} was renamed; use {replacement!r} instead",
+                    )
                 valid = ", ".join(sorted(_VALID_MODES))
                 _raise(source, prefix + "modes", f"must contain only: {valid}")
             modes = parsed_modes

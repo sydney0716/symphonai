@@ -121,8 +121,24 @@ def check_base_url_reaches_provider() -> None:
         # invalid fixture before provider construction can open any request.
         if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
             fail(f"base URL fixture is not loopback: {base_url!r}")
-        if host_main._arguments([]).permission_mode != "prompt":
-            fail("host permission mode no longer defaults to prompt")
+        if host_main._arguments([]).permission_mode != "ask":
+            fail("host permission mode no longer defaults to ask")
+        for old, replacement in (
+            ("prompt", "ask"),
+            ("auto", "allow"),
+            ("accept_edits", "ask, plan, or allow"),
+        ):
+            error = io.StringIO()
+            with mock.patch("sys.stderr", error):
+                try:
+                    host_main._arguments(["--permission-mode", old])
+                except SystemExit as exc:
+                    if exc.code != 2:
+                        fail(f"old host mode {old!r} exited with {exc.code!r}")
+                else:
+                    fail(f"old host mode {old!r} was accepted")
+            if replacement not in error.getvalue():
+                fail(f"old host mode error omitted {replacement!r}: {error.getvalue()!r}")
         with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "loopback-test-key"}):
             host = HostServer(None, PermissionPolicy(repo_root=ROOT))
             host.start()

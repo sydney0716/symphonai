@@ -3011,7 +3011,7 @@ def check_mcp_start_and_schema() -> None:
             mock.patch.object(host_main.signal, "signal"),
             contextlib.redirect_stdout(output),
         ):
-            host_main.main(["--repo-root", str(repo), "--permission-mode", "auto"])
+            host_main.main(["--repo-root", str(repo), "--permission-mode", "allow"])
         parent = int(parent_file.read_text(encoding="utf-8"))
         child = int(child_file.read_text(encoding="utf-8"))
         try:

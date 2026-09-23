@@ -115,7 +115,7 @@ def check_preapproved_no_prompt() -> None:
     routes = {url: _Response()}
     patcher, _ = _patched_opener(routes)
     with workspace() as ws, patcher:
-        for mode in ("auto", "prompt"):
+        for mode in ("allow", "ask"):
             policy = PermissionPolicy(
                 repo_root=ws.root,
                 mode=mode,
@@ -127,8 +127,8 @@ def check_preapproved_no_prompt() -> None:
         fail(f"preapproved domain prompted for approval: {requests!r}")
 
 
-@check("web_fetch.unapproved_auto_denied")
-def check_unapproved_auto_denied() -> None:
+@check("web_fetch.unapproved_allow_denied")
+def check_unapproved_allow_denied() -> None:
     url = "https://example.com/private"
     patcher, opened = _patched_opener({url: _Response()})
     with workspace() as ws, patcher:
@@ -136,35 +136,35 @@ def check_unapproved_auto_denied() -> None:
         decision = policy.check_fetch(url)
         result = WebFetchTool().execute(_call(url), policy)
     if decision.denial is not DenialReason.DOMAIN_NOT_APPROVED or result.ok:
-        fail(f"unapproved auto fetch was not denied: {decision!r}, {result!r}")
+        fail(f"unapproved allow fetch was not denied: {decision!r}, {result!r}")
     if opened[0].requests:
         fail(f"denied fetch issued HTTP: {opened[0].requests!r}")
 
 
-@check("web_fetch.unapproved_prompt_asks")
-def check_unapproved_prompt_asks() -> None:
+@check("web_fetch.unapproved_ask_asks")
+def check_unapproved_ask_asks() -> None:
     url = "https://example.com/page"
     seen: list[object] = []
     patcher, opened = _patched_opener({url: _Response()})
     with workspace() as ws, patcher:
         denied = PermissionPolicy(
             repo_root=ws.root,
-            mode="prompt",
+            mode="ask",
             approval_callback=lambda request: seen.append(request) or False,
         )
         denied_result = WebFetchTool().execute(_call(url, 1), denied)
         allowed = PermissionPolicy(
             repo_root=ws.root,
-            mode="prompt",
+            mode="ask",
             approval_callback=lambda request: seen.append(request) or True,
         )
         allowed_result = WebFetchTool().execute(_call(url, 2), allowed)
     if denied_result.ok or not allowed_result.ok or len(seen) != 2:
-        fail(f"prompt answers were not honored: {denied_result!r}, {allowed_result!r}, {seen!r}")
+        fail(f"ask answers were not honored: {denied_result!r}, {allowed_result!r}, {seen!r}")
     if any(getattr(request, "operation", None) != "web_fetch" for request in seen):
         fail(f"approval request used the wrong operation: {seen!r}")
     if len(opened[0].requests) != 0 or len(opened[1].requests) != 1:
-        fail("prompt denial issued HTTP or approval failed to issue HTTP")
+        fail("ask denial issued HTTP or approval failed to issue HTTP")
 
 
 @check("web_fetch.scheme_denied")

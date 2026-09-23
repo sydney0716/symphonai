@@ -96,14 +96,14 @@ test("ceiling rows distinguish no grant from no limit and preserve list order", 
     allowed_write_scope: [],
     fetch_allowlist: null,
     fetch_enabled: true,
-    modes: ["plan", "auto"],
+    modes: ["plan", "allow"],
     shell_allowlist: [["git", "status"], ["ls"]],
   } } };
   assert.deepEqual(ceilingRows(reply), [
     { capability: "allowed_write_scope", value: "none" },
     { capability: "fetch_allowlist", value: "not set" },
     { capability: "fetch_enabled", value: "on" },
-    { capability: "modes", value: "plan, auto" },
+    { capability: "modes", value: "plan, allow" },
     { capability: "shell_allowlist", value: "git status, ls" },
     { capability: "shell_enabled", value: "not set" },
   ]);

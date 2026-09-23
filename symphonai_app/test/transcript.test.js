@@ -58,7 +58,7 @@ const RECORDED_EVENTS = Object.freeze({
   PromptSubmitted: event("PromptSubmitted", { text: "hello", message_count: 1 }),
   HistoryMessage: history("assistant", "replayed"),
   ToolCallFailed: call("ToolCallFailed", "recorded-call", { error: "broken" }),
-  PermissionRequested: call("PermissionRequested", "recorded-call", { mode: "prompt" }),
+  PermissionRequested: call("PermissionRequested", "recorded-call", { mode: "ask" }),
   PermissionDenied: call("PermissionDenied", "recorded-call", { reason: "no" }),
   SessionStarted: event("SessionStarted", { session_run_id: "session-1" }),
   SessionEnded: event("SessionEnded", { session_run_id: "session-1" }),
@@ -488,7 +488,7 @@ test("an empty wire diff remains ordinary activity", () => {
 
 test("permission questions resolve only on matching answers", () => {
   const denied = applyAll([
-    call("PermissionRequested", "deny-1", { mode: "prompt" }),
+    call("PermissionRequested", "deny-1", { mode: "ask" }),
     call("PermissionDenied", "other", { reason: "wrong question" }),
   ]);
   assert.equal(denied.model[0].resolved, false);
@@ -498,7 +498,7 @@ test("permission questions resolve only on matching answers", () => {
     agentId: "agent-1",
     toolCallId: "deny-1",
     toolName: "read_file",
-    mode: "prompt",
+    mode: "ask",
     resolved: true,
     allowed: false,
     reason: "user denied",
@@ -506,7 +506,7 @@ test("permission questions resolve only on matching answers", () => {
 
   const allowed = applyAll([
     call("ToolCallStarted", "allow-1"),
-    call("PermissionRequested", "allow-1", { mode: "prompt" }),
+    call("PermissionRequested", "allow-1", { mode: "ask" }),
     call("ToolCallFinished", "other", { ok: true }),
   ]);
   const question = allowed.model.find(({ type }) => type === "question");
@@ -519,7 +519,7 @@ test("permission questions resolve only on matching answers", () => {
 test("a failed tool completion does not answer its permission question", () => {
   const transcript = applyAll([
     call("ToolCallStarted", "denied-1"),
-    call("PermissionRequested", "denied-1", { mode: "prompt" }),
+    call("PermissionRequested", "denied-1", { mode: "ask" }),
     call("ToolCallFinished", "denied-1", { ok: false }),
   ]);
   const question = transcript.model.find(({ type }) => type === "question");
@@ -612,7 +612,7 @@ test("every event-derived entry is attributed and gaps are not", () => {
     }),
     call("PermissionRequested", "question-call", {
       agent_id: "question-agent",
-      mode: "prompt",
+      mode: "ask",
     }),
     event("CompactionApplied", {
       agent_id: "compaction-agent",

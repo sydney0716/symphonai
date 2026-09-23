@@ -25,7 +25,7 @@ keep stdout free of wrapper logging until it has read that line. The parent also
 owns the process lifetime and must terminate the sidecar on app exit: the
 host's signal handler only handles signals that the parent actually sends.
 
-The packaged sidecar defaults to `--permission-mode prompt`: side-effectful
+The packaged sidecar defaults to `--permission-mode ask`: side-effectful
 tools park until the client answers their approval request (or it times out).
-Clients that deliberately need another policy can pass `auto`, `plan`, or
-`accept_edits` explicitly.
+Clients that deliberately need another policy can pass `allow` or `plan`
+explicitly.

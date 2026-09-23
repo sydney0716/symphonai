@@ -738,7 +738,7 @@ test("settings navigation renders hooks, ceiling, and trust before inventory", a
         { event: "prompt", command: "p-hook" },
         { event: "turn", command: "a-hook" },
       ],
-      ceiling: { allowed_write_scope: [], modes: ["plan", "auto"] },
+      ceiling: { allowed_write_scope: [], modes: ["plan", "allow"] },
       trust: [
         { root: "/z", allow: [] },
         { root: "/a", allow: ["agents", "skills"] },
@@ -774,7 +774,7 @@ test("settings navigation renders hooks, ceiling, and trust before inventory", a
     ["allowed_write_scope", "none"],
     ["fetch_allowlist", "not set"],
     ["fetch_enabled", "not set"],
-    ["modes", "plan, auto"],
+    ["modes", "plan, allow"],
     ["shell_allowlist", "not set"],
     ["shell_enabled", "not set"],
   ]);

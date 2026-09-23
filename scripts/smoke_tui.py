@@ -8,6 +8,7 @@ request is made by this script.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import threading
@@ -766,7 +767,7 @@ async def smoke_approval_case(
                         ToolCall(
                             id="write-1",
                             name="write_file",
-                            arguments={"path": target, "content": "written from prompt mode"},
+                            arguments={"path": target, "content": "written from ask mode"},
                         )
                     ],
                 )
@@ -795,7 +796,7 @@ async def smoke_approval_case(
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=root,
-        permission_mode="prompt",
+        permission_mode="ask",
     )
     async with app.run_test(size=(76, 20)) as pilot:
         await submit_message(pilot, "please write")
@@ -847,7 +848,7 @@ async def smoke_approval_case(
             ok("escape on the approval screen denies the tool without cancelling the turn")
             return
         label = "approve" if approve else "deny"
-        ok(f"prompt permission mode can {label} a side-effectful tool call")
+        ok(f"ask permission mode can {label} a side-effectful tool call")
 
 
 async def smoke_approval_stop_case(root: Path) -> None:
@@ -890,7 +891,7 @@ async def smoke_approval_stop_case(root: Path) -> None:
         leader_provider=leader_provider,
         subagent_provider=subagent_provider,
         repo_root=root,
-        permission_mode="prompt",
+        permission_mode="ask",
     )
     async with app.run_test(size=(76, 20)) as pilot:
         await submit_message(pilot, "stop at approval")
@@ -933,6 +934,12 @@ async def smoke_approval_stop_case(root: Path) -> None:
 async def main_async() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        for mode in ("ask", "allow"):
+            with mock.patch.dict(os.environ, {"SYMPHONAI_TUI_PERMISSION_MODE": mode}):
+                app = SymphonAITuiApp(repo_root=root)
+            if app._permission_mode != mode:  # noqa: SLF001
+                fail(f"TUI environment mode {mode!r} resolved as {app._permission_mode!r}")  # noqa: SLF001
+        ok("TUI environment accepts ask and allow permission modes")
         await smoke_success_case(root)
         await smoke_error_case(root)
         await smoke_stop_case(root)

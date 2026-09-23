@@ -334,11 +334,16 @@ class SymphonAITuiApp(App[None]):
             return
 
     def _resolve_permission_mode(self, permission_mode: PermissionMode | None) -> PermissionMode:
-        raw_mode = permission_mode or os.environ.get("SYMPHONAI_TUI_PERMISSION_MODE", "auto")
+        raw_mode = permission_mode or os.environ.get("SYMPHONAI_TUI_PERMISSION_MODE", "allow")
         mode = raw_mode.strip().lower()
-        if mode not in ("auto", "prompt"):
+        if mode not in ("allow", "ask"):
+            replacement = {"auto": "allow", "prompt": "ask"}.get(mode)
+            if replacement is not None:
+                raise ValueError(
+                    f"unknown permission mode {raw_mode!r}; use {replacement!r} instead"
+                )
             raise ValueError(
-                f"unknown permission mode {raw_mode!r}; expected 'auto' or 'prompt'"
+                f"unknown permission mode {raw_mode!r}; expected 'allow' or 'ask'"
             )
         return mode  # type: ignore[return-value]
 

@@ -280,7 +280,7 @@ def _smoke_interpreter() -> None:
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(repo_root=root, mode="prompt"),
+            PermissionPolicy(repo_root=root, mode="ask"),
             sessions_root=root / "sessions",
         )
         host.start()
