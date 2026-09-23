@@ -77,6 +77,22 @@ test("provider choice uses an authenticated JSON request", async () => {
   });
 });
 
+test("fork sends opaque session and record ids in the authenticated body", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, { run_id: "fork-run", replayed: 1 });
+  } });
+  assert.deepEqual(await client.forkSession("source-run", "rec-opaque"), {
+    run_id: "fork-run", replayed: 1,
+  });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/session/fork");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(JSON.parse(records[0].options.body), {
+    run_id: "source-run", record_id: "rec-opaque",
+  });
+});
+
 test("parseHandshake accepts only a port and nonempty token", () => {
   assert.deepEqual(parseHandshake('{"port":4312,"token":"abc"}'), {
     port: 4312,

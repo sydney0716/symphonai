@@ -79,6 +79,17 @@ button.session-link {
   text-align: left;
 }
 
+.fork-message {
+  display: block;
+  margin: -0.3rem 0 0.8rem auto;
+  padding: 0.2rem 0.5rem;
+  color: #9aa7b8;
+  background: transparent;
+  border: 1px solid #394150;
+  border-radius: 0.3rem;
+  cursor: pointer;
+}
+
 .sidebar-toggle {
   position: fixed;
   z-index: 1;
@@ -128,6 +139,12 @@ button.session-link {
   grid-column: 3;
   grid-row: 1;
   background: #171d26;
+}
+
+.agent-children {
+  margin-left: 0.75rem;
+  padding-left: 0.6rem;
+  border-left: 1px solid #394150;
 }
 
 .app-shell.rail-folded #status-rail {

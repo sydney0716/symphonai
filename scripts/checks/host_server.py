@@ -31,6 +31,7 @@ import symphonai_host.__main__ as host_main
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
+from symphonai_api.agent_run import RunNode
 from symphonai_api.config import ConfigError, ResolvedConfig
 from symphonai_api.events import (
     AssistantTextDelta,
@@ -555,6 +556,149 @@ def check_file_route() -> None:
             host.close()
 
 
+@check("host_server.search_settings_credentials_and_registry")
+def check_search_settings_credentials_and_registry() -> None:
+    secret = "recognisable-search-secret-25ff"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        agents = root / ".symphonai" / "agents"
+        agents.mkdir(parents=True)
+        user_config = home / ".symphonai" / "config.toml"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        (root / ".symphonai" / "config.toml").write_text(
+            '[search]\nendpoint = "brave"\n', encoding="utf-8",
+        )
+        (agents / "searcher.toml").write_text(
+            'prompt = "Search."\ntools = ["read_file", "web_search"]\n[model]\nprovider = "fake"\n', encoding="utf-8",
+        )
+        (agents / "reader.toml").write_text(
+            'prompt = "Read."\ntools = ["read_file"]\n[model]\nprovider = "fake"\n', encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        if set(extensions.agents) != {"searcher", "reader"}:
+            fail("trusted project search definitions did not load")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "searcher", "dispatch_subagent", {"subagent_name": "searcher", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "searcher done")),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "reader", "dispatch_subagent", {"subagent_name": "reader", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "reader done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        host = HostServer(
+            provider, PermissionPolicy(root), sessions_root=root / "sessions",
+            extensions=extensions,
+        )
+        host.start()
+        try:
+            with mock.patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": ""}):
+                connection, response = _request(host, "GET", "/settings", headers=_headers(host))
+                try:
+                    settings = json.loads(response.read())["settings"]
+                    if response.status != 200 or settings["search"] != [{
+                        "name": "brave", "env_var": "BRAVE_SEARCH_API_KEY", "key_present": False,
+                    }]:
+                        fail(f"unkeyed search settings were wrong: {settings['search']!r}")
+                finally:
+                    connection.close()
+                with mock.patch.object(host_server_module, "store") as stored:
+                    connection, response = _request(
+                        host, "POST", "/credentials",
+                        body={"name": "BRAVE_SEARCH_API_KEY", "value": secret},
+                        headers=_headers(host),
+                    )
+                    try:
+                        credential_body = response.read()
+                        if response.status != 200 or secret.encode() in credential_body:
+                            fail(f"search credential route failed or disclosed its value: {response.status}")
+                    finally:
+                        connection.close()
+                    stored.assert_called_once_with("BRAVE_SEARCH_API_KEY", secret)
+                connection, response = _request(host, "GET", "/settings", headers=_headers(host))
+                try:
+                    body = response.read()
+                    settings = json.loads(body)["settings"]
+                    if response.status != 200 or secret.encode() in body or settings["search"] != [{
+                        "name": "brave", "env_var": "BRAVE_SEARCH_API_KEY", "key_present": True,
+                    }]:
+                        fail(f"keyed search settings were wrong or disclosed the key: {settings['search']!r}")
+                finally:
+                    connection.close()
+                session = SessionStore(root / "sessions", "search-registry", repo_root=root)
+                try:
+                    leader = host.run._new_leader(session)
+                    if "web_search" not in leader._agent._tools:
+                        fail("configured host leader did not receive web_search")
+                    leader.run("delegate")
+                    for name, expected in (("searcher", True), ("reader", False)):
+                        record = leader.subagents.get(name)
+                        if record is None or ("web_search" in record.agent._tools) != expected:
+                            fail(f"project {name} search registry was wrong: {record!r}")
+                    backend = host.run._search_backend
+                    assert backend is not None
+                    backend.max_attempts = 1
+                    requests = []
+
+                    def urlopen(request, *, timeout):
+                        requests.append(request)
+                        return io.BytesIO(b'{"web":{"results":[]}}')
+
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), mock.patch(
+                        "urllib.request.urlopen", side_effect=urlopen,
+                    ):
+                        backend.search("fixture query", limit=1)
+                    if len(requests) != 1 or secret in requests[0].full_url:
+                        fail("search key entered the request URL")
+                    if requests[0].get_header("X-subscription-token") != secret:
+                        fail("search key did not reach its preset header")
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), mock.patch(
+                        "urllib.request.urlopen", side_effect=ConnectionError(secret),
+                    ):
+                        try:
+                            backend.search("failure query", limit=1)
+                        except Exception as exc:
+                            if secret in str(exc):
+                                fail("search exception disclosed the key")
+                        else:
+                            fail("mocked search failure was accepted")
+                    if secret in output.getvalue():
+                        fail("search logs disclosed the key")
+                finally:
+                    session.close()
+        finally:
+            host.close()
+        (root / ".symphonai" / "config.toml").write_text("", encoding="utf-8")
+        unconfigured = load_extensions(repo_root=root, home=home)
+        run = HostRun(
+            FakeModelProvider(), PermissionPolicy(root), EventBroker(),
+            sessions_root=root / "unconfigured-sessions", extensions=unconfigured,
+        )
+        session = SessionStore(root / "unconfigured-sessions", "no-search", repo_root=root)
+        try:
+            leader = run._new_leader(session)
+            if "web_search" in leader._agent._tools:
+                fail("unconfigured host leader acquired web_search")
+            result = leader._dispatch_tool.execute(
+                ToolCall("missing-search", "dispatch_subagent", {
+                    "subagent_name": "searcher", "task": "inspect",
+                }),
+                PermissionPolicy(root),
+            )
+            if result.ok or "search is not configured" not in (result.error or ""):
+                fail(f"unconfigured project search definition escaped dispatch refusal: {result!r}")
+        finally:
+            session.close()
+
+
 @check("host_server.survey_route")
 def check_survey_route() -> None:
     token = "survey-route-token"
@@ -753,7 +897,7 @@ def check_settings_route() -> None:
                 "config", "ceiling", "trust", "hooks", "mcp_servers",
                 "agents", "skills", "plugins", "withheld", "providers",
             }
-            if set(settings) != expected_fields:
+            if set(settings) != expected_fields | {"search"} or settings["search"] != []:
                 fail(f"settings route returned the wrong fields: {settings!r}")
             config = {entry["key"]: entry for entry in settings["config"]}
             if (
@@ -1676,6 +1820,116 @@ def check_conversation_usage() -> None:
             encoded = first_body + second_body
             if secret.encode() in encoded or str(root).encode() in encoded:
                 fail("conversation payload leaked a token or absolute repository path")
+        finally:
+            host.close()
+
+
+def _delegating_conversation_host(root: Path) -> HostServer:
+    provider = FakeModelProvider([
+        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+            "dispatch", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"},
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "child")),
+        ModelResponse(Message(Role.ASSISTANT, "done")),
+    ])
+    host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+    host.start()
+    return host
+
+
+@check("host_server.conversation_live_parentage")
+def check_conversation_live_parentage() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host = _delegating_conversation_host(Path(temporary))
+        try:
+            _send_host_prompt(host, "dispatch")
+            conversation = _conversation_reply(host)[1]["conversation"]
+            agents = {agent["name"]: agent for agent in conversation["agents"]}
+            if set(agents) != {"leader", "worker"}:
+                fail(f"live conversation omitted an agent: {agents!r}")
+            if agents["leader"]["parent_agent_id"] is not None or agents["worker"]["parent_agent_id"] != agents["leader"]["agent_id"]:
+                fail(f"live conversation lost dispatch parentage: {agents!r}")
+            if "usage" not in conversation or any("total_tokens" not in agent for agent in agents.values()):
+                fail(f"live conversation lost accounted usage: {conversation!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.conversation_reopened_parentage")
+def check_conversation_reopened_parentage() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host = _delegating_conversation_host(Path(temporary))
+        try:
+            _send_host_prompt(host, "dispatch")
+            run_id = host.run._conversation[1].run_id
+            call_count = host.run._provider.call_count
+            connection, response = _request(
+                host, "POST", "/session/open", body={"run_id": run_id}, headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"session reopen failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            conversation = _conversation_reply(host)[1]["conversation"]
+            if conversation is None or set(conversation) != {"agents"}:
+                fail(f"reopened conversation did not report agents without usage: {conversation!r}")
+            agents = {agent["name"]: agent for agent in conversation["agents"]}
+            if set(agents) != {"leader", "worker"}:
+                fail(f"reopened conversation omitted an agent: {agents!r}")
+            if agents["leader"]["parent_agent_id"] is not None or agents["worker"]["parent_agent_id"] != agents["leader"]["agent_id"]:
+                fail(f"reopened conversation lost persisted parentage: {agents!r}")
+            if any(set(agent) != {"agent_id", "name", "parent_agent_id"} for agent in agents.values()):
+                fail(f"reopened agents reported unaccounted usage or cost: {agents!r}")
+            if host.run._provider.call_count != call_count:
+                fail("reopening ran a new model turn")
+        finally:
+            host.close()
+
+
+@check("host_server.conversation_repeated_agent_parentage")
+def check_conversation_repeated_agent_parentage() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(root), sessions_root=root / "sessions",
+        )
+        host.start()
+        try:
+            if _conversation_reply(host)[1] != {"conversation": None}:
+                fail("a host without a conversation reported agents")
+            _send_host_prompt(host, "one root")
+            host.run.open_session(host.run._conversation[1].run_id)
+            root_only = _conversation_reply(host)[1]["conversation"]
+            if len(root_only["agents"]) != 1 or root_only["agents"][0]["parent_agent_id"] is not None:
+                fail(f"reopened conversation without subagents lost its root: {root_only!r}")
+
+            graph = (
+                RunNode("r1", "leader", "leader", None, None, False, (
+                    RunNode("r4", "c", "C", "r1", None, False),
+                    RunNode("r2", "a", "A", "r1", None, False, (
+                        RunNode("r3", "b", "B", "r2", None, False),
+                    )),
+                )),
+                RunNode("r5", "leader", "leader", None, None, False, (
+                    RunNode("r6", "b", "B", "r5", None, False),
+                )),
+                RunNode("r7", "orphan", "Orphan", "missing", None, False),
+            )
+            records = [
+                {"type": "run_started", "run_id": f"r{index}", "ts": f"2026-01-01T00:00:0{index}Z"}
+                for index in range(1, 8)
+            ]
+            with mock.patch.object(host.run._conversation[0], "run_graph", return_value=graph), mock.patch.object(
+                host_run_module, "read_records", return_value=(records, 0),
+            ):
+                agents = _conversation_reply(host)[1]["conversation"]["agents"]
+            if [agent["agent_id"] for agent in agents] != ["leader", "a", "b", "c", "orphan"]:
+                fail(f"spawn order or repeated-agent folding changed: {agents!r}")
+            if [agent["parent_agent_id"] for agent in agents] != [None, "leader", "a", "leader", None]:
+                fail(f"nested or unknown parent was misplaced: {agents!r}")
         finally:
             host.close()
 

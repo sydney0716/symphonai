@@ -560,8 +560,6 @@ def tool_allow_and_deny() -> None:
         unknown_cases = (
             ("tools", "unknown_tool"),
             ("deny_tools", "unknown_tool"),
-            ("tools", "web_search"),
-            ("deny_tools", "web_search"),
             ("tools", "read_tool_result"),
             ("deny_tools", "read_tool_result"),
         )
@@ -728,3 +726,26 @@ def no_runtime_imports() -> None:
     for probe in safe:
         if _agent_file_forbidden_imports(probe):
             fail(f"import inspection rejected {probe.strip()!r}")
+
+
+@check("agent_file.web_search_allow_and_deny")
+def web_search_allow_and_deny() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        default_model = ModelSelector("fake")
+        allowed = _write(
+            directory, "search.toml",
+            'prompt = "Search."\ntools = ["web_search", "read_file"]\n',
+        )
+        spec = load_agent_file(allowed, repo_root=directory, default_model=default_model)
+        if spec.tool_names != ("read_file", "web_search"):
+            fail(f"explicit search tool was not canonicalized: {spec.tool_names!r}")
+        denied = _write(
+            directory, "no-search.toml",
+            'prompt = "Read."\ntools = ["web_search", "read_file"]\ndeny_tools = ["web_search"]\n',
+        )
+        spec = load_agent_file(denied, repo_root=directory, default_model=default_model)
+        if spec.tool_names != ("read_file",):
+            fail(f"search deny did not remove the tool: {spec.tool_names!r}")
+        if tuple(standard_tool_registry()) != STANDARD_TOOL_NAMES:
+            fail("unconfigured standard registry acquired web_search")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import threading
 from collections.abc import Callable, Mapping
@@ -27,13 +28,18 @@ from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import (
+    SessionError,
     SessionStore,
     default_sessions_root,
+    fork_run,
+    load_run,
     load_run_for_resume,
+    read_records,
     tool_result_search_path,
 )
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.web_search import HttpJsonSearchBackend, search_endpoint
 from symphonai_host.broker import EventBroker
 from symphonai_host.approvals import ApprovalBroker, PendingApproval
 from symphonai_host.protocol import HistoryMessage
@@ -49,6 +55,14 @@ class RunActiveError(RuntimeError):
 
 class ProviderSelectionError(ValueError):
     """A conversation cannot start with the requested provider."""
+
+
+@dataclass(frozen=True)
+class ForkableHistoryMessage(HistoryMessage):
+    record_id: str
+
+    def payload(self) -> dict:
+        return {**super().payload(), "record_id": self.record_id}
 
 
 CONVERSATION_TITLE_LIMIT = 80
@@ -138,6 +152,10 @@ class HostRun:
             else None
         )
         self._extensions = extensions
+        endpoint_key = None if extensions is None else extensions.config.get("search.endpoint")
+        self._search_backend = (
+            None if endpoint_key is None else HttpJsonSearchBackend(search_endpoint(endpoint_key))
+        )
         self._hooks = (
             None
             if extensions is None
@@ -165,7 +183,7 @@ class HostRun:
         self._usage_by_agent: dict[str, tuple[str, dict[str, UsageTotals]]] = {}
         self._closing = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.approvals = ApprovalBroker(publish_approval or (lambda _: False), timeout=approval_timeout)
         self._policy.approval_callback = self.approvals.callback
 
@@ -262,7 +280,7 @@ class HostRun:
             directory=session.tool_results_directory,
             fallback_directories=tool_result_search_path(session),
         )
-        roster = builtin_subagent_specs(self._provider, self._policy)
+        roster = builtin_subagent_specs(self._provider, self._policy, self._search_backend)
         if self._extensions is not None:
             roster.update(self._extensions.agents)
         if self._subagent_budget is not None:
@@ -276,6 +294,12 @@ class HostRun:
                 for name, spec in roster.items()
             }
         defined_leader = roster.get("leader")
+        if (
+            defined_leader is not None
+            and self._search_backend is None
+            and "web_search" in (defined_leader.tool_names or ())
+        ):
+            raise ProviderSelectionError("leader cannot use web_search: search is not configured")
         leader_provider = self._provider
         leader_model = self._model
         if defined_leader is not None:
@@ -304,6 +328,7 @@ class HostRun:
                 extensions=self._extensions,
                 stream=True,
                 result_store=result_store,
+                search_backend=self._search_backend,
                 extra_tools=self._mcp_tools,
                 leader_policy=self._policy,
                 leader_model=leader_model,
@@ -334,38 +359,48 @@ class HostRun:
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
             reader = SessionStore.open(self._sessions_root, run_id)
-            loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
-            choice = reader.read_meta().get("provider_choice")
-            reader.close()
+            try:
+                loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
+                choice = reader.read_meta().get("provider_choice")
+            finally:
+                reader.close()
+            previous_provider = (self._provider, self._model, self._provider_choice)
+            provider, model, provider_choice = previous_provider
             if isinstance(choice, dict) and self._provider_factory is not None:
                 provider = self._provider_factory(choice.get("name"), choice.get("model"), choice.get("base_url"))
                 if provider is None:
                     raise ProviderSelectionError("session provider is unavailable")
-                self._provider = provider
-                self._model = choice.get("model")
-                self._provider_choice = choice
-            elif self._provider is None and self._provider_factory is not None:
-                self._provider = self._provider_factory(None, None, None)
-                if self._provider is None:
+                model = choice.get("model")
+                provider_choice = choice
+            elif provider is None and self._provider_factory is not None:
+                provider = self._provider_factory(None, None, None)
+                if provider is None:
                     raise ProviderSelectionError("no configured provider; add an API key in Settings")
-            if self._conversation is not None:
-                self._conversation[1].close()
             store = SessionStore.open(
                 self._sessions_root,
                 run_id,
                 events=fan_out(self._broker.publish, self._hooks),
             )
-            leader = self._new_leader(store)
-            leader.seed_chat(loaded.messages, persisted=True)
+            try:
+                self._provider, self._model, self._provider_choice = provider, model, provider_choice
+                leader = self._new_leader(store)
+                leader.seed_chat(loaded.messages, persisted=True)
+            except Exception:
+                self._provider, self._model, self._provider_choice = previous_provider
+                store.close()
+                raise
+            if self._conversation is not None:
+                self._conversation[1].close()
             self._conversation = (leader, store)
             self._context_report = None
             self._usage_by_agent.clear()
-        for message in loaded.messages:
-            self._broker.publish(HistoryMessage(
+        for message, record_id in zip(loaded.messages, loaded.record_ids, strict=True):
+            self._broker.publish(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
                 tool_calls=[{"id": call.id, "name": call.name} for call in message.tool_calls],
                 turn_id=message.turn_id,
+                record_id=record_id,
             ))
         return {
             "run_id": loaded.run_id,
@@ -374,6 +409,42 @@ class HostRun:
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
         }
+
+    def fork_session(self, run_id: str, record_id: str) -> dict:
+        """Copy a message prefix, then reopen the descendant conversation."""
+        with self._lock:
+            if self._active is not None:
+                raise RunActiveError(self._active.run_id)
+            source = SessionStore.open(self._sessions_root, run_id)
+            try:
+                loaded = load_run(source)
+                if record_id not in loaded.record_ids:
+                    raise SessionError(f"run {run_id!r} has no current message record {record_id!r}")
+                source_meta = source.read_meta()
+                new_run_id = new_id("run")
+                destination = SessionStore(
+                    self._sessions_root, new_run_id, repo_root=self._policy.repo_root,
+                )
+                try:
+                    fork_run(source, through_record_id=record_id, new_store=destination)
+                    meta = destination.read_meta()
+                    meta["title"] = source_meta.get("title")
+                    if "provider_choice" in source_meta:
+                        meta["provider_choice"] = source_meta["provider_choice"]
+                    destination.write_meta(meta)
+                except Exception:
+                    destination.close()
+                    shutil.rmtree(destination.directory)
+                    raise
+                else:
+                    destination.close()
+            finally:
+                source.close()
+            try:
+                return self.open_session(new_run_id)
+            except Exception:
+                shutil.rmtree(destination.directory)
+                raise
 
     def end_conversation(self) -> None:
         with self._lock:
@@ -431,13 +502,31 @@ class HostRun:
 
     def conversation_stats(self) -> dict | None:
         with self._lock:
+            conversation = self._conversation
+            if conversation is None:
+                return None
+            graph = conversation[0].run_graph()
+            started_at = {}
+            try:
+                paths = sorted(conversation[1].directory.glob("*.jsonl"))
+            except OSError:
+                paths = []
+            for path in paths:
+                try:
+                    records, _ = read_records(path)
+                except Exception:
+                    continue
+                for record in records:
+                    if (
+                        record.get("type") == "run_started"
+                        and isinstance(record.get("ts"), str)
+                    ):
+                        started_at.setdefault(record.get("run_id"), record["ts"])
             report = self._context_report
             usage_by_agent = {
                 agent_id: (name, dict(by_model))
                 for agent_id, (name, by_model) in self._usage_by_agent.items()
             }
-        if report is None:
-            return None
 
         def usage_fields(by_model: Mapping[str, UsageTotals]) -> dict:
             totals = UsageTotals()
@@ -457,16 +546,45 @@ class HostRun:
                 }
             return fields
 
-        all_models: dict[str, UsageTotals] = {}
         agents = []
+        seen = set()
+
+        def run_order(node):  # noqa: ANN001
+            return node.run_id not in started_at, started_at.get(node.run_id, "")
+
+        def add_node(node, parent_agent_id: str | None) -> None:  # noqa: ANN001
+            if node.agent_id not in seen:
+                seen.add(node.agent_id)
+                name, by_model = usage_by_agent.get(node.agent_id, (node.agent_name, None))
+                agent = {
+                    "agent_id": node.agent_id,
+                    "name": name,
+                    "parent_agent_id": parent_agent_id if parent_agent_id != node.agent_id else None,
+                }
+                if by_model is not None and report is not None:
+                    agent.update(usage_fields(by_model))
+                agents.append(agent)
+            for child in sorted(node.children, key=run_order):
+                add_node(child, node.agent_id)
+
+        for root in sorted(graph, key=run_order):
+            add_node(root, None)
         for agent_id, (name, by_model) in usage_by_agent.items():
+            if agent_id not in seen:
+                agents.append({
+                    "agent_id": agent_id,
+                    "name": name,
+                    "parent_agent_id": None,
+                    **(usage_fields(by_model) if report is not None else {}),
+                })
+
+        result = {"agents": agents}
+        if report is None:
+            return result
+        all_models: dict[str, UsageTotals] = {}
+        for _, by_model in usage_by_agent.values():
             all_models = self._merge_usage(all_models, by_model)
-            agents.append({
-                "agent_id": agent_id,
-                "name": name,
-                **usage_fields(by_model),
-            })
-        return {
+        result.update({
             "context": {
                 "used_tokens": report.total_tokens,
                 "budget_tokens": report.budget,
@@ -476,8 +594,8 @@ class HostRun:
                 },
             },
             "usage": usage_fields(all_models),
-            "agents": agents,
-        }
+        })
+        return result
 
     def _publish(self, host_run_id: str, event: Event) -> None:
         if isinstance(event, RunStarted):

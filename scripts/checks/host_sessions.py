@@ -24,6 +24,7 @@ from symphonai_api.providers.fake import FakeModelProvider
 import symphonai_host.__main__ as host_main
 from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
+from symphonai_host.run import ProviderSelectionError
 from symphonai_host.server import HostServer
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prune_sessions
 from scripts.checks.host_server import _WaitingProvider, _await_sse, _headers, _request, _subscribed_stream
@@ -212,7 +213,7 @@ def check_list_order_and_fields() -> None:
         host, client, run_id = _finished_session(root)
         try:
             sessions = client.list_sessions()
-            expected_fields = {"run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "repo_root", "state", "message_count"}
+            expected_fields = {"run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id", "repo_root", "state", "message_count"}
             meta = json.loads(
                 (root / "sessions" / run_id / "meta.json").read_text(encoding="utf-8")
             )
@@ -248,6 +249,7 @@ def check_damaged_session_listed() -> None:
                 "updated_at": None,
                 "stopped_reason": None,
                 "parent_run_id": None,
+                "parent_session_id": None,
                 "repo_root": "",
                 "state": "unreadable",
                 "message_count": 0,
@@ -666,3 +668,279 @@ def check_prune_startup() -> None:
                 or observed[0][2].tzinfo is None
             ):
                 fail(f"startup pruning arguments were wrong: {observed!r}")
+
+
+def _fork(host: HostServer, run_id: str, record_id: str) -> tuple[int, dict]:
+    connection, response = _request(
+        host, "POST", "/session/fork",
+        body={"run_id": run_id, "record_id": record_id}, headers=_headers(host),
+    )
+    try:
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+@check("host_sessions.fork_prefix_current_parent")
+def check_fork_prefix_current_parent() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, client = _host(root, [
+            ModelResponse(Message(Role.ASSISTANT, "original answer")),
+            ModelResponse(Message(Role.ASSISTANT, "fork answer")),
+        ])
+        try:
+            source_id = client.send_prompt("first")["run_id"]
+            _wait_idle(client)
+            source_path = root / "sessions" / source_id / "run.jsonl"
+            source_bytes = source_path.read_bytes()
+            meta_path = source_path.parent / "meta.json"
+            source_meta = meta_path.read_bytes()
+            source = SessionStore.open(root / "sessions", source_id)
+            try:
+                first_id = load_run(source).record_ids[0]
+            finally:
+                source.close()
+            stream_connection, stream_response = _subscribed_stream(host)
+            try:
+                status, reply = _fork(host, source_id, first_id)
+                if status != 200 or reply["run_id"] == source_id or reply["replayed"] != 1:
+                    fail(f"fork did not create and reopen the prefix: {status}, {reply!r}")
+                fork_id = reply["run_id"]
+                _, frame = _await_sse(
+                    stream_connection, stream_response,
+                    lambda frame: frame[0] == "event" and frame[1].get("type") == "HistoryMessage",
+                    what="fork history",
+                )
+                if (
+                    frame.get("record_id") is None
+                    or frame["record_id"] == first_id
+                    or "/" in frame["record_id"]
+                    or str(root) in json.dumps(frame)
+                    or set(frame) != {"type", "role", "text", "tool_calls", "turn_id", "record_id"}
+                ):
+                    fail(f"fork history record id was absent or disclosed a path: {frame!r}")
+                fork_store = SessionStore.open(root / "sessions", fork_id)
+                try:
+                    forked = load_run(fork_store)
+                finally:
+                    fork_store.close()
+                if [message.text for message in forked.messages] != ["first"]:
+                    fail(f"fork copied messages beyond its boundary: {forked.messages!r}")
+                listed = {item["run_id"]: item for item in client.list_sessions()}
+                if listed[fork_id]["parent_session_id"] != source_id:
+                    fail(f"fork parent session was absent from listing: {listed[fork_id]!r}")
+                next_run = client.send_prompt("different path")
+                _wait_idle(client)
+                fork_store = SessionStore.open(root / "sessions", fork_id)
+                try:
+                    texts = [message.text for message in load_run(fork_store).messages]
+                finally:
+                    fork_store.close()
+                if next_run["run_id"] == fork_id or texts != ["first", "different path", "fork answer"]:
+                    fail(f"next prompt did not continue the fork: {texts!r}")
+                listed = {item["run_id"]: item for item in client.list_sessions()}
+                if listed[fork_id]["parent_session_id"] != source_id:
+                    fail("fork parent session disappeared after a later prompt")
+                if source_path.read_bytes() != source_bytes or meta_path.read_bytes() != source_meta:
+                    fail("fork changed the original session")
+            finally:
+                stream_connection.close()
+        finally:
+            host.close()
+
+
+@check("host_sessions.fork_last_message_inherits_context")
+def check_fork_last_message_inherits_context() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instructions = root / ".symphonai" / "INSTRUCTIONS.md"
+        instructions.parent.mkdir()
+        instructions.write_text("original fork convention", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-home")}):
+            host, client = _host(root, [
+                ModelResponse(Message(Role.ASSISTANT, "first answer")),
+                ModelResponse(Message(Role.ASSISTANT, "second answer")),
+            ])
+            try:
+                source_id = client.send_prompt("first")["run_id"]
+                _wait_idle(client)
+                source = SessionStore.open(root / "sessions", source_id)
+                try:
+                    loaded = load_run(source)
+                    last_id = loaded.record_ids[-1]
+                    source_meta = source.read_meta()
+                    source_meta["provider_choice"] = {"name": "fake", "model": "inherited"}
+                    source.write_meta(source_meta)
+                finally:
+                    source.close()
+                host.run._provider_factory = lambda name, model, base_url: host.run._provider
+                instructions.write_text("changed fork convention", encoding="utf-8")
+                status, reply = _fork(host, source_id, last_id)
+                if status != 200 or reply["replayed"] != len(loaded.messages):
+                    fail(f"last-message fork was not equivalent to source history: {status}, {reply!r}")
+                fork_id = reply["run_id"]
+                fork_store = SessionStore.open(root / "sessions", fork_id)
+                try:
+                    forked = load_run(fork_store)
+                    if forked.messages != loaded.messages or fork_store.read_meta().get("provider_choice") != source_meta["provider_choice"]:
+                        fail("last-message fork lost source messages or provider choice")
+                finally:
+                    fork_store.close()
+                with mock.patch.object(host.run._provider, "create_response", wraps=host.run._provider.create_response) as response_spy:
+                    client.send_prompt("continue fork")
+                    _wait_idle(client)
+                sent = response_spy.call_args.args[0].messages
+                system = [message.text for message in sent if message.role == Role.SYSTEM]
+                if len(system) != 1 or "original fork convention" not in system[0] or "changed fork convention" in system[0]:
+                    fail(f"fork duplicated or reloaded instructions: {system!r}")
+                if [message.text for message in sent if message.role != Role.SYSTEM] != [
+                    "first", "first answer", "continue fork",
+                ]:
+                    fail(f"last-message fork did not continue source history: {sent!r}")
+            finally:
+                host.close()
+
+
+@check("host_sessions.fork_invalid_and_active")
+def check_fork_invalid_and_active() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, client, source_id = _finished_session(root)
+        try:
+            before = {path.name for path in (root / "sessions").iterdir()}
+            status, _ = _fork(host, source_id, "rec_missing")
+            after = {path.name for path in (root / "sessions").iterdir()}
+            if status != 404 or after != before:
+                fail("unknown record fork succeeded or left a destination directory")
+            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+            response.read()
+            connection.close()
+            waiting = _WaitingProvider()
+            host.run.select_provider(waiting)
+            active_id = client.send_prompt("busy")["run_id"]
+            source = SessionStore.open(root / "sessions", source_id)
+            try:
+                record_id = load_run(source).record_ids[0]
+            finally:
+                source.close()
+            status, body = _fork(host, source_id, record_id)
+            if status != 409 or body.get("run_id") != active_id:
+                fail(f"fork did not refuse an active run: {status}, {body!r}")
+            waiting.release.set()
+            _wait_idle(client)
+        finally:
+            host.close()
+
+
+@check("host_sessions.fork_reopen_failure_leaves_nothing")
+def check_fork_reopen_failure_leaves_nothing() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, _, source_id = _finished_session(root)
+        try:
+            sessions_root = root / "sessions"
+            source = SessionStore.open(sessions_root, source_id)
+            try:
+                record_id = load_run(source).record_ids[-1]
+                meta = source.read_meta()
+                meta["provider_choice"] = {"name": "unavailable"}
+                source.write_meta(meta)
+            finally:
+                source.close()
+            transcript_path = sessions_root / source_id / "run.jsonl"
+            meta_path = sessions_root / source_id / "meta.json"
+            transcript_before = transcript_path.read_bytes()
+            meta_before = meta_path.read_bytes()
+            directories_before = {path.name for path in sessions_root.iterdir() if path.is_dir()}
+            host.run._provider_factory = lambda name, model, base_url: None
+            try:
+                host.run.fork_session(source_id, record_id)
+            except ProviderSelectionError as exc:
+                if str(exc) != "session provider is unavailable":
+                    fail(f"fork changed the provider failure: {exc!r}")
+            else:
+                fail("fork accepted an unavailable recorded provider")
+            directories_after = {path.name for path in sessions_root.iterdir() if path.is_dir()}
+            if directories_after != directories_before:
+                fail(f"failed fork left a session directory: {directories_after!r}")
+            status, body = _fork(host, source_id, record_id)
+            directories_after = {path.name for path in sessions_root.iterdir() if path.is_dir()}
+            if status != 400 or body.get("error") != "session provider is unavailable" or directories_after != directories_before:
+                fail(f"failed fork route changed its status or left a session: {status}, {body!r}, {directories_after!r}")
+            if transcript_path.read_bytes() != transcript_before or meta_path.read_bytes() != meta_before:
+                fail("failed fork changed the source session")
+            if host.run._conversation is None or host.run._conversation[1].run_id != source_id:
+                fail("failed fork replaced the current source conversation")
+        finally:
+            host.close()
+
+
+@check("host_sessions.reopen_failure_keeps_current_store")
+def check_reopen_failure_keeps_current_store() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, client = _host(root, [
+            ModelResponse(Message(Role.ASSISTANT, "first answer")),
+            ModelResponse(Message(Role.ASSISTANT, "second answer")),
+        ])
+        try:
+            run_id = client.send_prompt("first")["run_id"]
+            _wait_idle(client)
+            current = host.run._conversation
+            provider = (host.run._provider, host.run._model, host.run._provider_choice)
+            rejected = []
+            leader_error = RuntimeError("leader construction failed")
+
+            def reject_leader(store):  # noqa: ANN001
+                rejected.append(store)
+                raise leader_error
+
+            with mock.patch.object(host.run, "_new_leader", side_effect=reject_leader):
+                try:
+                    host.run.open_session(run_id)
+                except RuntimeError as exc:
+                    if exc is not leader_error:
+                        fail(f"reopen changed the leader exception: {exc!r}")
+                else:
+                    fail("reopen accepted a failed leader construction")
+            if host.run._conversation is not current or current[1]._closed or not rejected[0]._closed:
+                fail("failed leader construction closed the current store or leaked its replacement")
+            if (host.run._provider, host.run._model, host.run._provider_choice) != provider:
+                fail("failed leader construction changed the current provider")
+
+            original_open = SessionStore.open
+            open_calls = 0
+            store_error = RuntimeError("replacement store failed")
+
+            def fail_replacement(*args, **kwargs):  # noqa: ANN002, ANN003
+                nonlocal open_calls
+                open_calls += 1
+                if open_calls == 2:
+                    raise store_error
+                return original_open(*args, **kwargs)
+
+            with mock.patch.object(SessionStore, "open", side_effect=fail_replacement):
+                try:
+                    host.run.open_session(run_id)
+                except RuntimeError as exc:
+                    if exc is not store_error:
+                        fail(f"reopen changed the store exception: {exc!r}")
+                else:
+                    fail("reopen accepted a failed replacement store")
+            if open_calls != 2 or host.run._conversation is not current or current[1]._closed:
+                fail("failed store open changed or closed the current conversation")
+
+            client.send_prompt("second")
+            _wait_idle(client)
+            records, _ = read_records(root / "sessions" / run_id / "run.jsonl")
+            if sum(record["type"] == "run_started" for record in records) != 2:
+                fail("prompt after failed reopen reported success without persisting its run")
+            if sum(record["type"] == "run_finished" for record in records) != 2:
+                fail("prompt after failed reopen did not persist a normal turn")
+
+            host.run.open_session(run_id)
+            if host.run._conversation is current or not current[1]._closed or host.run._conversation[1]._closed:
+                fail("successful reopen did not replace the conversation and close its old store")
+        finally:
+            host.close()

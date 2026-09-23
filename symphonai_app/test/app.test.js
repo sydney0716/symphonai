@@ -190,7 +190,7 @@ export function fakeClient(
     conversation = null,
   } = {},
 ) {
-  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], newSession: 0, openSession: [], prompt: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], newSession: 0, openSession: [], prompt: [], selectProvider: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -266,6 +266,10 @@ export function fakeClient(
     async openSession(runId) {
       calls.openSession.push(runId);
       return { run_id: runId };
+    },
+    async forkSession(runId, recordId) {
+      calls.forkSession.push([runId, recordId]);
+      return { run_id: "fork-run" };
     },
     async newSession() {
       calls.newSession += 1;
@@ -616,10 +620,62 @@ test("status rail keeps the roadmap beside settings and renders live agents", as
   await client.emit(eventFrame("SubagentSpawned", {
     subagent_agent_id: "agent-2", subagent_name: "worker",
   }));
-  assert.deepEqual(agents.children.map((row) => row.className), ["agent-row", "agent-row"]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), [
-    "leader · running · read", "worker · running",
-  ]);
+  await client.emit(eventFrame("SubagentSpawned", {
+    subagent_agent_id: "agent-3", subagent_name: "sibling",
+  }));
+  await client.emit(eventFrame("SubagentSpawned", {
+    agent_id: "agent-2", subagent_agent_id: "agent-4", subagent_name: "grandchild",
+  }));
+  await client.emit(eventFrame("ToolCallStarted", { agent_id: "agent-4", tool_name: "search" }));
+  await client.emit(eventFrame("SubagentStopped", { subagent_agent_id: "agent-2" }));
+  const root = agents.children[0];
+  const children = root.children[0];
+  const worker = children.children[0];
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read"]);
+  assert.equal(children.className, "agent-children");
+  assert.deepEqual(children.children.map((row) => row.textContent), ["worker · done", "sibling · running"]);
+  assert.equal(worker.children[0].className, "agent-children");
+  assert.deepEqual(worker.children[0].children.map((row) => row.textContent), ["grandchild · running · search"]);
+
+  await client.emit(eventFrame("SubagentSpawned", {
+    agent_id: "missing", subagent_agent_id: "orphan", subagent_name: "orphan",
+  }));
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read", "orphan · running"]);
+});
+
+test("reopened history and conversation stats render a nested agent tree without run events", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [{ run_id: "prior", title: "Prior", repo_root: "/work/current" }],
+  });
+  let conversation = null;
+  client.conversationStats = async () => ({ conversation });
+  client.openSession = async (runId) => {
+    client.calls.openSession.push(runId);
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", role: "assistant", text: "Prior answer", tool_calls: [], turn_id: "prior-turn",
+    } });
+    conversation = { agents: [
+      { agent_id: "root", name: "leader", parent_agent_id: null },
+      { agent_id: "a", name: "A", parent_agent_id: "root" },
+      { agent_id: "b", name: "B", parent_agent_id: "a" },
+      { agent_id: "c", name: "C", parent_agent_id: "root" },
+    ] };
+    return { run_id: runId };
+  };
+  await start({ global: {}, document, client });
+  const agents = document.getElementById("agents");
+  assert.equal(visibleText(agents), "\nNothing is running.");
+  const link = find(document.getElementById("sidebar"), (row) => row.className === "session-link");
+  await link.dispatch("click");
+  assert.deepEqual(client.calls.openSession, ["prior"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · done"]);
+  const children = agents.children[0].children[0];
+  assert.deepEqual(children.children.map((row) => row.textContent), ["A · done", "C · done"]);
+  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["B · done"]);
+  assert.equal(find(document.body, (row) => row.className === "conversation-usage").textContent, "");
+  assert.match(visibleText(document.getElementById("chat")), /Prior answer/);
+  assert.doesNotMatch(visibleText(agents), /tokens|USD/);
 });
 
 test("settings routes render general origins, model presence, and unknown fallback", async () => {
@@ -1344,6 +1400,50 @@ test("session history renders as the original conversation", async () => {
     ["assistant", "The config changed."],
   ]);
   assert.doesNotMatch(visibleText(chat), /Received HistoryMessage\./);
+});
+
+test("replayed messages offer a fork at the message and show the parent in the sidebar", async () => {
+  const document = new FakeDocument();
+  const source = { run_id: "source", title: "Original", repo_root: "/work/current" };
+  const fork = { run_id: "fork-run", title: "Original", parent_session_id: "source", repo_root: "/work/current" };
+  const client = fakeClient(fixtureRoadmap(), { sessions: [source] });
+  client.sessions = async (limit) => {
+    client.calls.sessions.push(limit);
+    return client.calls.sessions.length === 1 ? [source] : [fork, source];
+  };
+  client.forkSession = async (runId, recordId) => {
+    client.calls.forkSession.push([runId, recordId]);
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", role: "user", text: "What changed?", record_id: "rec-fork",
+      tool_calls: [], turn_id: "turn-fork",
+    } });
+    return { run_id: "fork-run" };
+  };
+  await start({ global: {}, document, client });
+  const chat = document.getElementById("chat");
+  assert.equal(find(chat, (value) => value.className === "fork-message"), undefined);
+  const sourceButton = find(document.getElementById("sidebar"), (value) =>
+    value.className === "session-link" && value.textContent === "Original"
+  );
+  await sourceButton.dispatch("click");
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "What changed?", record_id: "rec-user",
+    tool_calls: [], turn_id: "turn-1",
+  } });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "assistant", text: "The config changed.", record_id: "rec-answer",
+    tool_calls: [], turn_id: "turn-1",
+  } });
+  const controls = walk(chat).filter((value) => value.className === "fork-message");
+  assert.equal(controls.length, 2);
+  await controls[0].dispatch("click");
+  assert.deepEqual(client.calls.forkSession, [["source", "rec-user"]]);
+  assert.match(visibleText(chat), /What changed\?/);
+  assert.doesNotMatch(visibleText(chat), /The config changed\./);
+  assert.match(visibleText(document.getElementById("sidebar")), /Original · fork of Original/);
+  const forkControl = find(chat, (value) => value.className === "fork-message");
+  await forkControl.dispatch("click");
+  assert.deepEqual(client.calls.forkSession[1], ["fork-run", "rec-fork"]);
 });
 
 test("unknown events render and do not stop later frames", async () => {

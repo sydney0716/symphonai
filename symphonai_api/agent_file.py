@@ -69,6 +69,7 @@ _STANDARD_TOOL_NAMES = (
     "run_shell",
     "web_fetch",
 )
+_AGENT_TOOL_NAMES = (*_STANDARD_TOOL_NAMES, "web_search")
 
 
 def _raise(path: Path, key: str, detail: str) -> None:
@@ -160,13 +161,13 @@ def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | N
         _raise(path, "tools", "must not be empty")
     for key, names in (("tools", tools), ("deny_tools", denied)):
         for name in names:
-            if name not in _STANDARD_TOOL_NAMES:
+            if name not in _AGENT_TOOL_NAMES:
                 _raise(path, key, f"unknown tool name: {name!r}")
     base = set(tools)
     denied_names = set(denied)
     result = tuple(
         name
-        for name in _STANDARD_TOOL_NAMES
+        for name in _AGENT_TOOL_NAMES
         if name in base and name not in denied_names
     )
     if not result:

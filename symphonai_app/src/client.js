@@ -257,6 +257,10 @@ export function createClient({
       return post("session/open", { run_id: runId });
     },
 
+    forkSession(runId, recordId) {
+      return request("POST", "/session/fork", { run_id: runId, record_id: recordId });
+    },
+
     approvals() {
       return request("GET", "/approvals");
     },

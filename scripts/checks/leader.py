@@ -67,6 +67,7 @@ from symphonai_api.tools.metadata import (
     ToolEffect,
     ToolMetadata,
 )
+from symphonai_api.web_search import SearchBackend
 
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -2223,3 +2224,47 @@ def check_default_spec_reports_actual_tools() -> None:
         reported = set(leader._leader_spec.tool_names or ())
         if actual != {"dispatch_subagent", *standard_tool_registry()} or reported != actual:
             fail(f"leader spec did not report its actual dispatch and standard tools: {reported!r}, {actual!r}")
+
+
+@check("leader.search_roster_dispatch")
+def check_search_roster_dispatch() -> None:
+    class Backend(SearchBackend):
+        @property
+        def name(self) -> str:
+            return "fake-search"
+
+        def search(self, query: str, *, limit: int, cancel=None) -> list:
+            return []
+
+    with workspace() as ws:
+        backend = Backend()
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")) for _ in range(4)
+        ])
+        roster = builtin_subagent_specs(provider, ws.policy, backend)
+        roster["project_search"] = _spec(ws.root, "project_search").with_overrides(
+            tool_names=("read_file", "web_search")
+        )
+        roster["project_read"] = _spec(ws.root, "project_read").with_overrides(
+            tool_names=("read_file",)
+        )
+        tool = DispatchSubagentTool(
+            provider, ws.policy, subagent_specs=roster, search_backend=backend,
+        )
+        for name, should_search in (
+            ("worker", True), ("explorer", True),
+            ("project_search", True), ("project_read", False),
+        ):
+            result = tool.execute(_dispatch(name, "inspect", name), ws.policy)
+            if not result.ok:
+                fail(f"configured {name} did not dispatch: {result!r}")
+            actual = "web_search" in tool.pool[name].agent._tools
+            if actual != should_search:
+                fail(f"configured {name} search registry mismatch: {tool.pool[name].agent._tools!r}")
+        missing = DispatchSubagentTool(
+            FakeModelProvider(), ws.policy,
+            subagent_specs={"project_search": roster["project_search"]},
+        )
+        result = missing.execute(_dispatch("project_search", "inspect"), ws.policy)
+        if result.ok or "search is not configured" not in (result.error or "") or missing.pool:
+            fail(f"unconfigured search definition did not fail at dispatch: {result!r}")

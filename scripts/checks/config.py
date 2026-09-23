@@ -1044,3 +1044,22 @@ def budget_cost_requires_price_table() -> None:
         )
         if leader is None or leader.wall_seconds != 2 or leader.max_total_tokens != 10:
             fail("non-cost ceilings required a price table")
+
+
+@check("config.search_endpoint_validation")
+def search_endpoint_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        _write(source, '[search]\nendpoint = "brave"\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("search.endpoint") != "brave" or resolved.scope_of("search.endpoint") is not Scope.PROJECT:
+            fail("configured search endpoint lost its value or provenance")
+        _write(source, '[search]\nendpoint = "unknown-search"\n')
+        try:
+            load_config(repo_root=repo_root, home=home)
+        except ConfigError as exc:
+            if str(source) not in str(exc) or "search.endpoint" not in str(exc) or "unknown-search" not in str(exc):
+                fail(f"unknown endpoint error omitted source or key: {exc!r}")
+        else:
+            fail("unknown search endpoint was accepted")

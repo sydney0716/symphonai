@@ -165,6 +165,7 @@ export async function start({ global, document, client }) {
   append(providerControls, providerLabel, modelInput, baseUrlInput, providerStatus);
   append(form, providerControls);
   let sessions = initialSessions;
+  let currentSessionId = null;
   let conversation = conversationReply?.conversation ?? null;
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
@@ -373,6 +374,44 @@ export async function start({ global, document, client }) {
   listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
+  function showTranscript() {
+    renderTranscript(document, chatRoot, transcript.model);
+    const rows = [...chatRoot.children];
+    const children = [];
+    for (const [index, entry] of transcript.model.entries()) {
+      children.push(rows[index]);
+      if (!currentSessionId || !entry.recordId || !["prompt", "text"].includes(entry.type)) {
+        continue;
+      }
+      const button = element(document, "button", { className: "fork-message", text: "Fork here" });
+      button.type = "button";
+      listen(button, "click", async () => {
+        const sourceId = currentSessionId;
+        const previous = [...transcript.model];
+        transcript.model.length = 0;
+        showTranscript();
+        try {
+          const reply = await boundary.forkSession(sourceId, entry.recordId);
+          currentSessionId = reply.run_id;
+          try {
+            sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+            showProjects();
+          } catch {
+            // The fork remains current if refreshing the sidebar fails.
+          }
+          navigate({ page: "chat", section: "" });
+        } catch {
+          transcript.model.splice(0, transcript.model.length, ...previous);
+          showTranscript();
+          promptFailure = "Fork failed.";
+          showPromptError();
+        }
+      });
+      children.push(button);
+    }
+    replace(chatRoot, ...children);
+  }
+
   function showProjects() {
     const groups = [];
     for (const group of projectGroups(sessions, project.repo_root)) {
@@ -400,7 +439,10 @@ export async function start({ global, document, client }) {
         }));
       }
       for (const session of group.sessions) {
-        const label = session.title || session.run_id;
+        const parent = sessions.find((item) => item.run_id === session.parent_session_id);
+        const label = (session.title || session.run_id) + (
+          session.parent_session_id ? ` · fork of ${parent?.title || session.parent_session_id}` : ""
+        );
         if (!current) {
           append(section, element(document, "p", {
             className: "session-link unavailable",
@@ -414,8 +456,25 @@ export async function start({ global, document, client }) {
         });
         button.type = "button";
         listen(button, "click", async () => {
-          await boundary.openSession(session.run_id);
-          navigate({ page: "chat", section: "" });
+          const previous = [...transcript.model];
+          const previousId = currentSessionId;
+          transcript.model.length = 0;
+          currentSessionId = session.run_id;
+          showTranscript();
+          try {
+            await boundary.openSession(session.run_id);
+            board.clear();
+            conversation = null;
+            showConversationUsage();
+            showAgents();
+            await refreshConversation();
+            navigate({ page: "chat", section: "" });
+          } catch (error) {
+            transcript.model.splice(0, transcript.model.length, ...previous);
+            currentSessionId = previousId;
+            showTranscript();
+            throw error;
+          }
         });
         append(section, button);
       }
@@ -428,8 +487,10 @@ export async function start({ global, document, client }) {
     try {
       await boundary.newSession();
       transcript.model.length = 0;
-      renderTranscript(document, chatRoot, transcript.model);
+      currentSessionId = null;
+      showTranscript();
       conversation = null;
+      board.clear();
       showConversationUsage();
       showAgents();
       promptFailure = "";
@@ -537,14 +598,10 @@ export async function start({ global, document, client }) {
   }
 
   function showConversationUsage() {
-    if (conversation === null) {
-      conversationUsage.textContent = "";
-      return;
-    }
-    const context = conversation.context;
+    const context = conversation?.context;
     conversationUsage.textContent = [
-      `Context ${context.used_tokens} / ${context.budget_tokens} tokens`,
-      usageText(conversation.usage),
+      context && `Context ${context.used_tokens} / ${context.budget_tokens} tokens`,
+      usageText(conversation?.usage),
     ].filter(Boolean).join(" · ");
   }
 
@@ -552,21 +609,43 @@ export async function start({ global, document, client }) {
     const rows = [...board.rows];
     for (const agent of conversation?.agents ?? []) {
       if (!rows.some((row) => row.agentId === agent.agent_id)) {
-        rows.push({ agentId: agent.agent_id, name: agent.name, state: "done", tool: "" });
+        rows.push({ agentId: agent.agent_id, parentAgentId: agent.parent_agent_id ?? null, name: agent.name, state: "done", tool: "" });
       }
     }
     const usageByAgent = new Map(
       (conversation?.agents ?? []).map((agent) => [agent.agent_id, agent]),
     );
-    replace(agentsRoot, ...(
-      rows.length === 0
-        ? [element(document, "p", { text: "Nothing is running." })]
-        : rows.map(({ agentId, name, state, tool }) => element(document, "div", {
-          className: "agent-row",
-          text: [name, state, tool, usageText(usageByAgent.get(agentId))]
-            .filter(Boolean).join(" · "),
-        }))
-    ));
+    if (rows.length === 0) {
+      replace(agentsRoot, element(document, "p", { text: "Nothing is running." }));
+      return;
+    }
+    const byId = new Map(rows.map((row) => [row.agentId, row]));
+    const nodes = new Map(rows.map(({ agentId, name, state, tool }) => [agentId, element(document, "div", {
+      className: "agent-row",
+      text: [name, state, tool, usageText(usageByAgent.get(agentId))]
+        .filter(Boolean).join(" · "),
+    })]));
+    const children = new Map();
+    const roots = [];
+    for (const row of rows) {
+      const seen = new Set([row.agentId]);
+      let ancestor = byId.get(row.parentAgentId);
+      while (ancestor && !seen.has(ancestor.agentId)) {
+        seen.add(ancestor.agentId);
+        ancestor = byId.get(ancestor.parentAgentId);
+      }
+      const parent = ancestor ? null : nodes.get(row.parentAgentId);
+      if (!parent) {
+        roots.push(nodes.get(row.agentId));
+        continue;
+      }
+      if (!children.has(row.parentAgentId)) {
+        children.set(row.parentAgentId, element(document, "div", { className: "agent-children" }));
+        append(parent, children.get(row.parentAgentId));
+      }
+      append(children.get(row.parentAgentId), nodes.get(row.agentId));
+    }
+    replace(agentsRoot, ...roots);
   }
   showConversationUsage();
   showAgents();
@@ -685,10 +764,18 @@ export async function start({ global, document, client }) {
   });
 
   async function onFrame(frame) {
+    const previousLength = transcript.model.length;
     transcript.apply(frame);
+    if (
+      frame.kind === "event" && frame.payload?.type === "HistoryMessage"
+      && typeof frame.payload.record_id === "string"
+      && transcript.model.length === previousLength + 1
+    ) {
+      transcript.model.at(-1).recordId = frame.payload.record_id;
+    }
     board.apply(frame);
     showAgents();
-    renderTranscript(document, chatRoot, transcript.model);
+    showTranscript();
     if (frame.kind === "approval_requested") {
       await approvals.onFrame(frame);
       showApprovals();

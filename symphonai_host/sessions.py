@@ -69,6 +69,7 @@ def list_sessions(root: Path, *, limit: int | None = None) -> list[dict]:
             "updated_at": None,
             "stopped_reason": None,
             "parent_run_id": None,
+            "parent_session_id": None,
             "repo_root": "",
             "state": "unreadable",
             "message_count": 0,
@@ -79,7 +80,7 @@ def list_sessions(root: Path, *, limit: int | None = None) -> list[dict]:
             meta = store.read_meta()
             item.update({
                 key: meta.get(key)
-                for key in ("run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id")
+                for key in ("run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id")
             })
             repo_root = meta.get("repo_root")
             item["repo_root"] = repo_root if isinstance(repo_root, str) else ""

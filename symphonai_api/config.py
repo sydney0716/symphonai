@@ -21,6 +21,7 @@ from symphonai_api.permissions import (
     _is_prefix,
 )
 from symphonai_api.paths import symphonai_home
+from symphonai_api.web_search import search_endpoint
 
 
 class ConfigError(ValueError):
@@ -70,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search")
 _VALID_MODES = {"auto", "prompt", "plan", "accept_edits"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
 
@@ -124,6 +125,15 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    search = _table(source, values, "search")
+    if search is not None:
+        _unknown_keys(source, "search", search, {"endpoint"})
+        if "endpoint" in search:
+            key = _string(source, "search.endpoint", search["endpoint"])
+            try:
+                search_endpoint(key)
+            except KeyError:
+                _raise(source, "search.endpoint", f"unknown search endpoint {key!r}")
     budgets = _table(source, values, "budgets")
     if budgets is not None:
         _unknown_keys(source, "budgets", budgets, {"leader", "subagent", "price_table"})

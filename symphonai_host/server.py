@@ -26,6 +26,7 @@ from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KE
 from symphonai_api.session import SessionError, TranscriptError
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.web_search import search_endpoint, search_endpoints
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
 from symphonai_host.protocol import (
@@ -512,6 +513,8 @@ class HostServer:
                         ]
 
                     ceiling = None if extensions is None else extensions.ceiling
+                    search_key = None if extensions is None else extensions.config.get("search.endpoint")
+                    configured_search = None if search_key is None else search_endpoint(search_key)
                     settings = {
                         "config": [] if extensions is None else [
                             {
@@ -561,6 +564,13 @@ class HostServer:
                                 "key_present": bool(os.environ.get(variable, "").strip()),
                             }
                             for name, variable, _ in PROVIDERS
+                        ],
+                        "search": [] if configured_search is None else [
+                            {
+                                "name": configured_search.key,
+                                "env_var": configured_search.api_key_env_var,
+                                "key_present": bool(os.environ.get(configured_search.api_key_env_var, "").strip()),
+                            }
                         ],
                     }
                     self._json(HTTPStatus.OK, {"settings": settings})
@@ -625,7 +635,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/new", "/provider") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -638,7 +648,12 @@ class HostServer:
                         return
                     name = payload.get("name")
                     value = payload.get("value")
-                    if name not in (ANTHROPIC_KEY_ENV_VAR, GEMINI_KEY_ENV_VAR, OPENAI_KEY_ENV_VAR):
+                    if name not in (
+                        ANTHROPIC_KEY_ENV_VAR,
+                        GEMINI_KEY_ENV_VAR,
+                        OPENAI_KEY_ENV_VAR,
+                        *(endpoint.api_key_env_var for endpoint in search_endpoints()),
+                    ):
                         self._json(HTTPStatus.BAD_REQUEST, {"error": "unknown credential name"})
                         return
                     if not isinstance(value, str):
@@ -668,6 +683,33 @@ class HostServer:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
                         return
                     self._json(HTTPStatus.OK, {"ended": True})
+                    return
+                if self.path == "/session/fork":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"run_id", "record_id"} or any(
+                            type(payload[key]) is not str or not payload[key]
+                            for key in ("run_id", "record_id")
+                        ):
+                            raise ProtocolError("session/fork requires run_id and record_id strings")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        reply = host.run.fork_session(payload["run_id"], payload["record_id"])
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except SessionError as exc:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                        return
+                    except TranscriptError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except ProviderSelectionError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
                     return
                 if self.path == "/provider":
                     try:

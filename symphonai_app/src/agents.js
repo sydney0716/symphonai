@@ -2,6 +2,11 @@ export function createAgentBoard() {
   const rows = [];
   const subagents = new Set();
 
+  function clear() {
+    rows.length = 0;
+    subagents.clear();
+  }
+
   function apply(frame) {
     if (frame?.kind !== "event" || !frame.payload) return;
     const { type, agent_id, agent_name, subagent_agent_id, subagent_name, tool_name } = frame.payload;
@@ -11,16 +16,15 @@ export function createAgentBoard() {
         Object.assign(row, { name: agent_name || "agent", state: "running", tool: "" });
       } else {
         if (!subagents.has(agent_id)) {
-          rows.length = 0;
-          subagents.clear();
+          clear();
         }
-        rows.unshift({ agentId: agent_id, name: agent_name || "agent", state: "running", tool: "" });
+        rows.unshift({ agentId: agent_id, parentAgentId: null, name: agent_name || "agent", state: "running", tool: "" });
       }
       return;
     }
     if (type === "SubagentSpawned") {
       subagents.add(subagent_agent_id);
-      rows.push({ agentId: subagent_agent_id, name: subagent_name, state: "running", tool: "" });
+      rows.push({ agentId: subagent_agent_id, parentAgentId: agent_id ?? null, name: subagent_name, state: "running", tool: "" });
       return;
     }
     const id = type === "SubagentStopped" ? subagent_agent_id : agent_id;
@@ -42,5 +46,5 @@ export function createAgentBoard() {
     }
   }
 
-  return { rows, apply };
+  return { rows, apply, clear };
 }

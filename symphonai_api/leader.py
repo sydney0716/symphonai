@@ -75,6 +75,7 @@ from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.web_search import SearchBackend
 
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
@@ -82,7 +83,11 @@ DEFAULT_SUBAGENT_MAX_TURNS = 5
 EXPLORER_TOOL_NAMES = ("read_file", "glob", "grep", "list_files", "web_fetch")
 
 
-def builtin_subagent_specs(provider: ModelProvider, policy: PermissionPolicy) -> dict[str, AgentSpec]:
+def builtin_subagent_specs(
+    provider: ModelProvider,
+    policy: PermissionPolicy,
+    search_backend: SearchBackend | None = None,
+) -> dict[str, AgentSpec]:
     selector = ModelSelector(
         provider=getattr(provider, "name", None) or "unknown",
         model=getattr(provider, "model", None),
@@ -97,8 +102,8 @@ def builtin_subagent_specs(provider: ModelProvider, policy: PermissionPolicy) ->
             call_class=CallClass.BACKGROUND,
         )
         for name, tools in (
-            ("worker", tuple(standard_tool_registry())),
-            ("explorer", EXPLORER_TOOL_NAMES),
+            ("worker", tuple(standard_tool_registry(search_backend=search_backend))),
+            ("explorer", EXPLORER_TOOL_NAMES + (("web_search",) if search_backend is not None else ())),
         )
     }
 
@@ -239,6 +244,7 @@ class DispatchSubagentTool(LocalTool):
         hooks: HookRunner | None = None,
         stream: bool = False,
         result_store: ToolResultStore | None = None,
+        search_backend: SearchBackend | None = None,
         extra_tools: Mapping[str, LocalTool] | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
@@ -262,6 +268,7 @@ class DispatchSubagentTool(LocalTool):
         self._hooks = hooks
         self._stream = stream
         self._result_store = result_store
+        self._search_backend = search_backend
         self._extra_tools = extra_tools
         self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
@@ -393,6 +400,12 @@ class DispatchSubagentTool(LocalTool):
                 ok=False,
                 error=f"unknown subagent {subagent_name!r}; known subagents: {known}",
             )
+        if self._search_backend is None and "web_search" in (spec.tool_names or ()):
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"subagent {subagent_name!r} cannot use web_search: search is not configured",
+            )
         if self._dispatching_depth >= spec.max_depth:
             return ToolResult(
                 tool_call_id=tool_call.id,
@@ -422,7 +435,11 @@ class DispatchSubagentTool(LocalTool):
             if tool_names is not None and self._result_store is not None:
                 tool_names = (*tool_names, "read_tool_result")
             subagent_tools = merge_tool_registry(
-                standard_tool_registry(tool_names, result_store=self._result_store),
+                standard_tool_registry(
+                    tool_names,
+                    result_store=self._result_store,
+                    search_backend=self._search_backend,
+                ),
                 self._extra_tools,
             )
             agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
@@ -626,6 +643,7 @@ class LeaderConfig:
     extensions: Extensions | None = None
     stream: bool = False
     result_store: ToolResultStore | None = None
+    search_backend: SearchBackend | None = None
     extra_tools: Mapping[str, LocalTool] | None = None
     leader_policy: PermissionPolicy | None = None
     leader_model: str | None = None
@@ -700,6 +718,7 @@ class Leader:
             hooks=self._hook_runner,
             stream=config.stream,
             result_store=config.result_store,
+            search_backend=config.search_backend,
             extra_tools=config.extra_tools,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
@@ -711,6 +730,7 @@ class Leader:
             standard_tool_registry(
                 tool_names,
                 result_store=config.result_store,
+                search_backend=config.search_backend,
             ),
             config.extra_tools,
         )

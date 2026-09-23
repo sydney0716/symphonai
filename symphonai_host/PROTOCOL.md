@@ -93,13 +93,24 @@ Receive the handshake through a pipe or stdin, never on a command line.
 `GET /sessions` returns a bare array of persisted session metadata newest first.
 An optional positive `limit` query parameter bounds the entries returned and
 classified; missing, empty, non-numeric, zero, and negative values return the
-full listing. `POST
-/session/open` takes a `run_id`, replays `HistoryMessage` event frames before
+full listing. `POST /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
 its reply, and makes that conversation current. Later prompts append to the
 same session directory and transcript, while each prompt still has a distinct
 run id. `POST /session/new` takes an empty JSON object, ends the current
 conversation, and returns `{"ended": true}`. The next prompt creates a new
 session directory. It returns `409` if a run is active.
+
+Each replayed `HistoryMessage` also carries an opaque `record_id` for the
+message. `POST /session/fork` takes `{"run_id": str, "record_id": str}` and
+copies the source conversation through that message into a new session. It
+replays the fork's messages, makes the fork current, and returns the same
+reply shape as `/session/open`, with the new `run_id`. The original session is
+unchanged. A fork inherits the source provider choice and seeded instructions;
+later prompts continue the fork without reloading instruction files. The new
+session's `parent_session_id` identifies its source in `GET /sessions`;
+`parent_run_id` retains its runtime meaning. Any current message may be
+selected if its prefix has no unanswered tool call. A missing session or
+message returns `404`, and an active run returns `409`.
 
 At a new conversation's first prompt, the host loads the user, project, and
 working-directory `.symphonai/INSTRUCTIONS.md` hierarchy. It seeds the
@@ -155,10 +166,15 @@ If no vendor has a key, the first prompt returns `400` until a key is added or
 a valid selection is sent. Launch flags do not select a provider.
 
 Authenticated `GET /conversation` returns `{"conversation": null}` before a
-conversation has completed a run. Otherwise `conversation` contains `context`
-(`used_tokens`, `budget_tokens`, `remaining_tokens`, and `by_source`), aggregate
-`usage`, and an `agents` array whose entries identify an agent by opaque id and
-name and report `input_tokens`, `output_tokens`, `calls`, and `total_tokens`.
+conversation is open. Otherwise `conversation` contains an `agents` array whose
+entries identify an agent by opaque id and name, plus `parent_agent_id` (an
+opaque id or `null` for a root). Each agent appears once; the first run in the
+timestamp-ordered run graph determines its parent. After a run completes in
+this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,
+`remaining_tokens`, and `by_source`), aggregate `usage`, and per-agent
+`input_tokens`, `output_tokens`, `calls`, and `total_tokens`. Immediately after
+reopening a conversation, `context`, aggregate `usage`, and per-agent usage and
+`cost` are omitted until another run is accounted in this process.
 When every used model has a configured price, usage objects also contain
 `cost` with decimal-string `amount` and `currency`; `cost` is omitted when no
 price table exists or any used model is unpriced. The payload contains no
