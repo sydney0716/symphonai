@@ -77,6 +77,26 @@ test("provider choice uses an authenticated JSON request", async () => {
   });
 });
 
+test("model listing uses authenticated query parameters", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, {
+      provider: "openai", state: "available", models: ["gpt-test"], detail: "",
+    });
+  } });
+  assert.deepEqual(
+    await client.models("openai", "http://127.0.0.1:9000/v1"),
+    { provider: "openai", state: "available", models: ["gpt-test"], detail: "" },
+  );
+  assert.equal(
+    records[0].url,
+    "http://127.0.0.1:4312/models?provider=openai&base_url=http%3A%2F%2F127.0.0.1%3A9000%2Fv1",
+  );
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+});
+
 test("permission mode uses an authenticated JSON request", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {

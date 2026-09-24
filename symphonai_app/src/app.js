@@ -138,6 +138,10 @@ export async function start({ global, document, client }) {
   const modelInput = element(document, "input");
   modelInput.placeholder = "Model (optional)";
   modelInput.ariaLabel = "Model (optional)";
+  const modelList = element(document, "datalist");
+  modelList.id = "provider-models";
+  modelInput.setAttribute?.("list", modelList.id);
+  const modelStatus = element(document, "span", { className: "model-status" });
   const baseUrlInput = element(document, "input");
   baseUrlInput.placeholder = "Base URL (optional)";
   baseUrlInput.ariaLabel = "Base URL (optional)";
@@ -157,13 +161,68 @@ export async function start({ global, document, client }) {
       : "Changes to an active chat apply to the next chat.";
   }
   showProviderChoices();
-  listen(providerSelect, "change", () => {
+  let modelRequest = 0;
+  let modelState = { state: "unknown", models: [], detail: "Choose a provider." };
+  function showModelState() {
+    replace(modelList, ...modelState.models.map((model) => {
+      const option = element(document, "option");
+      option.value = model;
+      return option;
+    }));
+    const typed = modelInput.value.trim();
+    if (modelState.state === "available") {
+      modelStatus.textContent = typed && !modelState.models.includes(typed)
+        ? "Unavailable in the provider listing; this model will still be submitted."
+        : `${modelState.models.length} models available.`;
+      return;
+    }
+    modelStatus.textContent = modelState.detail || "Model listing unavailable.";
+  }
+  async function refreshModels() {
+    const request = ++modelRequest;
+    const provider = providerSelect.value;
+    if (!provider) {
+      modelState = { state: "unknown", models: [], detail: "Choose a provider." };
+      showModelState();
+      return;
+    }
+    modelStatus.textContent = "Loading models…";
+    try {
+      const baseUrl = baseUrlInput.value.trim();
+      const reply = await boundary.models(provider, baseUrl || undefined);
+      if (request !== modelRequest) return;
+      if (reply?.state === "available" && Array.isArray(reply.models)) {
+        modelState = { state: "available", models: reply.models, detail: "" };
+      } else if (reply?.state === "unknown" && Array.isArray(reply.models)) {
+        modelState = { state: "unknown", models: [], detail: reply.detail ?? "" };
+      } else {
+        throw new Error("invalid model listing reply");
+      }
+    } catch {
+      if (request !== modelRequest) return;
+      modelState = { state: "unknown", models: [], detail: "Model listing unavailable." };
+    }
+    showModelState();
+  }
+  listen(providerSelect, "change", async () => {
     modelInput.value = "";
     baseUrlInput.value = "";
+    await refreshModels();
   });
+  listen(baseUrlInput, "change", refreshModels);
+  listen(modelInput, "input", showModelState);
   append(providerLabel, providerSelect);
-  append(providerControls, providerLabel, modelInput, baseUrlInput, providerStatus);
+  append(
+    providerControls,
+    providerLabel,
+    modelInput,
+    baseUrlInput,
+    modelList,
+    modelStatus,
+    providerStatus,
+  );
   append(form, providerControls);
+  await refreshModels();
   const allModes = ["ask", "plan", "allow"];
   const ceilingModes = settingsReply?.settings?.ceiling?.modes;
   const permittedModes = Array.isArray(ceilingModes)
@@ -271,6 +330,7 @@ export async function start({ global, document, client }) {
             if (providerRow) {
               providerRow.key_present = Boolean(value);
               showProviderChoices();
+              await refreshModels();
             }
             notice.textContent = value ? "Key stored." : "Key removed.";
           } catch {

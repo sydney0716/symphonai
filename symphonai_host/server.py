@@ -18,8 +18,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
 from symphonai_api.cost import PriceTable
 from symphonai_api.extensions import Extensions
+from symphonai_api.model_discovery import list_models
 from symphonai_api.permissions import PermissionPolicy, _contains_path
-from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR, AnthropicProvider
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR, GeminiProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
@@ -111,6 +112,8 @@ class HostServer:
         self.token = token or secrets.token_urlsafe(32)
         self._repo_root = policy.repo_root
         self._mcp_started = mcp_tools is not None
+        self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
+        self._model_cache_lock = threading.Lock()
         self.broker = broker or EventBroker()
         self.run = HostRun(
             provider,
@@ -420,6 +423,62 @@ class HostServer:
                         HTTPStatus.OK,
                         {"conversation": host.run.conversation_stats()},
                     )
+                    return
+                if request_path == "/models":
+                    if not self._authorized():
+                        return
+                    query = parse_qs(request_url.query, keep_blank_values=True)
+                    names = query.get("provider", [])
+                    base_urls = query.get("base_url", [])
+                    known = {name for name, _, _ in PROVIDERS}
+                    if (
+                        set(query) - {"provider", "base_url"}
+                        or len(names) != 1
+                        or names[0] not in known
+                        or len(base_urls) > 1
+                        or (base_urls and not base_urls[0].strip())
+                    ):
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid model listing request"})
+                        return
+                    name = names[0]
+                    base_url = base_urls[0] if base_urls else None
+                    cache_key = (name, base_url)
+                    with host._model_cache_lock:
+                        cached = host._model_cache.get(cache_key)
+                    if cached is not None:
+                        self._json(HTTPStatus.OK, {
+                            "provider": name,
+                            "state": "available",
+                            "models": list(cached),
+                            "detail": "",
+                        })
+                        return
+                    try:
+                        provider = _provider(name, None, base_url)
+                        if provider is None:
+                            raise ProviderSelectionError(f"{name} is unavailable")
+                        models = list_models(provider)
+                    except (ProviderSelectionError, ProviderError) as exc:
+                        detail = str(exc)
+                        variable = next(key for vendor, key, _ in PROVIDERS if vendor == name)
+                        secret = os.environ.get(variable, "").strip()
+                        if secret:
+                            detail = detail.replace(secret, "[redacted]")
+                        self._json(HTTPStatus.OK, {
+                            "provider": name,
+                            "state": "unknown",
+                            "models": [],
+                            "detail": detail,
+                        })
+                        return
+                    with host._model_cache_lock:
+                        host._model_cache[cache_key] = tuple(models)
+                    self._json(HTTPStatus.OK, {
+                        "provider": name,
+                        "state": "available",
+                        "models": models,
+                        "detail": "",
+                    })
                     return
                 if request_path == "/app":
                     location = "/app/"

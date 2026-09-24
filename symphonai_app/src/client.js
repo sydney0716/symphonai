@@ -282,6 +282,12 @@ export function createClient({
       return request("GET", "/settings");
     },
 
+    models(provider, baseUrl) {
+      const query = new URLSearchParams({ provider });
+      if (baseUrl) query.set("base_url", baseUrl);
+      return request("GET", `/models?${query}`);
+    },
+
     selectProvider(choice) {
       return request("POST", "/provider", choice);
     },

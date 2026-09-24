@@ -165,6 +165,16 @@ the first vendor with a key in Settings order (anthropic, gemini, openai).
 If no vendor has a key, the first prompt returns `400` until a key is added or
 a valid selection is sent. Launch flags do not select a provider.
 
+Authenticated `GET /models?provider=<name>` lists the models for a known
+provider, with optional `base_url` using the same meaning as `POST /provider`.
+It returns `provider`, `state`, `models`, and `detail`. A successful lookup has
+`state: "available"`, the filtered model ids from live model discovery, and an
+empty detail. A lookup that cannot be attempted or fails has `state: "unknown"`,
+an empty models array, and a key-safe explanation in detail. Successful results
+are cached for the host process by provider and base URL; unknown results are
+not cached. A listing is advisory: clients may still submit any model id to
+`POST /provider`.
+
 Authenticated `POST /mode` takes exactly `{"mode": "ask" | "plan" | "allow"}`
 and returns `{"mode": <current mode>}`. The available values are intersected
 with `agents.ceiling.modes`; an unknown or excluded value returns `400` with

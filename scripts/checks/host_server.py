@@ -49,7 +49,7 @@ from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore, load_run_for_resume
@@ -981,6 +981,135 @@ def check_settings_route() -> None:
                 started_host.close()
         finally:
             pool.close()
+
+
+@check("host_server.model_listing_route")
+def check_model_listing_route() -> None:
+    secret = "recognisable-model-listing-secret-25i"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = _host(repo_root=root)
+
+        def get(path: str, *, authorized: bool = True) -> tuple[int, bytes, dict | None]:
+            connection, response = _request(
+                host,
+                "GET",
+                path,
+                headers=_headers(host) if authorized else None,
+            )
+            try:
+                body = response.read()
+                return response.status, body, json.loads(body) if body else None
+            finally:
+                connection.close()
+
+        try:
+            status, body, _ = get("/models?provider=openai", authorized=False)
+            if status != 401 or body != b"":
+                fail("model listing accepted an unauthenticated request")
+
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}), mock.patch.object(
+                host_server_module, "list_models"
+            ) as listed:
+                status, _, reply = get("/models?provider=openai")
+                if (
+                    status != 200
+                    or reply is None
+                    or reply.get("state") != "unknown"
+                    or reply.get("models") != []
+                    or "no API key" not in reply.get("detail", "")
+                    or listed.call_count != 0
+                ):
+                    fail(f"missing-key model listing was wrong: {status}, {reply!r}")
+
+            calls = []
+
+            def available(provider: ModelProvider) -> list[str]:
+                calls.append(provider)
+                return ["gpt-listed", "gpt-second"]
+
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": secret}), mock.patch.object(
+                host_server_module, "list_models", side_effect=available,
+            ):
+                first = get("/models?provider=openai")
+                second = get("/models?provider=openai")
+                alternate = get(
+                    "/models?provider=openai&base_url=http%3A%2F%2F127.0.0.1%3A9000%2Fv1"
+                )
+            expected = {
+                "provider": "openai",
+                "state": "available",
+                "models": ["gpt-listed", "gpt-second"],
+                "detail": "",
+            }
+            if any(status != 200 or reply != expected for status, _, reply in (first, second, alternate)):
+                fail(f"available model listing response changed: {first!r}, {second!r}, {alternate!r}")
+            if len(calls) != 2 or getattr(calls[1], "base_url", None) != "http://127.0.0.1:9000/v1":
+                fail(f"successful model listings were not cached by base URL: {calls!r}")
+
+            failure_url = "/models?provider=openai&base_url=http%3A%2F%2F127.0.0.1%3A9001%2Fv1"
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": secret}), mock.patch.object(
+                host_server_module,
+                "list_models",
+                side_effect=ProviderError(f"catalogue failed with {secret}"),
+            ) as failed:
+                failures = [get(failure_url), get(failure_url)]
+            for status, body, reply in failures:
+                if (
+                    status != 200
+                    or reply is None
+                    or reply.get("state") != "unknown"
+                    or reply.get("models") != []
+                    or "catalogue failed" not in reply.get("detail", "")
+                    or secret.encode() in body
+                ):
+                    fail(f"failed model listing was unsafe or malformed: {status}, {body!r}")
+            if failed.call_count != 2:
+                fail("an unknown model listing result was cached")
+
+            with mock.patch.object(host_server_module, "list_models") as listed:
+                status, _, reply = get("/settings")
+                if status != 200 or reply is None or listed.call_count != 0:
+                    fail("settings performed model discovery")
+
+            selected = FakeModelProvider()
+            with mock.patch.object(host_server_module, "_provider", return_value=selected) as factory:
+                connection, response = _request(
+                    host,
+                    "POST",
+                    "/provider",
+                    body={
+                        "name": "openai",
+                        "model": "gpt-custom",
+                        "base_url": "http://127.0.0.1:9002/v1",
+                    },
+                    headers=_headers(host),
+                )
+                try:
+                    body = response.read()
+                    if response.status != 200 or json.loads(body) != {"selected": True}:
+                        fail(f"provider payload was rejected: {response.status}, {body!r}")
+                finally:
+                    connection.close()
+                connection, response = _request(
+                    host,
+                    "POST",
+                    "/provider",
+                    body={"name": "openai", "extra": True},
+                    headers=_headers(host),
+                )
+                try:
+                    response.read()
+                    if response.status != 400:
+                        fail("provider route accepted an unknown field")
+                finally:
+                    connection.close()
+                if factory.call_args_list != [mock.call(
+                    "openai", "gpt-custom", "http://127.0.0.1:9002/v1"
+                )]:
+                    fail(f"provider route changed its accepted payload: {factory.call_args_list!r}")
+        finally:
+            host.close()
 
 
 @check("host_server.settings_roster_paths")

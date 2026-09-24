@@ -188,9 +188,10 @@ export function fakeClient(
     settings = { settings: {} },
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
     conversation = null,
+    modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
   } = {},
 ) {
-  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], newSession: 0, openSession: [], prompt: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], models: [], newSession: 0, openSession: [], prompt: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -226,6 +227,10 @@ export function fakeClient(
     prompt(text) {
       calls.prompt.push(text);
       return promptReply;
+    },
+    async models(provider, baseUrl) {
+      calls.models.push([provider, baseUrl]);
+      return { ...modelListing, provider };
     },
     async selectProvider(choice) {
       calls.selectProvider.push(choice);
@@ -510,6 +515,51 @@ test("composer offers only keyed vendors and sends its model choice before the p
     name: "openai", model: "custom-model", base_url: "http://127.0.0.1:9000/v1",
   }]);
   assert.deepEqual(client.calls.prompt, ["hello"]);
+});
+
+test("composer offers listed models, warns without blocking, and preserves unknown input", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { settings: { settings: { providers: [
+    { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
+  ] } } });
+  client.models = async (provider, baseUrl) => {
+    client.calls.models.push([provider, baseUrl]);
+    return baseUrl
+      ? { provider, state: "unknown", models: [], detail: "Catalogue request failed." }
+      : { provider, state: "available", models: ["gpt-listed", "gpt-other"], detail: "" };
+  };
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "run-model" };
+  };
+  await start({ global: {}, document, client });
+  const controls = find(document.getElementById("prompt-form"), (node) =>
+    node.className === "provider-controls"
+  );
+  const input = controls.children[1];
+  const baseUrl = controls.children[2];
+  const list = find(controls, (node) => node.tagName === "DATALIST");
+  const status = find(controls, (node) => node.className === "model-status");
+  assert.deepEqual(list.children.map((option) => option.value), ["gpt-listed", "gpt-other"]);
+
+  input.value = "private-model";
+  await input.dispatch("input");
+  assert.match(status.textContent, /Unavailable/);
+  document.getElementById("prompt").value = "use my model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "private-model" }]);
+  assert.deepEqual(client.calls.prompt, ["use my model"]);
+
+  baseUrl.value = "http://127.0.0.1:9000/v1";
+  await baseUrl.dispatch("change");
+  assert.equal(input.value, "private-model");
+  assert.notEqual(input.disabled, true);
+  assert.deepEqual(list.children, []);
+  assert.equal(status.textContent, "Catalogue request failed.");
+  assert.deepEqual(client.calls.models, [
+    ["openai", undefined],
+    ["openai", "http://127.0.0.1:9000/v1"],
+  ]);
 });
 
 test("composer shows the live permission mode and restores it after a refusal", async () => {
