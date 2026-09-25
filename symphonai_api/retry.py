@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import math
 import random
+import re
 import ssl
 import time
 import urllib.error
@@ -14,7 +15,7 @@ from email.utils import parsedate_to_datetime
 
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
-from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
 
 DEFAULT_MAX_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
@@ -31,6 +32,16 @@ _PERMANENT_URL_ERROR_MARKERS = (
     "unknown scheme",
     "unknown url type",
     "unsupported url",
+)
+_CONTEXT_LENGTH_MARKERS = (
+    "context_length_exceeded",
+    "string_above_max_length",
+    "prompt is too long",
+)
+_CONTEXT_TOKEN_LIMIT = re.compile(
+    r"\binput token count\b.{0,80}\bexceeds?\b.{0,80}"
+    r"\bmaximum(?: number of)? tokens? allowed\b",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -80,7 +91,13 @@ def read_with_retry(
                     cancel.raise_if_cancelled()
                 return body
         except urllib.error.HTTPError as exc:
-            detail = _redacted_error_detail(exc.read(), api_key)
+            raw_detail = exc.read()
+            detail = _redacted_error_detail(raw_detail, api_key)
+            if 400 <= exc.code <= 499 and _is_context_length_error(raw_detail):
+                raise ContextLengthExceededError(
+                    f"{operation} returned HTTP {exc.code}: "
+                    "request exceeded the model context window"
+                ) from None
             if exc.code in OVERLOAD_STATUS_CODES and call_class is CallClass.BACKGROUND:
                 attempt_text = (
                     "the first attempt" if attempt == 1 else f"attempt {attempt}"
@@ -161,6 +178,14 @@ def _redacted_error_detail(raw: bytes, api_key: str) -> str:
     redacted = redact_secret(raw.decode("utf-8", errors="replace"), api_key)
     truncated = redacted.encode("utf-8")[:MAX_ERROR_DETAIL_BYTES]
     return truncated.decode("utf-8", errors="ignore")
+
+
+def _is_context_length_error(raw: bytes) -> bool:
+    detail = raw.decode("utf-8", errors="replace")
+    lowered = detail.casefold()
+    return any(marker in lowered for marker in _CONTEXT_LENGTH_MARKERS) or bool(
+        _CONTEXT_TOKEN_LIMIT.search(detail)
+    )
 
 
 def _is_retryable_status(status: int) -> bool:

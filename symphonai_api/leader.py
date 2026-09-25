@@ -29,7 +29,7 @@ from symphonai_api.agent_run import (
     new_agent_run,
     read_run_graph,
 )
-from symphonai_api.agent_spec import AgentSpec, Effort, Isolation, ModelSelector, validate_output
+from symphonai_api.agent_spec import AgentSpec, Isolation, ModelSelector, validate_output
 from symphonai_api.budgets import RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import (
@@ -49,6 +49,7 @@ from symphonai_api.compaction import (
     CompactionResult,
     ContextCompactionError,
     compact_messages_for_budget,
+    estimate_messages_tokens,
 )
 from symphonai_api.gemini_schema import sanitize_for_gemini
 from symphonai_api.events import (
@@ -68,7 +69,7 @@ from symphonai_api.identity import AgentRef, RunRef, new_agent_ref
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import Message, Role, ToolCall, ToolResult
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
-from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore
 from symphonai_api.tool_schema import tool_registry_schemas
@@ -702,7 +703,7 @@ class Leader:
             else defined_leader.model.model
         )
         self._leader_effort = (
-            Effort.DEFAULT if defined_leader is None else defined_leader.model.effort
+            None if defined_leader is None else defined_leader.model.effort
         )
         self._leader_run: AgentRun | None = None
         self._dispatch_tool = DispatchSubagentTool(
@@ -790,6 +791,7 @@ class Leader:
             "automatic compaction",
             max_consecutive_failures=config.max_consecutive_compaction_failures,
         )
+        self._context_overflow_repair_failed = False
 
     @property
     def subagents(self) -> dict[str, SubagentRecord]:
@@ -893,6 +895,7 @@ class Leader:
             if self._leader_prompt else []
         )
         self._automatic_compaction_breaker.reset()
+        self._context_overflow_repair_failed = False
         return self.clear_subagents()
 
     def seed_chat(self, messages: Sequence[Message], *, persisted: bool = False) -> None:
@@ -916,14 +919,29 @@ class Leader:
     def compact_chat(self, *, cancel: CancellationToken | None = None) -> CompactionResult:
         """Apply context compaction to the persisted multi-turn chat state."""
 
+        result = self._compact_chat_to_budget(
+            self._config.chat_token_budget,
+            cancel=cancel,
+        )
+        self._context_overflow_repair_failed = False
+        return result
+
+    def _compact_chat_to_budget(
+        self,
+        budget: int,
+        *,
+        cancel: CancellationToken | None = None,
+        record_success: bool = True,
+    ) -> CompactionResult:
         result = compact_messages_for_budget(
             self._chat_messages,
-            budget=self._config.chat_token_budget,
+            budget=budget,
             recent_turns=self._config.chat_recent_turns,
             cancel=cancel,
         )
         self._chat_messages = result.messages
-        self._automatic_compaction_breaker.record_success()
+        if record_success:
+            self._automatic_compaction_breaker.record_success()
         if result.changed:
             if self._session is not None:
                 self._session.writer_for(
@@ -951,13 +969,31 @@ class Leader:
             )
         return result
 
+    def _compact_after_context_overflow(
+        self, *, cancel: CancellationToken | None = None
+    ) -> bool:
+        before_tokens = estimate_messages_tokens(self._chat_messages)
+        forced_budget = min(
+            self._config.chat_token_budget,
+            max(1, before_tokens - 1),
+        )
+        return self._compact_chat_to_budget(
+            forced_budget,
+            cancel=cancel,
+            record_success=False,
+        ).changed
+
     def _automatic_compact_chat(
         self, *, cancel: CancellationToken | None = None
     ) -> None:
         if self._automatic_compaction_breaker.is_open:
             return
         try:
-            self.compact_chat(cancel=cancel)
+            self._compact_chat_to_budget(
+                self._config.chat_token_budget,
+                cancel=cancel,
+                record_success=not self._context_overflow_repair_failed,
+            )
         except ContextCompactionError:
             self._automatic_compaction_breaker.record_failure()
         except OperationCancelled:
@@ -976,7 +1012,32 @@ class Leader:
         """
         self._chat_messages.append(Message(role=Role.USER, content=message))
         self._automatic_compact_chat(cancel=cancel)
-        result = self._run_messages(self._chat_messages, cancel=cancel)
+        recovered_overflow = False
+        try:
+            result = self._run_messages(self._chat_messages, cancel=cancel)
+        except ContextLengthExceededError as overflow:
+            if self._automatic_compaction_breaker.is_open:
+                raise
+            try:
+                changed = self._compact_after_context_overflow(cancel=cancel)
+            except ContextCompactionError:
+                self._automatic_compaction_breaker.record_failure()
+                self._context_overflow_repair_failed = True
+                raise overflow from None
+            if not changed:
+                self._automatic_compaction_breaker.record_failure()
+                self._context_overflow_repair_failed = True
+                raise
+            try:
+                result = self._run_messages(self._chat_messages, cancel=cancel)
+            except ContextLengthExceededError:
+                self._automatic_compaction_breaker.record_failure()
+                self._context_overflow_repair_failed = True
+                raise
+            recovered_overflow = True
+        if recovered_overflow or self._context_overflow_repair_failed:
+            self._automatic_compaction_breaker.record_success()
+            self._context_overflow_repair_failed = False
         self._chat_messages = result.leader_messages
         self._automatic_compact_chat(cancel=cancel)
         result.stopped_repairs = self._stopped_repairs()

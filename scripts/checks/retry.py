@@ -22,7 +22,7 @@ from symphonai_api.model_discovery import list_models
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
-from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
 from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
@@ -365,6 +365,65 @@ def check_retry_http_400_fails_immediately() -> None:
     if urlopen_mock.call_count != 1:
         fail(f"HTTP 400 must make exactly one attempt, got {urlopen_mock.call_count}")
     sleep_mock.assert_not_called()
+
+
+@check("retry.context_length_classification")
+def check_retry_context_length_classification() -> None:
+    request = urllib.request.Request("https://mock.invalid/test")
+    secret = "context-classification-secret-do-not-use"
+    overflow_bodies = (
+        f'{{"error":{{"code":"context_length_exceeded","message":"{secret}"}}}}',
+        '{"error":{"code":"string_above_max_length"}}',
+        '{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}',
+        (
+            '{"error":{"message":"The input token count (100001) exceeds '
+            'the maximum number of tokens allowed (100000)."}}'
+        ),
+    )
+    for body in overflow_bodies:
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=_http_error(400, body),
+        ) as urlopen_mock:
+            try:
+                read_with_retry(
+                    request,
+                    timeout=2.0,
+                    api_key=secret,
+                    operation="context classification",
+                )
+            except ContextLengthExceededError as exc:
+                message = str(exc)
+            else:
+                fail(f"context overflow was not classified: {body!r}")
+        if urlopen_mock.call_count != 1:
+            fail("context overflow must not be retried by the HTTP transport")
+        if secret in message or any(marker in message for marker in (
+            "context_length_exceeded",
+            "string_above_max_length",
+            "prompt is too long",
+            "input token count",
+        )):
+            fail(f"overflow error exposed vendor detail or a secret: {message!r}")
+
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=_http_error(400, '{"error":"malformed tool arguments"}'),
+    ) as urlopen_mock:
+        try:
+            read_with_retry(
+                request,
+                timeout=2.0,
+                api_key=secret,
+                operation="ordinary bad request",
+            )
+        except ProviderError as exc:
+            if type(exc) is not ProviderError:
+                fail(f"ordinary 400 used the overflow subclass: {type(exc).__name__}")
+        else:
+            fail("ordinary HTTP 400 did not raise ProviderError")
+    if urlopen_mock.call_count != 1:
+        fail("ordinary HTTP 400 must remain terminal and unretried")
 
 @check("retry.exhausted_transient_failures")
 def check_retry_exhausted_transient_failures() -> None:

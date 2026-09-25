@@ -28,6 +28,10 @@ class ProviderError(Exception):
     """
 
 
+class ContextLengthExceededError(ProviderError):
+    """Raised when a vendor rejects a request that exceeds its context window."""
+
+
 def parse_json_object(raw: bytes, operation: str) -> dict[str, Any]:
     """Decode a successful vendor response as a JSON object.
 

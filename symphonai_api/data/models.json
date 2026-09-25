@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "notes": "UNVERIFIED model effort capabilities. No live account has been used to validate these entries; check current vendor documentation before relying on them.",
+  "models": [
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-5.4-mini",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-haiku-4-5",
+      "efforts": []
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-haiku-4-5-20251001",
+      "efforts": []
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-sonnet-5",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3.5-flash",
+      "efforts": [
+        {"id": "minimal", "value": "minimal"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-2.5-flash",
+      "efforts": [
+        {"id": "1024", "value": 1024},
+        {"id": "4096", "value": 4096},
+        {"id": "8192", "value": 8192}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-flash-lite-latest",
+      "efforts": [
+        {"id": "512", "value": 512},
+        {"id": "4096", "value": 4096},
+        {"id": "8192", "value": 8192}
+      ]
+    }
+  ]
+}

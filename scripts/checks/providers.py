@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 import os
 import unittest.mock as mock
-from symphonai_api.agent_spec import Effort
+import symphonai_api.model_table as model_table_module
+from symphonai_api.model_table import (
+    _models_from_json,
+    model_capabilities,
+    resolve_effort,
+)
 from symphonai_api.models import Message, ModelRequest, Role
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
 from symphonai_api.providers.anthropic_provider import (
@@ -56,17 +61,28 @@ def _openai_success(content: str) -> _FakeHttpResponse:
 @check("providers.effort_request_bodies")
 def check_effort_request_bodies() -> None:
     message = Message(role=Role.USER, content="hello")
-    high = ModelRequest(messages=[message], effort=Effort.HIGH)
     bodies = {
-        "openai": _build_openai_body(high, "gpt-5.4-mini"),
-        "anthropic": _build_anthropic_body(high, "claude-sonnet-5", 1024),
-        "gemini-3": _build_gemini_body(high, "gemini-3.5-flash"),
-        "gemini-2.5": _build_gemini_body(high, "gemini-2.5-flash"),
+        "openai": _build_openai_body(
+            ModelRequest(messages=[message], effort="high"), "gpt-5.4-mini"
+        ),
+        "anthropic": _build_anthropic_body(
+            ModelRequest(messages=[message], effort="xhigh"),
+            "claude-sonnet-5",
+            1024,
+        ),
+        "gemini-3": _build_gemini_body(
+            ModelRequest(messages=[message], effort="minimal"),
+            "gemini-3.5-flash",
+        ),
+        "gemini-2.5": _build_gemini_body(
+            ModelRequest(messages=[message], effort="8192"),
+            "gemini-2.5-flash",
+        ),
     }
     expected = {
         "openai": "high",
-        "anthropic": {"effort": "high"},
-        "gemini-3": {"thinkingLevel": "high"},
+        "anthropic": {"effort": "xhigh"},
+        "gemini-3": {"thinkingLevel": "minimal"},
         "gemini-2.5": {"thinkingBudget": 8192},
     }
     actual = {
@@ -81,6 +97,26 @@ def check_effort_request_bodies() -> None:
     }
     if actual != expected:
         fail(f"provider effort request fields were wrong: {actual!r}")
+
+
+@check("providers.model_table_schema")
+def check_model_table_schema() -> None:
+    capabilities = model_capabilities()
+    indexed = {(item.wire_format, item.model): item for item in capabilities}
+    required = {
+        (1, "gpt-5.4-mini"),
+        (2, "claude-haiku-4-5"),
+        (2, "claude-sonnet-5"),
+        (3, "gemini-2.5-flash"),
+        (3, "gemini-3.5-flash"),
+    }
+    if not required.issubset(indexed):
+        fail(f"model effort table omitted required entries: {indexed!r}")
+    if _models_from_json({"schema_version": 2, "notes": "bad", "models": []}) != ():
+        fail("a mismatched model table schema did not fail closed")
+    with mock.patch.object(model_table_module, "model_capabilities", return_value=()):
+        if resolve_effort(3, "gemini-2.5-flash", "future") != "future":
+            fail("an unavailable model table did not degrade to pass-through")
 
 
 @check("providers.default_effort_body_identity")
@@ -107,43 +143,63 @@ def check_default_effort_body_identity() -> None:
     }
     if actual != expected:
         fail(f"default effort changed provider request bodies: {actual!r}")
-    unknown = {
+
+
+@check("providers.unlisted_effort_passthrough")
+def check_unlisted_effort_passthrough() -> None:
+    message = Message(role=Role.USER, content="hello")
+    unknown_model = "invented-model-that-is-not-in-the-25p-table"
+    request = ModelRequest(messages=[message], effort="vendor-special")
+    bodies = {
         "openai": _build_openai_body(
-            ModelRequest(messages=request.messages, effort=Effort.HIGH),
-            "unclassified-model",
+            request,
+            unknown_model,
         ),
         "anthropic": _build_anthropic_body(
-            ModelRequest(messages=request.messages, effort=Effort.HIGH),
-            "unclassified-model",
+            request,
+            unknown_model,
             1024,
         ),
         "gemini": _build_gemini_body(
-            ModelRequest(messages=request.messages, effort=Effort.HIGH),
-            "unclassified-model",
+            request,
+            unknown_model,
         ),
     }
-    if unknown != {
-        "openai": {
-            "model": "unclassified-model",
-            "messages": [{"role": "user", "content": "hello"}],
-        },
-        "anthropic": {
-            "model": "unclassified-model",
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": "hello"}],
-        },
-        "gemini": {
-            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-        },
-    }:
-        fail(f"unknown models received guessed effort controls: {unknown!r}")
+    actual = {
+        "openai": bodies["openai"].get("reasoning_effort"),
+        "anthropic": bodies["anthropic"].get("output_config", {}).get("effort"),
+        "gemini": bodies["gemini"].get("generationConfig", {})
+        .get("thinkingConfig", {})
+        .get("thinkingLevel"),
+    }
+    if actual != {name: "vendor-special" for name in actual}:
+        fail(f"unlisted model effort was not passed through: {actual!r}")
+
+
+@check("providers.listed_effort_rejection")
+def check_listed_effort_rejection() -> None:
+    try:
+        _build_anthropic_body(
+            ModelRequest(
+                messages=[Message(role=Role.USER, content="hello")],
+                effort="high",
+            ),
+            "claude-haiku-4-5",
+            1024,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "claude-haiku-4-5" not in message or "accepted efforts: none" not in message:
+            fail(f"listed effort rejection was not actionable: {message!r}")
+    else:
+        fail("a listed model accepted an undeclared effort")
 
 
 @check("providers.effort_reaches_transports")
 def check_effort_reaches_transports() -> None:
     request = ModelRequest(
         messages=[Message(role=Role.USER, content="hello")],
-        effort=Effort.HIGH,
+        effort="high",
     )
     captured: dict[str, dict] = {}
 

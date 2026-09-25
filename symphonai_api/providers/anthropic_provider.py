@@ -20,9 +20,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from symphonai_api.agent_spec import Effort
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
+from symphonai_api.model_table import resolve_effort
 from symphonai_api.models import (
     DocumentBlock,
     ImageBlock,
@@ -53,19 +53,6 @@ DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
-
-_EFFORT_MODEL_PREFIXES = (
-    "claude-fable-5",
-    "claude-mythos-5",
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-)
-
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for tool calls that arrive without one.
@@ -162,8 +149,9 @@ def _build_request_body(request: ModelRequest, model: str, default_max_tokens: i
         body["tools"] = request.tools
     if request.temperature is not None:
         body["temperature"] = request.temperature
-    if request.effort is not Effort.DEFAULT and model.startswith(_EFFORT_MODEL_PREFIXES):
-        body["output_config"] = {"effort": request.effort.value}
+    effort = resolve_effort(2, model, request.effort)
+    if effort is not None:
+        body["output_config"] = {"effort": effort}
     return body
 
 

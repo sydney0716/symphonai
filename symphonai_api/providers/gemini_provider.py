@@ -29,10 +29,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from symphonai_api.agent_spec import Effort
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.gemini_schema import sanitize_for_gemini
 from symphonai_api.identity import new_id
+from symphonai_api.model_table import resolve_effort
 from symphonai_api.models import (
     DocumentBlock,
     ImageBlock,
@@ -71,13 +71,6 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # be worth much if it could not call tools. Step up to `gemini-flash-latest`
 # or a pro model via `model=` when a task needs more capability.
 DEFAULT_MODEL = "gemini-flash-lite-latest"
-
-_THINKING_BUDGETS = {
-    Effort.LOW: 1024,
-    Effort.MEDIUM: 4096,
-    Effort.HIGH: 8192,
-}
-
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for Gemini functionCalls that omit one.
@@ -222,15 +215,11 @@ def _build_request_body(
         generation_config["maxOutputTokens"] = request.max_tokens
     if request.temperature is not None:
         generation_config["temperature"] = request.temperature
-    model_name = "" if model is None else model.rsplit("/", 1)[-1]
-    if request.effort is not Effort.DEFAULT and model_name.startswith("gemini-3"):
-        generation_config["thinkingConfig"] = {
-            "thinkingLevel": request.effort.value,
-        }
-    elif request.effort is not Effort.DEFAULT and model_name.startswith("gemini-2.5"):
-        generation_config["thinkingConfig"] = {
-            "thinkingBudget": _THINKING_BUDGETS[request.effort],
-        }
+    effort = None if model is None else resolve_effort(3, model, request.effort)
+    if isinstance(effort, str):
+        generation_config["thinkingConfig"] = {"thinkingLevel": effort}
+    elif isinstance(effort, int):
+        generation_config["thinkingConfig"] = {"thinkingBudget": effort}
     if generation_config:
         body["generationConfig"] = generation_config
 

@@ -18,7 +18,6 @@ from symphonai_api.agent_file import (
 from symphonai_api.agent_spec import (
     AgentSpec,
     ContextInheritance,
-    Effort,
     IOContract,
     Isolation,
     ModelSelector,
@@ -138,7 +137,7 @@ def minimal_and_full() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         repo_root = directory / "repo"
-        default_model = ModelSelector("default", "default-model", Effort.LOW)
+        default_model = ModelSelector("default", "default-model", "provider-low")
         minimal = _write(directory, "minimal.toml", 'prompt = "Review."\n')
         loaded = load_agent_file(
             minimal,
@@ -175,7 +174,7 @@ def minimal_and_full() -> None:
         if effort_loaded.model != ModelSelector(
             "default",
             "default-model",
-            Effort.HIGH,
+            "high",
         ):
             fail("effort-only model did not merge over the default")
         provider_only = _write(
@@ -242,7 +241,7 @@ output_schema = { type = "object", properties = { verdict = { type = "string" } 
         if full_loaded.model != ModelSelector(
             "anthropic",
             "claude-sonnet-5",
-            Effort.HIGH,
+            "high",
         ):
             fail(f"full model was not loaded: {full_loaded.model!r}")
         without_default = load_agent_file(
@@ -447,17 +446,14 @@ def validation_errors_name_the_key() -> None:
         bad_effort = _write(
             directory,
             "bad-effort.toml",
-            'prompt = "Review."\n[model]\neffort = "extreme"\n',
+            'prompt = "Review."\n[model]\neffort = 3\n',
         )
-        message = _expect_error(
+        _expect_error(
             bad_effort,
             "effort",
             repo_root=directory,
             default_model=default_model,
         )
-        for value in ("default", "low", "medium", "high"):
-            if value not in message:
-                fail(f"effort error omitted valid value {value!r}: {message!r}")
         for mode in ("ask", "plan", "allow"):
             path = _write(
                 directory,
@@ -693,10 +689,8 @@ def tool_allow_and_deny() -> None:
 
 @check("agent_file.effort_leaves_schema_version_alone")
 def effort_leaves_schema_version_alone() -> None:
-    if [value.value for value in Effort] != ["default", "low", "medium", "high"]:
-        fail(f"unexpected effort values: {list(Effort)!r}")
     model = ModelSelector("fake")
-    if model.effort is not Effort.DEFAULT:
+    if model.effort is not None:
         fail(f"model effort default changed: {model.effort!r}")
     with tempfile.TemporaryDirectory() as temporary:
         policy = PermissionPolicy(Path(temporary))
@@ -710,6 +704,27 @@ def effort_leaves_schema_version_alone() -> None:
         )
         if versions != (1, 1, 1, 1, 1):
             fail(f"effort changed schema versions: {versions!r}")
+
+
+@check("agent_file.opaque_effort")
+def opaque_effort() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        path = _write(
+            directory,
+            "opaque-effort.toml",
+            """prompt = "Review."
+[model]
+provider = "anthropic"
+model = "claude-sonnet-5"
+effort = "xhigh"
+""",
+        )
+        loaded = load_agent_file(path, repo_root=directory)
+        if loaded.model.effort != "xhigh":
+            fail(f"provider effort string was not preserved: {loaded.model!r}")
+        if ModelSelector("future", "model", "vendor-special").effort != "vendor-special":
+            fail("ModelSelector restricted an opaque provider effort")
 
 
 def _agent_file_forbidden_imports(source: str) -> list[str]:

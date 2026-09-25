@@ -10,7 +10,6 @@ import tomllib
 from symphonai_api.agent_spec import (
     AgentSpec,
     ContextInheritance,
-    Effort,
     IOContract,
     Isolation,
     ModelSelector,
@@ -215,14 +214,9 @@ def _model(
     model = default.model if default is not None else None
     if "model" in table:
         model = _string(path, "model", table["model"])
-    effort = default.effort if default is not None else Effort.DEFAULT
+    effort = default.effort if default is not None else None
     if "effort" in table:
-        raw_effort = _string(path, "effort", table["effort"])
-        try:
-            effort = Effort(raw_effort)
-        except ValueError:
-            valid = ", ".join(value.value for value in Effort)
-            _raise(path, "effort", f"must be one of: {valid}")
+        effort = _string(path, "effort", table["effort"])
     try:
         return ModelSelector(provider=provider, model=model, effort=effort)
     except ValueError as exc:

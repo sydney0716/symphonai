@@ -14,7 +14,6 @@ from symphonai_api.budgets import RunBudget
 from symphonai_api.agent_spec import (
     AgentSpec,
     ContextInheritance,
-    Effort,
     IOContract,
     Isolation,
     ModelSelector,
@@ -48,6 +47,7 @@ from symphonai_api.models import (
 )
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider
+from symphonai_api.providers.base import ContextLengthExceededError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.providers.gemini_provider import (
     API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR,
@@ -141,6 +141,21 @@ class _RaisingProvider(FakeModelProvider):
         raise RuntimeError("scripted provider failure")
 
 
+class _ContextOverflowProvider(FakeModelProvider):
+    def __init__(self, overflows: list[bool]) -> None:
+        super().__init__([ModelResponse(Message(Role.ASSISTANT, "recovered"))])
+        self._overflows = iter(overflows)
+        self.requests: list[ModelRequest] = []
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        self.requests.append(request)
+        if next(self._overflows, False):
+            raise ContextLengthExceededError("request exceeded the model context window")
+        return super().create_response(request, cancel=cancel)
+
+
 class _DeadlineProvider(FakeModelProvider):
     def create_response(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -175,7 +190,7 @@ def _spec(
     io: IOContract = IOContract(),
     deadline_seconds: float | None = None,
     max_depth: int = 0,
-    effort: Effort = Effort.DEFAULT,
+    effort: str | None = None,
     model: str = "test-model",
 ) -> AgentSpec:
     return AgentSpec(
@@ -224,10 +239,10 @@ def check_spec_effort_reaches_requests() -> None:
         )
         specs = {
             "quick": _spec(
-                ws.root, "quick", effort=Effort.LOW, model="gpt-5.4-mini"
+                ws.root, "quick", effort="low", model="gpt-5.4-mini"
             ),
             "deep": _spec(
-                ws.root, "deep", effort=Effort.HIGH, model="gpt-5.4-mini"
+                ws.root, "deep", effort="high", model="gpt-5.4-mini"
             ),
         }
         dispatching_provider = FakeModelProvider(
@@ -266,7 +281,7 @@ def check_spec_effort_reaches_requests() -> None:
         leader_provider = _RecordingFakeProvider(
             [ModelResponse(Message(Role.ASSISTANT, "leader done"))]
         )
-        leader_spec = _spec(ws.root, "leader", effort=Effort.MEDIUM)
+        leader_spec = _spec(ws.root, "leader", effort="xhigh")
         leader = Leader(
             LeaderConfig(
                 leader_provider=leader_provider,
@@ -278,7 +293,7 @@ def check_spec_effort_reaches_requests() -> None:
         result = leader.run("work")
         if result.final_answer != "leader done":
             fail(f"leader effort run did not finish: {result!r}")
-        if [request.effort for request in leader_provider.requests] != [Effort.MEDIUM]:
+        if [request.effort for request in leader_provider.requests] != ["xhigh"]:
             fail(f"leader spec effort did not reach its request: {leader_provider.requests!r}")
 
 
@@ -1383,6 +1398,93 @@ def check_chat_history() -> None:
         contents = [m.text for m in second.leader_messages]
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
+
+
+@check("leader.context_overflow_compacts_and_recovers")
+def check_context_overflow_compacts_and_recovers() -> None:
+    with workspace() as ws:
+        provider = _ContextOverflowProvider([True, False, False])
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            chat_token_budget=10_000,
+            chat_recent_turns=1,
+        ))
+        leader.seed_chat([
+            Message(Role.USER, "first goal must stay"),
+            Message(Role.ASSISTANT, "old answer " * 80),
+            Message(Role.USER, "old follow-up " * 80),
+            Message(Role.ASSISTANT, "old analysis " * 80),
+        ])
+
+        recovered = leader.chat("current request")
+        if recovered.final_answer != "recovered" or len(provider.requests) != 2:
+            fail("context overflow did not compact and retry exactly once")
+        if len(provider.requests[1].messages) >= len(provider.requests[0].messages):
+            fail("overflow retry did not send fewer messages than the rejected request")
+        if not any(
+            "Earlier conversation compacted" in message.text
+            for message in provider.requests[1].messages
+        ):
+            fail("overflow retry did not carry the compacted conversation summary")
+
+        following = leader.chat("following request")
+        if following.final_answer != "recovered" or len(provider.requests) != 3:
+            fail("conversation was not usable after overflow recovery")
+        following_text = [message.text for message in provider.requests[2].messages]
+        if "current request" not in following_text or "following request" not in following_text:
+            fail(f"following request did not use compacted history: {following_text!r}")
+
+
+@check("leader.context_overflow_retry_failure")
+def check_context_overflow_retry_failure() -> None:
+    with workspace() as ws:
+        provider = _ContextOverflowProvider([True, True, True, True, True])
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            chat_token_budget=10_000,
+            chat_recent_turns=1,
+            max_consecutive_compaction_failures=2,
+        ))
+        leader.seed_chat([
+            Message(Role.USER, "first goal must stay"),
+            Message(Role.ASSISTANT, "old answer " * 80),
+            Message(Role.USER, "old follow-up " * 80),
+            Message(Role.ASSISTANT, "old analysis " * 80),
+        ])
+
+        try:
+            leader.chat("current request")
+        except ContextLengthExceededError:
+            pass
+        else:
+            fail("second context overflow did not propagate")
+        if len(provider.requests) != 2:
+            fail(f"overflow recovery looped instead of retrying once: {len(provider.requests)} requests")
+        breaker = leader._automatic_compaction_breaker
+        if breaker.consecutive_failures != 1 or breaker.is_open:
+            fail("second overflow did not record a failed automatic repair")
+
+        try:
+            leader.chat("still too large")
+        except ContextLengthExceededError:
+            pass
+        else:
+            fail("another second overflow did not propagate")
+        if len(provider.requests) != 4 or not breaker.is_open:
+            fail("consecutive overflow repairs did not open the breaker")
+
+        try:
+            leader.chat("breaker is open")
+        except ContextLengthExceededError:
+            pass
+        else:
+            fail("open compaction breaker hid the next overflow")
+        if len(provider.requests) != 5:
+            fail("open compaction breaker allowed another compact-and-retry attempt")
 
 
 @check("leader.standard_tools")
