@@ -425,6 +425,30 @@ def check_retry_context_length_classification() -> None:
     if urlopen_mock.call_count != 1:
         fail("ordinary HTTP 400 must remain terminal and unretried")
 
+
+@check("retry.context_markers_keep_retryable_statuses")
+def check_context_markers_keep_retryable_statuses() -> None:
+    request = urllib.request.Request("https://mock.invalid/test")
+    overflow_body = '{"error":{"code":"context_length_exceeded"}}'
+    for status in (408, 409, 429):
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=[_http_error(status, overflow_body), _FakeHttpResponse(b"ok")],
+        ) as urlopen_mock:
+            with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+                with mock.patch("symphonai_api.retry.random.uniform", return_value=0.0):
+                    raw = read_with_retry(
+                        request,
+                        timeout=2.0,
+                        max_attempts=2,
+                        api_key="retryable-context-marker-key",
+                        operation=f"HTTP {status} context-marker test",
+                    )
+        if raw != b"ok" or urlopen_mock.call_count != 2:
+            fail(f"HTTP {status} context marker was classified instead of retried")
+        sleep_mock.assert_called_once_with(0.5)
+
+
 @check("retry.exhausted_transient_failures")
 def check_retry_exhausted_transient_failures() -> None:
     basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])

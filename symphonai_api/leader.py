@@ -932,11 +932,16 @@ class Leader:
         *,
         cancel: CancellationToken | None = None,
         record_success: bool = True,
+        recent_turns: int | None = None,
     ) -> CompactionResult:
         result = compact_messages_for_budget(
             self._chat_messages,
             budget=budget,
-            recent_turns=self._config.chat_recent_turns,
+            recent_turns=(
+                self._config.chat_recent_turns
+                if recent_turns is None
+                else recent_turns
+            ),
             cancel=cancel,
         )
         self._chat_messages = result.messages
@@ -977,11 +982,26 @@ class Leader:
             self._config.chat_token_budget,
             max(1, before_tokens - 1),
         )
-        return self._compact_chat_to_budget(
-            forced_budget,
-            cancel=cancel,
-            record_success=False,
-        ).changed
+        user_turns = sum(
+            message.role is Role.USER for message in self._chat_messages
+        )
+        starting_recent_turns = min(
+            self._config.chat_recent_turns,
+            max(1, user_turns),
+        )
+        last_error: ContextCompactionError | None = None
+        for recent_turns in range(starting_recent_turns, 0, -1):
+            try:
+                return self._compact_chat_to_budget(
+                    forced_budget,
+                    cancel=cancel,
+                    record_success=False,
+                    recent_turns=recent_turns,
+                ).changed
+            except ContextCompactionError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
 
     def _automatic_compact_chat(
         self, *, cancel: CancellationToken | None = None

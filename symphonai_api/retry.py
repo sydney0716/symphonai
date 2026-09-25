@@ -93,7 +93,11 @@ def read_with_retry(
         except urllib.error.HTTPError as exc:
             raw_detail = exc.read()
             detail = _redacted_error_detail(raw_detail, api_key)
-            if 400 <= exc.code <= 499 and _is_context_length_error(raw_detail):
+            if (
+                400 <= exc.code <= 499
+                and exc.code not in RETRYABLE_STATUS_CODES
+                and _is_context_length_error(raw_detail)
+            ):
                 raise ContextLengthExceededError(
                     f"{operation} returned HTTP {exc.code}: "
                     "request exceeded the model context window"

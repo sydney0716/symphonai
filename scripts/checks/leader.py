@@ -145,6 +145,9 @@ class _ContextOverflowProvider(FakeModelProvider):
     def __init__(self, overflows: list[bool]) -> None:
         super().__init__([ModelResponse(Message(Role.ASSISTANT, "recovered"))])
         self._overflows = iter(overflows)
+        self.overflow_error = ContextLengthExceededError(
+            "request exceeded the model context window"
+        )
         self.requests: list[ModelRequest] = []
 
     def create_response(
@@ -152,7 +155,7 @@ class _ContextOverflowProvider(FakeModelProvider):
     ) -> ModelResponse:
         self.requests.append(request)
         if next(self._overflows, False):
-            raise ContextLengthExceededError("request exceeded the model context window")
+            raise self.overflow_error
         return super().create_response(request, cancel=cancel)
 
 
@@ -1435,6 +1438,96 @@ def check_context_overflow_compacts_and_recovers() -> None:
         following_text = [message.text for message in provider.requests[2].messages]
         if "current request" not in following_text or "following request" not in following_text:
             fail(f"following request did not use compacted history: {following_text!r}")
+
+
+@check("leader.context_overflow_narrows_recent_window")
+def check_context_overflow_narrows_recent_window() -> None:
+    with workspace() as ws:
+        provider = _ContextOverflowProvider([True, False])
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            chat_token_budget=10_000,
+            chat_recent_turns=3,
+        ))
+        leader.seed_chat([
+            Message(Role.USER, "first goal must stay"),
+            Message(Role.ASSISTANT, "first large answer " * 200),
+            Message(Role.ASSISTANT, "second large answer " * 200),
+            Message(Role.USER, "recent request must stay"),
+            Message(Role.ASSISTANT, "recent answer must stay"),
+        ])
+
+        result = leader.chat("current request must stay")
+        if result.final_answer != "recovered" or len(provider.requests) != 2:
+            fail("narrowing the recent window did not recover the overflow")
+        first_count = len(provider.requests[0].messages)
+        second_messages = provider.requests[1].messages
+        if len(second_messages) >= first_count:
+            fail("narrowed overflow retry did not contain fewer messages")
+        second_text = [message.text for message in second_messages]
+        for preserved in (
+            "first goal must stay",
+            "recent request must stay",
+            "recent answer must stay",
+            "current request must stay",
+        ):
+            if preserved not in second_text:
+                fail(f"narrowed overflow retry lost required context: {preserved!r}")
+
+
+@check("leader.context_overflow_one_turn_failure")
+def check_context_overflow_one_turn_failure() -> None:
+    with workspace() as ws:
+        provider = _ContextOverflowProvider([True])
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            chat_token_budget=10_000,
+            chat_recent_turns=4,
+        ))
+        try:
+            leader.chat("x" * 4_000)
+        except ContextLengthExceededError as exc:
+            if exc is not provider.overflow_error:
+                fail("one-turn compaction did not propagate the original overflow")
+        else:
+            fail("one-turn overflow unexpectedly recovered")
+        if len(provider.requests) != 1:
+            fail("one-turn overflow retried without a compactable message")
+        if leader._automatic_compaction_breaker.consecutive_failures != 1:
+            fail("one-turn overflow did not record a compaction failure")
+
+
+@check("leader.budget_compaction_keeps_recent_window")
+def check_budget_compaction_keeps_recent_window() -> None:
+    with workspace() as ws:
+        leader = Leader(LeaderConfig(
+            FakeModelProvider(),
+            FakeModelProvider(),
+            str(ws.root),
+            chat_token_budget=100,
+            chat_recent_turns=2,
+        ))
+        recent_window = [
+            Message(Role.USER, "recent request one"),
+            Message(Role.ASSISTANT, "recent answer one"),
+            Message(Role.USER, "recent request two"),
+            Message(Role.ASSISTANT, "recent answer two"),
+        ]
+        leader.seed_chat([
+            Message(Role.USER, "first goal"),
+            Message(Role.ASSISTANT, "old answer " * 400),
+            *recent_window,
+        ])
+
+        compacted = leader.compact_chat()
+        if not compacted.changed or compacted.recent_turns != 2:
+            fail(f"ordinary compaction did not use the configured window: {compacted!r}")
+        if compacted.messages[-len(recent_window):] != recent_window:
+            fail("ordinary compaction changed the configured recent window")
 
 
 @check("leader.context_overflow_retry_failure")
