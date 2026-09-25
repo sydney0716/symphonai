@@ -14,6 +14,7 @@ from symphonai_api.budgets import RunBudget
 from symphonai_api.agent_spec import (
     AgentSpec,
     ContextInheritance,
+    Effort,
     IOContract,
     Isolation,
     ModelSelector,
@@ -174,11 +175,13 @@ def _spec(
     io: IOContract = IOContract(),
     deadline_seconds: float | None = None,
     max_depth: int = 0,
+    effort: Effort = Effort.DEFAULT,
+    model: str = "test-model",
 ) -> AgentSpec:
     return AgentSpec(
         name=name,
         prompt=prompt,
-        model=ModelSelector("fake", "test-model"),
+        model=ModelSelector("fake", model, effort=effort),
         policy_ceiling=policy or PermissionPolicy(root),
         deadline_seconds=deadline_seconds,
         isolation=isolation,
@@ -194,6 +197,89 @@ def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
         name="dispatch_subagent",
         arguments={"subagent_name": name, "task": task},
     )
+
+
+@check("leader.spec_effort_reaches_requests")
+def check_spec_effort_reaches_requests() -> None:
+    with workspace() as ws:
+        captured: list[dict] = []
+
+        def effort_urlopen(request, timeout=None):  # noqa: ANN001
+            captured.append(json.loads(request.data.decode("utf-8")))
+            payload = {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+            return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        child_provider = OpenAICompatibleProvider(
+            api_key_env_var=OPENAI_COMPATIBLE_API_KEY_ENV_VAR,
+            base_url="https://mock.invalid/v1",
+            provider_label="grok",
+        )
+        specs = {
+            "quick": _spec(
+                ws.root, "quick", effort=Effort.LOW, model="gpt-5.4-mini"
+            ),
+            "deep": _spec(
+                ws.root, "deep", effort=Effort.HIGH, model="gpt-5.4-mini"
+            ),
+        }
+        dispatching_provider = FakeModelProvider(
+            [
+                ModelResponse(
+                    Message(
+                        Role.ASSISTANT,
+                        tool_calls=[
+                            _dispatch("quick", "quick work", "quick-call"),
+                            _dispatch("deep", "deep work", "deep-call"),
+                        ],
+                    )
+                ),
+                ModelResponse(Message(Role.ASSISTANT, "all done")),
+            ]
+        )
+        dispatching_leader = Leader(
+            LeaderConfig(
+                leader_provider=dispatching_provider,
+                subagent_provider=child_provider,
+                repo_root=str(ws.root),
+                subagent_specs=specs,
+            )
+        )
+        with mock.patch.dict(
+            os.environ,
+            {OPENAI_COMPATIBLE_API_KEY_ENV_VAR: "compatible-effort-key"},
+        ), mock.patch("urllib.request.urlopen", side_effect=effort_urlopen):
+            dispatch_result = dispatching_leader.run("delegate both tasks")
+        if dispatch_result.final_answer != "all done":
+            fail(f"effort test leader did not finish: {dispatch_result!r}")
+        efforts = [body.get("reasoning_effort") for body in captured]
+        if efforts != ["low", "high"]:
+            fail(f"subagent specs did not keep independent efforts: {captured!r}")
+
+        leader_provider = _RecordingFakeProvider(
+            [ModelResponse(Message(Role.ASSISTANT, "leader done"))]
+        )
+        leader_spec = _spec(ws.root, "leader", effort=Effort.MEDIUM)
+        leader = Leader(
+            LeaderConfig(
+                leader_provider=leader_provider,
+                subagent_provider=FakeModelProvider(),
+                repo_root=str(ws.root),
+                subagent_specs={"leader": leader_spec},
+            )
+        )
+        result = leader.run("work")
+        if result.final_answer != "leader done":
+            fail(f"leader effort run did not finish: {result!r}")
+        if [request.effort for request in leader_provider.requests] != [Effort.MEDIUM]:
+            fail(f"leader spec effort did not reach its request: {leader_provider.requests!r}")
 
 
 # Captured from commit c11c7c3 -- the last tree before leader control-plane

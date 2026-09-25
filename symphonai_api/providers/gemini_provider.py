@@ -29,6 +29,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from symphonai_api.agent_spec import Effort
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.gemini_schema import sanitize_for_gemini
 from symphonai_api.identity import new_id
@@ -70,6 +71,12 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # be worth much if it could not call tools. Step up to `gemini-flash-latest`
 # or a pro model via `model=` when a task needs more capability.
 DEFAULT_MODEL = "gemini-flash-lite-latest"
+
+_THINKING_BUDGETS = {
+    Effort.LOW: 1024,
+    Effort.MEDIUM: 4096,
+    Effort.HIGH: 8192,
+}
 
 
 def _synthesize_tool_call_id() -> str:
@@ -195,7 +202,9 @@ def _build_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"functionDeclarations": declarations}] if declarations else []
 
 
-def _build_request_body(request: ModelRequest) -> dict[str, Any]:
+def _build_request_body(
+    request: ModelRequest, model: str | None = None
+) -> dict[str, Any]:
     reject_system_attachments(request.messages)
     body: dict[str, Any] = {"contents": _build_contents(request.messages)}
 
@@ -213,6 +222,15 @@ def _build_request_body(request: ModelRequest) -> dict[str, Any]:
         generation_config["maxOutputTokens"] = request.max_tokens
     if request.temperature is not None:
         generation_config["temperature"] = request.temperature
+    model_name = "" if model is None else model.rsplit("/", 1)[-1]
+    if request.effort is not Effort.DEFAULT and model_name.startswith("gemini-3"):
+        generation_config["thinkingConfig"] = {
+            "thinkingLevel": request.effort.value,
+        }
+    elif request.effort is not Effort.DEFAULT and model_name.startswith("gemini-2.5"):
+        generation_config["thinkingConfig"] = {
+            "thinkingBudget": _THINKING_BUDGETS[request.effort],
+        }
     if generation_config:
         body["generationConfig"] = generation_config
 
@@ -368,7 +386,7 @@ class GeminiProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request)
+        body = _build_request_body(request, model)
         http_request = urllib.request.Request(
             f"{self.base_url}/models/{model}:generateContent",
             data=json.dumps(body).encode("utf-8"),
@@ -399,7 +417,7 @@ class GeminiProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request)
+        body = _build_request_body(request, model)
         http_request = urllib.request.Request(
             f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse",
             data=json.dumps(body).encode("utf-8"),

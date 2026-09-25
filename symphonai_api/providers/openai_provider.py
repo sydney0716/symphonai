@@ -20,6 +20,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from symphonai_api.agent_spec import Effort
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
 from symphonai_api.models import (
@@ -57,6 +58,15 @@ _ROLE_TO_OPENAI = {
     Role.ASSISTANT: "assistant",
     Role.TOOL: "tool",
 }
+
+
+def _supports_reasoning_effort(model: str) -> bool:
+    model_name = model.rsplit("/", 1)[-1]
+    return model_name.startswith(("gpt-5", "gpt-6", "o1-", "o3-", "o4-")) or model_name in {
+        "o1",
+        "o3",
+        "o4",
+    }
 
 
 def _openai_content(message: Message) -> list[dict[str, Any]]:
@@ -134,6 +144,8 @@ def _build_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
         body["max_tokens"] = request.max_tokens
     if request.temperature is not None:
         body["temperature"] = request.temperature
+    if request.effort is not Effort.DEFAULT and _supports_reasoning_effort(model):
+        body["reasoning_effort"] = request.effort.value
     return body
 
 

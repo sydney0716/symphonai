@@ -29,7 +29,7 @@ from symphonai_api.agent_run import (
     new_agent_run,
     read_run_graph,
 )
-from symphonai_api.agent_spec import AgentSpec, Isolation, ModelSelector, validate_output
+from symphonai_api.agent_spec import AgentSpec, Effort, Isolation, ModelSelector, validate_output
 from symphonai_api.budgets import RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import (
@@ -522,6 +522,7 @@ class DispatchSubagentTool(LocalTool):
                 run_result = record.agent.run(
                     record.messages,
                     model=spec.model.model,
+                    effort=spec.model.effort,
                     parent_run_id=(
                         None
                         if self._parent_run is None
@@ -700,6 +701,9 @@ class Leader:
             if defined_leader is None or defined_leader.model.model is None
             else defined_leader.model.model
         )
+        self._leader_effort = (
+            Effort.DEFAULT if defined_leader is None else defined_leader.model.effort
+        )
         self._leader_run: AgentRun | None = None
         self._dispatch_tool = DispatchSubagentTool(
             subagent_provider=config.subagent_provider,
@@ -746,6 +750,7 @@ class Leader:
                     if self._leader_model is not None
                     else getattr(config.leader_provider, "model", None)
                 ),
+                effort=self._leader_effort,
             ),
             policy_ceiling=leader_policy,
             tool_names=tuple(leader_tools),
@@ -817,6 +822,7 @@ class Leader:
             result = self._agent.run(
                 messages,
                 model=self._leader_model,
+                effort=self._leader_effort,
                 cancel=cancel,
                 hooks=self._hook_runner,
             )

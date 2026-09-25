@@ -12,10 +12,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from symphonai_api.call_class import CallClass
 from symphonai_api.identity import SCHEMA_VERSION
+
+if TYPE_CHECKING:
+    from symphonai_api.agent_spec import Effort
+
+
+def _default_effort() -> Effort:
+    from symphonai_api.agent_spec import Effort
+
+    return Effort.DEFAULT
 
 
 @dataclass(frozen=True)
@@ -226,6 +235,7 @@ class ModelRequest:
     model: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    effort: Effort = field(default_factory=_default_effort)
     call_class: CallClass = CallClass.FOREGROUND
 
 

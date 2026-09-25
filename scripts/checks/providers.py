@@ -5,14 +5,25 @@ from __future__ import annotations
 import json
 import os
 import unittest.mock as mock
+from symphonai_api.agent_spec import Effort
 from symphonai_api.models import Message, ModelRequest, Role
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
-from symphonai_api.providers.anthropic_provider import AnthropicProvider
+from symphonai_api.providers.anthropic_provider import (
+    AnthropicProvider,
+    _build_request_body as _build_anthropic_body,
+)
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
-from symphonai_api.providers.gemini_provider import GeminiProvider
+from symphonai_api.providers.gemini_provider import (
+    GeminiProvider,
+    _build_request_body as _build_gemini_body,
+)
 from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
-from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.providers.openai_provider import (
+    API_KEY_ENV_VAR,
+    OpenAIProvider,
+    _build_request_body as _build_openai_body,
+)
 from scripts.checks.harness import check, fail
 
 
@@ -40,6 +51,172 @@ def _openai_success(content: str) -> _FakeHttpResponse:
         "usage": {},
     }
     return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+
+@check("providers.effort_request_bodies")
+def check_effort_request_bodies() -> None:
+    message = Message(role=Role.USER, content="hello")
+    high = ModelRequest(messages=[message], effort=Effort.HIGH)
+    bodies = {
+        "openai": _build_openai_body(high, "gpt-5.4-mini"),
+        "anthropic": _build_anthropic_body(high, "claude-sonnet-5", 1024),
+        "gemini-3": _build_gemini_body(high, "gemini-3.5-flash"),
+        "gemini-2.5": _build_gemini_body(high, "gemini-2.5-flash"),
+    }
+    expected = {
+        "openai": "high",
+        "anthropic": {"effort": "high"},
+        "gemini-3": {"thinkingLevel": "high"},
+        "gemini-2.5": {"thinkingBudget": 8192},
+    }
+    actual = {
+        "openai": bodies["openai"].get("reasoning_effort"),
+        "anthropic": bodies["anthropic"].get("output_config"),
+        "gemini-3": bodies["gemini-3"].get("generationConfig", {}).get(
+            "thinkingConfig"
+        ),
+        "gemini-2.5": bodies["gemini-2.5"].get("generationConfig", {}).get(
+            "thinkingConfig"
+        ),
+    }
+    if actual != expected:
+        fail(f"provider effort request fields were wrong: {actual!r}")
+
+
+@check("providers.default_effort_body_identity")
+def check_default_effort_body_identity() -> None:
+    request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
+    actual = {
+        "openai": _build_openai_body(request, "gpt-5.4-mini"),
+        "anthropic": _build_anthropic_body(request, "claude-sonnet-5", 1024),
+        "gemini": _build_gemini_body(request, "gemini-3.5-flash"),
+    }
+    expected = {
+        "openai": {
+            "model": "gpt-5.4-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        "anthropic": {
+            "model": "claude-sonnet-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        "gemini": {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        },
+    }
+    if actual != expected:
+        fail(f"default effort changed provider request bodies: {actual!r}")
+    unknown = {
+        "openai": _build_openai_body(
+            ModelRequest(messages=request.messages, effort=Effort.HIGH),
+            "unclassified-model",
+        ),
+        "anthropic": _build_anthropic_body(
+            ModelRequest(messages=request.messages, effort=Effort.HIGH),
+            "unclassified-model",
+            1024,
+        ),
+        "gemini": _build_gemini_body(
+            ModelRequest(messages=request.messages, effort=Effort.HIGH),
+            "unclassified-model",
+        ),
+    }
+    if unknown != {
+        "openai": {
+            "model": "unclassified-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        "anthropic": {
+            "model": "unclassified-model",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        "gemini": {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        },
+    }:
+        fail(f"unknown models received guessed effort controls: {unknown!r}")
+
+
+@check("providers.effort_reaches_transports")
+def check_effort_reaches_transports() -> None:
+    request = ModelRequest(
+        messages=[Message(role=Role.USER, content="hello")],
+        effort=Effort.HIGH,
+    )
+    captured: dict[str, dict] = {}
+
+    def openai_urlopen(http_request, timeout=None):  # noqa: ANN001
+        captured["openai"] = json.loads(http_request.data.decode("utf-8"))
+        return _openai_success("ok")
+
+    with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "openai-effort-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=openai_urlopen
+    ):
+        OpenAIProvider(model="gpt-5.4-mini").create_response(request)
+
+    def anthropic_urlopen(http_request, timeout=None):  # noqa: ANN001
+        captured["anthropic"] = json.loads(http_request.data.decode("utf-8"))
+        payload = {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {},
+            "stop_reason": "end_turn",
+        }
+        return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+    with mock.patch.dict(
+        os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "anthropic-effort-key"}
+    ), mock.patch("urllib.request.urlopen", side_effect=anthropic_urlopen):
+        AnthropicProvider(model="claude-sonnet-5").create_response(request)
+
+    def gemini_urlopen(http_request, timeout=None):  # noqa: ANN001
+        captured["gemini"] = json.loads(http_request.data.decode("utf-8"))
+        payload = {
+            "candidates": [
+                {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {},
+        }
+        return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+    with mock.patch.dict(
+        os.environ, {GEMINI_API_KEY_ENV_VAR: "gemini-effort-key"}
+    ), mock.patch("urllib.request.urlopen", side_effect=gemini_urlopen):
+        GeminiProvider(model="gemini-3.5-flash").create_response(request)
+
+    compatible_env = "SYMPHONAI_EFFORT_COMPATIBLE_KEY"
+
+    def compatible_urlopen(http_request, timeout=None):  # noqa: ANN001
+        captured["compatible"] = json.loads(http_request.data.decode("utf-8"))
+        return _openai_success("ok")
+
+    with mock.patch.dict(os.environ, {compatible_env: "compatible-effort-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=compatible_urlopen
+    ):
+        OpenAICompatibleProvider(
+            api_key_env_var=compatible_env,
+            base_url="https://mock.invalid/v1",
+            model="gpt-5.4-mini",
+            provider_label="grok",
+        ).create_response(request)
+
+    actual = {
+        "openai": captured["openai"].get("reasoning_effort"),
+        "anthropic": captured["anthropic"].get("output_config"),
+        "gemini": captured["gemini"].get("generationConfig", {}).get(
+            "thinkingConfig"
+        ),
+        "compatible": captured["compatible"].get("reasoning_effort"),
+    }
+    expected = {
+        "openai": "high",
+        "anthropic": {"effort": "high"},
+        "gemini": {"thinkingLevel": "high"},
+        "compatible": "high",
+    }
+    if actual != expected:
+        fail(f"effort did not reach fake HTTP transports: {actual!r}")
 
 @check("providers.model_overrides")
 def check_providers_model_overrides() -> None:

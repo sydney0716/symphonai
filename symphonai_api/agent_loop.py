@@ -16,6 +16,7 @@ import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 
+from symphonai_api.agent_spec import Effort
 from symphonai_api.budgets import BudgetState, RunBudget, DEFAULT_MAX_TURNS
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
@@ -213,6 +214,7 @@ class ApiAgent:
         messages: list[Message],
         *,
         model: str | None = None,
+        effort: Effort = Effort.DEFAULT,
         parent_run_id: str | None = None,
         cancel: CancellationToken | None = None,
         pause: PauseGate | None = None,
@@ -378,6 +380,7 @@ class ApiAgent:
                     messages=list(conversation),
                     model=model,
                     tools=self._tool_schemas,
+                    effort=effort,
                     call_class=self._call_class,
                 )
                 append_record(
