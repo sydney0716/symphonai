@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from symphonai_api.models import ToolCall
-from symphonai_api.permissions import DenialReason, PermissionPolicy
+from symphonai_api.permissions import ApprovalOutcome, DenialReason, PermissionPolicy
 from symphonai_api.tools.shell_classify import classify
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -21,7 +21,11 @@ def check_plan_path_decisions() -> None:
             mode="plan",
         )
         read = policy.check_read("existing.txt")
-        if not read.allowed or read.denial is not None:
+        if (
+            not read.allowed
+            or read.denial is not None
+            or read.outcome is not ApprovalOutcome.ALLOWED
+        ):
             fail(f"plan mode refused an in-root read: {read!r}")
 
         write = policy.check_write("existing.txt")
@@ -29,6 +33,7 @@ def check_plan_path_decisions() -> None:
             write.allowed
             or write.reason != PLAN_MODE_REASON
             or write.denial is not DenialReason.PLAN_MODE
+            or write.outcome is not ApprovalOutcome.REJECTED
         ):
             fail(f"plan mode did not refuse a writable path: {write!r}")
 
@@ -37,6 +42,7 @@ def check_plan_path_decisions() -> None:
             outside.allowed
             or outside.reason != "path escapes repo_root: '../outside.txt'"
             or outside.denial is not DenialReason.OUTSIDE_ROOT
+            or outside.outcome is not ApprovalOutcome.REJECTED
         ):
             fail(f"outside-root reason did not take precedence in plan mode: {outside!r}")
 
@@ -55,6 +61,7 @@ def check_plan_command_decisions() -> None:
             always_denied.allowed
             or always_denied.reason != "command matches always-deny rule: 'rm'"
             or always_denied.denial is not DenialReason.ALWAYS_DENY
+            or always_denied.outcome is not ApprovalOutcome.REJECTED
         ):
             fail(f"always-deny did not take precedence in plan mode: {always_denied!r}")
 
@@ -66,6 +73,7 @@ def check_plan_command_decisions() -> None:
             plan_denied.allowed
             or plan_denied.reason != PLAN_MODE_REASON
             or plan_denied.denial is not DenialReason.PLAN_MODE
+            or plan_denied.outcome is not ApprovalOutcome.REJECTED
         ):
             fail(f"safe-classified shell escaped plan mode: {plan_denied!r}")
 

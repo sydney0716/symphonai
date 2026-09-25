@@ -9,7 +9,7 @@ import time
 from dataclasses import fields
 from pathlib import Path
 
-from symphonai_api.permissions import DenialReason, ToolApprovalRequest
+from symphonai_api.permissions import ApprovalOutcome, DenialReason, ToolApprovalRequest
 from symphonai_host.approvals import ApprovalBroker, PendingApproval
 from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
@@ -104,7 +104,11 @@ def check_allow_resumes() -> None:
     broker, item, result, thread = _waiting()
     broker.resolve(item.approval_id, allowed=True, reason="")
     thread.join(1)
-    if not result or not result[0].allowed:
+    if (
+        not result
+        or not result[0].allowed
+        or result[0].outcome is not ApprovalOutcome.ALLOWED
+    ):
         fail(f"allowed reply did not resume: {result!r}")
 
 
@@ -113,7 +117,11 @@ def check_deny_blocks_call() -> None:
     broker, item, result, thread = _waiting()
     broker.resolve(item.approval_id, allowed=False, reason="no")
     thread.join(1)
-    if not result or result[0].denial is not DenialReason.DENIED_BY_USER:
+    if (
+        not result
+        or result[0].denial is not DenialReason.DENIED_BY_USER
+        or result[0].outcome is not ApprovalOutcome.REJECTED
+    ):
         fail(f"denial reason was lost: {result!r}")
 
 
@@ -127,7 +135,11 @@ def check_unknown_id_404() -> None:
 def check_timeout_denies() -> None:
     broker = ApprovalBroker(lambda _: True, timeout=0.05)
     result = broker.callback(REQUEST)
-    if result.denial is not DenialReason.APPROVAL_FAILED or "0.05" not in result.reason:
+    if (
+        result.denial is not DenialReason.APPROVAL_FAILED
+        or result.outcome is not ApprovalOutcome.UNAVAILABLE
+        or "0.05" not in result.reason
+    ):
         fail(f"timeout denial was wrong: {result!r}")
 
 
@@ -135,7 +147,11 @@ def check_timeout_denies() -> None:
 def check_no_subscriber_denies_fast() -> None:
     start = time.monotonic()
     result = ApprovalBroker(lambda _: False, timeout=1).callback(REQUEST)
-    if result.denial is not DenialReason.NO_APPROVAL_CALLBACK or time.monotonic() - start > 0.2:
+    if (
+        result.denial is not DenialReason.NO_APPROVAL_CALLBACK
+        or result.outcome is not ApprovalOutcome.UNAVAILABLE
+        or time.monotonic() - start > 0.2
+    ):
         fail(f"missing subscriber parked approval: {result!r}")
 
 
@@ -144,14 +160,22 @@ def check_broker_cancel_all_unparks() -> None:
     broker, item, result, thread = _waiting()
     broker.cancel_all(reason="stopped")
     thread.join(1)
-    if not result or "stopped" not in result[0].reason:
+    if (
+        not result
+        or result[0].denial is not DenialReason.APPROVAL_CANCELLED
+        or result[0].outcome is not ApprovalOutcome.CANCELLED
+        or "stopped" not in result[0].reason
+    ):
         fail(f"stop did not unpark approval: {result!r}")
 
 
 @check("host_approvals.callback_never_raises")
 def check_callback_never_raises() -> None:
     result = ApprovalBroker(lambda _: (_ for _ in ()).throw(RuntimeError("boom"))).callback(REQUEST)
-    if result.denial is not DenialReason.NO_APPROVAL_CALLBACK:
+    if (
+        result.denial is not DenialReason.NO_APPROVAL_CALLBACK
+        or result.outcome is not ApprovalOutcome.UNAVAILABLE
+    ):
         fail(f"publisher failure escaped approval callback: {result!r}")
 
 
@@ -371,7 +395,12 @@ def check_no_subscriber_over_http() -> None:
         started = time.monotonic()
         decision = callback(REQUEST)
         elapsed = time.monotonic() - started
-        if decision.allowed or decision.denial is not DenialReason.NO_APPROVAL_CALLBACK or elapsed >= 1:
+        if (
+            decision.allowed
+            or decision.denial is not DenialReason.NO_APPROVAL_CALLBACK
+            or decision.outcome is not ApprovalOutcome.UNAVAILABLE
+            or elapsed >= 1
+        ):
             fail(f"no-subscriber approval did not deny promptly: {decision!r}, elapsed={elapsed:.3f}s")
     finally:
         host.close()
@@ -404,7 +433,12 @@ def check_stop_unparks_over_http() -> None:
             if thread.is_alive() or not result:
                 fail(f"stop did not unpark approval; pending={pending!r}, result={result!r}")
             decision = result[0]
-            if decision.allowed or decision.denial is not DenialReason.APPROVAL_FAILED or "stopped" not in decision.reason:
+            if (
+                decision.allowed
+                or decision.denial is not DenialReason.APPROVAL_CANCELLED
+                or decision.outcome is not ApprovalOutcome.CANCELLED
+                or "stopped" not in decision.reason
+            ):
                 fail(f"stop returned the wrong approval decision: {decision!r}")
         finally:
             connection.close()

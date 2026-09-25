@@ -117,7 +117,7 @@ class ApprovalBroker:
                 if item.decision is None:
                     item.decision = PermissionDecision.deny(
                         f"run stopped while waiting for approval: {reason}",
-                        denial=DenialReason.APPROVAL_FAILED,
+                        denial=DenialReason.APPROVAL_CANCELLED,
                     )
                     item.event.set()
             return len(pending)

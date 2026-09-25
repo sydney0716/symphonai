@@ -12,6 +12,8 @@ from pathlib import Path
 from symphonai_api.events import CollectingSink, PermissionDenied, PermissionRequested
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import (
+    ApprovalOutcome,
+    DENIAL_OUTCOMES,
     DenialReason,
     PermissionDecision,
     PermissionPolicy,
@@ -243,6 +245,95 @@ def check_permissions_typed_reasons() -> None:
         encoded = json.dumps(list(DenialReason))
         if json.loads(encoded) != [reason.value for reason in DenialReason]:
             fail(f"DenialReason did not serialize as string values: {encoded!r}")
+
+
+@check("permissions.approval_outcome_mapping")
+def check_approval_outcome_mapping() -> None:
+    if tuple(ApprovalOutcome) != (
+        ApprovalOutcome.ALLOWED,
+        ApprovalOutcome.REJECTED,
+        ApprovalOutcome.CANCELLED,
+        ApprovalOutcome.UNAVAILABLE,
+    ):
+        fail(f"approval outcomes are not the closed four-value set: {tuple(ApprovalOutcome)!r}")
+    if set(DENIAL_OUTCOMES) != set(DenialReason):
+        missing = set(DenialReason) - set(DENIAL_OUTCOMES)
+        extra = set(DENIAL_OUTCOMES) - set(DenialReason)
+        fail(f"denial outcome mapping is not total: missing={missing!r}, extra={extra!r}")
+
+    expected_unavailable = {
+        DenialReason.NO_APPROVAL_CALLBACK,
+        DenialReason.APPROVAL_FAILED,
+        DenialReason.INVALID_APPROVAL,
+    }
+    for denial in DenialReason:
+        expected = (
+            ApprovalOutcome.CANCELLED
+            if denial is DenialReason.APPROVAL_CANCELLED
+            else ApprovalOutcome.UNAVAILABLE
+            if denial in expected_unavailable
+            else ApprovalOutcome.REJECTED
+        )
+        if DENIAL_OUTCOMES[denial] is not expected:
+            fail(f"wrong outcome for {denial.value}: {DENIAL_OUTCOMES[denial].value}")
+
+
+@check("permissions.approval_outcome_paths")
+def check_approval_outcome_paths() -> None:
+    with workspace() as ws:
+        def raising_callback(request) -> bool:
+            raise RuntimeError("approval broke")
+
+        paths = {
+            "allowed": PermissionPolicy(
+                repo_root=ws.root,
+                mode="ask",
+                approval_callback=lambda request: True,
+            ).check_write("new.txt"),
+            "rejected": PermissionPolicy(
+                repo_root=ws.root,
+                mode="ask",
+                approval_callback=lambda request: False,
+            ).check_write("new.txt"),
+            "missing": PermissionPolicy(
+                repo_root=ws.root,
+                mode="ask",
+            ).check_write("new.txt"),
+            "raising": PermissionPolicy(
+                repo_root=ws.root,
+                mode="ask",
+                approval_callback=raising_callback,
+            ).check_write("new.txt"),
+            "invalid": PermissionPolicy(
+                repo_root=ws.root,
+                mode="ask",
+                approval_callback=lambda request: "invalid",
+            ).check_write("new.txt"),
+            "cancelled": PermissionDecision.deny(
+                "run stopped",
+                denial=DenialReason.APPROVAL_CANCELLED,
+            ),
+        }
+        expected = {
+            "allowed": ApprovalOutcome.ALLOWED,
+            "rejected": ApprovalOutcome.REJECTED,
+            "missing": ApprovalOutcome.UNAVAILABLE,
+            "raising": ApprovalOutcome.UNAVAILABLE,
+            "invalid": ApprovalOutcome.UNAVAILABLE,
+            "cancelled": ApprovalOutcome.CANCELLED,
+        }
+        actual = {name: decision.outcome for name, decision in paths.items()}
+        if actual != expected:
+            fail(f"approval paths produced wrong outcomes: {actual!r}")
+        if any(
+            decision.allowed
+            for name, decision in paths.items()
+            if expected[name] is not ApprovalOutcome.ALLOWED
+        ):
+            fail(f"a non-allowed approval outcome opened the gate: {paths!r}")
+        fallback = PermissionDecision(allowed=False, reason="unknown denial")
+        if fallback.outcome is not ApprovalOutcome.UNAVAILABLE:
+            fail(f"unclassified denial did not fail closed: {fallback!r}")
 
 
 @check("permissions.named_modes_and_equality")
@@ -1064,6 +1155,7 @@ def opaque_tool_modes() -> None:
         ("APPROVAL_FAILED", "approval_failed"),
         ("DENIED_BY_USER", "denied_by_user"),
         ("INVALID_APPROVAL", "invalid_approval"),
+        ("APPROVAL_CANCELLED", "approval_cancelled"),
         ("PLAN_MODE", "plan_mode"),
         ("UNSUPPORTED_SCHEME", "unsupported_scheme"),
         ("BLOCKED_HOST", "blocked_host"),

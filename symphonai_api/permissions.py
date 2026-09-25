@@ -90,10 +90,40 @@ class DenialReason(str, Enum):
     APPROVAL_FAILED = "approval_failed"
     DENIED_BY_USER = "denied_by_user"
     INVALID_APPROVAL = "invalid_approval"
+    APPROVAL_CANCELLED = "approval_cancelled"
     PLAN_MODE = "plan_mode"
     UNSUPPORTED_SCHEME = "unsupported_scheme"
     BLOCKED_HOST = "blocked_host"
     DOMAIN_NOT_APPROVED = "domain_not_approved"
+
+
+class ApprovalOutcome(str, Enum):
+    """How an approval or policy decision ended."""
+
+    ALLOWED = "allowed"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    UNAVAILABLE = "unavailable"
+
+
+DENIAL_OUTCOMES: dict[DenialReason, ApprovalOutcome] = {
+    DenialReason.OUTSIDE_ROOT: ApprovalOutcome.REJECTED,
+    DenialReason.FORBIDDEN_PATTERN: ApprovalOutcome.REJECTED,
+    DenialReason.OUTSIDE_WRITE_SCOPE: ApprovalOutcome.REJECTED,
+    DenialReason.EMPTY_COMMAND: ApprovalOutcome.REJECTED,
+    DenialReason.ALWAYS_DENY: ApprovalOutcome.REJECTED,
+    DenialReason.SHELL_DISABLED: ApprovalOutcome.REJECTED,
+    DenialReason.NOT_ALLOWLISTED: ApprovalOutcome.REJECTED,
+    DenialReason.NO_APPROVAL_CALLBACK: ApprovalOutcome.UNAVAILABLE,
+    DenialReason.APPROVAL_FAILED: ApprovalOutcome.UNAVAILABLE,
+    DenialReason.DENIED_BY_USER: ApprovalOutcome.REJECTED,
+    DenialReason.INVALID_APPROVAL: ApprovalOutcome.UNAVAILABLE,
+    DenialReason.APPROVAL_CANCELLED: ApprovalOutcome.CANCELLED,
+    DenialReason.PLAN_MODE: ApprovalOutcome.REJECTED,
+    DenialReason.UNSUPPORTED_SCHEME: ApprovalOutcome.REJECTED,
+    DenialReason.BLOCKED_HOST: ApprovalOutcome.REJECTED,
+    DenialReason.DOMAIN_NOT_APPROVED: ApprovalOutcome.REJECTED,
+}
 
 
 @dataclass(frozen=True)
@@ -103,6 +133,15 @@ class PermissionDecision:
     allowed: bool
     reason: str = ""
     denial: DenialReason | None = None
+    outcome: ApprovalOutcome = field(init=False)
+
+    def __post_init__(self) -> None:
+        outcome = (
+            ApprovalOutcome.ALLOWED
+            if self.allowed
+            else DENIAL_OUTCOMES.get(self.denial, ApprovalOutcome.UNAVAILABLE)
+        )
+        object.__setattr__(self, "outcome", outcome)
 
     @classmethod
     def allow(cls) -> "PermissionDecision":
