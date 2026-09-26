@@ -19,6 +19,7 @@ from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECEN
 from symphonai_api.cost import PriceTable
 from symphonai_api.extensions import Extensions
 from symphonai_api.model_discovery import list_models
+from symphonai_api.model_table import model_capabilities
 from symphonai_api.permissions import PermissionPolicy, _contains_path
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR, AnthropicProvider
@@ -56,6 +57,18 @@ PROVIDERS = (
     ("gemini", GEMINI_KEY_ENV_VAR, GeminiProvider),
     ("openai", OPENAI_KEY_ENV_VAR, OpenAIProvider),
 )
+
+
+def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+    efforts = {
+        capability.model: [option.id for option in capability.efforts]
+        for capability in model_capabilities()
+        if capability.provider == provider
+    }
+    return [
+        {"id": model, "efforts": efforts.get(model, [])}
+        for model in models
+    ]
 
 
 def _provider(name: str | None = None, model: str | None = None, base_url: str | None = None) -> ModelProvider | None:
@@ -449,7 +462,7 @@ class HostServer:
                         self._json(HTTPStatus.OK, {
                             "provider": name,
                             "state": "available",
-                            "models": list(cached),
+                            "models": _models_with_efforts(name, cached),
                             "detail": "",
                         })
                         return
@@ -476,7 +489,7 @@ class HostServer:
                     self._json(HTTPStatus.OK, {
                         "provider": name,
                         "state": "available",
-                        "models": models,
+                        "models": _models_with_efforts(name, models),
                         "detail": "",
                     })
                     return
@@ -774,15 +787,23 @@ class HostServer:
                 if self.path == "/provider":
                     try:
                         choice = self._read_object()
-                        if not isinstance(choice.get("name"), str) or set(choice) - {"name", "model", "base_url"}:
+                        if not isinstance(choice.get("name"), str) or set(choice) - {"name", "model", "base_url", "effort"}:
                             raise ProviderSelectionError("unknown provider option")
+                        effort = choice.get("effort")
+                        if effort is not None and (not isinstance(effort, str) or not effort.strip()):
+                            raise ProviderSelectionError("effort must be a non-empty string")
                         provider = _provider(choice.get("name"), choice.get("model"), choice.get("base_url"))
                         if provider is None:
                             raise ProviderSelectionError("choose a provider")
                     except (ProtocolError, ProviderSelectionError) as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
-                    host.run.select_provider(provider, choice.get("model"), choice)
+                    host.run.select_provider(
+                        provider,
+                        choice.get("model"),
+                        effort,
+                        choice,
+                    )
                     self._json(HTTPStatus.OK, {"selected": True})
                     return
                 if self.path == "/mode":

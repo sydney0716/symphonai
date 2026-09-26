@@ -649,6 +649,7 @@ class LeaderConfig:
     extra_tools: Mapping[str, LocalTool] | None = None
     leader_policy: PermissionPolicy | None = None
     leader_model: str | None = None
+    leader_effort: str | None = None
     hook_runner: HookRunner | None = None
 
 
@@ -703,7 +704,9 @@ class Leader:
             else defined_leader.model.model
         )
         self._leader_effort = (
-            None if defined_leader is None else defined_leader.model.effort
+            config.leader_effort
+            if defined_leader is None or defined_leader.model.effort is None
+            else defined_leader.model.effort
         )
         self._leader_run: AgentRun | None = None
         self._dispatch_tool = DispatchSubagentTool(

@@ -69,11 +69,11 @@ test("provider choice uses an authenticated JSON request", async () => {
     records.push({ url, options });
     return response(200, { selected: true });
   } });
-  assert.deepEqual(await client.selectProvider({ name: "openai", model: "custom", base_url: "http://127.0.0.1:9000/v1" }), { selected: true });
+  assert.deepEqual(await client.selectProvider({ name: "openai", model: "custom", base_url: "http://127.0.0.1:9000/v1", effort: "high" }), { selected: true });
   assert.equal(records[0].url, "http://127.0.0.1:4312/provider");
   assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
   assert.deepEqual(JSON.parse(records[0].options.body), {
-    name: "openai", model: "custom", base_url: "http://127.0.0.1:9000/v1",
+    name: "openai", model: "custom", base_url: "http://127.0.0.1:9000/v1", effort: "high",
   });
 });
 
@@ -82,12 +82,16 @@ test("model listing uses authenticated query parameters", async () => {
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
     records.push({ url, options });
     return response(200, {
-      provider: "openai", state: "available", models: ["gpt-test"], detail: "",
+      provider: "openai", state: "available",
+      models: [{ id: "gpt-test", efforts: ["low", "high"] }], detail: "",
     });
   } });
   assert.deepEqual(
     await client.models("openai", "http://127.0.0.1:9000/v1"),
-    { provider: "openai", state: "available", models: ["gpt-test"], detail: "" },
+    {
+      provider: "openai", state: "available",
+      models: [{ id: "gpt-test", efforts: ["low", "high"] }], detail: "",
+    },
   );
   assert.equal(
     records[0].url,

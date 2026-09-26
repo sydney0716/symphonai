@@ -141,6 +141,8 @@ export async function start({ global, document, client }) {
   const modelList = element(document, "datalist");
   modelList.id = "provider-models";
   modelInput.setAttribute?.("list", modelList.id);
+  const effortControls = element(document, "span", { className: "effort-controls" });
+  let effortSelect = null;
   const modelStatus = element(document, "span", { className: "model-status" });
   const baseUrlInput = element(document, "input");
   baseUrlInput.placeholder = "Base URL (optional)";
@@ -163,15 +165,36 @@ export async function start({ global, document, client }) {
   showProviderChoices();
   let modelRequest = 0;
   let modelState = { state: "unknown", models: [], detail: "Choose a provider." };
+  function showEfforts() {
+    const previous = effortSelect?.value;
+    const selected = modelState.models.find((model) => model.id === modelInput.value.trim());
+    if (!selected || selected.efforts.length === 0) {
+      effortSelect = null;
+      replace(effortControls);
+      return;
+    }
+    const label = element(document, "label", { text: "Effort " });
+    effortSelect = element(document, "select");
+    effortSelect.ariaLabel = "Effort";
+    replace(effortSelect, ...selected.efforts.map((effort) => {
+      const option = element(document, "option", { text: effort });
+      option.value = effort;
+      return option;
+    }));
+    effortSelect.value = selected.efforts.includes(previous) ? previous : selected.efforts[0];
+    append(label, effortSelect);
+    replace(effortControls, label);
+  }
   function showModelState() {
     replace(modelList, ...modelState.models.map((model) => {
       const option = element(document, "option");
-      option.value = model;
+      option.value = model.id;
       return option;
     }));
+    showEfforts();
     const typed = modelInput.value.trim();
     if (modelState.state === "available") {
-      modelStatus.textContent = typed && !modelState.models.includes(typed)
+      modelStatus.textContent = typed && !modelState.models.some((model) => model.id === typed)
         ? "Unavailable in the provider listing; this model will still be submitted."
         : `${modelState.models.length} models available.`;
       return;
@@ -191,9 +214,13 @@ export async function start({ global, document, client }) {
       const baseUrl = baseUrlInput.value.trim();
       const reply = await boundary.models(provider, baseUrl || undefined);
       if (request !== modelRequest) return;
-      if (reply?.state === "available" && Array.isArray(reply.models)) {
+      const validModels = Array.isArray(reply?.models) && reply.models.every((model) =>
+        model && typeof model.id === "string" && Array.isArray(model.efforts)
+        && model.efforts.every((effort) => typeof effort === "string")
+      );
+      if (reply?.state === "available" && validModels) {
         modelState = { state: "available", models: reply.models, detail: "" };
-      } else if (reply?.state === "unknown" && Array.isArray(reply.models)) {
+      } else if (reply?.state === "unknown" && validModels) {
         modelState = { state: "unknown", models: [], detail: reply.detail ?? "" };
       } else {
         throw new Error("invalid model listing reply");
@@ -218,6 +245,7 @@ export async function start({ global, document, client }) {
     modelInput,
     baseUrlInput,
     modelList,
+    effortControls,
     modelStatus,
     providerStatus,
   );
@@ -830,6 +858,7 @@ export async function start({ global, document, client }) {
             const choice = { name: providerSelect.value };
             if (modelInput.value.trim()) choice.model = modelInput.value.trim();
             if (baseUrlInput.value.trim()) choice.base_url = baseUrlInput.value.trim();
+            if (effortSelect?.value) choice.effort = effortSelect.value;
             await boundary.selectProvider(choice);
           }
           const reply = await boundary.prompt(action.text);

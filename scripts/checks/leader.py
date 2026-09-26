@@ -300,6 +300,73 @@ def check_spec_effort_reaches_requests() -> None:
             fail(f"leader spec effort did not reach its request: {leader_provider.requests!r}")
 
 
+@check("leader.conversation_effort_stays_with_leader")
+def check_conversation_effort_stays_with_leader() -> None:
+    with workspace() as ws:
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(
+                Role.ASSISTANT,
+                tool_calls=[
+                    _dispatch("configured", "configured work", "configured-call"),
+                    _dispatch("plain", "plain work", "plain-call"),
+                ],
+            )),
+            ModelResponse(Message(Role.ASSISTANT, "all done")),
+        ])
+        child_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "configured done")),
+            ModelResponse(Message(Role.ASSISTANT, "plain done")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(ws.root),
+            leader_effort="high",
+            subagent_specs={
+                "configured": _spec(
+                    ws.root,
+                    "configured",
+                    effort="low",
+                    model="configured-model",
+                ),
+                "plain": _spec(ws.root, "plain", model="plain-model"),
+            },
+        ))
+        result = leader.run("delegate both tasks")
+        if result.final_answer != "all done":
+            fail(f"conversation effort run did not finish: {result!r}")
+        if [request.effort for request in leader_provider.requests] != ["high", "high"]:
+            fail(f"conversation effort did not stay on leader requests: {leader_provider.requests!r}")
+        child_efforts = {
+            request.model: request.effort
+            for request in child_provider.requests
+        }
+        if child_efforts != {"configured-model": "low", "plain-model": None}:
+            fail(f"conversation effort leaked into a dispatched agent: {child_provider.requests!r}")
+
+
+@check("leader.definition_effort_overrides_conversation")
+def check_definition_effort_overrides_conversation() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=provider,
+            subagent_provider=FakeModelProvider(),
+            repo_root=str(ws.root),
+            leader_effort="high",
+            subagent_specs={
+                "leader": _spec(ws.root, "leader", effort="low"),
+            },
+        ))
+        result = leader.run("work")
+        if result.final_answer != "done":
+            fail(f"defined leader effort run did not finish: {result!r}")
+        if [request.effort for request in provider.requests] != ["low"]:
+            fail(f"conversation effort replaced the leader definition: {provider.requests!r}")
+
+
 # Captured from commit c11c7c3 -- the last tree before leader control-plane
 # wiring -- by running the probe below. Frozen rather than recomputed from
 # repository history: that would compare this change with itself once

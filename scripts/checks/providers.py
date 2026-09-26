@@ -63,35 +63,28 @@ def check_effort_request_bodies() -> None:
     message = Message(role=Role.USER, content="hello")
     bodies = {
         "openai": _build_openai_body(
-            ModelRequest(messages=[message], effort="high"), "gpt-5.4-mini"
+            ModelRequest(messages=[message], effort="high"),
+            "invented-openai-model",
         ),
         "anthropic": _build_anthropic_body(
             ModelRequest(messages=[message], effort="xhigh"),
             "claude-sonnet-5",
             1024,
         ),
-        "gemini-3": _build_gemini_body(
+        "gemini": _build_gemini_body(
             ModelRequest(messages=[message], effort="minimal"),
             "gemini-3.5-flash",
-        ),
-        "gemini-2.5": _build_gemini_body(
-            ModelRequest(messages=[message], effort="8192"),
-            "gemini-2.5-flash",
         ),
     }
     expected = {
         "openai": "high",
         "anthropic": {"effort": "xhigh"},
-        "gemini-3": {"thinkingLevel": "minimal"},
-        "gemini-2.5": {"thinkingBudget": 8192},
+        "gemini": {"thinkingLevel": "minimal"},
     }
     actual = {
         "openai": bodies["openai"].get("reasoning_effort"),
         "anthropic": bodies["anthropic"].get("output_config"),
-        "gemini-3": bodies["gemini-3"].get("generationConfig", {}).get(
-            "thinkingConfig"
-        ),
-        "gemini-2.5": bodies["gemini-2.5"].get("generationConfig", {}).get(
+        "gemini": bodies["gemini"].get("generationConfig", {}).get(
             "thinkingConfig"
         ),
     }
@@ -104,18 +97,42 @@ def check_model_table_schema() -> None:
     capabilities = model_capabilities()
     indexed = {(item.wire_format, item.model): item for item in capabilities}
     required = {
-        (1, "gpt-5.4-mini"),
         (2, "claude-haiku-4-5"),
         (2, "claude-sonnet-5"),
-        (3, "gemini-2.5-flash"),
+        (3, "gemini-3-pro"),
         (3, "gemini-3.5-flash"),
     }
     if not required.issubset(indexed):
         fail(f"model effort table omitted required entries: {indexed!r}")
+    gemini_efforts = {
+        model: tuple(option.id for option in indexed[(3, model)].efforts)
+        for model in ("gemini-3-pro", "gemini-3.5-flash")
+    }
+    if gemini_efforts != {
+        "gemini-3-pro": ("low", "high"),
+        "gemini-3.5-flash": ("minimal", "low", "medium", "high"),
+    }:
+        fail(f"Gemini model efforts were flattened across models: {gemini_efforts!r}")
     if _models_from_json({"schema_version": 2, "notes": "bad", "models": []}) != ():
         fail("a mismatched model table schema did not fail closed")
+    integer_capabilities = _models_from_json({
+        "schema_version": 1,
+        "notes": "integer wire value fixture",
+        "models": [{
+            "provider": "fixture",
+            "wire_format": 3,
+            "id": "integer-value-fixture",
+            "efforts": [{"id": "8192", "value": 8192}],
+        }],
+    })
+    if (
+        len(integer_capabilities) != 1
+        or integer_capabilities[0].efforts[0].value != 8192
+        or type(integer_capabilities[0].efforts[0].value) is not int
+    ):
+        fail(f"model table loader rejected an integer wire value: {integer_capabilities!r}")
     with mock.patch.object(model_table_module, "model_capabilities", return_value=()):
-        if resolve_effort(3, "gemini-2.5-flash", "future") != "future":
+        if resolve_effort(3, "invented-unavailable-table-model", "future") != "future":
             fail("an unavailable model table did not degrade to pass-through")
 
 

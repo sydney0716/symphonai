@@ -153,8 +153,12 @@ Limits reset for each prompt. `RunFinished.stopped_reason` reports `max_turns`,
 the conversation remains available for another prompt.
 
 Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
-"openai", "model": str?, "base_url": str?}` and returns `{"selected": true}`.
-`model` and `base_url` are optional non-empty strings. `openai` with a
+"openai", "model": str?, "base_url": str?, "effort": str?}` and returns
+`{"selected": true}`. `model`, `base_url`, and `effort` are optional non-empty
+strings. The effort is applied to the leader's requests when the selection
+starts the next conversation. It does not replace a dispatched agent's own
+effort, and a `leader` definition's effort takes precedence over this choice.
+`openai` with a
 `base_url` selects an OpenAI-compatible endpoint. Unknown vendors, malformed
 options, and vendors without a configured API key return `400`. The selection
 applies when the next conversation starts; changing it while a conversation
@@ -167,13 +171,16 @@ a valid selection is sent. Launch flags do not select a provider.
 
 Authenticated `GET /models?provider=<name>` lists the models for a known
 provider, with optional `base_url` using the same meaning as `POST /provider`.
-It returns `provider`, `state`, `models`, and `detail`. A successful lookup has
-`state: "available"`, the filtered model ids from live model discovery, and an
-empty detail. A lookup that cannot be attempted or fails has `state: "unknown"`,
-an empty models array, and a key-safe explanation in detail. Successful results
-are cached for the host process by provider and base URL; unknown results are
+It returns `provider`, `state`, `models`, and `detail`. Each model is
+`{"id": str, "efforts": [str, ...]}`. A successful lookup has `state:
+"available"`, the filtered models from live model discovery, their declared
+effort identifiers, and an empty detail. A model absent from the capability
+table has an empty effort list. A lookup that cannot be attempted or fails has
+`state: "unknown"`, an empty models array, and a key-safe explanation in detail.
+Successful vendor results are cached for the host process by provider and base
+URL; adding efforts does not perform another vendor call. Unknown results are
 not cached. A listing is advisory: clients may still submit any model id to
-`POST /provider`.
+`POST /provider`, without an effort when none was offered.
 
 Authenticated `POST /mode` takes exactly `{"mode": "ask" | "plan" | "allow"}`
 and returns `{"mode": <current mode>}`. The available values are intersected

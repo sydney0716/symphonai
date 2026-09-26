@@ -1039,7 +1039,10 @@ def check_model_listing_route() -> None:
             expected = {
                 "provider": "openai",
                 "state": "available",
-                "models": ["gpt-listed", "gpt-second"],
+                "models": [
+                    {"id": "gpt-listed", "efforts": []},
+                    {"id": "gpt-second", "efforts": []},
+                ],
                 "detail": "",
             }
             if any(status != 200 or reply != expected for status, _, reply in (first, second, alternate)):
@@ -1110,6 +1113,107 @@ def check_model_listing_route() -> None:
                     fail(f"provider route changed its accepted payload: {factory.call_args_list!r}")
         finally:
             host.close()
+
+
+@check("host_server.model_listing_efforts_cached")
+def check_model_listing_efforts_cached() -> None:
+    secret = "recognisable-model-effort-secret-25q"
+    host = _host()
+
+    def get() -> dict:
+        connection, response = _request(
+            host,
+            "GET",
+            "/models?provider=anthropic",
+            headers=_headers(host),
+        )
+        try:
+            body = response.read()
+            if response.status != 200:
+                fail(f"effort model listing returned {response.status}: {body!r}")
+            return json.loads(body)
+        finally:
+            connection.close()
+
+    try:
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret}), mock.patch.object(
+            host_server_module,
+            "list_models",
+            return_value=["claude-sonnet-5", "vendor-private"],
+        ) as listed:
+            first = get()
+            second = get()
+        expected_models = [
+            {
+                "id": "claude-sonnet-5",
+                "efforts": ["low", "medium", "high", "xhigh", "max"],
+            },
+            {"id": "vendor-private", "efforts": []},
+        ]
+        if first.get("models") != expected_models or second.get("models") != expected_models:
+            fail(f"model efforts were missing or changed: {first!r}, {second!r}")
+        if listed.call_count != 1:
+            fail(f"adding efforts changed model listing cache behavior: {listed.call_count}")
+    finally:
+        host.close()
+
+
+@check("host_server.provider_effort_reaches_request")
+def check_provider_effort_reaches_request() -> None:
+    def received(choice: dict) -> tuple[str | None, str | None, bool]:
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = HostServer(
+                None,
+                PermissionPolicy(root),
+                sessions_root=root / "sessions",
+            )
+            host.start()
+            try:
+                with mock.patch.object(
+                    host_server_module,
+                    "_provider",
+                    return_value=provider,
+                ), mock.patch.object(
+                    provider,
+                    "create_response",
+                    wraps=provider.create_response,
+                ) as create_response:
+                    connection, response = _request(
+                        host,
+                        "POST",
+                        "/provider",
+                        body=choice,
+                        headers=_headers(host),
+                    )
+                    try:
+                        body = response.read()
+                        if response.status != 200:
+                            fail(f"effort provider choice was rejected: {response.status}, {body!r}")
+                    finally:
+                        connection.close()
+                    _send_host_prompt(host, "use this choice")
+                if create_response.call_count != 1:
+                    fail(f"provider received {create_response.call_count} requests")
+                request = create_response.call_args.args[0]
+                leader = host.run._conversation[0]
+                provider_is_unwrapped = (
+                    leader._config.leader_provider is provider
+                    and leader._config.subagent_provider is provider
+                )
+                return request.model, request.effort, provider_is_unwrapped
+            finally:
+                host.close()
+
+    selected = received({"name": "openai", "model": "gpt-listed", "effort": "high"})
+    if selected != ("gpt-listed", "high", True):
+        fail(f"selected effort did not reach the provider request: {selected!r}")
+    unlisted = received({"name": "openai", "model": "private-model"})
+    if unlisted != ("private-model", None, True):
+        fail(f"an unlisted typed model acquired an effort: {unlisted!r}")
 
 
 @check("host_server.settings_roster_paths")

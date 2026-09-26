@@ -526,7 +526,10 @@ test("composer offers listed models, warns without blocking, and preserves unkno
     client.calls.models.push([provider, baseUrl]);
     return baseUrl
       ? { provider, state: "unknown", models: [], detail: "Catalogue request failed." }
-      : { provider, state: "available", models: ["gpt-listed", "gpt-other"], detail: "" };
+      : { provider, state: "available", models: [
+        { id: "gpt-listed", efforts: ["low", "high"] },
+        { id: "gpt-other", efforts: [] },
+      ], detail: "" };
   };
   client.prompt = async (text) => {
     client.calls.prompt.push(text);
@@ -560,6 +563,55 @@ test("composer offers listed models, warns without blocking, and preserves unkno
     ["openai", undefined],
     ["openai", "http://127.0.0.1:9000/v1"],
   ]);
+});
+
+test("composer offers the selected model efforts and sends the chosen value", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { providers: [
+      { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
+    ] } },
+    modelListing: {
+      provider: "openai",
+      state: "available",
+      models: [
+        { id: "gpt-listed", efforts: ["low", "high"] },
+        { id: "gpt-other", efforts: [] },
+      ],
+      detail: "",
+    },
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "run-effort" };
+  };
+  await start({ global: {}, document, client });
+  const controls = find(document.getElementById("prompt-form"), (node) =>
+    node.className === "provider-controls"
+  );
+  const input = controls.children[1];
+  const effortControls = find(controls, (node) => node.className === "effort-controls");
+  assert.equal(find(effortControls, (node) => node.tagName === "SELECT"), undefined);
+
+  input.value = "gpt-listed";
+  await input.dispatch("input");
+  let effort = find(effortControls, (node) => node.tagName === "SELECT");
+  assert.deepEqual(effort.children.map((option) => option.value), ["low", "high"]);
+
+  input.value = "gpt-other";
+  await input.dispatch("input");
+  assert.equal(find(effortControls, (node) => node.tagName === "SELECT"), undefined);
+
+  input.value = "gpt-listed";
+  await input.dispatch("input");
+  effort = find(effortControls, (node) => node.tagName === "SELECT");
+  effort.value = "high";
+  document.getElementById("prompt").value = "use high effort";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{
+    name: "openai", model: "gpt-listed", effort: "high",
+  }]);
+  assert.deepEqual(client.calls.prompt, ["use high effort"]);
 });
 
 test("composer shows the live permission mode and restores it after a refusal", async () => {

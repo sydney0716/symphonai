@@ -1,28 +1,78 @@
 {
   "schema_version": 1,
-  "notes": "UNVERIFIED model effort capabilities. No live account has been used to validate these entries; check current vendor documentation before relying on them.",
+  "notes": "UNVERIFIED against live accounts. Anthropic efforts reflect current vendor documentation; Gemini efforts reflect ref/CLIProxyAPI/internal/registry/models/models.json. Probe OpenAI before adding entries.",
   "models": [
     {
-      "provider": "openai",
-      "wire_format": 1,
-      "id": "gpt-5.4-mini",
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-fable-5-1",
       "efforts": [
         {"id": "low", "value": "low"},
         {"id": "medium", "value": "medium"},
-        {"id": "high", "value": "high"}
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
       ]
     },
     {
       "provider": "anthropic",
       "wire_format": 2,
-      "id": "claude-haiku-4-5",
-      "efforts": []
+      "id": "claude-fable-5",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
+      ]
     },
     {
       "provider": "anthropic",
       "wire_format": 2,
-      "id": "claude-haiku-4-5-20251001",
-      "efforts": []
+      "id": "claude-mythos-5-1",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-opus-5",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-opus-4-8",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-opus-4-7",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"},
+        {"id": "max", "value": "max"}
+      ]
     },
     {
       "provider": "anthropic",
@@ -34,6 +84,91 @@
         {"id": "high", "value": "high"},
         {"id": "xhigh", "value": "xhigh"},
         {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-opus-4-6",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-sonnet-4-6",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "max", "value": "max"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-opus-4-5",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-sonnet-4-5",
+      "efforts": []
+    },
+    {
+      "provider": "anthropic",
+      "wire_format": 2,
+      "id": "claude-haiku-4-5",
+      "efforts": []
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3-pro",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3.1-pro",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3-flash",
+      "efforts": [
+        {"id": "minimal", "value": "minimal"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3.1-flash-lite",
+      "efforts": [
+        {"id": "minimal", "value": "minimal"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
       ]
     },
     {
@@ -50,21 +185,43 @@
     {
       "provider": "gemini",
       "wire_format": 3,
-      "id": "gemini-2.5-flash",
+      "id": "gemini-3.5-flash-lite",
       "efforts": [
-        {"id": "1024", "value": 1024},
-        {"id": "4096", "value": 4096},
-        {"id": "8192", "value": 8192}
+        {"id": "minimal", "value": "minimal"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
       ]
     },
     {
       "provider": "gemini",
       "wire_format": 3,
-      "id": "gemini-flash-lite-latest",
+      "id": "gemini-3.6-flash",
       "efforts": [
-        {"id": "512", "value": 512},
-        {"id": "4096", "value": 4096},
-        {"id": "8192", "value": 8192}
+        {"id": "minimal", "value": "minimal"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3.7-flash",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-3.8-flash",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
       ]
     }
   ]

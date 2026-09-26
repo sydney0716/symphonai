@@ -158,6 +158,7 @@ class HostRun:
             self._working_dir = Path(working_dir)
         self._max_turns = max_turns
         self._model = model
+        self._effort: str | None = None
         self._provider_factory = provider_factory
         self._provider_choice = (
             {"name": provider.name, "model": model, "base_url": getattr(provider, "base_url", None)}
@@ -226,10 +227,17 @@ class HostRun:
     def sessions_root(self):
         return self._sessions_root
 
-    def select_provider(self, provider: ModelProvider, model: str | None = None, choice: dict | None = None) -> None:
+    def select_provider(
+        self,
+        provider: ModelProvider,
+        model: str | None = None,
+        effort: str | None = None,
+        choice: dict | None = None,
+    ) -> None:
         with self._lock:
             self._provider = provider
             self._model = model
+            self._effort = effort
             self._provider_choice = choice
 
     def permitted_modes(self) -> tuple[str, ...]:
@@ -361,6 +369,7 @@ class HostRun:
                 extra_tools=self._mcp_tools,
                 leader_policy=self._policy,
                 leader_model=leader_model,
+                leader_effort=self._effort,
                 subagent_specs=roster,
                 subagent_budget=self._subagent_budget,
                 hook_runner=self._hooks,
@@ -393,14 +402,20 @@ class HostRun:
                 choice = reader.read_meta().get("provider_choice")
             finally:
                 reader.close()
-            previous_provider = (self._provider, self._model, self._provider_choice)
+            previous_provider = (
+                self._provider,
+                self._model,
+                self._effort,
+                self._provider_choice,
+            )
             previous_mode = self._policy.mode
-            provider, model, provider_choice = previous_provider
+            provider, model, effort, provider_choice = previous_provider
             if isinstance(choice, dict) and self._provider_factory is not None:
                 provider = self._provider_factory(choice.get("name"), choice.get("model"), choice.get("base_url"))
                 if provider is None:
                     raise ProviderSelectionError("session provider is unavailable")
                 model = choice.get("model")
+                effort = choice.get("effort")
                 provider_choice = choice
             elif provider is None and self._provider_factory is not None:
                 provider = self._provider_factory(None, None, None)
@@ -412,12 +427,17 @@ class HostRun:
                 events=fan_out(self._broker.publish, self._hooks),
             )
             try:
-                self._provider, self._model, self._provider_choice = provider, model, provider_choice
+                self._provider, self._model, self._effort, self._provider_choice = (
+                    provider,
+                    model,
+                    effort,
+                    provider_choice,
+                )
                 self._policy.mode = self._starting_mode
                 leader = self._new_leader(store)
                 leader.seed_chat(loaded.messages, persisted=True)
             except Exception:
-                self._provider, self._model, self._provider_choice = previous_provider
+                self._provider, self._model, self._effort, self._provider_choice = previous_provider
                 self._policy.mode = previous_mode
                 store.close()
                 raise
