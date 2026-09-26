@@ -302,6 +302,20 @@ receive `415`, and files larger than 1 MiB receive `413`. The route requires the
 same bearer token as every non-health endpoint and never returns the token or an
 absolute filesystem path.
 
+`GET /agent?name=<name>&scope=<user|project>` returns one agent definition as
+`{"name": <stem>, "scope": <scope>, "text": <contents>}`. `POST /agent`
+takes `{"name": <name>, "scope": <user|project>, "text": <contents>}` and
+validates the text with the runtime's `load_agent_file` before atomically
+replacing or creating the definition. A name may be a single stem or that
+stem with a `.toml` suffix; separators, `..`, and other extensions are
+rejected before filesystem access. Project reads and writes require the
+repository's `agents` trust capability, while user scope uses the user's
+`.symphonai/agents` directory without repository trust. Validation errors
+preserve the loader's file-and-key message. A successful write returns
+`written`, the normalized `name` and `scope`, the target `path`, and a
+message explaining that the definition applies on the next run. Both routes
+require the ordinary bearer token.
+
 `GET /app/` returns the browser shell with one inline handshake script setting
 `window.__symphonai` to the running host's `port` and `token`. `GET
 /app/<asset path>` serves only `.js`, `.css`, and `.html` files resolved beneath

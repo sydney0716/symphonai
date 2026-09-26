@@ -7,6 +7,7 @@ import os
 import secrets
 import shlex
 import threading
+import tempfile
 from collections.abc import Mapping
 from http.cookies import CookieError, SimpleCookie
 from http import HTTPStatus
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
 from symphonai_api.cost import PriceTable
+from symphonai_api.agent_file import AgentFileError, load_agent_file
 from symphonai_api.extensions import Extensions
 from symphonai_api.model_discovery import list_models
 from symphonai_api.model_table import model_capabilities
@@ -26,6 +28,7 @@ from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHRO
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR, GeminiProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
 from symphonai_api.session import SessionError, TranscriptError
+from symphonai_api.paths import symphonai_home
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
@@ -114,6 +117,7 @@ class HostServer:
         model: str | None = None,
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
+        home: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
         price_table: PriceTable | None = None,
@@ -124,6 +128,7 @@ class HostServer:
             raise ValueError("keepalive_seconds must be greater than 0")
         self.token = token or secrets.token_urlsafe(32)
         self._repo_root = policy.repo_root
+        self._home = symphonai_home(home)
         self._mcp_started = mcp_tools is not None
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
         self._model_cache_lock = threading.Lock()
@@ -402,6 +407,142 @@ class HostServer:
                     return
                 self._json(HTTPStatus.OK, {"path": requested, "text": text})
 
+            def _definition_target(
+                self,
+                name: object,
+                scope: object,
+            ) -> tuple[str, str, Path] | tuple[None, None, None]:
+                if not isinstance(name, str) or not name:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must be a non-empty string"})
+                    return None, None, None
+                if not isinstance(scope, str) or scope not in ("project", "user"):
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "scope must be 'project' or 'user'"})
+                    return None, None, None
+                if any(separator in name for separator in ("/", "\\")):
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must be a single segment"})
+                    return None, None, None
+                if name in (".", ".."):
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must not be a parent reference"})
+                    return None, None, None
+                if name.endswith(".toml"):
+                    stem = name[:-5]
+                elif Path(name).suffix:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must use the .toml extension"})
+                    return None, None, None
+                else:
+                    stem = name
+                if not stem or stem in (".", "..") or Path(stem).name != stem:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must be a single segment"})
+                    return None, None, None
+                filename = f"{stem}.toml"
+                directory = (
+                    host._repo_root / ".symphonai" / "agents"
+                    if scope == "project"
+                    else host._home / "agents"
+                )
+                try:
+                    base = (
+                        Path(host._repo_root).resolve()
+                        if scope == "project"
+                        else host._home.resolve()
+                    )
+                    root = directory.resolve()
+                    target = (root / filename).resolve(strict=False)
+                except (OSError, RuntimeError):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return None, None, None
+                if not _contains_path(base, root) or not _contains_path(root, target):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return None, None, None
+                return stem, scope, target
+
+            def _definition_trusted(self, scope: str) -> bool:
+                if scope == "user":
+                    return True
+                extensions = host.run.extensions
+                return extensions is not None and extensions.trust.allows(
+                    host._repo_root,
+                    "agents",
+                )
+
+            def _validate_definition(self, target: Path, text: str) -> None:
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        staged = Path(temporary) / target.name
+                        staged.write_text(text, encoding="utf-8")
+                        load_agent_file(
+                            staged,
+                            repo_root=host._repo_root,
+                            ceiling=(
+                                None
+                                if host.run.extensions is None
+                                else host.run.extensions.ceiling
+                            ),
+                        )
+                except AgentFileError as exc:
+                    message = str(exc)
+                    prefix = f"{staged}: "
+                    if message.startswith(prefix):
+                        message = f"{target}: {message[len(prefix):]}"
+                    raise AgentFileError(message) from None
+
+            def _write_definition(self, target: Path, text: str) -> None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary_name: str | None = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        dir=target.parent,
+                        prefix=f".{target.name}.",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as temporary:
+                        temporary_name = temporary.name
+                        temporary.write(text)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                    os.replace(temporary_name, target)
+                finally:
+                    if temporary_name is not None:
+                        try:
+                            Path(temporary_name).unlink()
+                        except FileNotFoundError:
+                            pass
+
+            def _serve_definition(self) -> None:
+                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if set(values) != {"name", "scope"} or any(
+                    len(values[key]) != 1 for key in ("name", "scope")
+                ):
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name and scope are required"})
+                    return
+                stem, scope, target = self._definition_target(
+                    values["name"][0], values["scope"][0]
+                )
+                if target is None:
+                    return
+                if not self._definition_trusted(scope):
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "repository not trusted for agents"},
+                    )
+                    return
+                try:
+                    data = target.read_bytes()
+                except OSError:
+                    self._not_found()
+                    return
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    return
+                self._json(
+                    HTTPStatus.OK,
+                    {"name": stem, "scope": scope, "text": text},
+                )
+
             def _read_object(self) -> dict:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -519,6 +660,11 @@ class HostServer:
                     if not self._authorized():
                         return
                     self._serve_file()
+                    return
+                if request_path == "/agent":
+                    if not self._authorized():
+                        return
+                    self._serve_definition()
                     return
                 if request_path == "/survey":
                     if not self._authorized():
@@ -708,10 +854,52 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/agent") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
+                    return
+                if self.path == "/agent":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"name", "scope", "text"}:
+                            raise ProtocolError("agent requires name, scope, and text")
+                        if not all(isinstance(payload[key], str) for key in ("name", "scope", "text")):
+                            raise ProtocolError("agent name, scope, and text must be strings")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    stem, scope, target = self._definition_target(
+                        payload["name"], payload["scope"]
+                    )
+                    if target is None:
+                        return
+                    if not self._definition_trusted(scope):
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {"error": "repository not trusted for agents"},
+                        )
+                        return
+                    try:
+                        self._validate_definition(target, payload["text"])
+                    except AgentFileError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        self._write_definition(target, payload["text"])
+                    except OSError as exc:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"could not write definition: {exc}"})
+                        return
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "written": True,
+                            "name": stem,
+                            "scope": scope,
+                            "path": str(target),
+                            "message": "definition saved; it will take effect on the next run",
+                        },
+                    )
                     return
                 if credential_route:
                     try:

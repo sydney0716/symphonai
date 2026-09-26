@@ -4179,3 +4179,255 @@ def check_budget_stop_survives_next_prompt() -> None:
         finally:
             connection.close()
             host.close()
+
+
+@check("host_server.agent_definition_read_write")
+def check_agent_definition_read_write() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        (home / ".symphonai").mkdir(parents=True)
+        (home / ".symphonai" / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        text = (
+            'prompt = "Project reviewer."\n'
+            'tools = ["read_file"]\n'
+            '[model]\nprovider = "fake"\n'
+        )
+        host = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            home=home,
+            extensions=extensions,
+        )
+        host.start()
+        try:
+            connection, response = _request(
+                host,
+                "POST",
+                "/agent",
+                body={"name": "reviewer", "scope": "project", "text": text},
+                headers=_headers(host),
+            )
+            try:
+                written = json.loads(response.read())
+                if response.status != 200 or not written.get("written"):
+                    fail(f"trusted project definition was not written: {response.status}, {written!r}")
+                if written.get("message") != "definition saved; it will take effect on the next run":
+                    fail(f"write response did not defer activation: {written!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host,
+                "GET",
+                f"/agent?{urlencode({'name': 'reviewer', 'scope': 'project'})}",
+                headers=_headers(host),
+            )
+            try:
+                opened = json.loads(response.read())
+                if response.status != 200 or opened != {
+                    "name": "reviewer", "scope": "project", "text": text
+                }:
+                    fail(f"definition read was not byte-for-byte: {response.status}, {opened!r}")
+            finally:
+                connection.close()
+        finally:
+            host.close()
+        loaded = load_extensions(repo_root=root, home=home)
+        spec = loaded.agents.get("reviewer")
+        if (
+            spec is None
+            or spec.prompt != "Project reviewer."
+            or spec.tool_names != ("read_file",)
+        ):
+            fail(f"next extension load did not see the written definition: {loaded.agents!r}")
+
+
+@check("host_server.agent_definition_validation_and_atomicity")
+def check_agent_definition_validation_and_atomicity() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        project_agents = root / ".symphonai" / "agents"
+        project_agents.mkdir(parents=True)
+        (home / ".symphonai").mkdir(parents=True)
+        (home / ".symphonai" / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        target = project_agents / "reviewer.toml"
+        original = 'prompt = "keep this file"\n[model]\nprovider = "fake"\n'
+        target.write_text(original, encoding="utf-8")
+        host = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            home=home,
+            extensions=load_extensions(repo_root=root, home=home),
+        )
+        host.start()
+        try:
+            invalid = 'prompt = "broken"\n[mystery]\nvalue = true\n'
+            connection, response = _request(
+                host,
+                "POST",
+                "/agent",
+                body={"name": "reviewer", "scope": "project", "text": invalid},
+                headers=_headers(host),
+            )
+            try:
+                body = json.loads(response.read())
+                error = body.get("error", "")
+                if response.status != 400 or str(target) not in error or "mystery" not in error:
+                    fail(f"invalid definition did not preserve loader error: {response.status}, {body!r}")
+            finally:
+                connection.close()
+            if target.read_text(encoding="utf-8") != original:
+                fail("invalid replacement changed the existing definition")
+
+            missing = project_agents / "new-agent.toml"
+            connection, response = _request(
+                host,
+                "POST",
+                "/agent",
+                body={"name": "new-agent", "scope": "project", "text": invalid},
+                headers=_headers(host),
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 400 or missing.exists() or str(missing) not in body.get("error", ""):
+                    fail(f"invalid creation reached its target: {response.status}, {body!r}")
+            finally:
+                connection.close()
+        finally:
+            host.close()
+
+
+@check("host_server.agent_definition_trust_and_user_scope")
+def check_agent_definition_trust_and_user_scope() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        project_agents = root / ".symphonai" / "agents"
+        project_agents.mkdir(parents=True)
+        (project_agents / "offered.toml").write_text(
+            'prompt = "offered"\n[model]\nprovider = "fake"\n',
+            encoding="utf-8",
+        )
+        (home / ".symphonai").mkdir(parents=True)
+        extensions = load_extensions(repo_root=root, home=home)
+        before = sorted(path.name for path in project_agents.iterdir())
+        host = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            home=home,
+            extensions=extensions,
+        )
+        host.start()
+        try:
+            connection, response = _request(
+                host,
+                "POST",
+                "/agent",
+                body={
+                    "name": "blocked",
+                    "scope": "project",
+                    "text": 'prompt = "blocked"\n[model]\nprovider = "fake"\n',
+                },
+                headers=_headers(host),
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 403 or "not trusted for agents" not in body.get("error", ""):
+                    fail(f"untrusted project write was accepted: {response.status}, {body!r}")
+            finally:
+                connection.close()
+            after = sorted(path.name for path in project_agents.iterdir())
+            if before != after:
+                fail(f"untrusted project write changed its directory: {before!r} -> {after!r}")
+
+            user_text = 'prompt = "private"\n[model]\nprovider = "fake"\n'
+            connection, response = _request(
+                host,
+                "POST",
+                "/agent",
+                body={"name": "private", "scope": "user", "text": user_text},
+                headers=_headers(host),
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 200 or not body.get("written"):
+                    fail(f"user definition did not bypass repository trust: {response.status}, {body!r}")
+            finally:
+                connection.close()
+            if (home / ".symphonai" / "agents" / "private.toml").read_text(encoding="utf-8") != user_text:
+                fail("user definition text was not written exactly")
+            connection, response = _request(
+                host,
+                "GET",
+                f"/agent?{urlencode({'name': 'private', 'scope': 'user'})}",
+                headers=_headers(host),
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 200 or body != {
+                    "name": "private", "scope": "user", "text": user_text
+                }:
+                    fail(f"user definition did not round-trip through read route: {response.status}, {body!r}")
+            finally:
+                connection.close()
+        finally:
+            host.close()
+
+
+@check("host_server.agent_definition_name_validation_and_auth")
+def check_agent_definition_name_validation_and_auth() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        host = HostServer(
+            FakeModelProvider(),
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            home=home,
+        )
+        host.start()
+        try:
+            for method, path, body in (
+                ("GET", "/agent?name=bad.txt&scope=project", None),
+                ("POST", "/agent", {"name": "../escape", "scope": "project", "text": "x"}),
+            ):
+                connection, response = _request(host, method, path, body=body)
+                try:
+                    if response.status != 401 or response.read() != b"":
+                        fail(f"unauthenticated definition route succeeded: {method} {path}")
+                finally:
+                    connection.close()
+
+            for name in ("../escape", "nested/name", "bad.txt", "agent.toml.bak"):
+                connection, response = _request(
+                    host,
+                    "POST",
+                    "/agent",
+                    body={"name": name, "scope": "project", "text": "x"},
+                    headers=_headers(host),
+                )
+                try:
+                    if response.status != 400:
+                        fail(f"invalid definition name was not refused: {name!r}, {response.status}")
+                finally:
+                    connection.close()
+            if (root / ".symphonai").exists() or (home / ".symphonai").exists():
+                fail("invalid names touched a definition directory")
+
+            protocol = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text(encoding="utf-8")
+            for phrase in ("GET /agent?name=", "POST /agent", "load_agent_file", "next run"):
+                if phrase not in protocol:
+                    fail(f"agent definition protocol omitted {phrase!r}")
+        finally:
+            host.close()
