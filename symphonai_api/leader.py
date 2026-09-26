@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent, _message_digest
+from symphonai_api.agent_memory import AgentMemory, MemoryEntry, MemorySettings
 from symphonai_api.agent_run import (
     AgentRun,
     RunNode,
@@ -75,6 +76,7 @@ from symphonai_api.session import SessionStore
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.web_search import SearchBackend
 
@@ -82,6 +84,15 @@ DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
 DEFAULT_SUBAGENT_MAX_TURNS = 5
 EXPLORER_TOOL_NAMES = ("read_file", "glob", "grep", "list_files", "web_fetch")
+
+
+def _memory_entries(
+    store: AgentMemory | None,
+    spec: AgentSpec,
+) -> tuple[MemoryEntry, ...]:
+    if store is None or not spec.memory.enabled:
+        return ()
+    return store.read(spec.name)[-spec.memory.max_entries:]
 
 
 def builtin_subagent_specs(
@@ -247,6 +258,7 @@ class DispatchSubagentTool(LocalTool):
         result_store: ToolResultStore | None = None,
         search_backend: SearchBackend | None = None,
         extra_tools: Mapping[str, LocalTool] | None = None,
+        memory: AgentMemory | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -271,12 +283,16 @@ class DispatchSubagentTool(LocalTool):
         self._result_store = result_store
         self._search_backend = search_backend
         self._extra_tools = extra_tools
+        self._memory = memory
         self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id: str | None = None
         self._event_turn_id: str | None = None
         self.pool: dict[str, SubagentRecord] = {}
+
+    def _active_run_id(self) -> str | None:
+        return None if self._active_run is None else self._active_run.run.run_id
 
     def set_parent_context(
         self,
@@ -435,11 +451,21 @@ class DispatchSubagentTool(LocalTool):
             tool_names = spec.tool_names
             if tool_names is not None and self._result_store is not None:
                 tool_names = (*tool_names, "read_tool_result")
+            memory_tool = (
+                MemoryTool(
+                    self._memory,
+                    spec.name,
+                    self._active_run_id,
+                )
+                if spec.memory.enabled
+                else None
+            )
             subagent_tools = merge_tool_registry(
                 standard_tool_registry(
                     tool_names,
                     result_store=self._result_store,
                     search_backend=self._search_backend,
+                    memory_tool=memory_tool,
                 ),
                 self._extra_tools,
             )
@@ -514,6 +540,7 @@ class DispatchSubagentTool(LocalTool):
                 spec,
                 task,
                 parent_messages=self._parent_messages,
+                memory=_memory_entries(self._memory, spec),
             )
         run_result = None
         failure: str | None = None
@@ -651,6 +678,7 @@ class LeaderConfig:
     leader_model: str | None = None
     leader_effort: str | None = None
     hook_runner: HookRunner | None = None
+    memory: AgentMemory | None = None
 
 
 @dataclass
@@ -728,17 +756,28 @@ class Leader:
             result_store=config.result_store,
             search_backend=config.search_backend,
             extra_tools=config.extra_tools,
+            memory=config.memory,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
         tool_names = None if defined_leader is None else defined_leader.tool_names
         if tool_names is not None and config.result_store is not None:
             tool_names = (*tool_names, "read_tool_result")
+        leader_memory_tool = (
+            MemoryTool(
+                config.memory,
+                "leader",
+                self._leader_run_id,
+            )
+            if defined_leader is not None and defined_leader.memory.enabled
+            else None
+        )
         standard_tools = merge_tool_registry(
             standard_tool_registry(
                 tool_names,
                 result_store=config.result_store,
                 search_backend=config.search_backend,
+                memory_tool=leader_memory_tool,
             ),
             config.extra_tools,
         )
@@ -759,6 +798,11 @@ class Leader:
             policy_ceiling=leader_policy,
             tool_names=tuple(leader_tools),
             budget=config.leader_budget,
+            memory=(
+                defined_leader.memory
+                if defined_leader is not None
+                else MemorySettings()
+            ),
             call_class=CallClass.FOREGROUND,
             max_depth=0,
         )
@@ -786,10 +830,7 @@ class Leader:
                 else session.writer_for(self._agent_ref.agent_id, is_root=True)
             ),
         )
-        self._chat_messages: list[Message] = (
-            [Message(role=Role.SYSTEM, content=self._leader_prompt)]
-            if self._leader_prompt else []
-        )
+        self._chat_messages = self._initial_leader_messages()
         self._automatic_compaction_breaker = ConsecutiveFailureBreaker(
             "automatic compaction",
             max_consecutive_failures=config.max_consecutive_compaction_failures,
@@ -810,6 +851,23 @@ class Leader:
             *(record.breaker for record in self._dispatch_tool.pool.values()),
         ]
         return tuple(sorted(breaker.name for breaker in breakers if breaker.is_open))
+
+    def _leader_run_id(self) -> str | None:
+        return None if self._leader_run is None else self._leader_run.run.run_id
+
+    def _initial_leader_messages(self) -> list[Message]:
+        if not self._leader_spec.memory.enabled:
+            return (
+                [Message(role=Role.SYSTEM, content=self._leader_prompt)]
+                if self._leader_prompt
+                else []
+            )
+        messages = seed_messages(
+            self._leader_spec,
+            "",
+            memory=_memory_entries(self._config.memory, self._leader_spec),
+        )
+        return messages[:-1]
 
     def _run_messages(
         self, messages: list[Message], *, cancel: CancellationToken | None = None
@@ -877,9 +935,7 @@ class Leader:
     ) -> LeaderRunResult:
         """Run a single, one-shot task. Each call starts a fresh conversation."""
         self.clear_subagents()
-        messages: list[Message] = []
-        if self._leader_prompt:
-            messages.append(Message(role=Role.SYSTEM, content=self._leader_prompt))
+        messages = self._initial_leader_messages()
         if system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=system_prompt))
         messages.append(Message(role=Role.USER, content=goal))
@@ -893,10 +949,7 @@ class Leader:
         thereby clear the pool twice.
         """
 
-        self._chat_messages = (
-            [Message(role=Role.SYSTEM, content=self._leader_prompt)]
-            if self._leader_prompt else []
-        )
+        self._chat_messages = self._initial_leader_messages()
         self._automatic_compaction_breaker.reset()
         self._context_overflow_repair_failed = False
         return self.clear_subagents()
@@ -904,9 +957,11 @@ class Leader:
     def seed_chat(self, messages: Sequence[Message], *, persisted: bool = False) -> None:
         """Set the history used by the next chat without changing subagents."""
 
-        self._chat_messages = list(messages)
-        if self._leader_prompt and not persisted:
-            self._chat_messages.insert(0, Message(role=Role.SYSTEM, content=self._leader_prompt))
+        self._chat_messages = (
+            list(messages)
+            if persisted
+            else [*self._initial_leader_messages(), *messages]
+        )
         if persisted:
             self._agent._persisted_digests = [
                 _message_digest(message) for message in messages

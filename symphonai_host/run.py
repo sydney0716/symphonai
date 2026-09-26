@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS
+from symphonai_api.agent_memory import AgentMemory
+from symphonai_api.agent_spec import AgentSpec
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
@@ -30,6 +32,7 @@ from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import (
     SessionError,
     SessionStore,
+    default_memory_root,
     default_sessions_root,
     fork_run,
     load_run,
@@ -135,6 +138,7 @@ class HostRun:
         publish_approval=None,
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
+        memory_root: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
         price_table: PriceTable | None = None,
@@ -196,6 +200,9 @@ class HostRun:
         self._usage_by_agent: dict[str, tuple[str, dict[str, UsageTotals]]] = {}
         self._closing = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
+        self._memory_root = default_memory_root() if memory_root is None else Path(memory_root)
+        self._memory: AgentMemory | None = None
+        self._memory_open_attempted = False
         self._lock = threading.RLock()
         self.approvals = ApprovalBroker(publish_approval or (lambda _: False), timeout=approval_timeout)
         self._policy.approval_callback = self.approvals.callback
@@ -312,6 +319,17 @@ class HostRun:
             thread.start()
             return run_id
 
+    def _memory_for(self, roster: Mapping[str, AgentSpec]) -> AgentMemory | None:
+        if not any(spec.memory.enabled for spec in roster.values()):
+            return None
+        if not self._memory_open_attempted:
+            self._memory_open_attempted = True
+            try:
+                self._memory = AgentMemory(self._memory_root)
+            except OSError:
+                self._memory = None
+        return self._memory
+
     def _new_leader(self, session: SessionStore) -> Leader:
         result_store = ToolResultStore(
             directory=session.tool_results_directory,
@@ -373,6 +391,7 @@ class HostRun:
                 subagent_specs=roster,
                 subagent_budget=self._subagent_budget,
                 hook_runner=self._hooks,
+                memory=self._memory_for(roster),
             ),
             session=session,
         )

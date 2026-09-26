@@ -9,6 +9,7 @@ from pathlib import Path
 import unittest.mock as mock
 from dataclasses import fields
 
+from symphonai_api.agent_memory import MAX_ENTRY_CHARS, AgentMemory, MemorySettings
 from symphonai_api.agent_run import RunPhase, new_agent_run
 from symphonai_api.budgets import RunBudget
 from symphonai_api.agent_spec import (
@@ -195,6 +196,7 @@ def _spec(
     max_depth: int = 0,
     effort: str | None = None,
     model: str = "test-model",
+    memory: MemorySettings = MemorySettings(),
 ) -> AgentSpec:
     return AgentSpec(
         name=name,
@@ -204,6 +206,7 @@ def _spec(
         deadline_seconds=deadline_seconds,
         isolation=isolation,
         io=io,
+        memory=memory,
         call_class=CallClass.BACKGROUND,
         max_depth=max_depth,
     )
@@ -2625,3 +2628,216 @@ def check_search_roster_dispatch() -> None:
         result = missing.execute(_dispatch("project_search", "inspect"), ws.policy)
         if result.ok or "search is not configured" not in (result.error or "") or missing.pool:
             fail(f"unconfigured search definition did not fail at dispatch: {result!r}")
+
+
+@check("leader.memory_registry_and_seeding")
+def check_memory_registry_and_seeding() -> None:
+    with workspace() as ws:
+        store = AgentMemory(ws.root / "memory")
+        store.write("enabled", "older lesson", run_id="old-1")
+        store.write("enabled", "latest lesson", run_id="old-2")
+        store.write("leader", "leader preference", run_id="old-3")
+        enabled = _spec(
+            ws.root,
+            "enabled",
+            prompt="enabled prompt",
+            memory=MemorySettings(enabled=True, max_entries=1),
+        )
+        disabled = _spec(ws.root, "disabled", prompt="disabled prompt")
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "enabled done")),
+            ModelResponse(Message(Role.ASSISTANT, "disabled done")),
+        ])
+        dispatch = DispatchSubagentTool(
+            provider,
+            ws.policy,
+            subagent_specs={"enabled": enabled, "disabled": disabled},
+            memory=store,
+        )
+        for name in ("enabled", "disabled"):
+            result = dispatch.execute(_dispatch(name, "same task", name), ws.policy)
+            if not result.ok:
+                fail(f"{name} memory dispatch failed: {result!r}")
+        if "remember" not in dispatch.pool["enabled"].agent._tools:
+            fail("memory-enabled agent registry omitted remember")
+        if "remember" in dispatch.pool["disabled"].agent._tools:
+            fail("memory-disabled agent registry exposed remember")
+        enabled_text = [message.text for message in provider.requests[0].messages]
+        if (
+            enabled_text[0] != "enabled prompt"
+            or "latest lesson" not in enabled_text[1]
+            or "older lesson" in enabled_text[1]
+            or enabled_text[-1] != "same task"
+        ):
+            fail(f"enabled memory seed was wrong: {enabled_text!r}")
+        disabled_text = [message.text for message in provider.requests[1].messages]
+        if disabled_text != ["disabled prompt", "same task"]:
+            fail(f"disabled memory changed context seeding: {disabled_text!r}")
+
+        leader_spec = _spec(
+            ws.root,
+            "leader",
+            prompt="leader prompt",
+            memory=MemorySettings(enabled=True),
+        )
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider,
+            FakeModelProvider(),
+            str(ws.root),
+            subagent_specs={"leader": leader_spec},
+            memory=store,
+        ))
+        leader.run("lead")
+        if "remember" not in leader._agent._tools:
+            fail("memory-enabled leader registry omitted remember")
+        leader_text = [message.text for message in leader_provider.requests[0].messages]
+        if (
+            leader_text[0] != "leader prompt"
+            or "leader preference" not in leader_text[1]
+            or leader_text[-1] != "lead"
+        ):
+            fail(f"leader did not follow memory seeding: {leader_text!r}")
+
+
+@check("leader.memory_round_trip_and_isolation")
+def check_memory_round_trip_and_isolation() -> None:
+    with workspace() as ws:
+        store = AgentMemory(ws.root / "memory")
+        spec = _spec(
+            ws.root,
+            "reviewer",
+            memory=MemorySettings(enabled=True),
+        )
+        writing = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "remember-call",
+                "remember",
+                {"text": "Use the project's terse report style."},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "written")),
+        ])
+        first = DispatchSubagentTool(
+            writing,
+            ws.policy,
+            subagent_specs={"reviewer": spec},
+            memory=store,
+        )
+        result = first.execute(_dispatch("reviewer", "review", "first"), ws.policy)
+        entries = store.read("reviewer")
+        if not result.ok or len(entries) != 1:
+            fail(f"memory tool did not complete its dispatch: {result!r}, {entries!r}")
+        current_run_id = first.pool["reviewer"].runs[0].run.run_id
+        if entries[0].run_id != current_run_id:
+            fail(f"memory used {entries[0].run_id!r}, expected current run {current_run_id!r}")
+
+        reading = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "read")),
+        ])
+        second = DispatchSubagentTool(
+            reading,
+            ws.policy,
+            subagent_specs={"reviewer": spec},
+            memory=store,
+        )
+        result = second.execute(_dispatch("reviewer", "review", "second"), ws.policy)
+        seeded = [message.text for message in reading.requests[0].messages]
+        if not result.ok or not any(entries[0].text in text for text in seeded):
+            fail(f"later dispatch was not seeded from the write: {seeded!r}")
+
+        other_spec = _spec(
+            ws.root,
+            "analyzer",
+            memory=MemorySettings(enabled=True),
+        )
+        isolated_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "isolated")),
+        ])
+        isolated = DispatchSubagentTool(
+            isolated_provider,
+            ws.policy,
+            subagent_specs={"analyzer": other_spec},
+            memory=store,
+        )
+        result = isolated.execute(_dispatch("analyzer", "review", "other"), ws.policy)
+        other_seed = [message.text for message in isolated_provider.requests[0].messages]
+        if not result.ok or any(entries[0].text in text for text in other_seed):
+            fail(f"another agent received reviewer's memory: {other_seed!r}")
+
+
+@check("leader.memory_failures_do_not_fail_run")
+def check_memory_failures_do_not_fail_run() -> None:
+    with workspace() as ws:
+        spec = _spec(
+            ws.root,
+            "reviewer",
+            prompt="review prompt",
+            memory=MemorySettings(enabled=True),
+        )
+        oversized = "x" * (MAX_ENTRY_CHARS + 1)
+        store = AgentMemory(ws.root / "memory")
+        limited_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "too-long", "remember", {"text": oversized},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "continued")),
+        ])
+        limited = DispatchSubagentTool(
+            limited_provider,
+            ws.policy,
+            subagent_specs={"reviewer": spec},
+            memory=store,
+        )
+        result = limited.execute(_dispatch("reviewer", "review", "limited"), ws.policy)
+        tool_results = [
+            message.tool_result
+            for message in limited_provider.requests[1].messages
+            if message.tool_result is not None
+        ]
+        if (
+            not result.ok
+            or len(tool_results) != 1
+            or tool_results[0].ok
+            or "MAX_ENTRY_CHARS" not in (tool_results[0].error or "")
+            or store.read("reviewer")
+        ):
+            fail(f"overlong memory did not fail only its tool call: {result!r}, {tool_results!r}")
+
+        unavailable_root = ws.root / "unavailable-memory"
+        unavailable = AgentMemory(unavailable_root)
+        original_mode = unavailable_root.stat().st_mode
+        unavailable_root.chmod(0o500)
+        try:
+            unavailable_provider = _RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    "unavailable", "remember", {"text": "durable lesson"},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "continued")),
+            ])
+            dispatch = DispatchSubagentTool(
+                unavailable_provider,
+                ws.policy,
+                subagent_specs={"reviewer": spec},
+                memory=unavailable,
+            )
+            result = dispatch.execute(_dispatch("reviewer", "review", "unavailable"), ws.policy)
+            unavailable_results = [
+                message.tool_result
+                for message in unavailable_provider.requests[1].messages
+                if message.tool_result is not None
+            ]
+            initial = [message.text for message in unavailable_provider.requests[0].messages]
+            if (
+                not result.ok
+                or len(unavailable_results) != 1
+                or unavailable_results[0].ok
+                or initial != ["review prompt", "review"]
+            ):
+                fail(
+                    "unavailable memory did not degrade to an empty seed and failed tool: "
+                    f"{result!r}, {initial!r}, {unavailable_results!r}"
+                )
+        finally:
+            unavailable_root.chmod(original_mode)

@@ -22,6 +22,7 @@ from symphonai_api.agent_spec import (
     Isolation,
     ModelSelector,
 )
+from symphonai_api.agent_memory import MemorySettings
 from symphonai_api.call_class import CallClass
 from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.identity import SCHEMA_VERSION
@@ -795,3 +796,21 @@ def web_search_allow_and_deny() -> None:
             fail(f"search deny did not remove the tool: {spec.tool_names!r}")
         if tuple(standard_tool_registry()) != STANDARD_TOOL_NAMES:
             fail("unconfigured standard registry acquired web_search")
+
+
+@check("agent_file.memory_reaches_agent_spec")
+def memory_reaches_agent_spec() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        path = _write(
+            directory,
+            "reviewer.toml",
+            'prompt = "Review."\n[memory]\nenabled = true\nmax_entries = 7\n',
+        )
+        loaded = load_agent_file(
+            path,
+            repo_root=directory,
+            default_model=ModelSelector("fake"),
+        )
+        if loaded.memory != MemorySettings(enabled=True, max_entries=7):
+            fail(f"loaded AgentSpec discarded memory settings: {loaded.memory!r}")

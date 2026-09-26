@@ -106,6 +106,15 @@ def default_sessions_root() -> Path:
     return symphonai_home() / "sessions"
 
 
+def default_memory_root() -> Path:
+    """The user-level directory durable agent memory is written under."""
+
+    override = os.environ.get("SYMPHONAI_MEMORY_DIR")
+    if override:
+        return Path(override).expanduser()
+    return symphonai_home() / "memory"
+
+
 class TranscriptWriter:
     """Append-only, one open file, one lock, flushed per record."""
 

@@ -8,7 +8,9 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 import re
 import stat
+from unittest import mock
 
+import symphonai_api.session as session_module
 from symphonai_api.agent_file import AgentFileError, memory_settings
 from symphonai_api.agent_memory import (
     MAX_ENTRIES,
@@ -18,6 +20,9 @@ from symphonai_api.agent_memory import (
     MemorySettings,
     MemoryUnavailable,
 )
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.tools.memory import MemoryTool
 from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
 
@@ -318,6 +323,49 @@ def settings_from_the_file() -> None:
             pass
         else:
             fail("MemorySettings was mutable")
+
+
+@check("agent_memory.default_root")
+def default_root() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary) / "home"
+        override = Path(temporary) / "elsewhere"
+        with mock.patch.object(session_module, "symphonai_home", return_value=home):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                if session_module.default_memory_root() != home / "memory":
+                    fail("default memory root was not beside the other user data")
+            with mock.patch.dict(
+                "os.environ",
+                {"SYMPHONAI_MEMORY_DIR": str(override)},
+                clear=True,
+            ):
+                if session_module.default_memory_root() != override:
+                    fail("SYMPHONAI_MEMORY_DIR did not override the memory root")
+
+
+@check("agent_memory.tool_writes_and_reopens")
+def tool_writes_and_reopens() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "memory"
+        store = AgentMemory(root)
+        tool = MemoryTool(store, "reviewer", lambda: "run-current")
+        result = tool.execute(
+            ToolCall("remember-1", "remember", {"text": "Prefer short reports."}),
+            PermissionPolicy(Path(temporary)),
+        )
+        if not result.ok:
+            fail(f"memory tool rejected a valid lesson: {result!r}")
+        entries = AgentMemory(root).read("reviewer")
+        if (
+            len(entries) != 1
+            or entries[0].text != "Prefer short reports."
+            or entries[0].run_id != "run-current"
+        ):
+            fail(f"memory did not survive a reconstructed store: {entries!r}")
+        description = tool.description.lower()
+        for phrase in ("durable lesson", "person taught", "task state", "finding", "summary"):
+            if phrase not in description:
+                fail(f"memory tool description omitted {phrase!r}: {description!r}")
 
 
 @check("agent_memory.no_runtime_imports")

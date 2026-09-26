@@ -3861,6 +3861,93 @@ def check_defined_worker_reaches_pool() -> None:
             session.close()
 
 
+@check("host_server.agent_memory_survives_new_host")
+def check_agent_memory_survives_new_host() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self, responses):  # noqa: ANN001
+            super().__init__(responses)
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):  # noqa: ANN001
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        memory_root = Path(temporary) / "memory"
+        agents = root / ".symphonai" / "agents"
+        agents.mkdir(parents=True)
+        user_base = home / ".symphonai"
+        user_base.mkdir(parents=True)
+        (user_base / "config.toml").write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        (agents / "reviewer.toml").write_text(
+            'prompt = "review carefully"\n'
+            '[memory]\nenabled = true\n'
+            '[model]\nprovider = "fake"\n',
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        first_provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent",
+                {"subagent_name": "reviewer", "task": "review"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "remember", "remember", {"text": "Prefer concise findings."},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "saved")),
+            ModelResponse(Message(Role.ASSISTANT, "first done")),
+        ])
+        first_host = HostRun(
+            first_provider,
+            PermissionPolicy(root),
+            EventBroker(),
+            sessions_root=root / "sessions-one",
+            memory_root=memory_root,
+            extensions=extensions,
+        )
+        first_session = SessionStore(root / "sessions-one", "first", repo_root=root)
+        try:
+            first_leader = first_host._new_leader(first_session)
+            result = first_leader.run("delegate")
+            if result.final_answer != "first done":
+                fail(f"first host could not write agent memory: {result!r}")
+        finally:
+            first_session.close()
+
+        second_provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent",
+                {"subagent_name": "reviewer", "task": "review"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "read")),
+            ModelResponse(Message(Role.ASSISTANT, "second done")),
+        ])
+        second_host = HostRun(
+            second_provider,
+            PermissionPolicy(root),
+            EventBroker(),
+            sessions_root=root / "sessions-two",
+            memory_root=memory_root,
+            extensions=extensions,
+        )
+        second_session = SessionStore(root / "sessions-two", "second", repo_root=root)
+        try:
+            second_leader = second_host._new_leader(second_session)
+            result = second_leader.run("delegate")
+            seeded = [message.text for message in second_provider.requests[1].messages]
+            if result.final_answer != "second done" or not any("Prefer concise findings." in text for text in seeded):
+                fail(f"new host did not reopen the agent memory root: {seeded!r}")
+            if second_host._memory is first_host._memory:
+                fail("host persistence test reused the same AgentMemory object")
+        finally:
+            second_session.close()
+
+
 @check("host_server.defined_leader_provider_model_and_tools")
 def check_defined_leader_provider_model_and_tools() -> None:
     class RecordingProvider(FakeModelProvider):

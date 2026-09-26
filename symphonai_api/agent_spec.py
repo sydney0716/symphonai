@@ -13,6 +13,7 @@ from enum import Enum
 from pathlib import PurePosixPath
 from types import MappingProxyType
 
+from symphonai_api.agent_memory import MemorySettings
 from symphonai_api.budgets import RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.identity import SCHEMA_VERSION
@@ -149,6 +150,7 @@ class AgentSpec:
     deadline_seconds: float | None = None
     isolation: Isolation = Isolation()
     io: IOContract = IOContract()
+    memory: MemorySettings = MemorySettings()
     call_class: CallClass = CallClass.BACKGROUND
     max_depth: int = 0
     schema_version: int = SCHEMA_VERSION

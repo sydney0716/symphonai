@@ -379,7 +379,6 @@ def load_agent_file(
     budget_table = _table(source, data, "budget")
     policy_table = _table(source, data, "policy")
     io_table = _table(source, data, "io")
-    _memory_settings(source, memory_table)
     values: dict[str, object] = {
         "name": source.stem,
         "prompt": prompt,
@@ -389,6 +388,7 @@ def load_agent_file(
         "budget": _budget(source, budget_table, price_table),
         "isolation": _isolation(source, isolation_table),
         "io": _io(source, io_table),
+        "memory": _memory_settings(source, memory_table),
     }
     if "deadline_seconds" in data:
         values["deadline_seconds"] = _number(

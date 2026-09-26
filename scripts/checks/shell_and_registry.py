@@ -12,6 +12,7 @@ from symphonai_api.permissions import (
     PermissionPolicy,
 )
 from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.shell_classify import classify
 from scripts.checks.harness import check, fail, ok
 
@@ -138,6 +139,14 @@ def check_registry_subsets() -> None:
     narrowed_tools = standard_tool_registry(["grep", "read_file"])
     if list(narrowed_tools) != ["read_file", "grep"]:
         fail(f"narrowed registry lost canonical ordering: {list(narrowed_tools)!r}")
+    memory_tools = standard_tool_registry(
+        ["read_file"],
+        memory_tool=MemoryTool(None, "reviewer", lambda: None),
+    )
+    if list(memory_tools) != ["read_file", "remember"]:
+        fail(f"opt-in memory tool was not added after the selected tools: {list(memory_tools)!r}")
+    if "remember" in metadata_tools:
+        fail("unconfigured standard registry acquired the memory tool")
     try:
         standard_tool_registry(["read_fil"])
     except ValueError as exc:

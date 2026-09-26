@@ -28,6 +28,7 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import EditFileTool, MultiEditFileTool
 from symphonai_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
+from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.tools.search import GlobTool, GrepTool
 from symphonai_api.tools.shell import RunShellTool
@@ -43,8 +44,9 @@ def standard_tool_registry(
     ledger: ReadLedger | None = None,
     result_store: ToolResultStore | None = None,
     search_backend: SearchBackend | None = None,
+    memory_tool: MemoryTool | None = None,
 ) -> dict[str, LocalTool]:
-    """The nine standard tools, plus optional search and stored-result tools.
+    """The standard tools plus explicitly supplied optional tools.
 
     `names` selects a subset, returned in canonical registry order, and an
     unknown or empty sequence raises `ValueError`.
@@ -76,11 +78,14 @@ def standard_tool_registry(
         requested_names = set(names)
     else:
         requested_names = None
-    return {
+    registry = {
         tool.name: tool
         for tool in tools
         if requested_names is None or tool.name in requested_names
     }
+    if memory_tool is not None:
+        registry[memory_tool.name] = memory_tool
+    return registry
 
 
 def merge_tool_registry(
