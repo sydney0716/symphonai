@@ -88,6 +88,11 @@ token only in the `Authorization` header, and decode every SSE `data:` frame
 with the protocol decoder. Keep unknown events and dropped notices visible.
 Receive the handshake through a pipe or stdin, never on a command line.
 
+When started for interactive use, the host writes its unchanged JSON handshake
+as the first stdout line, then writes `http://127.0.0.1:<port>/app/?token=<token>`
+to stderr for the operator to open. The URL is on stderr so the first stdout
+line remains machine-readable for a parent process.
+
 ## Sessions
 
 `GET /sessions` returns a bare array of persisted session metadata newest first.

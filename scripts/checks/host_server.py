@@ -403,6 +403,47 @@ def check_handshake_line() -> None:
         host.close()
 
 
+@check("host_server.handshake_url")
+def check_handshake_url() -> None:
+    host = object.__new__(HostServer)
+    host._httpd = mock.Mock(server_address=("127.0.0.1", 51234))
+    host.token = "handshake-test-token"
+    host._handshake_printed = False
+    writes: list[str] = []
+
+    class RecordedOutput(io.StringIO):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def write(self, text: str) -> int:
+            writes.append(self.name)
+            return super().write(text)
+
+    output = RecordedOutput("stdout")
+    errors = RecordedOutput("stderr")
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+        host.print_handshake()
+        host.print_handshake()
+    lines = output.getvalue().splitlines()
+    if len(lines) != 1:
+        fail(f"host printed {len(lines)} stdout lines: {lines!r}")
+    handshake = json.loads(lines[0])
+    expected = (
+        f"http://127.0.0.1:{handshake['port']}/app/?token={handshake['token']}"
+    )
+    if (
+        set(handshake) != {"port", "token"}
+        or handshake != {"port": host.port, "token": host.token}
+        or errors.getvalue().splitlines() != [expected]
+        or list(dict.fromkeys(writes)) != ["stdout", "stderr"]
+    ):
+        fail(
+            "host startup output did not include the matching app URL on stderr: "
+            f"stdout={output.getvalue()!r}, stderr={errors.getvalue()!r}"
+        )
+
+
 @check("host_server.auth_required")
 def check_auth_required() -> None:
     host = _host()

@@ -24,6 +24,9 @@ The sidecar writes its JSON handshake as its first stdout line. The parent must
 keep stdout free of wrapper logging until it has read that line. The parent also
 owns the process lifetime and must terminate the sidecar on app exit: the
 host's signal handler only handles signals that the parent actually sends.
+After writing the handshake, the host prints the app URL, including its token,
+to stderr for interactive use. This keeps stdout's first-line handshake
+contract unchanged.
 
 The packaged sidecar starts in `ask`: side-effectful tools park until the
 client answers their approval request (or it times out). Clients change the

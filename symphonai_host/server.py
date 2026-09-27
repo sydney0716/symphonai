@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import shlex
+import sys
 import threading
 import tempfile
 from collections.abc import Mapping
@@ -191,7 +192,13 @@ class HostServer:
 
     def print_handshake(self) -> None:
         if not self._handshake_printed:
-            print(json.dumps(self.handshake()), flush=True)
+            handshake = self.handshake()
+            print(json.dumps(handshake), flush=True)
+            print(
+                f"http://127.0.0.1:{handshake['port']}/app/?token={handshake['token']}",
+                file=sys.stderr,
+                flush=True,
+            )
             self._handshake_printed = True
 
     def start(self) -> None:
