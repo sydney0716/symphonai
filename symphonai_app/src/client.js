@@ -123,7 +123,7 @@ export function createClient({
     return value;
   }
 
-  async function request(method, path, body, read = readReply) {
+  async function request(method, path, body, read = readReply, { detailOnError = false } = {}) {
     const options = { method, headers: headers() };
     if (body !== undefined) {
       options.headers = headers({ "Content-Type": "application/json" });
@@ -140,7 +140,20 @@ export function createClient({
       throw new ProtocolError("host returned a malformed response");
     }
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`host request failed with status ${response.status}`);
+      let detail = "";
+      if (detailOnError) {
+        try {
+          const value = await response.json();
+          if (isObject(value) && typeof value.error === "string") {
+            detail = value.error;
+          }
+        } catch {
+          // Keep the status error when the host did not return JSON.
+        }
+      }
+      const error = new Error(detail || `host request failed with status ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
     return read(response);
   }
@@ -280,6 +293,21 @@ export function createClient({
 
     settings() {
       return request("GET", "/settings");
+    },
+
+    agent(name, scope) {
+      const query = new URLSearchParams({ name, scope });
+      return request("GET", `/agent?${query}`);
+    },
+
+    saveAgent(name, scope, text) {
+      return request(
+        "POST",
+        "/agent",
+        { name, scope, text },
+        readReply,
+        { detailOnError: true },
+      );
     },
 
     models(provider, baseUrl) {

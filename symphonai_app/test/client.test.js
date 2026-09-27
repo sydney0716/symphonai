@@ -113,6 +113,42 @@ test("permission mode uses an authenticated JSON request", async () => {
   assert.deepEqual(JSON.parse(records[0].options.body), { mode: "plan" });
 });
 
+test("agent definitions use authenticated read and write routes", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, { name: "reviewer", scope: "project", text: 'prompt = "ok"\n' });
+    },
+  });
+  assert.deepEqual(await client.agent("reviewer", "project"), {
+    name: "reviewer", scope: "project", text: 'prompt = "ok"\n',
+  });
+  assert.deepEqual(await client.saveAgent("reviewer", "project", 'prompt = "ok"\n'), {
+    name: "reviewer", scope: "project", text: 'prompt = "ok"\n',
+  });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/agent?name=reviewer&scope=project");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.equal(records[1].url, "http://127.0.0.1:4312/agent");
+  assert.deepEqual(JSON.parse(records[1].options.body), {
+    name: "reviewer", scope: "project", text: 'prompt = "ok"\n',
+  });
+});
+
+test("agent save preserves the host validation message", async () => {
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => response(400, { error: "/tmp/reviewer.toml: model: bad provider" }),
+  });
+  await assert.rejects(
+    client.saveAgent("reviewer", "project", "broken"),
+    (error) => error.message === "/tmp/reviewer.toml: model: bad provider" && error.status === 400,
+  );
+});
+
 test("fork sends opaque session and record ids in the authenticated body", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {

@@ -178,6 +178,39 @@ button.session-link {
   margin-left: 0.75rem;
 }
 
+.agent-form {
+  display: grid;
+  max-width: 48rem;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.agent-form label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.agent-form input,
+.agent-form select,
+.agent-form textarea {
+  width: 100%;
+  padding: 0.4rem;
+  color: inherit;
+  background: #0d1117;
+  border: 1px solid #394150;
+}
+
+.agent-form textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.agent-status {
+  margin: 0;
+  color: #9aa7b8;
+  white-space: pre-wrap;
+}
+
 .chat-pane {
   display: grid;
   grid-template-rows: auto 1fr auto auto;

@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  ceilingRows, generalRows, hookRows, inventoryRows, modelRows, rosterRows,
-  serverRows, SettingsError, trustRows,
+  agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows,
+  modelRows, parseAgentText, rosterRows, serverRows, SettingsError, trustRows,
 } from "../src/settings.js";
 
 test("general rows sort by key, retain scope, and render complete values", () => {
@@ -76,6 +76,105 @@ test("rosters sort each extension kind and ignore unknown kinds", () => {
   assert.deepEqual(rosterRows(reply, "unknown"), []);
   assert.deepEqual(rosterRows({ settings: {} }, "skills"), []);
   assert.equal(reply.settings.skills[0].name, "zeta");
+});
+
+test("agent rows include scope and withheld reasons", () => {
+  const reply = { settings: {
+    agents: [{ name: "project-agent", path: ".symphonai/agents/project-agent.toml" }, { name: "builtin", path: "" }],
+    withheld: [
+      { scope: "project", directory: ".symphonai/agents", names: ["blocked"], reason: "repository not trusted" },
+      { scope: "project", directory: ".symphonai/skills", names: ["skill"], reason: "not an agent" },
+    ],
+  } };
+
+  assert.deepEqual(agentRows(reply), [
+    { name: "blocked", path: ".symphonai/agents/blocked.toml", scope: "project", reason: "repository not trusted", editable: false },
+    { name: "builtin", path: "", scope: "user", reason: "", editable: false },
+    { name: "project-agent", path: ".symphonai/agents/project-agent.toml", scope: "project", reason: "", editable: true },
+  ]);
+});
+
+test("agent text parses and composes the editable fields", () => {
+  const source = `prompt = "Review the change.\\nKeep it short."\n`
+    + `tools = ["read_file", "grep"]\n`
+    + `deny_tools = ["grep"]\n`
+    + `deadline_seconds = 30\n`
+    + `[model]\nprovider = "openai"\nmodel = "gpt-test"\neffort = "high"\n`
+    + `\n[budget]\nmax_turns = 4\n`;
+  const fields = parseAgentText(source);
+  assert.deepEqual(fields, {
+    prompt: "Review the change.\nKeep it short.",
+    provider: "openai",
+    model: "gpt-test",
+    effort: "high",
+    tools: ["read_file", "grep"],
+    denyTools: ["grep"],
+  });
+  assert.equal(composeAgentText(fields, source),
+    'prompt = "Review the change.\\nKeep it short."\n'
+    + 'tools = ["read_file", "grep"]\n'
+    + 'deny_tools = ["grep"]\n'
+    + 'deadline_seconds = 30\n'
+    + '[model]\nprovider = "openai"\nmodel = "gpt-test"\neffort = "high"\n'
+    + '\n[budget]\nmax_turns = 4\n');
+});
+
+test("editing owned fields preserves all other lines exactly", () => {
+  const source = [
+    'prompt = "old prompt"',
+    'tools = ["read_file"]',
+    'deny_tools = ["grep"]',
+    'deadline_seconds = 30',
+    '',
+    '[model]',
+    'provider = "openai"',
+    'model = "gpt-test"',
+    'effort = "low"',
+    '',
+    '[budget]',
+    'max_turns = 4',
+    '',
+    '[memory]',
+    'enabled = true',
+    '',
+    '[policy]',
+    'mode = "ask"',
+    '# keep this comment',
+    '',
+  ].join("\n");
+  const fields = parseAgentText(source);
+  assert.equal(composeAgentText({ ...fields, prompt: "new prompt" }, source), source.replace('prompt = "old prompt"', 'prompt = "new prompt"'));
+  assert.equal(composeAgentText({ ...fields, denyTools: [] }, source), source.replace('deny_tools = ["grep"]\n', ''));
+});
+
+test("adding a missing model field leaves other tables untouched", () => {
+  const source = 'prompt = "review"\n\n[budget]\nmax_turns = 4\n\n[memory]\nenabled = true\n';
+  const fields = parseAgentText(source);
+  const output = composeAgentText({ ...fields, effort: "high" }, source);
+  assert.equal(output, `${source}[model]\neffort = "high"\n`);
+});
+
+test("hashes inside strings stay part of the value while trailing comments are removed", () => {
+  const source = 'prompt = "issue #42 matters"\ntools = ["read_file"] # keep\n';
+  const fields = parseAgentText(source);
+  assert.equal(fields.prompt, "issue #42 matters");
+  assert.deepEqual(fields.tools, ["read_file"]);
+  assert.equal(composeAgentText(fields, source), source);
+});
+
+test("parsing an existing definition does not leak its text into a new definition", () => {
+  parseAgentText('tools = ["read_file"] # keep\n\n[budget]\nmax_turns = 4\n');
+  assert.equal(composeAgentText({
+    prompt: "p",
+    provider: "openai",
+    model: "m",
+    tools: ["read_file"],
+  }, ""), 'prompt = "p"\ntools = ["read_file"]\n[model]\nprovider = "openai"\nmodel = "m"\n');
+});
+
+test("new agent composition retains its minimal exact file", () => {
+  const fields = parseAgentText("");
+  assert.equal(composeAgentText(fields, ""), 'prompt = ""\n');
 });
 
 test("inventory rows retain withheld details and explain an absent reason", () => {

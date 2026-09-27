@@ -6,7 +6,7 @@ import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
-import { ceilingRows, generalRows, hookRows, inventoryRows, modelRows, rosterRows, serverRows, trustRows } from "./settings.js";
+import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, rosterRows, serverRows, trustRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
@@ -123,7 +123,7 @@ export async function start({ global, document, client }) {
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
   const board = createAgentBoard();
-  const [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply] = await Promise.all([
+  let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
@@ -391,6 +391,150 @@ export async function start({ global, document, client }) {
       return;
     }
     if (section === "skills" || section === "plugins" || section === "agents") {
+      if (section === "agents") {
+        const tableRoot = element(document, "div");
+        const editorRoot = element(document, "div", { className: "agent-editor" });
+        const newAgent = element(document, "button", { text: "New agent" });
+        newAgent.type = "button";
+
+        function renderAgentRows() {
+          const rows = agentRows(settingsReply);
+          const table = element(document, "table", { className: "settings-table" });
+          const heading = element(document, "tr");
+          append(heading, ...["Name", "Scope", "Path", "Reason", "Action"].map((text) =>
+            element(document, "th", { text })
+          ));
+          append(table, heading);
+          for (const rowData of rows) {
+            const row = element(document, "tr", { className: "settings-row" });
+            const action = element(document, "td");
+            if (rowData.editable) {
+              const open = element(document, "button", { text: "Open" });
+              open.type = "button";
+              listen(open, "click", () => openAgent(rowData));
+              append(action, open);
+            } else if (rowData.reason) {
+              const withheld = element(document, "button", { text: "Withheld" });
+              withheld.type = "button";
+              withheld.disabled = true;
+              append(action, withheld);
+            }
+            append(
+              row,
+              element(document, "td", { text: rowData.name }),
+              element(document, "td", { text: rowData.scope }),
+              element(document, "td", { text: rowData.path }),
+              element(document, "td", { text: rowData.reason }),
+              action,
+            );
+            append(table, row);
+          }
+          replace(tableRoot, table);
+        }
+
+        function field(document, tagName, className, value) {
+          const control = element(document, tagName, { className });
+          control.value = value;
+          control.name = {
+            "agent-name": "name",
+            "agent-scope": "scope",
+            "agent-prompt": "prompt",
+            "agent-provider": "provider",
+            "agent-model": "model",
+            "agent-effort": "effort",
+            "agent-tools": "tools",
+            "agent-deny-tools": "deny_tools",
+          }[className] ?? className;
+          return control;
+        }
+
+        function renderEditor(values, identity = null, original = "", message = "") {
+          const form = element(document, "form", { className: "agent-form" });
+          const name = field(document, "input", "agent-name", identity?.name ?? "");
+          const scope = field(document, "select", "agent-scope", identity?.scope ?? "project");
+          replace(scope, ...["project", "user"].map((value) => {
+            const option = element(document, "option", { text: value });
+            option.value = value;
+            return option;
+          }));
+          scope.value = identity?.scope ?? "project";
+          name.disabled = Boolean(identity);
+          scope.disabled = Boolean(identity);
+          const prompt = field(document, "textarea", "agent-prompt", values.prompt);
+          const provider = field(document, "input", "agent-provider", values.provider);
+          const model = field(document, "input", "agent-model", values.model);
+          const effort = field(document, "input", "agent-effort", values.effort);
+          const tools = field(document, "textarea", "agent-tools", values.tools.join("\n"));
+          const denyTools = field(document, "textarea", "agent-deny-tools", values.denyTools.join("\n"));
+          const status = element(document, "p", { className: "agent-status", text: message });
+          const save = element(document, "button", { className: "agent-save", text: "Save" });
+          save.type = "submit";
+          const labels = [
+            ["Name", name], ["Scope", scope], ["Prompt", prompt],
+            ["Model provider", provider], ["Model id", model], ["Model effort", effort],
+            ["Allowed tools", tools], ["Denied tools", denyTools],
+          ];
+          for (const [labelText, control] of labels) {
+            const label = element(document, "label", { text: labelText });
+            append(label, control);
+            append(form, label);
+          }
+          append(form, save, status);
+          listen(form, "submit", async (event) => {
+            event.preventDefault();
+            const currentName = name.value.trim();
+            const currentScope = scope.value;
+            const text = composeAgentText({
+              prompt: prompt.value,
+              provider: provider.value.trim(),
+              model: model.value.trim(),
+              effort: effort.value.trim(),
+              tools: tools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+              denyTools: denyTools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+            }, original);
+            try {
+              const reply = await boundary.saveAgent(currentName, currentScope, text);
+              settingsReply = await boundary.settings();
+              renderAgentRows();
+              status.textContent = reply?.message || "definition saved; it will take effect on the next run";
+            } catch (error) {
+              status.textContent = error instanceof Error ? error.message : String(error);
+            }
+          });
+          replace(editorRoot, form);
+        }
+
+        async function openAgent(rowData) {
+          const status = findAgentStatus();
+          if (status) status.textContent = "Loading definition…";
+          try {
+            const reply = await boundary.agent(rowData.name, rowData.scope);
+            const original = typeof reply?.text === "string" ? reply.text : "";
+            renderEditor(parseAgentText(original), rowData, original);
+          } catch (error) {
+            if (status) status.textContent = error instanceof Error ? error.message : String(error);
+          }
+        }
+
+        function findAgentStatus() {
+          const form = editorRoot.children[0];
+          for (const child of form?.children ?? []) {
+            if (child.className === "agent-status") return child;
+          }
+          return null;
+        }
+
+        listen(newAgent, "click", () => renderEditor(parseAgentText(""), null, ""));
+        renderAgentRows();
+        replace(
+          settingsContent,
+          element(document, "h2", { text: "Agents" }),
+          newAgent,
+          tableRoot,
+          editorRoot,
+        );
+        return;
+      }
       const rows = rosterRows(settingsReply, section);
       const table = settingsTable(["Name", "Path"], rows.map(({ name, path }) => [name, path]));
       for (const [index, { path }] of rows.entries()) {

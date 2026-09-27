@@ -191,7 +191,7 @@ export function fakeClient(
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
   } = {},
 ) {
-  const calls = { approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], models: [], newSession: 0, openSession: [], prompt: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { agent: [], approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], models: [], newSession: 0, openSession: [], prompt: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -256,6 +256,14 @@ export function fakeClient(
     async settings() {
       calls.settings += 1;
       return settings;
+    },
+    async agent(name, scope) {
+      calls.agent.push([name, scope]);
+      return { name, scope, text: 'prompt = "loaded"\n[model]\nprovider = "openai"\n' };
+    },
+    async saveAgent(name, scope, text) {
+      calls.saveAgent.push({ name, scope, text });
+      return { written: true, message: "definition saved; it will take effect on the next run" };
     },
     async health() {
       return health;
@@ -1083,8 +1091,8 @@ test("extension settings routes show startup state, complete commands, and withh
 
   await open("Agents");
   assert.deepEqual(rowCells(), [
-    ["builder", ".symphonai/agents/builder.toml"],
-    ["reviewer", ""],
+    ["builder", "project", ".symphonai/agents/builder.toml", "", ""],
+    ["reviewer", "user", "", "", ""],
   ]);
 
   await open("Inventory");
@@ -1094,11 +1102,82 @@ test("extension settings routes show startup state, complete commands, and withh
   ]);
 });
 
-test("definition settings offer no file-write call", async () => {
+test("definition settings use the agent definition route", async () => {
   const source = await readFile(new URL("../src/client.js", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../src/app.js", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /request\("POST",\s*"\/file"/);
-  assert.doesNotMatch(appSource, /storeDefinition|writeDefinition|editDefinition/);
+  assert.match(source, /"\/agent"/);
+  assert.match(appSource, /saveAgent/);
+});
+
+test("agent settings open, save, preserve refused edits, and create definitions", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/agents" });
+  const document = new FakeDocument();
+  const settings = { settings: {
+    agents: [{ name: "reviewer", path: ".symphonai/agents/reviewer.toml" }],
+    withheld: [{ scope: "project", directory: ".symphonai/agents", names: ["blocked"], reason: "repository not trusted" }],
+  } };
+  const client = fakeClient(fixtureRoadmap(), { settings });
+  client.agent = async () => ({
+    name: "reviewer",
+    scope: "project",
+    text: 'prompt = "loaded prompt"\n\ntools = ["read_file"] # keep this comment\n'
+      + 'deadline_seconds = 30\n'
+      + '[model]\nprovider = "openai"\nmodel = "gpt-test"\neffort = "high"\n'
+      + '[budget]\nmax_turns = 4\n[memory]\nenabled = true\n[policy]\nmode = "ask"\n',
+  });
+  const saved = [];
+  client.saveAgent = async (name, scope, text) => {
+    saved.push({ name, scope, text });
+    return { written: true, message: "definition saved; it will take effect on the next run" };
+  };
+  await start({ global: browser.global, document, client });
+  const content = find(document.getElementById("page"), (value) => value.className === "settings-content");
+  const rows = walk(content).filter((value) => value.className === "settings-row");
+  assert.equal(rows.length, 2);
+  assert.equal(visibleText(rows[0]), "\nblocked\nproject\n.symphonai/agents/blocked.toml\nrepository not trusted\n\nWithheld");
+  assert.equal(rows[0].children[4].children[0].disabled, true);
+
+  await find(rows[1], (value) => value.tagName === "BUTTON").dispatch("click");
+  const form = find(content, (value) => value.className === "agent-form");
+  const controls = Object.fromEntries(
+    walk(form).filter((value) => value.className?.startsWith("agent-")).map((value) => [value.className, value]),
+  );
+  assert.equal(controls["agent-prompt"].value, "loaded prompt");
+  assert.equal(controls["agent-provider"].value, "openai");
+  controls["agent-prompt"].value = "edited prompt";
+  await form.dispatch("submit");
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].name, "reviewer");
+  assert.equal(saved[0].scope, "project");
+  assert.match(saved[0].text, /prompt = "edited prompt"/);
+  assert.match(saved[0].text, /deadline_seconds = 30/);
+  assert.match(saved[0].text, /tools = \["read_file"\] # keep this comment/);
+  assert.match(saved[0].text, /\[budget\]\nmax_turns = 4/);
+  assert.match(saved[0].text, /\[memory\]\nenabled = true/);
+  assert.match(saved[0].text, /\[policy\]\nmode = "ask"/);
+  assert.match(visibleText(form), /definition saved; it will take effect on the next run/);
+
+  client.saveAgent = async () => { throw new Error("/tmp/reviewer.toml: model: bad provider"); };
+  controls["agent-model"].value = "kept-model";
+  await form.dispatch("submit");
+  assert.equal(controls["agent-model"].value, "kept-model");
+  assert.match(visibleText(form), /\/tmp\/reviewer\.toml: model: bad provider/);
+
+  await find(content, (value) => value.tagName === "BUTTON" && value.textContent === "New agent").dispatch("click");
+  const newForm = find(content, (value) => value.className === "agent-form");
+  const newControls = Object.fromEntries(
+    walk(newForm).filter((value) => value.className?.startsWith("agent-")).map((value) => [value.className, value]),
+  );
+  newControls["agent-name"].value = "new-agent";
+  newControls["agent-provider"].value = "anthropic";
+  newControls["agent-prompt"].value = "new prompt";
+  client.saveAgent = async (name, scope, text) => {
+    saved.push({ name, scope, text });
+    return { written: true, message: "definition saved; it will take effect on the next run" };
+  };
+  await newForm.dispatch("submit");
+  assert.equal(saved.at(-1).name, "new-agent");
+  assert.equal(saved.at(-1).scope, "project");
 });
 
 test("an empty extension inventory says nothing was withheld", async () => {
