@@ -26,6 +26,8 @@ UNBOUND_BY_DESIGN: dict[str, str] = {
         "test hygiene: five host checks racing a fifty-millisecond keepalive",
     "specs/18/18k-a-page-you-can-open.md":
         "development browser shell omitted from the phase 18 roadmap",
+    "specs/27/27d-a-selfcheck-worth-its-minute.md":
+        "test hygiene: reduce selfcheck time without changing roadmap capability",
 }
 
 
@@ -123,6 +125,7 @@ def _unbound_set_errors(unbound_by_design: dict[str, str]) -> list[str]:
     expected = {
         "specs/18/18j-five-flaky-checks-one-race.md",
         "specs/18/18k-a-page-you-can-open.md",
+        "specs/27/27d-a-selfcheck-worth-its-minute.md",
     }
     return sorted(set(unbound_by_design) ^ expected)
 

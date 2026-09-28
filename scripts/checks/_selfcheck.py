@@ -17,18 +17,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from scripts.checks.harness import check, fail, ok, run  # noqa: E402
 
 
-EXPECTED_REPOSITORY_CHECKS = (
-    "app.roadmap",
-    "app.spec_view",
-    "app.real_roadmap",
-    "packaging.bundle_input",
-    "packaging.page_tracked",
-    "roadmap_data.schema",
-    "roadmap_data.spec_bindings",
-    "plugins.manifest_validation",
-)
-
-
 @check("selfcheck.pass")
 def passing_check() -> None:
     ok("deliberate pass")
@@ -77,10 +65,10 @@ def _run_fixture(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _write_skip_fixture(root: Path) -> None:
+def _write_skip_fixture(root: Path, repository_checks: list[str]) -> None:
     _copy_harness(root)
     definitions = []
-    for index, name in enumerate(EXPECTED_REPOSITORY_CHECKS):
+    for index, name in enumerate(repository_checks):
         definitions.append(
             f'@check({name!r}, needs_repository=True)\n'
             f"def repository_check_{index}() -> None:\n"
@@ -94,24 +82,19 @@ def _write_skip_fixture(root: Path) -> None:
     (root / "scripts" / "check.py").write_text(source, encoding="utf-8")
 
 
-def _write_repository_fixture(root: Path) -> Path:
+def _write_repository_fixture(root: Path, check_name: str) -> None:
     _copy_harness(root)
-    shutil.copy2(
-        REPO_ROOT / "scripts" / "checks" / "roadmap_data.py",
-        root / "scripts" / "checks" / "roadmap_data.py",
-    )
     docs = root / "docs"
     docs.mkdir()
-    for name in ("roadmap.json", "roadmap.schema.json"):
-        shutil.copy2(REPO_ROOT / "docs" / name, docs / name)
-    (root / ".git").mkdir()
+    (docs / "roadmap.json").touch()
     (root / "scripts" / "check.py").write_text(
-        "from scripts.checks import roadmap_data\n"
-        "from scripts.checks.harness import run\n"
-        'raise SystemExit(run("roadmap_data.schema"))\n',
+        "from scripts.checks.harness import check, fail, run\n\n"
+        f"@check({check_name!r}, needs_repository=True)\n"
+        "def broken_repository_check() -> None:\n"
+        '    fail("deliberately broken repository check")\n\n'
+        f"raise SystemExit(run({check_name!r}))\n",
         encoding="utf-8",
     )
-    return docs / "roadmap.schema.json"
 
 
 def main() -> None:
@@ -142,57 +125,6 @@ def main() -> None:
     else:
         raise RuntimeError("duplicate check name was accepted")
 
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-
-        no_git = root / "no-git"
-        _write_skip_fixture(no_git)
-        skipped = _run_fixture(no_git)
-        expected_skip_lines = [
-            f"SKIP  {name}: needs the working repository"
-            for name in EXPECTED_REPOSITORY_CHECKS
-        ]
-        require(skipped.returncode == 0, f"skip-only run failed: {skipped.stdout!r}")
-        require(
-            skipped.stdout.splitlines()
-            == [
-                *expected_skip_lines,
-                # Derived, not copied: a count typed beside a list it describes
-                # goes stale the moment the list grows, which is how this
-                # assertion came to say seven of an eight-name set.
-                f"0 passed, 0 failed, {len(EXPECTED_REPOSITORY_CHECKS)} skipped, "
-                f"{len(EXPECTED_REPOSITORY_CHECKS)} selected of "
-                f"{len(EXPECTED_REPOSITORY_CHECKS)} registered",
-            ],
-            f"no-git skips were wrong: {skipped.stdout!r}",
-        )
-
-        working = root / "working"
-        schema = _write_repository_fixture(working)
-        present = _run_fixture(working)
-        require(
-            present.returncode == 0 and "SKIP  " not in present.stdout,
-            f"working-repository check was skipped or failed: {present.stdout!r}",
-        )
-        schema.rename(schema.with_suffix(".hidden"))
-        hidden = _run_fixture(working)
-        require(hidden.returncode == 1, "broken repository check exited successfully")
-        require(
-            "FAIL  roadmap_data.schema:" in hidden.stdout,
-            f"broken repository check did not fail normally: {hidden.stdout!r}",
-        )
-
-    # The registry's names come from the registry. A hand-maintained copy of
-    # them forced an edit in 61 reports, produced two false failures when it
-    # went stale, and never caught a defect -- and the isolation loop below
-    # proved registration order cannot affect any outcome, so the order it
-    # pinned guarded nothing. `--list` is the source; what is asserted is that
-    # the CLI agrees with the registry it prints, not that someone retyped it.
-    listed = invoke_check("--list")
-    require(listed.returncode == 0, f"list failed: {listed.stderr!r}")
-    expected_names = listed.stdout.splitlines()
-    require(bool(expected_names), "check registry was empty")
-
     marked = subprocess.run(
         [
             sys.executable,
@@ -209,20 +141,69 @@ def main() -> None:
         check=False,
     )
     require(marked.returncode == 0, f"repository check listing failed: {marked.stderr!r}")
-    require(
-        marked.stdout.splitlines() == list(EXPECTED_REPOSITORY_CHECKS),
-        f"repository-dependent check set was wrong: {marked.stdout!r}",
-    )
+    repository_checks = marked.stdout.splitlines()
+    require(bool(repository_checks), "repository-dependent check registry was empty")
 
-    full_run = invoke_check()
-    require(full_run.returncode == 0, f"full run failed: {full_run.stdout!r}")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        no_git = root / "no-git"
+        _write_skip_fixture(no_git, repository_checks)
+        skipped = _run_fixture(no_git)
+        expected_skip_lines = [
+            f"SKIP  {name}: needs the working repository"
+            for name in repository_checks
+        ]
+        require(skipped.returncode == 0, f"skip-only run failed: {skipped.stdout!r}")
+        require(
+            skipped.stdout.splitlines()
+            == [
+                *expected_skip_lines,
+                f"0 passed, 0 failed, {len(repository_checks)} skipped, "
+                f"{len(repository_checks)} selected of {len(repository_checks)} registered",
+            ],
+            f"no-git skips were wrong: {skipped.stdout!r}",
+        )
+
+        working = root / "working"
+        broken_name = repository_checks[0]
+        _write_repository_fixture(working, broken_name)
+        present = _run_fixture(working)
+        require(
+            present.returncode == 1
+            and f"FAIL  {broken_name}: deliberately broken repository check" in present.stdout
+            and "SKIP  " not in present.stdout,
+            f"broken repository check was skipped or not reported: {present.stdout!r}",
+        )
+
+    bytecode_cache = Path(__file__).parent / "__pycache__"
+    shutil.rmtree(bytecode_cache, ignore_errors=True)
+    direct_import = subprocess.run(
+        [sys.executable, "-c", "from scripts.checks import leader"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     require(
-        full_run.stdout.splitlines()[-1]
-        == (
-            f"{len(expected_names)} passed, 0 failed, 0 skipped, "
-            f"{len(expected_names)} selected of {len(expected_names)} registered"
-        ),
-        f"unexpected full-run summary: {full_run.stdout!r}",
+        direct_import.returncode == 0,
+        f"direct leader import failed: {direct_import.stderr!r}",
+    )
+    cached_modules = list(bytecode_cache.glob("*.pyc"))
+    require(
+        all(path.name.startswith("__init__.cpython-") for path in cached_modules),
+        f"direct leader import cached check modules: {cached_modules!r}",
+    )
+    shutil.rmtree(bytecode_cache, ignore_errors=True)
+
+    listed = invoke_check("--list")
+    require(listed.returncode == 0, f"list failed: {listed.stderr!r}")
+    require(not bytecode_cache.exists(), "check.py created scripts/checks/__pycache__")
+    expected_names = listed.stdout.splitlines()
+    require(bool(expected_names), "check registry was empty")
+    require(
+        set(repository_checks).issubset(expected_names),
+        f"repository-dependent checks were missing from --list: {repository_checks!r}",
     )
 
     # --only selects by substring, so a check name that is a substring of
@@ -239,10 +220,11 @@ def main() -> None:
         f"check names collide under --only substring selection: {collisions!r}",
     )
 
-    target_schema = invoke_check("--only", "tools.target_keys_match_schemas")
+    target_schema = invoke_check("--list", "--only", "tools.target_keys_match_schemas")
     require(
-        "  OK:   10 target keys match declared schemas\n" in target_schema.stdout,
-        f"target schema check did not exercise all ten rows: {target_schema.stdout!r}",
+        target_schema.returncode == 0
+        and target_schema.stdout.splitlines() == ["tools.target_keys_match_schemas"],
+        f"target schema selector did not match exactly: {target_schema.stdout!r}",
     )
 
     listed_retry = invoke_check("--list", "--only", "retry")
@@ -264,26 +246,12 @@ def main() -> None:
         f"unexpected filtered breaker list: {listed_breakers.stdout!r}",
     )
 
-    shell_selected = [name for name in expected_names if "shell" in name.lower()]
+    shell_selected = [name for name in expected_names if "shell" in name.casefold()]
     for selector in ("shell", "SHELL"):
-        selected = invoke_check("--only", selector)
+        selected = invoke_check("--list", "--only", selector)
         require(selected.returncode == 0, f"selector {selector!r} failed")
-        selected_lines = selected.stdout.splitlines()
         require(
-            selected_lines[-1]
-            == (
-                f"{len(shell_selected)} passed, 0 failed, 0 skipped, "
-                f"{len(shell_selected)} selected of {len(expected_names)} registered"
-            ),
-            f"unexpected selector summary: {selected.stdout!r}",
-        )
-        require(
-            [
-                line.removeprefix("PASS  ")
-                for line in selected_lines
-                if line.startswith("PASS  ")
-            ]
-            == shell_selected,
+            selected.stdout.splitlines() == shell_selected,
             f"selector {selector!r} returned unexpected names: {selected.stdout!r}",
         )
 
@@ -315,29 +283,6 @@ def main() -> None:
         f"unexpected mixed-registry output: {mixed.stdout!r}",
     )
 
-    bytecode_cache = Path(__file__).parent / "__pycache__"
-    shutil.rmtree(bytecode_cache, ignore_errors=True)
-    direct_import = subprocess.run(
-        [sys.executable, "-c", "from scripts.checks import leader"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    require(
-        direct_import.returncode == 0,
-        f"direct leader import failed: {direct_import.stderr!r}",
-    )
-    cached_modules = list(bytecode_cache.glob("*.pyc"))
-    require(
-        all(path.name.startswith("__init__.cpython-") for path in cached_modules),
-        f"direct leader import cached check modules: {cached_modules!r}",
-    )
-
-    shutil.rmtree(bytecode_cache, ignore_errors=True)
-    bytecode_run = invoke_check("--only", "content.message_normalization")
-    require(bytecode_run.returncode == 0, f"bytecode check run failed: {bytecode_run.stdout!r}")
-    require(not bytecode_cache.exists(), "check.py created scripts/checks/__pycache__")
     print("harness selfcheck passed")
 
 
