@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -22,7 +23,11 @@ from symphonai_api.models import (
     Usage,
 )
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
-from symphonai_api.providers.base import ModelProvider, ProviderError
+from symphonai_api.providers.base import (
+    ContextLengthExceededError,
+    ModelProvider,
+    ProviderError,
+)
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.providers.gemini_provider import GeminiProvider, _build_request_body
 from symphonai_api.providers import openai_compatible
@@ -542,6 +547,31 @@ def check_retry_before_first_line_only() -> None:
     if lines != [b"line\n"] or opener.call_count != 2:
         fail(f"pre-line failure did not retry once: {lines!r}, {opener.call_count}")
 
+    http_error = urllib.error.HTTPError(
+        request.full_url,
+        429,
+        "Too Many Requests",
+        {"Retry-After": "0"},
+        io.BytesIO(b"try again"),
+    )
+    with mock.patch(
+        "symphonai_api.streaming.urllib.request.urlopen",
+        side_effect=[http_error, _LinesResponse([b"retried\n"])],
+    ) as opener, mock.patch(
+        "symphonai_api.streaming._wait_before_retry", return_value=True
+    ):
+        lines = list(
+            open_stream_with_retry(
+                request,
+                timeout=5,
+                max_attempts=2,
+                api_key="key",
+                operation="test",
+            )
+        )
+    if lines != [b"retried\n"] or opener.call_count != 2:
+        fail(f"retryable HTTP failure did not retry once: {lines!r}, {opener.call_count}")
+
     api_key = "stream-secret-key"
 
     class _FailsAfterLine(_LinesResponse):
@@ -571,6 +601,118 @@ def check_retry_before_first_line_only() -> None:
             fail("post-line stream failure did not raise")
     if opener.call_count != 1:
         fail(f"post-line failure replayed the stream {opener.call_count} times")
+
+
+@check("streaming.http_error_body_details")
+def check_http_error_body_details() -> None:
+    request = urllib.request.Request("https://stream.invalid")
+    api_key = "stream-http-error-secret"
+
+    class _ErrorBody:
+        def __init__(self, body: bytes = b"", error: Exception | None = None) -> None:
+            self.body = body
+            self.error = error
+            self.read_count = 0
+
+        def read(self) -> bytes:
+            self.read_count += 1
+            if self.error is not None:
+                raise self.error
+            return self.body
+
+        def close(self) -> None:
+            pass
+
+    body = _ErrorBody(
+        f'{{"error":{{"message":"invalid model option {api_key}"}}}}'.encode()
+    )
+    error = urllib.error.HTTPError(
+        request.full_url, 400, "Bad Request", {}, body
+    )
+    with mock.patch(
+        "symphonai_api.streaming.urllib.request.urlopen",
+        side_effect=error,
+    ):
+        try:
+            list(
+                open_stream_with_retry(
+                    request,
+                    timeout=5,
+                    max_attempts=1,
+                    api_key=api_key,
+                    operation="test",
+                )
+            )
+        except ProviderError as exc:
+            message = str(exc)
+            if "invalid model option" not in message or api_key in message:
+                fail(f"stream error lost or exposed the vendor reason: {message!r}")
+            if "[redacted]" not in message or "HTTP 400" not in message:
+                fail(f"stream error did not retain status and redact its key: {message!r}")
+        else:
+            fail("streamed HTTP 400 did not raise ProviderError")
+    if body.read_count != 1:
+        fail(f"stream error body was read {body.read_count} times")
+
+    for unavailable_body in (
+        _ErrorBody(),
+        _ErrorBody(b"\xff\xfe"),
+        _ErrorBody(error=OSError("body read failed")),
+    ):
+        error = urllib.error.HTTPError(
+            request.full_url, 400, "Bad Request", {}, unavailable_body
+        )
+        with mock.patch(
+            "symphonai_api.streaming.urllib.request.urlopen",
+            side_effect=error,
+        ):
+            try:
+                list(
+                    open_stream_with_retry(
+                        request,
+                        timeout=5,
+                        max_attempts=1,
+                        api_key=api_key,
+                        operation="test",
+                    )
+                )
+            except ProviderError as exc:
+                if (
+                    type(exc) is not ProviderError
+                    or "HTTP 400" not in str(exc)
+                    or "HTTP Error 400: Bad Request" not in str(exc)
+                ):
+                    fail(f"unavailable body changed the HTTP error: {type(exc).__name__}: {exc}")
+            else:
+                fail("streamed HTTP 400 with unavailable body did not raise ProviderError")
+        if unavailable_body.read_count != 1:
+            fail(f"unavailable stream body was read {unavailable_body.read_count} times")
+
+    overflow = _ErrorBody(b'{"error":{"code":"context_length_exceeded"}}')
+    error = urllib.error.HTTPError(
+        request.full_url, 400, "Bad Request", {}, overflow
+    )
+    with mock.patch(
+        "symphonai_api.streaming.urllib.request.urlopen",
+        side_effect=error,
+    ):
+        try:
+            list(
+                open_stream_with_retry(
+                    request,
+                    timeout=5,
+                    max_attempts=1,
+                    api_key=api_key,
+                    operation="test",
+                )
+            )
+        except ContextLengthExceededError as exc:
+            if "context window" not in str(exc):
+                fail(f"stream overflow did not retain its classification: {exc}")
+        else:
+            fail("streamed context overflow was not classified")
+    if overflow.read_count != 1:
+        fail(f"context overflow body was read {overflow.read_count} times")
 
 
 @check("streaming.cancel_mid_stream")

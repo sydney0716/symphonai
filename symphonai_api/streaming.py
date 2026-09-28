@@ -13,10 +13,12 @@ from typing import Iterable, Iterator
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
 from symphonai_api.models import Message, ModelResponse, ToolCall
-from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
 from symphonai_api.retry import (
+    _is_context_length_error,
     _is_retryable_status,
     _is_retryable_url_error,
+    _redacted_error_detail,
     _wait_before_retry,
     redact_secret,
 )
@@ -155,7 +157,24 @@ def open_stream_with_retry(
                     yield line
                 return
         except urllib.error.HTTPError as exc:
-            reason = redact_secret(str(exc), api_key)
+            try:
+                raw_detail = exc.read()
+                if raw_detail:
+                    raw_detail.decode("utf-8")
+                detail = _redacted_error_detail(raw_detail, api_key) if raw_detail else ""
+            except Exception:
+                raw_detail = b""
+                detail = ""
+            reason = detail or redact_secret(str(exc), api_key)
+            if (
+                400 <= exc.code <= 499
+                and not _is_retryable_status(exc.code)
+                and _is_context_length_error(raw_detail)
+            ):
+                raise ContextLengthExceededError(
+                    f"{operation} stream returned HTTP {exc.code}: "
+                    "request exceeded the model context window"
+                ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             if not yielded and _is_retryable_status(exc.code) and _wait_before_retry(
                 attempt=attempt,
