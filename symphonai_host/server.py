@@ -53,6 +53,7 @@ APP_CONTENT_TYPES = {
     ".css": "text/css",
     ".html": "text/html",
     ".js": "text/javascript",
+    ".json": "application/json",
 }
 APP_HANDSHAKE_MARKER = "<!-- symphonai-handshake -->"
 APP_COOKIE_NAME = "symphonai_app"

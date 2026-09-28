@@ -64,6 +64,14 @@ from scripts.checks.harness import CheckFailed, check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_APP_HTML_RESOURCE = re.compile(r"""(?:src|href)=[\"']([^\"']+)[\"']""")
+_APP_STATIC_IMPORT = re.compile(
+    r"""\b(?:import|export)\s+(?:[^;\"']*?\s+from\s*)?[\"']([^\"']+)[\"']"""
+)
+_APP_DYNAMIC_IMPORT = re.compile(r"""\bimport\(\s*[\"']([^\"']+)[\"']\s*\)""")
+_APP_CSS_REFERENCE = re.compile(
+    r"""(?:@import\s+(?:url\()?\s*|url\(\s*)[\"']?([^\"'()\s;]+)"""
+)
 _PRE_19B_COMMIT = "08206022734f05d5c2afb9b32c7e2789a892f1ed"
 _PRE_19E_COMMIT = "fa9a7dd06eee2b5f29772c1870e57a648dac9cdc"
 _FROZEN_HOST_RUN = (
@@ -82,6 +90,66 @@ _FROZEN_PROTOCOL = (
     ("ApprovalReply", "OpenSessionRequest", "PromptRequest", "StopRequest"),
     ("approval_requested", "error", "event", "reply"),
 )
+
+
+def _app_import_references(content_type: str, text: str) -> list[str]:
+    if content_type == "text/html":
+        return _APP_HTML_RESOURCE.findall(text)
+    if content_type == "text/javascript":
+        return [*_APP_STATIC_IMPORT.findall(text), *_APP_DYNAMIC_IMPORT.findall(text)]
+    if content_type == "text/css":
+        return [
+            reference
+            for reference in _APP_CSS_REFERENCE.findall(text)
+            if not reference.startswith(("data:", "blob:", "#"))
+        ]
+    return []
+
+
+def _check_app_import_graph(get, host, page: str, headers: dict[str, str]) -> set[str]:
+    pending = [
+        urljoin("/app/", reference)
+        for reference in _app_import_references("text/html", page)
+    ]
+    fetched: set[str] = set()
+    while pending:
+        asset_url = pending.pop()
+        parsed = urlsplit(asset_url)
+        if parsed.scheme or parsed.netloc or not parsed.path.startswith("/app/"):
+            fail(f"app import escaped the served app directory: {asset_url!r}")
+        asset_path = parsed.path
+        if asset_path in fetched:
+            continue
+        expected_type = host_server_module.APP_CONTENT_TYPES.get(Path(asset_path).suffix)
+        if expected_type is None:
+            fail(f"app import graph names an unserved asset: {asset_path!r}")
+        fetched.add(asset_path)
+        status, response_headers, response_body = get(host, asset_url, headers=headers)
+        if status != 200:
+            fail(f"app import graph could not fetch {asset_path!r}: {status}")
+        content_types = [
+            value
+            for key, value in response_headers
+            if key.casefold() == "content-type"
+        ]
+        if content_types != [expected_type]:
+            fail(
+                f"app import graph got the wrong content type for {asset_path!r}: "
+                f"{content_types!r}, expected {expected_type!r}"
+            )
+        text = response_body.decode("utf-8")
+        pending.extend(
+            urljoin(asset_url, reference)
+            for reference in _app_import_references(expected_type, text)
+        )
+    for required in (
+        "/app/keys.default.json",
+        "/app/src/picker.js",
+        "/app/src/json.js",
+    ):
+        if required not in fetched:
+            fail(f"app import graph did not reach {required!r}")
+    return fetched
 
 
 class _RecordingWireFakeProvider(FakeModelProvider):
@@ -1495,10 +1563,20 @@ def check_app_routes() -> None:
             if status != 200 or b"window.__symphonai = " not in body:
                 fail("app cookie did not reload the page route")
 
-            references = re.findall(r'(?:src|href)="([^"]+)"', served_html)
-            if not references:
-                fail("app index contained no browser subresource references")
-            for reference in references:
+            json_status, json_headers, _ = get(
+                host,
+                "/app/keys.default.json",
+                headers={"Cookie": cookie_header},
+            )
+            if json_status != 200 or header_values(json_headers, "Content-Type") != [
+                "application/json"
+            ]:
+                fail(
+                    "app JSON module did not load as application/json: "
+                    f"{json_status}, {json_headers!r}"
+                )
+
+            for reference in re.findall(r'(?:src|href)="([^"]+)"', served_html):
                 asset_path = urljoin("/app/", reference)
                 status, _, _ = get(
                     host,
@@ -1651,6 +1729,54 @@ def check_app_routes() -> None:
                 )
                 if not allowed:
                     fail(f"app response header exposed the token: {method} {path}")
+
+
+@check("host_server.app_import_graph")
+def check_app_import_graph() -> None:
+    token = "app-import-graph-token"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        host = _host(repo_root=root, token=token)
+
+        def get(
+            active_host,
+            path: str,
+            *,
+            headers: dict[str, str] | None = None,
+        ):  # noqa: ANN202
+            connection, response = _request(
+                active_host,
+                "GET",
+                path,
+                headers=headers,
+            )
+            try:
+                return response.status, tuple(response.getheaders()), response.read()
+            finally:
+                connection.close()
+
+        try:
+            status, headers, body = get(host, "/app/", headers=_headers(host))
+            if status != 200:
+                fail(f"app import graph could not load /app/: {status}")
+            content_types = [
+                value
+                for key, value in headers
+                if key.casefold() == "content-type"
+            ]
+            if content_types != ["text/html"]:
+                fail(f"app page had the wrong content type: {content_types!r}")
+            fetched = _check_app_import_graph(
+                get,
+                host,
+                body.decode("utf-8"),
+                _headers(host),
+            )
+            if "/app/keys.default.json" not in fetched:
+                fail("app import graph omitted keys.default.json")
+        finally:
+            host.close()
 
 
 @check("host_server.event_stream_delivers")

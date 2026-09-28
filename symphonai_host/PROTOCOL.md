@@ -326,11 +326,12 @@ require the ordinary bearer token.
 
 `GET /app/` returns the browser shell with one inline handshake script setting
 `window.__symphonai` to the running host's `port` and `token`. `GET
-/app/<asset path>` serves only `.js`, `.css`, and `.html` files resolved beneath
-`symphonai_app/`; other extensions, absolute paths, traversal, and escaping
-symlinks receive `403` with an empty body. JavaScript is served as
-`text/javascript`, CSS as `text/css`, and HTML as `text/html`. Static assets do
-not contain the token or absolute filesystem paths.
+/app/<asset path>` serves only `.js`, `.json`, `.css`, and `.html` files
+resolved beneath `symphonai_app/`; other extensions, absolute paths, traversal,
+and escaping symlinks receive `403` with an empty body. JavaScript is served as
+`text/javascript`, JSON as `application/json`, CSS as `text/css`, and HTML as
+`text/html`. Static assets do not contain the token or absolute filesystem
+paths.
 
 The app directory is resolved beside the installed host package, not beneath
 the repository selected by `--repo-root`. If that sibling `symphonai_app/`
