@@ -6,6 +6,9 @@ import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
+import keymapDefaults from "../keys.default.json" with { type: "json" };
+import { parseKeymap } from "./keys.js";
+import { createPicker } from "./picker.js";
 import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, rosterRows, serverRows, trustRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
@@ -118,6 +121,8 @@ export async function start({ global, document, client }) {
   const form = document.getElementById("prompt-form");
   const input = document.getElementById("prompt");
   const promptError = document.getElementById("prompt-error");
+  const pickerHost = element(document, "div", { className: "picker-host" });
+  form.before(pickerHost);
   const turn = createTurnState();
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
@@ -132,6 +137,8 @@ export async function start({ global, document, client }) {
     boundary.conversationStats().catch(() => ({ conversation: null })),
   ]);
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
+  const keymap = parseKeymap(JSON.stringify(keymapDefaults));
+  const platform = /mac/i.test(global.navigator?.platform ?? "") ? "darwin" : "other";
   const allModes = ["ask", "plan", "allow"];
   const ceilingModes = settingsReply?.settings?.ceiling?.modes;
   const permittedModes = Array.isArray(ceilingModes)
@@ -900,69 +907,223 @@ export async function start({ global, document, client }) {
     showTranscript();
   }
 
+  function showPicker(options) {
+    replace(pickerHost, createPicker({
+      document,
+      keymap,
+      platform,
+      ...options,
+    }));
+  }
+
+  function closePicker() {
+    replace(pickerHost);
+  }
+
+  function currentModelLabel() {
+    return conversation?.model
+      ? `${conversation.provider ? `${conversation.provider} / ` : ""}${conversation.model}`
+      : "the current model";
+  }
+
+  async function chooseMode(mode) {
+    try {
+      const reply = await boundary.selectMode(mode);
+      if (reply?.mode !== mode || !permittedModes.includes(reply.mode)) {
+        throw new Error("Host refused the mode change.");
+      }
+      currentMode = reply.mode;
+      conversation = { ...(conversation ?? {}), mode: reply.mode };
+      closePicker();
+      showConversationUsage();
+      answerCommand(`Mode set to ${reply.mode}.`);
+      await refreshConversation();
+    } catch (error) {
+      closePicker();
+      answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function openModePicker() {
+    const rows = permittedModes.map((mode) => ({
+      id: mode,
+      label: mode,
+      current: mode === (conversation?.mode ?? currentMode),
+      efforts: [],
+    }));
+    showPicker({
+      title: "Permission mode",
+      rows,
+      initialIndex: Math.max(0, rows.findIndex((row) => row.current)),
+      onChoose: (row) => chooseMode(row.id),
+      onCancel: () => {
+        closePicker();
+        answerCommand(`Kept mode as ${conversation?.mode ?? currentMode}.`);
+      },
+    });
+  }
+
+  async function chooseModel(provider, row) {
+    const choice = { name: provider, model: row.id };
+    if (row.efforts.length > 0) choice.effort = row.efforts[row.effortIndex];
+    try {
+      await boundary.selectProvider(choice);
+      conversation = { ...(conversation ?? {}), provider, model: row.id };
+      if (choice.effort) conversation.effort = choice.effort;
+      closePicker();
+      showConversationUsage();
+      answerCommand(`Model set to ${provider} / ${row.id}${choice.effort ? ` · effort ${choice.effort}` : ""}.`);
+      input.value = "";
+      await refreshConversation();
+    } catch (error) {
+      closePicker();
+      answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function openModelPicker(provider, requestedModel = "") {
+    try {
+      const reply = await boundary.models(provider);
+      if (reply?.state !== "available" || !Array.isArray(reply.models)) {
+        showPicker({
+          title: `Models · ${provider}`,
+          message: reply?.detail || `Models for ${provider} are unavailable.`,
+          onCancel: () => {
+            closePicker();
+            answerCommand(`Kept model as ${currentModelLabel()}.`);
+          },
+        });
+        return;
+      }
+      const rows = reply.models.map((model) => {
+        const efforts = Array.isArray(model.efforts) ? model.efforts : [];
+        const existingEffort = conversation?.provider === provider && conversation?.model === model.id
+          ? conversation.effort
+          : "";
+        return {
+          id: model.id,
+          label: model.id,
+          current: conversation?.provider === provider && conversation?.model === model.id,
+          efforts,
+          effortIndex: Math.max(0, efforts.indexOf(existingEffort)),
+        };
+      });
+      const selected = rows.findIndex((row) => row.id === requestedModel);
+      const current = rows.findIndex((row) => row.current);
+      showPicker({
+        title: `Models · ${provider}`,
+        rows,
+        initialIndex: selected >= 0 ? selected : Math.max(0, current),
+        showEfforts: true,
+        onChoose: (row) => chooseModel(provider, row),
+        onCancel: () => {
+          closePicker();
+          answerCommand(`Kept model as ${currentModelLabel()}.`);
+        },
+      });
+    } catch (error) {
+      showPicker({
+        title: `Models · ${provider}`,
+        message: error instanceof Error ? error.message : String(error),
+        onCancel: () => {
+          closePicker();
+          answerCommand(`Kept model as ${currentModelLabel()}.`);
+        },
+      });
+    }
+  }
+
+  function openProviderPicker() {
+    const providers = providerRows.filter((row) => row.key_present);
+    const rows = providers.map((provider) => ({
+      id: provider.name,
+      label: provider.name,
+      current: provider.name === conversation?.provider,
+      efforts: [],
+    }));
+    showPicker({
+      title: "Choose a provider",
+      rows,
+      message: rows.length === 0 ? "Add a provider key in Settings to choose a model." : "",
+      initialIndex: Math.max(0, rows.findIndex((row) => row.current)),
+      onChoose: (row) => openModelPicker(row.id),
+      onCancel: () => {
+        closePicker();
+        answerCommand(conversation?.provider
+          ? `Kept model as ${currentModelLabel()}.`
+          : `Kept the default provider as ${providers[0]?.name ?? "unset"}.`);
+      },
+    });
+  }
+
+  async function openDefaultModelPicker() {
+    const currentProvider = conversation?.provider;
+    if (typeof currentProvider === "string" && currentProvider) {
+      await openModelPicker(currentProvider);
+      return;
+    }
+    const providers = providerRows.filter((row) => row.key_present);
+    if (providers.length === 1) {
+      await openModelPicker(providers[0].name);
+    } else {
+      openProviderPicker();
+    }
+  }
+
   async function runCommand(command) {
     const parts = command.split(/\s+/);
     const name = parts[0];
     const args = parts.slice(1);
-    try {
-      if (name === "/mode") {
-        if (args.length > 1 || (args.length === 1 && !permittedModes.includes(args[0]))) {
-          answerCommand(`Usage: /mode [${permittedModes.join(" | ")}]`);
-          return;
-        }
-        if (args.length === 0) {
-          answerCommand(`Modes: ${permittedModes.map((mode) => `${mode}${mode === currentMode ? " (current)" : ""}`).join(", ")}`);
-          return;
-        }
-        const reply = await boundary.selectMode(args[0]);
-        if (reply?.mode !== args[0] || !permittedModes.includes(reply.mode)) {
-          throw new Error("Host refused the mode change.");
-        }
-        currentMode = reply.mode;
-        conversation = { ...(conversation ?? {}), mode: reply.mode };
-        showConversationUsage();
-        answerCommand(`Mode set to ${reply.mode}.`);
-        input.value = "";
-        await refreshConversation();
+    if (name === "/mode") {
+      input.value = "";
+      closePicker();
+      if (args.length > 0) {
+        answerCommand("Usage: /mode");
         return;
       }
-      if (name === "/model") {
-        const provider = conversation?.provider;
-        const currentModel = conversation?.model;
-        if (args.length === 0) {
-          if (typeof provider !== "string" || !provider) {
-            answerCommand("No current provider is reported for this conversation.");
-            return;
-          }
-          const reply = await boundary.models(provider);
-          if (reply?.state !== "available" || !Array.isArray(reply.models)) {
-            answerCommand(reply?.detail || `Models for ${provider} are unavailable.`);
-            return;
-          }
-          answerCommand(`Models for ${provider}: ${reply.models.map((item) => `${item.id}${item.id === currentModel ? " (current)" : ""}`).join(", ") || "none listed"}`);
-          return;
-        }
-        const choice = args.length === 1 && provider
-          ? { name: provider, model: args[0] }
-          : args.length === 2
-            ? { name: args[0], model: args[1] }
-            : null;
-        if (!choice) {
-          answerCommand("Usage: /model [<id> | <provider> <id>]");
-          return;
-        }
-        await boundary.selectProvider(choice);
-        conversation = { ...(conversation ?? {}), provider: choice.name, model: choice.model };
-        showConversationUsage();
-        answerCommand(`Model set to ${choice.name} / ${choice.model}.`);
-        input.value = "";
-        await refreshConversation();
-        return;
-      }
-      answerCommand(`Unknown command: ${name}`);
-    } catch (error) {
-      answerCommand(error instanceof Error ? error.message : String(error));
+      openModePicker();
+      return;
     }
+    if (name === "/model") {
+      input.value = "";
+      closePicker();
+      if (args.length === 0) {
+        await openDefaultModelPicker();
+        return;
+      }
+      if (args.length === 1) {
+        await openModelPicker(args[0]);
+        return;
+      }
+      if (args.length === 2) {
+        const [provider, model] = args;
+        let listing;
+        try {
+          listing = await boundary.models(provider);
+        } catch (error) {
+          answerCommand(error instanceof Error ? error.message : String(error));
+          return;
+        }
+        if (listing?.state === "unknown") {
+          try {
+            await boundary.selectProvider({ name: provider, model });
+            conversation = { ...(conversation ?? {}), provider, model };
+            closePicker();
+            showConversationUsage();
+            answerCommand(`Model set to ${provider} / ${model}.`);
+            await refreshConversation();
+          } catch (error) {
+            answerCommand(error instanceof Error ? error.message : String(error));
+          }
+          return;
+        }
+        await openModelPicker(provider, model);
+        return;
+      }
+      answerCommand("Usage: /model [<provider>]");
+      return;
+    }
+    answerCommand(`Unknown command: ${name}`);
   }
 
   async function onFrame(frame) {

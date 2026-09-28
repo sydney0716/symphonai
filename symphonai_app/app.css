@@ -249,6 +249,70 @@ button.session-link {
   display: none;
 }
 
+.picker-host:empty {
+  display: none;
+}
+
+.picker-host {
+  grid-column: 1 / -1;
+}
+
+.picker {
+  max-height: min(18rem, 45vh);
+  overflow: auto;
+  padding: 0.5rem;
+  border: 1px solid #52647a;
+  border-radius: 0.5rem;
+  background: #171d26;
+  box-shadow: 0 0.5rem 1.5rem #0008;
+  outline: none;
+}
+
+.picker-title,
+.picker-message {
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  color: #9aa7b8;
+}
+
+.picker-list {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.picker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.15rem 1rem;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.3rem;
+  cursor: pointer;
+}
+
+.picker-row.focused {
+  background: #29384a;
+  border-color: #82b5f2;
+}
+
+.picker-row.current .picker-row-label {
+  font-weight: 700;
+}
+
+.picker-row-description {
+  color: #9aa7b8;
+}
+
+.picker-row-detail {
+  grid-column: 1 / -1;
+  color: #9aa7b8;
+  font-size: 0.8rem;
+}
+
 .roadmap-phase > summary {
   color: #9aa7b8;
   cursor: pointer;

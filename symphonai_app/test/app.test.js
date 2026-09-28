@@ -26,11 +26,24 @@ class FakeElement {
   }
 
   append(...children) {
+    for (const child of children) child.parentNode = this;
     this.children.push(...children);
   }
 
   replaceChildren(...children) {
+    for (const child of this.children) child.parentNode = null;
+    for (const child of children) child.parentNode = this;
     this.children = [...children];
+  }
+
+  before(...siblings) {
+    const index = this.parentNode.children.indexOf(this);
+    for (const sibling of siblings) sibling.parentNode = this.parentNode;
+    this.parentNode.children.splice(index, 0, ...siblings);
+  }
+
+  focus() {
+    this.focused = true;
   }
 
   addEventListener(type, listener) {
@@ -39,8 +52,8 @@ class FakeElement {
     this.listeners.set(type, listeners);
   }
 
-  async dispatch(type) {
-    const event = { preventDefault() {} };
+  async dispatch(type, fields = {}) {
+    const event = { preventDefault() {}, ...fields };
     for (const listener of this.listeners.get(type) ?? []) {
       await listener(event);
     }
@@ -514,7 +527,7 @@ test("composer contains only its textbox and send button, with status and error 
   assert.equal(walk(form).some((node) => node.tagName === "INPUT"), false);
 });
 
-test("slash commands list and change permitted modes without starting a run", async () => {
+test("mode picker marks the current mode and selects with keyboard without prompting", async () => {
   const document = new FakeDocument();
   let current = { provider: "openai", model: "gpt-old", mode: "ask" };
   const client = fakeClient(fixtureRoadmap(), {
@@ -527,50 +540,134 @@ test("slash commands list and change permitted modes without starting a run", as
   const input = document.getElementById("prompt");
   input.value = "/mode";
   await document.getElementById("prompt-form").dispatch("submit");
-  assert.match(visibleText(document.getElementById("chat")), /Modes: ask \(current\), plan/);
-  input.value = "/mode plan";
-  await document.getElementById("prompt-form").dispatch("submit");
+  const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  let rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["ask", "plan"]);
+  assert.match(rows[0].className, /focused current/);
+  assert.equal(input.value, "");
+  await picker.dispatch("keydown", { key: "ArrowDown" });
+  rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.match(rows[1].className, /focused/);
+  await picker.dispatch("keydown", { key: "Enter" });
   assert.deepEqual(client.calls.selectMode, ["plan"]);
   assert.deepEqual(client.calls.prompt, []);
   const status = find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage"));
   assert.match(status.textContent, /Mode plan/);
   assert.match(status.className, /plan/);
-
-  client.selectMode = async (mode) => {
-    client.calls.selectMode.push(mode);
-    throw new Error("mode plan denied by host policy");
-  };
-  input.value = "/mode ask";
-  await document.getElementById("prompt-form").dispatch("submit");
-  assert.match(visibleText(document.getElementById("chat")), /mode plan denied by host policy/);
-  assert.deepEqual(client.calls.prompt, []);
+  assert.match(visibleText(document.getElementById("chat")), /Mode set to plan/);
 });
 
-test("model commands list current models and select a model without prompting", async () => {
+test("model picker moves, adjusts effort, selects by keyboard and pointer", async () => {
   const document = new FakeDocument();
   let current = { provider: "openai", model: "gpt-current", mode: "ask" };
   const client = fakeClient(fixtureRoadmap(), {
     conversation: current,
     modelListing: { provider: "openai", state: "available", models: [
-      { id: "gpt-current", efforts: [] }, { id: "gpt-next", efforts: [] },
+      { id: "gpt-current", efforts: ["low", "high"] },
+      { id: "gpt-next", efforts: ["medium", "high"] },
+      { id: "gpt-basic", efforts: [] },
     ], detail: "" },
   });
-  client.selectProvider = async (choice) => { client.calls.selectProvider.push(choice); current = { ...current, provider: choice.name, model: choice.model }; };
+  client.selectProvider = async (choice) => { client.calls.selectProvider.push(choice); current = { ...current, provider: choice.name, model: choice.model, effort: choice.effort }; };
   client.conversationStats = async () => ({ conversation: current });
   await start({ global: {}, document, client });
   const input = document.getElementById("prompt");
   input.value = "/model";
   await document.getElementById("prompt-form").dispatch("submit");
-  assert.match(visibleText(document.getElementById("chat")), /gpt-current \(current\), gpt-next/);
+  let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  let rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["gpt-current", "gpt-next", "gpt-basic"]);
+  assert.match(rows[0].className, /focused current/);
+  assert.equal(rows[0].children[1].textContent, "Current");
+  assert.equal(rows[0].children[2].textContent, "Effort: low · ← → to adjust");
+  assert.equal(rows[2].children[2].textContent, "Effort not supported");
   assert.deepEqual(client.calls.models, [["openai", undefined]]);
-  input.value = "/model gpt-next";
+  await picker.dispatch("keydown", { key: "ArrowRight" });
+  rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.equal(rows[0].children[2].textContent, "Effort: high · ← → to adjust");
+  await picker.dispatch("keydown", { key: "ArrowLeft" });
+  rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.equal(rows[0].children[2].textContent, "Effort: low · ← → to adjust");
+  await picker.dispatch("keydown", { key: "ArrowDown" });
+  await picker.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "gpt-next", effort: "medium" }]);
+  assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-next/);
+  assert.equal(input.value, "");
+  input.value = "/model";
   await document.getElementById("prompt-form").dispatch("submit");
-  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "gpt-next" }]);
+  picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "gpt-basic").dispatch("click");
+  assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-basic" });
   assert.deepEqual(client.calls.prompt, []);
-  assert.match(find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage")).textContent, /gpt-next/);
+  assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-basic/);
 });
 
-test("unknown and mistyped slash commands answer without clearing the textbox", async () => {
+test("escape cancels through the keymap and keeps the current model", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { conversation: { provider: "openai", model: "gpt-one", mode: "ask" } });
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "/model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  await picker.dispatch("keydown", { key: "Escape" });
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
+  assert.match(visibleText(document.getElementById("chat")), /Kept model as openai \/ gpt-one/);
+  assert.deepEqual(client.calls.selectProvider, []);
+  assert.deepEqual(client.calls.prompt, []);
+  assert.equal(input.value, "");
+});
+
+test("model picker opens before a conversation and choosing among providers opens their models", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { providers: [
+      { name: "openai", key_present: true },
+      { name: "anthropic", key_present: true },
+    ] } },
+    conversation: null,
+    modelListing: { provider: "openai", state: "available", models: [{ id: "gpt-alpha", efforts: [] }], detail: "" },
+  });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: `${provider}-model`, efforts: [] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "/model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  let rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["openai", "anthropic"]);
+  assert.match(visibleText(document.getElementById("chat")), /^\s*$/);
+  await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "anthropic").dispatch("click");
+  picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["anthropic-model"]);
+  assert.deepEqual(client.calls.prompt, []);
+});
+
+test("unknown model listings show the reason and keep the typed fallback", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "custom-old", mode: "ask" },
+  });
+  client.models = async (provider) => ({ provider, state: "unknown", models: [], detail: "Catalogue unavailable for this endpoint." });
+  await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "/model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  assert.equal(find(picker, (node) => node.className === "picker-message").textContent, "Catalogue unavailable for this endpoint.");
+  assert.equal(find(picker, (node) => node.className === "picker-list").children.length, 0);
+  document.getElementById("prompt").value = "/model custom-provider custom-id";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{ name: "custom-provider", model: "custom-id" }]);
+  assert.deepEqual(client.calls.prompt, []);
+  assert.match(visibleText(document.getElementById("chat")), /Model set to custom-provider \/ custom-id/);
+});
+
+test("unknown commands stay in the textbox while picker commands clear it", async () => {
   const document = new FakeDocument();
   const client = fakeClient(fixtureRoadmap(), { conversation: { provider: "openai", model: "gpt-one", mode: "ask" } });
   await start({ global: {}, document, client });
@@ -579,10 +676,9 @@ test("unknown and mistyped slash commands answer without clearing the textbox", 
   await document.getElementById("prompt-form").dispatch("submit");
   assert.equal(input.value, "/nope keep this");
   assert.match(visibleText(document.getElementById("chat")), /Unknown command: \/nope/);
-  input.value = "/mode danger keep this";
+  input.value = "/mode";
   await document.getElementById("prompt-form").dispatch("submit");
-  assert.equal(input.value, "/mode danger keep this");
-  assert.match(visibleText(document.getElementById("chat")), /Usage: \/mode \[ask \| plan \| allow\]/);
+  assert.equal(input.value, "");
   assert.deepEqual(client.calls.prompt, []);
 });
 
