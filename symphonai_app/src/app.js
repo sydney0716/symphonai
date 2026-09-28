@@ -132,125 +132,6 @@ export async function start({ global, document, client }) {
     boundary.conversationStats().catch(() => ({ conversation: null })),
   ]);
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
-  const providerControls = element(document, "div", { className: "provider-controls" });
-  const providerLabel = element(document, "label", { text: "Provider " });
-  const providerSelect = element(document, "select");
-  const modelInput = element(document, "input");
-  modelInput.placeholder = "Model (optional)";
-  modelInput.ariaLabel = "Model (optional)";
-  const modelList = element(document, "datalist");
-  modelList.id = "provider-models";
-  modelInput.setAttribute?.("list", modelList.id);
-  const effortControls = element(document, "span", { className: "effort-controls" });
-  let effortSelect = null;
-  const modelStatus = element(document, "span", { className: "model-status" });
-  const baseUrlInput = element(document, "input");
-  baseUrlInput.placeholder = "Base URL (optional)";
-  baseUrlInput.ariaLabel = "Base URL (optional)";
-  const providerStatus = element(document, "span", { className: "provider-status" });
-  function showProviderChoices() {
-    const current = providerSelect.value;
-    const keyed = providerRows.filter((row) => row.key_present);
-    replace(providerSelect, ...keyed.map((row) => {
-      const option = element(document, "option", { text: row.name });
-      option.value = row.name;
-      return option;
-    }));
-    providerSelect.value = keyed.some((row) => row.name === current) ? current : (keyed[0]?.name ?? "");
-    providerSelect.disabled = keyed.length === 0;
-    providerStatus.textContent = keyed.length === 0
-      ? "Add an API key in Settings to choose a provider."
-      : "Changes to an active chat apply to the next chat.";
-  }
-  showProviderChoices();
-  let modelRequest = 0;
-  let modelState = { state: "unknown", models: [], detail: "Choose a provider." };
-  function showEfforts() {
-    const previous = effortSelect?.value;
-    const selected = modelState.models.find((model) => model.id === modelInput.value.trim());
-    if (!selected || selected.efforts.length === 0) {
-      effortSelect = null;
-      replace(effortControls);
-      return;
-    }
-    const label = element(document, "label", { text: "Effort " });
-    effortSelect = element(document, "select");
-    effortSelect.ariaLabel = "Effort";
-    replace(effortSelect, ...selected.efforts.map((effort) => {
-      const option = element(document, "option", { text: effort });
-      option.value = effort;
-      return option;
-    }));
-    effortSelect.value = selected.efforts.includes(previous) ? previous : selected.efforts[0];
-    append(label, effortSelect);
-    replace(effortControls, label);
-  }
-  function showModelState() {
-    replace(modelList, ...modelState.models.map((model) => {
-      const option = element(document, "option");
-      option.value = model.id;
-      return option;
-    }));
-    showEfforts();
-    const typed = modelInput.value.trim();
-    if (modelState.state === "available") {
-      modelStatus.textContent = typed && !modelState.models.some((model) => model.id === typed)
-        ? "Unavailable in the provider listing; this model will still be submitted."
-        : `${modelState.models.length} models available.`;
-      return;
-    }
-    modelStatus.textContent = modelState.detail || "Model listing unavailable.";
-  }
-  async function refreshModels() {
-    const request = ++modelRequest;
-    const provider = providerSelect.value;
-    if (!provider) {
-      modelState = { state: "unknown", models: [], detail: "Choose a provider." };
-      showModelState();
-      return;
-    }
-    modelStatus.textContent = "Loading models…";
-    try {
-      const baseUrl = baseUrlInput.value.trim();
-      const reply = await boundary.models(provider, baseUrl || undefined);
-      if (request !== modelRequest) return;
-      const validModels = Array.isArray(reply?.models) && reply.models.every((model) =>
-        model && typeof model.id === "string" && Array.isArray(model.efforts)
-        && model.efforts.every((effort) => typeof effort === "string")
-      );
-      if (reply?.state === "available" && validModels) {
-        modelState = { state: "available", models: reply.models, detail: "" };
-      } else if (reply?.state === "unknown" && validModels) {
-        modelState = { state: "unknown", models: [], detail: reply.detail ?? "" };
-      } else {
-        throw new Error("invalid model listing reply");
-      }
-    } catch {
-      if (request !== modelRequest) return;
-      modelState = { state: "unknown", models: [], detail: "Model listing unavailable." };
-    }
-    showModelState();
-  }
-  listen(providerSelect, "change", async () => {
-    modelInput.value = "";
-    baseUrlInput.value = "";
-    await refreshModels();
-  });
-  listen(baseUrlInput, "change", refreshModels);
-  listen(modelInput, "input", showModelState);
-  append(providerLabel, providerSelect);
-  append(
-    providerControls,
-    providerLabel,
-    modelInput,
-    baseUrlInput,
-    modelList,
-    effortControls,
-    modelStatus,
-    providerStatus,
-  );
-  append(form, providerControls);
-  await refreshModels();
   const allModes = ["ask", "plan", "allow"];
   const ceilingModes = settingsReply?.settings?.ceiling?.modes;
   const permittedModes = Array.isArray(ceilingModes)
@@ -261,46 +142,6 @@ export async function start({ global, document, client }) {
     ? configuredMode
     : (permittedModes[0] ?? "ask");
   let currentMode = conversationReply?.conversation?.mode ?? launchMode;
-  const modeControls = element(document, "div", { className: "mode-controls" });
-  const modeLabel = element(document, "label", { text: "Mode " });
-  const modeSelect = element(document, "select");
-  const modeStatus = element(document, "span", { className: "mode-status" });
-  replace(modeSelect, ...permittedModes.map((mode) => {
-    const option = element(document, "option", {
-      text: mode === "plan" ? "plan · read only" : mode,
-    });
-    option.value = mode;
-    return option;
-  }));
-  function showMode(message = "") {
-    modeSelect.value = currentMode;
-    modeControls.className = currentMode === "plan" ? "mode-controls plan" : "mode-controls";
-    modeStatus.textContent = message || (
-      currentMode === "plan" ? "Plan mode is read only."
-        : currentMode === "ask" ? "Ask before changes."
-          : "Allow changes within configured limits."
-    );
-  }
-  listen(modeSelect, "change", async () => {
-    const requested = modeSelect.value;
-    modeSelect.disabled = true;
-    try {
-      const reply = await boundary.selectMode(requested);
-      if (!permittedModes.includes(reply?.mode)) {
-        throw new Error("host returned an invalid mode");
-      }
-      currentMode = reply.mode;
-      showMode();
-    } catch {
-      showMode(`Mode change refused; still ${currentMode}.`);
-    } finally {
-      modeSelect.disabled = false;
-    }
-  });
-  append(modeLabel, modeSelect);
-  append(modeControls, modeLabel, modeStatus);
-  append(form, modeControls);
-  showMode();
   let sessions = initialSessions;
   let currentSessionId = null;
   let conversation = conversationReply?.conversation ?? null;
@@ -355,11 +196,7 @@ export async function start({ global, document, client }) {
             await boundary.storeCredential(envVar, value);
             table.children[index + 1].children[2].textContent = value ? "present" : "absent";
             const providerRow = providerRows.find((item) => item.env_var === envVar);
-            if (providerRow) {
-              providerRow.key_present = Boolean(value);
-              showProviderChoices();
-              await refreshModels();
-            }
+            if (providerRow) providerRow.key_present = Boolean(value);
             notice.textContent = value ? "Key stored." : "Key removed.";
           } catch {
             notice.textContent = "Could not update key.";
@@ -773,7 +610,6 @@ export async function start({ global, document, client }) {
       showTranscript();
       conversation = null;
       currentMode = launchMode;
-      showMode();
       board.clear();
       showConversationUsage();
       showAgents();
@@ -883,10 +719,21 @@ export async function start({ global, document, client }) {
 
   function showConversationUsage() {
     const context = conversation?.context;
+    const provider = conversation?.provider;
+    const model = conversation?.model;
+    const modelText = typeof model === "string" && model
+      ? `${typeof provider === "string" && provider ? `${provider} / ` : ""}${model}`
+      : "";
+    const mode = permittedModes.includes(conversation?.mode) ? conversation.mode : "";
     conversationUsage.textContent = [
-      context && `Context ${context.used_tokens} / ${context.budget_tokens} tokens`,
+      modelText,
+      mode && `Mode ${mode}`,
+      Number.isInteger(context?.used_tokens) && Number.isInteger(context?.budget_tokens)
+        ? `Context ${context.used_tokens} / ${context.budget_tokens} tokens`
+        : "",
       usageText(conversation?.usage),
     ].filter(Boolean).join(" · ");
+    conversationUsage.className = `conversation-usage${mode === "plan" ? " plan" : ""}`;
   }
 
   function showAgents() {
@@ -940,7 +787,6 @@ export async function start({ global, document, client }) {
       conversation = reply?.conversation ?? null;
       if (permittedModes.includes(conversation?.mode)) {
         currentMode = conversation.mode;
-        showMode();
       }
       showConversationUsage();
       showAgents();
@@ -998,13 +844,6 @@ export async function start({ global, document, client }) {
     for (const action of actions) {
       if (action.kind === "prompt") {
         try {
-          if (providerSelect.value) {
-            const choice = { name: providerSelect.value };
-            if (modelInput.value.trim()) choice.model = modelInput.value.trim();
-            if (baseUrlInput.value.trim()) choice.base_url = baseUrlInput.value.trim();
-            if (effortSelect?.value) choice.effort = effortSelect.value;
-            await boundary.selectProvider(choice);
-          }
           const reply = await boundary.prompt(action.text);
           if (reply?.conflict === true) {
             const active = await activeRuntimeRun();
@@ -1039,18 +878,92 @@ export async function start({ global, document, client }) {
 
   listen(form, "submit", (event) => {
     event.preventDefault();
-    if (providerRows.length > 0 && !providerSelect.value) {
+    const text = input.value;
+    const command = text.trim();
+    if (command.startsWith("/")) {
+      return runCommand(command);
+    }
+    if (providerRows.length > 0 && !providerRows.some((row) => row.key_present)) {
       promptFailure = "Add an API key in Settings before sending a message.";
       showPromptError();
       return;
     }
-    const text = input.value;
     input.value = "";
     promptFailure = "";
     const actions = turn.submit(text);
     showPromptError();
     return perform(actions);
   });
+
+  function answerCommand(text) {
+    transcript.model.push({ type: "text", text });
+    showTranscript();
+  }
+
+  async function runCommand(command) {
+    const parts = command.split(/\s+/);
+    const name = parts[0];
+    const args = parts.slice(1);
+    try {
+      if (name === "/mode") {
+        if (args.length > 1 || (args.length === 1 && !permittedModes.includes(args[0]))) {
+          answerCommand(`Usage: /mode [${permittedModes.join(" | ")}]`);
+          return;
+        }
+        if (args.length === 0) {
+          answerCommand(`Modes: ${permittedModes.map((mode) => `${mode}${mode === currentMode ? " (current)" : ""}`).join(", ")}`);
+          return;
+        }
+        const reply = await boundary.selectMode(args[0]);
+        if (reply?.mode !== args[0] || !permittedModes.includes(reply.mode)) {
+          throw new Error("Host refused the mode change.");
+        }
+        currentMode = reply.mode;
+        conversation = { ...(conversation ?? {}), mode: reply.mode };
+        showConversationUsage();
+        answerCommand(`Mode set to ${reply.mode}.`);
+        input.value = "";
+        await refreshConversation();
+        return;
+      }
+      if (name === "/model") {
+        const provider = conversation?.provider;
+        const currentModel = conversation?.model;
+        if (args.length === 0) {
+          if (typeof provider !== "string" || !provider) {
+            answerCommand("No current provider is reported for this conversation.");
+            return;
+          }
+          const reply = await boundary.models(provider);
+          if (reply?.state !== "available" || !Array.isArray(reply.models)) {
+            answerCommand(reply?.detail || `Models for ${provider} are unavailable.`);
+            return;
+          }
+          answerCommand(`Models for ${provider}: ${reply.models.map((item) => `${item.id}${item.id === currentModel ? " (current)" : ""}`).join(", ") || "none listed"}`);
+          return;
+        }
+        const choice = args.length === 1 && provider
+          ? { name: provider, model: args[0] }
+          : args.length === 2
+            ? { name: args[0], model: args[1] }
+            : null;
+        if (!choice) {
+          answerCommand("Usage: /model [<id> | <provider> <id>]");
+          return;
+        }
+        await boundary.selectProvider(choice);
+        conversation = { ...(conversation ?? {}), provider: choice.name, model: choice.model };
+        showConversationUsage();
+        answerCommand(`Model set to ${choice.name} / ${choice.model}.`);
+        input.value = "";
+        await refreshConversation();
+        return;
+      }
+      answerCommand(`Unknown command: ${name}`);
+    } catch (error) {
+      answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   async function onFrame(frame) {
     const previousLength = transcript.model.length;

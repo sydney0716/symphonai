@@ -232,29 +232,17 @@ button.session-link {
   gap: 0.75rem;
 }
 
-.provider-controls {
-  grid-column: 1 / -1;
-  grid-row: 1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.provider-controls input {
-  min-width: 8rem;
-  flex: 1;
-}
-
-.provider-status {
-  width: 100%;
-  color: #ffbd66;
-}
-
 .conversation-usage {
   grid-column: 1 / -1;
+  grid-row: 2;
   margin: 0;
   color: #9aa7b8;
   font-size: 0.85rem;
+}
+
+.conversation-usage.plan {
+  color: #ffbd66;
+  font-weight: 700;
 }
 
 .conversation-usage:empty {
@@ -348,13 +336,13 @@ button.session-link {
 
 .prompt-form textarea {
   grid-column: 1;
-  grid-row: 2;
+  grid-row: 1;
   resize: vertical;
 }
 
 .prompt-form button {
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 1;
 }
 
 .prompt-error {

@@ -62,6 +62,7 @@ export class FakeDocument {
       "chat-pane": "main",
       "prompt-form": "form",
       prompt: "textarea",
+      "send-button": "button",
     };
     this.elements = new Map(
       [
@@ -83,6 +84,7 @@ export class FakeDocument {
         "approvals",
         "prompt-form",
         "prompt",
+        "send-button",
         "prompt-error",
       ].map((id) => [id, new FakeElement(tags[id] ?? "div", id)]),
     );
@@ -92,7 +94,7 @@ export class FakeDocument {
     get("new-chat").className = "new-chat";
     get("sidebar").append(get("home-link"), get("new-chat"), get("page-links"));
     get("status-rail").append(get("agents"), get("roadmap"), get("spec"));
-    get("prompt-form").append(get("prompt"), get("prompt-error"));
+    get("prompt-form").append(get("prompt"), get("send-button"), get("prompt-error"));
     get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
     get("page").append(get("chat-pane"));
     get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"), get("status-rail"), get("rail-toggle"));
@@ -381,6 +383,7 @@ test("conversation context and per-agent usage render and refresh after compacti
     {
       fixture_secret: secret,
       repo_root: absolutePath,
+      provider: "openai", model: "gpt-test", mode: "ask",
       context: { used_tokens: 120, budget_tokens: 160, remaining_tokens: 40, by_source: { user: 70, assistant: 50 } },
       usage: { input_tokens: 30, output_tokens: 12, calls: 3, total_tokens: 42 },
       agents: [
@@ -404,7 +407,7 @@ test("conversation context and per-agent usage render and refresh after compacti
   await start({ global: {}, document, client });
 
   const usage = find(document.body, (value) => value.className === "conversation-usage");
-  assert.equal(usage.textContent, "Context 120 / 160 tokens · 42 tokens");
+  assert.equal(usage.textContent, "openai / gpt-test · Mode ask · Context 120 / 160 tokens · 42 tokens");
   assert.doesNotMatch(usage.textContent, /USD|undefined/);
   assert.match(visibleText(document.getElementById("agents")), /leader · done · 30 tokens · USD 0\.004/);
   assert.match(visibleText(document.getElementById("agents")), /researcher · done · 12 tokens/);
@@ -500,163 +503,87 @@ test("new chat clears the transcript and the next prompt adds a session link", a
   ]);
 });
 
-test("composer offers only keyed vendors and sends its model choice before the prompt", async () => {
+test("composer contains only its textbox and send button, with status and error text", async () => {
   const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), { settings: { settings: { providers: [
-    { name: "anthropic", env_var: "ANTHROPIC_API_KEY", key_present: false },
-    { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
-  ] } } });
-  client.prompt = async (text) => {
-    client.calls.prompt.push(text);
-    assert.equal(client.calls.selectProvider.length, 1);
-    return { accepted: true, run_id: "run-provider" };
-  };
-  await start({ global: {}, document, client });
-  const controls = find(document.getElementById("prompt-form"), (node) => node.className === "provider-controls");
-  const select = find(controls, (node) => node.tagName === "SELECT");
-  assert.deepEqual(select.children.map((option) => option.value), ["openai"]);
-  controls.children[1].value = "custom-model";
-  controls.children[2].value = "http://127.0.0.1:9000/v1";
-  document.getElementById("prompt").value = "hello";
-  await document.getElementById("prompt-form").dispatch("submit");
-  assert.deepEqual(client.calls.selectProvider, [{
-    name: "openai", model: "custom-model", base_url: "http://127.0.0.1:9000/v1",
-  }]);
-  assert.deepEqual(client.calls.prompt, ["hello"]);
-});
-
-test("composer offers listed models, warns without blocking, and preserves unknown input", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), { settings: { settings: { providers: [
-    { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
-  ] } } });
-  client.models = async (provider, baseUrl) => {
-    client.calls.models.push([provider, baseUrl]);
-    return baseUrl
-      ? { provider, state: "unknown", models: [], detail: "Catalogue request failed." }
-      : { provider, state: "available", models: [
-        { id: "gpt-listed", efforts: ["low", "high"] },
-        { id: "gpt-other", efforts: [] },
-      ], detail: "" };
-  };
-  client.prompt = async (text) => {
-    client.calls.prompt.push(text);
-    return { accepted: true, run_id: "run-model" };
-  };
-  await start({ global: {}, document, client });
-  const controls = find(document.getElementById("prompt-form"), (node) =>
-    node.className === "provider-controls"
-  );
-  const input = controls.children[1];
-  const baseUrl = controls.children[2];
-  const list = find(controls, (node) => node.tagName === "DATALIST");
-  const status = find(controls, (node) => node.className === "model-status");
-  assert.deepEqual(list.children.map((option) => option.value), ["gpt-listed", "gpt-other"]);
-
-  input.value = "private-model";
-  await input.dispatch("input");
-  assert.match(status.textContent, /Unavailable/);
-  document.getElementById("prompt").value = "use my model";
-  await document.getElementById("prompt-form").dispatch("submit");
-  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "private-model" }]);
-  assert.deepEqual(client.calls.prompt, ["use my model"]);
-
-  baseUrl.value = "http://127.0.0.1:9000/v1";
-  await baseUrl.dispatch("change");
-  assert.equal(input.value, "private-model");
-  assert.notEqual(input.disabled, true);
-  assert.deepEqual(list.children, []);
-  assert.equal(status.textContent, "Catalogue request failed.");
-  assert.deepEqual(client.calls.models, [
-    ["openai", undefined],
-    ["openai", "http://127.0.0.1:9000/v1"],
+  await start({ global: {}, document, client: fakeClient() });
+  const form = document.getElementById("prompt-form");
+  assert.deepEqual(form.children.map((child) => child.id || child.className), [
+    "prompt", "send-button", "prompt-error", "conversation-usage",
   ]);
+  assert.equal(walk(form).some((node) => node.tagName === "SELECT"), false);
+  assert.equal(walk(form).some((node) => node.tagName === "INPUT"), false);
 });
 
-test("composer offers the selected model efforts and sends the chosen value", async () => {
+test("slash commands list and change permitted modes without starting a run", async () => {
   const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), {
-    settings: { settings: { providers: [
-      { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
-    ] } },
-    modelListing: {
-      provider: "openai",
-      state: "available",
-      models: [
-        { id: "gpt-listed", efforts: ["low", "high"] },
-        { id: "gpt-other", efforts: [] },
-      ],
-      detail: "",
-    },
-  });
-  client.prompt = async (text) => {
-    client.calls.prompt.push(text);
-    return { accepted: true, run_id: "run-effort" };
-  };
-  await start({ global: {}, document, client });
-  const controls = find(document.getElementById("prompt-form"), (node) =>
-    node.className === "provider-controls"
-  );
-  const input = controls.children[1];
-  const effortControls = find(controls, (node) => node.className === "effort-controls");
-  assert.equal(find(effortControls, (node) => node.tagName === "SELECT"), undefined);
-
-  input.value = "gpt-listed";
-  await input.dispatch("input");
-  let effort = find(effortControls, (node) => node.tagName === "SELECT");
-  assert.deepEqual(effort.children.map((option) => option.value), ["low", "high"]);
-
-  input.value = "gpt-other";
-  await input.dispatch("input");
-  assert.equal(find(effortControls, (node) => node.tagName === "SELECT"), undefined);
-
-  input.value = "gpt-listed";
-  await input.dispatch("input");
-  effort = find(effortControls, (node) => node.tagName === "SELECT");
-  effort.value = "high";
-  document.getElementById("prompt").value = "use high effort";
-  await document.getElementById("prompt-form").dispatch("submit");
-  assert.deepEqual(client.calls.selectProvider, [{
-    name: "openai", model: "gpt-listed", effort: "high",
-  }]);
-  assert.deepEqual(client.calls.prompt, ["use high effort"]);
-});
-
-test("composer shows the live permission mode and restores it after a refusal", async () => {
-  const document = new FakeDocument();
+  let current = { provider: "openai", model: "gpt-old", mode: "ask" };
   const client = fakeClient(fixtureRoadmap(), {
     settings: { settings: { mode: "ask", ceiling: { modes: ["ask", "plan"] } } },
-    conversation: { agents: [], mode: "plan" },
+    conversation: current,
   });
-  let refused = true;
+  client.selectMode = async (mode) => { client.calls.selectMode.push(mode); current = { ...current, mode }; return { mode }; };
+  client.conversationStats = async () => ({ conversation: current });
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "/mode";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.match(visibleText(document.getElementById("chat")), /Modes: ask \(current\), plan/);
+  input.value = "/mode plan";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectMode, ["plan"]);
+  assert.deepEqual(client.calls.prompt, []);
+  const status = find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage"));
+  assert.match(status.textContent, /Mode plan/);
+  assert.match(status.className, /plan/);
+
   client.selectMode = async (mode) => {
     client.calls.selectMode.push(mode);
-    if (refused) {
-      refused = false;
-      throw new Error("permitted modes: ask, plan");
-    }
-    return { mode };
+    throw new Error("mode plan denied by host policy");
   };
+  input.value = "/mode ask";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.match(visibleText(document.getElementById("chat")), /mode plan denied by host policy/);
+  assert.deepEqual(client.calls.prompt, []);
+});
+
+test("model commands list current models and select a model without prompting", async () => {
+  const document = new FakeDocument();
+  let current = { provider: "openai", model: "gpt-current", mode: "ask" };
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: current,
+    modelListing: { provider: "openai", state: "available", models: [
+      { id: "gpt-current", efforts: [] }, { id: "gpt-next", efforts: [] },
+    ], detail: "" },
+  });
+  client.selectProvider = async (choice) => { client.calls.selectProvider.push(choice); current = { ...current, provider: choice.name, model: choice.model }; };
+  client.conversationStats = async () => ({ conversation: current });
   await start({ global: {}, document, client });
-  const controls = find(document.getElementById("prompt-form"), (node) =>
-    node.className.startsWith("mode-controls")
-  );
-  const select = find(controls, (node) => node.tagName === "SELECT");
-  const status = find(controls, (node) => node.className === "mode-status");
-  assert.equal(select.value, "plan");
-  assert.equal(select.children.find((option) => option.value === "plan").textContent, "plan · read only");
-  assert.equal(status.textContent, "Plan mode is read only.");
+  const input = document.getElementById("prompt");
+  input.value = "/model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.match(visibleText(document.getElementById("chat")), /gpt-current \(current\), gpt-next/);
+  assert.deepEqual(client.calls.models, [["openai", undefined]]);
+  input.value = "/model gpt-next";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "gpt-next" }]);
+  assert.deepEqual(client.calls.prompt, []);
+  assert.match(find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage")).textContent, /gpt-next/);
+});
 
-  select.value = "ask";
-  await select.dispatch("change");
-  assert.equal(select.value, "plan");
-  assert.equal(status.textContent, "Mode change refused; still plan.");
-
-  select.value = "ask";
-  await select.dispatch("change");
-  assert.deepEqual(client.calls.selectMode, ["ask", "ask"]);
-  assert.equal(select.value, "ask");
-  assert.equal(status.textContent, "Ask before changes.");
+test("unknown and mistyped slash commands answer without clearing the textbox", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { conversation: { provider: "openai", model: "gpt-one", mode: "ask" } });
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "/nope keep this";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(input.value, "/nope keep this");
+  assert.match(visibleText(document.getElementById("chat")), /Unknown command: \/nope/);
+  input.value = "/mode danger keep this";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(input.value, "/mode danger keep this");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/mode \[ask \| plan \| allow\]/);
+  assert.deepEqual(client.calls.prompt, []);
 });
 
 test("sidebar shows the current project when it has no sessions", async () => {
@@ -978,11 +905,10 @@ test("model settings save and remove a key without displaying its value", async 
   const controls = find(content, (value) => value.className === "credential-controls");
   const input = find(controls, (value) => value.tagName === "INPUT");
   const status = find(content, (value) => value.className === "settings-row").children[2];
-  const providerSelect = find(document.getElementById("prompt-form"), (value) => value.tagName === "SELECT");
   const secret = "recognisable-app-key-fixture";
 
   assert.equal(input.type, "password");
-  assert.deepEqual(providerSelect.children, []);
+  assert.equal(walk(document.getElementById("prompt-form")).some((node) => node.tagName === "SELECT"), false);
   document.getElementById("prompt").value = "wait for a key";
   await document.getElementById("prompt-form").dispatch("submit");
   assert.deepEqual(client.calls.prompt, []);
@@ -992,13 +918,12 @@ test("model settings save and remove a key without displaying its value", async 
   assert.deepEqual(client.calls.credentials, [{ name: "OPENAI_API_KEY", value: secret }]);
   assert.equal(input.value, "");
   assert.equal(status.textContent, "present");
-  assert.deepEqual(providerSelect.children.map((option) => option.value), ["openai"]);
   assert.ok(!visibleText(content).includes(secret));
 
   await find(controls, (value) => value.tagName === "BUTTON" && value.textContent === "Remove").dispatch("click");
   assert.deepEqual(client.calls.credentials.at(-1), { name: "OPENAI_API_KEY", value: "" });
   assert.equal(status.textContent, "absent");
-  assert.deepEqual(providerSelect.children, []);
+  assert.equal(walk(document.getElementById("prompt-form")).some((node) => node.tagName === "SELECT"), false);
 });
 
 test("credential client sends the value only in an authenticated POST body", async () => {

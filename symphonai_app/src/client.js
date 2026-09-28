@@ -317,11 +317,11 @@ export function createClient({
     },
 
     selectProvider(choice) {
-      return request("POST", "/provider", choice);
+      return request("POST", "/provider", choice, readReply, { detailOnError: true });
     },
 
     selectMode(mode) {
-      return request("POST", "/mode", { mode });
+      return request("POST", "/mode", { mode }, readReply, { detailOnError: true });
     },
 
     storeCredential(name, value) {

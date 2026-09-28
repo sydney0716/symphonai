@@ -113,6 +113,18 @@ test("permission mode uses an authenticated JSON request", async () => {
   assert.deepEqual(JSON.parse(records[0].options.body), { mode: "plan" });
 });
 
+test("permission mode refusal preserves the host message", async () => {
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => response(403, { error: "plan mode is forbidden by the workspace ceiling" }),
+  });
+  await assert.rejects(
+    client.selectMode("plan"),
+    (error) => error.status === 403 && error.message === "plan mode is forbidden by the workspace ceiling",
+  );
+});
+
 test("agent definitions use authenticated read and write routes", async () => {
   const records = [];
   const client = createClient({

@@ -58,7 +58,7 @@ from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_host.broker import EventBroker
 from symphonai_host.protocol import decode_event, decode_frame
-from symphonai_host.run import HostRun
+from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.server import HostServer
 from scripts.checks.harness import CheckFailed, check, fail
 
@@ -82,6 +82,26 @@ _FROZEN_PROTOCOL = (
     ("ApprovalReply", "OpenSessionRequest", "PromptRequest", "StopRequest"),
     ("approval_requested", "error", "event", "reply"),
 )
+
+
+class _RecordingWireFakeProvider(FakeModelProvider):
+    def __init__(self, name: str, wire_format: int, responses: list[ModelResponse]) -> None:
+        super().__init__(responses)
+        self._provider_name = name
+        self._wire_format = wire_format
+        self.requests = []
+
+    @property
+    def name(self) -> str:
+        return self._provider_name
+
+    @property
+    def wire_format(self) -> int:
+        return self._wire_format
+
+    def create_response(self, request, *, cancel=None):
+        self.requests.append(request)
+        return super().create_response(request, cancel=cancel)
 
 
 def _host(
@@ -1986,8 +2006,12 @@ def check_provider_default_and_rejection() -> None:
 
 @check("host_server.provider_choice_per_conversation")
 def check_provider_choice_per_conversation() -> None:
-    first = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "first"))])
-    second = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "second"))])
+    first = _RecordingWireFakeProvider(
+        "anthropic", 2, [ModelResponse(Message(Role.ASSISTANT, "first"))]
+    )
+    second = _RecordingWireFakeProvider(
+        "gemini", 3, [ModelResponse(Message(Role.ASSISTANT, "second"))]
+    )
     providers = {"anthropic": first, "gemini": second}
     with tempfile.TemporaryDirectory() as temporary:
         host = HostServer(None, PermissionPolicy(Path(temporary)), sessions_root=Path(temporary) / "sessions")
@@ -2010,9 +2034,16 @@ def check_provider_choice_per_conversation() -> None:
                 if leader._config.leader_provider is not first or leader._config.subagent_provider is not first:
                     fail("first conversation did not use its provider for both Leader roles")
                 select("gemini")
+                changed_leader = host.run._conversation[0]
+                if (
+                    changed_leader is leader
+                    or host.run._conversation[1].run_id != first_session_id
+                    or changed_leader._config.leader_provider is not second
+                ):
+                    fail("provider selection did not rebuild the leader in the same session")
                 _send_host_prompt(host, "same conversation")
-                if first.call_count != 2 or second.call_count != 0 or host.run._conversation[0] is not leader:
-                    fail("changing the choice altered the running conversation")
+                if first.call_count != 1 or second.call_count != 1 or host.run._conversation[0] is not changed_leader:
+                    fail("the next turn did not use the new provider")
                 connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
                 try:
                     if response.status != 200:
@@ -2022,7 +2053,7 @@ def check_provider_choice_per_conversation() -> None:
                     connection.close()
                 _send_host_prompt(host, "new conversation")
                 leader = host.run._conversation[0]
-                if second.call_count != 1 or leader._config.leader_provider is not second or leader._config.subagent_provider is not second:
+                if second.call_count != 2 or leader._config.leader_provider is not second or leader._config.subagent_provider is not second:
                     fail("next conversation did not use the new provider for both Leader roles")
                 connection, response = _request(host, "POST", "/session/open", body={"run_id": first_session_id}, headers=_headers(host))
                 try:
@@ -2031,10 +2062,164 @@ def check_provider_choice_per_conversation() -> None:
                     response.read()
                 finally:
                     connection.close()
-                if host.run._conversation[0]._config.leader_provider is not first:
-                    fail("reopening a conversation changed its provider")
+                if host.run._conversation[0]._config.leader_provider is not second:
+                    fail("reopening a conversation did not restore its updated provider choice")
         finally:
             host.close()
+
+
+@check("host_server.provider_change_rebuilds_schema_and_keeps_history")
+def check_provider_change_rebuilds_schema_and_keeps_history() -> None:
+    first = _RecordingWireFakeProvider("anthropic", 2, [
+        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+            "first-call",
+            "read_file",
+            {"path": "note.txt"},
+            provider_metadata={"thoughtSignature": "old-vendor-state"},
+            vendor_id="old-vendor-id",
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "first answer")),
+    ])
+    second = _RecordingWireFakeProvider("gemini", 3, [
+        ModelResponse(Message(Role.ASSISTANT, "second answer")),
+    ])
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "note.txt").write_text("tool result", encoding="utf-8")
+        run = HostRun(
+            first,
+            PermissionPolicy(root),
+            EventBroker(),
+            model="anthropic-before",
+            sessions_root=root / "sessions",
+        )
+        try:
+            run.start("first provider turn")
+            _wait_until(lambda: not run.active, "first provider turn did not finish")
+            old_leader, session = run._conversation
+            old_history = list(old_leader._chat_messages)
+            expected_history = [
+                replace(
+                    message,
+                    tool_calls=[
+                        replace(call, provider_metadata={}, vendor_id=None)
+                        for call in message.tool_calls
+                    ],
+                )
+                if message.tool_calls
+                else message
+                for message in old_history
+            ]
+            run.select_provider(
+                second,
+                "gemini-next",
+                "high",
+                {"name": "gemini", "model": "gemini-next", "effort": "high"},
+            )
+            new_leader, new_session = run._conversation
+            if new_session is not session or new_leader is old_leader:
+                fail("provider change did not rebuild the leader in its existing session")
+            if old_leader._agent._tool_schemas == new_leader._agent._tool_schemas:
+                fail("provider change did not rebuild tool schemas for the new wire format")
+            if new_leader._chat_messages != expected_history:
+                fail("provider change did not preserve history while clearing old vendor state")
+
+            if new_session.read_meta().get("provider_state_reset") is not True:
+                fail("provider change did not record its vendor-state reset for reopening")
+            run.start("second provider turn")
+            _wait_until(lambda: not run.active, "second provider turn did not finish")
+            if len(second.requests) != 1:
+                fail(f"new provider received {len(second.requests)} requests")
+            request = second.requests[0]
+            if request.model != "gemini-next" or request.effort != "high":
+                fail(f"new provider did not receive its selected model and effort: {request!r}")
+            if request.tools != new_leader._agent._tool_schemas:
+                fail("new provider request did not carry the rebuilt tool schemas")
+            if request.messages[:-1] != expected_history:
+                fail("new provider request did not carry the prior conversation history")
+            vendor_calls = [
+                call
+                for message in request.messages
+                for call in message.tool_calls
+            ]
+            if any(call.vendor_id is not None or call.provider_metadata for call in vendor_calls):
+                fail("old vendor-specific call state reached the new provider")
+            run.open_session(session.run_id)
+            reopened_calls = [
+                call
+                for message in run._conversation[0]._chat_messages
+                for call in message.tool_calls
+            ]
+            if any(call.vendor_id is not None or call.provider_metadata for call in reopened_calls):
+                fail("reopening the changed provider session restored old vendor state")
+        finally:
+            run.close()
+
+
+@check("host_server.provider_change_refused_while_active")
+def check_provider_change_refused_while_active() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingProvider(_RecordingWireFakeProvider):
+        def create_response(self, request, *, cancel=None):
+            entered.set()
+            if not release.wait(3):
+                fail("blocking provider was not released")
+            return super().create_response(request, cancel=cancel)
+
+    first = BlockingProvider("anthropic", 2, [ModelResponse(Message(Role.ASSISTANT, "done"))])
+    second = _RecordingWireFakeProvider("gemini", 3, [ModelResponse(Message(Role.ASSISTANT, "unused"))])
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        run = HostRun(first, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        try:
+            run.start("hold the run")
+            if not entered.wait(2):
+                fail("provider request did not become active")
+            try:
+                run.select_provider(second, choice={"name": "gemini"})
+            except RunActiveError as exc:
+                if exc.run_id != run.active_run_id:
+                    fail("active provider refusal reported the wrong run id")
+            else:
+                fail("provider change was accepted while a run was active")
+            if run._provider is not first or run._conversation[0]._config.leader_provider is not first:
+                fail("refused provider change replaced the current provider")
+        finally:
+            release.set()
+            run.close()
+
+
+@check("host_server.conversation_reports_model_selection")
+def check_conversation_reports_model_selection() -> None:
+    provider = _RecordingWireFakeProvider(
+        "openai", 1,
+        [ModelResponse(Message(Role.ASSISTANT, "first")), ModelResponse(Message(Role.ASSISTANT, "second"))],
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        run = HostRun(provider, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        try:
+            run.start("first turn")
+            _wait_until(lambda: not run.active, "first model turn did not finish")
+            run.select_provider(
+                provider,
+                "live-model",
+                "xhigh",
+                {"name": "openai", "model": "live-model", "effort": "xhigh"},
+            )
+            conversation = run.conversation_stats()
+            if (conversation.get("provider"), conversation.get("model"), conversation.get("effort")) != (
+                "openai", "live-model", "xhigh"
+            ):
+                fail(f"conversation did not report its live selection: {conversation!r}")
+            run.start("second turn")
+            _wait_until(lambda: not run.active, "second model turn did not finish")
+            if provider.requests[-1].model != "live-model" or provider.requests[-1].effort != "xhigh":
+                fail("reported model selection did not reach the following request")
+        finally:
+            run.close()
 
 
 @check("host_server.permission_mode_control")
@@ -2334,7 +2519,9 @@ def check_conversation_reopened_parentage() -> None:
             finally:
                 connection.close()
             conversation = _conversation_reply(host)[1]["conversation"]
-            if conversation is None or set(conversation) != {"agents", "mode"}:
+            if conversation is None or set(conversation) != {
+                "agents", "mode", "provider", "model", "effort"
+            }:
                 fail(f"reopened conversation did not report agents without usage: {conversation!r}")
             agents = {agent["name"]: agent for agent in conversation["agents"]}
             if set(agents) != {"leader", "worker"}:

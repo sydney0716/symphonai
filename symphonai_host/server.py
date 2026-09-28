@@ -993,12 +993,16 @@ class HostServer:
                     except (ProtocolError, ProviderSelectionError) as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
-                    host.run.select_provider(
-                        provider,
-                        choice.get("model"),
-                        effort,
-                        choice,
-                    )
+                    try:
+                        host.run.select_provider(
+                            provider,
+                            choice.get("model"),
+                            effort,
+                            choice,
+                        )
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
                     self._json(HTTPStatus.OK, {"selected": True})
                     return
                 if self.path == "/mode":

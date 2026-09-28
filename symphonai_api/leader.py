@@ -18,7 +18,7 @@ Subagent pool state lives only in memory for the duration of one
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent, _message_digest
@@ -643,10 +643,11 @@ class DispatchSubagentTool(LocalTool):
 
 @dataclass
 class LeaderConfig:
-    """Fixed, user-chosen configuration for a leader run.
+    """User-chosen configuration for a leader conversation.
 
     The leader never picks its own or its subagents' provider/model --
-    both are fixed here by the caller, once, before the run starts.
+    they are set by the caller. A host may update the leader's model and effort
+    between turns without rebuilding its tool registry.
     Each subagent independently accounts against ``subagent_budget``; there is
     no shared drawdown. Optional ``subagent_specs`` declare named child roles;
     omitting them preserves the legacy synthesized defaults.
@@ -726,6 +727,17 @@ class Leader:
         self._leases = WorkspaceLeases(config.repo_root)
         defined_leader = None if config.subagent_specs is None else config.subagent_specs.get("leader")
         self._leader_prompt = "" if defined_leader is None else defined_leader.prompt
+        leader_provider_name = getattr(config.leader_provider, "name", None) or "unknown"
+        self._leader_model_locked = bool(
+            defined_leader is not None
+            and (
+                defined_leader.model.model is not None
+                or defined_leader.model.provider != leader_provider_name
+            )
+        )
+        self._leader_effort_locked = bool(
+            defined_leader is not None and defined_leader.model.effort is not None
+        )
         self._leader_model = (
             config.leader_model
             if defined_leader is None or defined_leader.model.model is None
@@ -854,6 +866,26 @@ class Leader:
 
     def _leader_run_id(self) -> str | None:
         return None if self._leader_run is None else self._leader_run.run.run_id
+
+    def select_model(self, model: str | None, effort: str | None) -> None:
+        """Apply a host model choice to the next request without rebuilding tools."""
+        self._config.leader_model = model
+        self._config.leader_effort = effort
+        if not self._leader_model_locked:
+            self._leader_model = model
+        if not self._leader_effort_locked:
+            self._leader_effort = effort
+        actual_model = self._leader_model
+        if actual_model is None:
+            actual_model = getattr(self._config.leader_provider, "model", None)
+        self._leader_spec = replace(
+            self._leader_spec,
+            model=replace(
+                self._leader_spec.model,
+                model=actual_model,
+                effort=self._leader_effort,
+            ),
+        )
 
     def _initial_leader_messages(self) -> list[Message]:
         if not self._leader_spec.memory.enabled:

@@ -1473,6 +1473,36 @@ def check_chat_history() -> None:
             fail("expected the first call's user message to still be present in the second call's context")
 
 
+@check("leader.selection_updates_next_request")
+def check_selection_updates_next_request() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([
+            ModelResponse(message=Message(Role.ASSISTANT, "first")),
+            ModelResponse(message=Message(Role.ASSISTANT, "second")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=provider,
+            subagent_provider=FakeModelProvider(),
+            repo_root=str(ws.root),
+            leader_model="original-model",
+        ))
+        agent = leader._agent
+        leader.chat("first turn")
+        leader.select_model("next-model", "high")
+        leader.chat("second turn")
+
+        if len(provider.requests) != 2:
+            fail(f"selection made {len(provider.requests)} provider requests")
+        next_request = provider.requests[1]
+        if (next_request.model, next_request.effort) != ("next-model", "high"):
+            fail(
+                "model and effort selection did not reach the next provider request: "
+                f"{next_request.model!r}, {next_request.effort!r}"
+            )
+        if leader._agent is not agent:
+            fail("model and effort selection rebuilt the leader agent")
+
+
 @check("leader.context_overflow_compacts_and_recovers")
 def check_context_overflow_compacts_and_recovers() -> None:
     with workspace() as ws:

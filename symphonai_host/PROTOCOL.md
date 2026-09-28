@@ -160,16 +160,18 @@ the conversation remains available for another prompt.
 Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
 "openai", "model": str?, "base_url": str?, "effort": str?}` and returns
 `{"selected": true}`. `model`, `base_url`, and `effort` are optional non-empty
-strings. The effort is applied to the leader's requests when the selection
-starts the next conversation. It does not replace a dispatched agent's own
-effort, and a `leader` definition's effort takes precedence over this choice.
+strings. The model and effort apply to the next leader request in the current
+conversation. They do not replace a dispatched agent's own settings, and a
+`leader` definition's explicit model or effort takes precedence over this choice.
 `openai` with a
 `base_url` selects an OpenAI-compatible endpoint. Unknown vendors, malformed
-options, and vendors without a configured API key return `400`. The selection
-applies when the next conversation starts; changing it while a conversation
-is running does not change that conversation. Reopening a selected conversation
-restores its provider choice from session metadata. Both Leader providers use the
-conversation's selected provider. When no selection was sent, the host uses
+options, and vendors without a configured API key return `400`. A provider
+change rebuilds the conversation's leader for the next turn while preserving
+the session and message history; provider-specific tool-call metadata from the
+previous provider is discarded. A selection while a run is active returns
+`409`. Reopening a selected conversation restores its provider choice from
+session metadata. Both Leader providers use the conversation's selected
+provider. When no selection was sent, the host uses
 the first vendor with a key in Settings order (anthropic, gemini, openai).
 If no vendor has a key, the first prompt returns `400` until a key is added or
 a valid selection is sent. Launch flags do not select a provider.
@@ -200,7 +202,8 @@ preferring `plan` to `allow`. An empty modes ceiling is a configuration error.
 Starting a new chat or reopening a session resets to that starting mode.
 
 Authenticated `GET /conversation` returns `{"conversation": null}` before a
-conversation is open. Otherwise `conversation` contains an `agents` array whose
+conversation is open. Otherwise `conversation` contains the live `provider`,
+`model`, and `effort`, plus an `agents` array whose
 entries identify an agent by opaque id and name, plus `parent_agent_id` (an
 opaque id or `null` for a root), and `mode` reports the mode currently in force.
 Each agent appears once; the first run in the

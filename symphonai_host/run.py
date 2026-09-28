@@ -6,7 +6,7 @@ import shutil
 import sys
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS
@@ -76,6 +76,29 @@ class ForkableHistoryMessage(HistoryMessage):
 
 
 CONVERSATION_TITLE_LIMIT = 80
+
+
+def _provider_identity(provider: ModelProvider) -> tuple[str, int, str | None]:
+    return (
+        provider.name,
+        provider.wire_format,
+        getattr(provider, "base_url", None),
+    )
+
+
+def _without_vendor_state(messages: list[Message]) -> list[Message]:
+    return [
+        replace(
+            message,
+            tool_calls=[
+                replace(call, provider_metadata={}, vendor_id=None)
+                for call in message.tool_calls
+            ],
+        )
+        if message.tool_calls
+        else message
+        for message in messages
+    ]
 
 
 def _conversation_title(prompt: str) -> str:
@@ -242,10 +265,47 @@ class HostRun:
         choice: dict | None = None,
     ) -> None:
         with self._lock:
+            if self._active is not None:
+                raise RunActiveError(self._active.run_id)
+            conversation = self._conversation
+            provider_changed = (
+                conversation is not None
+                and _provider_identity(self._provider) != _provider_identity(provider)
+            )
+            previous = (self._provider, self._model, self._effort, self._provider_choice)
             self._provider = provider
             self._model = model
             self._effort = effort
             self._provider_choice = choice
+            if conversation is None:
+                return
+            leader, session = conversation
+            try:
+                if provider_changed:
+                    replacement = self._new_leader(session)
+                    replacement.seed_chat(
+                        _without_vendor_state(leader._chat_messages),
+                        persisted=True,
+                    )
+                    self._conversation = replacement, session
+                else:
+                    leader.select_model(
+                        model if model is not None else getattr(provider, "model", None),
+                        effort,
+                    )
+                metadata = session.read_meta()
+                metadata["provider_choice"] = (
+                    choice
+                    if choice is not None
+                    else {"name": provider.name, "model": model, "effort": effort}
+                )
+                if provider_changed:
+                    metadata["provider_state_reset"] = True
+                session.write_meta(metadata)
+            except Exception:
+                self._provider, self._model, self._effort, self._provider_choice = previous
+                self._conversation = conversation
+                raise
 
     def permitted_modes(self) -> tuple[str, ...]:
         ceiling = None if self._extensions is None else getattr(self._extensions, "ceiling", None)
@@ -418,7 +478,9 @@ class HostRun:
             reader = SessionStore.open(self._sessions_root, run_id)
             try:
                 loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
-                choice = reader.read_meta().get("provider_choice")
+                metadata = reader.read_meta()
+                choice = metadata.get("provider_choice")
+                provider_state_reset = metadata.get("provider_state_reset") is True
             finally:
                 reader.close()
             previous_provider = (
@@ -454,7 +516,12 @@ class HostRun:
                 )
                 self._policy.mode = self._starting_mode
                 leader = self._new_leader(store)
-                leader.seed_chat(loaded.messages, persisted=True)
+                messages = (
+                    _without_vendor_state(loaded.messages)
+                    if provider_state_reset
+                    else loaded.messages
+                )
+                leader.seed_chat(messages, persisted=True)
             except Exception:
                 self._provider, self._model, self._effort, self._provider_choice = previous_provider
                 self._policy.mode = previous_mode
@@ -578,6 +645,12 @@ class HostRun:
             if conversation is None:
                 return None
             graph = conversation[0].run_graph()
+            leader = conversation[0]
+            selection = {
+                "provider": leader._config.leader_provider.name,
+                "model": leader._leader_spec.model.model,
+                "effort": leader._leader_spec.model.effort,
+            }
             started_at = {}
             try:
                 paths = sorted(conversation[1].directory.glob("*.jsonl"))
@@ -651,7 +724,7 @@ class HostRun:
                     **(usage_fields(by_model) if report is not None else {}),
                 })
 
-        result = {"agents": agents, "mode": mode}
+        result = {"agents": agents, "mode": mode, **selection}
         if report is None:
             return result
         all_models: dict[str, UsageTotals] = {}
