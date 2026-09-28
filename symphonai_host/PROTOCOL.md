@@ -181,13 +181,16 @@ provider, with optional `base_url` using the same meaning as `POST /provider`.
 It returns `provider`, `state`, `models`, and `detail`. Each model is
 `{"id": str, "efforts": [str, ...]}`. A successful lookup has `state:
 "available"`, the filtered models from live model discovery, their declared
-effort identifiers, and an empty detail. A model absent from the capability
-table has an empty effort list. A lookup that cannot be attempted or fails has
-`state: "unknown"`, an empty models array, and a key-safe explanation in detail.
-Successful vendor results are cached for the host process by provider and base
-URL; adding efforts does not perform another vendor call. Unknown results are
-not cached. A listing is advisory: clients may still submit any model id to
-`POST /provider`, without an effort when none was offered.
+effort identifiers, and an empty detail. A lookup that cannot be attempted or
+fails has `state: "unknown"`, an empty models array, and a key-safe explanation
+in detail. Successful vendor results are cached for the host process by
+provider and base URL; adding efforts does not perform another vendor call.
+Failed or unavailable listings are not cached. For each model,
+`efforts` is an array when the capability table has a row (including an empty
+array when the model accepts no effort) and `null` when the table has no row
+and effort support is unknown. A listing is advisory: clients may still submit
+any model id to `POST /provider`; an effort for an unlisted model is passed
+through as supplied.
 
 Authenticated `POST /mode` takes exactly `{"mode": "ask" | "plan" | "allow"}`
 and returns `{"mode": <current mode>}`. The available values are intersected

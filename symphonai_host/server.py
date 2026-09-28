@@ -71,7 +71,7 @@ def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> 
         if capability.provider == provider
     }
     return [
-        {"id": model, "efforts": efforts.get(model, [])}
+        {"id": model, "efforts": efforts.get(model)}
         for model in models
     ]
 

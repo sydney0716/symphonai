@@ -26,6 +26,9 @@ export function createPicker({
 
   function detail(row) {
     if (!showEfforts) return "";
+    if (row.efforts === null) {
+      return "Effort support unknown · set with /model <provider> <id> <effort>";
+    }
     if (row.efforts.length === 0) return "Effort not supported";
     return `Effort: ${row.efforts[row.effortIndex]} · ← → to adjust`;
   }
@@ -71,7 +74,7 @@ export function createPicker({
       onChoose(rows[focused], focused);
     } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && focused >= 0 && showEfforts) {
       const row = rows[focused];
-      if (row.efforts.length > 0) {
+      if (Array.isArray(row.efforts) && row.efforts.length > 0) {
         event.preventDefault();
         row.effortIndex = (row.effortIndex + (event.key === "ArrowRight" ? 1 : -1) + row.efforts.length) % row.efforts.length;
         renderRows();

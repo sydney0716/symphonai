@@ -566,6 +566,7 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
       { id: "gpt-current", efforts: ["low", "high"] },
       { id: "gpt-next", efforts: ["medium", "high"] },
       { id: "gpt-basic", efforts: [] },
+      { id: "gpt-unknown", efforts: null },
     ], detail: "" },
   });
   client.selectProvider = async (choice) => { client.calls.selectProvider.push(choice); current = { ...current, provider: choice.name, model: choice.model, effort: choice.effort }; };
@@ -576,11 +577,12 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
   await document.getElementById("prompt-form").dispatch("submit");
   let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
   let rows = find(picker, (node) => node.className === "picker-list").children;
-  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["gpt-current", "gpt-next", "gpt-basic"]);
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["gpt-current", "gpt-next", "gpt-basic", "gpt-unknown"]);
   assert.match(rows[0].className, /focused current/);
   assert.equal(rows[0].children[1].textContent, "Current");
   assert.equal(rows[0].children[2].textContent, "Effort: low · ← → to adjust");
   assert.equal(rows[2].children[2].textContent, "Effort not supported");
+  assert.equal(rows[3].children[2].textContent, "Effort support unknown · set with /model <provider> <id> <effort>");
   assert.deepEqual(client.calls.models, [["openai", undefined]]);
   await picker.dispatch("keydown", { key: "ArrowRight" });
   rows = find(picker, (node) => node.className === "picker-list").children;
@@ -600,6 +602,14 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
   assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-basic" });
   assert.deepEqual(client.calls.prompt, []);
   assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-basic/);
+  input.value = "/model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "gpt-unknown").dispatch("click");
+  assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-unknown" });
+  input.value = "/model openai gpt-unknown experimental";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-unknown", effort: "experimental" });
 });
 
 test("escape cancels through the keymap and keeps the current model", async () => {

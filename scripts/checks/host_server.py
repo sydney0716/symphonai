@@ -1169,8 +1169,8 @@ def check_model_listing_route() -> None:
                 "provider": "openai",
                 "state": "available",
                 "models": [
-                    {"id": "gpt-listed", "efforts": []},
-                    {"id": "gpt-second", "efforts": []},
+                    {"id": "gpt-listed", "efforts": None},
+                    {"id": "gpt-second", "efforts": None},
                 ],
                 "detail": "",
             }
@@ -1268,7 +1268,7 @@ def check_model_listing_efforts_cached() -> None:
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret}), mock.patch.object(
             host_server_module,
             "list_models",
-            return_value=["claude-sonnet-5", "vendor-private"],
+            return_value=["claude-sonnet-5", "claude-haiku-4-5", "vendor-private"],
         ) as listed:
             first = get()
             second = get()
@@ -1277,12 +1277,66 @@ def check_model_listing_efforts_cached() -> None:
                 "id": "claude-sonnet-5",
                 "efforts": ["low", "medium", "high", "xhigh", "max"],
             },
-            {"id": "vendor-private", "efforts": []},
+            {"id": "claude-haiku-4-5", "efforts": []},
+            {"id": "vendor-private", "efforts": None},
         ]
         if first.get("models") != expected_models or second.get("models") != expected_models:
             fail(f"model efforts were missing or changed: {first!r}, {second!r}")
         if listed.call_count != 1:
             fail(f"adding efforts changed model listing cache behavior: {listed.call_count}")
+    finally:
+        host.close()
+
+
+@check("host_server.model_effort_knowledge_states")
+def check_model_effort_knowledge_states() -> None:
+    host = _host()
+
+    def get(provider: str) -> dict:
+        connection, response = _request(
+            host,
+            "GET",
+            f"/models?provider={provider}",
+            headers=_headers(host),
+        )
+        try:
+            body = response.read()
+            if response.status != 200:
+                fail(f"{provider} model listing returned {response.status}: {body!r}")
+            return json.loads(body)
+        finally:
+            connection.close()
+
+    def listed(provider: ModelProvider) -> list[str]:
+        if provider.name == "anthropic":
+            return ["claude-sonnet-5", "claude-haiku-4-5"]
+        return ["openai-model-with-no-table-row"]
+
+    try:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ANTHROPIC_API_KEY": "anthropic-model-state-key",
+                "OPENAI_API_KEY": "openai-model-state-key",
+            },
+        ), mock.patch.object(host_server_module, "list_models", side_effect=listed) as discovery:
+            anthropic = get("anthropic")
+            openai = get("openai")
+        states = {
+            (reply["provider"], model["id"]): model["efforts"]
+            for reply in (anthropic, openai)
+            for model in reply["models"]
+        }
+        if states != {
+            ("anthropic", "claude-sonnet-5"): [
+                "low", "medium", "high", "xhigh", "max"
+            ],
+            ("anthropic", "claude-haiku-4-5"): [],
+            ("openai", "openai-model-with-no-table-row"): None,
+        }:
+            fail(f"model effort knowledge states were collapsed: {states!r}")
+        if discovery.call_count != 2:
+            fail(f"model state lookup made {discovery.call_count} discovery calls")
     finally:
         host.close()
 
@@ -1343,6 +1397,43 @@ def check_provider_effort_reaches_request() -> None:
     unlisted = received({"name": "openai", "model": "private-model"})
     if unlisted != ("private-model", None, True):
         fail(f"an unlisted typed model acquired an effort: {unlisted!r}")
+
+
+@check("host_server.unknown_model_effort_can_be_set")
+def check_unknown_model_effort_can_be_set() -> None:
+    provider = _RecordingWireFakeProvider(
+        "openai",
+        1,
+        [ModelResponse(Message(Role.ASSISTANT, "done"))],
+    )
+    host = _host()
+    try:
+        with mock.patch.object(host_server_module, "_provider", return_value=provider):
+            connection, response = _request(
+                host,
+                "POST",
+                "/provider",
+                body={
+                    "name": "openai",
+                    "model": "private-model",
+                    "effort": "experimental",
+                },
+                headers=_headers(host),
+            )
+            try:
+                body = response.read()
+                if response.status != 200:
+                    fail(f"unknown model effort was rejected: {response.status}, {body!r}")
+            finally:
+                connection.close()
+        _send_host_prompt(host, "use the custom effort")
+        if len(provider.requests) != 1:
+            fail(f"unknown model effort made {len(provider.requests)} requests")
+        request = provider.requests[0]
+        if request.model != "private-model" or request.effort != "experimental":
+            fail(f"unknown model effort was not forwarded: {request!r}")
+    finally:
+        host.close()
 
 
 @check("host_server.settings_roster_paths")

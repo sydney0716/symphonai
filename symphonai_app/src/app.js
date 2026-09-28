@@ -965,7 +965,9 @@ export async function start({ global, document, client }) {
 
   async function chooseModel(provider, row) {
     const choice = { name: provider, model: row.id };
-    if (row.efforts.length > 0) choice.effort = row.efforts[row.effortIndex];
+    if (Array.isArray(row.efforts) && row.efforts.length > 0) {
+      choice.effort = row.efforts[row.effortIndex];
+    }
     try {
       await boundary.selectProvider(choice);
       conversation = { ...(conversation ?? {}), provider, model: row.id };
@@ -977,6 +979,22 @@ export async function start({ global, document, client }) {
       await refreshConversation();
     } catch (error) {
       closePicker();
+      answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function chooseTypedModel(provider, model, effort = "") {
+    const choice = { name: provider, model };
+    if (effort) choice.effort = effort;
+    try {
+      await boundary.selectProvider(choice);
+      conversation = { ...(conversation ?? {}), provider, model };
+      if (effort) conversation.effort = effort;
+      closePicker();
+      showConversationUsage();
+      answerCommand(`Model set to ${provider} / ${model}${effort ? ` · effort ${effort}` : ""}.`);
+      await refreshConversation();
+    } catch (error) {
       answerCommand(error instanceof Error ? error.message : String(error));
     }
   }
@@ -996,7 +1014,7 @@ export async function start({ global, document, client }) {
         return;
       }
       const rows = reply.models.map((model) => {
-        const efforts = Array.isArray(model.efforts) ? model.efforts : [];
+        const efforts = Array.isArray(model.efforts) ? model.efforts : null;
         const existingEffort = conversation?.provider === provider && conversation?.model === model.id
           ? conversation.effort
           : "";
@@ -1005,7 +1023,7 @@ export async function start({ global, document, client }) {
           label: model.id,
           current: conversation?.provider === provider && conversation?.model === model.id,
           efforts,
-          effortIndex: Math.max(0, efforts.indexOf(existingEffort)),
+          effortIndex: Array.isArray(efforts) ? Math.max(0, efforts.indexOf(existingEffort)) : 0,
         };
       });
       const selected = rows.findIndex((row) => row.id === requestedModel);
@@ -1095,8 +1113,12 @@ export async function start({ global, document, client }) {
         await openModelPicker(args[0]);
         return;
       }
-      if (args.length === 2) {
-        const [provider, model] = args;
+      if (args.length === 2 || args.length === 3) {
+        const [provider, model, effort] = args;
+        if (effort) {
+          await chooseTypedModel(provider, model, effort);
+          return;
+        }
         let listing;
         try {
           listing = await boundary.models(provider);
@@ -1105,22 +1127,21 @@ export async function start({ global, document, client }) {
           return;
         }
         if (listing?.state === "unknown") {
-          try {
-            await boundary.selectProvider({ name: provider, model });
-            conversation = { ...(conversation ?? {}), provider, model };
-            closePicker();
-            showConversationUsage();
-            answerCommand(`Model set to ${provider} / ${model}.`);
-            await refreshConversation();
-          } catch (error) {
-            answerCommand(error instanceof Error ? error.message : String(error));
-          }
+          await chooseTypedModel(provider, model);
+          return;
+        }
+        if (
+          listing?.state === "available"
+          && Array.isArray(listing.models)
+          && !listing.models.some((row) => row.id === model)
+        ) {
+          await chooseTypedModel(provider, model);
           return;
         }
         await openModelPicker(provider, model);
         return;
       }
-      answerCommand("Usage: /model [<provider>]");
+      answerCommand("Usage: /model [<provider> [<id> [<effort>]]]");
       return;
     }
     answerCommand(`Unknown command: ${name}`);
