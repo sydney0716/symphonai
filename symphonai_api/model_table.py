@@ -90,6 +90,30 @@ def model_capabilities() -> tuple[ModelCapability, ...]:
         return ()
 
 
+def _capability_for_model(
+    wire_format: int,
+    model: str,
+    capabilities: tuple[ModelCapability, ...],
+) -> ModelCapability | None:
+    matching_format = [
+        item for item in capabilities if item.wire_format == wire_format
+    ]
+    exact = next((item for item in matching_format if item.model == model), None)
+    if exact is not None:
+        return exact
+
+    for item in matching_format:
+        prefix = f"{item.model}-"
+        if not model.startswith(prefix):
+            continue
+        suffix = model[len(prefix):]
+        if suffix == "preview" or (
+            len(suffix) == 8 and suffix.isascii() and suffix.isdigit()
+        ):
+            return item
+    return None
+
+
 def resolve_effort(
     wire_format: int,
     model: str,
@@ -101,14 +125,7 @@ def resolve_effort(
         return None
     if not isinstance(effort, str) or not effort:
         raise ValueError("effort must be a non-empty string or None")
-    capability = next(
-        (
-            item
-            for item in model_capabilities()
-            if item.wire_format == wire_format and item.model == model
-        ),
-        None,
-    )
+    capability = _capability_for_model(wire_format, model, model_capabilities())
     if capability is None:
         return effort
     for option in capability.efforts:

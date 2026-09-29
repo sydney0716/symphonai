@@ -7,6 +7,8 @@ import os
 import unittest.mock as mock
 import symphonai_api.model_table as model_table_module
 from symphonai_api.model_table import (
+    ModelCapability,
+    ModelEffort,
     _models_from_json,
     model_capabilities,
     resolve_effort,
@@ -210,6 +212,68 @@ def check_listed_effort_rejection() -> None:
             fail(f"listed effort rejection was not actionable: {message!r}")
     else:
         fail("a listed model accepted an undeclared effort")
+
+
+@check("providers.dated_model_effort_families")
+def check_dated_model_effort_families() -> None:
+    request = ModelRequest(
+        messages=[Message(role=Role.USER, content="hello")],
+        effort="high",
+    )
+    try:
+        _build_anthropic_body(
+            request,
+            "claude-haiku-4-5-20251001",
+            1024,
+        )
+    except ValueError as exc:
+        if "claude-haiku-4-5-20251001" not in str(exc) or "accepted efforts: none" not in str(exc):
+            fail(f"dated Haiku model did not use its no-effort row: {exc}")
+    else:
+        fail("dated Haiku model accepted an effort")
+
+    for effort in ("low", "medium", "high"):
+        resolved = resolve_effort(3, "gemini-3.1-pro-preview", effort)
+        if resolved != effort:
+            fail(f"Gemini preview effort {effort!r} resolved as {resolved!r}")
+
+    if resolve_effort(3, "gemini-3-flash-preview", "minimal") != "minimal":
+        fail("Gemini Flash preview did not use the Flash family row")
+    for model in (
+        "gemini-3-flash-lite",
+        "gemini-3-flash-lite-preview",
+        "claude-opus-4-5x",
+        "claude-opus-4-5-20251",
+        "unlisted-family-model",
+    ):
+        if resolve_effort(3 if model.startswith("gemini") else 2, model, "vendor-effort") != "vendor-effort":
+            fail(f"unmatched model {model!r} borrowed a family effort row")
+
+
+@check("providers.exact_model_capability_wins")
+def check_exact_model_capability_wins() -> None:
+    family = ModelCapability(
+        "anthropic",
+        2,
+        "claude-haiku-4-5",
+        (ModelEffort("family", "family-wire"),),
+    )
+    exact = ModelCapability(
+        "anthropic",
+        2,
+        "claude-haiku-4-5-20251001",
+        (ModelEffort("exact", "exact-wire"),),
+    )
+    with mock.patch.object(model_table_module, "model_capabilities", return_value=(family, exact)):
+        if resolve_effort(2, exact.model, "exact") != "exact-wire":
+            fail("a suffixed exact row did not take precedence over the family")
+        try:
+            resolve_effort(2, exact.model, "family")
+        except ValueError as exc:
+            if "accepted efforts: exact" not in str(exc):
+                fail(f"family efforts overrode the exact row: {exc}")
+        else:
+            fail("the exact row accepted only the family's effort")
 
 
 @check("providers.effort_reaches_transports")
