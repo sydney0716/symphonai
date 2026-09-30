@@ -628,6 +628,56 @@ test("escape cancels through the keymap and keeps the current model", async () =
   assert.equal(input.value, "");
 });
 
+test("bare model command in a conversation can switch to another keyed provider", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { providers: [
+      { name: "openai", key_present: true },
+      { name: "anthropic", key_present: true },
+    ] } },
+    conversation: { provider: "openai", model: "gpt-old", mode: "ask" },
+  });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: `${provider}-model`, efforts: [] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "/model";
+  await document.getElementById("prompt-form").dispatch("submit");
+  let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  let rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["openai", "anthropic"]);
+  assert.match(rows[0].className, /current/);
+  await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "anthropic").dispatch("click");
+  picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["anthropic-model"]);
+  assert.deepEqual(client.calls.selectProvider, []);
+  assert.deepEqual(client.calls.prompt, []);
+});
+
+test("a model hidden from discovery can still be selected by ID", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-current", mode: "ask" },
+    modelListing: { provider: "openai", state: "available", models: [{ id: "gpt-visible", efforts: [] }], detail: "" },
+  });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "gpt-visible", efforts: [] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "/model openai gpt-hidden-by-preference";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "gpt-hidden-by-preference" }]);
+  assert.deepEqual(client.calls.prompt, []);
+});
+
 test("model picker opens before a conversation and choosing among providers opens their models", async () => {
   const document = new FakeDocument();
   const client = fakeClient(fixtureRoadmap(), {

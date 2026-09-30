@@ -1077,6 +1077,11 @@ export async function start({ global, document, client }) {
   async function openDefaultModelPicker() {
     const currentProvider = conversation?.provider;
     if (typeof currentProvider === "string" && currentProvider) {
+      const otherKeyedProvider = providerRows.some((row) => row.key_present && row.name !== currentProvider);
+      if (otherKeyedProvider) {
+        openProviderPicker();
+        return;
+      }
       await openModelPicker(currentProvider);
       return;
     }

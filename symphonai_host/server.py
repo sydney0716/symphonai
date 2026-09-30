@@ -76,6 +76,23 @@ def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> 
     ]
 
 
+def _model_listing(
+    host: HostServer,
+    provider: str,
+    models: list[str] | tuple[str, ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    extensions = host.run.extensions
+    configured = None if extensions is None else extensions.config.get(f"models.{provider}")
+    if configured is None:
+        return _models_with_efforts(provider, models), {"applied": False, "hidden": 0}
+    allowed = set(configured)
+    visible = [model for model in models if model in allowed]
+    return _models_with_efforts(provider, visible), {
+        "applied": True,
+        "hidden": len(models) - len(visible),
+    }
+
+
 def _provider(name: str | None = None, model: str | None = None, base_url: str | None = None) -> ModelProvider | None:
     if name is None:
         name = next((vendor for vendor, key, _ in PROVIDERS if os.environ.get(key, "").strip()), None)
@@ -608,11 +625,13 @@ class HostServer:
                     with host._model_cache_lock:
                         cached = host._model_cache.get(cache_key)
                     if cached is not None:
+                        listed, model_filter = _model_listing(host, name, cached)
                         self._json(HTTPStatus.OK, {
                             "provider": name,
                             "state": "available",
-                            "models": _models_with_efforts(name, cached),
+                            "models": listed,
                             "detail": "",
+                            "filter": model_filter,
                         })
                         return
                     try:
@@ -631,15 +650,18 @@ class HostServer:
                             "state": "unknown",
                             "models": [],
                             "detail": detail,
+                            "filter": _model_listing(host, name, [])[1],
                         })
                         return
                     with host._model_cache_lock:
                         host._model_cache[cache_key] = tuple(models)
+                    listed, model_filter = _model_listing(host, name, models)
                     self._json(HTTPStatus.OK, {
                         "provider": name,
                         "state": "available",
-                        "models": _models_with_efforts(name, models),
+                        "models": listed,
                         "detail": "",
+                        "filter": model_filter,
                     })
                     return
                 if request_path == "/app":

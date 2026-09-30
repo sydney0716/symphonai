@@ -71,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -126,6 +126,11 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    models = _table(source, values, "models")
+    if models is not None:
+        _unknown_keys(source, "models", models, {"anthropic", "gemini", "openai"})
+        for provider in models:
+            _strings(source, f"models.{provider}", models[provider])
     search = _table(source, values, "search")
     if search is not None:
         _unknown_keys(source, "search", search, {"endpoint"})

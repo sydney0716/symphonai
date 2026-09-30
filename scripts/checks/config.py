@@ -1077,3 +1077,37 @@ def search_endpoint_validation() -> None:
                 fail(f"unknown endpoint error omitted source or key: {exc!r}")
         else:
             fail("unknown search endpoint was accepted")
+
+
+@check("config.model_preferences")
+def model_preferences() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        _write(source, '[models]\nanthropic = ["claude-sonnet"]\nopenai = []\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("models.anthropic") != ["claude-sonnet"]:
+            fail(f"provider model preferences were not flattened: {resolved.values!r}")
+        if resolved.get("models.openai") != [] or resolved.scope_of("models.openai") is not Scope.PROJECT:
+            fail(f"empty model preference or provenance was lost: {resolved.values!r}")
+        if resolved.get("models.gemini") is not None:
+            fail("an omitted provider unexpectedly gained a model preference")
+
+
+@check("config.model_preferences_validation")
+def model_preferences_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        source = _scope_path(Scope.PROJECT, repo_root, home)
+        for content, key in (
+            ('[models]\nunknown = ["model"]\n', "models.unknown"),
+            ('[models]\nopenai = ["gpt-1", 2]\n', "models.openai"),
+        ):
+            _write(source, content)
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError as exc:
+                if str(source) not in str(exc) or key not in str(exc):
+                    fail(f"model preference error omitted source or key {key}: {exc!r}")
+            else:
+                fail(f"invalid model preference was accepted for {key}")

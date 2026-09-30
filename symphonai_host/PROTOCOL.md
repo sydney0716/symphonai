@@ -178,12 +178,17 @@ a valid selection is sent. Launch flags do not select a provider.
 
 Authenticated `GET /models?provider=<name>` lists the models for a known
 provider, with optional `base_url` using the same meaning as `POST /provider`.
-It returns `provider`, `state`, `models`, and `detail`. Each model is
+It returns `provider`, `state`, `models`, `detail`, and `filter`. Each model is
 `{"id": str, "efforts": [str, ...]}`. A successful lookup has `state:
-"available"`, the filtered models from live model discovery, their declared
-effort identifiers, and an empty detail. A lookup that cannot be attempted or
-fails has `state: "unknown"`, an empty models array, and a key-safe explanation
-in detail. Successful vendor results are cached for the host process by
+"available"`, models from live model discovery, their declared effort
+identifiers, and an empty detail. `filter` is `{"applied": bool, "hidden": int}`;
+when a TOML `[models]` table has an array for that provider (for example,
+`openai = ["gpt-5", "gpt-5-mini"]`), only matching discovered IDs are returned
+and `hidden` counts discovered IDs omitted from the response. Without a
+provider list, all discovered models are returned with `applied: false` and
+`hidden: 0`. Configured IDs absent from discovery are ignored. A lookup that
+cannot be attempted or fails has `state: "unknown"`, an empty models array,
+and a key-safe explanation in detail. Successful vendor results are cached for the host process by
 provider and base URL; adding efforts does not perform another vendor call.
 Failed or unavailable listings are not cached. For each model,
 `efforts` is an array when the capability table has a row (including an empty

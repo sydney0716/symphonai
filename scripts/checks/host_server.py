@@ -1173,6 +1173,7 @@ def check_model_listing_route() -> None:
                     {"id": "gpt-second", "efforts": None},
                 ],
                 "detail": "",
+                "filter": {"applied": False, "hidden": 0},
             }
             if any(status != 200 or reply != expected for status, _, reply in (first, second, alternate)):
                 fail(f"available model listing response changed: {first!r}, {second!r}, {alternate!r}")
@@ -1397,6 +1398,40 @@ def check_provider_effort_reaches_request() -> None:
     unlisted = received({"name": "openai", "model": "private-model"})
     if unlisted != ("private-model", None, True):
         fail(f"an unlisted typed model acquired an effort: {unlisted!r}")
+
+
+@check("host_server.model_listing_filter")
+def check_model_listing_filter() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / ".symphonai" / "config.toml"
+        source.parent.mkdir(parents=True)
+        source.write_text('[models]\nopenai = ["gpt-second", "not-discovered"]\n', encoding="utf-8")
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(repo_root=root),
+            keepalive_seconds=0.05,
+            extensions=load_extensions(repo_root=root),
+        )
+        host.start()
+        try:
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "model-filter-test-key"}), mock.patch.object(
+                host_server_module, "list_models", return_value=["gpt-first", "gpt-second", "gpt-third"],
+            ):
+                connection, response = _request(host, "GET", "/models?provider=openai", headers=_headers(host))
+                try:
+                    body = response.read()
+                    reply = json.loads(body)
+                finally:
+                    connection.close()
+            if (
+                response.status != 200
+                or [row["id"] for row in reply.get("models", [])] != ["gpt-second"]
+                or reply.get("filter") != {"applied": True, "hidden": 2}
+            ):
+                fail(f"configured model list did not filter discovered models: {reply!r}")
+        finally:
+            host.close()
 
 
 @check("host_server.unknown_model_effort_can_be_set")
