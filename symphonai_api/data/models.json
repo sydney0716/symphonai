@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "notes": "UNVERIFIED against live accounts. Anthropic efforts reflect current vendor documentation; Gemini efforts reflect ref/CLIProxyAPI/internal/registry/models/models.json. Probe OpenAI before adding entries.",
+  "notes": "UNVERIFIED against live accounts. Anthropic efforts reflect current vendor documentation; Gemini efforts reflect ref/CLIProxyAPI/internal/registry/models/models.json; OpenAI efforts reflect live_test_provider.py --probe-efforts.",
   "models": [
     {
       "provider": "anthropic",
@@ -222,6 +222,77 @@
         {"id": "low", "value": "low"},
         {"id": "medium", "value": "medium"},
         {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-5.6-terra",
+      "efforts": [
+        {"id": "none", "value": "none"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-5.6-sol",
+      "efforts": [
+        {"id": "none", "value": "none"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-5.6-luna",
+      "efforts": [
+        {"id": "none", "value": "none"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-6-sol",
+      "efforts": [
+        {"id": "none", "value": "none"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-6-luna",
+      "efforts": [
+        {"id": "none", "value": "none"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-6-astra",
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
       ]
     }
   ]

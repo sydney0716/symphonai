@@ -98,9 +98,11 @@ def check_base_url_reaches_provider() -> None:
             requests.append((self.path, json.loads(self.rfile.read(length))))
             request_seen.set()
             payload = json.dumps({
-                "choices": [{
-                    "message": {"role": "assistant", "content": "loopback"},
-                    "finish_reason": "stop",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "loopback"}],
                 }],
                 "usage": {},
             }).encode("utf-8")
@@ -151,8 +153,16 @@ def check_base_url_reaches_provider() -> None:
                     fail("base URL selection did not reach the provider")
                 HostClient(HostAddress(host.port, host.token)).send_prompt("hello")
                 if not request_seen.wait(5):
-                    fail("selected OpenAI-compatible endpoint was not called")
-                if len(requests) != 1 or requests[0][0] != "/v1/chat/completions" or requests[0][1].get("model") != host.run._provider.model or requests[0][1].get("messages") != [{"role": "user", "content": "hello"}]:
+                    fail("selected OpenAI endpoint was not called")
+                if (
+                    len(requests) != 1
+                    or requests[0][0] != "/v1/responses"
+                    or requests[0][1].get("model") != host.run._provider.model
+                    or requests[0][1].get("input") != [{
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    }]
+                ):
                     fail(f"base URL did not reach only the loopback provider: {requests!r}")
             finally:
                 host.close()

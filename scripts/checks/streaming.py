@@ -526,6 +526,40 @@ def _openai_transcript() -> list[bytes]:
     ]
 
 
+def _responses_transcript() -> list[bytes]:
+    completed = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello world"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "tool-1",
+                "name": "weather",
+                "arguments": '{"city":"Seoul"}',
+            },
+        ],
+        "usage": {"input_tokens": 3, "output_tokens": 5},
+    }
+    return [
+        b'event: response.output_text.delta\n',
+        b'data: {"type":"response.output_text.delta","delta":"hello "}\n\n',
+        b'event: response.output_item.added\n',
+        b'data: {"output_index":1,"item":{"type":"function_call","call_id":"tool-1","name":"weather","arguments":""}}\n\n',
+        b'event: response.function_call_arguments.delta\n',
+        b'data: {"output_index":1,"delta":"{\\"city\\":"}\n\n',
+        b'event: response.output_text.delta\n',
+        b'data: {"type":"response.output_text.delta","delta":"world"}\n\n',
+        b'event: response.function_call_arguments.delta\n',
+        b'data: {"output_index":1,"delta":"\\"Seoul\\"}"}\n\n',
+        b'event: response.completed\n',
+        ("data: " + json.dumps({"response": completed}) + "\n\n").encode(),
+    ]
+
+
 @check("streaming.retry_before_first_line_only")
 def check_retry_before_first_line_only() -> None:
     request = urllib.request.Request("https://stream.invalid")
@@ -784,24 +818,16 @@ def check_anthropic_matches_non_streaming() -> None:
 @check("streaming.openai_matches_non_streaming")
 def check_openai_matches_non_streaming() -> None:
     body = {
-        "choices": [
+        "status": "completed",
+        "output": [
             {
-                "message": {
-                    "content": "hello world",
-                    "tool_calls": [
-                        {
-                            "id": "tool-1",
-                            "function": {
-                                "name": "weather",
-                                "arguments": json.dumps({"city": "Seoul"}),
-                            },
-                        }
-                    ],
-                },
-                "finish_reason": "tool_calls",
-            }
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello world"}],
+            },
+            {"type": "function_call", "call_id": "tool-1", "name": "weather", "arguments": '{"city":"Seoul"}'},
         ],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+        "usage": {"input_tokens": 3, "output_tokens": 5},
     }
     with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-stream-key"}):
         with mock.patch(
@@ -809,11 +835,35 @@ def check_openai_matches_non_streaming() -> None:
         ):
             expected = OpenAIProvider().create_response(_request())
         with mock.patch(
-            "urllib.request.urlopen", return_value=_LinesResponse(_openai_transcript())
+            "urllib.request.urlopen", return_value=_LinesResponse(_responses_transcript())
         ):
             actual = _assemble(OpenAIProvider().create_response_stream(_request()))
     if actual != expected:
         fail(f"OpenAI streaming response differed from non-streaming: {actual!r}")
+
+
+@check("streaming.responses_stream_chunks")
+def check_responses_stream_chunks() -> None:
+    captured: dict[str, object] = {}
+
+    def open_stream(request, timeout=None):  # noqa: ANN001
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _LinesResponse(_responses_transcript())
+
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-responses-stream-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=open_stream,
+    ):
+        chunks = list(OpenAIProvider().create_response_stream(_request()))
+    if captured.get("url") != "https://api.openai.com/v1/responses" or captured.get("body", {}).get("stream") is not True:
+        fail(f"Responses stream used the wrong endpoint or body: {captured!r}")
+    if not any(isinstance(chunk, TextDelta) for chunk in chunks):
+        fail(f"Responses stream omitted text deltas: {chunks!r}")
+    if not any(isinstance(chunk, ToolCallDelta) and chunk.arguments_fragment for chunk in chunks):
+        fail(f"Responses stream omitted function argument deltas: {chunks!r}")
+    completed = [chunk for chunk in chunks if isinstance(chunk, StreamCompleted)]
+    if len(completed) != 1 or _assemble(chunks).message.tool_calls[0].arguments != {"city": "Seoul"}:
+        fail(f"Responses stream did not complete the tool call: {chunks!r}")
 
 
 @check("streaming.compatible_shares_openai_mapping")
@@ -865,6 +915,30 @@ def check_openai_parallel_tool_calls() -> None:
         b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}},{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}\n\n',
         b'data: [DONE]\n\n',
     ]
+    terminal = {
+        "status": "completed",
+        "output": [
+            {"type": "function_call", "call_id": "first", "name": "first_tool", "arguments": '{"a":1}'},
+            {"type": "function_call", "call_id": "second", "name": "second_tool", "arguments": '{"b":2}'},
+        ],
+        "usage": {},
+    }
+    transcript = [
+        b'event: response.output_item.added\n',
+        b'data: {"output_index":1,"item":{"type":"function_call","call_id":"second","name":"second_tool","arguments":""}}\n\n',
+        b'event: response.output_item.added\n',
+        b'data: {"output_index":0,"item":{"type":"function_call","call_id":"first","name":"first_tool","arguments":""}}\n\n',
+        b'event: response.function_call_arguments.delta\n',
+        b'data: {"output_index":1,"delta":"{\\"b\\":"}\n\n',
+        b'event: response.function_call_arguments.delta\n',
+        b'data: {"output_index":0,"delta":"{\\"a\\":"}\n\n',
+        b'event: response.function_call_arguments.delta\n',
+        b'data: {"output_index":0,"delta":"1}"}\n\n',
+        b'event: response.function_call_arguments.delta\n',
+        b'data: {"output_index":1,"delta":"2}"}\n\n',
+        b'event: response.completed\n',
+        ("data: " + json.dumps({"response": terminal}) + "\n\n").encode(),
+    ]
     with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-parallel-key"}):
         with mock.patch("urllib.request.urlopen", return_value=_LinesResponse(transcript)):
             calls = _assemble(OpenAIProvider().create_response_stream(_request())).message.tool_calls
@@ -896,9 +970,10 @@ def check_anthropic_error_event() -> None:
 @check("streaming.openai_empty_choices_ignored")
 def check_openai_empty_choices_ignored() -> None:
     transcript = [
-        b'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n\n',
-        b'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9}}\n\n',
-        b'data: [DONE]\n\n',
+        b'event: response.output_text.delta\n',
+        b'data: {"delta":"done"}\n\n',
+        b'event: response.completed\n',
+        b'data: {"response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":7,"output_tokens":9}}}\n\n',
     ]
     with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-empty-key"}):
         with mock.patch("urllib.request.urlopen", return_value=_LinesResponse(transcript)):
@@ -936,7 +1011,10 @@ def check_truncated_stream_raises() -> None:
     with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-truncated-key"}):
         with mock.patch(
             "urllib.request.urlopen",
-            return_value=_LinesResponse([b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n']),
+            return_value=_LinesResponse([
+                b'event: response.output_text.delta\n',
+                b'data: {"delta":"partial"}\n\n',
+            ]),
         ):
             chunks = OpenAIProvider().create_response_stream(_request())
             try:
@@ -952,7 +1030,7 @@ def check_truncated_stream_raises() -> None:
 def check_stream_flag_present() -> None:
     providers = [
         (AnthropicProvider(), "ANTHROPIC_API_KEY", "anthropic-flag-key", _anthropic_transcript()),
-        (OpenAIProvider(), "OPENAI_API_KEY", "openai-flag-key", _openai_transcript()),
+        (OpenAIProvider(), "OPENAI_API_KEY", "openai-flag-key", _responses_transcript()),
         (OpenAICompatibleProvider("SYMPHONAI_FLAG_COMPATIBLE", "https://compatible.invalid/v1"), "SYMPHONAI_FLAG_COMPATIBLE", "compatible-flag-key", _openai_transcript()),
     ]
     for provider, environment, key, transcript in providers:
@@ -962,7 +1040,9 @@ def check_stream_flag_present() -> None:
             bodies.append(json.loads(request.data.decode("utf-8")))
             if isinstance(provider, AnthropicProvider):
                 return _BytesResponse(b'{"content":[],"usage":{},"stop_reason":"end_turn"}')
-            return _BytesResponse(b'{"choices":[{"message":{},"finish_reason":"stop"}],"usage":{}}')
+            if isinstance(provider, OpenAICompatibleProvider):
+                return _BytesResponse(b'{"choices":[{"message":{},"finish_reason":"stop"}],"usage":{}}')
+            return _BytesResponse(b'{"status":"completed","output":[],"usage":{}}')
 
         with mock.patch.dict(os.environ, {environment: key}):
             with mock.patch("urllib.request.urlopen", side_effect=non_stream):
@@ -1028,24 +1108,16 @@ def check_non_streaming_path_unchanged() -> None:
         "stop_reason": "tool_use",
     }
     openai_body = {
-        "choices": [
+        "status": "completed",
+        "output": [
             {
-                "message": {
-                    "content": "hello world",
-                    "tool_calls": [
-                        {
-                            "id": "tool-1",
-                            "function": {
-                                "name": "weather",
-                                "arguments": json.dumps({"city": "Seoul"}),
-                            },
-                        }
-                    ],
-                },
-                "finish_reason": "tool_calls",
-            }
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello world"}],
+            },
+            {"type": "function_call", "call_id": "tool-1", "name": "weather", "arguments": json.dumps({"city": "Seoul"})},
         ],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+        "usage": {"input_tokens": 3, "output_tokens": 5},
     }
     gemini_body = {
         "candidates": [
@@ -1078,7 +1150,22 @@ def check_non_streaming_path_unchanged() -> None:
             "compatible",
             OpenAICompatibleProvider("SYMPHONAI_FROZEN", "https://compatible.invalid/v1"),
             "SYMPHONAI_FROZEN",
-            openai_body,
+            {
+                "choices": [{
+                    "message": {
+                        "content": "hello world",
+                        "tool_calls": [{
+                            "id": "tool-1",
+                            "function": {
+                                "name": "weather",
+                                "arguments": json.dumps({"city": "Seoul"}),
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+            },
             expected_message,
         ),
         ("gemini", GeminiProvider(), "GEMINI_API_KEY", gemini_body, gemini_message),
@@ -1105,7 +1192,9 @@ def check_non_streaming_path_unchanged() -> None:
 def check_openai_error_event() -> None:
     key = "openai-secret-to-redact"
     transcript = [
-        b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        b'event: response.output_text.delta\n',
+        b'data: {"delta":"partial"}\n\n',
+        b'event: error\n',
         b'data: {"error":{"message":"rate limit exceeded for openai-secret-to-redact"}}\n\n',
     ]
     with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}):

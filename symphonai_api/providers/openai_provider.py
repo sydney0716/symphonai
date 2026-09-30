@@ -1,15 +1,13 @@
-"""OpenAI-backed ModelProvider: calls the real OpenAI Chat Completions API.
+"""OpenAI-backed ModelProvider: calls the real OpenAI Responses API.
 
 Maps symphonai_api's provider-agnostic Message/ToolCall/ToolResult shape
-into and out of OpenAI's Chat Completions wire format
-(https://platform.openai.com/docs/api-reference/chat), using only the
+into and out of OpenAI's Responses wire format
+(https://platform.openai.com/docs/api-reference/responses), using only the
 standard library (`urllib.request`) -- no new dependency.
 
-`ModelRequest.tools` is passed through unmodified into the request's
-`tools` field, so callers must already supply tool definitions in
-OpenAI's native `{"type": "function", "function": {...}}` shape. The
-standard runtime call sites prepare that shape via
-`symphonai_api.tool_schema`.
+The runtime supplies Chat-shaped tool schemas; this provider translates them
+to Responses function tools. The Chat Completions mapping helpers remain
+available to OpenAI-compatible vendors.
 """
 
 from __future__ import annotations
@@ -58,6 +56,7 @@ _ROLE_TO_OPENAI = {
     Role.ASSISTANT: "assistant",
     Role.TOOL: "tool",
 }
+_RESPONSES_REASONING_KEY = "responses_reasoning_items"
 
 
 def _openai_content(message: Message) -> list[dict[str, Any]]:
@@ -141,6 +140,83 @@ def _build_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
     return body
 
 
+def _responses_content(message: Message) -> list[dict[str, Any]]:
+    role = "output_text" if message.role == Role.ASSISTANT else "input_text"
+    parts: list[dict[str, Any]] = []
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            parts.append({"type": role, "text": block.text})
+        elif isinstance(block, ImageBlock):
+            parts.append({
+                "type": "input_image",
+                "image_url": f"data:{block.media_type};base64,{block.data}",
+            })
+        elif isinstance(block, DocumentBlock):
+            parts.append({
+                "type": "input_file",
+                "filename": block.filename or "document.pdf",
+                "file_data": f"data:{block.media_type};base64,{block.data}",
+            })
+    return parts
+
+
+def _responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function", {})
+    translated = {"type": "function"}
+    for key in ("name", "description", "parameters", "strict"):
+        if key in function:
+            translated[key] = function[key]
+    return translated
+
+
+def _build_responses_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
+    reject_system_attachments(request.messages)
+    id_map = wire_tool_call_ids(request.messages)
+    items: list[dict[str, Any]] = []
+    for message in request.messages:
+        if message.role == Role.TOOL:
+            result = message.tool_result
+            assert result is not None, "tool-role Message must carry a tool_result"
+            items.append({
+                "type": "function_call_output",
+                "call_id": id_map.get(result.tool_call_id, result.tool_call_id),
+                "output": result.content if result.ok else (result.error or ""),
+            })
+            continue
+        if message.role == Role.ASSISTANT and message.tool_calls:
+            reasoning_items = message.tool_calls[0].provider_metadata.get(_RESPONSES_REASONING_KEY)
+            if isinstance(reasoning_items, list):
+                items.extend(reasoning_items)
+            if message.text:
+                items.append({
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": message.text}],
+                })
+            for call in message.tool_calls:
+                call_id = id_map.get(call.id, call.vendor_id or call.id)
+                items.append({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments),
+                })
+            continue
+        role = "system" if message.role == Role.SYSTEM else message.role.value
+        items.append({"role": role, "content": _responses_content(message)})
+
+    body: dict[str, Any] = {"model": model, "input": items}
+    if request.tools:
+        body["tools"] = [_responses_tool(tool) for tool in request.tools]
+    if request.max_tokens is not None:
+        body["max_output_tokens"] = request.max_tokens
+    if request.temperature is not None:
+        body["temperature"] = request.temperature
+    effort = resolve_effort(1, model, request.effort)
+    if effort is not None:
+        body["reasoning"] = {"effort": effort}
+    return body
+
+
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for tool calls that arrive without one.
 
@@ -184,6 +260,118 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
         ),
         stop_reason=choices[0].get("finish_reason") or "stop",
     )
+
+
+def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
+    error = data.get("error")
+    if not isinstance(error, dict) and data.get("status") == "failed":
+        failed_response = data.get("response")
+        error = failed_response.get("error", {}) if isinstance(failed_response, dict) else {}
+    if isinstance(error, dict) or data.get("status") == "failed":
+        detail = error.get("message") if isinstance(error, dict) else None
+        raise ProviderError(redact_secret(
+            str(detail or "OpenAI API response failed"),
+            os.environ.get(API_KEY_ENV_VAR, "").strip(),
+        ))
+    output = data.get("output") or []
+    if not isinstance(output, list):
+        raise ProviderError("OpenAI API response contained invalid output")
+    text_parts: list[str] = []
+    reasoning_items: list[dict[str, Any]] = []
+    tool_calls: list[ToolCall] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "reasoning":
+            reasoning_items.append(item)
+        elif item.get("type") == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
+                    if isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
+        elif item.get("type") == "function_call":
+            name = item.get("name", "")
+            vendor_id = item.get("call_id") or None
+            raw_args = item.get("arguments", "{}")
+            try:
+                arguments = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                raise ProviderError("OpenAI function call arguments were not valid JSON") from None
+            tool_calls.append(ToolCall(
+                id=vendor_id or _synthesize_tool_call_id(),
+                name=name,
+                arguments=arguments,
+                vendor_id=vendor_id,
+            ))
+    if reasoning_items and tool_calls:
+        first = tool_calls[0]
+        tool_calls[0] = ToolCall(
+            id=first.id,
+            name=first.name,
+            arguments=first.arguments,
+            provider_metadata={_RESPONSES_REASONING_KEY: reasoning_items},
+            vendor_id=first.vendor_id,
+        )
+    usage_raw = data.get("usage", {})
+    status = data.get("status")
+    incomplete = data.get("incomplete_details")
+    stop_reason = "tool_calls" if tool_calls else (
+        "length" if status == "incomplete" or isinstance(incomplete, dict) else "stop"
+    )
+    return ModelResponse(
+        message=Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls),
+        usage=Usage(
+            input_tokens=usage_raw.get("input_tokens", 0) if isinstance(usage_raw, dict) else 0,
+            output_tokens=usage_raw.get("output_tokens", 0) if isinstance(usage_raw, dict) else 0,
+        ),
+        stop_reason=stop_reason,
+    )
+
+
+def _responses_stream_chunks(
+    lines: Iterator[bytes], *, operation: str, api_key: str = ""
+) -> Iterator[StreamChunk]:
+    for event, payload in sse_events(lines):
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"{operation} stream returned invalid JSON: {exc}") from None
+        if not isinstance(data, dict):
+            raise ProviderError(f"{operation} stream returned non-object JSON")
+        if event in {"error", "response.failed"} or isinstance(data.get("error"), dict):
+            error = data.get("error")
+            if not isinstance(error, dict):
+                failed_response = data.get("response")
+                error = failed_response.get("error", {}) if isinstance(failed_response, dict) else {}
+            message = error.get("message") if isinstance(error, dict) else None
+            raise ProviderError(redact_secret(str(message or f"{operation} stream failed"), api_key))
+        if event == "response.output_text.delta":
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                yield TextDelta(delta)
+        elif event == "response.output_item.added":
+            item = data.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                index = data.get("output_index")
+                if isinstance(index, int):
+                    call_id = item.get("call_id")
+                    yield ToolCallDelta(
+                        index,
+                        id=call_id,
+                        name=item.get("name"),
+                        vendor_id=call_id,
+                    )
+        elif event == "response.function_call_arguments.delta":
+            index = data.get("output_index")
+            delta = data.get("delta")
+            if isinstance(index, int) and isinstance(delta, str):
+                yield ToolCallDelta(index, arguments_fragment=delta)
+        elif event in {"response.completed", "response.incomplete"}:
+            response_data = data.get("response")
+            if not isinstance(response_data, dict):
+                raise ProviderError(f"{operation} stream omitted its completed response")
+            yield StreamCompleted(_parse_responses_response(response_data))
+            return
 
 
 def _openai_stream_chunks(
@@ -263,7 +451,7 @@ def _openai_stream_chunks(
 
 @dataclass
 class OpenAIProvider(ModelProvider):
-    """Calls the real OpenAI Chat Completions API.
+    """Calls the real OpenAI Responses API.
 
     The API key is never accepted as a constructor argument or stored on
     this object -- it is read from `OPENAI_API_KEY` fresh on every call,
@@ -296,9 +484,9 @@ class OpenAIProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model)
+        body = _build_responses_request_body(request, model)
         http_request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            f"{self.base_url}/responses",
             data=json.dumps(body).encode("utf-8"),
             method="POST",
             headers={
@@ -317,7 +505,7 @@ class OpenAIProvider(ModelProvider):
         )
         data = parse_json_object(raw, "OpenAI API")
 
-        return _parse_response(data)
+        return _parse_responses_response(data)
 
     def create_response_stream(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -327,11 +515,10 @@ class OpenAIProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model)
+        body = _build_responses_request_body(request, model)
         body["stream"] = True
-        body["stream_options"] = {"include_usage": True}
         http_request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
+            f"{self.base_url}/responses",
             data=json.dumps(body).encode("utf-8"),
             method="POST",
             headers={
@@ -347,6 +534,6 @@ class OpenAIProvider(ModelProvider):
             operation="OpenAI API",
             cancel=cancel,
         )
-        yield from _openai_stream_chunks(
+        yield from _responses_stream_chunks(
             lines, operation="OpenAI API", api_key=api_key
         )

@@ -40,7 +40,12 @@ def check_providers_live_openai_tools_and_model_override() -> None:
                 captured["body"] = json.loads(request.data.decode("utf-8"))
                 payload = json.dumps(
                     {
-                        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}],
+                        }],
                         "usage": {},
                     }
                 ).encode("utf-8")
@@ -56,7 +61,7 @@ def check_providers_live_openai_tools_and_model_override() -> None:
                 )
             del os.environ[API_KEY_ENV_VAR]
 
-            sent_tool_names = {t["function"]["name"] for t in captured.get("body", {}).get("tools", [])}
+            sent_tool_names = {tool["name"] for tool in captured.get("body", {}).get("tools", [])}
             expected_tool_names = {
                 "read_file",
                 "write_file",

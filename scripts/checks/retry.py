@@ -63,12 +63,12 @@ def _http_error(
 
 def _openai_success(content: str) -> _FakeHttpResponse:
     payload = {
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+        }],
         "usage": {},
     }
     return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
