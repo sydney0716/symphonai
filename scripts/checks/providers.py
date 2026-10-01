@@ -6,6 +6,7 @@ import json
 import os
 import unittest.mock as mock
 import symphonai_api.model_table as model_table_module
+from symphonai_api.compaction import budget_for_model
 from symphonai_api.model_table import (
     ModelCapability,
     ModelEffort,
@@ -150,6 +151,59 @@ def check_model_table_schema() -> None:
     with mock.patch.object(model_table_module, "model_capabilities", return_value=()):
         if resolve_effort(3, "invented-unavailable-table-model", "future") != "future":
             fail("an unavailable model table did not degrade to pass-through")
+
+
+@check("providers.model_context_budgets")
+def check_model_context_budgets() -> None:
+    cases = (
+        (2, "claude-opus-4-8", 955_000),
+        (2, "claude-haiku-4-5-20251001", 155_000),
+        (3, "gemini-3.5-flash", 1_003_576),
+        (1, "gpt-5.6-terra", 83_000),
+        (2, "invented-model", 83_000),
+        (2, None, 83_000),
+    )
+    for wire_format, model, expected in cases:
+        actual = budget_for_model(wire_format, model)
+        if actual != expected:
+            fail(
+                f"budget for wire format {wire_format}, model {model!r}: "
+                f"{actual}, expected {expected}"
+            )
+
+
+@check("providers.context_window_malformed_fails_closed")
+def check_context_window_malformed_fails_closed() -> None:
+    for invalid in (0, -1, "1000", True):
+        result = _models_from_json(
+            {
+                "schema_version": 1,
+                "notes": "invalid context window fixture",
+                "models": [
+                    {
+                        "provider": "fixture",
+                        "wire_format": 2,
+                        "id": "fixture-model",
+                        "context_window": invalid,
+                        "efforts": [],
+                    }
+                ],
+            }
+        )
+        if result != ():
+            fail(f"invalid context_window {invalid!r} did not fail the table closed")
+
+
+@check("providers.new_anthropic_models_have_efforts")
+def check_new_anthropic_models_have_efforts() -> None:
+    for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+        if resolve_effort(2, model, "xhigh") != "xhigh":
+            fail(f"{model} did not resolve xhigh")
+        try:
+            resolve_effort(2, model, "none")
+        except ValueError:
+            continue
+        fail(f"{model} accepted unsupported effort none")
 
 
 @check("providers.default_effort_body_identity")

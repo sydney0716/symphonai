@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
+from symphonai_api.compaction import DEFAULT_RECENT_TURNS
 from symphonai_api.cost import PriceTable
 from symphonai_api.agent_file import AgentFileError, load_agent_file
 from symphonai_api.extensions import Extensions
@@ -140,7 +140,7 @@ class HostServer:
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
         price_table: PriceTable | None = None,
-        chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+        chat_token_budget: int | None = None,
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
     ) -> None:
         if keepalive_seconds <= 0:

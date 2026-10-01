@@ -7,9 +7,13 @@ import math
 from dataclasses import dataclass, replace
 
 from symphonai_api.cancellation import CancellationToken
+from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 16_000
+DEFAULT_CONTEXT_WINDOW = 128_000
+REPLY_RESERVE_TOKENS = 32_000
+COMPACTION_BUFFER_TOKENS = 13_000
 DEFAULT_RECENT_TURNS = 4
 ATTACHMENT_BYTES_PER_TOKEN = 750
 COMPACTABLE_TOOL_NAMES = frozenset(
@@ -23,6 +27,14 @@ COMPACTABLE_TOOL_NAMES = frozenset(
     }
 )
 CLEARED_CONTENT_MARKER = "[old tool result content cleared]"
+
+
+def budget_for_model(wire_format: int, model: str | None) -> int:
+    """Derive the compaction budget from a known model window or the default."""
+    context_window = context_window_for_model(wire_format, model)
+    if context_window is None:
+        context_window = DEFAULT_CONTEXT_WINDOW
+    return context_window - REPLY_RESERVE_TOKENS - COMPACTION_BUFFER_TOKENS
 
 
 class ContextCompactionError(ValueError):

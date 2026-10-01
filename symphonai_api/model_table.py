@@ -20,6 +20,7 @@ class ModelCapability:
     wire_format: int
     model: str
     efforts: tuple[ModelEffort, ...]
+    context_window: int | None = None
 
 
 def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
@@ -39,6 +40,7 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
         wire_format = raw_model.get("wire_format")
         model = raw_model.get("id")
         raw_efforts = raw_model.get("efforts")
+        context_window = raw_model.get("context_window")
         if (
             not isinstance(provider, str)
             or not provider
@@ -48,6 +50,14 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
             or not isinstance(model, str)
             or not model
             or not isinstance(raw_efforts, list)
+            or (
+                "context_window" in raw_model
+                and (
+                    not isinstance(context_window, int)
+                    or isinstance(context_window, bool)
+                    or context_window <= 0
+                )
+            )
             or (wire_format, model) in seen_models
         ):
             return ()
@@ -71,7 +81,11 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
             seen_efforts.add(identifier)
             efforts.append(ModelEffort(identifier, value))
         seen_models.add((wire_format, model))
-        models.append(ModelCapability(provider, wire_format, model, tuple(efforts)))
+        models.append(
+            ModelCapability(
+                provider, wire_format, model, tuple(efforts), context_window
+            )
+        )
     return tuple(models)
 
 
@@ -136,3 +150,11 @@ def resolve_effort(
         f"model {model!r} does not accept effort {effort!r}; "
         f"accepted efforts: {accepted}"
     )
+
+
+def context_window_for_model(wire_format: int, model: str | None) -> int | None:
+    """Return the listed context window for a model, if the table knows it."""
+    if model is None:
+        return None
+    capability = _capability_for_model(wire_format, model, model_capabilities())
+    return None if capability is None else capability.context_window

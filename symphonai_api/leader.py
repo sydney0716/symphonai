@@ -45,10 +45,10 @@ from symphonai_api.circuit_breaker import (
 )
 from symphonai_api.cost import UsageTotals
 from symphonai_api.compaction import (
-    DEFAULT_CONTEXT_TOKEN_BUDGET,
     DEFAULT_RECENT_TURNS,
     CompactionResult,
     ContextCompactionError,
+    budget_for_model,
     compact_messages_for_budget,
     estimate_messages_tokens,
 )
@@ -665,7 +665,7 @@ class LeaderConfig:
     subagent_specs: Mapping[str, AgentSpec] | None = None
     permission_mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
-    chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET
+    chat_token_budget: int | None = None
     chat_recent_turns: int = DEFAULT_RECENT_TURNS
     events: EventSink | None = None
     max_consecutive_compaction_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
@@ -857,6 +857,16 @@ class Leader:
     def agent_ref(self) -> AgentRef:
         return self._agent_ref
 
+    @property
+    def chat_token_budget(self) -> int:
+        """The explicit or model-derived budget currently used for chat compaction."""
+        if self._config.chat_token_budget is not None:
+            return self._config.chat_token_budget
+        return budget_for_model(
+            self._config.leader_provider.wire_format,
+            self._leader_spec.model.model,
+        )
+
     def _stopped_repairs(self) -> tuple[str, ...]:
         breakers = [
             self._automatic_compaction_breaker,
@@ -1010,7 +1020,7 @@ class Leader:
         """Apply context compaction to the persisted multi-turn chat state."""
 
         result = self._compact_chat_to_budget(
-            self._config.chat_token_budget,
+            self.chat_token_budget,
             cancel=cancel,
         )
         self._context_overflow_repair_failed = False
@@ -1069,7 +1079,7 @@ class Leader:
     ) -> bool:
         before_tokens = estimate_messages_tokens(self._chat_messages)
         forced_budget = min(
-            self._config.chat_token_budget,
+            self.chat_token_budget,
             max(1, before_tokens - 1),
         )
         user_turns = sum(
@@ -1100,7 +1110,7 @@ class Leader:
             return
         try:
             self._compact_chat_to_budget(
-                self._config.chat_token_budget,
+                self.chat_token_budget,
                 cancel=cancel,
                 record_success=not self._context_overflow_repair_failed,
             )

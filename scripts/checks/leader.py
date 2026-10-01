@@ -135,6 +135,16 @@ class _RecordingFakeProvider(FakeModelProvider):
         return super().create_response(request, cancel=cancel)
 
 
+class _AnthropicFakeProvider(FakeModelProvider):
+    @property
+    def name(self) -> str:
+        return "anthropic"
+
+    @property
+    def wire_format(self) -> int:
+        return 2
+
+
 class _RaisingProvider(FakeModelProvider):
     def create_response(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -1501,6 +1511,90 @@ def check_selection_updates_next_request() -> None:
             )
         if leader._agent is not agent:
             fail("model and effort selection rebuilt the leader agent")
+
+
+def _large_file_history() -> list[Message]:
+    messages = [Message(Role.SYSTEM, "system prompt")]
+    for index in range(7):
+        call_id = f"read-{index}"
+        # Keep the approximate total and preserved tail described by 28b.
+        messages.extend(
+            [
+                Message(Role.USER, f"prompt {index} " + "x" * 240),
+                Message(
+                    Role.ASSISTANT,
+                    tool_calls=[ToolCall(call_id, "read_file", {"path": f"{index}.py"})],
+                ),
+                Message(
+                    Role.TOOL,
+                    tool_result=ToolResult(
+                        tool_call_id=call_id,
+                        ok=True,
+                        content="line of code\n" * 1200,
+                    ),
+                ),
+            ]
+        )
+    return messages
+
+
+@check("leader.model_window_sets_compaction_budget")
+def check_model_window_sets_compaction_budget() -> None:
+    with workspace() as ws:
+        default_events = CollectingSink()
+        default = Leader(
+            LeaderConfig(
+                _AnthropicFakeProvider([ModelResponse(Message(Role.ASSISTANT, "reply"))]),
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-opus-4-8",
+                # Include four completed file results plus the new chat prompt.
+                chat_recent_turns=5,
+                events=default_events,
+            )
+        )
+        default.seed_chat(_large_file_history(), persisted=True)
+        default.chat("one more prompt " + "x" * 240)
+        if default_events.of_type(CompactionApplied):
+            fail("model-window budget compacted the large but in-window history")
+        if default._automatic_compaction_breaker.consecutive_failures != 0:
+            fail("model-window budget recorded an automatic compaction failure")
+
+        small = Leader(
+            LeaderConfig(
+                _AnthropicFakeProvider([ModelResponse(Message(Role.ASSISTANT, "reply"))]),
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-opus-4-8",
+                chat_token_budget=16_000,
+                chat_recent_turns=5,
+            )
+        )
+        small.seed_chat(_large_file_history(), persisted=True)
+        small.chat("one more prompt " + "x" * 240)
+        if small._automatic_compaction_breaker.consecutive_failures < 1:
+            fail("explicit 16,000-token budget did not record the expected compaction failure")
+
+
+@check("leader.model_window_budget_tracks_selection")
+def check_model_window_budget_tracks_selection() -> None:
+    with workspace() as ws:
+        leader = Leader(
+            LeaderConfig(
+                _AnthropicFakeProvider([ModelResponse(Message(Role.ASSISTANT, "reply"))]),
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-opus-4-8",
+            )
+        )
+        agent = leader._agent
+        if leader.chat_token_budget != 955_000:
+            fail(f"Opus context budget was {leader.chat_token_budget}, expected 955000")
+        leader.select_model("claude-haiku-4-5", None)
+        if leader.chat_token_budget != 155_000:
+            fail(f"selected Haiku context budget was {leader.chat_token_budget}, expected 155000")
+        if leader._agent is not agent:
+            fail("changing the model to update the budget rebuilt the leader")
 
 
 @check("leader.context_overflow_compacts_and_recovers")

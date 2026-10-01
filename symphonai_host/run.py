@@ -14,7 +14,7 @@ from symphonai_api.agent_memory import AgentMemory
 from symphonai_api.agent_spec import AgentSpec
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.compaction import DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_RECENT_TURNS
+from symphonai_api.compaction import DEFAULT_RECENT_TURNS
 from symphonai_api.config import resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
@@ -165,7 +165,7 @@ class HostRun:
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
         price_table: PriceTable | None = None,
-        chat_token_budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+        chat_token_budget: int | None = None,
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
     ) -> None:
         self._provider = provider
@@ -636,7 +636,7 @@ class HostRun:
             )
         self._context_report = account_context(
             leader._chat_messages,
-            budget=self._chat_token_budget,
+            budget=leader.chat_token_budget,
         )
 
     def conversation_stats(self) -> dict | None:

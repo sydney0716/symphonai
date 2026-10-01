@@ -2474,6 +2474,49 @@ def check_conversation_reports_model_selection() -> None:
             run.close()
 
 
+@check("host_server.context_budget_tracks_model")
+def check_context_budget_tracks_model() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _RecordingWireFakeProvider(
+            "anthropic", 2, [ModelResponse(Message(Role.ASSISTANT, "done"))]
+        )
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            model="claude-opus-4-8",
+            sessions_root=root / "default-sessions",
+        )
+        host.start()
+        try:
+            _send_host_prompt(host, "hello")
+            conversation = _conversation_reply(host)[1]["conversation"]
+            budget = conversation["context"]["budget_tokens"]
+            if budget != 955_000:
+                fail(f"default model context budget was {budget}, expected 955000")
+        finally:
+            host.close()
+
+        explicit = HostServer(
+            _RecordingWireFakeProvider(
+                "anthropic", 2, [ModelResponse(Message(Role.ASSISTANT, "done"))]
+            ),
+            PermissionPolicy(root),
+            model="claude-opus-4-8",
+            sessions_root=root / "explicit-sessions",
+            chat_token_budget=170,
+        )
+        explicit.start()
+        try:
+            _send_host_prompt(explicit, "hello")
+            conversation = _conversation_reply(explicit)[1]["conversation"]
+            budget = conversation["context"]["budget_tokens"]
+            if budget != 170:
+                fail(f"explicit host context budget was {budget}, expected 170")
+        finally:
+            explicit.close()
+
+
 @check("host_server.permission_mode_control")
 def check_permission_mode_control() -> None:
     with tempfile.TemporaryDirectory() as temporary:
