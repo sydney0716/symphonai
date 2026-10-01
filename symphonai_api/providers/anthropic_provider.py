@@ -53,6 +53,7 @@ DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
+DEFAULT_STREAM_MAX_TOKENS = 32000
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for tool calls that arrive without one.
@@ -316,7 +317,7 @@ class AnthropicProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model, self.max_tokens)
+        body = _build_request_body(request, model, DEFAULT_STREAM_MAX_TOKENS)
         body["stream"] = True
         http_request = urllib.request.Request(
             f"{self.base_url}/messages",

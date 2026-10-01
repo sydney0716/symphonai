@@ -90,13 +90,27 @@ class StreamAssembler:
         if not content:
             content = "".join(self._text)
         tool_calls = terminal.message.tool_calls
+        cut_tool_call_id = terminal.cut_tool_call_id
         if not tool_calls:
-            tool_calls = [
-                self._finish_tool_call(index, self._tool_calls[index])
-                for index in sorted(self._tool_calls)
-            ]
+            indices = sorted(self._tool_calls)
+            output_limited = terminal.stop_reason in {"max_tokens", "length", "MAX_TOKENS"}
+            tool_calls = []
+            for index in indices:
+                partial = self._tool_calls[index]
+                if output_limited and index == indices[-1]:
+                    tool_call = ToolCall(
+                        id=partial.id or new_id("call"),
+                        name=partial.name or "",
+                        arguments={},
+                        provider_metadata=dict(partial.provider_metadata),
+                        vendor_id=partial.vendor_id,
+                    )
+                    cut_tool_call_id = tool_call.id
+                else:
+                    tool_call = self._finish_tool_call(index, partial)
+                tool_calls.append(tool_call)
         message = replace(terminal.message, content=content, tool_calls=tool_calls)
-        return replace(terminal, message=message)
+        return replace(terminal, message=message, cut_tool_call_id=cut_tool_call_id)
 
     @staticmethod
     def _finish_tool_call(index: int, partial: _PartialToolCall) -> ToolCall:

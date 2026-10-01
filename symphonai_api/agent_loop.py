@@ -65,6 +65,10 @@ from symphonai_api.tools.metadata import call_target
 
 # Re-exported: DEFAULT_MAX_TURNS lives in budgets.py because RunBudget defaults
 # to it, and budgets.py cannot import this module without a cycle.
+_CUT_TOOL_CALL_ERROR = (
+    "not run: the reply reached its output limit before this call was complete. "
+    "Split the work into smaller calls."
+)
 
 
 def _message_digest(message: Message) -> str:
@@ -475,9 +479,22 @@ class ApiAgent:
                         data={"stopped_reason": "final_response", "turns_used": turn},
                     )
                     return result
-                batches = partition_tool_calls(
-                    response.message.tool_calls, self._tools
+                cut_call = next(
+                    (
+                        call
+                        for call in response.message.tool_calls
+                        if call.id == response.cut_tool_call_id
+                    ),
+                    None,
                 )
+                executable_calls = [
+                    call
+                    for call in response.message.tool_calls
+                    if call.id != response.cut_tool_call_id
+                ]
+                batches = partition_tool_calls(executable_calls, self._tools)
+                if cut_call is not None:
+                    batches.append([cut_call])
                 for batch in batches:
                     for tool_call in batch:
                         append_record(
@@ -505,7 +522,13 @@ class ApiAgent:
 
                     cancelled = False
                     results: dict[int, ToolResult] = {}
-                    if len(batch) == 1:
+                    if batch[0].id == response.cut_tool_call_id:
+                        results[0] = ToolResult(
+                            tool_call_id=batch[0].id,
+                            ok=False,
+                            error=_CUT_TOOL_CALL_ERROR,
+                        )
+                    elif len(batch) == 1:
                         tool_call = batch[0]
                         results[0] = self._execute_tool_call(
                             tool_call,

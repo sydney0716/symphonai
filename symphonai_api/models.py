@@ -236,6 +236,7 @@ class ModelResponse:
     message: Message
     usage: Usage = field(default_factory=Usage)
     stop_reason: str = "end_turn"
+    cut_tool_call_id: str | None = None
 
     @property
     def has_tool_calls(self) -> bool:

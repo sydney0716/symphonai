@@ -12,7 +12,12 @@ from unittest import mock
 
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import AssistantTextDelta, CollectingSink
+from symphonai_api.events import (
+    AssistantTextDelta,
+    CollectingSink,
+    ToolCallFailed,
+    ToolCallFinished,
+)
 from symphonai_api.identity import AgentRef, RunRef, TurnRef
 from symphonai_api.models import (
     Message,
@@ -20,6 +25,7 @@ from symphonai_api.models import (
     ModelResponse,
     Role,
     ToolCall,
+    ToolResult,
     Usage,
 )
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
@@ -43,6 +49,8 @@ from symphonai_api.streaming import (
     open_stream_with_retry,
     sse_events,
 )
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -83,6 +91,35 @@ def _fixed_identity():
             return_value=TurnRef("turn-fixed", "run-fixed", 1),
         ),
     )
+
+
+class _RecordingTool(LocalTool):
+    def __init__(self, name: str = "write_file") -> None:
+        self._name = name
+        self.calls: list[dict] = []
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return "test tool"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}}
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(
+            effect=ToolEffect.READ_ONLY,
+            concurrency_safe=False,
+            paths=(),
+        )
+
+    def _execute(self, tool_call, policy, cancel=None) -> ToolResult:
+        self.calls.append(tool_call.arguments)
+        return ToolResult(tool_call_id=tool_call.id, ok=True, content="ran")
 
 
 @check("streaming.default_yields_one_completion")
@@ -458,6 +495,115 @@ def check_dropped_events_change_nothing() -> None:
         or dropped.final_response != expected.final_response
     ):
         fail("exceptions from the event sink changed the streamed result")
+
+
+@check("streaming.output_limit_cut_call_fails_without_execution")
+def check_output_limit_cut_call_fails_without_execution() -> None:
+    expected_error = (
+        "not run: the reply reached its output limit before this call was complete. "
+        "Split the work into smaller calls."
+    )
+    for stop_reason in ("max_tokens", "length", "MAX_TOKENS"):
+        tool = _RecordingTool()
+        sink = CollectingSink()
+        with workspace() as ws:
+            result = ApiAgent(
+                FakeModelProvider(
+                    streams=[
+                        [
+                            ToolCallDelta(
+                                0,
+                                id=f"cut-{stop_reason}",
+                                name="write_file",
+                                arguments_fragment='{"path":"unfinished.py","content":',
+                            ),
+                            _empty_completion(stop_reason=stop_reason),
+                        ],
+                        [TextDelta("continued"), _empty_completion()],
+                    ]
+                ),
+                {"write_file": tool},
+                ws.policy,
+                stream=True,
+                events=sink,
+            ).run([Message(role=Role.USER, content="write the file")])
+        assistant = next(
+            message
+            for message in result.messages
+            if message.role == Role.ASSISTANT and message.tool_calls
+        )
+        tool_result = next(
+            message.tool_result
+            for message in result.messages
+            if message.role == Role.TOOL
+        )
+        if assistant.tool_calls[0].arguments != {}:
+            fail("cut tool call did not retain an empty argument object")
+        if tool.calls:
+            fail("cut write_file call reached the registered tool")
+        if tool_result is None or tool_result.ok or tool_result.error != expected_error:
+            fail(f"cut tool call did not persist the exact failed result: {tool_result!r}")
+        if result.final_response.message.text != "continued":
+            fail("agent did not continue to the next model turn after the cut call")
+        failures = sink.of_type(ToolCallFailed)
+        finishes = sink.of_type(ToolCallFinished)
+        if len(failures) != 1 or failures[0].error != expected_error:
+            fail(f"cut result did not emit the failure event: {failures!r}")
+        if len(finishes) != 1 or finishes[0].ok:
+            fail(f"cut result did not emit the normal failed completion event: {finishes!r}")
+
+
+@check("streaming.output_limit_cuts_only_last_call")
+def check_output_limit_cuts_only_last_call() -> None:
+    tool = _RecordingTool("record")
+    with workspace() as ws:
+        result = ApiAgent(
+            FakeModelProvider(
+                streams=[
+                    [
+                        ToolCallDelta(0, id="complete", name="record", arguments_fragment='{"n":1}'),
+                        ToolCallDelta(1, id="cut-valid-json", name="record", arguments_fragment='{"n":2}'),
+                        _empty_completion(stop_reason="max_tokens"),
+                    ],
+                    [_empty_completion()],
+                ]
+            ),
+            {"record": tool},
+            ws.policy,
+            stream=True,
+        ).run([Message(role=Role.USER, content="record both")])
+    if tool.calls != [{"n": 1}]:
+        fail(f"prior complete tool call did not run alone: {tool.calls!r}")
+    assistant = next(
+        message
+        for message in result.messages
+        if message.role == Role.ASSISTANT and message.tool_calls
+    )
+    if [call.arguments for call in assistant.tool_calls] != [{"n": 1}, {}]:
+        fail(f"valid JSON on the final limited call was not discarded: {assistant.tool_calls!r}")
+    tool_results = [message.tool_result for message in result.messages if message.role == Role.TOOL]
+    if len(tool_results) != 2 or not tool_results[0].ok or tool_results[1].ok:
+        fail(f"the complete and cut call results were incorrect: {tool_results!r}")
+
+
+@check("streaming.anthropic_max_tokens_defaults")
+def check_anthropic_max_tokens_defaults() -> None:
+    message = Message(role=Role.USER, content="hello")
+    provider = AnthropicProvider()
+    captured: list[dict] = []
+
+    def capture(http_request, **kwargs):
+        captured.append(json.loads(http_request.data))
+        return _BytesResponse(b'{"content":[]}')
+
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+        with mock.patch("urllib.request.urlopen", side_effect=capture):
+            provider.create_response(ModelRequest(messages=[message]))
+            provider.create_response(ModelRequest(messages=[message], max_tokens=500))
+            list(provider.create_response_stream(ModelRequest(messages=[message])))
+            list(provider.create_response_stream(ModelRequest(messages=[message], max_tokens=500)))
+    if [body["max_tokens"] for body in captured] != [1024, 500, 32000, 500]:
+        fail(f"Anthropic max_tokens defaults/overrides changed: {captured!r}")
 
 
 class _LinesResponse:
