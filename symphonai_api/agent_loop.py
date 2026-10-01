@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from symphonai_api.budgets import BudgetState, RunBudget, DEFAULT_MAX_TURNS
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.compaction import estimate_messages_tokens
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
     AssistantTextDelta,
@@ -53,7 +54,7 @@ from symphonai_api.models import (
     ToolResult,
 )
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.repair import repair_unanswered_tool_calls
 from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from symphonai_api.serialization import message_to_json
@@ -395,34 +396,40 @@ class ApiAgent:
                         "tool_names": sorted(self._tools),
                     },
                 )
-                if self._stream:
-                    assembler = StreamAssembler()
-                    chunks = (
-                        self._provider.create_response_stream(request)
-                        if cancel is None
-                        else self._provider.create_response_stream(
+                try:
+                    if self._stream:
+                        assembler = StreamAssembler()
+                        chunks = (
+                            self._provider.create_response_stream(request)
+                            if cancel is None
+                            else self._provider.create_response_stream(
+                                request, cancel=cancel
+                            )
+                        )
+                        for chunk in chunks:
+                            if cancel is not None:
+                                cancel.raise_if_cancelled()
+                            if isinstance(chunk, TextDelta):
+                                emit(
+                                    event_sink,
+                                    AssistantTextDelta(
+                                        agent_id=self._agent_ref.agent_id,
+                                        run_id=run_ref.run_id,
+                                        turn_id=turn_ref.turn_id,
+                                        text=chunk.text,
+                                    ),
+                                )
+                            assembler.add(chunk)
+                        response = assembler.finish()
+                    elif cancel is None:
+                        response = self._provider.create_response(request)
+                    else:
+                        response = self._provider.create_response(
                             request, cancel=cancel
                         )
-                    )
-                    for chunk in chunks:
-                        if cancel is not None:
-                            cancel.raise_if_cancelled()
-                        if isinstance(chunk, TextDelta):
-                            emit(
-                                event_sink,
-                                AssistantTextDelta(
-                                    agent_id=self._agent_ref.agent_id,
-                                    run_id=run_ref.run_id,
-                                    turn_id=turn_ref.turn_id,
-                                    text=chunk.text,
-                                ),
-                            )
-                        assembler.add(chunk)
-                    response = assembler.finish()
-                elif cancel is None:
-                    response = self._provider.create_response(request)
-                else:
-                    response = self._provider.create_response(request, cancel=cancel)
+                except ContextLengthExceededError as exc:
+                    exc.request_tokens = estimate_messages_tokens(request.messages)
+                    raise
                 provider_calls += 1
                 usage = UsageTotals.from_usage(response.usage)
                 usage_by_model[requested_model] = usage_by_model.get(

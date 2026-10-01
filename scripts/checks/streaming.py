@@ -12,6 +12,7 @@ from unittest import mock
 
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.cancellation import CancellationToken
+from symphonai_api.compaction import estimate_messages_tokens
 from symphonai_api.events import (
     AssistantTextDelta,
     CollectingSink,
@@ -961,6 +962,29 @@ def check_cancel_mid_stream() -> None:
         fail(f"mid-stream cancellation escaped the agent boundary: {result!r}")
     if any(message.role == Role.ASSISTANT for message in result.messages):
         fail(f"partial streamed response entered the conversation: {result.messages!r}")
+
+
+@check("streaming.overflow_records_request_tokens")
+def check_stream_overflow_records_request_tokens() -> None:
+    overflow = ContextLengthExceededError("streamed context overflow")
+
+    class _OverflowingStream(FakeModelProvider):
+        def create_response_stream(self, request, *, cancel=None):
+            yield TextDelta("partial")
+            raise overflow
+
+    messages = [Message(role=Role.USER, content="stream request")]
+    with workspace() as ws:
+        try:
+            ApiAgent(_OverflowingStream(), {}, ws.policy, stream=True).run(messages)
+        except ContextLengthExceededError as exc:
+            if exc is not overflow:
+                fail("streamed overflow replaced the provider's exception")
+            expected = estimate_messages_tokens(messages)
+            if exc.request_tokens != expected:
+                fail(f"stream overflow request estimate was {exc.request_tokens}, expected {expected}")
+        else:
+            fail("streamed context overflow did not propagate")
 
 
 @check("streaming.sse_parsing")

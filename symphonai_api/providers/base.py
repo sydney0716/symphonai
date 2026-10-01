@@ -37,10 +37,12 @@ class ContextLengthExceededError(ProviderError):
         *,
         actual_tokens: int | None = None,
         limit_tokens: int | None = None,
+        request_tokens: int | None = None,
     ) -> None:
         super().__init__(message)
         self.actual_tokens = actual_tokens
         self.limit_tokens = limit_tokens
+        self.request_tokens = request_tokens
 
 
 def parse_json_object(raw: bytes, operation: str) -> dict[str, Any]:

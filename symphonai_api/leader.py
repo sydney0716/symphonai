@@ -1152,10 +1152,16 @@ class Leader:
             result = self._run_messages(self._chat_messages, cancel=cancel)
         except ContextLengthExceededError as overflow:
             before_tokens = estimate_messages_tokens(self._chat_messages)
-            if overflow.actual_tokens is not None and before_tokens > 0:
+            request_tokens = overflow.request_tokens
+            denominator = (
+                request_tokens
+                if request_tokens is not None and request_tokens > 0
+                else before_tokens
+            )
+            if overflow.actual_tokens is not None and denominator > 0:
                 self._token_ratio = max(
                     self._token_ratio,
-                    overflow.actual_tokens / before_tokens,
+                    overflow.actual_tokens / denominator,
                 )
             if self._automatic_compaction_breaker.is_open:
                 raise

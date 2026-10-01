@@ -170,6 +170,45 @@ class _WindowCountingProvider(_AnthropicFakeProvider):
         return super().create_response(request, cancel=cancel)
 
 
+class _GrowingRequestProvider(_AnthropicFakeProvider):
+    def __init__(self, window: int = 200_000) -> None:
+        super().__init__()
+        self.window = window
+        self.estimates: list[int] = []
+        self.actual_counts: list[int] = []
+        self.overflowed = False
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        estimate = estimate_messages_tokens(request.messages)
+        actual = int(1.2 * estimate)
+        self.estimates.append(estimate)
+        self.actual_counts.append(actual)
+        if actual > self.window and not self.overflowed:
+            self.overflowed = True
+            raise ContextLengthExceededError(
+                "request exceeded the model context window",
+                actual_tokens=actual,
+                limit_tokens=self.window,
+            )
+        if self.overflowed:
+            return ModelResponse(Message(Role.ASSISTANT, "recovered"))
+        index = len(self.estimates) - 1
+        return ModelResponse(
+            Message(
+                Role.ASSISTANT,
+                tool_calls=[
+                    ToolCall(
+                        f"grow-{index}",
+                        "read_file",
+                        {"path": f"growth-{index}.txt"},
+                    )
+                ],
+            )
+        )
+
+
 class _RaisingProvider(FakeModelProvider):
     def create_response(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -1727,6 +1766,70 @@ def check_vendor_counts_recover_and_adjust_budget() -> None:
         leader.select_model("claude-haiku-4-5", None)
         if leader.chat_token_budget != 155_000 or leader._token_ratio != 1.0:
             fail("select_model did not reset the learned model-specific ratio")
+
+
+@check("leader.mid_turn_overflow_uses_failed_request_ratio")
+def check_mid_turn_overflow_uses_failed_request_ratio() -> None:
+    with workspace() as ws:
+        for index in range(12):
+            (ws.root / f"growth-{index}.txt").write_text(("x" * 400 + "\n") * 200)
+        provider = _GrowingRequestProvider()
+        leader = Leader(
+            LeaderConfig(
+                provider,
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-haiku-4-5",
+            )
+        )
+        history = [Message(Role.SYSTEM, "system instructions")]
+        for index in range(4):
+            call_id = f"history-read-{index}"
+            history.extend(
+                [
+                    Message(Role.USER, f"inspect history file {index}"),
+                    Message(
+                        Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                call_id,
+                                "read_file",
+                                {"path": f"history-{index}.txt"},
+                            )
+                        ],
+                    ),
+                    Message(
+                        Role.TOOL,
+                        tool_result=ToolResult(
+                            tool_call_id=call_id,
+                            ok=True,
+                            content="h" * 24_000,
+                        ),
+                    ),
+                ]
+            )
+        leader.seed_chat(history, persisted=True)
+        initial_estimate = estimate_messages_tokens(leader._chat_messages)
+        if not 23_000 <= initial_estimate <= 26_000:
+            fail(f"seeded history estimate was {initial_estimate}, expected about 24164")
+        first = leader.chat("read the requested files")
+        if first.final_answer != "recovered" or not provider.overflowed:
+            fail("mid-turn overflow did not recover")
+        if len(provider.estimates) < 3:
+            fail(f"provider did not grow the request through tool reads: {provider.estimates!r}")
+        failed_estimate = provider.estimates[-2]
+        failed_actual = provider.actual_counts[-2]
+        if failed_actual <= provider.window:
+            fail(f"last pre-recovery request did not overflow: {provider.actual_counts!r}")
+        if not math.isclose(leader._token_ratio, 1.2, abs_tol=0.01):
+            fail(f"mid-turn token ratio was {leader._token_ratio}, expected about 1.2")
+        expected_budget = math.floor(155_000 / 1.2)
+        if abs(leader.chat_token_budget - expected_budget) > 1:
+            fail(
+                f"mid-turn budget was {leader.chat_token_budget}, expected about {expected_budget}"
+            )
+        if abs(failed_actual / failed_estimate - 1.2) > 0.01:
+            fail("failed request's fake vendor count did not match its estimate ratio")
 
 
 @check("leader.uncounted_overflow_uses_three_quarters")
