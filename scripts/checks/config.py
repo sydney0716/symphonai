@@ -1094,8 +1094,8 @@ def model_preferences() -> None:
             fail("an omitted provider unexpectedly gained a model preference")
 
 
-@check("config.model_preferences_validation")
-def model_preferences_validation() -> None:
+@check("config.invalid_model_preferences")
+def invalid_model_preferences() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         repo_root, home = _roots(temporary)
         source = _scope_path(Scope.PROJECT, repo_root, home)
