@@ -426,6 +426,42 @@ def check_retry_context_length_classification() -> None:
         fail("ordinary HTTP 400 must remain terminal and unretried")
 
 
+@check("retry.context_counts_reported")
+def check_retry_context_counts_reported() -> None:
+    request = urllib.request.Request("https://mock.invalid/test")
+    cases = (
+        (
+            '{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}',
+            (210_000, 200_000),
+        ),
+        (
+            '{"error":{"message":"The input token count (100001) exceeds '
+            'the maximum number of tokens allowed (100000)."}}',
+            (100_001, 100_000),
+        ),
+        ('{"error":{"code":"context_length_exceeded"}}', (None, None)),
+    )
+    for body, expected in cases:
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=_http_error(400, body),
+        ):
+            try:
+                read_with_retry(
+                    request,
+                    timeout=2.0,
+                    max_attempts=1,
+                    api_key="test-key",
+                    operation="count parsing",
+                )
+            except ContextLengthExceededError as exc:
+                actual = (exc.actual_tokens, exc.limit_tokens)
+            else:
+                fail(f"context overflow was not raised for {body!r}")
+        if actual != expected:
+            fail(f"parsed token counts were {actual!r}, expected {expected!r}")
+
+
 @check("retry.context_markers_keep_retryable_statuses")
 def check_context_markers_keep_retryable_statuses() -> None:
     request = urllib.request.Request("https://mock.invalid/test")

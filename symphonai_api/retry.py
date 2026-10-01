@@ -43,6 +43,14 @@ _CONTEXT_TOKEN_LIMIT = re.compile(
     r"\bmaximum(?: number of)? tokens? allowed\b",
     re.IGNORECASE | re.DOTALL,
 )
+_ANTHROPIC_CONTEXT_COUNTS = re.compile(
+    r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)", re.IGNORECASE
+)
+_GEMINI_CONTEXT_COUNTS = re.compile(
+    r"input token count\s*\(\s*(\d+)\s*\)\s*exceeds\s*"
+    r"the maximum number of tokens allowed\s*\(\s*(\d+)\s*\)",
+    re.IGNORECASE,
+)
 
 
 def redact_secret(text: str, secret: str) -> str:
@@ -98,9 +106,12 @@ def read_with_retry(
                 and exc.code not in RETRYABLE_STATUS_CODES
                 and _is_context_length_error(raw_detail)
             ):
+                actual_tokens, limit_tokens = _context_token_counts(raw_detail)
                 raise ContextLengthExceededError(
                     f"{operation} returned HTTP {exc.code}: "
-                    "request exceeded the model context window"
+                    "request exceeded the model context window",
+                    actual_tokens=actual_tokens,
+                    limit_tokens=limit_tokens,
                 ) from None
             if exc.code in OVERLOAD_STATUS_CODES and call_class is CallClass.BACKGROUND:
                 attempt_text = (
@@ -190,6 +201,16 @@ def _is_context_length_error(raw: bytes) -> bool:
     return any(marker in lowered for marker in _CONTEXT_LENGTH_MARKERS) or bool(
         _CONTEXT_TOKEN_LIMIT.search(detail)
     )
+
+
+def _context_token_counts(raw: bytes) -> tuple[int | None, int | None]:
+    """Extract input and limit counts from supported vendor overflow errors."""
+    detail = raw.decode("utf-8", errors="replace")
+    for pattern in (_ANTHROPIC_CONTEXT_COUNTS, _GEMINI_CONTEXT_COUNTS):
+        match = pattern.search(detail)
+        if match is not None:
+            return int(match.group(1)), int(match.group(2))
+    return None, None
 
 
 def _is_retryable_status(status: int) -> bool:

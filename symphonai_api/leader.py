@@ -17,6 +17,7 @@ Subagent pool state lives only in memory for the duration of one
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -848,6 +849,7 @@ class Leader:
             max_consecutive_failures=config.max_consecutive_compaction_failures,
         )
         self._context_overflow_repair_failed = False
+        self._token_ratio = 1.0
 
     @property
     def subagents(self) -> dict[str, SubagentRecord]:
@@ -860,12 +862,15 @@ class Leader:
     @property
     def chat_token_budget(self) -> int:
         """The explicit or model-derived budget currently used for chat compaction."""
-        if self._config.chat_token_budget is not None:
-            return self._config.chat_token_budget
-        return budget_for_model(
-            self._config.leader_provider.wire_format,
-            self._leader_spec.model.model,
+        base = (
+            self._config.chat_token_budget
+            if self._config.chat_token_budget is not None
+            else budget_for_model(
+                self._config.leader_provider.wire_format,
+                self._leader_spec.model.model,
+            )
         )
+        return math.floor(base / self._token_ratio)
 
     def _stopped_repairs(self) -> tuple[str, ...]:
         breakers = [
@@ -879,6 +884,7 @@ class Leader:
 
     def select_model(self, model: str | None, effort: str | None) -> None:
         """Apply a host model choice to the next request without rebuilding tools."""
+        self._token_ratio = 1.0
         self._config.leader_model = model
         self._config.leader_effort = effort
         if not self._leader_model_locked:
@@ -1075,13 +1081,22 @@ class Leader:
         return result
 
     def _compact_after_context_overflow(
-        self, *, cancel: CancellationToken | None = None
+        self,
+        overflow: ContextLengthExceededError,
+        *,
+        cancel: CancellationToken | None = None,
     ) -> bool:
         before_tokens = estimate_messages_tokens(self._chat_messages)
-        forced_budget = min(
-            self.chat_token_budget,
-            max(1, before_tokens - 1),
-        )
+        if overflow.actual_tokens is not None:
+            forced_budget = min(
+                self.chat_token_budget,
+                max(1, before_tokens - 1),
+            )
+        else:
+            forced_budget = min(
+                self.chat_token_budget,
+                max(1, before_tokens * 3 // 4),
+            )
         user_turns = sum(
             message.role is Role.USER for message in self._chat_messages
         )
@@ -1136,10 +1151,19 @@ class Leader:
         try:
             result = self._run_messages(self._chat_messages, cancel=cancel)
         except ContextLengthExceededError as overflow:
+            before_tokens = estimate_messages_tokens(self._chat_messages)
+            if overflow.actual_tokens is not None and before_tokens > 0:
+                self._token_ratio = max(
+                    self._token_ratio,
+                    overflow.actual_tokens / before_tokens,
+                )
             if self._automatic_compaction_breaker.is_open:
                 raise
             try:
-                changed = self._compact_after_context_overflow(cancel=cancel)
+                changed = self._compact_after_context_overflow(
+                    overflow,
+                    cancel=cancel,
+                )
             except ContextCompactionError:
                 self._automatic_compaction_breaker.record_failure()
                 self._context_overflow_repair_failed = True

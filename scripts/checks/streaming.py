@@ -895,6 +895,47 @@ def check_http_error_body_details() -> None:
         fail(f"context overflow body was read {overflow.read_count} times")
 
 
+@check("streaming.context_counts_reported")
+def check_stream_context_counts_reported() -> None:
+    request = urllib.request.Request("https://stream.invalid")
+    cases = (
+        (
+            b'{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}',
+            (210_000, 200_000),
+        ),
+        (
+            b'{"error":{"message":"The input token count (100001) exceeds '
+            b'the maximum number of tokens allowed (100000)."}}',
+            (100_001, 100_000),
+        ),
+        (b'{"error":{"code":"context_length_exceeded"}}', (None, None)),
+    )
+    for body, expected in cases:
+        error = urllib.error.HTTPError(
+            request.full_url, 400, "Bad Request", {}, io.BytesIO(body)
+        )
+        with mock.patch(
+            "symphonai_api.streaming.urllib.request.urlopen",
+            side_effect=error,
+        ):
+            try:
+                list(
+                    open_stream_with_retry(
+                        request,
+                        timeout=5,
+                        max_attempts=1,
+                        api_key="test-key",
+                        operation="count parsing",
+                    )
+                )
+            except ContextLengthExceededError as exc:
+                actual = (exc.actual_tokens, exc.limit_tokens)
+            else:
+                fail(f"stream context overflow was not raised for {body!r}")
+        if actual != expected:
+            fail(f"stream parsed token counts {actual!r}, expected {expected!r}")
+
+
 @check("streaming.cancel_mid_stream")
 def check_cancel_mid_stream() -> None:
     token = CancellationToken()

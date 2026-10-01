@@ -31,6 +31,17 @@ class ProviderError(Exception):
 class ContextLengthExceededError(ProviderError):
     """Raised when a vendor rejects a request that exceeds its context window."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        actual_tokens: int | None = None,
+        limit_tokens: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.actual_tokens = actual_tokens
+        self.limit_tokens = limit_tokens
+
 
 def parse_json_object(raw: bytes, operation: str) -> dict[str, Any]:
     """Decode a successful vendor response as a JSON object.

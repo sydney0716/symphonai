@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import unittest.mock as mock
@@ -35,6 +36,7 @@ from symphonai_api.events import (
     SubagentSpawned,
     ToolCallStarted,
 )
+from symphonai_api.compaction import ContextCompactionError, estimate_messages_tokens
 import symphonai_api.leader as leader_module
 from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig, builtin_subagent_specs
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
@@ -143,6 +145,29 @@ class _AnthropicFakeProvider(FakeModelProvider):
     @property
     def wire_format(self) -> int:
         return 2
+
+
+class _WindowCountingProvider(_AnthropicFakeProvider):
+    def __init__(self, window: int = 200_000) -> None:
+        super().__init__([ModelResponse(Message(Role.ASSISTANT, "recovered"))])
+        self.window = window
+        self.estimates: list[int] = []
+        self.actual_counts: list[int] = []
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        estimate = estimate_messages_tokens(request.messages)
+        actual = (estimate * 3 + 1) // 2
+        self.estimates.append(estimate)
+        self.actual_counts.append(actual)
+        if actual > self.window:
+            raise ContextLengthExceededError(
+                "request exceeded the model context window",
+                actual_tokens=actual,
+                limit_tokens=self.window,
+            )
+        return super().create_response(request, cancel=cancel)
 
 
 class _RaisingProvider(FakeModelProvider):
@@ -1634,6 +1659,119 @@ def check_context_overflow_compacts_and_recovers() -> None:
             fail(f"following request did not use compacted history: {following_text!r}")
 
 
+def _vendor_overflow_history() -> list[Message]:
+    messages = [Message(Role.SYSTEM, "system instructions")]
+    for index in range(8):
+        call_id = f"large-read-{index}"
+        messages.extend(
+            [
+                Message(Role.USER, f"inspect file {index}"),
+                Message(
+                    Role.ASSISTANT,
+                    tool_calls=[
+                        ToolCall(
+                            call_id,
+                            "read_file",
+                            {"path": f"source-{index}.py"},
+                        )
+                    ],
+                ),
+                Message(
+                    Role.TOOL,
+                    tool_result=ToolResult(
+                        tool_call_id=call_id,
+                        ok=True,
+                        content="x" * 72_000,
+                    ),
+                ),
+            ]
+        )
+    return messages
+
+
+@check("leader.vendor_counts_recover_and_adjust_budget")
+def check_vendor_counts_recover_and_adjust_budget() -> None:
+    with workspace() as ws:
+        provider = _WindowCountingProvider(window=200_000)
+        leader = Leader(
+            LeaderConfig(
+                provider,
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-haiku-4-5",
+            )
+        )
+        leader.seed_chat(_vendor_overflow_history(), persisted=True)
+        initial_estimate = estimate_messages_tokens(leader._chat_messages)
+        if not 140_000 <= initial_estimate <= 150_000:
+            fail(f"seeded history estimate was {initial_estimate}, expected about 145000")
+
+        first = leader.chat("summarize the inspected files")
+        if first.final_answer != "recovered" or len(provider.estimates) != 2:
+            fail(f"counted overflow did not recover in exactly one retry: {provider.estimates!r}")
+        if provider.actual_counts[0] <= provider.window or provider.actual_counts[1] > provider.window:
+            fail(f"overflow and retry did not straddle the fake window: {provider.actual_counts!r}")
+        if leader._automatic_compaction_breaker.consecutive_failures != 0:
+            fail("successful overflow recovery left a compaction breaker failure")
+
+        ratio = provider.actual_counts[0] / provider.estimates[0]
+        if leader._token_ratio != ratio:
+            fail(f"leader token ratio was {leader._token_ratio}, expected {ratio}")
+        expected_budget = math.floor(155_000 / ratio)
+        if leader.chat_token_budget != expected_budget:
+            fail(f"adjusted budget was {leader.chat_token_budget}, expected {expected_budget}")
+
+        second = leader.chat("one more question")
+        if second.final_answer != "recovered" or len(provider.estimates) != 3:
+            fail(f"later prompt overflowed or retried: {provider.estimates!r}")
+        leader.select_model("claude-haiku-4-5", None)
+        if leader.chat_token_budget != 155_000 or leader._token_ratio != 1.0:
+            fail("select_model did not reset the learned model-specific ratio")
+
+
+@check("leader.uncounted_overflow_uses_three_quarters")
+def check_uncounted_overflow_uses_three_quarters() -> None:
+    with workspace() as ws:
+        leader = Leader(
+            LeaderConfig(
+                _AnthropicFakeProvider([]),
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-haiku-4-5",
+            )
+        )
+        leader.seed_chat(
+            [
+                Message(Role.USER, "goal"),
+                Message(Role.ASSISTANT, "old context " * 500),
+            ],
+            persisted=True,
+        )
+        before_tokens = estimate_messages_tokens(leader._chat_messages)
+        observed_budgets: list[int] = []
+
+        def refuse_compaction(budget: int, **kwargs) -> None:
+            observed_budgets.append(budget)
+            raise ContextCompactionError("fixture refuses compaction")
+
+        with mock.patch.object(
+            leader,
+            "_compact_chat_to_budget",
+            side_effect=refuse_compaction,
+        ):
+            try:
+                leader._compact_after_context_overflow(
+                    ContextLengthExceededError("unknown vendor count")
+                )
+            except ContextCompactionError:
+                pass
+            else:
+                fail("uncompacted context did not propagate the fixture failure")
+        expected = min(leader.chat_token_budget, max(1, before_tokens * 3 // 4))
+        if observed_budgets != [expected] or expected > before_tokens * 3 // 4:
+            fail(f"uncounted overflow budget was {observed_budgets!r}, expected {expected}")
+
+
 @check("leader.context_overflow_narrows_recent_window")
 def check_context_overflow_narrows_recent_window() -> None:
     with workspace() as ws:
@@ -1761,7 +1899,7 @@ def check_context_overflow_retry_failure() -> None:
             pass
         else:
             fail("another second overflow did not propagate")
-        if len(provider.requests) != 4 or not breaker.is_open:
+        if len(provider.requests) != 3 or not breaker.is_open:
             fail("consecutive overflow repairs did not open the breaker")
 
         try:
@@ -1770,7 +1908,7 @@ def check_context_overflow_retry_failure() -> None:
             pass
         else:
             fail("open compaction breaker hid the next overflow")
-        if len(provider.requests) != 5:
+        if len(provider.requests) != 4:
             fail("open compaction breaker allowed another compact-and-retry attempt")
 
 

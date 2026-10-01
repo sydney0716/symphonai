@@ -15,6 +15,7 @@ from symphonai_api.identity import new_id
 from symphonai_api.models import Message, ModelResponse, ToolCall
 from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
 from symphonai_api.retry import (
+    _context_token_counts,
     _is_context_length_error,
     _is_retryable_status,
     _is_retryable_url_error,
@@ -185,9 +186,12 @@ def open_stream_with_retry(
                 and not _is_retryable_status(exc.code)
                 and _is_context_length_error(raw_detail)
             ):
+                actual_tokens, limit_tokens = _context_token_counts(raw_detail)
                 raise ContextLengthExceededError(
                     f"{operation} stream returned HTTP {exc.code}: "
-                    "request exceeded the model context window"
+                    "request exceeded the model context window",
+                    actual_tokens=actual_tokens,
+                    limit_tokens=limit_tokens,
                 ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             if not yielded and _is_retryable_status(exc.code) and _wait_before_retry(
