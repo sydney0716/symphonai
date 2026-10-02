@@ -333,7 +333,15 @@ def _anthropic_stream_chunks(
                 for block in content
             )
             if has_thinking and tool_indices:
+                cut_index = (
+                    max(tool_indices)
+                    if stop_reason in {"max_tokens", "length", "MAX_TOKENS"}
+                    else None
+                )
                 for index in tool_indices:
+                    if index == cut_index:
+                        content_blocks[index]["input"] = {}
+                        continue
                     fragments = "".join(tool_input_fragments.get(index, []))
                     if fragments:
                         try:

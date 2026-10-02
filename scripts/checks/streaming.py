@@ -665,6 +665,36 @@ def _anthropic_transcript() -> list[bytes]:
     ]
 
 
+def _anthropic_thinking_tool_transcript(
+    calls: list[tuple[str, str, str]], stop_reason: str
+) -> list[bytes]:
+    events = [
+        ("message_start", {"message": {"usage": {"input_tokens": 3}}}),
+        ("content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        ("content_block_delta", {"index": 0, "delta": {"type": "signature_delta", "signature": "S1"}}),
+    ]
+    for index, (call_id, name, arguments) in enumerate(calls, start=1):
+        events.extend([
+            ("content_block_start", {
+                "index": index,
+                "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}},
+            }),
+            ("content_block_delta", {
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": arguments},
+            }),
+        ])
+    events.extend([
+        ("message_delta", {"delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 5}}),
+        ("message_stop", {}),
+    ])
+    lines: list[bytes] = []
+    for event, payload in events:
+        lines.append(f"event: {event}\n".encode())
+        lines.append(f"data: {json.dumps(payload)}\n\n".encode())
+    return lines
+
+
 def _openai_transcript() -> list[bytes]:
     return [
         b'data: {"choices":[{"delta":{"content":"hello "},"finish_reason":null}]}\n\n',
@@ -1068,6 +1098,120 @@ def check_anthropic_thinking_matches_non_streaming() -> None:
         fail(f"streamed thinking response differed from non-streaming: {actual!r}")
     if actual.message.tool_calls[0].provider_metadata.get("anthropic_content") != content:
         fail(f"streamed thinking signature was not retained in the exact content: {actual.message!r}")
+
+
+@check("streaming.anthropic_thinking_cut_call")
+def check_anthropic_thinking_cut_call() -> None:
+    incomplete = '{"path":"a.py","content":"def f'
+    cut_lines = _anthropic_thinking_tool_transcript(
+        [("toolu_1", "write_file", incomplete)], "max_tokens"
+    )
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "anthropic-thinking-cut-key"}):
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_LinesResponse(cut_lines)
+        ):
+            assembled = _assemble(AnthropicProvider().create_response_stream(_request()))
+    if assembled.cut_tool_call_id != "toolu_1":
+        fail(f"thinking stream did not mark its truncated call as cut: {assembled!r}")
+    call = assembled.message.tool_calls[0]
+    stored = call.provider_metadata.get("anthropic_content")
+    if call.arguments != {} or stored != [
+        {"type": "thinking", "thinking": "", "signature": "S1"},
+        {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "write_file",
+            "input": {},
+        },
+    ]:
+        fail(f"cut call did not retain matching empty input and thinking: {call!r}")
+
+    expected_error = (
+        "not run: the reply reached its output limit before this call was complete. "
+        "Split the work into smaller calls."
+    )
+    tool = _RecordingTool()
+    continuation = [
+        b"event: message_start\n",
+        b'data: {"message":{"usage":{"input_tokens":3}}}\n\n',
+        b"event: content_block_start\n",
+        b'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b"event: content_block_delta\n",
+        b'data: {"index":0,"delta":{"type":"text_delta","text":"continued"}}\n\n',
+        b"event: message_delta\n",
+        b'data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n',
+        b"event: message_stop\n",
+        b"data: {}\n\n",
+    ]
+    request_bodies: list[dict] = []
+    responses = [_LinesResponse(cut_lines), _LinesResponse(continuation)]
+
+    def open_stream(http_request, timeout=None):  # noqa: ANN001
+        request_bodies.append(json.loads(http_request.data.decode("utf-8")))
+        return responses.pop(0)
+
+    with workspace() as ws, mock.patch.dict(
+        os.environ, {"ANTHROPIC_API_KEY": "anthropic-thinking-cut-key"}
+    ), mock.patch("urllib.request.urlopen", side_effect=open_stream):
+        result = ApiAgent(
+            AnthropicProvider(),
+            {"write_file": tool},
+            ws.policy,
+            stream=True,
+        ).run([Message(role=Role.USER, content="write a file")])
+    if tool.calls or result.final_response.message.text != "continued":
+        fail(f"cut thinking call was executed or did not continue: calls={tool.calls!r}")
+    tool_result = next(
+        message.tool_result for message in result.messages if message.role == Role.TOOL
+    )
+    if tool_result is None or tool_result.ok or tool_result.error != expected_error:
+        fail(f"cut thinking call did not receive the output-limit failure: {tool_result!r}")
+    if len(request_bodies) != 2 or request_bodies[1]["messages"][1]["content"] != stored:
+        fail(f"continuation did not replay the cut thinking content: {request_bodies!r}")
+    replay_results = [
+        block
+        for message in request_bodies[1]["messages"]
+        for block in (message["content"] if isinstance(message["content"], list) else [])
+        if block.get("type") == "tool_result"
+    ]
+    if not replay_results or replay_results[-1].get("content") != expected_error:
+        fail(f"continuation omitted the cut-call failure text: {request_bodies[1]!r}")
+
+    invalid_lines = _anthropic_thinking_tool_transcript(
+        [("toolu_bad", "write_file", incomplete)], "end_turn"
+    )
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "anthropic-thinking-cut-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=_LinesResponse(invalid_lines)
+    ):
+        try:
+            _assemble(AnthropicProvider().create_response_stream(_request()))
+        except ProviderError as exc:
+            if "write_file" not in str(exc) or "index 1" not in str(exc):
+                fail(f"invalid thinking tool error omitted its name or index: {exc}")
+        else:
+            fail("invalid tool arguments without an output-limit stop were accepted")
+
+    two_call_lines = _anthropic_thinking_tool_transcript(
+        [
+            ("toolu_first", "inspect", '{"path":"first.py"}'),
+            ("toolu_last", "write_file", incomplete),
+        ],
+        "max_tokens",
+    )
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "anthropic-thinking-cut-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=_LinesResponse(two_call_lines)
+    ):
+        two_calls = _assemble(AnthropicProvider().create_response_stream(_request()))
+    two_stored = two_calls.message.tool_calls[0].provider_metadata.get("anthropic_content")
+    if (
+        [call.arguments for call in two_calls.message.tool_calls]
+        != [{"path": "first.py"}, {}]
+        or two_stored is None
+        or [block.get("input") for block in two_stored if block.get("type") == "tool_use"]
+        != [{"path": "first.py"}, {}]
+        or two_calls.cut_tool_call_id != "toolu_last"
+    ):
+        fail(f"max-token stop did not parse only calls before the cut one: {two_calls!r}")
 
 
 @check("streaming.cache_usage_accounting")
