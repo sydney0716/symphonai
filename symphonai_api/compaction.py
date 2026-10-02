@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from symphonai_api.cancellation import CancellationToken
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 
@@ -27,6 +28,16 @@ COMPACTABLE_TOOL_NAMES = frozenset(
     }
 )
 CLEARED_CONTENT_MARKER = "[old tool result content cleared]"
+MODEL_SUMMARY_PROMPT = """You are summarizing the earlier part of a coding session so the work can continue without it. Respond with text only; do not call tools. Write these sections:
+1. Requests and intent: every explicit request the user made, in detail.
+2. Key technical concepts.
+3. Files and code: each file examined, changed or created, the snippets that matter, and why.
+4. Errors and fixes, including any feedback the user gave.
+5. Problem solving: what was solved and what is still being investigated.
+6. User messages: every user message, as close to verbatim as you can.
+7. Pending tasks.
+8. Current work: precisely what was in progress where this part ends.
+Be specific: names, paths, values."""
 
 
 def budget_for_model(wire_format: int, model: str | None) -> int:
@@ -218,6 +229,7 @@ def compact_messages_for_budget(
     budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
     recent_turns: int = DEFAULT_RECENT_TURNS,
     cancel: CancellationToken | None = None,
+    summarize: Callable[[list[Message]], str] | None = None,
 ) -> CompactionResult:
     """Compact a conversation if its estimated token cost exceeds `budget`.
 
@@ -284,6 +296,39 @@ def compact_messages_for_budget(
     # would spend that trace describing bookkeeping instead of content.
     dropped = [original[index] for index in dropped_indices]
 
+    if summarize is not None:
+        try:
+            summary_text = summarize(dropped)
+        except OperationCancelled:
+            raise
+        except Exception:
+            summary_text = ""
+        if isinstance(summary_text, str) and summary_text.strip():
+            summarized = [
+                *prefix,
+                Message(
+                    role=Role.SYSTEM,
+                    content=(
+                        "Summary of the earlier conversation, written when it was compacted:\n\n"
+                        + summary_text
+                    ),
+                ),
+                *recent,
+            ]
+            after_tokens = estimate_messages_tokens(summarized)
+            if after_tokens <= budget:
+                return CompactionResult(
+                    messages=summarized,
+                    before_tokens=before_tokens,
+                    after_tokens=after_tokens,
+                    budget=budget,
+                    changed=True,
+                    dropped_messages=len(dropped),
+                    summary_messages=1,
+                    cleared_tool_results=microcompacted.cleared_tool_results,
+                    recent_turns=recent_turns,
+                )
+
     for max_summary_chars in (800, 320, 120, 0):
         compacted = list(prefix)
         summary_messages = 0
@@ -314,6 +359,27 @@ def compact_messages_for_budget(
             )
 
     raise _impossible_error(before_tokens, budget, recent_turns)
+
+
+def render_dropped_messages(messages: list[Message]) -> str:
+    transcript: list[str] = []
+    for index, message in enumerate(messages, start=1):
+        lines = [f"[{message.role.value.upper()} message {index}]"]
+        if message.text:
+            lines.append(message.text)
+        for call in message.tool_calls:
+            arguments = json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
+            lines.append(f"Tool call: {call.name}\nArguments: {arguments}")
+        if message.tool_result is not None:
+            result = message.tool_result
+            label = "Tool result" if result.ok else "Tool error"
+            content = result.content if result.ok else (result.error or result.content)
+            lines.append(f"{label}:\n{content}")
+        for block in message.content:
+            if isinstance(block, (ImageBlock, DocumentBlock)):
+                lines.append(f"[attachment: {block.media_type}]")
+        transcript.append("\n".join(lines))
+    return "\n\n".join(transcript)
 
 
 def describe_compaction(result: CompactionResult) -> str:

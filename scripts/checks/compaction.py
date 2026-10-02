@@ -13,8 +13,10 @@ from symphonai_api.compaction import (
     describe_compaction,
     estimate_messages_tokens,
     microcompact_messages,
+    render_dropped_messages,
 )
-from symphonai_api.models import ImageBlock, Message, Role, ToolCall, ToolResult
+from symphonai_api.models import ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
+from symphonai_api.providers.base import ProviderError
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from scripts.checks.harness import check, fail
 
@@ -37,6 +39,27 @@ def _single_clearable_conversation() -> list[Message]:
             ),
         ),
         Message(role=Role.USER, content="latest request"),
+    ]
+
+
+def _model_summary_conversation() -> list[Message]:
+    return [
+        Message(Role.SYSTEM, "system prompt"),
+        Message(Role.USER, "first goal"),
+        Message(
+            Role.ASSISTANT,
+            tool_calls=[ToolCall("old-read", "read_file", {"path": "notes.txt"})],
+        ),
+        Message(
+            Role.TOOL,
+            tool_result=ToolResult(
+                tool_call_id="old-read", ok=True, content="original result " * 100
+            ),
+        ),
+        Message(Role.ASSISTANT, "old assistant detail " * 50),
+        Message(Role.USER, "old follow-up " * 40),
+        Message(Role.ASSISTANT, "more old detail " * 40),
+        Message(Role.USER, "latest request"),
     ]
 
 
@@ -406,3 +429,134 @@ def check_compaction_clears_then_drops() -> None:
         fail(f"the summary spent an excerpt describing the clearing: {summaries[0]!r}")
     if "r" * 50 not in summaries[0]:
         fail(f"the summary lost the dropped tool result's real content: {summaries[0]!r}")
+
+
+@check("compaction.model_summary_replaces_excerpts")
+def check_model_summary_replaces_excerpts() -> None:
+    messages = _model_summary_conversation()
+    result = compact_messages_for_budget(
+        messages,
+        budget=140,
+        recent_turns=1,
+        summarize=lambda dropped: "SUMMARY",
+    )
+    summary_index = next(
+        (
+            index
+            for index, message in enumerate(result.messages)
+            if message.role == Role.SYSTEM and message.text.startswith(
+                "Summary of the earlier conversation, written when it was compacted:"
+            )
+        ),
+        None,
+    )
+    if summary_index != 2 or not result.messages[summary_index].text.endswith("SUMMARY"):
+        fail(f"model summary was not placed between prefix and recent turns: {result.messages!r}")
+    if any("Old excerpts" in message.text for message in result.messages):
+        fail(f"model summary retained deterministic excerpts: {result.messages!r}")
+    if [message.text for message in result.messages[:2]] != ["system prompt", "first goal"]:
+        fail(f"model summary changed the preserved prefix: {result.messages!r}")
+    if result.messages[-1].text != "latest request":
+        fail(f"model summary changed the recent turn: {result.messages!r}")
+
+
+@check("compaction.model_summary_receives_uncleared_dropped_messages")
+def check_model_summary_receives_uncleared_dropped_messages() -> None:
+    messages = _model_summary_conversation()
+    captured: list[list[Message]] = []
+    result = compact_messages_for_budget(
+        messages,
+        budget=140,
+        recent_turns=1,
+        summarize=lambda dropped: captured.append(dropped) or "SUMMARY",
+    )
+    expected_dropped = messages[2:7]
+    if captured != [expected_dropped]:
+        fail(f"summarizer received the wrong dropped messages: {captured!r}")
+    if captured[0][1].tool_result.content != "original result " * 100:
+        fail("summarizer received cleared tool content instead of the original")
+    if result.cleared_tool_results != 1:
+        fail(f"fixture did not exercise clearing before dropping: {result!r}")
+
+    transcript = render_dropped_messages(
+        [
+            Message(
+                Role.USER,
+                [TextBlock("text"), ImageBlock("aW1hZ2U=", "image/png")],
+            ),
+            Message(
+                Role.ASSISTANT,
+                tool_calls=[ToolCall("call", "read_file", {"path": "notes.txt"})],
+            ),
+            Message(
+                Role.TOOL,
+                tool_result=ToolResult(tool_call_id="call", ok=False, error="denied"),
+            ),
+        ]
+    )
+    if (
+        "[USER message 1]" not in transcript
+        or "text" not in transcript
+        or "[attachment: image/png]" not in transcript
+        or 'Tool call: read_file\nArguments: {"path": "notes.txt"}' not in transcript
+        or "Tool error:\ndenied" not in transcript
+    ):
+        fail(f"summary transcript omitted message content: {transcript!r}")
+
+
+@check("compaction.model_summary_falls_back_byte_for_byte")
+def check_model_summary_falls_back_byte_for_byte() -> None:
+    messages = _model_summary_conversation()
+    expected = compact_messages_for_budget(
+        messages, budget=140, recent_turns=1
+    ).messages
+
+    def provider_error(dropped: list[Message]) -> str:
+        raise ProviderError("summary provider failed")
+
+    summaries = (
+        provider_error,
+        lambda dropped: "   ",
+        lambda dropped: "too long " * 2_000,
+    )
+    for summarize in summaries:
+        actual = compact_messages_for_budget(
+            messages,
+            budget=140,
+            recent_turns=1,
+            summarize=summarize,
+        ).messages
+        if actual != expected:
+            fail("failed, blank, or unfit model summary changed the deterministic fallback")
+
+
+@check("compaction.model_summary_propagates_cancellation")
+def check_model_summary_propagates_cancellation() -> None:
+    def cancel_summary(dropped: list[Message]) -> str:
+        raise OperationCancelled()
+
+    try:
+        compact_messages_for_budget(
+            _model_summary_conversation(),
+            budget=140,
+            recent_turns=1,
+            summarize=cancel_summary,
+        )
+    except OperationCancelled:
+        return
+    fail("model summary swallowed operation cancellation")
+
+
+@check("compaction.model_summary_skipped_when_microcompaction_fits")
+def check_model_summary_skipped_when_microcompaction_fits() -> None:
+    messages = _single_clearable_conversation()
+    before_tokens = estimate_messages_tokens(messages)
+    calls: list[list[Message]] = []
+    result = compact_messages_for_budget(
+        messages,
+        budget=before_tokens - 1,
+        recent_turns=1,
+        summarize=lambda dropped: calls.append(dropped) or "should not run",
+    )
+    if calls or result.cleared_tool_results != 1 or result.dropped_messages:
+        fail(f"microcompaction-fit path invoked the model summarizer: {result!r}")

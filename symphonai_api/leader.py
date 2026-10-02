@@ -47,11 +47,13 @@ from symphonai_api.circuit_breaker import (
 from symphonai_api.cost import UsageTotals
 from symphonai_api.compaction import (
     DEFAULT_RECENT_TURNS,
+    MODEL_SUMMARY_PROMPT,
     CompactionResult,
     ContextCompactionError,
     budget_for_model,
     compact_messages_for_budget,
     estimate_messages_tokens,
+    render_dropped_messages,
 )
 from symphonai_api.gemini_schema import sanitize_for_gemini
 from symphonai_api.events import (
@@ -69,11 +71,12 @@ from symphonai_api.extensions import Extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import AgentRef, RunRef, new_agent_ref
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
-from symphonai_api.models import Message, Role, ToolCall, ToolResult
+from symphonai_api.models import Message, ModelRequest, Role, ToolCall, ToolResult
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore
+from symphonai_api.streaming import StreamAssembler
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
@@ -681,6 +684,7 @@ class LeaderConfig:
     leader_effort: str | None = None
     hook_runner: HookRunner | None = None
     memory: AgentMemory | None = None
+    model_summary: bool = False
 
 
 @dataclass
@@ -844,6 +848,7 @@ class Leader:
             ),
         )
         self._chat_messages = self._initial_leader_messages()
+        self._compaction_usage_by_model: dict[str, UsageTotals] = {}
         self._automatic_compaction_breaker = ConsecutiveFailureBreaker(
             "automatic compaction",
             max_consecutive_failures=config.max_consecutive_compaction_failures,
@@ -1032,6 +1037,48 @@ class Leader:
         self._context_overflow_repair_failed = False
         return result
 
+    def _write_model_summary(
+        self,
+        dropped: list[Message],
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> str:
+        model = self._leader_spec.model.model
+        request = ModelRequest(
+            messages=[
+                Message(Role.SYSTEM, MODEL_SUMMARY_PROMPT),
+                Message(Role.USER, render_dropped_messages(dropped)),
+            ],
+            model=model,
+            tools=[],
+            max_tokens=20_000,
+            call_class=CallClass.BACKGROUND,
+        )
+        if self._config.stream:
+            chunks = (
+                self._config.leader_provider.create_response_stream(request)
+                if cancel is None
+                else self._config.leader_provider.create_response_stream(
+                    request, cancel=cancel
+                )
+            )
+            assembler = StreamAssembler()
+            for chunk in chunks:
+                assembler.add(chunk)
+            response = assembler.finish()
+        elif cancel is None:
+            response = self._config.leader_provider.create_response(request)
+        else:
+            response = self._config.leader_provider.create_response(
+                request, cancel=cancel
+            )
+        model_key = model or getattr(self._config.leader_provider, "model", None) or "unknown"
+        totals = UsageTotals.from_usage(response.usage)
+        self._compaction_usage_by_model[model_key] = self._compaction_usage_by_model.get(
+            model_key, UsageTotals()
+        ).merged(totals)
+        return response.message.text
+
     def _compact_chat_to_budget(
         self,
         budget: int,
@@ -1040,16 +1087,20 @@ class Leader:
         record_success: bool = True,
         recent_turns: int | None = None,
     ) -> CompactionResult:
-        result = compact_messages_for_budget(
-            self._chat_messages,
-            budget=budget,
-            recent_turns=(
+        compact_kwargs = {
+            "budget": budget,
+            "recent_turns": (
                 self._config.chat_recent_turns
                 if recent_turns is None
                 else recent_turns
             ),
-            cancel=cancel,
-        )
+            "cancel": cancel,
+        }
+        if self._config.model_summary:
+            compact_kwargs["summarize"] = lambda dropped: self._write_model_summary(
+                dropped, cancel=cancel
+            )
+        result = compact_messages_for_budget(self._chat_messages, **compact_kwargs)
         self._chat_messages = result.messages
         if record_success:
             self._automatic_compaction_breaker.record_success()
@@ -1146,6 +1197,7 @@ class Leader:
         has full context of the conversation so far.
         """
         self._chat_messages.append(Message(role=Role.USER, content=message))
+        self._compaction_usage_by_model.clear()
         self._automatic_compact_chat(cancel=cancel)
         recovered_overflow = False
         try:
@@ -1190,5 +1242,11 @@ class Leader:
             self._context_overflow_repair_failed = False
         self._chat_messages = result.leader_messages
         self._automatic_compact_chat(cancel=cancel)
+        leader_usage = result.usage_by_agent.setdefault(
+            self._agent_ref.agent_id, {}
+        )
+        for model, usage in self._compaction_usage_by_model.items():
+            leader_usage[model] = leader_usage.get(model, UsageTotals()).merged(usage)
+        self._compaction_usage_by_model.clear()
         result.stopped_repairs = self._stopped_repairs()
         return result

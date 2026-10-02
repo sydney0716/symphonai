@@ -448,6 +448,7 @@ class HostRun:
                 leader_policy=self._policy,
                 leader_model=leader_model,
                 leader_effort=self._effort,
+                model_summary=True,
                 subagent_specs=roster,
                 subagent_budget=self._subagent_budget,
                 hook_runner=self._hooks,

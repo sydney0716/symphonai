@@ -2947,6 +2947,8 @@ def check_conversation_cost_and_context() -> None:
             for index in range(6):
                 _send_host_prompt(host, f"prompt {index} " + "x" * 80)
                 used.append(_conversation_reply(host)[1]["conversation"]["context"]["used_tokens"])
+            if host.run._conversation is None or not host.run._conversation[0]._config.model_summary:
+                fail("host-built leader did not enable model summaries")
             events = []
             while (event := subscription.get(timeout=0.01)) is not None:
                 events.append(event)

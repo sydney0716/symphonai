@@ -47,6 +47,7 @@ from symphonai_api.models import (
     Role,
     ToolCall,
     ToolResult,
+    Usage,
 )
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR, AnthropicProvider
@@ -1970,6 +1971,110 @@ def check_budget_compaction_keeps_recent_window() -> None:
             fail(f"ordinary compaction did not use the configured window: {compacted!r}")
         if compacted.messages[-len(recent_window):] != recent_window:
             fail("ordinary compaction changed the configured recent window")
+
+
+@check("leader.model_summary_request_and_usage")
+def check_model_summary_request_and_usage() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self) -> None:
+            super().__init__([
+                ModelResponse(
+                    Message(Role.ASSISTANT, "compressed history"),
+                    usage=Usage(input_tokens=100, output_tokens=50),
+                ),
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+            ])
+            self.requests: list[ModelRequest] = []
+
+        def create_response(self, request, *, cancel=None) -> ModelResponse:
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with workspace() as ws:
+        provider = RecordingProvider()
+        provider.model = "leader-summary-model"
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            leader_model="leader-summary-model",
+            chat_token_budget=150,
+            chat_recent_turns=1,
+            model_summary=True,
+        ))
+        leader.seed_chat([
+            Message(Role.USER, "first request"),
+            Message(Role.ASSISTANT, "dropped decision and file details " * 100),
+            Message(Role.USER, "previous turn"),
+        ])
+        result = leader.chat("current request")
+        if len(provider.requests) != 2:
+            fail(f"model compaction did not add exactly one provider call: {len(provider.requests)}")
+        summary_request = provider.requests[0]
+        if (
+            summary_request.call_class is not CallClass.BACKGROUND
+            or summary_request.max_tokens != 20_000
+            or summary_request.tools
+        ):
+            fail(f"summary request had incorrect call settings: {summary_request!r}")
+        if len(summary_request.messages) != 2 or summary_request.messages[0].role is not Role.SYSTEM:
+            fail(f"summary request did not contain the system prompt and transcript: {summary_request.messages!r}")
+        if "every explicit request" not in summary_request.messages[0].text:
+            fail("summary request omitted the required summary prompt")
+        transcript = summary_request.messages[1]
+        if transcript.role is not Role.USER or "dropped decision and file details" not in transcript.text:
+            fail(f"summary request did not include dropped conversation text: {transcript!r}")
+        usage = result.usage_by_agent.get(leader._agent_ref.agent_id, {}).get("leader-summary-model")
+        if usage is None or (usage.input_tokens, usage.output_tokens, usage.calls) != (100, 50, 2):
+            fail(f"summary usage was not included under the leader: {result.usage_by_agent!r}")
+
+        default_provider = RecordingProvider()
+        default_leader = Leader(LeaderConfig(
+            default_provider,
+            FakeModelProvider(),
+            str(ws.root),
+            chat_token_budget=150,
+            chat_recent_turns=1,
+        ))
+        default_leader.seed_chat([
+            Message(Role.USER, "first request"),
+            Message(Role.ASSISTANT, "dropped decision and file details " * 100),
+            Message(Role.USER, "previous turn"),
+        ])
+        default_leader.chat("current request")
+        if len(default_provider.requests) != 1:
+            fail(f"default leader unexpectedly made a model summary call: {len(default_provider.requests)}")
+
+        post_provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "final answer " * 15)),
+            ModelResponse(
+                Message(Role.ASSISTANT, "shortened history"),
+                usage=Usage(input_tokens=100, output_tokens=50),
+            ),
+        ])
+        post_provider.model = "leader-summary-model"
+        post_leader = Leader(LeaderConfig(
+            post_provider,
+            FakeModelProvider(),
+            str(ws.root),
+            leader_model="leader-summary-model",
+            chat_token_budget=150,
+            chat_recent_turns=1,
+            model_summary=True,
+        ))
+        post_leader.seed_chat([
+            Message(Role.USER, "first request"),
+            Message(Role.ASSISTANT, "old context " * 30),
+            Message(Role.USER, "previous turn"),
+        ])
+        post_result = post_leader.chat("current request")
+        post_usage = post_result.usage_by_agent.get(post_leader._agent_ref.agent_id, {}).get(
+            "leader-summary-model"
+        )
+        if post_provider.call_count != 2 or post_usage is None or (
+            post_usage.input_tokens, post_usage.output_tokens
+        ) != (100, 50):
+            fail(f"post-run compaction summary usage was not returned: {post_result.usage_by_agent!r}")
 
 
 @check("leader.context_overflow_retry_failure")
