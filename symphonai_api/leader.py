@@ -1101,6 +1101,23 @@ class Leader:
                 dropped, cancel=cancel
             )
         result = compact_messages_for_budget(self._chat_messages, **compact_kwargs)
+        if result.changed:
+            stripped_messages: list[Message] = []
+            for message in result.messages:
+                tool_calls = []
+                for call in message.tool_calls:
+                    if "anthropic_content" not in call.provider_metadata:
+                        tool_calls.append(call)
+                        continue
+                    metadata = dict(call.provider_metadata)
+                    del metadata["anthropic_content"]
+                    tool_calls.append(replace(call, provider_metadata=metadata))
+                stripped_messages.append(
+                    replace(message, tool_calls=tool_calls)
+                    if tool_calls != message.tool_calls
+                    else message
+                )
+            result = replace(result, messages=stripped_messages)
         self._chat_messages = result.messages
         if record_success:
             self._automatic_compaction_breaker.record_success()

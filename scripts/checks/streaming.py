@@ -1028,6 +1028,48 @@ def check_anthropic_matches_non_streaming() -> None:
         fail(f"Anthropic streaming response differed from non-streaming: {actual!r}")
 
 
+@check("streaming.anthropic_thinking_matches_non_streaming")
+def check_anthropic_thinking_matches_non_streaming() -> None:
+    content = [
+        {"type": "thinking", "thinking": "", "signature": "S1"},
+        {"type": "text", "text": "reading"},
+        {"type": "tool_use", "id": "tool-A", "name": "read_file", "input": {"path": "a"}},
+        {"type": "tool_use", "id": "tool-B", "name": "read_file", "input": {"path": "b"}},
+    ]
+    events = [
+        ("message_start", {"message": {"usage": {"input_tokens": 3}}}),
+        ("content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        ("content_block_delta", {"index": 0, "delta": {"type": "signature_delta", "signature": "S1"}}),
+        ("content_block_start", {"index": 1, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"index": 1, "delta": {"type": "text_delta", "text": "reading"}}),
+        ("content_block_start", {"index": 2, "content_block": {"type": "tool_use", "id": "tool-A", "name": "read_file", "input": {}}}),
+        ("content_block_delta", {"index": 2, "delta": {"type": "input_json_delta", "partial_json": '{"path":"a"}'}}),
+        ("content_block_start", {"index": 3, "content_block": {"type": "tool_use", "id": "tool-B", "name": "read_file", "input": {}}}),
+        ("content_block_delta", {"index": 3, "delta": {"type": "input_json_delta", "partial_json": '{"path":"b"}'}}),
+        ("message_delta", {"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
+        ("message_stop", {}),
+    ]
+    lines: list[bytes] = []
+    for event, payload in events:
+        lines.append(f"event: {event}\n".encode())
+        lines.append(f"data: {json.dumps(payload)}\n\n".encode())
+    response_data = {"content": content, "usage": {"input_tokens": 3, "output_tokens": 5}, "stop_reason": "tool_use"}
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "anthropic-thinking-stream-key"}):
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=_BytesResponse(json.dumps(response_data).encode()),
+        ):
+            expected = AnthropicProvider().create_response(_request())
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_LinesResponse(lines)
+        ):
+            actual = _assemble(AnthropicProvider().create_response_stream(_request()))
+    if actual != expected:
+        fail(f"streamed thinking response differed from non-streaming: {actual!r}")
+    if actual.message.tool_calls[0].provider_metadata.get("anthropic_content") != content:
+        fail(f"streamed thinking signature was not retained in the exact content: {actual.message!r}")
+
+
 @check("streaming.cache_usage_accounting")
 def check_stream_cache_usage_accounting() -> None:
     request = _request()

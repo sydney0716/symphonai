@@ -54,6 +54,7 @@ DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_STREAM_MAX_TOKENS = 32000
+_ANTHROPIC_CONTENT_KEY = "anthropic_content"
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for tool calls that arrive without one.
@@ -117,6 +118,16 @@ def _to_anthropic_content(message: Message, id_map: dict[str, str]) -> list[dict
             }
         ]
     if message.role == Role.ASSISTANT and message.tool_calls:
+        stored = message.tool_calls[0].provider_metadata.get(_ANTHROPIC_CONTENT_KEY)
+        if isinstance(stored, list) and all(isinstance(block, dict) for block in stored):
+            stored_ids = [
+                block.get("id")
+                for block in stored
+                if block.get("type") == "tool_use"
+            ]
+            call_ids = [call.vendor_id or call.id for call in message.tool_calls]
+            if stored_ids == call_ids:
+                return stored
         blocks = _anthropic_blocks(message)
         for tool_call in message.tool_calls:
             blocks.append(
@@ -186,7 +197,8 @@ def _build_request_body(request: ModelRequest, model: str, default_max_tokens: i
 def _parse_response(data: dict[str, Any]) -> ModelResponse:
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    for block in data.get("content", []):
+    content = data.get("content", [])
+    for block in content:
         if block.get("type") == "text":
             text_parts.append(block.get("text", ""))
         elif block.get("type") == "tool_use":
@@ -199,6 +211,14 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
                     vendor_id=vendor_id,
                 )
             )
+    if (
+        tool_calls
+        and any(
+            block.get("type") in {"thinking", "redacted_thinking"}
+            for block in content
+        )
+    ):
+        tool_calls[0].provider_metadata[_ANTHROPIC_CONTENT_KEY] = content
     usage_raw = data.get("usage")
     if not isinstance(usage_raw, dict):
         usage_raw = {}
@@ -227,6 +247,9 @@ def _anthropic_stream_chunks(
     cache_write_tokens = 0
     output_tokens = 0
     stop_reason = "end_turn"
+    content_blocks: dict[int, dict[str, Any]] = {}
+    tool_input_fragments: dict[int, list[str]] = {}
+    tool_indices: list[int] = []
     for event, payload in sse_events(lines):
         try:
             data = json.loads(payload)
@@ -253,9 +276,14 @@ def _anthropic_stream_chunks(
             continue
         if event == "content_block_start":
             block = data.get("content_block", {})
+            index = data["index"]
+            if isinstance(block, dict):
+                content_blocks[index] = dict(block)
             if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_indices.append(index)
+                tool_input_fragments[index] = []
                 yield ToolCallDelta(
-                    data["index"],
+                    index,
                     id=block.get("id"),
                     name=block.get("name"),
                     vendor_id=block.get("id"),
@@ -266,10 +294,28 @@ def _anthropic_stream_chunks(
             if not isinstance(delta, dict):
                 continue
             if delta.get("type") == "text_delta":
-                yield TextDelta(delta.get("text", ""))
+                text = delta.get("text", "")
+                block = content_blocks.get(data["index"])
+                if block is not None:
+                    block["text"] = block.get("text", "") + text
+                yield TextDelta(text)
+            elif delta.get("type") == "thinking_delta":
+                block = content_blocks.get(data["index"])
+                if block is not None:
+                    block["thinking"] = block.get("thinking", "") + delta.get(
+                        "thinking", ""
+                    )
+            elif delta.get("type") == "signature_delta":
+                block = content_blocks.get(data["index"])
+                if block is not None:
+                    block["signature"] = block.get("signature", "") + delta.get(
+                        "signature", ""
+                    )
             elif delta.get("type") == "input_json_delta":
+                fragment = delta.get("partial_json", "")
+                tool_input_fragments.setdefault(data["index"], []).append(fragment)
                 yield ToolCallDelta(
-                    data["index"], arguments_fragment=delta.get("partial_json", "")
+                    data["index"], arguments_fragment=fragment
                 )
             continue
         if event == "message_delta":
@@ -281,6 +327,35 @@ def _anthropic_stream_chunks(
                 output_tokens = _usage_count(usage.get("output_tokens"))
             continue
         if event == "message_stop":
+            content = [content_blocks[index] for index in sorted(content_blocks)]
+            has_thinking = any(
+                block.get("type") in {"thinking", "redacted_thinking"}
+                for block in content
+            )
+            if has_thinking and tool_indices:
+                for index in tool_indices:
+                    fragments = "".join(tool_input_fragments.get(index, []))
+                    if fragments:
+                        try:
+                            arguments = json.loads(fragments)
+                        except json.JSONDecodeError as exc:
+                            name = content_blocks[index].get("name") or "<unknown>"
+                            raise ProviderError(
+                                f"streamed tool {name!r} at index {index} returned invalid "
+                                f"arguments JSON: {exc}"
+                            ) from None
+                        if not isinstance(arguments, dict):
+                            name = content_blocks[index].get("name") or "<unknown>"
+                            raise ProviderError(
+                                f"streamed tool {name!r} at index {index} returned "
+                                "non-object arguments"
+                            )
+                        content_blocks[index]["input"] = arguments
+                first_tool_index = min(tool_indices)
+                yield ToolCallDelta(
+                    first_tool_index,
+                    provider_metadata={_ANTHROPIC_CONTENT_KEY: content},
+                )
             yield StreamCompleted(
                 ModelResponse(
                     Message(role=Role.ASSISTANT),

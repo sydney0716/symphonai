@@ -1973,6 +1973,63 @@ def check_budget_compaction_keeps_recent_window() -> None:
             fail("ordinary compaction changed the configured recent window")
 
 
+@check("leader.compaction_strips_anthropic_thinking_only_when_changed")
+def check_compaction_strips_anthropic_thinking_only_when_changed() -> None:
+    def history() -> list[Message]:
+        return [
+            Message(Role.USER, "first goal"),
+            Message(Role.ASSISTANT, "old context " * 300),
+            Message(Role.USER, "recent request"),
+            Message(
+                Role.ASSISTANT,
+                "tool request",
+                tool_calls=[ToolCall(
+                    "read-call",
+                    "read_file",
+                    {"path": "notes.txt"},
+                    provider_metadata={
+                        "anthropic_content": [
+                            {"type": "thinking", "thinking": "", "signature": "S1"},
+                            {"type": "tool_use", "id": "read-call", "name": "read_file", "input": {"path": "notes.txt"}},
+                        ],
+                        "thoughtSignature": "gemini-thought",
+                    },
+                )],
+            ),
+        ]
+
+    with workspace() as ws:
+        unchanged = Leader(LeaderConfig(
+            FakeModelProvider(), FakeModelProvider(), str(ws.root),
+            chat_token_budget=10_000, chat_recent_turns=1,
+        ))
+        unchanged.seed_chat(history())
+        unchanged_result = unchanged.compact_chat()
+        if unchanged_result.changed:
+            fail("under-budget compaction unexpectedly changed history")
+        untouched_call = unchanged._chat_messages[-1].tool_calls[0]
+        if "anthropic_content" not in untouched_call.provider_metadata or (
+            untouched_call.provider_metadata.get("thoughtSignature") != "gemini-thought"
+        ):
+            fail(f"unchanged compaction stripped vendor state: {untouched_call!r}")
+
+        compacted = Leader(LeaderConfig(
+            FakeModelProvider(), FakeModelProvider(), str(ws.root),
+            chat_token_budget=100, chat_recent_turns=1,
+        ))
+        compacted.seed_chat(history())
+        changed_result = compacted.compact_chat()
+        if not changed_result.changed:
+            fail("large seeded history did not compact")
+        calls = [call for message in compacted._chat_messages for call in message.tool_calls]
+        if len(calls) != 1:
+            fail(f"compaction lost the retained tool call: {compacted._chat_messages!r}")
+        if "anthropic_content" in calls[0].provider_metadata:
+            fail(f"changed compaction retained stale Anthropic thinking: {calls[0]!r}")
+        if calls[0].provider_metadata != {"thoughtSignature": "gemini-thought"}:
+            fail(f"changed compaction removed unrelated provider metadata: {calls[0]!r}")
+
+
 @check("leader.model_summary_request_and_usage")
 def check_model_summary_request_and_usage() -> None:
     class RecordingProvider(FakeModelProvider):

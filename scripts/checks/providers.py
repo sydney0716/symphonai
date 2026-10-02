@@ -19,6 +19,7 @@ from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHRO
 from symphonai_api.providers.anthropic_provider import (
     AnthropicProvider,
     _build_request_body as _build_anthropic_body,
+    _parse_response as _parse_anthropic_response,
 )
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
@@ -290,6 +291,95 @@ def check_anthropic_cache_control_and_tool_message_merging() -> None:
     )
     if lone["messages"] != [{"role": "user", "content": "hello"}]:
         fail(f"lone Anthropic user message changed shape: {lone['messages']!r}")
+
+
+@check("providers.anthropic_thinking_capture")
+def check_anthropic_thinking_capture() -> None:
+    content = [
+        {"type": "thinking", "thinking": "", "signature": "S1"},
+        {"type": "text", "text": "reading"},
+        {"type": "tool_use", "id": "tool-A", "name": "read_file", "input": {"path": "a"}},
+        {"type": "tool_use", "id": "tool-B", "name": "read_file", "input": {"path": "b"}},
+    ]
+    parsed = _parse_anthropic_response({"content": content, "stop_reason": "tool_use"})
+    first, second = parsed.message.tool_calls
+    if first.provider_metadata.get("anthropic_content") != content:
+        fail(f"Anthropic thinking content was not captured verbatim: {first!r}")
+    if "anthropic_content" in second.provider_metadata:
+        fail(f"Anthropic content was stored on more than the first tool call: {second!r}")
+    if parsed.message.text != "reading":
+        fail(f"capturing thinking changed the visible text: {parsed.message.text!r}")
+
+    plain = _parse_anthropic_response({
+        "content": [
+            {"type": "text", "text": "reading"},
+            {"type": "tool_use", "id": "plain-tool", "name": "read_file", "input": {}},
+        ]
+    })
+    if "anthropic_content" in plain.message.tool_calls[0].provider_metadata:
+        fail("Anthropic response without thinking gained vendor content metadata")
+
+
+@check("providers.anthropic_thinking_replay")
+def check_anthropic_thinking_replay() -> None:
+    content = [
+        {"type": "thinking", "thinking": "", "signature": "S1"},
+        {"type": "text", "text": "reading"},
+        {"type": "tool_use", "id": "tool-A", "name": "read_file", "input": {"path": "a"}},
+        {"type": "tool_use", "id": "tool-B", "name": "read_file", "input": {"path": "b"}},
+    ]
+    message = _parse_anthropic_response({"content": content}).message
+    body = _build_anthropic_body(
+        ModelRequest(messages=[Message(Role.USER, "go"), message]),
+        "claude-sonnet-5-5",
+        1024,
+    )
+    if body["messages"][1]["content"] != content:
+        fail(f"Anthropic request did not replay stored content verbatim: {body['messages'][1]!r}")
+
+
+@check("providers.anthropic_redacted_thinking_replay")
+def check_anthropic_redacted_thinking_replay() -> None:
+    content = [
+        {"type": "redacted_thinking", "data": "opaque-redacted-payload"},
+        {"type": "tool_use", "id": "tool-redacted", "name": "inspect", "input": {}},
+    ]
+    message = _parse_anthropic_response({"content": content}).message
+    body = _build_anthropic_body(
+        ModelRequest(messages=[Message(Role.USER, "continue"), message]),
+        "claude-sonnet-5-5",
+        1024,
+    )
+    if body["messages"][1]["content"] != content:
+        fail(f"redacted thinking did not round-trip unchanged: {body['messages'][1]!r}")
+
+
+@check("providers.anthropic_thinking_mismatch_rebuild")
+def check_anthropic_thinking_mismatch_rebuild() -> None:
+    stored = [
+        {"type": "thinking", "thinking": "private", "signature": "S1"},
+        {"type": "tool_use", "id": "old-tool", "name": "inspect", "input": {}},
+    ]
+    message = Message(
+        Role.ASSISTANT,
+        "visible text",
+        tool_calls=[ToolCall(
+            "new-tool",
+            "inspect",
+            {},
+            provider_metadata={"anthropic_content": stored},
+        )],
+    )
+    body = _build_anthropic_body(
+        ModelRequest(messages=[Message(Role.USER, "continue"), message]),
+        "claude-sonnet-5-5",
+        1024,
+    )
+    content = body["messages"][1]["content"]
+    if any(block.get("type") in {"thinking", "redacted_thinking"} for block in content):
+        fail(f"mismatched Anthropic tool ids replayed stale thinking: {content!r}")
+    if content[0] != {"type": "text", "text": "visible text"}:
+        fail(f"mismatched ids did not use the rebuilt assistant content: {content!r}")
 
 
 @check("providers.cache_usage_accounting")
