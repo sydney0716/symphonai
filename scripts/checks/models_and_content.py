@@ -304,6 +304,11 @@ def check_content_provider_encoding() -> None:
             "attachment token budgeting changed: "
             f"text={text_only_tokens}, attached={attached_tokens}"
         )
+    excerpts = _message_excerpts(
+        [Message(Role.USER, DocumentBlock(data="cGRm"))], limit=1
+    )
+    if excerpts != ["user: [1 attachment: application/pdf]"]:
+        fail(f"attachment-only compaction excerpt changed: {excerpts!r}")
 
 
 @check("content.cache_usage_totals_merge")
@@ -315,8 +320,3 @@ def check_cache_usage_totals_merge() -> None:
         fail(f"merged cache usage was not doubled: {doubled!r}")
     if doubled.input_tokens != 2000 or doubled.output_tokens != 40 or doubled.calls != 2:
         fail(f"usage totals merge changed existing totals: {doubled!r}")
-    excerpts = _message_excerpts(
-        [Message(Role.USER, DocumentBlock(data="cGRm"))], limit=1
-    )
-    if excerpts != ["user: [1 attachment: application/pdf]"]:
-        fail(f"attachment-only compaction excerpt changed: {excerpts!r}")
