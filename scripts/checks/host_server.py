@@ -2712,7 +2712,7 @@ def check_conversation_usage() -> None:
                     "dispatch", "dispatch_subagent",
                     {"subagent_name": "worker", "task": "inspect"},
                 )]),
-                usage=Usage(input_tokens=10, output_tokens=1),
+                usage=Usage(1050, 20, 900, 50),
             ),
             ModelResponse(Message(Role.ASSISTANT, "child"), usage=Usage(input_tokens=3, output_tokens=2)),
             ModelResponse(Message(Role.ASSISTANT, "first"), usage=Usage(input_tokens=20, output_tokens=4)),
@@ -2749,13 +2749,23 @@ def check_conversation_usage() -> None:
             second_stats = second["conversation"]
             if second_stats["context"]["used_tokens"] <= first_stats["context"]["used_tokens"]:
                 fail(f"context usage did not grow across prompts: {first_stats!r}, {second_stats!r}")
-            if second_stats["usage"]["total_tokens"] != 46:
+            if second_stats["usage"]["total_tokens"] != 1105:
                 fail(f"conversation usage did not accumulate across prompts: {second_stats!r}")
+            if (
+                second_stats["usage"]["cache_read_tokens"] != 900
+                or second_stats["usage"]["cache_write_tokens"] != 50
+            ):
+                fail(f"aggregate cache usage was wrong: {second_stats['usage']!r}")
             agents = {agent["name"]: agent for agent in second_stats["agents"]}
             if set(agents) != {"leader", "worker"}:
                 fail(f"per-agent usage did not name leader and child: {agents!r}")
-            if agents["leader"]["total_tokens"] != 41 or agents["worker"]["total_tokens"] != 5:
+            if agents["leader"]["total_tokens"] != 1100 or agents["worker"]["total_tokens"] != 5:
                 fail(f"per-agent totals were wrong: {agents!r}")
+            if (
+                agents["leader"]["cache_read_tokens"] != 900
+                or agents["leader"]["cache_write_tokens"] != 50
+            ):
+                fail(f"leader cache usage was wrong: {agents['leader']!r}")
             if "cost" in second_stats["usage"] or any("cost" in agent for agent in agents.values()):
                 fail(f"missing price table rendered zero cost: {second_stats!r}")
             encoded = first_body + second_body

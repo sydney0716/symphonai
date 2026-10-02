@@ -683,6 +683,8 @@ class HostRun:
                 "output_tokens": totals.output_tokens,
                 "calls": totals.calls,
                 "total_tokens": totals.total_tokens,
+                "cache_read_tokens": totals.cache_read_tokens,
+                "cache_write_tokens": totals.cache_write_tokens,
             }
             cost = total_cost(by_model, self._price_table)
             if cost is not None and self._price_table is not None:

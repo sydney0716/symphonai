@@ -4,6 +4,6 @@
   "currency": "USD",
   "unit": "per_million_tokens",
   "models": {
-    "example-model-name": {"input": "0.00", "output": "0.00"}
+    "example-model-name": {"input": "0.00", "output": "0.00", "cache_read": "0.00", "cache_write": "0.00"}
   }
 }

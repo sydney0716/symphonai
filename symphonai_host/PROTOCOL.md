@@ -218,7 +218,8 @@ Each agent appears once; the first run in the
 timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,
 `remaining_tokens`, and `by_source`), aggregate `usage`, and per-agent
-`input_tokens`, `output_tokens`, `calls`, and `total_tokens`. Immediately after
+`input_tokens`, `output_tokens`, `calls`, `total_tokens`, `cache_read_tokens`,
+and `cache_write_tokens`. Immediately after
 reopening a conversation, `context`, aggregate `usage`, and per-agent usage and
 `cost` are omitted until another run is accounted in this process.
 When every used model has a configured price, usage objects also contain

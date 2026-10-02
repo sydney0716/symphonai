@@ -49,6 +49,8 @@ class UsageTotals:
 class ModelPrice:
     input_per_million: Decimal
     output_per_million: Decimal
+    cache_read_per_million: Decimal | None = None
+    cache_write_per_million: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -61,8 +63,24 @@ class PriceTable:
         if price is None:
             return None
         million = Decimal(1_000_000)
+        uncached_tokens = max(
+            0,
+            totals.input_tokens - totals.cache_read_tokens - totals.cache_write_tokens,
+        )
+        cache_read_rate = (
+            price.cache_read_per_million
+            if price.cache_read_per_million is not None
+            else price.input_per_million
+        )
+        cache_write_rate = (
+            price.cache_write_per_million
+            if price.cache_write_per_million is not None
+            else price.input_per_million
+        )
         return (
-            Decimal(totals.input_tokens) * price.input_per_million
+            Decimal(uncached_tokens) * price.input_per_million
+            + Decimal(totals.cache_read_tokens) * cache_read_rate
+            + Decimal(totals.cache_write_tokens) * cache_write_rate
             + Decimal(totals.output_tokens) * price.output_per_million
         ) / million
 
@@ -115,6 +133,16 @@ def load_price_table(path: str | Path) -> PriceTable:
         prices[model] = ModelPrice(
             input_per_million=_rate(entry.get("input"), model=model, kind="input"),
             output_per_million=_rate(entry.get("output"), model=model, kind="output"),
+            cache_read_per_million=(
+                _rate(entry["cache_read"], model=model, kind="cache_read")
+                if "cache_read" in entry
+                else None
+            ),
+            cache_write_per_million=(
+                _rate(entry["cache_write"], model=model, kind="cache_write")
+                if "cache_write" in entry
+                else None
+            ),
         )
     return PriceTable(prices=prices, currency=currency)
 

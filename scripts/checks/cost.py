@@ -177,8 +177,12 @@ def check_price_table_loads_example() -> None:
     price = table.prices["example-model-name"]
     if price.input_per_million != Decimal("0.00") or price.output_per_million != Decimal("0.00"):
         fail(f"example rates did not load exactly: {price!r}")
+    if price.cache_read_per_million != Decimal("0.00") or price.cache_write_per_million != Decimal("0.00"):
+        fail(f"example cache rates did not load exactly: {price!r}")
     if not isinstance(price.input_per_million, Decimal) or not isinstance(
         price.output_per_million, Decimal
+    ) or not isinstance(price.cache_read_per_million, Decimal) or not isinstance(
+        price.cache_write_per_million, Decimal
     ):
         fail(f"example rates are not Decimal values: {price!r}")
 
@@ -237,6 +241,73 @@ def check_price_table_rejects_malformed() -> None:
             else:
                 path.write_text(json.dumps(data), encoding="utf-8")
             assert_rejected(path, expected)
+
+
+@check("cost.cache_rates_adjust_cost")
+def check_cache_rates_adjust_cost() -> None:
+    totals = UsageTotals(
+        input_tokens=1050,
+        output_tokens=20,
+        calls=1,
+        cache_read_tokens=900,
+        cache_write_tokens=50,
+    )
+    discounted = PriceTable(
+        prices={
+            "model": ModelPrice(
+                Decimal("4"),
+                Decimal("20"),
+                Decimal("0.40"),
+                Decimal("5.00"),
+            )
+        },
+        currency="USD",
+    )
+    if discounted.cost("model", totals) != Decimal("0.00141"):
+        fail(f"cached input was not priced at cache rates: {discounted.cost('model', totals)!r}")
+
+    regular = PriceTable(
+        prices={"model": ModelPrice(Decimal("4"), Decimal("20"))},
+        currency="USD",
+    )
+    if regular.cost("model", totals) != Decimal("0.0046"):
+        fail(f"missing cache rates changed legacy cost: {regular.cost('model', totals)!r}")
+
+
+@check("cost.cache_rate_validation")
+def check_cache_rate_validation() -> None:
+    cases = {
+        "cache_read": "bad",
+        "cache_write": -1,
+        "cache_read_bool": True,
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "cache-rates.json"
+        for field, value in cases.items():
+            price_field = "cache_read" if field == "cache_read_bool" else field
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "currency": "USD",
+                        "models": {
+                            "model": {
+                                "input": "4",
+                                "output": "20",
+                                price_field: value,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                load_price_table(path)
+            except ValueError as exc:
+                if "non-negative number" not in str(exc):
+                    fail(f"invalid cache rate {field!r} produced the wrong error: {exc!r}")
+            else:
+                fail(f"invalid cache rate {field!r} was accepted")
 
 
 @check("cost.unknown_model_costs_nothing_known")
