@@ -73,8 +73,8 @@ the change is pure cost.>
 - `python3 scripts/check.py --only <area>` — matches most changes; match the
   selector to the surface you touched.
 - `python3 scripts/check.py` — the whole suite, once before you finish.
-- `python3 scripts/checks/_selfcheck.py` — only when this change adds, renames
-  or reorders a check name. Once, never inside a loop.
+- `python3 scripts/checks/_selfcheck.py` — only when this change edits the
+  runner itself (`scripts/check.py` or `scripts/checks/harness.py`). Once.
 - `.venv/bin/python scripts/smoke_host.py` — only when the host changed.
 - `.venv/bin/python scripts/smoke_tui.py` — only when the runtime or the TUI
   changed. A change under `symphonai_app/` cannot reach either.
