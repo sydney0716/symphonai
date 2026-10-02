@@ -518,6 +518,12 @@ def _default_specs_probe() -> tuple[dict, int]:
             ),
         }
 
+    def usage_totals(value) -> dict[str, int]:
+        return {
+            key: getattr(value, key)
+            for key in ("calls", "input_tokens", "output_tokens")
+        }
+
     events = CollectingSink()
     leader = Leader(
         LeaderConfig(
@@ -566,7 +572,7 @@ def _default_specs_probe() -> tuple[dict, int]:
             "messages": [message(item) for item in record.messages],
             "turns": record.turns_used,
             "usage": sorted(
-                (model, vars(usage))
+                (model, usage_totals(usage))
                 for model, usage in record.usage_by_model.items()
             ),
         }
@@ -581,7 +587,8 @@ def _default_specs_probe() -> tuple[dict, int]:
         "usage": sorted(
             (
                 sorted(
-                    (model, vars(usage)) for model, usage in totals.items()
+                    (model, usage_totals(usage))
+                    for model, usage in totals.items()
                 )
                 for totals in outcome.usage_by_agent.values()
             ),

@@ -226,6 +226,10 @@ def _synthesize_tool_call_id() -> str:
     return new_id("call")
 
 
+def _usage_count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _parse_response(data: dict[str, Any]) -> ModelResponse:
     choices = data.get("choices") or []
     if not choices:
@@ -250,13 +254,22 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             )
         )
 
-    usage_raw = data.get("usage", {})
+    usage_raw = data.get("usage")
+    if not isinstance(usage_raw, dict):
+        usage_raw = {}
+    prompt_details = usage_raw.get("prompt_tokens_details")
+    cache_read_tokens = _usage_count(
+        prompt_details.get("cached_tokens")
+        if isinstance(prompt_details, dict)
+        else 0
+    )
     message = Message(role=Role.ASSISTANT, content=message_raw.get("content") or "", tool_calls=tool_calls)
     return ModelResponse(
         message=message,
         usage=Usage(
-            input_tokens=usage_raw.get("prompt_tokens", 0),
-            output_tokens=usage_raw.get("completion_tokens", 0),
+            input_tokens=_usage_count(usage_raw.get("prompt_tokens")),
+            output_tokens=_usage_count(usage_raw.get("completion_tokens")),
+            cache_read_tokens=cache_read_tokens,
         ),
         stop_reason=choices[0].get("finish_reason") or "stop",
     )
@@ -312,7 +325,15 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
             provider_metadata={_RESPONSES_REASONING_KEY: reasoning_items},
             vendor_id=first.vendor_id,
         )
-    usage_raw = data.get("usage", {})
+    usage_raw = data.get("usage")
+    if not isinstance(usage_raw, dict):
+        usage_raw = {}
+    input_details = usage_raw.get("input_tokens_details")
+    cache_read_tokens = _usage_count(
+        input_details.get("cached_tokens")
+        if isinstance(input_details, dict)
+        else 0
+    )
     status = data.get("status")
     incomplete = data.get("incomplete_details")
     stop_reason = "tool_calls" if tool_calls else (
@@ -321,8 +342,9 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
     return ModelResponse(
         message=Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls),
         usage=Usage(
-            input_tokens=usage_raw.get("input_tokens", 0) if isinstance(usage_raw, dict) else 0,
-            output_tokens=usage_raw.get("output_tokens", 0) if isinstance(usage_raw, dict) else 0,
+            input_tokens=_usage_count(usage_raw.get("input_tokens")) if isinstance(usage_raw, dict) else 0,
+            output_tokens=_usage_count(usage_raw.get("output_tokens")) if isinstance(usage_raw, dict) else 0,
+            cache_read_tokens=cache_read_tokens,
         ),
         stop_reason=stop_reason,
     )
@@ -408,8 +430,13 @@ def _openai_stream_chunks(
         usage_raw = data.get("usage")
         if isinstance(usage_raw, dict):
             usage = Usage(
-                input_tokens=usage_raw.get("prompt_tokens", 0),
-                output_tokens=usage_raw.get("completion_tokens", 0),
+                input_tokens=_usage_count(usage_raw.get("prompt_tokens")),
+                output_tokens=_usage_count(usage_raw.get("completion_tokens")),
+                cache_read_tokens=_usage_count(
+                    usage_raw.get("prompt_tokens_details", {}).get("cached_tokens")
+                    if isinstance(usage_raw.get("prompt_tokens_details"), dict)
+                    else 0
+                ),
             )
         # Unlike _parse_response, this accepts an empty choices list because
         # include_usage makes the final usage payload legitimately choice-less.

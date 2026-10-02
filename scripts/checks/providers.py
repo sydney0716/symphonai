@@ -14,7 +14,7 @@ from symphonai_api.model_table import (
     model_capabilities,
     resolve_effort,
 )
-from symphonai_api.models import Message, ModelRequest, Role, ToolResult
+from symphonai_api.models import Message, ModelRequest, Role, ToolCall, ToolResult, Usage
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
 from symphonai_api.providers.anthropic_provider import (
     AnthropicProvider,
@@ -223,6 +223,7 @@ def check_default_effort_body_identity() -> None:
             "model": "claude-sonnet-5",
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": "hello"}],
+            "cache_control": {"type": "ephemeral"},
         },
         "gemini": {
             "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
@@ -230,6 +231,184 @@ def check_default_effort_body_identity() -> None:
     }
     if actual != expected:
         fail(f"default effort changed provider request bodies: {actual!r}")
+
+
+@check("providers.anthropic_cache_control_and_tool_message_merging")
+def check_anthropic_cache_control_and_tool_message_merging() -> None:
+    calls = [ToolCall(f"call-{index}", f"tool-{index}", {}) for index in range(3)]
+    messages = [
+        Message(Role.ASSISTANT, tool_calls=calls),
+        *[
+            Message(
+                Role.TOOL,
+                tool_result=ToolResult(
+                    tool_call_id=f"call-{index}", ok=True, content=f"result-{index}"
+                ),
+            )
+            for index in range(3)
+        ],
+    ]
+    body = _build_anthropic_body(ModelRequest(messages=messages), "test-model", 100)
+    if body.get("cache_control") != {"type": "ephemeral"}:
+        fail(f"Anthropic request omitted top-level cache_control: {body!r}")
+    if len(body["messages"]) != 2:
+        fail(f"consecutive tool results were not merged: {body['messages']!r}")
+    tool_blocks = body["messages"][1]["content"]
+    expected_ids = ["call-0", "call-1", "call-2"]
+    if [block.get("tool_use_id") for block in tool_blocks] != expected_ids:
+        fail(f"merged Anthropic tool results changed call order: {tool_blocks!r}")
+
+    redirected = _build_anthropic_body(
+        ModelRequest(
+            messages=[
+                Message(
+                    Role.TOOL,
+                    tool_result=ToolResult(
+                        tool_call_id="call-0", ok=True, content="result"
+                    ),
+                ),
+                Message(Role.USER, "follow-up redirect"),
+            ]
+        ),
+        "test-model",
+        100,
+    )
+    expected_content = [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-0",
+            "content": "result",
+            "is_error": False,
+        },
+        {"type": "text", "text": "follow-up redirect"},
+    ]
+    if redirected["messages"] != [{"role": "user", "content": expected_content}]:
+        fail(f"tool result and redirect were not merged in order: {redirected['messages']!r}")
+
+    lone = _build_anthropic_body(
+        ModelRequest(messages=[Message(Role.USER, "hello")]), "test-model", 100
+    )
+    if lone["messages"] != [{"role": "user", "content": "hello"}]:
+        fail(f"lone Anthropic user message changed shape: {lone['messages']!r}")
+
+
+@check("providers.cache_usage_accounting")
+def check_cache_usage_accounting() -> None:
+    request = ModelRequest(messages=[Message(Role.USER, "usage")])
+
+    def anthropic_urlopen(http_request, timeout=None):  # noqa: ANN001
+        return _FakeHttpResponse(
+            json.dumps(
+                {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 900,
+                        "cache_creation_input_tokens": 50,
+                        "output_tokens": 20,
+                    },
+                    "stop_reason": "end_turn",
+                }
+            ).encode()
+        )
+
+    with mock.patch.dict(
+        os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "anthropic-cache-key"}
+    ), mock.patch("urllib.request.urlopen", side_effect=anthropic_urlopen):
+        anthropic = AnthropicProvider().create_response(request)
+    if anthropic.usage != Usage(1050, 20, 900, 50):
+        fail(f"Anthropic cache usage was not included in total input: {anthropic.usage!r}")
+
+    responses_provider = OpenAIProvider()
+
+    def responses_urlopen(http_request, timeout=None):  # noqa: ANN001
+        return _FakeHttpResponse(
+            json.dumps(
+                {
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 10,
+                        "input_tokens_details": {"cached_tokens": 800},
+                    },
+                }
+            ).encode()
+        )
+
+    with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "openai-cache-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=responses_urlopen
+    ):
+        responses = responses_provider.create_response(request)
+    if responses.usage != Usage(1000, 10, 800, 0):
+        fail(f"OpenAI Responses cache usage was wrong: {responses.usage!r}")
+
+    compatible_env = "SYMPHONAI_CACHE_COMPATIBLE_KEY"
+
+    def chat_urlopen(http_request, timeout=None):  # noqa: ANN001
+        return _FakeHttpResponse(
+            json.dumps(
+                {
+                    "choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 1000,
+                        "completion_tokens": 10,
+                        "prompt_tokens_details": {"cached_tokens": 800},
+                    },
+                }
+            ).encode()
+        )
+
+    with mock.patch.dict(os.environ, {compatible_env: "chat-cache-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=chat_urlopen
+    ):
+        chat = OpenAICompatibleProvider(
+            compatible_env, "https://compatible.invalid/v1"
+        ).create_response(request)
+    if chat.usage != Usage(1000, 10, 800, 0):
+        fail(f"OpenAI Chat cache usage was wrong: {chat.usage!r}")
+
+    def malformed_usage_urlopen(http_request, timeout=None):  # noqa: ANN001
+        return _FakeHttpResponse(
+            json.dumps(
+                {
+                    "choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": "1000",
+                        "prompt_tokens_details": {"cached_tokens": "800"},
+                    },
+                }
+            ).encode()
+        )
+
+    with mock.patch.dict(os.environ, {compatible_env: "chat-malformed-cache-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=malformed_usage_urlopen
+    ):
+        malformed_chat = OpenAICompatibleProvider(
+            compatible_env, "https://compatible.invalid/v1"
+        ).create_response(request)
+    if malformed_chat.usage != Usage():
+        fail(f"non-integer OpenAI usage counts were not treated as zero: {malformed_chat.usage!r}")
+
+    def gemini_urlopen(http_request, timeout=None):  # noqa: ANN001
+        return _FakeHttpResponse(
+            json.dumps(
+                {
+                    "candidates": [{"content": {"parts": []}, "finishReason": "STOP"}],
+                    "usageMetadata": {
+                        "promptTokenCount": 1000,
+                        "cachedContentTokenCount": 600,
+                    },
+                }
+            ).encode()
+        )
+
+    with mock.patch.dict(os.environ, {GEMINI_API_KEY_ENV_VAR: "gemini-cache-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=gemini_urlopen
+    ):
+        gemini = GeminiProvider().create_response(request)
+    if gemini.usage != Usage(1000, 0, 600, 0):
+        fail(f"Gemini cache usage was wrong: {gemini.usage!r}")
 
 
 @check("providers.unlisted_effort_passthrough")

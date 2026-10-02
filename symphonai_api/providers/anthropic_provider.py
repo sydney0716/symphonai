@@ -132,6 +132,34 @@ def _to_anthropic_role(role: Role) -> str:
     return "assistant" if role == Role.ASSISTANT else "user"
 
 
+def _anthropic_messages(
+    messages: list[Message], id_map: dict[str, str]
+) -> list[dict[str, Any]]:
+    wire_messages: list[dict[str, Any]] = []
+    for message in messages:
+        role = _to_anthropic_role(message.role)
+        content = _to_anthropic_content(message, id_map)
+        if role == "user" and wire_messages and wire_messages[-1]["role"] == "user":
+            previous = wire_messages[-1]["content"]
+            previous_blocks = previous if isinstance(previous, list) else [
+                {"type": "text", "text": previous}
+            ]
+            content_blocks = content if isinstance(content, list) else [
+                {"type": "text", "text": content}
+            ]
+            combined = previous_blocks + content_blocks
+            wire_messages[-1]["content"] = [
+                block for block in combined if block.get("type") == "tool_result"
+            ] + [block for block in combined if block.get("type") != "tool_result"]
+        else:
+            wire_messages.append({"role": role, "content": content})
+    return wire_messages
+
+
+def _usage_count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _build_request_body(request: ModelRequest, model: str, default_max_tokens: int) -> dict[str, Any]:
     reject_system_attachments(request.messages)
     id_map = wire_tool_call_ids(request.messages)
@@ -140,9 +168,8 @@ def _build_request_body(request: ModelRequest, model: str, default_max_tokens: i
     body: dict[str, Any] = {
         "model": model,
         "max_tokens": request.max_tokens or default_max_tokens,
-        "messages": [
-            {"role": _to_anthropic_role(m.role), "content": _to_anthropic_content(m, id_map)} for m in non_system
-        ],
+        "messages": _anthropic_messages(non_system, id_map),
+        "cache_control": {"type": "ephemeral"},
     }
     if system_parts:
         body["system"] = "\n".join(system_parts)
@@ -172,13 +199,20 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
                     vendor_id=vendor_id,
                 )
             )
-    usage_raw = data.get("usage", {})
+    usage_raw = data.get("usage")
+    if not isinstance(usage_raw, dict):
+        usage_raw = {}
+    input_tokens = _usage_count(usage_raw.get("input_tokens"))
+    cache_read_tokens = _usage_count(usage_raw.get("cache_read_input_tokens"))
+    cache_write_tokens = _usage_count(usage_raw.get("cache_creation_input_tokens"))
     message = Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls)
     return ModelResponse(
         message=message,
         usage=Usage(
-            input_tokens=usage_raw.get("input_tokens", 0),
-            output_tokens=usage_raw.get("output_tokens", 0),
+            input_tokens=input_tokens + cache_read_tokens + cache_write_tokens,
+            output_tokens=_usage_count(usage_raw.get("output_tokens")),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         ),
         stop_reason=data.get("stop_reason") or "end_turn",
     )
@@ -189,6 +223,8 @@ def _anthropic_stream_chunks(
 ) -> Iterator[StreamChunk]:
     """Map Anthropic Messages SSE events to the provider-neutral chunks."""
     input_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
     output_tokens = 0
     stop_reason = "end_turn"
     for event, payload in sse_events(lines):
@@ -207,7 +243,13 @@ def _anthropic_stream_chunks(
             message = data.get("message", {})
             usage = message.get("usage", {}) if isinstance(message, dict) else {}
             if isinstance(usage, dict):
-                input_tokens = usage.get("input_tokens", 0)
+                input_tokens = _usage_count(usage.get("input_tokens"))
+                cache_read_tokens = _usage_count(
+                    usage.get("cache_read_input_tokens")
+                )
+                cache_write_tokens = _usage_count(
+                    usage.get("cache_creation_input_tokens")
+                )
             continue
         if event == "content_block_start":
             block = data.get("content_block", {})
@@ -236,13 +278,18 @@ def _anthropic_stream_chunks(
             if isinstance(delta, dict) and delta.get("stop_reason") is not None:
                 stop_reason = delta["stop_reason"]
             if isinstance(usage, dict):
-                output_tokens = usage.get("output_tokens", 0)
+                output_tokens = _usage_count(usage.get("output_tokens"))
             continue
         if event == "message_stop":
             yield StreamCompleted(
                 ModelResponse(
                     Message(role=Role.ASSISTANT),
-                    usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+                    usage=Usage(
+                        input_tokens=input_tokens + cache_read_tokens + cache_write_tokens,
+                        output_tokens=output_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                    ),
                     stop_reason=stop_reason,
                 )
             )

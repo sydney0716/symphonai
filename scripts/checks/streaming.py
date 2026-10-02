@@ -605,6 +605,8 @@ def check_anthropic_max_tokens_defaults() -> None:
             list(provider.create_response_stream(ModelRequest(messages=[message], max_tokens=500)))
     if [body["max_tokens"] for body in captured] != [1024, 500, 32000, 500]:
         fail(f"Anthropic max_tokens defaults/overrides changed: {captured!r}")
+    if any(body.get("cache_control") != {"type": "ephemeral"} for body in captured):
+        fail(f"Anthropic non-streaming or streaming request omitted cache_control: {captured!r}")
 
 
 class _LinesResponse:
@@ -1024,6 +1026,69 @@ def check_anthropic_matches_non_streaming() -> None:
             actual = _assemble(AnthropicProvider().create_response_stream(_request()))
     if actual != expected:
         fail(f"Anthropic streaming response differed from non-streaming: {actual!r}")
+
+
+@check("streaming.cache_usage_accounting")
+def check_stream_cache_usage_accounting() -> None:
+    request = _request()
+    anthropic_stream = _LinesResponse(
+        [
+            b"event: message_start\n",
+            b'data: {"message":{"usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50}}}\n\n',
+            b"event: message_delta\n",
+            b'data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}\n\n',
+            b"event: message_stop\n",
+            b"data: {}\n\n",
+        ]
+    )
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "anthropic-stream-cache-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=anthropic_stream
+    ):
+        anthropic = _assemble(AnthropicProvider().create_response_stream(request))
+    if anthropic.usage != Usage(1050, 20, 900, 50):
+        fail(f"streamed Anthropic cache usage was wrong: {anthropic.usage!r}")
+
+    responses_stream = _LinesResponse(
+        [
+            b"event: response.completed\n",
+            b'data: {"response":{"status":"completed","output":[],"usage":{"input_tokens":1000,"output_tokens":10,"input_tokens_details":{"cached_tokens":800}}}}\n\n',
+        ]
+    )
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-responses-cache-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=responses_stream
+    ):
+        responses = _assemble(OpenAIProvider().create_response_stream(request))
+    if responses.usage != Usage(1000, 10, 800, 0):
+        fail(f"streamed OpenAI Responses cache usage was wrong: {responses.usage!r}")
+
+    compatible_env = "SYMPHONAI_STREAM_CACHE_KEY"
+    chat_stream = _LinesResponse(
+        [
+            b'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":800}}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    compatible = OpenAICompatibleProvider(
+        compatible_env, "https://compatible.invalid/v1"
+    )
+    with mock.patch.dict(os.environ, {compatible_env: "compatible-stream-cache-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=chat_stream
+    ):
+        chat = _assemble(compatible.create_response_stream(request))
+    if chat.usage != Usage(1000, 10, 800, 0):
+        fail(f"streamed OpenAI Chat cache usage was wrong: {chat.usage!r}")
+
+    gemini_stream = _LinesResponse(
+        [
+            b'data: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":600}}\n\n'
+        ]
+    )
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-stream-cache-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=gemini_stream
+    ):
+        gemini = _assemble(GeminiProvider().create_response_stream(request))
+    if gemini.usage != Usage(1000, 0, 600, 0):
+        fail(f"streamed Gemini cache usage was wrong: {gemini.usage!r}")
 
 
 @check("streaming.openai_matches_non_streaming")

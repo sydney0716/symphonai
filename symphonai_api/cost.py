@@ -18,6 +18,8 @@ class UsageTotals:
     input_tokens: int = 0
     output_tokens: int = 0
     calls: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -28,6 +30,8 @@ class UsageTotals:
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
             calls=self.calls + other.calls,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
         )
 
     @classmethod
@@ -36,6 +40,8 @@ class UsageTotals:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             calls=1,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
         )
 
 

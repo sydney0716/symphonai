@@ -83,6 +83,10 @@ def _synthesize_tool_call_id() -> str:
     return new_id("call")
 
 
+def _usage_count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _tool_call_names(messages: list[Message]) -> dict[str, str]:
     """Map tool_call_id -> function name, by scanning earlier assistant turns.
 
@@ -256,12 +260,16 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
                 )
             )
 
-    usage_raw = data.get("usageMetadata", {})
+    usage_raw = data.get("usageMetadata")
+    if not isinstance(usage_raw, dict):
+        usage_raw = {}
+    cache_read_tokens = _usage_count(usage_raw.get("cachedContentTokenCount"))
     return ModelResponse(
         message=Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls),
         usage=Usage(
-            input_tokens=usage_raw.get("promptTokenCount", 0),
-            output_tokens=usage_raw.get("candidatesTokenCount", 0),
+            input_tokens=_usage_count(usage_raw.get("promptTokenCount")),
+            output_tokens=_usage_count(usage_raw.get("candidatesTokenCount")),
+            cache_read_tokens=cache_read_tokens,
         ),
         stop_reason=candidate.get("finishReason") or "STOP",
     )
@@ -290,8 +298,11 @@ def _gemini_stream_chunks(
         usage_raw = data.get("usageMetadata")
         if isinstance(usage_raw, dict):
             usage = Usage(
-                input_tokens=usage_raw.get("promptTokenCount", 0),
-                output_tokens=usage_raw.get("candidatesTokenCount", 0),
+                input_tokens=_usage_count(usage_raw.get("promptTokenCount")),
+                output_tokens=_usage_count(usage_raw.get("candidatesTokenCount")),
+                cache_read_tokens=_usage_count(
+                    usage_raw.get("cachedContentTokenCount")
+                ),
             )
         candidates = data.get("candidates") or []
         if not candidates:

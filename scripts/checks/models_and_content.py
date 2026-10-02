@@ -9,7 +9,8 @@ from pathlib import Path
 import symphonai_api.content as content
 from symphonai_api.compaction import _message_excerpts, estimate_message_tokens
 from symphonai_api.content import content_block_from_bytes, content_block_from_path, detect_media_type
-from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, TextBlock, ToolCall, ToolResult, has_attachments, reject_system_attachments
+from symphonai_api.cost import UsageTotals
+from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, TextBlock, ToolCall, ToolResult, Usage, has_attachments, reject_system_attachments
 from symphonai_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body
 from symphonai_api.providers.gemini_provider import _build_request_body as _build_gemini_body
 from symphonai_api.providers.openai_provider import _build_request_body as _build_openai_body
@@ -284,7 +285,7 @@ def check_content_provider_encoding() -> None:
     )
     expected_legacy_bodies = (
         '{"messages": [{"content": "system", "role": "system"}, {"content": "user", "role": "user"}, {"content": "assistant", "role": "assistant", "tool_calls": [{"function": {"arguments": "{\\"key\\": \\"value\\"}", "name": "lookup"}, "id": "vendor", "type": "function"}]}, {"content": "result", "role": "tool", "tool_call_id": "vendor"}], "model": "test-model"}',
-        '{"max_tokens": 100, "messages": [{"content": "user", "role": "user"}, {"content": [{"text": "assistant", "type": "text"}, {"id": "vendor", "input": {"key": "value"}, "name": "lookup", "type": "tool_use"}], "role": "assistant"}, {"content": [{"content": "result", "is_error": false, "tool_use_id": "vendor", "type": "tool_result"}], "role": "user"}], "model": "test-model", "system": "system"}',
+        '{"cache_control": {"type": "ephemeral"}, "max_tokens": 100, "messages": [{"content": "user", "role": "user"}, {"content": [{"text": "assistant", "type": "text"}, {"id": "vendor", "input": {"key": "value"}, "name": "lookup", "type": "tool_use"}], "role": "assistant"}, {"content": [{"content": "result", "is_error": false, "tool_use_id": "vendor", "type": "tool_result"}], "role": "user"}], "model": "test-model", "system": "system"}',
         '{"contents": [{"parts": [{"text": "user"}], "role": "user"}, {"parts": [{"text": "assistant"}, {"functionCall": {"args": {"key": "value"}, "id": "vendor", "name": "lookup"}, "thoughtSignature": "signature"}], "role": "model"}, {"parts": [{"functionResponse": {"name": "lookup", "response": {"output": "result"}}}], "role": "user"}], "system_instruction": {"parts": [{"text": "system"}]}}',
     )
     if actual_legacy_bodies != expected_legacy_bodies:
@@ -303,6 +304,17 @@ def check_content_provider_encoding() -> None:
             "attachment token budgeting changed: "
             f"text={text_only_tokens}, attached={attached_tokens}"
         )
+
+
+@check("content.cache_usage_totals_merge")
+def check_cache_usage_totals_merge() -> None:
+    usage = Usage(1000, 20, 800, 50)
+    totals = UsageTotals.from_usage(usage)
+    doubled = totals.merged(UsageTotals.from_usage(usage))
+    if doubled.cache_read_tokens != 1600 or doubled.cache_write_tokens != 100:
+        fail(f"merged cache usage was not doubled: {doubled!r}")
+    if doubled.input_tokens != 2000 or doubled.output_tokens != 40 or doubled.calls != 2:
+        fail(f"usage totals merge changed existing totals: {doubled!r}")
     excerpts = _message_excerpts(
         [Message(Role.USER, DocumentBlock(data="cGRm"))], limit=1
     )
