@@ -43,7 +43,14 @@ class FakeElement {
   }
 
   focus() {
+    let document = this;
+    while (document && !(document instanceof FakeDocument)) {
+      document = document.parentNode;
+    }
+    if (!document) return;
+    if (document.activeElement) document.activeElement.focused = false;
     this.focused = true;
+    document.activeElement = this;
   }
 
   addEventListener(type, listener) {
@@ -113,6 +120,7 @@ export class FakeDocument {
     get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"), get("status-rail"), get("rail-toggle"));
     this.body = new FakeElement("body", "body");
     this.body.append(get("app-shell"));
+    this.body.parentNode = this;
   }
 
   createElement(tagName) {
@@ -541,6 +549,7 @@ test("mode picker marks the current mode and selects with keyboard without promp
   input.value = "/mode";
   await document.getElementById("prompt-form").dispatch("submit");
   const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  assert.equal(picker.focused, true);
   let rows = find(picker, (node) => node.className === "picker-list").children;
   assert.deepEqual(rows.map((row) => row.children[0].textContent), ["ask", "plan"]);
   assert.match(rows[0].className, /focused current/);
@@ -551,6 +560,7 @@ test("mode picker marks the current mode and selects with keyboard without promp
   await picker.dispatch("keydown", { key: "Enter" });
   assert.deepEqual(client.calls.selectMode, ["plan"]);
   assert.deepEqual(client.calls.prompt, []);
+  assert.equal(input.focused, true);
   const status = find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage"));
   assert.match(status.textContent, /Mode plan/);
   assert.match(status.className, /plan/);
@@ -576,6 +586,7 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
   input.value = "/model";
   await document.getElementById("prompt-form").dispatch("submit");
   let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  assert.equal(picker.focused, true);
   let rows = find(picker, (node) => node.className === "picker-list").children;
   assert.deepEqual(rows.map((row) => row.children[0].textContent), ["gpt-current", "gpt-next", "gpt-basic", "gpt-unknown"]);
   assert.match(rows[0].className, /focused current/);
@@ -626,6 +637,7 @@ test("escape cancels through the keymap and keeps the current model", async () =
   assert.deepEqual(client.calls.selectProvider, []);
   assert.deepEqual(client.calls.prompt, []);
   assert.equal(input.value, "");
+  assert.equal(input.focused, true);
 });
 
 test("bare model command in a conversation can switch to another keyed provider", async () => {

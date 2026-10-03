@@ -85,6 +85,5 @@ export function createPicker({
 
   renderRows();
   append(root, heading, list, status);
-  root.focus?.();
   return root;
 }

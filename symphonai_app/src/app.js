@@ -908,16 +908,19 @@ export async function start({ global, document, client }) {
   }
 
   function showPicker(options) {
-    replace(pickerHost, createPicker({
+    const picker = createPicker({
       document,
       keymap,
       platform,
       ...options,
-    }));
+    });
+    replace(pickerHost, picker);
+    picker.focus?.();
   }
 
   function closePicker() {
     replace(pickerHost);
+    input.focus?.();
   }
 
   function currentModelLabel() {
