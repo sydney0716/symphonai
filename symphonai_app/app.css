@@ -401,12 +401,16 @@ button.session-link {
 .prompt {
   margin-left: auto;
   max-width: 80%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   background: #2f4864;
 }
 
 .assistant {
   margin-right: auto;
   max-width: 80%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   background: #23483c;
 }
 

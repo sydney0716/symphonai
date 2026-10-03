@@ -2305,6 +2305,11 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.notEqual(promptBackground, neutral);
   assert.notEqual(assistantBackground, neutral);
   assert.notEqual(promptBackground, assistantBackground);
+  for (const className of ["prompt", "assistant"]) {
+    const rule = cssSource.match(new RegExp(`\\.${className}\\s*\\{([^}]*)\\}`))?.[1];
+    assert.match(rule, /(?:^|;)\s*white-space:\s*pre-wrap\s*;/);
+    assert.match(rule, /(?:^|;)\s*overflow-wrap:\s*anywhere\s*;/);
+  }
   assert.match(cssSource, /\.edit summary\s*{[^}]*cursor:\s*pointer/s);
   assert.match(cssSource, /\.edit pre\s*{[^}]*overflow-x:\s*auto/s);
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
