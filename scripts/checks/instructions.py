@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest.mock as mock
 from pathlib import Path
 
+import symphonai_api.environment as environment
 import symphonai_api.instructions as instructions
+from symphonai_api.environment import GitSnapshot, capture_environment, render_environment
 from symphonai_api.instructions import InstructionScope, load_instructions
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
@@ -28,6 +35,198 @@ def _instruction_file(directory: Path) -> Path:
     path = directory / INSTRUCTION_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+@check("instructions.environment_render_fixed_values")
+def check_environment_render_fixed_values() -> None:
+    actual = render_environment(
+        working_dir="/w/src",
+        repo_root="/w",
+        platform_text="darwin (macOS-27.0)",
+        date_text="2026-10-02",
+        provider="anthropic",
+        model="claude-opus-5-5",
+        git_snapshot=GitSnapshot("main", " M a.py", "abc1234 first"),
+    )
+    expected = (
+        "Environment when this conversation started (it does not update):\n"
+        "- Working directory: /w/src\n"
+        "- Repository root: /w\n"
+        "- Platform: darwin (macOS-27.0)\n"
+        "- Date: 2026-10-02\n"
+        "- Model: anthropic claude-opus-5-5\n\n"
+        "Git snapshot when this conversation started (it does not update):\n"
+        "Branch: main\n"
+        "Status:\n"
+        " M a.py\n"
+        "Recent commits:\n"
+        "abc1234 first"
+    )
+    if actual != expected:
+        fail(f"environment block differed from its exact contract: {actual!r}")
+    unknown = render_environment(
+        working_dir="/w",
+        repo_root="/w",
+        platform_text="darwin (macOS-27.0)",
+        date_text="2026-10-02",
+        provider="anthropic",
+        model=None,
+        git_snapshot=None,
+    )
+    if not unknown.endswith("- Model: anthropic"):
+        fail(f"unknown model line included a model value: {unknown!r}")
+
+
+@check("instructions.environment_git_capture")
+def check_environment_git_capture() -> None:
+    if shutil.which("git") is None:
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+        tracked = root / "tracked.txt"
+        tracked.write_text("committed content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git", "-c", "user.name=Environment Check",
+                "-c", "user.email=environment@example.invalid",
+                "commit", "-m", "environment snapshot commit",
+            ],
+            cwd=root,
+            capture_output=True,
+            check=True,
+        )
+        tracked.write_text("modified content\n", encoding="utf-8")
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        rendered = capture_environment(
+            working_dir=root,
+            repo_root=root,
+            provider="fake",
+            model="test-model",
+        )
+        if (
+            f"Branch: {branch}" not in rendered
+            or " M tracked.txt" not in rendered
+            or "environment snapshot commit" not in rendered
+        ):
+            fail(f"temporary repository snapshot omitted git state: {rendered!r}")
+
+
+@check("instructions.environment_git_failures_omitted")
+def check_environment_git_failures_omitted() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            outside = capture_environment(
+                working_dir=root,
+                repo_root=root,
+                provider="fake",
+                model=None,
+            )
+        if "Git snapshot when this conversation started" in outside or stderr.getvalue():
+            fail(f"non-repository environment did not omit git quietly: {outside!r}")
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            environment.subprocess,
+            "run",
+            side_effect=subprocess.CalledProcessError(1, ["git"]),
+        ) as runner, contextlib.redirect_stderr(stderr):
+            failed = capture_environment(
+                working_dir=root,
+                repo_root=root,
+                provider="fake",
+                model="test-model",
+            )
+        if runner.call_count != 1:
+            fail(f"failed status did not stop snapshot capture: {runner.call_count}")
+        if "Git snapshot when this conversation started" in failed or stderr.getvalue():
+            fail(f"failed git commands did not omit the snapshot quietly: {failed!r}")
+
+
+@check("instructions.environment_git_unborn_repository")
+def check_environment_git_unborn_repository() -> None:
+    if shutil.which("git") is None:
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+        untracked = root / "a.py"
+        untracked.write_text("print('hello')\n", encoding="utf-8")
+        branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        rendered = capture_environment(
+            working_dir=root,
+            repo_root=root,
+            provider="fake",
+            model=None,
+        )
+        if (
+            f"Branch: {branch}" not in rendered
+            or "Status:\n?? a.py" not in rendered
+            or not rendered.endswith("Recent commits:\n")
+        ):
+            fail(f"unborn repository snapshot was incomplete: {rendered!r}")
+
+
+@check("instructions.environment_git_detached_head")
+def check_environment_git_detached_head() -> None:
+    if shutil.which("git") is None:
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+        tracked = root / "tracked.txt"
+        tracked.write_text("content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git", "-c", "user.name=Environment Check",
+                "-c", "user.email=environment@example.invalid",
+                "commit", "-m", "detached head fixture",
+            ],
+            cwd=root,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(["git", "checkout", "--detach", "HEAD"], cwd=root, capture_output=True, check=True)
+        rendered = capture_environment(
+            working_dir=root,
+            repo_root=root,
+            provider="fake",
+            model=None,
+        )
+        if "Branch: HEAD" not in rendered:
+            fail(f"detached repository did not report HEAD: {rendered!r}")
+
+
+@check("instructions.environment_git_snapshot_truncated")
+def check_environment_git_snapshot_truncated() -> None:
+    rendered = render_environment(
+        working_dir="/w",
+        repo_root="/w",
+        platform_text="darwin (macOS-27.0)",
+        date_text="2026-10-02",
+        provider="anthropic",
+        model=None,
+        git_snapshot=GitSnapshot("main", " M " + "a" * 2_100, "abc1234 first"),
+    )
+    git_part = rendered.split("\n\n", 1)[1]
+    if len(git_part) > 2_000 or not git_part.endswith("... (truncated)"):
+        fail(f"long git snapshot was not capped with its marker: {len(git_part)}, {git_part[-40:]!r}")
 
 
 @check("instructions.scope_order")

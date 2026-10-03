@@ -140,7 +140,10 @@ def check_current_conversation() -> None:
             _wait_idle(client)
             if first == second or len(provider.requests) != 2:
                 fail("two prompts did not run separately in one conversation")
-            sent = [message.text for message in provider.requests[1].messages]
+            sent = [
+                message.text for message in provider.requests[1].messages
+                if message.role != Role.SYSTEM
+            ]
             if sent != ["first question", "first answer", "second question"]:
                 fail(f"second provider request lost the first exchange: {sent!r}")
             directories = [path for path in (root / "sessions").iterdir() if path.is_dir()]
@@ -150,7 +153,7 @@ def check_current_conversation() -> None:
                 fail(f"two prompts did not share the first run's directory: {directories!r}")
             if sum(record["type"] == "run_started" for record in records) != 2 or loaded.run_count != 2:
                 fail("conversation transcript did not contain two runs")
-            if [message.text for message in loaded.messages] != [
+            if [message.text for message in loaded.messages if message.role != Role.SYSTEM] != [
                 "first question", "first answer", "second question", "second answer"
             ]:
                 fail(f"conversation transcript did not rebuild in order: {loaded.messages!r}")
@@ -199,7 +202,7 @@ def check_new_conversation_route() -> None:
             loaded = load_run(SessionStore.open(root / "sessions", second))
             if second == first or len(list((root / "sessions").iterdir())) != 2:
                 fail("a new conversation did not create a second session directory")
-            if [message.text for message in loaded.messages] != ["second", "done"]:
+            if [message.text for message in loaded.messages if message.role != Role.SYSTEM] != ["second", "done"]:
                 fail(f"new conversation retained prior history: {loaded.messages!r}")
         finally:
             provider.release.set()
@@ -399,7 +402,7 @@ def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[di
             for kind, payload in client.events():
                 if kind == "event" and payload.get("type") == "HistoryMessage":
                     frames.append(payload)
-                    if len(frames) == 4:
+                    if len(frames) == 5:
                         return
         except Exception:
             return
@@ -416,7 +419,7 @@ def check_replay_order() -> None:
     with tempfile.TemporaryDirectory() as directory:
         host, _, _, frames, _ = _open_with_history(Path(directory))
         try:
-            expected = ["user", "assistant", "tool", "assistant"]
+            expected = ["system", "user", "assistant", "tool", "assistant"]
             deadline = time.monotonic() + 5
             while len(frames) < len(expected) and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -472,14 +475,17 @@ def check_continuation_conversation() -> None:
             ) as response_spy:
                 continued = client.send_prompt("second")
                 _wait_idle(client)
-            sent = [message.text for message in response_spy.call_args.args[0].messages]
+            sent = [
+                message.text for message in response_spy.call_args.args[0].messages
+                if message.role != Role.SYSTEM
+            ]
             if sent != ["first", "done", "second"]:
                 fail(f"reopened conversation did not reach the provider: {sent!r}")
             sessions = {item["run_id"]: item for item in client.list_sessions()}
             loaded = load_run(SessionStore.open(root / "sessions", run_id))
             if continued["run_id"] == run_id or set(sessions) != {run_id} or loaded.run_count != 2:
                 fail(f"continuation did not append a second run to the conversation: {sessions!r}")
-            if [message.text for message in loaded.messages] != ["first", "done", "second", "done"]:
+            if [message.text for message in loaded.messages if message.role != Role.SYSTEM] != ["first", "done", "second", "done"]:
                 fail(f"continued conversation did not rebuild in order: {loaded.messages!r}")
         finally:
             host.close()
@@ -497,6 +503,19 @@ def check_instructions_not_reloaded() -> None:
             try:
                 run_id = client.send_prompt("first")["run_id"]
                 _wait_idle(client)
+                initial_system: list[str] = []
+                with mock.patch.object(
+                    host.run._provider,
+                    "create_response",
+                    wraps=host.run._provider.create_response,
+                ) as initial_spy:
+                    client.send_prompt("capture initial environment")
+                    _wait_idle(client)
+                initial_system = [
+                    message.text
+                    for message in initial_spy.call_args.args[0].messages
+                    if message.role == Role.SYSTEM
+                ]
                 instructions.write_text("changed convention", encoding="utf-8")
                 client.open_session(run_id)
                 with mock.patch.object(host.run._provider, "create_response", wraps=host.run._provider.create_response) as response_spy:
@@ -504,7 +523,13 @@ def check_instructions_not_reloaded() -> None:
                     _wait_idle(client)
                 sent = response_spy.call_args.args[0].messages
                 system = [message.text for message in sent if message.role == Role.SYSTEM]
-                if len(system) != 1 or "original convention" not in system[0] or "changed convention" in system[0]:
+                if (
+                    len(system) != 2
+                    or "original convention" not in system[0]
+                    or "changed convention" in system[0]
+                    or not system[1].startswith("Environment when this conversation started")
+                    or system != initial_system
+                ):
                     fail(f"reopening reloaded or duplicated instructions: {system!r}")
             finally:
                 host.close()
@@ -545,7 +570,7 @@ def check_client_session_calls() -> None:
     with tempfile.TemporaryDirectory() as directory:
         host, client, run_id = _finished_session(Path(directory))
         try:
-            if not client.list_sessions() or client.open_session(run_id)["replayed"] != 2:
+            if not client.list_sessions() or client.open_session(run_id)["replayed"] != 3:
                 fail("client session calls did not round-trip")
         finally:
             host.close()
@@ -698,18 +723,25 @@ def check_fork_prefix_current_parent() -> None:
             source_meta = meta_path.read_bytes()
             source = SessionStore.open(root / "sessions", source_id)
             try:
-                first_id = load_run(source).record_ids[0]
+                source_run = load_run(source)
+                first_id = next(
+                    record_id
+                    for message, record_id in zip(source_run.messages, source_run.record_ids, strict=True)
+                    if message.role == Role.USER
+                )
             finally:
                 source.close()
             stream_connection, stream_response = _subscribed_stream(host)
             try:
                 status, reply = _fork(host, source_id, first_id)
-                if status != 200 or reply["run_id"] == source_id or reply["replayed"] != 1:
+                if status != 200 or reply["run_id"] == source_id or reply["replayed"] != 2:
                     fail(f"fork did not create and reopen the prefix: {status}, {reply!r}")
                 fork_id = reply["run_id"]
                 _, frame = _await_sse(
                     stream_connection, stream_response,
-                    lambda frame: frame[0] == "event" and frame[1].get("type") == "HistoryMessage",
+                    lambda frame: frame[0] == "event"
+                    and frame[1].get("type") == "HistoryMessage"
+                    and frame[1].get("role") == "user",
                     what="fork history",
                 )
                 if (
@@ -725,7 +757,7 @@ def check_fork_prefix_current_parent() -> None:
                     forked = load_run(fork_store)
                 finally:
                     fork_store.close()
-                if [message.text for message in forked.messages] != ["first"]:
+                if [message.text for message in forked.messages if message.role != Role.SYSTEM] != ["first"]:
                     fail(f"fork copied messages beyond its boundary: {forked.messages!r}")
                 listed = {item["run_id"]: item for item in client.list_sessions()}
                 if listed[fork_id]["parent_session_id"] != source_id:
@@ -734,7 +766,10 @@ def check_fork_prefix_current_parent() -> None:
                 _wait_idle(client)
                 fork_store = SessionStore.open(root / "sessions", fork_id)
                 try:
-                    texts = [message.text for message in load_run(fork_store).messages]
+                    texts = [
+                        message.text for message in load_run(fork_store).messages
+                        if message.role != Role.SYSTEM
+                    ]
                 finally:
                     fork_store.close()
                 if next_run["run_id"] == fork_id or texts != ["first", "different path", "fork answer"]:
@@ -792,7 +827,17 @@ def check_fork_last_message_inherits_context() -> None:
                     _wait_idle(client)
                 sent = response_spy.call_args.args[0].messages
                 system = [message.text for message in sent if message.role == Role.SYSTEM]
-                if len(system) != 1 or "original fork convention" not in system[0] or "changed fork convention" in system[0]:
+                source_system = [
+                    message.text for message in loaded.messages
+                    if message.role == Role.SYSTEM
+                ]
+                if (
+                    len(system) != 2
+                    or "original fork convention" not in system[0]
+                    or "changed fork convention" in system[0]
+                    or not system[1].startswith("Environment when this conversation started")
+                    or system != source_system
+                ):
                     fail(f"fork duplicated or reloaded instructions: {system!r}")
                 if [message.text for message in sent if message.role != Role.SYSTEM] != [
                     "first", "first answer", "continue fork",

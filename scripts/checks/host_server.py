@@ -2168,7 +2168,13 @@ def check_project_instructions_seeded() -> None:
                 with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy:
                     _send_host_prompt(host, "plain")
                     plain = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
-                    if plain != [("system", "host baseline"), ("user", "plain")]:
+                    if (
+                        len(plain) != 3
+                        or plain[0] != ("system", "host baseline")
+                        or plain[1][0] != "system"
+                        or not plain[1][1].startswith("Environment when this conversation started")
+                        or plain[2] != ("user", "plain")
+                    ):
                         fail(f"empty hierarchy or CLAUDE.md changed the provider request: {plain!r}")
                     host.run.end_conversation()
                     instructions = root / ".symphonai" / "INSTRUCTIONS.md"
@@ -2176,12 +2182,74 @@ def check_project_instructions_seeded() -> None:
                     instructions.write_text("project convention", encoding="utf-8")
                     _send_host_prompt(host, "with instructions")
                     sent = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
-                    if sent != [
-                        ("system", "host baseline"),
-                        ("system", "# instructions: project .symphonai/INSTRUCTIONS.md\nproject convention"),
-                        ("user", "with instructions"),
-                    ]:
+                    if (
+                        len(sent) != 4
+                        or sent[0] != ("system", "host baseline")
+                        or sent[1] != ("system", "# instructions: project .symphonai/INSTRUCTIONS.md\nproject convention")
+                        or sent[2][0] != "system"
+                        or not sent[2][1].startswith("Environment when this conversation started")
+                        or sent[3] != ("user", "with instructions")
+                    ):
                         fail(f"project instructions or system prompt missed the first request: {sent!r}")
+            finally:
+                host.close()
+
+
+@check("host_server.environment_seeded_once")
+def check_environment_seeded_once() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        instruction_path = root / ".symphonai" / "INSTRUCTIONS.md"
+        instruction_path.parent.mkdir()
+        instruction_path.write_text("project convention", encoding="utf-8")
+        environment_text = (
+            "Environment when this conversation started (it does not update):\n"
+            "- Working directory: /fixed/workdir\n"
+            "- Repository root: /fixed/repo\n"
+            "- Platform: fixed platform\n"
+            "- Date: 2026-10-02\n"
+            "- Model: fake test-model"
+        )
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "first answer")),
+            ModelResponse(Message(Role.ASSISTANT, "second answer")),
+        ])
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-home")}), mock.patch(
+            "symphonai_host.run.capture_environment", return_value=environment_text
+        ) as capture:
+            host = HostServer(
+                provider,
+                PermissionPolicy(root),
+                sessions_root=root / "sessions",
+            )
+            host.start()
+            try:
+                with mock.patch.object(
+                    provider, "create_response", wraps=provider.create_response
+                ) as response_spy:
+                    _send_host_prompt(host, "first")
+                    first = list(response_spy.call_args.args[0].messages)
+                    _send_host_prompt(host, "second")
+                    second = list(response_spy.call_args.args[0].messages)
+                for messages in (first, second):
+                    systems = [message.text for message in messages if message.role == Role.SYSTEM]
+                    environment_messages = [
+                        text for text in systems
+                        if text.startswith("Environment when this conversation started")
+                    ]
+                    if (
+                        len(systems) != 2
+                        or "project convention" not in systems[0]
+                        or systems[1] != environment_text
+                        or environment_messages != [environment_text]
+                    ):
+                        fail(f"request did not carry one environment block after instructions: {messages!r}")
+                if capture.call_count != 1:
+                    fail(f"environment was captured {capture.call_count} times in one conversation")
+                first_system = [message for message in first if message.role == Role.SYSTEM]
+                second_system = [message for message in second if message.role == Role.SYSTEM]
+                if first_system != second_system:
+                    fail(f"conversation environment changed between prompts: {first_system!r}, {second_system!r}")
             finally:
                 host.close()
 
@@ -2206,9 +2274,9 @@ def check_instruction_scope_and_warning() -> None:
                     _send_host_prompt(host, "check scopes")
                 sent = response_spy.call_args.args[0].messages
                 rendered = sent[0].text if sent and sent[0].role == Role.SYSTEM else ""
-                if len(sent) != 2 or "# instructions: project .symphonai/INSTRUCTIONS.md\n" not in rendered or project_text not in rendered:
+                if len(sent) != 3 or "# instructions: project .symphonai/INSTRUCTIONS.md\n" not in rendered or project_text not in rendered:
                     fail("project instruction text or scope did not reach the provider")
-                if "# instructions: directory src/.symphonai/INSTRUCTIONS.md\ndirectory rule" not in rendered:
+                if "# instructions: directory src/.symphonai/INSTRUCTIONS.md\ndirectory rule" not in rendered or not sent[1].text.startswith("Environment when this conversation started"):
                     fail("directory instruction text or scope did not reach the provider")
                 if "instruction warning:" not in stderr.getvalue() or "loaded in full" not in stderr.getvalue() or provider.call_count != 1:
                     fail("oversize warning was hidden or the run did not complete")
@@ -3427,7 +3495,14 @@ def _host_run_snapshot(
     )
     snapshot = (
         tuple(type(event).__name__ for event in events if type(event).__name__ != "SessionStarted"),
-        tuple((message.role.value, message.text) for message in loaded.messages),
+        tuple(
+            (message.role.value, message.text)
+            for message in loaded.messages
+            if not (
+                message.role == Role.SYSTEM
+                and message.text.startswith("Environment when this conversation started")
+            )
+        ),
         terminal,
     )
     subscription.close()

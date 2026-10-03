@@ -20,6 +20,7 @@ from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
 from symphonai_api.events import Event, RunFailed, RunFinished, RunStarted, fan_out
 from symphonai_api.extensions import Extensions
+from symphonai_api.environment import capture_environment
 from symphonai_api.identity import new_id
 from symphonai_api.instructions import load_instructions
 from symphonai_api.leader import (
@@ -357,8 +358,16 @@ class HostRun:
                 rendered = instructions.render()
                 if rendered:
                     seeded.append(Message(role=Role.SYSTEM, content=rendered))
-                if seeded:
-                    leader.seed_chat(seeded)
+                seeded.append(Message(
+                    role=Role.SYSTEM,
+                    content=capture_environment(
+                        working_dir=self._working_dir,
+                        repo_root=self._policy.repo_root,
+                        provider=leader._config.leader_provider.name,
+                        model=leader._leader_spec.model.model,
+                    ),
+                ))
+                leader.seed_chat(seeded)
                 meta = session.read_meta()
                 meta["title"] = _conversation_title(prompt)
                 if self._provider_choice is not None:

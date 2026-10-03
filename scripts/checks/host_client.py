@@ -154,14 +154,27 @@ def check_base_url_reaches_provider() -> None:
                 HostClient(HostAddress(host.port, host.token)).send_prompt("hello")
                 if not request_seen.wait(5):
                     fail("selected OpenAI endpoint was not called")
+                request_input = requests[0][1].get("input") if len(requests) == 1 else None
+                valid_input = (
+                    isinstance(request_input, list)
+                    and len(request_input) == 2
+                    and request_input[0].get("role") == "system"
+                    and isinstance(request_input[0].get("content"), list)
+                    and len(request_input[0]["content"]) == 1
+                    and request_input[0]["content"][0].get("type") == "input_text"
+                    and request_input[0]["content"][0].get("text", "").startswith(
+                        "Environment when this conversation started (it does not update):"
+                    )
+                    and request_input[1] == {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    }
+                )
                 if (
                     len(requests) != 1
                     or requests[0][0] != "/v1/responses"
                     or requests[0][1].get("model") != host.run._provider.model
-                    or requests[0][1].get("input") != [{
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "hello"}],
-                    }]
+                    or not valid_input
                 ):
                     fail(f"base URL did not reach only the loopback provider: {requests!r}")
             finally:
