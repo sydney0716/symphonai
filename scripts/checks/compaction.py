@@ -89,6 +89,48 @@ def check_compaction_under_budget_unchanged() -> None:
     if compact_under.changed or compact_under.messages != compact_under_messages:
         fail(f"under-budget compaction should leave messages untouched, got {compact_under}")
 
+
+@check("compaction.forced_under_budget")
+def check_compaction_forced_under_budget() -> None:
+    messages = [
+        Message(Role.SYSTEM, "system prompt"),
+        Message(Role.USER, "first goal"),
+        Message(Role.ASSISTANT, "old detail one"),
+        Message(Role.USER, "middle request one"),
+        Message(Role.ASSISTANT, "old detail two"),
+        Message(Role.USER, "middle request two"),
+        Message(Role.ASSISTANT, "old detail three"),
+        Message(Role.USER, "latest request"),
+        Message(Role.ASSISTANT, "latest answer"),
+    ]
+    ordinary = compact_messages_for_budget(messages, budget=10_000, recent_turns=1)
+    forced = compact_messages_for_budget(
+        messages,
+        budget=10_000,
+        recent_turns=1,
+        force=True,
+        summarize=lambda dropped: "forced summary",
+    )
+    if ordinary.changed or not forced.changed or forced.dropped_messages != 5:
+        fail(f"forced compaction did not differ from under-budget compaction: {ordinary!r}, {forced!r}")
+    if [message.text for message in forced.messages] != [
+        "system prompt",
+        "first goal",
+        "Summary of the earlier conversation, written when it was compacted:\n\nforced summary",
+        "latest request",
+        "latest answer",
+    ]:
+        fail(f"forced compaction did not preserve the prefix and most recent turn: {forced.messages!r}")
+
+    first_turn = [
+        Message(Role.SYSTEM, "system prompt"),
+        Message(Role.USER, "first request"),
+        Message(Role.ASSISTANT, "first answer"),
+    ]
+    unchanged = compact_messages_for_budget(first_turn, budget=10_000, force=True)
+    if unchanged.changed or unchanged.messages != first_turn or unchanged.dropped_messages:
+        fail(f"forced compaction changed a conversation with no older turn: {unchanged!r}")
+
 @check("compaction.preserves_required_context")
 def check_compaction_preserves_required_context() -> None:
     # -- context compaction: over budget drops old middle while staying coherent --

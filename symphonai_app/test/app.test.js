@@ -219,7 +219,7 @@ export function fakeClient(
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
   } = {},
 ) {
-  const calls = { agent: [], approve: [], conversationStats: 0, credentials: [], file: [], forkSession: [], models: [], newSession: 0, openSession: [], prompt: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], forkSession: [], models: [], newSession: 0, openSession: [], prompt: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -267,6 +267,10 @@ export function fakeClient(
     async selectMode(mode) {
       calls.selectMode.push(mode);
       return { mode };
+    },
+    async compact(instructions) {
+      calls.compact.push(instructions);
+      return { changed: false, before_tokens: 0, after_tokens: 0, dropped_messages: 0 };
     },
     async stop() {
       return { accepted: true };
@@ -367,6 +371,7 @@ test("help lists commands and their aliases in table order", async () => {
     "/plan — Switch plan mode on or off",
     "/resume [<search>] — Reopen a past conversation in this project (also /continue)",
     "/cost — Show what this conversation has used",
+    "/compact [<instructions>] — Summarize the conversation so far to free context",
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
@@ -606,6 +611,29 @@ test("resume and continue appear in command suggestions", async () => {
   assert.match(menu.children[0].textContent, /^\/resume/);
 });
 
+test("compact forwards instructions, answers the result, and refreshes conversation", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.compact = async (instructions) => {
+    client.calls.compact.push(instructions);
+    return { changed: true, before_tokens: 1200, after_tokens: 450, dropped_messages: 5 };
+  };
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/compact keep the API names");
+  assert.deepEqual(client.calls.compact, ["keep the API names"]);
+  assert.equal(document.getElementById("chat").children.at(-2).textContent, "Compacting…");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "Compacted: 1200 → 450 tokens, 5 messages summarized.");
+  assert.equal(client.calls.conversationStats, 2);
+
+  client.compact = async (instructions) => {
+    client.calls.compact.push(instructions);
+    return { changed: false, before_tokens: 450, after_tokens: 450, dropped_messages: 0 };
+  };
+  await submitCommand(document, "/compact");
+  assert.equal(client.calls.compact.at(-1), undefined);
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "Nothing to compact yet.");
+});
+
 test("slash suggestions render above the composer without taking focus", async () => {
   const document = new FakeDocument();
   await start({ global: {}, document, client: fakeClient() });
@@ -624,6 +652,7 @@ test("slash suggestions render above the composer without taking focus", async (
     "/plan    Switch plan mode on or off",
     "/resume  [<search>]  Reopen a past conversation in this project",
     "/cost    Show what this conversation has used",
+    "/compact  [<instructions>]  Summarize the conversation so far to free context",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));

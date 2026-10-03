@@ -21,6 +21,7 @@ from symphonai_api.agent_spec import (
     ModelSelector,
 )
 from symphonai_api.call_class import CallClass
+from symphonai_api.cost import UsageTotals
 from symphonai_api.cancellation import (
     CancelReason,
     CancellationToken,
@@ -2132,6 +2133,70 @@ def check_model_summary_request_and_usage() -> None:
             post_usage.input_tokens, post_usage.output_tokens
         ) != (100, 50):
             fail(f"post-run compaction summary usage was not returned: {post_result.usage_by_agent!r}")
+
+
+@check("leader.forced_compaction_instructions_and_usage")
+def check_forced_compaction_instructions_and_usage() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self) -> None:
+            super().__init__([
+                ModelResponse(
+                    Message(Role.ASSISTANT, "short summary"),
+                    usage=Usage(input_tokens=100, output_tokens=50),
+                ),
+                ModelResponse(Message(Role.ASSISTANT, "next answer")),
+            ])
+            self.requests: list[ModelRequest] = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with workspace() as ws:
+        provider = RecordingProvider()
+        provider.model = "leader-summary-model"
+        events = CollectingSink()
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            leader_model="leader-summary-model",
+            chat_token_budget=10_000,
+            chat_recent_turns=4,
+            model_summary=True,
+            events=events,
+        ))
+        leader.seed_chat([
+            Message(Role.SYSTEM, "system prompt"),
+            Message(Role.USER, "first goal"),
+            Message(Role.ASSISTANT, "earlier details " * 40),
+            Message(Role.USER, "middle request"),
+            Message(Role.ASSISTANT, "more earlier details " * 40),
+            Message(Role.USER, "latest request"),
+            Message(Role.ASSISTANT, "latest answer"),
+        ])
+        ordinary = leader.compact_chat()
+        if ordinary.changed:
+            fail(f"ordinary compact_chat changed an under-budget conversation: {ordinary!r}")
+        compacted, usage = leader.force_compact_chat("keep the API names")
+        if not compacted.changed or len(provider.requests) != 1:
+            fail(f"forced compaction did not summarize the under-budget history: {compacted!r}")
+        if not provider.requests[0].messages[0].text.endswith(
+            "Additional instructions from the user:\nkeep the API names"
+        ):
+            fail(f"summary request omitted the supplied instructions: {provider.requests[0]!r}")
+        if usage.get("leader-summary-model") != UsageTotals(
+            input_tokens=100, output_tokens=50, calls=1
+        ):
+            fail(f"forced summary usage was not returned: {usage!r}")
+        if len(events.of_type(CompactionApplied)) != 1:
+            fail(f"forced compaction skipped the normal compaction event: {events.events!r}")
+
+        leader.chat("next prompt")
+        if usage.get("leader-summary-model") != UsageTotals(
+            input_tokens=100, output_tokens=50, calls=1
+        ):
+            fail(f"the next chat mutated or cleared returned summary usage: {usage!r}")
 
 
 @check("leader.context_overflow_retry_failure")

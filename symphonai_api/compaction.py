@@ -230,8 +230,9 @@ def compact_messages_for_budget(
     recent_turns: int = DEFAULT_RECENT_TURNS,
     cancel: CancellationToken | None = None,
     summarize: Callable[[list[Message]], str] | None = None,
+    force: bool = False,
 ) -> CompactionResult:
-    """Compact a conversation if its estimated token cost exceeds `budget`.
+    """Compact a conversation if it exceeds `budget`, or when `force` is true.
 
     The compactor preserves all system messages before the recent window, the
     earliest user goal, and the most recent `recent_turns` user turns. Older
@@ -249,7 +250,7 @@ def compact_messages_for_budget(
 
     original = list(messages)
     before_tokens = estimate_messages_tokens(original)
-    if before_tokens <= budget:
+    if before_tokens <= budget and not force:
         return CompactionResult(
             messages=original,
             before_tokens=before_tokens,
@@ -259,13 +260,24 @@ def compact_messages_for_budget(
             recent_turns=recent_turns,
         )
 
-    microcompacted = microcompact_messages(
-        original,
-        budget=budget,
-        recent_turns=recent_turns,
-        cancel=cancel,
+    microcompacted = (
+        MicrocompactionResult(
+            messages=original,
+            before_tokens=before_tokens,
+            after_tokens=before_tokens,
+            budget=budget,
+            changed=False,
+            recent_turns=recent_turns,
+        )
+        if force
+        else microcompact_messages(
+            original,
+            budget=budget,
+            recent_turns=recent_turns,
+            cancel=cancel,
+        )
     )
-    if microcompacted.after_tokens <= budget:
+    if not force and microcompacted.after_tokens <= budget:
         return CompactionResult(
             messages=microcompacted.messages,
             before_tokens=before_tokens,
@@ -286,6 +298,15 @@ def compact_messages_for_budget(
         if index not in prefix_indices and index not in recent_indices
     ]
     if not dropped_indices:
+        if force:
+            return CompactionResult(
+                messages=original,
+                before_tokens=before_tokens,
+                after_tokens=before_tokens,
+                budget=budget,
+                changed=False,
+                recent_turns=recent_turns,
+            )
         raise _impossible_error(before_tokens, budget, recent_turns)
 
     prefix = [working[index] for index in sorted(prefix_indices)]

@@ -125,6 +125,29 @@ test("permission mode refusal preserves the host message", async () => {
   );
 });
 
+test("manual compaction uses the authenticated JSON request", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, {
+      changed: true,
+      before_tokens: 1200,
+      after_tokens: 450,
+      dropped_messages: 5,
+    });
+  } });
+  assert.deepEqual(await client.compact("keep the API names"), {
+    changed: true,
+    before_tokens: 1200,
+    after_tokens: 450,
+    dropped_messages: 5,
+  });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/compact");
+  assert.equal(records[0].options.method, "POST");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(JSON.parse(records[0].options.body), { instructions: "keep the API names" });
+});
+
 test("agent definitions use authenticated read and write routes", async () => {
   const records = [];
   const client = createClient({

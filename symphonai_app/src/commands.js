@@ -47,6 +47,12 @@ export const COMMANDS = Object.freeze([
     description: "Show what this conversation has used",
     argumentHint: "",
   }),
+  Object.freeze({
+    name: "compact",
+    aliases: Object.freeze([]),
+    description: "Summarize the conversation so far to free context",
+    argumentHint: "[<instructions>]",
+  }),
 ]);
 
 export function matchCommands(text) {

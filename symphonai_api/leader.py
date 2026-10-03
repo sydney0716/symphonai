@@ -1037,16 +1037,43 @@ class Leader:
         self._context_overflow_repair_failed = False
         return result
 
+    def force_compact_chat(
+        self,
+        instructions: str | None = None,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> tuple[CompactionResult, dict[str, UsageTotals]]:
+        """Compact the earlier conversation now and return summary usage."""
+        self._compaction_usage_by_model.clear()
+        try:
+            result = self._compact_chat_to_budget(
+                self.chat_token_budget,
+                cancel=cancel,
+                recent_turns=1,
+                force=True,
+                instructions=instructions,
+            )
+            self._context_overflow_repair_failed = False
+            return result, dict(self._compaction_usage_by_model)
+        finally:
+            self._compaction_usage_by_model.clear()
+
     def _write_model_summary(
         self,
         dropped: list[Message],
         *,
         cancel: CancellationToken | None = None,
+        instructions: str | None = None,
     ) -> str:
         model = self._leader_spec.model.model
+        system_prompt = MODEL_SUMMARY_PROMPT
+        if instructions is not None:
+            system_prompt += (
+                "\n\nAdditional instructions from the user:\n" + instructions
+            )
         request = ModelRequest(
             messages=[
-                Message(Role.SYSTEM, MODEL_SUMMARY_PROMPT),
+                Message(Role.SYSTEM, system_prompt),
                 Message(Role.USER, render_dropped_messages(dropped)),
             ],
             model=model,
@@ -1086,6 +1113,8 @@ class Leader:
         cancel: CancellationToken | None = None,
         record_success: bool = True,
         recent_turns: int | None = None,
+        force: bool = False,
+        instructions: str | None = None,
     ) -> CompactionResult:
         compact_kwargs = {
             "budget": budget,
@@ -1096,9 +1125,11 @@ class Leader:
             ),
             "cancel": cancel,
         }
+        if force:
+            compact_kwargs["force"] = True
         if self._config.model_summary:
             compact_kwargs["summarize"] = lambda dropped: self._write_model_summary(
-                dropped, cancel=cancel
+                dropped, cancel=cancel, instructions=instructions
             )
         result = compact_messages_for_budget(self._chat_messages, **compact_kwargs)
         if result.changed:

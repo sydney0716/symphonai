@@ -2511,6 +2511,142 @@ def check_provider_change_refused_while_active() -> None:
             run.close()
 
 
+@check("host_server.manual_compaction_endpoint")
+def check_manual_compaction_endpoint() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "answer one")),
+            ModelResponse(Message(Role.ASSISTANT, "answer two")),
+            ModelResponse(Message(Role.ASSISTANT, "answer three")),
+            ModelResponse(
+                Message(Role.ASSISTANT, "short summary"),
+                usage=Usage(input_tokens=100, output_tokens=50),
+            ),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            chat_token_budget=100_000,
+            chat_recent_turns=4,
+        )
+        host.start()
+        try:
+            for index in range(3):
+                _send_host_prompt(host, f"request {index} " + "x" * 1_200)
+            before_conversation = _conversation_reply(host)[1]["conversation"]
+            before = before_conversation["context"]["used_tokens"]
+            before_leader = next(
+                agent for agent in before_conversation["agents"] if agent["name"] == "leader"
+            )
+
+            connection, response = _request(
+                host, "POST", "/compact",
+                body={"instructions": "keep the API names"},
+                headers=_headers(host),
+            )
+            try:
+                compact_body = json.loads(response.read())
+                if response.status != 200:
+                    fail(f"manual compaction returned {response.status}: {compact_body!r}")
+            finally:
+                connection.close()
+            if (
+                compact_body.get("changed") is not True
+                or compact_body.get("after_tokens", before) >= before
+                or compact_body.get("dropped_messages", 0) < 1
+            ):
+                fail(f"manual compaction did not reduce context: {compact_body!r}, before={before}")
+            conversation = _conversation_reply(host)[1]["conversation"]
+            leader = next(agent for agent in conversation["agents"] if agent["name"] == "leader")
+            if (
+                conversation["context"]["used_tokens"] >= before
+                or leader.get("input_tokens") != before_leader.get("input_tokens", 0) + 100
+                or leader.get("output_tokens") != before_leader.get("output_tokens", 0) + 50
+                or leader.get("calls") != before_leader.get("calls", 0) + 1
+            ):
+                fail(f"conversation stats omitted compacted context or summary usage: {conversation!r}")
+
+            connection, response = _request(
+                host, "POST", "/compact", body={"x": 1}, headers=_headers(host)
+            )
+            try:
+                invalid = json.loads(response.read())
+                if response.status != 400:
+                    fail(f"invalid compact key returned {response.status}: {invalid!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/compact", body={"instructions": 3}, headers=_headers(host)
+            )
+            try:
+                if response.status != 400:
+                    fail(f"non-string compact instructions returned {response.status}")
+            finally:
+                connection.close()
+        finally:
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        empty = HostServer(
+            FakeModelProvider(), PermissionPolicy(root), sessions_root=root / "sessions"
+        )
+        empty.start()
+        try:
+            connection, response = _request(
+                empty, "POST", "/compact", body={}, headers=_headers(empty)
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 400 or body != {"error": "no conversation to compact"}:
+                    fail(f"pre-conversation compaction response was incorrect: {response.status}, {body!r}")
+            finally:
+                connection.close()
+        finally:
+            empty.close()
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingProvider(FakeModelProvider):
+        def create_response(self, request, *, cancel=None):
+            entered.set()
+            if not release.wait(3):
+                fail("active compact provider was not released")
+            return ModelResponse(Message(Role.ASSISTANT, "done"))
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        active = HostServer(
+            BlockingProvider(), PermissionPolicy(root), sessions_root=root / "sessions"
+        )
+        active.start()
+        try:
+            connection, response = _request(
+                active, "POST", "/prompt", body={"prompt": "hold"}, headers=_headers(active)
+            )
+            accepted = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or not accepted.get("accepted"):
+                fail(f"active compact fixture did not start: {response.status}, {accepted!r}")
+            if not entered.wait(2):
+                fail("active compact fixture did not reach its provider")
+            connection, response = _request(
+                active, "POST", "/compact", body={}, headers=_headers(active)
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 409 or body.get("run_id") != accepted.get("run_id"):
+                    fail(f"active compaction did not return 409 and run id: {response.status}, {body!r}")
+            finally:
+                connection.close()
+        finally:
+            release.set()
+            active.close()
+
+
 @check("host_server.conversation_reports_model_selection")
 def check_conversation_reports_model_selection() -> None:
     provider = _RecordingWireFakeProvider(

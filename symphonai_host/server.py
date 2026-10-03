@@ -44,7 +44,13 @@ from symphonai_host.protocol import (
     encode_event,
     encode_frame,
 )
-from symphonai_host.run import HostRun, ModeSelectionError, ProviderSelectionError, RunActiveError
+from symphonai_host.run import (
+    HostRun,
+    ModeSelectionError,
+    NoConversationError,
+    ProviderSelectionError,
+    RunActiveError,
+)
 from symphonai_host.sessions import list_sessions
 
 
@@ -884,7 +890,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/agent") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -1039,6 +1045,43 @@ class HostServer:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
                     self._json(HTTPStatus.OK, {"mode": mode})
+                    return
+                if self.path == "/compact":
+                    try:
+                        payload = self._read_object()
+                        if (
+                            set(payload) - {"instructions"}
+                            or (
+                                "instructions" in payload
+                                and not isinstance(payload["instructions"], str)
+                            )
+                        ):
+                            raise ProtocolError(
+                                "compact accepts only an optional string instructions"
+                            )
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        result = host.run.compact(payload.get("instructions"))
+                    except RunActiveError as exc:
+                        self._json(
+                            HTTPStatus.CONFLICT,
+                            {"error": str(exc), "run_id": exc.run_id},
+                        )
+                        return
+                    except NoConversationError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "changed": result.changed,
+                            "before_tokens": result.before_tokens,
+                            "after_tokens": result.after_tokens,
+                            "dropped_messages": result.dropped_messages,
+                        },
+                    )
                     return
                 kind = self.path.removeprefix("/")
                 try:

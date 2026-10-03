@@ -1478,6 +1478,20 @@ export async function start({ global, document, client }) {
     }
     if (entry.name === "cost") {
       await showCost(args);
+      return;
+    }
+    if (entry.name === "compact") {
+      answerCommand("Compacting…");
+      try {
+        const instructions = command.slice(typedName.length).trim();
+        const result = await boundary.compact(instructions || undefined);
+        answerCommand(result.changed
+          ? `Compacted: ${result.before_tokens} → ${result.after_tokens} tokens, ${result.dropped_messages} messages summarized.`
+          : "Nothing to compact yet.");
+      } catch (error) {
+        answerCommand(error instanceof Error ? error.message : String(error));
+      }
+      await refreshConversation();
     }
   }
 

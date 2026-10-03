@@ -209,6 +209,15 @@ its eventual answer still resolves that request. A host starts in `ask`; if
 preferring `plan` to `allow`. An empty modes ceiling is a configuration error.
 Starting a new chat or reopening a session resets to that starting mode.
 
+Authenticated `POST /compact` takes `{}` or `{"instructions": str}` and
+returns `{"changed": bool, "before_tokens": int, "after_tokens": int,
+"dropped_messages": int}`. It forces compaction of the current conversation,
+preserving its system messages, first user message, and latest user turn. A
+summary may include the optional user instructions. Other keys or a
+non-string `instructions` value return `400`; an active run returns `409` with
+its `run_id`; no open conversation returns `400` with
+`{"error": "no conversation to compact"}`.
+
 Authenticated `GET /conversation` returns `{"conversation": null}` before a
 conversation is open. Otherwise `conversation` contains the live `provider`,
 `model`, and `effort`, plus an `agents` array whose

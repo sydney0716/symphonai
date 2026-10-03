@@ -324,6 +324,16 @@ export function createClient({
       return request("POST", "/mode", { mode }, readReply, { detailOnError: true });
     },
 
+    compact(instructions) {
+      return request(
+        "POST",
+        "/compact",
+        instructions === undefined ? {} : { instructions },
+        readReply,
+        { detailOnError: true },
+      );
+    },
+
     storeCredential(name, value) {
       return request("POST", "/credentials", { name, value });
     },

@@ -14,7 +14,7 @@ from symphonai_api.agent_memory import AgentMemory
 from symphonai_api.agent_spec import AgentSpec
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.compaction import DEFAULT_RECENT_TURNS
+from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
 from symphonai_api.config import resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
@@ -55,6 +55,10 @@ class RunActiveError(RuntimeError):
     def __init__(self, run_id: str) -> None:
         super().__init__(f"run already active: {run_id}")
         self.run_id = run_id
+
+
+class NoConversationError(RuntimeError):
+    """A conversation-only operation was requested before the first prompt."""
 
 
 class ProviderSelectionError(ValueError):
@@ -648,6 +652,29 @@ class HostRun:
             leader._chat_messages,
             budget=leader.chat_token_budget,
         )
+
+    def compact(self, instructions: str | None = None) -> CompactionResult:
+        """Force compact the current conversation and publish its new usage."""
+        with self._lock:
+            if self._active is not None:
+                raise RunActiveError(self._active.run_id)
+            if self._conversation is None:
+                raise NoConversationError("no conversation to compact")
+            leader = self._conversation[0]
+            result, summary_usage = leader.force_compact_chat(instructions)
+            agent_id = leader.agent_ref.agent_id
+            name, current_usage = self._usage_by_agent.get(
+                agent_id, (leader.agent_ref.name, {})
+            )
+            self._usage_by_agent[agent_id] = (
+                name,
+                self._merge_usage(current_usage, summary_usage),
+            )
+            self._context_report = account_context(
+                leader._chat_messages,
+                budget=leader.chat_token_budget,
+            )
+            return result
 
     def conversation_stats(self) -> dict | None:
         with self._lock:
