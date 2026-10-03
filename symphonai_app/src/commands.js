@@ -35,6 +35,18 @@ export const COMMANDS = Object.freeze([
     description: "Switch plan mode on or off",
     argumentHint: "",
   }),
+  Object.freeze({
+    name: "resume",
+    aliases: Object.freeze(["continue"]),
+    description: "Reopen a past conversation in this project",
+    argumentHint: "[<search>]",
+  }),
+  Object.freeze({
+    name: "cost",
+    aliases: Object.freeze([]),
+    description: "Show what this conversation has used",
+    argumentHint: "",
+  }),
 ]);
 
 export function matchCommands(text) {

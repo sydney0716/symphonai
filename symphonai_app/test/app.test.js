@@ -365,6 +365,8 @@ test("help lists commands and their aliases in table order", async () => {
     "/help — Show the commands",
     "/new — Start a new chat (also /clear)",
     "/plan — Switch plan mode on or off",
+    "/resume [<search>] — Reopen a past conversation in this project (also /continue)",
+    "/cost — Show what this conversation has used",
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
@@ -460,6 +462,150 @@ test("the clear alias is suggested and Enter starts a new chat", async () => {
   assert.equal(document.getElementById("chat").children.length, 0);
 });
 
+test("resume lists this project's newest conversations and shares opening with the sidebar", async () => {
+  const document = new FakeDocument();
+  const sessions = [
+    { run_id: "newest", title: "Newest", repo_root: "/work/current", updated_at: "2026-03-03" },
+    { run_id: "middle", title: "Middle", repo_root: "/work/current", updated_at: "2026-03-02" },
+    { run_id: "oldest", title: null, repo_root: "/work/current", updated_at: "2026-03-01" },
+    { run_id: "elsewhere", title: "Elsewhere", repo_root: "/work/other", updated_at: "2026-03-04" },
+  ];
+  const client = fakeClient(fixtureRoadmap(), { sessions });
+  const transcriptAtOpen = [];
+  client.openSession = async (runId) => {
+    client.calls.openSession.push(runId);
+    transcriptAtOpen.push(visibleText(document.getElementById("chat")));
+    return { run_id: runId };
+  };
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: "Before sidebar open" }));
+  const newestLink = find(document.getElementById("sidebar"), (row) => (
+    row.className === "session-link" && row.textContent === "Newest"
+  ));
+  await newestLink.dispatch("click");
+  assert.equal(document.getElementById("chat").children.length, 0);
+
+  await client.emit(eventFrame("AssistantTextDelta", { text: "Before resume open" }));
+  await submitCommand(document, "/resume");
+  const picker = find(document.getElementById("chat-pane"), (row) => row.className === "picker");
+  assert.equal(find(picker, (row) => row.className === "picker-title").textContent, "Resume a conversation");
+  const rows = find(picker, (row) => row.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["Newest", "Middle", "oldest"]);
+  assert.match(rows[0].className, /current/);
+  assert.match(rows[1].className, /focused/);
+  assert.deepEqual(client.calls.sessions, [200, undefined]);
+  await picker.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(client.calls.openSession, ["newest", "middle"]);
+  assert.deepEqual(transcriptAtOpen, ["", ""]);
+  assert.equal(document.getElementById("chat").children.length, 0);
+});
+
+test("resume search opens one match directly, reports no matches, and cancels its picker", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [
+      { run_id: "run-refactor", title: "Refactor branch", repo_root: "/work/current" },
+      { run_id: "run-other", title: "Other work", repo_root: "/work/current" },
+    ],
+  });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/resume REFACTOR");
+  assert.deepEqual(client.calls.openSession, ["run-refactor"]);
+  assert.equal(find(document.getElementById("chat-pane"), (row) => row.className === "picker"), undefined);
+
+  await submitCommand(document, "/resume missing");
+  assert.match(visibleText(document.getElementById("chat")), /No conversation in this project matches "missing"\./);
+  await submitCommand(document, "/resume");
+  const picker = find(document.getElementById("chat-pane"), (row) => row.className === "picker");
+  await picker.dispatch("keydown", { key: "Escape" });
+  assert.equal(find(document.getElementById("chat-pane"), (row) => row.className === "picker"), undefined);
+  assert.match(visibleText(document.getElementById("chat")), /Kept the current conversation\./);
+});
+
+test("resume reports empty and failed session listings", async () => {
+  const emptyDocument = new FakeDocument();
+  const emptyClient = fakeClient();
+  await start({ global: {}, document: emptyDocument, client: emptyClient });
+  await submitCommand(emptyDocument, "/resume");
+  assert.match(visibleText(emptyDocument.getElementById("chat")), /No past conversations in this project\./);
+
+  const failedDocument = new FakeDocument();
+  const failedClient = fakeClient();
+  failedClient.sessions = async (limit) => {
+    failedClient.calls.sessions.push(limit);
+    if (limit === undefined) throw new Error("Session listing unavailable.");
+    return [];
+  };
+  await start({ global: {}, document: failedDocument, client: failedClient });
+  await submitCommand(failedDocument, "/resume");
+  assert.match(visibleText(failedDocument.getElementById("chat")), /Session listing unavailable\./);
+});
+
+test("cost prints agent and total usage with optional cache counts and cost", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  let conversation = null;
+  client.conversationStats = async () => {
+    client.calls.conversationStats += 1;
+    return { conversation };
+  };
+  await start({ global: {}, document, client });
+  conversation = {
+    agents: [{
+      name: "leader",
+      input_tokens: 1070,
+      output_tokens: 35,
+      total_tokens: 1105,
+      cache_read_tokens: 900,
+      cache_write_tokens: 50,
+      cost: { amount: "0.00141", currency: "USD" },
+    }],
+    usage: {
+      input_tokens: 1073,
+      output_tokens: 37,
+      total_tokens: 1110,
+      cache_read_tokens: 900,
+      cache_write_tokens: 50,
+      cost: { amount: "0.00141", currency: "USD" },
+    },
+  };
+  await submitCommand(document, "/cost");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, [
+    "leader: 1105 tokens (input 1070, output 35, cache read 900, cache write 50) · 0.00141 USD",
+    "Total: 1110 tokens (input 1073, output 37, cache read 900, cache write 50) · 0.00141 USD",
+  ].join("\n"));
+
+  conversation = {
+    agents: [{ name: "leader", input_tokens: 4, output_tokens: 1, total_tokens: 5 }],
+    usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+  };
+  await submitCommand(document, "/cost");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, [
+    "leader: 5 tokens (input 4, output 1)",
+    "Total: 5 tokens (input 4, output 1)",
+  ].join("\n"));
+
+  conversation = null;
+  await submitCommand(document, "/cost");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "No usage recorded in this conversation yet.");
+  await submitCommand(document, "/cost extra");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "Usage: /cost");
+});
+
+test("resume and continue appear in command suggestions", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const input = document.getElementById("prompt");
+  input.value = "/res";
+  await input.dispatch("input");
+  let menu = find(document.getElementById("chat-pane"), (row) => row.className === "command-menu");
+  assert.match(menu.children[0].textContent, /^\/resume/);
+  input.value = "/cont";
+  await input.dispatch("input");
+  menu = find(document.getElementById("chat-pane"), (row) => row.className === "command-menu");
+  assert.match(menu.children[0].textContent, /^\/resume/);
+});
+
 test("slash suggestions render above the composer without taking focus", async () => {
   const document = new FakeDocument();
   await start({ global: {}, document, client: fakeClient() });
@@ -476,6 +622,8 @@ test("slash suggestions render above the composer without taking focus", async (
     "/help    Show the commands",
     "/new    Start a new chat",
     "/plan    Switch plan mode on or off",
+    "/resume  [<search>]  Reopen a past conversation in this project",
+    "/cost    Show what this conversation has used",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));

@@ -543,6 +543,28 @@ export async function start({ global, document, client }) {
     replace(chatRoot, ...children);
   }
 
+  async function openSession(runId) {
+    const previous = [...transcript.model];
+    const previousId = currentSessionId;
+    transcript.model.length = 0;
+    currentSessionId = runId;
+    showTranscript();
+    try {
+      await boundary.openSession(runId);
+      board.clear();
+      conversation = null;
+      showConversationUsage();
+      showAgents();
+      await refreshConversation();
+      navigate({ page: "chat", section: "" });
+    } catch (error) {
+      transcript.model.splice(0, transcript.model.length, ...previous);
+      currentSessionId = previousId;
+      showTranscript();
+      throw error;
+    }
+  }
+
   function showProjects() {
     const groups = [];
     for (const group of projectGroups(sessions, project.repo_root)) {
@@ -587,25 +609,7 @@ export async function start({ global, document, client }) {
         });
         button.type = "button";
         listen(button, "click", async () => {
-          const previous = [...transcript.model];
-          const previousId = currentSessionId;
-          transcript.model.length = 0;
-          currentSessionId = session.run_id;
-          showTranscript();
-          try {
-            await boundary.openSession(session.run_id);
-            board.clear();
-            conversation = null;
-            showConversationUsage();
-            showAgents();
-            await refreshConversation();
-            navigate({ page: "chat", section: "" });
-          } catch (error) {
-            transcript.model.splice(0, transcript.model.length, ...previous);
-            currentSessionId = previousId;
-            showTranscript();
-            throw error;
-          }
+          await openSession(session.run_id);
         });
         append(section, button);
       }
@@ -987,6 +991,99 @@ export async function start({ global, document, client }) {
     await chooseMode(nextMode);
     if ((conversation?.mode ?? currentMode) !== "plan") {
       rememberedPlanMode = null;
+    }
+  }
+
+  async function resumeConversation(args) {
+    let listed;
+    try {
+      listed = await boundary.sessions();
+    } catch (error) {
+      answerCommand(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    let matches = (Array.isArray(listed) ? listed : [])
+      .filter((session) => session.repo_root === project.repo_root);
+    if (args.length > 0) {
+      const search = args.join(" ").toLowerCase();
+      matches = matches.filter((session) => (
+        (session.title ?? "").toLowerCase().includes(search)
+        || (session.run_id ?? "").toLowerCase().includes(search)
+      ));
+      if (matches.length === 0) {
+        answerCommand(`No conversation in this project matches "${args.join(" ")}".`);
+        return;
+      }
+      if (matches.length === 1) {
+        try {
+          await openSession(matches[0].run_id);
+        } catch (error) {
+          answerCommand(error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
+    } else {
+      matches = matches.slice(0, 20);
+      if (matches.length === 0) {
+        answerCommand("No past conversations in this project.");
+        return;
+      }
+    }
+
+    const rows = matches.map((session) => ({
+      id: session.run_id,
+      label: session.title || session.run_id,
+      current: session.run_id === currentSessionId,
+    }));
+    const firstNotCurrent = rows.findIndex((row) => !row.current);
+    showPicker({
+      title: "Resume a conversation",
+      rows,
+      initialIndex: firstNotCurrent < 0 ? 0 : firstNotCurrent,
+      onChoose: async (row) => {
+        closePicker();
+        try {
+          await openSession(row.id);
+        } catch (error) {
+          answerCommand(error instanceof Error ? error.message : String(error));
+        }
+      },
+      onCancel: () => {
+        closePicker();
+        answerCommand("Kept the current conversation.");
+      },
+    });
+  }
+
+  function usageLine(name, usage) {
+    const details = [`input ${usage.input_tokens}`, `output ${usage.output_tokens}`];
+    if (usage.cache_read_tokens > 0) details.push(`cache read ${usage.cache_read_tokens}`);
+    if (usage.cache_write_tokens > 0) details.push(`cache write ${usage.cache_write_tokens}`);
+    const cost = usage.cost && typeof usage.cost.amount === "string" && typeof usage.cost.currency === "string"
+      ? ` · ${usage.cost.amount} ${usage.cost.currency}`
+      : "";
+    return `${name}: ${usage.total_tokens} tokens (${details.join(", ")})${cost}`;
+  }
+
+  async function showCost(args) {
+    if (args.length > 0) {
+      answerCommand("Usage: /cost");
+      return;
+    }
+    try {
+      const reply = await boundary.conversationStats();
+      const current = reply?.conversation;
+      if (!current?.usage || !Number.isInteger(current.usage.total_tokens)) {
+        answerCommand("No usage recorded in this conversation yet.");
+        return;
+      }
+      const lines = (current.agents ?? [])
+        .filter((agent) => Number.isInteger(agent.total_tokens))
+        .map((agent) => usageLine(agent.name, agent));
+      lines.push(usageLine("Total", current.usage));
+      answerCommand(lines.join("\n"));
+    } catch (error) {
+      answerCommand(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -1373,6 +1470,14 @@ export async function start({ global, document, client }) {
         return;
       }
       await togglePlanMode();
+      return;
+    }
+    if (entry.name === "resume") {
+      await resumeConversation(args);
+      return;
+    }
+    if (entry.name === "cost") {
+      await showCost(args);
     }
   }
 
