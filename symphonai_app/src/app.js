@@ -15,6 +15,18 @@ import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState } from "./turn.js";
 
+export const INIT_PROMPT = `Please analyze this repository and write .symphonai/INSTRUCTIONS.md, which SymphonAI loads into every conversation in this project.
+
+Include:
+1. The commands used most often: how to build, lint and run the tests, including how to run a single test.
+2. The high-level architecture: the big picture that takes reading several files to understand.
+
+Rules:
+- If .symphonai/INSTRUCTIONS.md already exists, read it and improve it instead of starting over.
+- Keep it short: only what an agent would get wrong without it. Do not list every file or directory, and do not add generic advice such as writing tests or handling errors.
+- If README.md, CLAUDE.md, AGENTS.md, .cursorrules, .cursor/rules/ or .github/copilot-instructions.md exist, carry over the parts that matter.
+- Do not invent sections or facts the repository does not support.`;
+
 function filename(path) {
   return path.split("/").at(-1).replace(/\.md$/, "");
 }
@@ -1492,6 +1504,20 @@ export async function start({ global, document, client }) {
         answerCommand(error instanceof Error ? error.message : String(error));
       }
       await refreshConversation();
+      return;
+    }
+    if (entry.name === "init") {
+      if (args.length > 0) {
+        answerCommand("Usage: /init");
+        return;
+      }
+      if ((conversation?.mode ?? currentMode) === "plan") {
+        answerCommand("Plan mode cannot write files. Switch with /plan, then run /init.");
+        return;
+      }
+      promptFailure = "";
+      showPromptError();
+      await perform(turn.submit(INIT_PROMPT));
     }
   }
 

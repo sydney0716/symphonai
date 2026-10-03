@@ -53,6 +53,12 @@ export const COMMANDS = Object.freeze([
     description: "Summarize the conversation so far to free context",
     argumentHint: "[<instructions>]",
   }),
+  Object.freeze({
+    name: "init",
+    aliases: Object.freeze([]),
+    description: "Have the agent write .symphonai/INSTRUCTIONS.md",
+    argumentHint: "",
+  }),
 ]);
 
 export function matchCommands(text) {

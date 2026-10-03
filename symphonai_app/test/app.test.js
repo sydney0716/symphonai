@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-import { start } from "../src/app.js";
+import { INIT_PROMPT, start } from "../src/app.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
 import { createClient } from "../src/client.js";
 import { DISPATCHING, IDLE, RUNNING } from "../src/turn.js";
@@ -372,6 +372,7 @@ test("help lists commands and their aliases in table order", async () => {
     "/resume [<search>] — Reopen a past conversation in this project (also /continue)",
     "/cost — Show what this conversation has used",
     "/compact [<instructions>] — Summarize the conversation so far to free context",
+    "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
@@ -634,6 +635,74 @@ test("compact forwards instructions, answers the result, and refreshes conversat
   assert.equal(document.getElementById("chat").children.at(-1).textContent, "Nothing to compact yet.");
 });
 
+test("init sends the fixed prompt in ask mode and clears the composer", async () => {
+  const expected = `Please analyze this repository and write .symphonai/INSTRUCTIONS.md, which SymphonAI loads into every conversation in this project.
+
+Include:
+1. The commands used most often: how to build, lint and run the tests, including how to run a single test.
+2. The high-level architecture: the big picture that takes reading several files to understand.
+
+Rules:
+- If .symphonai/INSTRUCTIONS.md already exists, read it and improve it instead of starting over.
+- Keep it short: only what an agent would get wrong without it. Do not list every file or directory, and do not add generic advice such as writing tests or handling errors.
+- If README.md, CLAUDE.md, AGENTS.md, .cursorrules, .cursor/rules/ or .github/copilot-instructions.md exist, carry over the parts that matter.
+- Do not invent sections or facts the repository does not support.`;
+  assert.equal(INIT_PROMPT, expected);
+
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "ask" },
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "run-init" };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "/init";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, [expected]);
+  assert.equal(input.value, "");
+});
+
+test("init queues behind a running turn and sends when that turn finishes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: `run-${client.calls.prompt.length}` };
+  };
+  const app = await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "first request";
+  await document.getElementById("prompt-form").dispatch("submit");
+  await client.emit(eventFrame("RunStarted", { run_id: "run-active" }));
+
+  input.value = "/init";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, ["first request"]);
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), [INIT_PROMPT]);
+  assert.equal(input.value, "");
+
+  await client.emit(eventFrame("RunFinished", { run_id: "run-active" }));
+  assert.deepEqual(client.calls.prompt, ["first request", INIT_PROMPT]);
+  assert.deepEqual(app.turn.queue, []);
+});
+
+test("init is refused in plan mode and rejects arguments", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "plan" },
+  });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/init");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "Plan mode cannot write files. Switch with /plan, then run /init.");
+  assert.deepEqual(client.calls.prompt, []);
+  await submitCommand(document, "/init now");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "Usage: /init");
+  assert.deepEqual(client.calls.prompt, []);
+});
+
 test("slash suggestions render above the composer without taking focus", async () => {
   const document = new FakeDocument();
   await start({ global: {}, document, client: fakeClient() });
@@ -653,6 +722,7 @@ test("slash suggestions render above the composer without taking focus", async (
     "/resume  [<search>]  Reopen a past conversation in this project",
     "/cost    Show what this conversation has used",
     "/compact  [<instructions>]  Summarize the conversation so far to free context",
+    "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));
