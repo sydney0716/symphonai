@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 import { start } from "../src/app.js";
+import { COMMANDS, matchCommands } from "../src/commands.js";
 import { createClient } from "../src/client.js";
 import { DISPATCHING, IDLE, RUNNING } from "../src/turn.js";
 
@@ -64,6 +65,10 @@ class FakeElement {
     for (const listener of this.listeners.get(type) ?? []) {
       await listener(event);
     }
+  }
+
+  requestSubmit() {
+    return this.dispatch("submit");
   }
 }
 
@@ -336,6 +341,117 @@ function eventFrame(type, fields = {}) {
     },
   };
 }
+
+test("command matching prioritizes names and also searches descriptions", () => {
+  assert.deepEqual(matchCommands("/"), COMMANDS);
+  assert.deepEqual(matchCommands("/mo"), [COMMANDS[0], COMMANDS[1]]);
+  assert.deepEqual(matchCommands("/MOD"), [COMMANDS[0], COMMANDS[1]]);
+  assert.deepEqual(matchCommands("/model"), [COMMANDS[1]]);
+  assert.deepEqual(matchCommands("/choose"), COMMANDS);
+  assert.deepEqual(matchCommands("/current"), [COMMANDS[2]]);
+  assert.deepEqual(matchCommands("/model x"), []);
+  assert.deepEqual(matchCommands("hello"), []);
+});
+
+test("slash suggestions render above the composer without taking focus", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const input = document.getElementById("prompt");
+  input.focus();
+  input.value = "/";
+  await input.dispatch("input");
+
+  const menu = find(document.getElementById("chat-pane"), (node) => node.className === "command-menu");
+  assert.deepEqual(menu.children.map((row) => row.textContent), [
+    "/mode    Choose the permission mode",
+    "/model  [<provider> [<id> [<effort>]]]  Choose the provider, model and effort",
+    "/effort  [<value>]  Choose the effort for the current model",
+  ]);
+  assert.equal(document.activeElement, input);
+  assert.equal(menu.parentNode, document.getElementById("chat-pane"));
+
+  input.value = "/mode ";
+  await input.dispatch("input");
+  assert.equal(menu.children.length, 0);
+  assert.equal(document.activeElement, input);
+});
+
+test("slash menu navigation runs the highlighted command and Tab accepts without running", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "ask" },
+  });
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.focus();
+  input.value = "/mo";
+  await input.dispatch("input");
+  await input.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(document.activeElement, input);
+  await input.dispatch("keydown", { key: "Enter" });
+
+  const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  assert.equal(find(picker, (node) => node.className === "picker-title").textContent, "Models · openai");
+  assert.equal(input.value, "");
+
+  const tabDocument = new FakeDocument();
+  const tabClient = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "ask" },
+  });
+  await start({ global: {}, document: tabDocument, client: tabClient });
+  const tabInput = tabDocument.getElementById("prompt");
+  tabInput.focus();
+  tabInput.value = "/ef";
+  await tabInput.dispatch("input");
+  await tabInput.dispatch("keydown", { key: "Tab" });
+
+  assert.equal(tabInput.value, "/effort ");
+  assert.equal(find(tabDocument.getElementById("chat-pane"), (node) => node.className === "command-menu").children.length, 0);
+  assert.equal(tabDocument.activeElement, tabInput);
+  assert.deepEqual(tabClient.calls.models, []);
+  assert.deepEqual(tabClient.calls.selectProvider, []);
+  assert.equal(visibleText(tabDocument.getElementById("chat")), "");
+});
+
+test("Escape dismisses slash suggestions without changing text, and row clicks run commands", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const input = document.getElementById("prompt");
+  input.focus();
+  input.value = "/mo";
+  await input.dispatch("input");
+  await input.dispatch("keydown", { key: "Escape" });
+  const menu = find(document.getElementById("chat-pane"), (node) => node.className === "command-menu");
+  assert.equal(input.value, "/mo");
+  assert.equal(menu.children.length, 0);
+  assert.equal(document.activeElement, input);
+
+  input.value = "/";
+  await input.dispatch("input");
+  const modeRow = menu.children[0];
+  await modeRow.dispatch("mousedown");
+  assert.equal(document.activeElement, input);
+  await modeRow.dispatch("click");
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker").className, "picker");
+  assert.equal(input.value, "");
+});
+
+test("Mod+Enter submits the composer through the form", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "run-keyboard" };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.focus();
+  input.value = "hello";
+  await input.dispatch("keydown", { key: "Enter", ctrlKey: true });
+
+  assert.deepEqual(client.calls.prompt, ["hello"]);
+  assert.equal(input.value, "");
+});
 
 function toolStarted(id, name, target = "") {
   return eventFrame("ToolCallStarted", {
@@ -913,7 +1029,7 @@ test("commands clear the composer before running", async () => {
   input.value = "/nope keep this";
   await document.getElementById("prompt-form").dispatch("submit");
   assert.equal(input.value, "");
-  assert.match(visibleText(document.getElementById("chat")), /Unknown command: \/nope/);
+  assert.equal(visibleText(document.getElementById("chat")).trim(), "Unknown command: /nope. Type / to see commands.");
   input.value = "/mode";
   await document.getElementById("prompt-form").dispatch("submit");
   assert.equal(input.value, "");

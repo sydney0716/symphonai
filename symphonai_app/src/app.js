@@ -6,8 +6,9 @@ import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
+import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
-import { parseKeymap } from "./keys.js";
+import { lookup, parseKeymap } from "./keys.js";
 import { createPicker } from "./picker.js";
 import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, rosterRows, serverRows, trustRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
@@ -121,8 +122,11 @@ export async function start({ global, document, client }) {
   const form = document.getElementById("prompt-form");
   const input = document.getElementById("prompt");
   const promptError = document.getElementById("prompt-error");
+  const commandMenu = element(document, "div", { className: "command-menu" });
   const pickerHost = element(document, "div", { className: "picker-host" });
-  form.before(pickerHost);
+  form.before(commandMenu, pickerHost);
+  let commandMatches = [];
+  let highlightedCommand = 0;
   const turn = createTurnState();
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
@@ -906,6 +910,9 @@ export async function start({ global, document, client }) {
     return perform(actions);
   });
 
+  listen(input, "input", renderCommandMenu);
+  listen(input, "keydown", handleComposerKeydown);
+
   function answerCommand(text) {
     transcript.model.push({ type: "text", text });
     showTranscript();
@@ -1175,12 +1182,87 @@ export async function start({ global, document, client }) {
     }
   }
 
+  function closeCommandMenu() {
+    commandMatches = [];
+    highlightedCommand = 0;
+    replace(commandMenu);
+  }
+
+  function renderCommandMenuRows() {
+    const rows = commandMatches.map((command, index) => {
+      const button = element(document, "button", {
+        className: `command-suggestion${index === highlightedCommand ? " focused" : ""}`,
+        text: `/${command.name}  ${command.argumentHint}  ${command.description}`,
+      });
+      button.type = "button";
+      button.setAttribute?.("role", "option");
+      button.setAttribute?.("aria-selected", String(index === highlightedCommand));
+      listen(button, "mousedown", (event) => event.preventDefault());
+      listen(button, "click", () => runCommand(`/${command.name}`));
+      return button;
+    });
+    replace(commandMenu, ...rows);
+  }
+
+  function renderCommandMenu() {
+    commandMatches = matchCommands(input.value);
+    highlightedCommand = 0;
+    if (commandMatches.length === 0) {
+      closeCommandMenu();
+      return;
+    }
+    renderCommandMenuRows();
+  }
+
+  function moveCommandHighlight(amount) {
+    highlightedCommand = (highlightedCommand + amount + commandMatches.length) % commandMatches.length;
+    renderCommandMenuRows();
+  }
+
+  async function handleComposerKeydown(event) {
+    if (commandMatches.length > 0) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        moveCommandHighlight(event.key === "ArrowDown" ? 1 : -1);
+        return;
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        input.value = `/${commandMatches[highlightedCommand].name} `;
+        closeCommandMenu();
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        await runCommand(`/${commandMatches[highlightedCommand].name}`);
+        return;
+      }
+      if (lookup(keymap, event, { platform }) === "cancel") {
+        event.preventDefault();
+        closeCommandMenu();
+      }
+      return;
+    }
+    if (lookup(keymap, event, { platform }) === "submit") {
+      event.preventDefault();
+      await form.requestSubmit();
+    }
+  }
+
   async function runCommand(command) {
+    closeCommandMenu();
     input.value = "";
     const parts = command.split(/\s+/);
-    const name = parts[0];
+    const typedName = parts[0];
+    const entry = COMMANDS.find((candidate) => (
+      [candidate.name, ...candidate.aliases].some((name) => name.toLowerCase() === typedName.slice(1).toLowerCase())
+    ));
     const args = parts.slice(1);
-    if (name === "/mode") {
+    if (!entry) {
+      answerCommand(`Unknown command: ${typedName}. Type / to see commands.`);
+      return;
+    }
+    if (entry.name === "mode") {
       closePicker();
       if (args.length > 0) {
         answerCommand("Usage: /mode");
@@ -1189,7 +1271,7 @@ export async function start({ global, document, client }) {
       openModePicker();
       return;
     }
-    if (name === "/model") {
+    if (entry.name === "model") {
       closePicker();
       if (args.length === 0) {
         await openDefaultModelPicker();
@@ -1230,11 +1312,10 @@ export async function start({ global, document, client }) {
       answerCommand("Usage: /model [<provider> [<id> [<effort>]]]");
       return;
     }
-    if (name === "/effort") {
+    if (entry.name === "effort") {
       await runEffort(args);
       return;
     }
-    answerCommand(`Unknown command: ${name}`);
   }
 
   async function onFrame(frame) {
