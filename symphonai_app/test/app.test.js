@@ -347,10 +347,117 @@ test("command matching prioritizes names and also searches descriptions", () => 
   assert.deepEqual(matchCommands("/mo"), [COMMANDS[0], COMMANDS[1]]);
   assert.deepEqual(matchCommands("/MOD"), [COMMANDS[0], COMMANDS[1]]);
   assert.deepEqual(matchCommands("/model"), [COMMANDS[1]]);
-  assert.deepEqual(matchCommands("/choose"), COMMANDS);
+  assert.deepEqual(matchCommands("/choose"), COMMANDS.slice(0, 3));
   assert.deepEqual(matchCommands("/current"), [COMMANDS[2]]);
   assert.deepEqual(matchCommands("/model x"), []);
   assert.deepEqual(matchCommands("hello"), []);
+});
+
+test("help lists commands and their aliases in table order", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  await submitCommand(document, "/help");
+
+  assert.deepEqual(visibleText(document.getElementById("chat")).trim().split("\n"), [
+    "/mode — Choose the permission mode",
+    "/model [<provider> [<id> [<effort>]]] — Choose the provider, model and effort",
+    "/effort [<value>] — Choose the effort for the current model",
+    "/help — Show the commands",
+    "/new — Start a new chat (also /clear)",
+    "/plan — Switch plan mode on or off",
+  ]);
+  await submitCommand(document, "/help extra");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
+});
+
+test("new and clear commands share the New chat action", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: "Old thread" }));
+  assert.match(visibleText(document.getElementById("chat")), /Old thread/);
+
+  await submitCommand(document, "/new");
+  assert.equal(client.calls.newSession, 1);
+  assert.equal(document.getElementById("chat").children.length, 0);
+
+  await client.emit(eventFrame("AssistantTextDelta", { text: "Another old thread" }));
+  await submitCommand(document, "/clear");
+  assert.equal(client.calls.newSession, 2);
+  assert.equal(document.getElementById("chat").children.length, 0);
+
+  client.newSession = async () => { throw Object.assign(new Error("conflict"), { status: 409 }); };
+  await submitCommand(document, "/new");
+  assert.equal(document.getElementById("prompt-error").textContent, "Could not start a new chat.");
+  await submitCommand(document, "/new extra");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/new/);
+});
+
+test("plan toggles back to the mode that was active before plan", async () => {
+  const askDocument = new FakeDocument();
+  let askConversation = { provider: "openai", model: "gpt-one", mode: "ask" };
+  const askClient = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { mode: "ask", ceiling: { modes: ["ask", "allow", "plan"] } } },
+    conversation: askConversation,
+  });
+  askClient.selectMode = async (mode) => {
+    askClient.calls.selectMode.push(mode);
+    askConversation = { ...askConversation, mode };
+    return { mode };
+  };
+  askClient.conversationStats = async () => ({ conversation: askConversation });
+  await start({ global: {}, document: askDocument, client: askClient });
+  await submitCommand(askDocument, "/plan");
+  await submitCommand(askDocument, "/plan");
+  assert.deepEqual(askClient.calls.selectMode, ["plan", "ask"]);
+
+  const allowDocument = new FakeDocument();
+  let allowConversation = { provider: "openai", model: "gpt-one", mode: "allow" };
+  const allowClient = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { mode: "allow", ceiling: { modes: ["ask", "allow", "plan"] } } },
+    conversation: allowConversation,
+  });
+  allowClient.selectMode = async (mode) => {
+    allowClient.calls.selectMode.push(mode);
+    allowConversation = { ...allowConversation, mode };
+    return { mode };
+  };
+  allowClient.conversationStats = async () => ({ conversation: allowConversation });
+  await start({ global: {}, document: allowDocument, client: allowClient });
+  await submitCommand(allowDocument, "/plan");
+  await submitCommand(allowDocument, "/plan");
+  assert.deepEqual(allowClient.calls.selectMode, ["plan", "allow"]);
+});
+
+test("plan mode rejects disallowed settings and accepts no arguments", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { mode: "ask", ceiling: { modes: ["ask", "allow"] } } },
+    conversation: { provider: "openai", model: "gpt-one", mode: "ask" },
+  });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/plan");
+  assert.match(visibleText(document.getElementById("chat")), /Plan mode is not permitted here\./);
+  assert.deepEqual(client.calls.selectMode, []);
+  await submitCommand(document, "/plan extra");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/plan/);
+});
+
+test("the clear alias is suggested and Enter starts a new chat", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: "Old thread" }));
+  const input = document.getElementById("prompt");
+  input.focus();
+  input.value = "/cl";
+  await input.dispatch("input");
+  const menu = find(document.getElementById("chat-pane"), (node) => node.className === "command-menu");
+  assert.equal(menu.children.length, 1);
+  assert.match(menu.children[0].textContent, /^\/new/);
+  await input.dispatch("keydown", { key: "Enter" });
+  assert.equal(client.calls.newSession, 1);
+  assert.equal(document.getElementById("chat").children.length, 0);
 });
 
 test("slash suggestions render above the composer without taking focus", async () => {
@@ -366,6 +473,9 @@ test("slash suggestions render above the composer without taking focus", async (
     "/mode    Choose the permission mode",
     "/model  [<provider> [<id> [<effort>]]]  Choose the provider, model and effort",
     "/effort  [<value>]  Choose the effort for the current model",
+    "/help    Show the commands",
+    "/new    Start a new chat",
+    "/plan    Switch plan mode on or off",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));

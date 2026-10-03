@@ -153,6 +153,7 @@ export async function start({ global, document, client }) {
     ? configuredMode
     : (permittedModes[0] ?? "ask");
   let currentMode = conversationReply?.conversation?.mode ?? launchMode;
+  let rememberedPlanMode = null;
   let sessions = initialSessions;
   let currentSessionId = null;
   let conversation = conversationReply?.conversation ?? null;
@@ -613,7 +614,7 @@ export async function start({ global, document, client }) {
     replace(projectsRoot, ...groups);
   }
   showProjects();
-  listen(newChat, "click", async () => {
+  async function startNewChat() {
     try {
       await boundary.newSession();
       transcript.model.length = 0;
@@ -621,6 +622,7 @@ export async function start({ global, document, client }) {
       showTranscript();
       conversation = null;
       currentMode = launchMode;
+      rememberedPlanMode = null;
       board.clear();
       showConversationUsage();
       showAgents();
@@ -632,7 +634,8 @@ export async function start({ global, document, client }) {
       promptFailure = "Could not start a new chat.";
       showPromptError();
     }
-  });
+  }
+  listen(newChat, "click", startNewChat);
   replace(sidebar, homeLink, newChat, projectsRoot, pageLinks);
 
   function toggleFold(className, button, label) {
@@ -955,6 +958,35 @@ export async function start({ global, document, client }) {
     } catch (error) {
       closePicker();
       answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function togglePlanMode() {
+    if (!permittedModes.includes("plan")) {
+      answerCommand("Plan mode is not permitted here.");
+      return;
+    }
+    const activeMode = conversation?.mode ?? currentMode;
+    if (activeMode !== "plan") {
+      await chooseMode("plan");
+      if ((conversation?.mode ?? currentMode) === "plan") {
+        rememberedPlanMode = activeMode;
+      }
+      return;
+    }
+    const fallback = permittedModes.includes("ask")
+      ? "ask"
+      : permittedModes.find((mode) => mode !== "plan");
+    const nextMode = rememberedPlanMode && permittedModes.includes(rememberedPlanMode)
+      ? rememberedPlanMode
+      : fallback;
+    if (!nextMode) {
+      answerCommand("No non-plan mode is permitted here.");
+      return;
+    }
+    await chooseMode(nextMode);
+    if ((conversation?.mode ?? currentMode) !== "plan") {
+      rememberedPlanMode = null;
     }
   }
 
@@ -1315,6 +1347,32 @@ export async function start({ global, document, client }) {
     if (entry.name === "effort") {
       await runEffort(args);
       return;
+    }
+    if (entry.name === "help") {
+      if (args.length > 0) {
+        answerCommand("Usage: /help");
+        return;
+      }
+      answerCommand(COMMANDS.map(({ name, aliases, description, argumentHint }) => (
+        `/${name}${argumentHint ? ` ${argumentHint}` : ""} — ${description}`
+        + (aliases.length > 0 ? ` (also ${aliases.map((alias) => `/${alias}`).join(", ")})` : "")
+      )).join("\n"));
+      return;
+    }
+    if (entry.name === "new") {
+      if (args.length > 0) {
+        answerCommand("Usage: /new");
+        return;
+      }
+      await startNewChat();
+      return;
+    }
+    if (entry.name === "plan") {
+      if (args.length > 0) {
+        answerCommand("Usage: /plan");
+        return;
+      }
+      await togglePlanMode();
     }
   }
 

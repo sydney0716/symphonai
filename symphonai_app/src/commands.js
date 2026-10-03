@@ -17,6 +17,24 @@ export const COMMANDS = Object.freeze([
     description: "Choose the effort for the current model",
     argumentHint: "[<value>]",
   }),
+  Object.freeze({
+    name: "help",
+    aliases: Object.freeze([]),
+    description: "Show the commands",
+    argumentHint: "",
+  }),
+  Object.freeze({
+    name: "new",
+    aliases: Object.freeze(["clear"]),
+    description: "Start a new chat",
+    argumentHint: "",
+  }),
+  Object.freeze({
+    name: "plan",
+    aliases: Object.freeze([]),
+    description: "Switch plan mode on or off",
+    argumentHint: "",
+  }),
 ]);
 
 export function matchCommands(text) {
