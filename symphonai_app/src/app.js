@@ -732,8 +732,12 @@ export async function start({ global, document, client }) {
       ? `${typeof provider === "string" && provider ? `${provider} / ` : ""}${model}`
       : "";
     const mode = permittedModes.includes(conversation?.mode) ? conversation.mode : "";
+    const effort = typeof conversation?.effort === "string" && conversation.effort
+      ? `Effort ${conversation.effort}`
+      : "";
     conversationUsage.textContent = [
       modelText,
+      effort,
       mode && `Mode ${mode}`,
       Number.isInteger(context?.used_tokens) && Number.isInteger(context?.budget_tokens)
         ? `Context ${context.used_tokens} / ${context.budget_tokens} tokens`
@@ -978,7 +982,6 @@ export async function start({ global, document, client }) {
       closePicker();
       showConversationUsage();
       answerCommand(`Model set to ${provider} / ${row.id}${choice.effort ? ` · effort ${choice.effort}` : ""}.`);
-      input.value = "";
       await refreshConversation();
     } catch (error) {
       closePicker();
@@ -1000,6 +1003,82 @@ export async function start({ global, document, client }) {
     } catch (error) {
       answerCommand(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  async function chooseEffort(provider, model, effort) {
+    try {
+      await boundary.selectProvider({ name: provider, model, effort });
+      conversation = { ...(conversation ?? {}), provider, model, effort };
+      closePicker();
+      showConversationUsage();
+      answerCommand(`Effort set to ${effort}.`);
+      await refreshConversation();
+    } catch (error) {
+      closePicker();
+      answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function runEffort(args) {
+    if (args.length > 1) {
+      answerCommand("Usage: /effort [<value>]");
+      return;
+    }
+    const provider = conversation?.provider;
+    const model = conversation?.model;
+    if (!provider || !model) {
+      answerCommand("Choose a model first with /model.");
+      return;
+    }
+
+    let reply;
+    try {
+      reply = await boundary.models(provider);
+    } catch (error) {
+      answerCommand(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (reply?.state !== "available" || !Array.isArray(reply.models)) {
+      answerCommand(reply?.detail || `Models for ${provider} are unavailable.`);
+      return;
+    }
+
+    const listedModel = reply.models.find((row) => row.id === model);
+    const efforts = Array.isArray(listedModel?.efforts) ? listedModel.efforts : null;
+    if (efforts?.length === 0) {
+      answerCommand(`${model} does not take an effort.`);
+      return;
+    }
+
+    if (args.length === 0) {
+      if (!efforts) {
+        answerCommand(`Effort levels for ${model} are unknown; type /effort <value>.`);
+        return;
+      }
+      const rows = efforts.map((value) => ({
+        id: value,
+        label: value,
+        current: value === conversation.effort,
+      }));
+      showPicker({
+        title: `Effort · ${provider} / ${model}`,
+        rows,
+        initialIndex: Math.max(0, rows.findIndex((row) => row.current)),
+        onChoose: (row) => chooseEffort(provider, model, row.id),
+        onCancel: () => {
+          closePicker();
+          answerCommand(`Kept effort as ${conversation?.effort || "default"}.`);
+        },
+      });
+      return;
+    }
+
+    const effort = args[0];
+    if (efforts && !efforts.includes(effort)) {
+      answerCommand(`${model} accepts: ${efforts.join(", ")}.`);
+      return;
+    }
+    await chooseEffort(provider, model, effort);
   }
 
   async function openModelPicker(provider, requestedModel = "") {
@@ -1097,11 +1176,11 @@ export async function start({ global, document, client }) {
   }
 
   async function runCommand(command) {
+    input.value = "";
     const parts = command.split(/\s+/);
     const name = parts[0];
     const args = parts.slice(1);
     if (name === "/mode") {
-      input.value = "";
       closePicker();
       if (args.length > 0) {
         answerCommand("Usage: /mode");
@@ -1111,7 +1190,6 @@ export async function start({ global, document, client }) {
       return;
     }
     if (name === "/model") {
-      input.value = "";
       closePicker();
       if (args.length === 0) {
         await openDefaultModelPicker();
@@ -1150,6 +1228,10 @@ export async function start({ global, document, client }) {
         return;
       }
       answerCommand("Usage: /model [<provider> [<id> [<effort>]]]");
+      return;
+    }
+    if (name === "/effort") {
+      await runEffort(args);
       return;
     }
     answerCommand(`Unknown command: ${name}`);

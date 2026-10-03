@@ -318,6 +318,11 @@ export function fakeClient(
   };
 }
 
+async function submitCommand(document, command) {
+  document.getElementById("prompt").value = command;
+  await document.getElementById("prompt-form").dispatch("submit");
+}
+
 function eventFrame(type, fields = {}) {
   return {
     kind: "event",
@@ -739,14 +744,175 @@ test("unknown model listings show the reason and keep the typed fallback", async
   assert.match(visibleText(document.getElementById("chat")), /Model set to custom-provider \/ custom-id/);
 });
 
-test("unknown commands stay in the textbox while picker commands clear it", async () => {
+test("effort picker starts at the current level and applies the keyboard choice", async () => {
+  const document = new FakeDocument();
+  let conversation = { provider: "anthropic", model: "claude-sonnet-5", effort: "high", mode: "ask" };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "claude-sonnet-5", efforts: ["low", "medium", "high", "xhigh", "max"] }],
+    detail: "",
+  });
+  client.selectProvider = async (choice) => {
+    client.calls.selectProvider.push(choice);
+    conversation = { ...conversation, effort: choice.effort };
+  };
+  client.conversationStats = async () => ({ conversation });
+  await start({ global: {}, document, client });
+
+  await submitCommand(document, "/effort");
+  assert.equal(document.getElementById("prompt").value, "");
+  const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  const rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.equal(find(picker, (node) => node.className === "picker-title").textContent, "Effort · anthropic / claude-sonnet-5");
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["low", "medium", "high", "xhigh", "max"]);
+  assert.match(rows[2].className, /focused current/);
+  await picker.dispatch("keydown", { key: "ArrowDown" });
+  await picker.dispatch("keydown", { key: "Enter" });
+
+  assert.deepEqual(client.calls.selectProvider, [{ name: "anthropic", model: "claude-sonnet-5", effort: "xhigh" }]);
+  assert.equal(document.getElementById("prompt").value, "");
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
+  assert.match(visibleText(document.getElementById("chat")), /Effort set to xhigh\./);
+  assert.match(find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage")).textContent, /Effort xhigh/);
+});
+
+test("typed effort validates listed values and applies valid values without a picker", async () => {
+  const document = new FakeDocument();
+  let conversation = { provider: "anthropic", model: "claude-sonnet-5", effort: "high", mode: "ask" };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "claude-sonnet-5", efforts: ["low", "medium", "high", "xhigh", "max"] }],
+    detail: "",
+  });
+  client.selectProvider = async (choice) => {
+    client.calls.selectProvider.push(choice);
+    conversation = { ...conversation, effort: choice.effort };
+  };
+  client.conversationStats = async () => ({ conversation });
+  await start({ global: {}, document, client });
+
+  await submitCommand(document, "/effort low");
+  assert.equal(document.getElementById("prompt").value, "");
+  await submitCommand(document, "/effort turbo");
+
+  assert.deepEqual(client.calls.selectProvider, [{ name: "anthropic", model: "claude-sonnet-5", effort: "low" }]);
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
+  assert.match(visibleText(document.getElementById("chat")), /claude-sonnet-5 accepts: low, medium, high, xhigh, max\./);
+  assert.match(find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage")).textContent, /Effort low/);
+});
+
+test("effort handles models without effort support and unknown effort listings", async () => {
+  const document = new FakeDocument();
+  const conversation = { provider: "openai", model: "gpt-basic", mode: "ask" };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "gpt-basic", efforts: [] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+
+  await submitCommand(document, "/effort");
+  await submitCommand(document, "/effort high");
+  assert.deepEqual(client.calls.selectProvider, []);
+  assert.equal((visibleText(document.getElementById("chat")).match(/gpt-basic does not take an effort\./g) ?? []).length, 2);
+
+  const unknownDocument = new FakeDocument();
+  let unknownConversation = { provider: "openai", model: "gpt-unknown", mode: "ask" };
+  const unknownClient = fakeClient(fixtureRoadmap(), { conversation: unknownConversation });
+  unknownClient.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "gpt-unknown", efforts: null }],
+    detail: "",
+  });
+  unknownClient.selectProvider = async (choice) => {
+    unknownClient.calls.selectProvider.push(choice);
+    unknownConversation = { ...unknownConversation, effort: choice.effort };
+  };
+  unknownClient.conversationStats = async () => ({ conversation: unknownConversation });
+  await start({ global: {}, document: unknownDocument, client: unknownClient });
+
+  await submitCommand(unknownDocument, "/effort");
+  assert.match(visibleText(unknownDocument.getElementById("chat")), /Effort levels for gpt-unknown are unknown; type \/effort <value>\./);
+  assert.equal(find(unknownDocument.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
+  await submitCommand(unknownDocument, "/effort vendor-x");
+  assert.deepEqual(unknownClient.calls.selectProvider, [{ name: "openai", model: "gpt-unknown", effort: "vendor-x" }]);
+});
+
+test("effort accepts typed values for models absent from discovery", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "custom", model: "custom-model", mode: "ask" },
+  });
+  client.models = async (provider) => ({ provider, state: "available", models: [], detail: "" });
+  await start({ global: {}, document, client });
+
+  await submitCommand(document, "/effort experimental");
+
+  assert.deepEqual(client.calls.selectProvider, [{ name: "custom", model: "custom-model", effort: "experimental" }]);
+});
+
+test("effort reports missing models, usage errors, and unavailable listings", async () => {
+  const emptyDocument = new FakeDocument();
+  const emptyClient = fakeClient(fixtureRoadmap());
+  await start({ global: {}, document: emptyDocument, client: emptyClient });
+
+  await submitCommand(emptyDocument, "/effort");
+  assert.match(visibleText(emptyDocument.getElementById("chat")), /Choose a model first with \/model\./);
+  assert.deepEqual(emptyClient.calls.models, []);
+
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "ask" },
+  });
+  client.models = async (provider) => ({ provider, state: "unknown", models: [], detail: "Catalogue unavailable." });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/effort high");
+  assert.match(visibleText(document.getElementById("chat")), /Catalogue unavailable\./);
+  client.models = async () => { throw new Error("Model service offline."); };
+  await submitCommand(document, "/effort high");
+  assert.match(visibleText(document.getElementById("chat")), /Model service offline\./);
+  await submitCommand(document, "/effort low high");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/effort \[<value>\]/);
+});
+
+test("escape keeps the current effort without selecting another", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "anthropic", model: "claude-sonnet-5", effort: "high", mode: "ask" },
+  });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "claude-sonnet-5", efforts: ["low", "high", "max"] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+
+  await submitCommand(document, "/effort");
+  assert.equal(document.getElementById("prompt").value, "");
+  const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  await picker.dispatch("keydown", { key: "Escape" });
+
+  assert.equal(document.getElementById("prompt").value, "");
+  assert.match(visibleText(document.getElementById("chat")), /Kept effort as high\./);
+  assert.deepEqual(client.calls.selectProvider, []);
+});
+
+test("commands clear the composer before running", async () => {
   const document = new FakeDocument();
   const client = fakeClient(fixtureRoadmap(), { conversation: { provider: "openai", model: "gpt-one", mode: "ask" } });
   await start({ global: {}, document, client });
   const input = document.getElementById("prompt");
   input.value = "/nope keep this";
   await document.getElementById("prompt-form").dispatch("submit");
-  assert.equal(input.value, "/nope keep this");
+  assert.equal(input.value, "");
   assert.match(visibleText(document.getElementById("chat")), /Unknown command: \/nope/);
   input.value = "/mode";
   await document.getElementById("prompt-form").dispatch("submit");
