@@ -20,15 +20,27 @@ class FakeElement {
     this.children = [];
     this.className = "";
     this.open = false;
-    this.textContent = "";
+    this._textContent = "";
     this.type = "";
     this.value = "";
     this.listeners = new Map();
+    this.attributes = new Map();
   }
 
   append(...children) {
     for (const child of children) child.parentNode = this;
     this.children.push(...children);
+  }
+
+  get textContent() {
+    return this.className === "assistant"
+      ? this._textContent + this.children.map((child) => child.textContent).join("")
+      : this._textContent;
+  }
+
+  set textContent(value) {
+    this._textContent = String(value);
+    this.children = [];
   }
 
   replaceChildren(...children) {
@@ -58,6 +70,10 @@ class FakeElement {
     const listeners = this.listeners.get(type) ?? [];
     listeners.push(listener);
     this.listeners.set(type, listeners);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
   }
 
   async dispatch(type, fields = {}) {
@@ -2471,6 +2487,94 @@ test("assistant text after a command is rendered as its own entry", async () => 
   assert.equal(chat.children[1].textContent, "Agent reply");
 });
 
+test("assistant replies render Markdown blocks and inline formatting in order", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const reply = [
+    "# Heading",
+    "",
+    "- first",
+    "- second",
+    "",
+    "1. alpha",
+    "2. beta",
+    "",
+    "```python",
+    "print('hello')",
+    "```",
+    "",
+    "> quoted text",
+    "",
+    "Paragraph with `code`, **strong**, *em* and [link](https://example.com/path).",
+  ].join("\n");
+  await client.emit(eventFrame("AssistantTextDelta", { text: reply }));
+
+  const assistant = document.getElementById("chat").children[0];
+  assert.equal(assistant.className, "assistant");
+  assert.deepEqual(assistant.children.map((node) => node.tagName), ["H1", "UL", "OL", "PRE", "BLOCKQUOTE", "P"]);
+  assert.deepEqual(assistant.children[1].children.map((item) => item.tagName), ["LI", "LI"]);
+  assert.deepEqual(assistant.children[2].children.map((item) => item.tagName), ["LI", "LI"]);
+  const code = assistant.children[3].children[0];
+  assert.equal(code.tagName, "CODE");
+  assert.equal(code.textContent, "print('hello')");
+  assert.equal(code.attributes.get("data-language"), "python");
+  assert.equal(assistant.children[4].tagName, "BLOCKQUOTE");
+  const paragraph = assistant.children[5];
+  assert.deepEqual(walk(paragraph).filter((node) => ["CODE", "STRONG", "EM", "A"].includes(node.tagName)).map((node) => node.tagName), [
+    "CODE", "STRONG", "EM", "A",
+  ]);
+  const link = find(paragraph, (node) => node.tagName === "A");
+  assert.equal(link.textContent, "link");
+  assert.equal(link.attributes.get("href"), "https://example.com/path");
+  assert.equal(link.attributes.get("rel"), "noopener noreferrer");
+  assert.equal(link.attributes.get("target"), "_blank");
+});
+
+test("assistant Markdown keeps HTML and unsafe links as text", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", {
+    text: "<script>alert(1)</script>\n\n[x](javascript:alert(1))",
+  }));
+
+  const assistant = document.getElementById("chat").children[0];
+  assert.deepEqual(assistant.children.map((node) => node.tagName), ["P", "P"]);
+  assert.equal(assistant.children[0].textContent, "<script>alert(1)</script>");
+  assert.equal(assistant.children[1].textContent, "x");
+  assert.equal(walk(assistant).some((node) => node.tagName === "SCRIPT" || node.tagName === "A"), false);
+});
+
+test("assistant Markdown renders plain lines and unclosed fences while streaming", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: "A plain reply." }));
+  let assistant = document.getElementById("chat").children[0];
+  assert.deepEqual(assistant.children.map((node) => node.tagName), ["P"]);
+  assert.equal(assistant.children[0].textContent, "A plain reply.");
+
+  const partial = "```python\nprint('still streaming')";
+  await client.emit(eventFrame("AssistantTextDelta", { text: `\n\n${partial}` }));
+  assistant = document.getElementById("chat").children[0];
+  assert.deepEqual(assistant.children.map((node) => node.tagName), ["P", "PRE"]);
+  assert.equal(assistant.children[1].children[0].textContent, "print('still streaming')");
+  assert.equal(assistant.children[1].children[0].attributes.get("data-language"), "python");
+
+  const streamed = [
+    "# Heading", "", "- first", "- second", "", "1. alpha", "2. beta", "", "```python",
+    "print('hello')", "```", "", "> quoted text", "", "Paragraph with `code`, **strong**, *em* and [link](https://example.com/path).",
+  ].join("\n");
+  const streamDocument = new FakeDocument();
+  const streamClient = fakeClient();
+  await start({ global: {}, document: streamDocument, client: streamClient });
+  for (let index = 0; index < streamed.length; index += 1) {
+    await streamClient.emit(eventFrame("AssistantTextDelta", { text: streamed[index] }));
+  }
+  assert.equal(streamDocument.getElementById("chat").children[0].children.length, 6);
+});
+
 test("session history renders as the original conversation", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -2711,6 +2815,11 @@ test("render stays DOM-only and start does not read window", async () => {
   }
   assert.match(cssSource, /\.edit summary\s*{[^}]*cursor:\s*pointer/s);
   assert.match(cssSource, /\.edit pre\s*{[^}]*overflow-x:\s*auto/s);
+  assert.match(cssSource, /\.assistant pre\s*{[^}]*overflow-x:\s*auto/s);
+  assert.match(cssSource, /\.assistant pre\s*{[^}]*background:\s*#[0-9a-f]{6}/i);
+  assert.match(cssSource, /\.assistant code\s*{[^}]*font-family:\s*ui-monospace,\s*SFMono-Regular,\s*Menlo,\s*monospace/s);
+  assert.match(cssSource, /\.assistant ul,\s*\.assistant ol\s*{[^}]*padding-left:\s*1\.35em/s);
+  assert.match(cssSource, /\.assistant h1,[\s\S]*?\.assistant h6\s*{[^}]*font-size:\s*1\.1em/s);
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
   assert.equal((indexSource.match(/class="chat-pane"/g) ?? []).length, 1);
   assert.equal((indexSource.match(/id="status-rail"/g) ?? []).length, 1);

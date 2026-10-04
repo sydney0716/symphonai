@@ -408,6 +408,52 @@ button.session-link {
   background: #23483c;
 }
 
+.assistant > * {
+  margin: 0.45em 0;
+}
+
+.assistant > :first-child {
+  margin-top: 0;
+}
+
+.assistant > :last-child {
+  margin-bottom: 0;
+}
+
+.assistant h1,
+.assistant h2,
+.assistant h3,
+.assistant h4,
+.assistant h5,
+.assistant h6 {
+  font-size: 1.1em;
+}
+
+.assistant ul,
+.assistant ol {
+  margin: 0.45em 0;
+  padding-left: 1.35em;
+}
+
+.assistant pre {
+  overflow-x: auto;
+  margin: 0.5em 0;
+  padding: 0.6em;
+  background: #17231e;
+  border-radius: 0.3rem;
+  white-space: pre;
+}
+
+.assistant code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.assistant :not(pre) > code {
+  padding: 0.05em 0.25em;
+  background: #17231e;
+  border-radius: 0.2em;
+}
+
 .command {
   width: 100%;
   margin: 0;

@@ -1,6 +1,7 @@
 import { createApprovals } from "./approvals.js";
 import { createAgentBoard } from "./agents.js";
 import { createClient } from "./client.js";
+import { parseMarkdown } from "./markdown.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
@@ -519,7 +520,7 @@ export async function start({ global, document, client }) {
 
   const projectsRoot = element(document, "section", { className: "projects" });
   function showTranscript() {
-    renderTranscript(document, chatRoot, transcript.model);
+    renderTranscript(document, chatRoot, transcript.model, parseMarkdown);
     const rows = [...chatRoot.children];
     const children = [];
     for (const [index, entry] of transcript.model.entries()) {

@@ -56,8 +56,104 @@ function renderPrompt(document, entry) {
   return element(document, "p", { className: "prompt", text: entry.text });
 }
 
-function renderText(document, entry) {
-  return element(document, "p", { className: "assistant", text: entry.text });
+function renderInline(document, node) {
+  return INLINE_RENDERERS[node.type](document, node);
+}
+
+function renderInlineBlock(document, tagName, children) {
+  const renderer = children.length === 1 && children[0].type === "text"
+    ? INLINE_BLOCK_RENDERERS.plain
+    : INLINE_BLOCK_RENDERERS.rich;
+  return renderer(document, tagName, children);
+}
+
+function renderPlainInlineBlock(document, tagName, children) {
+  return element(document, tagName, { text: children[0].text });
+}
+
+function renderRichInlineBlock(document, tagName, children) {
+  const block = element(document, tagName);
+  append(block, ...children.map((child) => renderInline(document, child)));
+  return block;
+}
+
+const INLINE_BLOCK_RENDERERS = Object.freeze({
+  plain: renderPlainInlineBlock,
+  rich: renderRichInlineBlock,
+});
+
+function renderText(document, entry, parseMarkdown) {
+  const assistant = element(document, "div", { className: "assistant" });
+  append(assistant, ...parseMarkdown(entry.text).map((block) => renderBlock(document, block)));
+  return assistant;
+}
+
+function renderInlineCode(document, node) {
+  return element(document, "code", { text: node.text });
+}
+
+function renderInlineChildren(document, tagName, node) {
+  const block = element(document, tagName);
+  append(block, ...node.children.map((child) => renderInline(document, child)));
+  return block;
+}
+
+function renderLink(document, node) {
+  const link = element(document, "a", { text: node.label });
+  link.setAttribute("href", node.url);
+  link.setAttribute("rel", "noopener noreferrer");
+  link.setAttribute("target", "_blank");
+  return link;
+}
+
+function renderLineBreak(document) {
+  return element(document, "br");
+}
+
+const INLINE_RENDERERS = Object.freeze({
+  text: (document, node) => element(document, "span", { text: node.text }),
+  break: renderLineBreak,
+  code: renderInlineCode,
+  strong: (document, node) => renderInlineChildren(document, "strong", node),
+  em: (document, node) => renderInlineChildren(document, "em", node),
+  link: renderLink,
+});
+
+function renderParagraph(document, block) {
+  return renderInlineBlock(document, "p", block.children);
+}
+
+function renderHeading(document, block) {
+  return renderInlineBlock(document, `h${block.level}`, block.children);
+}
+
+function renderList(document, block) {
+  const list = element(document, block.ordered ? "ol" : "ul");
+  append(list, ...block.items.map((children) => renderInlineBlock(document, "li", children)));
+  return list;
+}
+
+function renderCodeBlock(document, block) {
+  const pre = element(document, "pre");
+  const code = element(document, "code", { text: block.text });
+  code.setAttribute("data-language", block.language ?? "");
+  return append(pre, code);
+}
+
+function renderQuote(document, block) {
+  return renderInlineBlock(document, "blockquote", block.children);
+}
+
+const BLOCK_RENDERERS = Object.freeze({
+  paragraph: renderParagraph,
+  heading: renderHeading,
+  list: renderList,
+  "code-block": renderCodeBlock,
+  quote: renderQuote,
+});
+
+function renderBlock(document, block) {
+  return BLOCK_RENDERERS[block.type](document, block);
 }
 
 function renderCommand(document, entry) {
@@ -132,11 +228,11 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
   unknown: renderUnknown,
 });
 
-export function renderTranscript(document, root, model) {
+export function renderTranscript(document, root, model, parseMarkdown) {
   return replace(
     root,
     ...model.map((entry) => (
       TRANSCRIPT_RENDERERS[entry.type] ?? renderUnknown
-    )(document, entry)),
+    )(document, entry, parseMarkdown)),
   );
 }
