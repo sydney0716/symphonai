@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { INIT_PROMPT, start } from "../src/app.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
 import { createClient } from "../src/client.js";
+import { parseMarkdown } from "../src/markdown.js";
 import { DISPATCHING, IDLE, RUNNING } from "../src/turn.js";
 
 const BASE = "specs/18/18a-a-client-for-the-boundary.md";
@@ -2573,6 +2574,50 @@ test("assistant Markdown renders plain lines and unclosed fences while streaming
     await streamClient.emit(eventFrame("AssistantTextDelta", { text: streamed[index] }));
   }
   assert.equal(streamDocument.getElementById("chat").children[0].children.length, 6);
+});
+
+test("underscores inside words stay literal while standalone emphasis still renders", () => {
+  for (const text of [
+    "Call standard_tool_registry with skills_dir set.",
+    `Edit symphonai${String.fromCharCode(95)}api/tools/shell_classify.py now.`,
+    "MAX_ATTACHMENT_BYTES",
+    "__init__",
+    "a__b",
+    "a_b_c",
+    "漢字_名前",
+    "école_test",
+  ]) {
+    assert.deepEqual(parseMarkdown(text), [{
+      type: "paragraph",
+      children: [{ type: "text", text }],
+    }]);
+  }
+
+  for (const [text, before, emphasized, after] of [
+    ["this is _important_ now", "this is ", "important", " now"],
+    ["_important_ now", "", "important", " now"],
+    ["this is _important_", "this is ", "important", ""],
+    ["(_important_)", "(", "important", ")"],
+    ["_漢字_", "", "漢字", ""],
+  ]) {
+    assert.deepEqual(parseMarkdown(text)[0].children, [
+      ...(before ? [{ type: "text", text: before }] : []),
+      { type: "em", children: [{ type: "text", text: emphasized }] },
+      ...(after ? [{ type: "text", text: after }] : []),
+    ]);
+  }
+});
+
+test("asterisk emphasis, strong, code, and links keep their parsing", () => {
+  assert.deepEqual(parseMarkdown("**strong** `code` *em* [link](https://example.com)")[0].children, [
+    { type: "strong", children: [{ type: "text", text: "strong" }] },
+    { type: "text", text: " " },
+    { type: "code", text: "code" },
+    { type: "text", text: " " },
+    { type: "em", children: [{ type: "text", text: "em" }] },
+    { type: "text", text: " " },
+    { type: "link", label: "link", url: "https://example.com" },
+  ]);
 });
 
 test("session history renders as the original conversation", async () => {

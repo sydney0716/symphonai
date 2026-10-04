@@ -7,6 +7,34 @@ function closingDelimiter(text, delimiter, start) {
   return index < 0 ? null : index;
 }
 
+function characterBefore(text, index) {
+  const previous = text.charCodeAt(index - 1);
+  const beforePrevious = text.charCodeAt(index - 2);
+  return previous >= 0xdc00 && previous <= 0xdfff && beforePrevious >= 0xd800 && beforePrevious <= 0xdbff
+    ? text.slice(index - 2, index)
+    : text.slice(index - 1, index);
+}
+
+function characterAt(text, index) {
+  return index < text.length ? String.fromCodePoint(text.codePointAt(index)) : "";
+}
+
+function isLetterOrDigit(character) {
+  return /[\p{L}\p{N}]/u.test(character);
+}
+
+function underscoreCanOpen(text, index) {
+  const before = characterBefore(text, index);
+  const after = characterAt(text, index + 1);
+  return before !== "_" && after !== "_" && !isLetterOrDigit(before) && !/\s/u.test(after);
+}
+
+function underscoreCanClose(text, index) {
+  const before = characterBefore(text, index);
+  const after = characterAt(text, index + 1);
+  return before !== "_" && after !== "_" && !/\s/u.test(before) && !isLetterOrDigit(after);
+}
+
 function linkAt(text, start) {
   const labelEnd = text.indexOf("](", start + 1);
   if (labelEnd < 0) return null;
@@ -29,6 +57,7 @@ function emphasisEnd(text, delimiter, start) {
   for (let index = start; index < text.length; index += 1) {
     if (text[index] !== delimiter) continue;
     if (delimiter === "*" && (text[index - 1] === "*" || text[index + 1] === "*")) continue;
+    if (delimiter === "_" && !underscoreCanClose(text, index)) continue;
     return index;
   }
   return null;
@@ -54,8 +83,10 @@ function parseInline(text) {
 
     const delimiter = text.startsWith("**", index)
       ? "**"
-      : text[index] === "`" || text[index] === "*" || text[index] === "_"
+      : text[index] === "`" || text[index] === "*"
         ? text[index]
+        : text[index] === "_" && underscoreCanOpen(text, index)
+          ? "_"
         : "";
     const close = delimiter
       ? delimiter === "*" || delimiter === "_"
