@@ -2721,6 +2721,36 @@ def check_context_budget_tracks_model() -> None:
             explicit.close()
 
 
+@check("host_server.context_window_reporting")
+def check_context_window_reporting() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for index, (model, expected_window) in enumerate((
+            ("claude-opus-4-8", 1_000_000),
+            ("model-without-a-window", None),
+        )):
+            host = HostServer(
+                _RecordingWireFakeProvider(
+                    "anthropic", 2, [ModelResponse(Message(Role.ASSISTANT, "done"))]
+                ),
+                PermissionPolicy(root),
+                model=model,
+                sessions_root=root / f"sessions-{index}",
+            )
+            host.start()
+            try:
+                _send_host_prompt(host, "measure context")
+                conversation = _conversation_reply(host)[1]["conversation"]
+                actual_window = conversation["context"].get("window_tokens", "missing")
+                if actual_window != expected_window:
+                    fail(
+                        f"{model} reported context window {actual_window!r}, "
+                        f"expected {expected_window!r}"
+                    )
+            finally:
+                host.close()
+
+
 @check("host_server.permission_mode_control")
 def check_permission_mode_control() -> None:
     with tempfile.TemporaryDirectory() as temporary:

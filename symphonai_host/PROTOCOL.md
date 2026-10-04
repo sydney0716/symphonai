@@ -226,7 +226,7 @@ opaque id or `null` for a root), and `mode` reports the mode currently in force.
 Each agent appears once; the first run in the
 timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,
-`remaining_tokens`, and `by_source`), aggregate `usage`, and per-agent
+`remaining_tokens`, `window_tokens`, and `by_source`), aggregate `usage`, and per-agent
 `input_tokens`, `output_tokens`, `calls`, `total_tokens`, `cache_read_tokens`,
 and `cache_write_tokens`. Immediately after
 reopening a conversation, `context`, aggregate `usage`, and per-agent usage and

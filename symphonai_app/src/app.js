@@ -1099,6 +1099,58 @@ export async function start({ global, document, client }) {
     }
   }
 
+  async function showContext(args) {
+    if (args.length > 0) {
+      answerCommand("Usage: /context");
+      return;
+    }
+    try {
+      const reply = await boundary.conversationStats();
+      const current = reply?.conversation;
+      const context = current?.context;
+      if (!context) {
+        answerCommand("No context measured yet. Send a message first.");
+        return;
+      }
+
+      const formatTokens = (value) => value.toLocaleString("en-US");
+      const model = typeof current.model === "string" && current.model
+        ? `${typeof current.provider === "string" && current.provider ? `${current.provider} / ` : ""}${current.model}`
+        : "";
+      const window = Number.isInteger(context.window_tokens)
+        ? ` · window ${formatTokens(context.window_tokens)}`
+        : "";
+      const used = context.used_tokens;
+      const budget = context.budget_tokens;
+      const lines = [
+        model ? `Context · ${model}` : "Context",
+        `Used ${formatTokens(used)} of ${formatTokens(budget)} tokens before compaction (${(used / budget * 100).toFixed(1)}%)${window}`,
+      ];
+      const labels = {
+        system_prompt: "System prompt",
+        instructions: "Instructions",
+        user: "Your messages",
+        assistant: "Replies",
+        tool_result: "Tool results",
+      };
+      const sourceOrder = ["system_prompt", "instructions", "user", "assistant", "tool_result"];
+      const sources = context.by_source ?? {};
+      const entries = sourceOrder
+        .filter((source) => Object.hasOwn(sources, source))
+        .map((source) => [labels[source], sources[source]]);
+      entries.push(...Object.entries(sources)
+        .filter(([source]) => !sourceOrder.includes(source)));
+      lines.push(...entries.map(([name, tokens]) => `    ${name.padEnd(16)}${formatTokens(tokens)}`));
+      lines.push(
+        `Remaining before compaction: ${formatTokens(context.remaining_tokens)}`,
+        "Counts are estimates, about 4 characters per token.",
+      );
+      answerCommand(lines.join("\n"));
+    } catch (error) {
+      answerCommand(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function openModePicker() {
     const rows = permittedModes.map((mode) => ({
       id: mode,
@@ -1118,18 +1170,23 @@ export async function start({ global, document, client }) {
     });
   }
 
-  async function chooseModel(provider, row) {
+  async function chooseModel(provider, row, efforts) {
+    const existingEffort = conversation?.effort;
     const choice = { name: provider, model: row.id };
-    if (Array.isArray(row.efforts) && row.efforts.length > 0) {
-      choice.effort = row.efforts[row.effortIndex];
-    }
+    const keepEffort = Boolean(existingEffort && Array.isArray(efforts) && efforts.includes(existingEffort));
+    if (keepEffort) choice.effort = existingEffort;
     try {
       await boundary.selectProvider(choice);
       conversation = { ...(conversation ?? {}), provider, model: row.id };
-      if (choice.effort) conversation.effort = choice.effort;
+      if (keepEffort) conversation.effort = existingEffort;
+      else delete conversation.effort;
       closePicker();
       showConversationUsage();
-      answerCommand(`Model set to ${provider} / ${row.id}${choice.effort ? ` · effort ${choice.effort}` : ""}.`);
+      answerCommand(keepEffort
+        ? `Model set to ${provider} / ${row.id} · effort ${existingEffort}.`
+        : existingEffort
+          ? `Model set to ${provider} / ${row.id} · effort reset to the model's default.`
+          : `Model set to ${provider} / ${row.id}.`);
       await refreshConversation();
     } catch (error) {
       closePicker();
@@ -1137,16 +1194,23 @@ export async function start({ global, document, client }) {
     }
   }
 
-  async function chooseTypedModel(provider, model, effort = "") {
+  async function chooseTypedModel(provider, model, efforts = null) {
+    const existingEffort = conversation?.effort;
     const choice = { name: provider, model };
-    if (effort) choice.effort = effort;
+    const keepEffort = Boolean(existingEffort && Array.isArray(efforts) && efforts.includes(existingEffort));
+    if (keepEffort) choice.effort = existingEffort;
     try {
       await boundary.selectProvider(choice);
       conversation = { ...(conversation ?? {}), provider, model };
-      if (effort) conversation.effort = effort;
+      if (keepEffort) conversation.effort = existingEffort;
+      else delete conversation.effort;
       closePicker();
       showConversationUsage();
-      answerCommand(`Model set to ${provider} / ${model}${effort ? ` · effort ${effort}` : ""}.`);
+      answerCommand(keepEffort
+        ? `Model set to ${provider} / ${model} · effort ${existingEffort}.`
+        : existingEffort
+          ? `Model set to ${provider} / ${model} · effort reset to the model's default.`
+          : `Model set to ${provider} / ${model}.`);
       await refreshConversation();
     } catch (error) {
       answerCommand(error instanceof Error ? error.message : String(error));
@@ -1229,72 +1293,64 @@ export async function start({ global, document, client }) {
     await chooseEffort(provider, model, effort);
   }
 
-  async function openModelPicker(provider, requestedModel = "") {
+  async function openModelPicker(provider, requestedModel = "", returnToProvider = false) {
+    const cancel = () => {
+      if (returnToProvider) {
+        openProviderPicker(provider);
+        return;
+      }
+      closePicker();
+      answerCommand(`Kept model as ${currentModelLabel()}.`);
+    };
     try {
       const reply = await boundary.models(provider);
       if (reply?.state !== "available" || !Array.isArray(reply.models)) {
         showPicker({
           title: `Models · ${provider}`,
           message: reply?.detail || `Models for ${provider} are unavailable.`,
-          onCancel: () => {
-            closePicker();
-            answerCommand(`Kept model as ${currentModelLabel()}.`);
-          },
+          onCancel: cancel,
         });
         return;
       }
-      const rows = reply.models.map((model) => {
-        const efforts = Array.isArray(model.efforts) ? model.efforts : null;
-        const existingEffort = conversation?.provider === provider && conversation?.model === model.id
-          ? conversation.effort
-          : "";
-        return {
-          id: model.id,
-          label: model.id,
-          current: conversation?.provider === provider && conversation?.model === model.id,
-          efforts,
-          effortIndex: Array.isArray(efforts) ? Math.max(0, efforts.indexOf(existingEffort)) : 0,
-        };
-      });
+      const effortsByModel = new Map(reply.models.map((model) => [model.id, model.efforts]));
+      const rows = reply.models.map((model) => ({
+        id: model.id,
+        label: model.id,
+        current: conversation?.provider === provider && conversation?.model === model.id,
+      }));
       const selected = rows.findIndex((row) => row.id === requestedModel);
       const current = rows.findIndex((row) => row.current);
       showPicker({
         title: `Models · ${provider}`,
         rows,
         initialIndex: selected >= 0 ? selected : Math.max(0, current),
-        showEfforts: true,
-        onChoose: (row) => chooseModel(provider, row),
-        onCancel: () => {
-          closePicker();
-          answerCommand(`Kept model as ${currentModelLabel()}.`);
-        },
+        onChoose: (row) => chooseModel(provider, row, effortsByModel.get(row.id)),
+        onCancel: cancel,
       });
     } catch (error) {
       showPicker({
         title: `Models · ${provider}`,
         message: error instanceof Error ? error.message : String(error),
-        onCancel: () => {
-          closePicker();
-          answerCommand(`Kept model as ${currentModelLabel()}.`);
-        },
+        onCancel: cancel,
       });
     }
   }
 
-  function openProviderPicker() {
+  function openProviderPicker(focusedProvider = "") {
     const providers = providerRows.filter((row) => row.key_present);
     const rows = providers.map((provider) => ({
       id: provider.name,
       label: provider.name,
       current: provider.name === conversation?.provider,
-      efforts: [],
     }));
+    const focused = rows.findIndex((row) => row.id === focusedProvider);
+    const current = rows.findIndex((row) => row.current);
     showPicker({
       title: "Choose a provider",
       rows,
       message: rows.length === 0 ? "Add a provider key in Settings to choose a model." : "",
-      initialIndex: Math.max(0, rows.findIndex((row) => row.current)),
-      onChoose: (row) => openModelPicker(row.id),
+      initialIndex: focused >= 0 ? focused : Math.max(0, current),
+      onChoose: (row) => openModelPicker(row.id, "", true),
       onCancel: () => {
         closePicker();
         answerCommand(conversation?.provider
@@ -1422,12 +1478,8 @@ export async function start({ global, document, client }) {
         await openModelPicker(args[0]);
         return;
       }
-      if (args.length === 2 || args.length === 3) {
-        const [provider, model, effort] = args;
-        if (effort) {
-          await chooseTypedModel(provider, model, effort);
-          return;
-        }
+      if (args.length === 2) {
+        const [provider, model] = args;
         let listing;
         try {
           listing = await boundary.models(provider);
@@ -1450,7 +1502,7 @@ export async function start({ global, document, client }) {
         await openModelPicker(provider, model);
         return;
       }
-      answerCommand("Usage: /model [<provider> [<id> [<effort>]]]");
+      answerCommand("Usage: /model [<provider> [<id>]]");
       return;
     }
     if (entry.name === "effort") {
@@ -1490,6 +1542,10 @@ export async function start({ global, document, client }) {
     }
     if (entry.name === "cost") {
       await showCost(args);
+      return;
+    }
+    if (entry.name === "context") {
+      await showContext(args);
       return;
     }
     if (entry.name === "compact") {

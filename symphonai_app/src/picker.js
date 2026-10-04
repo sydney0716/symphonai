@@ -9,10 +9,8 @@ export function createPicker({
   rows = [],
   initialIndex = 0,
   message = "",
-  showEfforts = false,
   onChoose,
   onCancel,
-  onAdjust = () => {},
 }) {
   const root = element(document, "section", { className: "picker" });
   root.tabIndex = 0;
@@ -23,15 +21,6 @@ export function createPicker({
   list.setAttribute?.("role", "listbox");
   const status = element(document, "p", { className: "picker-message", text: message });
   let focused = rows.length === 0 ? -1 : Math.max(0, Math.min(initialIndex, rows.length - 1));
-
-  function detail(row) {
-    if (!showEfforts) return "";
-    if (row.efforts === null) {
-      return "Effort support unknown · set with /model <provider> <id> <effort>";
-    }
-    if (row.efforts.length === 0) return "Effort not supported";
-    return `Effort: ${row.efforts[row.effortIndex]} · ← → to adjust`;
-  }
 
   function renderRows() {
     const buttons = rows.map((row, index) => {
@@ -45,7 +34,6 @@ export function createPicker({
         button,
         element(document, "span", { className: "picker-row-label", text: row.label }),
         element(document, "span", { className: "picker-row-description", text: row.current ? "Current" : "" }),
-        element(document, "span", { className: "picker-row-detail", text: detail(row) }),
       );
       listen(button, "click", () => onChoose(row, index));
       return button;
@@ -72,14 +60,6 @@ export function createPicker({
     } else if (event.key === "Enter" && focused >= 0) {
       event.preventDefault();
       onChoose(rows[focused], focused);
-    } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && focused >= 0 && showEfforts) {
-      const row = rows[focused];
-      if (Array.isArray(row.efforts) && row.efforts.length > 0) {
-        event.preventDefault();
-        row.effortIndex = (row.effortIndex + (event.key === "ArrowRight" ? 1 : -1) + row.efforts.length) % row.efforts.length;
-        renderRows();
-        onAdjust(row, focused);
-      }
     }
   });
 

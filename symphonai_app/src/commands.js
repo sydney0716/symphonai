@@ -8,8 +8,8 @@ export const COMMANDS = Object.freeze([
   Object.freeze({
     name: "model",
     aliases: Object.freeze([]),
-    description: "Choose the provider, model and effort",
-    argumentHint: "[<provider> [<id> [<effort>]]]",
+    description: "Choose the provider and model",
+    argumentHint: "[<provider> [<id>]]",
   }),
   Object.freeze({
     name: "effort",
@@ -45,6 +45,12 @@ export const COMMANDS = Object.freeze([
     name: "cost",
     aliases: Object.freeze([]),
     description: "Show what this conversation has used",
+    argumentHint: "",
+  }),
+  Object.freeze({
+    name: "context",
+    aliases: Object.freeze([]),
+    description: "Show what fills the context window",
     argumentHint: "",
   }),
   Object.freeze({

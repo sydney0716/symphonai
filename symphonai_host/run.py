@@ -27,6 +27,7 @@ from symphonai_api.leader import (
     DEFAULT_SUBAGENT_MAX_TURNS, Leader, LeaderConfig, LeaderRunResult,
     builtin_subagent_specs,
 )
+from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -774,6 +775,10 @@ class HostRun:
                 "used_tokens": report.total_tokens,
                 "budget_tokens": report.budget,
                 "remaining_tokens": report.remaining_tokens,
+                "window_tokens": context_window_for_model(
+                    leader._config.leader_provider.wire_format,
+                    leader._leader_spec.model.model,
+                ),
                 "by_source": {
                     source.value: tokens for source, tokens in report.by_source().items()
                 },

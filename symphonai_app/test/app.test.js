@@ -351,6 +351,7 @@ test("command matching prioritizes names and also searches descriptions", () => 
   assert.deepEqual(matchCommands("/mo"), [COMMANDS[0], COMMANDS[1]]);
   assert.deepEqual(matchCommands("/MOD"), [COMMANDS[0], COMMANDS[1]]);
   assert.deepEqual(matchCommands("/model"), [COMMANDS[1]]);
+  assert.ok(matchCommands("/con").some(({ name }) => name === "context"));
   assert.deepEqual(matchCommands("/choose"), COMMANDS.slice(0, 3));
   assert.deepEqual(matchCommands("/current"), [COMMANDS[2]]);
   assert.deepEqual(matchCommands("/model x"), []);
@@ -364,13 +365,14 @@ test("help lists commands and their aliases in table order", async () => {
 
   assert.deepEqual(visibleText(document.getElementById("chat")).trim().split("\n"), [
     "/mode — Choose the permission mode",
-    "/model [<provider> [<id> [<effort>]]] — Choose the provider, model and effort",
+    "/model [<provider> [<id>]] — Choose the provider and model",
     "/effort [<value>] — Choose the effort for the current model",
     "/help — Show the commands",
     "/new — Start a new chat (also /clear)",
     "/plan — Switch plan mode on or off",
     "/resume [<search>] — Reopen a past conversation in this project (also /continue)",
     "/cost — Show what this conversation has used",
+    "/context — Show what fills the context window",
     "/compact [<instructions>] — Summarize the conversation so far to free context",
     "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
@@ -714,18 +716,26 @@ test("slash suggestions render above the composer without taking focus", async (
   const menu = find(document.getElementById("chat-pane"), (node) => node.className === "command-menu");
   assert.deepEqual(menu.children.map((row) => row.textContent), [
     "/mode    Choose the permission mode",
-    "/model  [<provider> [<id> [<effort>]]]  Choose the provider, model and effort",
+    "/model  [<provider> [<id>]]  Choose the provider and model",
     "/effort  [<value>]  Choose the effort for the current model",
     "/help    Show the commands",
     "/new    Start a new chat",
     "/plan    Switch plan mode on or off",
     "/resume  [<search>]  Reopen a past conversation in this project",
     "/cost    Show what this conversation has used",
+    "/context    Show what fills the context window",
     "/compact  [<instructions>]  Summarize the conversation so far to free context",
     "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));
+
+  input.value = "/con";
+  await input.dispatch("input");
+  assert.deepEqual(menu.children.map((row) => row.textContent), [
+    "/resume  [<search>]  Reopen a past conversation in this project",
+    "/context    Show what fills the context window",
+  ]);
 
   input.value = "/mode ";
   await input.dispatch("input");
@@ -917,6 +927,67 @@ test("conversation context and per-agent usage render and refresh after compacti
   assert.equal(client.calls.conversationStats, 2);
 });
 
+test("context command shows the measured source breakdown and model window", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.conversationStats = async () => ({ conversation: {
+    provider: "anthropic",
+    model: "claude-opus-5-5",
+    context: {
+      used_tokens: 12400,
+      budget_tokens: 955000,
+      remaining_tokens: 942600,
+      window_tokens: 1000000,
+      by_source: { system_prompt: 2100, user: 800, assistant: 3000, tool_result: 6500 },
+    },
+  } });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/context");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, [
+    "Context · anthropic / claude-opus-5-5",
+    "Used 12,400 of 955,000 tokens before compaction (1.3%) · window 1,000,000",
+    "    System prompt   2,100",
+    "    Your messages   800",
+    "    Replies         3,000",
+    "    Tool results    6,500",
+    "Remaining before compaction: 942,600",
+    "Counts are estimates, about 4 characters per token.",
+  ].join("\n"));
+  await submitCommand(document, "/context now");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "Usage: /context");
+});
+
+test("context command omits an unknown window and handles unmeasured context", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  let conversation = {
+    provider: "anthropic",
+    model: "claude-custom",
+    context: {
+      used_tokens: 13,
+      budget_tokens: 100,
+      remaining_tokens: 87,
+      window_tokens: null,
+      by_source: { user: 8, assistant: 5 },
+    },
+  };
+  client.conversationStats = async () => ({ conversation });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/context");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, [
+    "Context · anthropic / claude-custom",
+    "Used 13 of 100 tokens before compaction (13.0%)",
+    "    Your messages   8",
+    "    Replies         5",
+    "Remaining before compaction: 87",
+    "Counts are estimates, about 4 characters per token.",
+  ].join("\n"));
+
+  conversation = { provider: "anthropic", model: "claude-custom" };
+  await submitCommand(document, "/context");
+  assert.equal(document.getElementById("chat").children.at(-1).textContent, "No context measured yet. Send a message first.");
+});
+
 test("sidebar groups sessions and keeps only the current project openable", async () => {
   const document = new FakeDocument();
   const client = fakeClient(fixtureRoadmap(), {
@@ -1045,9 +1116,9 @@ test("mode picker marks the current mode and selects with keyboard without promp
   assert.match(visibleText(document.getElementById("chat")), /Mode set to plan/);
 });
 
-test("model picker moves, adjusts effort, selects by keyboard and pointer", async () => {
+test("model picker selects models and preserves only supported effort", async () => {
   const document = new FakeDocument();
-  let current = { provider: "openai", model: "gpt-current", mode: "ask" };
+  let current = { provider: "openai", model: "gpt-current", effort: "high", mode: "ask" };
   const client = fakeClient(fixtureRoadmap(), {
     conversation: current,
     modelListing: { provider: "openai", state: "available", models: [
@@ -1057,7 +1128,12 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
       { id: "gpt-unknown", efforts: null },
     ], detail: "" },
   });
-  client.selectProvider = async (choice) => { client.calls.selectProvider.push(choice); current = { ...current, provider: choice.name, model: choice.model, effort: choice.effort }; };
+  client.selectProvider = async (choice) => {
+    client.calls.selectProvider.push(choice);
+    current = { ...current, provider: choice.name, model: choice.model };
+    if (Object.hasOwn(choice, "effort")) current.effort = choice.effort;
+    else delete current.effort;
+  };
   client.conversationStats = async () => ({ conversation: current });
   await start({ global: {}, document, client });
   const input = document.getElementById("prompt");
@@ -1069,20 +1145,15 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
   assert.deepEqual(rows.map((row) => row.children[0].textContent), ["gpt-current", "gpt-next", "gpt-basic", "gpt-unknown"]);
   assert.match(rows[0].className, /focused current/);
   assert.equal(rows[0].children[1].textContent, "Current");
-  assert.equal(rows[0].children[2].textContent, "Effort: low · ← → to adjust");
-  assert.equal(rows[2].children[2].textContent, "Effort not supported");
-  assert.equal(rows[3].children[2].textContent, "Effort support unknown · set with /model <provider> <id> <effort>");
+  assert.equal(rows[0].children.length, 2);
   assert.deepEqual(client.calls.models, [["openai", undefined]]);
   await picker.dispatch("keydown", { key: "ArrowRight" });
   rows = find(picker, (node) => node.className === "picker-list").children;
-  assert.equal(rows[0].children[2].textContent, "Effort: high · ← → to adjust");
-  await picker.dispatch("keydown", { key: "ArrowLeft" });
-  rows = find(picker, (node) => node.className === "picker-list").children;
-  assert.equal(rows[0].children[2].textContent, "Effort: low · ← → to adjust");
+  assert.match(rows[0].className, /focused current/);
   await picker.dispatch("keydown", { key: "ArrowDown" });
   await picker.dispatch("keydown", { key: "Enter" });
-  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "gpt-next", effort: "medium" }]);
-  assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-next/);
+  assert.deepEqual(client.calls.selectProvider, [{ name: "openai", model: "gpt-next", effort: "high" }]);
+  assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-next · effort high\./);
   assert.equal(input.value, "");
   input.value = "/model";
   await document.getElementById("prompt-form").dispatch("submit");
@@ -1090,7 +1161,7 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
   await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "gpt-basic").dispatch("click");
   assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-basic" });
   assert.deepEqual(client.calls.prompt, []);
-  assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-basic/);
+  assert.match(visibleText(document.getElementById("chat")), /Model set to openai \/ gpt-basic · effort reset to the model's default\./);
   input.value = "/model";
   await document.getElementById("prompt-form").dispatch("submit");
   picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
@@ -1098,7 +1169,8 @@ test("model picker moves, adjusts effort, selects by keyboard and pointer", asyn
   assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-unknown" });
   input.value = "/model openai gpt-unknown experimental";
   await document.getElementById("prompt-form").dispatch("submit");
-  assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-unknown", effort: "experimental" });
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/model \[<provider> \[<id>\]\]/);
+  assert.deepEqual(client.calls.selectProvider.at(-1), { name: "openai", model: "gpt-unknown" });
 });
 
 test("escape cancels through the keymap and keeps the current model", async () => {
@@ -1146,6 +1218,14 @@ test("bare model command in a conversation can switch to another keyed provider"
   assert.deepEqual(rows.map((row) => row.children[0].textContent), ["anthropic-model"]);
   assert.deepEqual(client.calls.selectProvider, []);
   assert.deepEqual(client.calls.prompt, []);
+  await picker.dispatch("keydown", { key: "Escape" });
+  picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  rows = find(picker, (node) => node.className === "picker-list").children;
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["openai", "anthropic"]);
+  assert.match(rows[1].className, /focused/);
+  assert.doesNotMatch(visibleText(document.getElementById("chat")), /Kept model as/);
+  await picker.dispatch("keydown", { key: "Escape" });
+  assert.match(visibleText(document.getElementById("chat")), /Kept model as openai \/ gpt-old/);
 });
 
 test("a model hidden from discovery can still be selected by ID", async () => {
@@ -2516,7 +2596,7 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.ok(!appSource.includes("chatLine"));
   assert.ok(!appSource.includes("roadmap.goal"));
   assert.ok(!appSource.includes('getElementById("turn-state")'));
-  assert.ok(!start.toString().includes("window"));
+  assert.ok(!/\bwindow\s*(?:\.|\[)/.test(start.toString()));
   for (const className of [
     "prompt",
     "activity",
