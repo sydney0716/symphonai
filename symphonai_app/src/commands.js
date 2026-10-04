@@ -62,8 +62,8 @@ export const COMMANDS = Object.freeze([
   Object.freeze({
     name: "goal",
     aliases: Object.freeze([]),
-    description: "Keep working until a check passes",
-    argumentHint: "[<objective> -- <check command> | pause | resume | clear]",
+    description: "Keep working toward a goal",
+    argumentHint: "[<objective> [-- <check command>] | pause | resume | clear]",
   }),
   Object.freeze({
     name: "init",

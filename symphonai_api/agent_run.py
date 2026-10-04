@@ -132,6 +132,10 @@ class AgentRun:
             self._redirects.clear()
             return redirects
 
+    def has_redirects(self) -> bool:
+        with self._control_lock:
+            return bool(self._redirects)
+
     def finish(self, result: object) -> None:
         self._require("finish", RunPhase.RUNNING)
         try:

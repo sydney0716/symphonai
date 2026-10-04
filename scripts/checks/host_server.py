@@ -2904,6 +2904,80 @@ def check_goal_stop_and_resume() -> None:
             host.close()
 
 
+@check("host_server.goal_resume_mid_round")
+def check_goal_resume_mid_round() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        counter = root / "check-count"
+        code = (
+            "from pathlib import Path; import sys; "
+            f"p=Path({str(counter)!r}); n=int(p.read_text())+1 if p.exists() else 1; "
+            "p.write_text(str(n)); sys.exit(0 if n == 2 else 1)"
+        )
+        provider = _WaitingProvider()
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", code]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            _wait_until(lambda: host.run.active, "goal round did not start")
+            connection, response = _request(
+                host, "POST", "/goal/state", body={"action": "pause"}, headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            connection, response = _request(
+                host, "POST", "/goal/state", body={"action": "resume"}, headers=_headers(host),
+            )
+            resumed = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or resumed["goal"]["phase"] != "active":
+                fail(f"mid-round resume was not accepted: {response.status}, {resumed!r}")
+            provider.release.set()
+            goal = _wait_goal_state(host, "complete")
+            if goal["rounds"] != 2 or goal["last_check"]["exit"] != 0 or counter.read_text() != "2":
+                fail(f"resumed goal did not check round one and continue: {goal!r}")
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_server.goal_pause_mid_round_stays_paused")
+def check_goal_pause_mid_round_stays_paused() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        marker = root / "check-ran"
+        code = f"from pathlib import Path; Path({str(marker)!r}).touch()"
+        provider = _WaitingProvider()
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", code]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            _wait_until(lambda: host.run.active, "goal round did not start")
+            connection, response = _request(
+                host, "POST", "/goal/state", body={"action": "pause"}, headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            provider.release.set()
+            goal = _wait_goal_state(host, "paused")
+            _wait_until(lambda: not host.run.active, "paused goal round did not finish")
+            if goal["rounds"] != 1 or goal["reason"] != "paused" or marker.exists():
+                fail(f"a paused round ran its check or changed state: {goal!r}")
+        finally:
+            provider.release.set()
+            host.close()
+
+
 @check("host_server.goal_check_timeout_kills_group")
 def check_goal_check_timeout_kills_group() -> None:
     with tempfile.TemporaryDirectory() as temporary:

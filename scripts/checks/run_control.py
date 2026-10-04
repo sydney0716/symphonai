@@ -19,7 +19,7 @@ from symphonai_api.agent_spec import AgentSpec, ModelSelector
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.cost import ModelPrice, PriceTable
-from symphonai_api.events import CollectingSink
+from symphonai_api.events import CollectingSink, RunFinished
 from symphonai_api.identity import AgentRef, RunRef, TurnRef
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
@@ -784,6 +784,76 @@ def redirect_reaches_the_next_turn() -> None:
         ]
         if len(delivered) != 1 or controlled.take_redirects() != ():
             fail("redirect was omitted, replayed, or left queued")
+
+
+@check("run_control.redirect_during_final_answer")
+def redirect_during_final_answer() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        controlled = _new_run(root, budget=RunBudget(max_turns=3))
+        token = CancellationToken()
+        controlled.start(token)
+
+        class RedirectingProvider(FakeModelProvider):
+            def __init__(self, responses, target_run):  # noqa: ANN001
+                super().__init__(responses)
+                self.requests = []
+                self.target_run = target_run
+
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    self.target_run.redirect("also update the docs")
+                return super().create_response(request, cancel=cancel)
+
+        provider = RedirectingProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+            ModelResponse(Message(Role.ASSISTANT, "done with docs")),
+        ], controlled)
+        sink = CollectingSink()
+        agent = ApiAgent(
+            provider,
+            {},
+            PermissionPolicy(repo_root=root),
+            budget=controlled.budget,
+            events=sink,
+        )
+        result = agent.run([Message(Role.USER, "task")], run=controlled)
+        if (
+            result.stopped_reason != "final_response"
+            or result.final_response.message.text != "done with docs"
+            or len(provider.requests) != 2
+            or provider.requests[1].messages[-1].role is not Role.USER
+            or provider.requests[1].messages[-1].text != "also update the docs"
+        ):
+            fail("redirect during a final answer was not delivered in one more turn")
+        run_finished = [event for event in sink.events if isinstance(event, RunFinished)]
+        if len(run_finished) != 1 or provider.call_count != 2:
+            fail(f"superseded answer emitted a terminal run event: {run_finished!r}")
+
+        capped = _new_run(root, budget=RunBudget(max_turns=1))
+        capped_token = CancellationToken()
+        capped.start(capped_token)
+        capped_sink = CollectingSink()
+        capped_provider = RedirectingProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done at the limit")),
+        ], capped)
+        capped_agent = ApiAgent(
+            capped_provider,
+            {},
+            PermissionPolicy(repo_root=root),
+            budget=capped.budget,
+            events=capped_sink,
+        )
+        capped_result = capped_agent.run([Message(Role.USER, "task")], run=capped)
+        capped_events = [event for event in capped_sink.events if isinstance(event, RunFinished)]
+        if (
+            capped_result.final_response.message.text != "done at the limit"
+            or capped_provider.call_count != 1
+            or len(capped_events) != 1
+            or capped.take_redirects() != ("also update the docs",)
+        ):
+            fail("redirect during the only allowed turn did not stop at the limit")
 
 
 @check("run_control.capped_turns_stop_the_run")

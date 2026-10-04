@@ -459,10 +459,24 @@ class HostRun:
                 return goal.payload()
             if action != "resume":
                 raise ValueError("unknown goal action")
-            if self._active is not None or self._goal_check is not None:
-                raise RunActiveError(self._active.run_id if self._active else "goal check")
+            if self._goal_check is not None:
+                raise RunActiveError("goal check")
             if goal.phase in ("active", "complete"):
                 raise RunActiveError("goal is already active or complete")
+            active = self._active
+            if active is not None:
+                conversation = self._conversation
+                if (
+                    not active.goal_round
+                    or conversation is None
+                    or conversation[1].run_id != session_id
+                ):
+                    raise RunActiveError(active.run_id)
+                goal.phase = "active"
+                goal.reason = ""
+                self._save_goal(session_id, goal)
+                self._goal_event("resume", goal, active.run_id, active.root_agent_id)
+                return goal.payload()
             goal.phase = "active"
             goal.reason = ""
             self._save_goal(session_id, goal)

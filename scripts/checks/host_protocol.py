@@ -44,6 +44,8 @@ def _event_instance(event_class: type[Event], *, turn_id_none: bool = False) -> 
             values[field.name] = 7
         elif hints[field.name] is bool:
             values[field.name] = True
+        elif hints[field.name] == dict | None:
+            values[field.name] = {"exit": 1, "ok": False, "output": "out"}
         else:
             raise AssertionError(f"unsupported event field {event_class.__name__}.{field.name}")
     return event_class(**values)

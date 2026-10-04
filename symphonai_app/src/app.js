@@ -1809,7 +1809,7 @@ export async function start({ global, document, client }) {
       return;
     }
     if (entry.name === "goal") {
-      const usage = "Usage: /goal [<objective> -- <check command> | pause | resume | clear]";
+      const usage = "Usage: /goal [<objective> [-- <check command>] | pause | resume | clear]";
       if (args.length === 0) {
         try {
           const reply = await boundary.conversationStats();
@@ -1921,14 +1921,6 @@ export async function start({ global, document, client }) {
     }
     const event = decodeEvent(frame.payload);
     if (event.type === "GoalChanged") {
-      const goalEntry = transcript.model.at(-1);
-      if (goalEntry?.type === "goal" && event.fields.change === "update") {
-        goalEntry.text = `Agent marked the goal ${event.fields.phase}: ${event.fields.reason}.`;
-      } else if (goalEntry?.type === "goal" && event.fields.change === "round") {
-        goalEntry.text = event.fields.phase === "blocked"
-          ? `Goal blocked: ${event.fields.reason}.`
-          : `No check configured. Starting round ${event.fields.rounds} of ${event.fields.max_rounds}.`;
-      }
       conversation = {
         ...(conversation ?? {}),
         goal: event.fields.change === "clear"

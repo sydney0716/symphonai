@@ -609,11 +609,23 @@ test("goal check events become command-style transcript entries", () => {
       change: "check", phase: "complete", rounds: 2, max_rounds: 10, reason: "",
       last_check: { exit: 0, ok: true, output: "" },
     }),
+    event("GoalChanged", {
+      change: "update", phase: "complete", rounds: 2, max_rounds: 10, reason: "all green", last_check: null,
+    }),
+    event("GoalChanged", {
+      change: "round", phase: "active", rounds: 2, max_rounds: 10, reason: "", last_check: null,
+    }),
+    event("GoalChanged", {
+      change: "round", phase: "blocked", rounds: 10, max_rounds: 10, reason: "rounds exhausted", last_check: null,
+    }),
   ]);
   assert.deepEqual(transcript.model.filter(({ type }) => type === "goal"), [
     { type: "goal", agentId: "agent-1", text: "Goal set: up to 10 rounds.", output: "" },
     { type: "goal", agentId: "agent-1", text: "Goal check failed (exit 1). Starting round 2 of 10.", output: "1 failed" },
     { type: "goal", agentId: "agent-1", text: "Goal check passed. Goal complete after 2 rounds.", output: "" },
+    { type: "goal", agentId: "agent-1", text: "Agent marked the goal complete: all green.", output: "" },
+    { type: "goal", agentId: "agent-1", text: "No check configured. Starting round 2 of 10.", output: "" },
+    { type: "goal", agentId: "agent-1", text: "Goal blocked: rounds exhausted.", output: "" },
   ]);
 });
 

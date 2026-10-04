@@ -47,7 +47,7 @@ fields on a known event are ignored for forward compatibility.
 | `SubagentSpawned` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
-| `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (including `update`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null` |
+| `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -267,11 +267,15 @@ the check decides at the end of the round. Goal updates publish
 `GoalChanged(change="update")` with the message in `reason`.
 
 For an unchecked goal, each final response starts the next round with a prompt
-reminding the leader to report `complete` or `blocked`; reaching `max_rounds`
-blocks it with reason `rounds exhausted`.
+reminding the leader to report `complete` or `blocked`. The host publishes
+`GoalChanged(change="round")` when it starts that next round and when reaching
+`max_rounds` blocks the goal with reason `rounds exhausted`.
 
 `POST /goal/state` takes `{"action": "pause" | "resume" | "clear"}`. Resume
-runs the check immediately and continues if needed. `GET /conversation`
+while a goal round is running reactivates the goal; its round-end check or
+check-less continuation then proceeds normally. Resume while a check is
+running returns `409`. With no run active, resume runs the check immediately
+and continues if needed. `GET /conversation`
 includes `goal`, either the current goal state or `null`. Goal state is stored
 in session metadata; reopening an active goal pauses it with reason `reopened`,
 and a fork starts without a goal. `GoalChanged` reports state transitions.

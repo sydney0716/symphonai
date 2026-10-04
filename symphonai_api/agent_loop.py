@@ -462,6 +462,12 @@ class ApiAgent:
                             index=turn,
                         ),
                     )
+                    if (
+                        run is not None
+                        and run.has_redirects()
+                        and turn < min(self._max_turns, run.budget.max_turns)
+                    ):
+                        continue
                     result = AgentRunResult(
                         final_response=response,
                         messages=conversation,

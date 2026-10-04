@@ -110,6 +110,7 @@ def check_usage_totals_merge() -> None:
     actual_event_fields = {
         event_type.__name__: {item.name for item in fields(event_type)}
         for event_type in Event.__subclasses__()
+        if event_type.__module__ == Event.__module__
     }
     if actual_event_fields != expected_event_fields:
         fail(f"event schema changed during usage tracking: {actual_event_fields!r}")

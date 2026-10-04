@@ -446,7 +446,7 @@ test("help lists commands and their aliases in table order", async () => {
     "/cost — Show what this conversation has used",
     "/context — Show what fills the context window",
     "/compact [<instructions>] — Summarize the conversation so far to free context",
-    "/goal [<objective> -- <check command> | pause | resume | clear] — Keep working until a check passes",
+    "/goal [<objective> [-- <check command>] | pause | resume | clear] — Keep working toward a goal",
     "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   await submitCommand(document, "/help extra");
@@ -486,7 +486,7 @@ test("goal syntax errors answer usage without posting", async () => {
   await start({ global: {}, document, client });
   for (const command of ["/goal fix it --", "/goal -- make test", "/goal pause now"]) {
     await submitCommand(document, command);
-    assert.match(visibleText(document.getElementById("chat")), /Usage: \/goal \[<objective> -- <check command> \| pause \| resume \| clear\]/);
+    assert.match(visibleText(document.getElementById("chat")), /Usage: \/goal \[<objective> \[-- <check command>\] \| pause \| resume \| clear\]/);
   }
   assert.deepEqual(client.calls.goal, []);
   assert.deepEqual(client.calls.goalState, []);
@@ -966,7 +966,7 @@ test("slash suggestions render above the composer without taking focus", async (
     "/cost    Show what this conversation has used",
     "/context    Show what fills the context window",
     "/compact  [<instructions>]  Summarize the conversation so far to free context",
-    "/goal  [<objective> -- <check command> | pause | resume | clear]  Keep working until a check passes",
+    "/goal  [<objective> [-- <check command>] | pause | resume | clear]  Keep working toward a goal",
     "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   assert.equal(document.activeElement, input);

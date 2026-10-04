@@ -256,6 +256,12 @@ export function createTranscript() {
         text = "Goal resumed.";
       } else if (fields.change === "clear") {
         text = "Goal cleared.";
+      } else if (fields.change === "update") {
+        text = `Agent marked the goal ${fields.phase}: ${fields.reason}.`;
+      } else if (fields.change === "round") {
+        text = fields.phase === "blocked"
+          ? `Goal blocked: ${fields.reason}.`
+          : `No check configured. Starting round ${fields.rounds} of ${fields.max_rounds}.`;
       }
       model.push({
         type: "goal",
