@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 
 from symphonai_api.cancellation import CancellationToken
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.compaction import estimate_text_tokens
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
@@ -263,8 +264,13 @@ class ReadFileTool(LocalTool):
 class WriteFileTool(LocalTool):
     """Write UTF-8 text content to a file inside the explicit allowed write scope."""
 
-    def __init__(self, ledger: ReadLedger) -> None:
+    def __init__(
+        self,
+        ledger: ReadLedger,
+        checkpoints: CheckpointStore | None = None,
+    ) -> None:
         self._ledger = ledger
+        self._checkpoints = checkpoints
 
     @property
     def name(self) -> str:
@@ -328,7 +334,11 @@ class WriteFileTool(LocalTool):
                 if stale_error is not None:
                     return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
             resolved.parent.mkdir(parents=True, exist_ok=True)
+            if self._checkpoints is not None:
+                self._checkpoints.before_write(resolved)
             resolved.write_text(content, encoding="utf-8")
+            if self._checkpoints is not None:
+                self._checkpoints.after_write(resolved)
             self._ledger.record(resolved, full=True, content=content)
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))

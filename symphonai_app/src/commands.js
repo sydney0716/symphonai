@@ -60,6 +60,12 @@ export const COMMANDS = Object.freeze([
     argumentHint: "[<instructions>]",
   }),
   Object.freeze({
+    name: "goal",
+    aliases: Object.freeze([]),
+    description: "Keep working until a check passes",
+    argumentHint: "[<objective> -- <check command> | pause | resume | clear]",
+  }),
+  Object.freeze({
     name: "init",
     aliases: Object.freeze([]),
     description: "Have the agent write .symphonai/INSTRUCTIONS.md",

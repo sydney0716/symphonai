@@ -24,8 +24,13 @@ function client({ pending = [], approve } = {}) {
   const calls = { approve: [], approvals: 0 };
   return {
     calls,
-    async approve(id, allowed, reason) {
-      calls.approve.push({ approval_id: id, allowed, reason });
+    async approve(id, allowed, reason, remember = false) {
+      calls.approve.push({
+        approval_id: id,
+        allowed,
+        reason,
+        ...(remember ? { remember: true } : {}),
+      });
       return approve ? approve(id, allowed, reason) : { resolved: true };
     },
     async approvals() {
@@ -183,5 +188,19 @@ test("an omitted reason is sent only as the protocol empty default", async () =>
     approval_id: "A",
     allowed: true,
     reason: "",
+  }]);
+});
+
+test("remembering an approval sends the remember flag", async () => {
+  const boundary = client();
+  const approvals = createApprovals({ client: boundary });
+  await approvals.onFrame(frame("A", { remember: "pytest" }));
+  assert.equal(approvals.state.get("A").remember, "pytest");
+  await approvals.answer("A", true, "", true);
+  assert.deepEqual(boundary.calls.approve, [{
+    approval_id: "A",
+    allowed: true,
+    reason: "",
+    remember: true,
   }]);
 });

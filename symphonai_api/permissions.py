@@ -158,6 +158,13 @@ _MODE_ORDER = {"plan": 0, "ask": 1, "allow": 2}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 
 
+def shell_grant_prefix(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Return the stable command prefix used for a session shell grant."""
+    if len(argv) >= 2 and not argv[1].startswith("-"):
+        return tuple(argv[:2])
+    return tuple(argv[:1])
+
+
 @dataclass(frozen=True)
 class ToolApprovalRequest:
     """A side-effectful tool action that needs an interactive decision."""
@@ -166,6 +173,7 @@ class ToolApprovalRequest:
     target: str
     details: str = ""
     tool_call_id: str = ""
+    command: tuple[str, ...] = ()
 
 
 ApprovalCallback = Callable[[ToolApprovalRequest], PermissionDecision | bool]
@@ -192,7 +200,7 @@ class PermissionPolicy:
     shell_allowlist: list[tuple[str, ...]] = field(default_factory=list)
     fetch_enabled: bool = False
     fetch_allowlist: list[str] = field(default_factory=list)
-    shell_timeout_seconds: float = 10.0
+    shell_timeout_seconds: float = 600.0
     shell_output_limit_chars: int = DEFAULT_SHELL_OUTPUT_CHARS
     mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
@@ -530,6 +538,7 @@ class PermissionPolicy:
                 operation="run_shell",
                 target=" ".join(argv),
                 details=f"run in repo root: {self.repo_root}",
+                command=argv_tuple,
             )
         if not self.shell_enabled:
             return self._deny(
@@ -574,6 +583,7 @@ class PermissionPolicy:
         operation: str,
         target: str,
         details: str = "",
+        command: tuple[str, ...] = (),
     ) -> PermissionDecision:
         with self._approval_lock:
             self._permission_requested(operation)
@@ -591,6 +601,7 @@ class PermissionPolicy:
                         target=target,
                         details=details,
                         tool_call_id=tool_call_id,
+                        command=command,
                     )
                 )
             except Exception as exc:  # noqa: BLE001

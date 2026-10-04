@@ -177,6 +177,24 @@ def check_request_validation() -> None:
             fail(f"invalid {kind} request was accepted")
 
 
+@check("host_protocol.approval_remember_validation")
+def check_approval_remember_validation() -> None:
+    base = {"approval_id": "approval-1", "allowed": True}
+    if decode_request("approval", base) != ApprovalReply("approval-1", True):
+        fail("omitted remember did not default to false")
+    if decode_request("approval", {**base, "remember": True}) != ApprovalReply(
+        "approval-1", True, remember=True
+    ):
+        fail("remember true was not decoded")
+    try:
+        decode_request("approval", {**base, "remember": "yes"})
+    except ProtocolError as exc:
+        if "remember" not in str(exc):
+            fail(f"invalid remember error omitted its field: {exc}")
+    else:
+        fail("non-boolean remember value was accepted")
+
+
 @check("host_protocol.document_covers_registry")
 def check_document_covers_registry() -> None:
     gc.collect()

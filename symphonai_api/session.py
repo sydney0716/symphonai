@@ -32,6 +32,7 @@ _RECORD_TYPES = frozenset(
         "turn_finished",
         "cancellation",
         "compaction",
+        "checkpoint",
         "conversation_rewritten",
         "run_finished",
         "run_failed",

@@ -246,9 +246,12 @@ export function fakeClient(
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
     conversation = null,
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
+    changes = { turns: [], files: [] },
+    revertConflictPaths = [],
   } = {},
 ) {
-  const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], forkSession: [], models: [], newSession: 0, openSession: [], prompt: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { agent: [], approve: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], file: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  let changesReply = changes;
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -301,11 +304,30 @@ export function fakeClient(
       calls.compact.push(instructions);
       return { changed: false, before_tokens: 0, after_tokens: 0, dropped_messages: 0 };
     },
+    async setGoal(objective, check) {
+      calls.goal.push({ objective, check });
+      return {
+        accepted: true,
+        run_id: "goal-run",
+        goal: { objective, check, phase: "active", rounds: 1, max_rounds: 10, last_check: null, reason: "" },
+      };
+    },
+    async goalState(action) {
+      calls.goalState.push(action);
+      return { goal: action === "clear" ? null : { objective: "goal", check: ["make", "test"], phase: action === "pause" ? "paused" : "active", rounds: 1, max_rounds: 10, last_check: null, reason: "" } };
+    },
     async stop() {
       return { accepted: true };
     },
-    async approve(id, allowed, reason) {
-      calls.approve.push({ id, allowed, reason });
+    async controlAgent(agentId, action, text) {
+      calls.controlAgent.push({ agent_id: agentId, action, ...(text === undefined ? {} : { text }) });
+      return {
+        agent_id: agentId,
+        state: action === "pause" ? "paused" : action === "stop" ? "stopping" : "running",
+      };
+    },
+    async approve(id, allowed, reason, remember = false) {
+      calls.approve.push({ id, allowed, reason, ...(remember ? { remember: true } : {}) });
       return { resolved: true };
     },
     async approvals() {
@@ -333,6 +355,21 @@ export function fakeClient(
       calls.conversationStats += 1;
       return { conversation };
     },
+    async changes() {
+      calls.changes += 1;
+      return changesReply;
+    },
+    async revertChanges(payload) {
+      calls.revertChanges.push(payload);
+      if (revertConflictPaths.length > 0 && !payload.force) {
+        const error = new Error("files changed outside the agent");
+        error.status = 409;
+        error.paths = revertConflictPaths;
+        throw error;
+      }
+      changesReply = { turns: [], files: [] };
+      return { reverted: [payload.path].filter(Boolean) };
+    },
     async storeCredential(name, value) {
       calls.credentials.push({ name, value });
       return { stored: true, name };
@@ -345,8 +382,8 @@ export function fakeClient(
       calls.openSession.push(runId);
       return { run_id: runId };
     },
-    async forkSession(runId, recordId) {
-      calls.forkSession.push([runId, recordId]);
+    async forkSession(runId, recordId, force = false) {
+      calls.forkSession.push([runId, recordId, ...(force ? [true] : [])]);
       return { run_id: "fork-run" };
     },
     async newSession() {
@@ -409,10 +446,176 @@ test("help lists commands and their aliases in table order", async () => {
     "/cost — Show what this conversation has used",
     "/context — Show what fills the context window",
     "/compact [<instructions>] — Summarize the conversation so far to free context",
+    "/goal [<objective> -- <check command> | pause | resume | clear] — Keep working until a check passes",
     "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
+});
+
+test("goal sets a check argv and queues a prompt during its first round", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  let active = false;
+  client.health = async () => ({ protocol_version: 1, state: active ? "active" : "idle", run_id: null, runtime_run_id: active ? "runtime-goal" : null });
+  client.setGoal = async (objective, check) => {
+    client.calls.goal.push({ objective, check });
+    active = true;
+    return { accepted: true, run_id: "goal-run", goal: { objective, check, phase: "active", rounds: 1, max_rounds: 10, last_check: null, reason: "" } };
+  };
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: false, conflict: true, run_id: "goal-run" };
+  };
+  const app = await start({ global: {}, document, client });
+  await submitCommand(document, "/goal fix the parser -- python3 -m pytest tests/parser");
+  assert.deepEqual(client.calls.goal, [{
+    objective: "fix the parser",
+    check: ["python3", "-m", "pytest", "tests/parser"],
+  }]);
+  assert.match(visibleText(document.getElementById("chat")), /Goal set\. Round 1 of 10 started\./);
+  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal active 1\/10/);
+  await submitCommand(document, "please finish the parser");
+  assert.equal(app.turn.state, RUNNING);
+  assert.deepEqual(app.turn.queue.map(({ text }) => text), ["please finish the parser"]);
+});
+
+test("goal syntax errors answer usage without posting", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  for (const command of ["/goal fix it --", "/goal -- make test", "/goal pause now"]) {
+    await submitCommand(document, command);
+    assert.match(visibleText(document.getElementById("chat")), /Usage: \/goal \[<objective> -- <check command> \| pause \| resume \| clear\]/);
+  }
+  assert.deepEqual(client.calls.goal, []);
+  assert.deepEqual(client.calls.goalState, []);
+});
+
+test("goal accepts a check-less objective and rejects an empty explicit check", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/goal fix the parser");
+  assert.deepEqual(client.calls.goal, [{ objective: "fix the parser", check: [] }]);
+  assert.match(visibleText(document.getElementById("chat")), /Goal set\. Round 1 of 10 started\./);
+  await submitCommand(document, "/goal fix it --");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/goal/);
+  assert.equal(client.calls.goal.length, 1);
+});
+
+test("goal set maps 409 to the active-run message", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.setGoal = async () => { throw Object.assign(new Error("conflict"), { status: 409 }); };
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/goal fix it -- make test");
+  assert.match(visibleText(document.getElementById("chat")), /A run is active\. Wait for it to finish, then set the goal\./);
+});
+
+test("goal state commands post their action and display host errors", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/goal pause");
+  await submitCommand(document, "/goal resume");
+  await submitCommand(document, "/goal clear");
+  assert.deepEqual(client.calls.goalState, ["pause", "resume", "clear"]);
+  assert.match(visibleText(document.getElementById("chat")), /Goal cleared\./);
+  client.goalState = async (action) => {
+    client.calls.goalState.push(action);
+    throw new Error("no goal");
+  };
+  await submitCommand(document, "/goal resume");
+  assert.match(visibleText(document.getElementById("chat")), /no goal/);
+});
+
+test("bare goal shows saved status and the last check result", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: {
+      goal: {
+        objective: "fix the parser",
+        check: ["python3", "-m", "pytest"],
+        phase: "paused",
+        rounds: 2,
+        max_rounds: 10,
+        reason: "interrupted",
+        last_check: { exit: 1, ok: false, output: "1 failed" },
+      },
+    },
+  });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/goal");
+  assert.match(visibleText(document.getElementById("chat")), /fix the parser/);
+  assert.match(visibleText(document.getElementById("chat")), /Check: python3 -m pytest/);
+  assert.match(visibleText(document.getElementById("chat")), /paused · round 2 of 10 · interrupted/);
+  assert.match(visibleText(document.getElementById("chat")), /Last check: exit 1/);
+  assert.match(visibleText(document.getElementById("chat")), /1 failed/);
+
+  const emptyDocument = new FakeDocument();
+  const emptyClient = fakeClient();
+  emptyClient.conversationStats = async () => ({ conversation: null });
+  await start({ global: {}, document: emptyDocument, client: emptyClient });
+  await submitCommand(emptyDocument, "/goal");
+  assert.match(visibleText(emptyDocument.getElementById("chat")), /No goal\. Set one with \/goal <objective> \[-- <check command>\]\./);
+});
+
+test("goal events render between rounds and update the status line", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: {
+      provider: "fake",
+      mode: "ask",
+      goal: { objective: "fix parser", check: ["make", "test"], phase: "active", rounds: 1, max_rounds: 10, reason: "", last_check: null },
+    },
+  });
+  const app = await start({ global: {}, document, client });
+  const goalEvent = (change, phase, rounds, last_check = null, reason = "") => eventFrame("GoalChanged", {
+    change, phase, rounds, max_rounds: 10, reason, last_check,
+  });
+  await app.onFrame(goalEvent("set", "active", 1));
+  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal active 1\/10/);
+  await app.onFrame(eventFrame("RunFinished", { stopped_reason: "final_response" }));
+  await app.onFrame(goalEvent("check", "active", 1, { exit: 1, ok: false, output: "1 failed" }));
+  await app.onFrame(eventFrame("PromptSubmitted", { text: "round two feedback", message_count: 2 }));
+  await app.onFrame(eventFrame("RunFinished", { stopped_reason: "final_response" }));
+  await app.onFrame(goalEvent("check", "complete", 2, { exit: 0, ok: true, output: "" }));
+  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal complete 2\/10/);
+  const entries = app.transcript.model.filter(({ type }) => type === "goal");
+  assert.deepEqual(entries.map(({ text }) => text), [
+    "Goal set: up to 10 rounds.",
+    "Goal check failed (exit 1). Starting round 2 of 10.",
+    "Goal check passed. Goal complete after 2 rounds.",
+  ]);
+  assert.equal(entries[1].output, "1 failed");
+  const goalEntry = find(document.getElementById("chat"), (value) => value.className === "goal-check-output");
+  assert.ok(goalEntry);
+  assert.match(visibleText(goalEntry), /Check output/);
+  assert.match(visibleText(goalEntry), /1 failed/);
+  await app.onFrame(goalEvent("clear", "", 0));
+  assert.doesNotMatch(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal /);
+});
+
+test("goal update and check-less round events render in the transcript", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: {
+      mode: "ask",
+      goal: { objective: "finish", check: [], phase: "active", rounds: 1, max_rounds: 2, reason: "", last_check: null },
+    },
+  });
+  const app = await start({ global: {}, document, client });
+  await app.onFrame(eventFrame("GoalChanged", {
+    change: "update", phase: "blocked", rounds: 1, max_rounds: 2,
+    reason: "missing access", last_check: null,
+  }));
+  assert.equal(app.transcript.model.at(-1).text, "Agent marked the goal blocked: missing access.");
+  await app.onFrame(eventFrame("GoalChanged", {
+    change: "round", phase: "active", rounds: 2, max_rounds: 2,
+    reason: "", last_check: null,
+  }));
+  assert.equal(app.transcript.model.at(-1).text, "No check configured. Starting round 2 of 2.");
 });
 
 test("new and clear commands share the New chat action", async () => {
@@ -763,6 +966,7 @@ test("slash suggestions render above the composer without taking focus", async (
     "/cost    Show what this conversation has used",
     "/context    Show what fills the context window",
     "/compact  [<instructions>]  Summarize the conversation so far to free context",
+    "/goal  [<objective> -- <check command> | pause | resume | clear]  Keep working until a check passes",
     "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
   ]);
   assert.equal(document.activeElement, input);
@@ -1607,19 +1811,65 @@ test("old stored roadmap routes fall back to chat, but a URL fragment wins", asy
   assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
 });
 
-test("sidebar keeps projects, a single settings link, and a home link", async () => {
+test("sidebar keeps projects, settings and changes links, and a home link", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/general" });
   await start({ global: browser.global, document, client: fakeClient() });
   const sidebar = document.getElementById("sidebar");
   const links = document.getElementById("page-links");
 
-  assert.deepEqual(links.children.map((link) => link.textContent), ["Settings"]);
+  assert.deepEqual(links.children.map((link) => link.textContent), ["Settings", "Changes"]);
   assert.doesNotMatch(visibleText(sidebar), /Roadmap|Chat/);
   assert.equal(sidebar.children[0], document.getElementById("home-link"));
   await document.getElementById("home-link").dispatch("click");
   assert.equal(browser.global.location.hash, "#/chat");
   assert.deepEqual(document.getElementById("page").children, [document.getElementById("chat-pane")]);
+});
+
+test("Changes page renders files and prompts, retries outside edits, and refreshes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    changes: {
+      turns: [{ key: "chk-one", prompt: "Update the source", paths: ["a.py"] }],
+      files: [{
+        path: "a.py",
+        status: "modified",
+        changed_outside: true,
+        diff: "-before\n+after",
+        truncated: false,
+      }],
+    },
+    revertConflictPaths: ["a.py"],
+  });
+  await start({ global: {}, document, client });
+  const page = document.getElementById("page");
+  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes")
+    .dispatch("click");
+  await Promise.resolve();
+
+  assert.equal(client.calls.changes, 1);
+  assert.match(visibleText(page), /a\.py · modified/);
+  assert.match(visibleText(page), /Changed outside the agent/);
+  assert.match(visibleText(page), /Update the source/);
+  assert.match(visibleText(page), /-before\n\+after/);
+  await find(page, (value) => value.textContent === "Revert").dispatch("click");
+  assert.deepEqual(client.calls.revertChanges, [{ path: "a.py" }]);
+  assert.match(visibleText(page), /Revert anyway/);
+  assert.match(visibleText(page), /a\.py/);
+
+  await find(page, (value) => value.textContent === "Revert anyway").dispatch("click");
+  assert.deepEqual(client.calls.revertChanges, [
+    { path: "a.py" },
+    { path: "a.py", force: true },
+  ]);
+  assert.equal(client.calls.changes, 2);
+  assert.match(visibleText(page), /No changes in this conversation/);
+
+  await document.getElementById("home-link").dispatch("click");
+  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes")
+    .dispatch("click");
+  await Promise.resolve();
+  assert.equal(client.calls.changes, 3);
 });
 
 test("status rail keeps the roadmap beside settings and renders live agents", async () => {
@@ -1663,6 +1913,68 @@ test("status rail keeps the roadmap beside settings and renders live agents", as
     agent_id: "missing", subagent_agent_id: "orphan", subagent_name: "orphan",
   }));
   assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read", "orphan · running"]);
+});
+
+test("agent rail controls pause, redirect, stop, and disappear when done", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/chat" });
+  const client = fakeClient();
+  await start({ global: browser.global, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
+
+  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  let controls = row.children.find((value) => value.className === "agent-controls");
+  assert.deepEqual(controls.children.map((button) => button.textContent), ["Pause", "Redirect", "Stop"]);
+  await controls.children[0].dispatch("click");
+  assert.deepEqual(client.calls.controlAgent[0], { agent_id: "leader-id", action: "pause" });
+  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  assert.match(row.textContent, /leader · paused/);
+  controls = row.children.find((value) => value.className === "agent-controls");
+  assert.equal(controls.children[0].textContent, "Resume");
+  await controls.children[1].dispatch("click");
+  let redirectInput = find(row, (value) => value.tagName === "INPUT");
+  assert.ok(redirectInput);
+  await redirectInput.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(find(row, (value) => value.tagName === "INPUT"), undefined);
+
+  await controls.children[1].dispatch("click");
+  redirectInput = find(row, (value) => value.tagName === "INPUT");
+  redirectInput.value = "Focus on the migration";
+  const send = find(row, (value) => value.textContent === "Send");
+  await send.dispatch("click");
+  assert.deepEqual(client.calls.controlAgent[1], {
+    agent_id: "leader-id", action: "redirect", text: "Focus on the migration",
+  });
+  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  controls = row.children.find((value) => value.className === "agent-controls");
+  await controls.children[2].dispatch("click");
+  assert.deepEqual(client.calls.controlAgent[2], { agent_id: "leader-id", action: "stop" });
+
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader-id", stopped_reason: "cancelled" }));
+  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  assert.equal(row.textContent, "leader · done");
+  assert.equal(row.children.some((value) => value.className === "agent-controls"), false);
+});
+
+test("agent rail keeps state unchanged and shows a control error", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/chat" });
+  const client = fakeClient();
+  client.controlAgent = async () => {
+    throw new Error("agent is already paused");
+  };
+  await start({ global: browser.global, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
+  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  const controls = row.children.find((value) => value.className === "agent-controls");
+  await controls.children[0].dispatch("click");
+  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  assert.equal(row._textContent, "leader · running");
+  assert.equal(
+    row.children.find((value) => value.className === "agent-control-error").textContent,
+    "agent is already paused",
+  );
+  assert.equal(row.children.find((value) => value.className === "agent-controls").children[0].textContent, "Pause");
 });
 
 test("reopened history and conversation stats render a nested agent tree without run events", async () => {
@@ -2406,6 +2718,50 @@ test("approvals stay separate and dropped frames render one model gap", async ()
   assert.deepEqual(app.transcript.model, [{ type: "gap", dropped: 2 }]);
 });
 
+test("shell approvals show and answer the remember button only when offered", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit({
+    kind: "approval_requested",
+    payload: {
+      approval_id: "shell-approval",
+      operation: "run_shell",
+      target: "pytest -x",
+      details: "run tests",
+      remember: "pytest",
+    },
+  });
+
+  const buttons = walk(document.getElementById("approvals"))
+    .filter((node) => node.tagName === "BUTTON");
+  assert.deepEqual(buttons.map((button) => button.textContent), [
+    "Allow",
+    "Allow, and don't ask again for pytest in this chat",
+    "Deny",
+  ]);
+  await buttons[1].dispatch("click");
+  assert.deepEqual(client.calls.approve, [{
+    id: "shell-approval",
+    allowed: true,
+    reason: "",
+    remember: true,
+  }]);
+
+  await client.emit({
+    kind: "approval_requested",
+    payload: {
+      approval_id: "ordinary-approval",
+      operation: "write_file",
+      target: "note.txt",
+      details: "write note",
+    },
+  });
+  const ordinaryButtons = walk(document.getElementById("approvals"))
+    .filter((node) => node.tagName === "BUTTON");
+  assert.deepEqual(ordinaryButtons.slice(-2).map((button) => button.textContent), ["Allow", "Deny"]);
+});
+
 test("assistant runs split around tool activity", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -2684,6 +3040,45 @@ test("replayed messages offer a fork at the message and show the parent in the s
   assert.deepEqual(client.calls.forkSession[1], ["fork-run", "rec-fork"]);
 });
 
+test("fork conflicts show paths and Branch anyway retries with force", async () => {
+  const document = new FakeDocument();
+  const source = { run_id: "source", title: "Original", repo_root: "/work/current" };
+  const fork = { run_id: "fork-run", title: "Original", parent_session_id: "source", repo_root: "/work/current" };
+  const client = fakeClient(fixtureRoadmap(), { sessions: [source] });
+  client.sessions = async () => [source, fork];
+  client.forkSession = async (runId, recordId, force = false) => {
+    client.calls.forkSession.push([runId, recordId, ...(force ? [true] : [])]);
+    if (!force) {
+      throw Object.assign(new Error("files changed outside the agent"), {
+        status: 409,
+        paths: ["src/a.py", "src/b.py"],
+      });
+    }
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", role: "user", text: "Original prompt", record_id: "rec-fork",
+      tool_calls: [], turn_id: "turn-fork",
+    } });
+    return { run_id: "fork-run" };
+  };
+  await start({ global: {}, document, client });
+  const sourceButton = find(document.getElementById("sidebar"), (value) =>
+    value.className === "session-link" && value.textContent === "Original"
+  );
+  await sourceButton.dispatch("click");
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "Original prompt", record_id: "rec-user",
+    tool_calls: [], turn_id: "turn-1",
+  } });
+  const forkButton = find(document.getElementById("chat"), (value) => value.className === "fork-message");
+  await forkButton.dispatch("click");
+  assert.match(visibleText(document.getElementById("chat")), /src\/a\.py, src\/b\.py/);
+  const branchAnyway = find(document.getElementById("chat"), (value) => value.textContent === "Branch anyway");
+  assert.ok(branchAnyway);
+  await branchAnyway.dispatch("click");
+  assert.deepEqual(client.calls.forkSession, [["source", "rec-user"], ["source", "rec-user", true]]);
+  assert.match(visibleText(document.getElementById("chat")), /Original prompt/);
+});
+
 test("unknown events render and do not stop later frames", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -2790,7 +3185,7 @@ test("render stays DOM-only and start does not read window", async () => {
     ["auto", "1fr", "auto", "auto"],
   );
   const sharedPaneRule = cssSource.match(
-    /#status-rail,\s*\.chat-pane,\s*\.settings-pane\s*\{([^}]*)\}/,
+    /#status-rail,\s*\.chat-pane,\s*\.settings-pane,\s*\.changes-pane\s*\{([^}]*)\}/,
   )?.[1];
   assert.match(sharedPaneRule, /(?:^|;)\s*overflow:\s*auto\s*;/);
 

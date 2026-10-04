@@ -170,6 +170,7 @@ export async function start({ global, document, client }) {
   let rememberedPlanMode = null;
   let sessions = initialSessions;
   let currentSessionId = null;
+  let forkConflict = null;
   let conversation = conversationReply?.conversation ?? null;
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   const allSpecPaths = roadmap.phases.flatMap((phase) =>
@@ -179,6 +180,7 @@ export async function start({ global, document, client }) {
   const settingsSections = element(document, "nav", { className: "settings-sections" });
   const settingsContent = element(document, "div", { className: "settings-content" });
   append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
+  const changesPane = element(document, "section", { className: "changes-pane" });
   let promptFailure = "";
   let route;
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
@@ -472,12 +474,130 @@ export async function start({ global, document, client }) {
     );
   }
 
+  async function showChanges() {
+    replace(
+      changesPane,
+      element(document, "h1", { text: "Changes" }),
+      element(document, "p", { className: "changes-loading", text: "Loading changes…" }),
+    );
+    let reply;
+    try {
+      reply = await boundary.changes();
+    } catch (error) {
+      replace(
+        changesPane,
+        element(document, "h1", { text: "Changes" }),
+        element(document, "p", {
+          className: "error",
+          text: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      return;
+    }
+
+    function showConflict(paths, payload) {
+      const warning = element(document, "section", { className: "changes-conflict" });
+      const list = element(document, "ul");
+      for (const path of paths) append(list, element(document, "li", { text: path }));
+      append(
+        warning,
+        element(document, "p", { text: "These files changed outside the agent:" }),
+        list,
+      );
+      const force = element(document, "button", { text: "Revert anyway" });
+      force.type = "button";
+      listen(force, "click", async () => {
+        try {
+          await boundary.revertChanges({ ...payload, force: true });
+          await showChanges();
+        } catch (error) {
+          if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
+            showConflict(error.paths, payload);
+          } else {
+            replace(
+              warning,
+              element(document, "p", {
+                className: "error",
+                text: error instanceof Error ? error.message : String(error),
+              }),
+            );
+          }
+        }
+      });
+      append(warning, force);
+      changesPane.append(warning);
+    }
+
+    async function revert(payload) {
+      try {
+        await boundary.revertChanges(payload);
+        await showChanges();
+      } catch (error) {
+        if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
+          showConflict(error.paths, payload);
+        } else {
+          changesPane.append(element(document, "p", {
+            className: "error",
+            text: error instanceof Error ? error.message : String(error),
+          }));
+        }
+      }
+    }
+
+    const files = Array.isArray(reply?.files) ? reply.files : [];
+    const turns = Array.isArray(reply?.turns) ? reply.turns : [];
+    const children = [element(document, "h1", { text: "Changes" })];
+    if (files.length === 0) {
+      children.push(element(document, "p", { text: "No changes in this conversation." }));
+    }
+    if (files.length > 0) {
+      children.push(element(document, "h2", { text: "Files" }));
+      for (const file of files) {
+        const row = element(document, "section", { className: "changes-file" });
+        append(row, element(document, "h3", { text: `${file.path} · ${file.status}` }));
+        if (file.changed_outside) {
+          append(row, element(document, "p", {
+            className: "changes-outside",
+            text: "Changed outside the agent.",
+          }));
+        }
+        append(row, element(document, "pre", { text: file.diff ?? "" }));
+        const button = element(document, "button", { text: "Revert" });
+        button.type = "button";
+        listen(button, "click", () => revert({ path: file.path }));
+        append(row, button);
+        children.push(row);
+      }
+    }
+    if (turns.length > 0) {
+      children.push(element(document, "h2", { text: "Prompts" }));
+      for (const turn of turns) {
+        const row = element(document, "section", { className: "changes-turn" });
+        append(row, element(document, "p", { text: turn.prompt || "(empty prompt)" }));
+        append(row, element(document, "p", {
+          className: "changes-paths",
+          text: Array.isArray(turn.paths) ? turn.paths.join(", ") : "",
+        }));
+        const button = element(document, "button", { text: "Revert this prompt and later" });
+        button.type = "button";
+        listen(button, "click", () => revert({ key: turn.key }));
+        append(row, button);
+        children.push(row);
+      }
+    }
+    replace(changesPane, ...children);
+  }
+
   function showPage(nextRoute) {
     route = nextRoute;
     if (route.page === "settings") {
       showSettings(route.section);
+    } else if (route.page === "changes") {
+      void showChanges();
     }
-    const pane = route.page === "settings" ? settingsPane : chatPane;
+    const pane = route.page === "settings"
+      ? settingsPane
+      : route.page === "changes" ? changesPane : chatPane;
     replace(pageRoot, pane);
   }
 
@@ -503,7 +623,7 @@ export async function start({ global, document, client }) {
   });
   replace(settingsSections, ...sectionLinks);
 
-  const links = PAGES.filter((page) => page === "settings").map((page) => {
+  const links = PAGES.filter((page) => page === "settings" || page === "changes").map((page) => {
     const pageRoute = { page, section: "" };
     const link = element(document, "a", {
       text: page[0].toUpperCase() + page.slice(1),
@@ -519,6 +639,33 @@ export async function start({ global, document, client }) {
   listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
+  async function forkAt(sourceId, recordId, force, previous) {
+    transcript.model.length = 0;
+    showTranscript();
+    try {
+      const reply = await boundary.forkSession(sourceId, recordId, force);
+      forkConflict = null;
+      currentSessionId = reply.run_id;
+      try {
+        sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+        showProjects();
+      } catch {
+        // The fork remains current if refreshing the sidebar fails.
+      }
+      navigate({ page: "chat", section: "" });
+    } catch (error) {
+      transcript.model.splice(0, transcript.model.length, ...previous);
+      if (!force && error?.status === 409 && Array.isArray(error.paths)) {
+        forkConflict = { sourceId, recordId, paths: error.paths };
+        showTranscript();
+        return;
+      }
+      showTranscript();
+      promptFailure = "Fork failed.";
+      showPromptError();
+    }
+  }
+
   function showTranscript() {
     renderTranscript(document, chatRoot, transcript.model, parseMarkdown);
     const rows = [...chatRoot.children];
@@ -530,29 +677,28 @@ export async function start({ global, document, client }) {
       }
       const button = element(document, "button", { className: "fork-message", text: "Fork here" });
       button.type = "button";
-      listen(button, "click", async () => {
-        const sourceId = currentSessionId;
-        const previous = [...transcript.model];
-        transcript.model.length = 0;
-        showTranscript();
-        try {
-          const reply = await boundary.forkSession(sourceId, entry.recordId);
-          currentSessionId = reply.run_id;
-          try {
-            sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
-            showProjects();
-          } catch {
-            // The fork remains current if refreshing the sidebar fails.
-          }
-          navigate({ page: "chat", section: "" });
-        } catch {
-          transcript.model.splice(0, transcript.model.length, ...previous);
-          showTranscript();
-          promptFailure = "Fork failed.";
-          showPromptError();
-        }
+      listen(button, "click", () => {
+        return forkAt(currentSessionId, entry.recordId, false, [...transcript.model]);
       });
       children.push(button);
+    }
+    if (forkConflict) {
+      children.push(element(document, "p", {
+        className: "fork-conflict",
+        text: `Files changed outside the agent: ${forkConflict.paths.join(", ")}`,
+      }));
+      const branchAnyway = element(document, "button", {
+        className: "fork-anyway",
+        text: "Branch anyway",
+      });
+      branchAnyway.type = "button";
+      listen(branchAnyway, "click", () => forkAt(
+        forkConflict.sourceId,
+        forkConflict.recordId,
+        true,
+        [...transcript.model],
+      ));
+      children.push(branchAnyway);
     }
     replace(chatRoot, ...children);
   }
@@ -764,6 +910,7 @@ export async function start({ global, document, client }) {
       modelText,
       effort,
       mode && `Mode ${mode}`,
+      conversation?.goal && `Goal ${conversation.goal.phase} ${conversation.goal.rounds}/${conversation.goal.max_rounds}`,
       Number.isInteger(context?.used_tokens) && Number.isInteger(context?.budget_tokens)
         ? `Context ${context.used_tokens} / ${context.budget_tokens} tokens`
         : "",
@@ -812,6 +959,80 @@ export async function start({ global, document, client }) {
       }
       append(children.get(row.parentAgentId), nodes.get(row.agentId));
     }
+    for (const row of rows) {
+      if (!["running", "waiting", "paused"].includes(row.state)) continue;
+      const node = nodes.get(row.agentId);
+      const controls = element(document, "div", { className: "agent-controls" });
+      const controlError = element(document, "p", {
+        className: "agent-control-error",
+        text: row.controlError ?? "",
+      });
+      const sendControl = async (action, text) => {
+        try {
+          const reply = await boundary.controlAgent(row.agentId, action, text);
+          row.state = reply.state;
+          row.controlError = "";
+          showAgents();
+        } catch (error) {
+          row.controlError = error.message || "Agent control failed.";
+          showAgents();
+        }
+      };
+      const pauseOrResume = element(document, "button", {
+        text: row.state === "paused" ? "Resume" : "Pause",
+      });
+      pauseOrResume.type = "button";
+      listen(pauseOrResume, "click", () => sendControl(
+        row.state === "paused" ? "resume" : "pause",
+      ));
+      const redirectButton = element(document, "button", { text: "Redirect" });
+      redirectButton.type = "button";
+      listen(redirectButton, "click", () => {
+        if (node.children.some((child) => child.className === "agent-redirect")) return;
+        const redirect = element(document, "div", { className: "agent-redirect" });
+        const redirectInput = element(document, "input");
+        redirectInput.type = "text";
+        redirectInput.setAttribute?.("aria-label", `Redirect ${row.name}`);
+        const send = element(document, "button", { text: "Send" });
+        send.type = "button";
+        const close = () => {
+          const parent = redirect.parentNode;
+          if (parent?.removeChild) {
+            parent.removeChild(redirect);
+          } else if (parent) {
+            parent.children = parent.children.filter(
+              (child) => child !== redirect,
+            );
+          }
+        };
+        const submit = () => {
+          if (!redirectInput.value.trim()) {
+            row.controlError = "Redirect text must not be blank.";
+            showAgents();
+            return;
+          }
+          void sendControl("redirect", redirectInput.value);
+        };
+        listen(send, "click", submit);
+        listen(redirectInput, "keydown", (event) => {
+          if (lookup(keymap, event, { platform }) === "cancel") {
+            event.preventDefault();
+            close();
+          } else if (event.key === "Enter") {
+            event.preventDefault();
+            submit();
+          }
+        });
+        append(redirect, redirectInput, send);
+        append(node, redirect);
+        redirectInput.focus?.();
+      });
+      const stop = element(document, "button", { text: "Stop" });
+      stop.type = "button";
+      listen(stop, "click", () => sendControl("stop"));
+      append(controls, pauseOrResume, redirectButton, stop);
+      append(node, controls, controlError);
+    }
     replace(agentsRoot, ...roots);
   }
   showConversationUsage();
@@ -851,6 +1072,22 @@ export async function start({ global, document, client }) {
           },
         );
         allow.type = "button";
+        if (question.remember) {
+          const remember = listen(
+            element(document, "button", {
+              text: `Allow, and don't ask again for ${question.remember} in this chat`,
+            }),
+            "click",
+            async () => {
+              await approvals.answer(id, true, "", true);
+              showApprovals();
+            },
+          );
+          remember.type = "button";
+          append(row, allow, remember);
+        } else {
+          append(row, allow);
+        }
         const deny = listen(
           element(document, "button", { text: "Deny" }),
           "click",
@@ -860,7 +1097,7 @@ export async function start({ global, document, client }) {
           },
         );
         deny.type = "button";
-        append(row, allow, deny);
+        append(row, deny);
       }
       children.push(row);
     }
@@ -1571,6 +1808,75 @@ export async function start({ global, document, client }) {
       await refreshConversation();
       return;
     }
+    if (entry.name === "goal") {
+      const usage = "Usage: /goal [<objective> -- <check command> | pause | resume | clear]";
+      if (args.length === 0) {
+        try {
+          const reply = await boundary.conversationStats();
+          const goal = reply?.conversation?.goal;
+          if (!goal) {
+            answerCommand("No goal. Set one with /goal <objective> [-- <check command>].");
+            return;
+          }
+          const lines = [
+            goal.objective,
+            `Check: ${goal.check?.length ? goal.check.join(" ") : "none (the agent reports completion)"}`,
+            `${goal.phase} · round ${goal.rounds} of ${goal.max_rounds}${goal.reason ? ` · ${goal.reason}` : ""}`,
+          ];
+          if (goal.last_check) {
+            lines.push(goal.last_check.ok
+              ? "Last check: passed"
+              : goal.last_check.exit === null
+                ? "Last check: timed out"
+                : `Last check: exit ${goal.last_check.exit}`);
+            if (goal.last_check.output) lines.push(goal.last_check.output);
+          }
+          answerCommand(lines.join("\n"));
+        } catch (error) {
+          answerCommand(error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
+      const action = args[0];
+      if (["pause", "resume", "clear"].includes(action)) {
+        if (args.length !== 1) {
+          answerCommand(usage);
+          return;
+        }
+        try {
+          const reply = await boundary.goalState(action);
+          conversation = { ...(conversation ?? {}), goal: reply.goal };
+          showConversationUsage();
+          answerCommand({ pause: "Goal paused.", resume: "Goal resumed.", clear: "Goal cleared." }[action]);
+        } catch (error) {
+          answerCommand(error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
+      const freeText = command.slice(typedName.length).trim();
+      const separator = freeText.indexOf(" -- ");
+      if (separator < 0 && (freeText === "--" || freeText.startsWith("-- ") || freeText.endsWith(" --"))) {
+        answerCommand(usage);
+        return;
+      }
+      const objective = (separator < 0 ? freeText : freeText.slice(0, separator)).trim();
+      const checkText = separator < 0 ? "" : freeText.slice(separator + 4).trim();
+      if (!objective || (separator >= 0 && !checkText)) {
+        answerCommand(usage);
+        return;
+      }
+      try {
+        const reply = await boundary.setGoal(objective, checkText ? checkText.split(/\s+/) : []);
+        conversation = { ...(conversation ?? {}), goal: reply.goal };
+        showConversationUsage();
+        answerCommand(`Goal set. Round 1 of ${reply.goal?.max_rounds ?? 10} started.`);
+      } catch (error) {
+        answerCommand(error?.status === 409
+          ? "A run is active. Wait for it to finish, then set the goal."
+          : error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
     if (entry.name === "init") {
       if (args.length > 0) {
         answerCommand("Usage: /init");
@@ -1614,6 +1920,31 @@ export async function start({ global, document, client }) {
       return;
     }
     const event = decodeEvent(frame.payload);
+    if (event.type === "GoalChanged") {
+      const goalEntry = transcript.model.at(-1);
+      if (goalEntry?.type === "goal" && event.fields.change === "update") {
+        goalEntry.text = `Agent marked the goal ${event.fields.phase}: ${event.fields.reason}.`;
+      } else if (goalEntry?.type === "goal" && event.fields.change === "round") {
+        goalEntry.text = event.fields.phase === "blocked"
+          ? `Goal blocked: ${event.fields.reason}.`
+          : `No check configured. Starting round ${event.fields.rounds} of ${event.fields.max_rounds}.`;
+      }
+      conversation = {
+        ...(conversation ?? {}),
+        goal: event.fields.change === "clear"
+          ? null
+          : {
+            ...(conversation?.goal ?? {}),
+            phase: event.fields.phase,
+            rounds: event.fields.rounds,
+            max_rounds: event.fields.max_rounds,
+            reason: event.fields.reason,
+            last_check: event.fields.last_check,
+          },
+      };
+      showTranscript();
+      showConversationUsage();
+    }
     if (
       (event.type === "RunFinished" || event.type === "RunFailed") &&
       (healthReply?.runtime_run_id === null ||

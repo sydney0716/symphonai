@@ -20,6 +20,9 @@ function questionOf(value) {
     operation: value.operation,
     target: value.target,
     details: value.details,
+    ...(typeof value.remember === "string" && value.remember.length > 0
+      ? { remember: value.remember }
+      : {}),
     state: "open",
     ...(typeof value.tool_call_id === "string" && value.tool_call_id.length > 0
       ? { tool_call_id: value.tool_call_id }
@@ -94,7 +97,7 @@ export function createApprovals({ client }) {
     }
   }
 
-  async function answer(id, allowed, reason = "") {
+  async function answer(id, allowed, reason = "", remember = false) {
     const question = questions.get(id);
     if (question === undefined || question.state !== "open") {
       return;
@@ -102,7 +105,7 @@ export function createApprovals({ client }) {
     questions.set(id, { ...question, state: "answering" });
     let reply;
     try {
-      reply = await client.approve(id, allowed, reason);
+      reply = await client.approve(id, allowed, reason, remember);
     } catch (error) {
       if (!isNotFound(error)) {
         throw error;

@@ -166,6 +166,22 @@ function renderCommand(document, entry) {
   return command;
 }
 
+function renderGoal(document, entry) {
+  const command = element(document, "div", { className: "command" });
+  const details = element(document, "details", { className: "goal-check-output" });
+  append(
+    details,
+    element(document, "summary", { text: "Check output" }),
+    element(document, "pre", { text: entry.output }),
+  );
+  append(
+    command,
+    element(document, "p", { className: "command-output", text: entry.text }),
+    ...(entry.output ? [details] : []),
+  );
+  return command;
+}
+
 function renderActivity(document, entry) {
   return element(document, "p", {
     className: "activity",
@@ -220,6 +236,7 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
   prompt: renderPrompt,
   text: renderText,
   command: renderCommand,
+  goal: renderGoal,
   activity: renderActivity,
   edit: renderEdit,
   question: renderQuestion,

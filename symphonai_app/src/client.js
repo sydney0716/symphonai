@@ -141,11 +141,15 @@ export function createClient({
     }
     if (response.status < 200 || response.status >= 300) {
       let detail = "";
+      let failureReply = null;
       if (detailOnError) {
         try {
           const value = await response.json();
-          if (isObject(value) && typeof value.error === "string") {
-            detail = value.error;
+          if (isObject(value)) {
+            failureReply = value;
+            if (typeof value.error === "string") {
+              detail = value.error;
+            }
           }
         } catch {
           // Keep the status error when the host did not return JSON.
@@ -153,6 +157,9 @@ export function createClient({
       }
       const error = new Error(detail || `host request failed with status ${response.status}`);
       error.status = response.status;
+      if (Array.isArray(failureReply?.paths)) {
+        error.paths = failureReply.paths;
+      }
       throw error;
     }
     return read(response);
@@ -262,16 +269,45 @@ export function createClient({
       return post("stop", { reason });
     },
 
-    approve(id, allowed, reason = "") {
-      return post("approval", { approval_id: id, allowed, reason });
+    controlAgent(agentId, action, text) {
+      return request(
+        "POST",
+        "/agent/control",
+        { agent_id: agentId, action, ...(text === undefined ? {} : { text }) },
+        readReply,
+        { detailOnError: true },
+      );
+    },
+
+    changes() {
+      return request("GET", "/changes");
+    },
+
+    revertChanges(payload) {
+      return request("POST", "/changes/revert", payload, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    approve(id, allowed, reason = "", remember = false) {
+      return post("approval", {
+        approval_id: id,
+        allowed,
+        reason,
+        ...(remember ? { remember: true } : {}),
+      });
     },
 
     openSession(runId) {
       return post("session/open", { run_id: runId });
     },
 
-    forkSession(runId, recordId) {
-      return request("POST", "/session/fork", { run_id: runId, record_id: recordId });
+    forkSession(runId, recordId, force = false) {
+      return request("POST", "/session/fork", {
+        run_id: runId,
+        record_id: recordId,
+        ...(force ? { force: true } : {}),
+      });
     },
 
     approvals() {
@@ -332,6 +368,34 @@ export function createClient({
         readReply,
         { detailOnError: true },
       );
+    },
+
+    setGoal(objective, check, maxRounds) {
+      return request(
+        "POST",
+        "/goal",
+        {
+          objective,
+          check,
+          ...(maxRounds === undefined ? {} : { max_rounds: maxRounds }),
+        },
+        readReply,
+        { detailOnError: true },
+      );
+    },
+
+    goalState(action) {
+      return request(
+        "POST",
+        "/goal/state",
+        { action },
+        readReply,
+        { detailOnError: true },
+      );
+    },
+
+    conversationStats() {
+      return request("GET", "/conversation", undefined, readReply);
     },
 
     storeCredential(name, value) {

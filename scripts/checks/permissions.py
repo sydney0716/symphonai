@@ -17,9 +17,38 @@ from symphonai_api.permissions import (
     DenialReason,
     PermissionDecision,
     PermissionPolicy,
+    ToolApprovalRequest,
+    shell_grant_prefix,
 )
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
+
+
+@check("permissions.shell_grant_prefix")
+def check_shell_grant_prefix() -> None:
+    cases = (
+        (["git", "commit", "-m", "x"], ("git", "commit")),
+        (["pytest", "-x"], ("pytest",)),
+        (["python3", "scripts/check.py", "--only", "app"], ("python3", "scripts/check.py")),
+        (["ls"], ("ls",)),
+    )
+    for argv, expected in cases:
+        if shell_grant_prefix(argv) != expected:
+            fail(f"wrong remembered shell prefix for {argv!r}: {shell_grant_prefix(argv)!r}")
+
+
+@check("permissions.always_deny_precedes_shell_approval")
+def check_always_deny_precedes_shell_approval() -> None:
+    with workspace() as ws:
+        requests: list[ToolApprovalRequest] = []
+        policy = PermissionPolicy(
+            ws.root,
+            mode="ask",
+            approval_callback=lambda request: requests.append(request) or True,
+        )
+        decision = policy.check_shell(["rm", "-rf", "/"])
+        if decision.allowed or requests:
+            fail(f"always-denied command reached the approval callback: {decision!r}, {requests!r}")
 
 
 @check("permissions.read_inside_root")

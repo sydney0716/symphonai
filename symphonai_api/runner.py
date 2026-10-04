@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.extensions import Extensions
 from symphonai_api.instructions import load_instructions
 from symphonai_api.identity import new_agent_ref
@@ -23,6 +24,7 @@ from symphonai_api.session import (
     load_run_for_resume,
     tool_result_search_path,
 )
+from symphonai_api.skills import Skill
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
@@ -32,6 +34,7 @@ from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.tools.search import GlobTool, GrepTool
 from symphonai_api.tools.shell import RunShellTool
+from symphonai_api.tools.skill import UseSkillTool
 from symphonai_api.tools.stored_result import ReadToolResultTool
 from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.tools.web_search import WebSearchTool
@@ -45,6 +48,8 @@ def standard_tool_registry(
     result_store: ToolResultStore | None = None,
     search_backend: SearchBackend | None = None,
     memory_tool: MemoryTool | None = None,
+    skills: Mapping[str, Skill] | None = None,
+    checkpoints: CheckpointStore | None = None,
 ) -> dict[str, LocalTool]:
     """The standard tools plus explicitly supplied optional tools.
 
@@ -55,9 +60,9 @@ def standard_tool_registry(
         ledger = ReadLedger()
     tools: list[LocalTool] = [
         ReadFileTool(ledger),
-        WriteFileTool(ledger),
-        EditFileTool(ledger),
-        MultiEditFileTool(ledger),
+        WriteFileTool(ledger, checkpoints),
+        EditFileTool(ledger, checkpoints),
+        MultiEditFileTool(ledger, checkpoints),
         ListFilesTool(),
         GlobTool(),
         GrepTool(),
@@ -66,6 +71,8 @@ def standard_tool_registry(
     ]
     if search_backend is not None:
         tools.append(WebSearchTool(search_backend))
+    if skills:
+        tools.append(UseSkillTool(skills))
     if result_store is not None:
         tools.append(ReadToolResultTool(result_store))
     if names is not None:

@@ -189,9 +189,7 @@ export function createTranscript() {
       if (record === null) {
         return;
       }
-      if (fields.ok) {
-        resolveQuestion(fields, true);
-      }
+      resolveQuestion(fields, true);
       const edit = diffResult(fields);
       if (fields.ok && edit !== null) {
         replaceWithEdit(record, edit, fields.agent_id);
@@ -233,6 +231,39 @@ export function createTranscript() {
         beforeTokens: fields.before_tokens,
         afterTokens: fields.after_tokens,
         droppedMessages: fields.dropped_messages,
+      });
+      return;
+    }
+    if (type === "GoalChanged") {
+      const lastCheck = fields.last_check;
+      const result = lastCheck?.exit === null || lastCheck?.exit === undefined
+        ? "timed out"
+        : `exit ${lastCheck.exit}`;
+      let text = "";
+      if (fields.change === "set") {
+        text = `Goal set: up to ${fields.max_rounds} rounds.`;
+      } else if (fields.change === "check" && fields.phase === "complete") {
+        text = `Goal check passed. Goal complete after ${fields.rounds} rounds.`;
+      } else if (fields.change === "check" && fields.phase === "active") {
+        text = `Goal check failed (${result}). Starting round ${fields.rounds + 1} of ${fields.max_rounds}.`;
+      } else if (fields.change === "check" && fields.phase === "blocked") {
+        text = `Goal check failed (${result}). Goal blocked: ${fields.reason}.`;
+      } else if (fields.change === "check" && fields.phase === "paused") {
+        text = `Goal check failed (${result}). Goal paused: ${fields.reason}.`;
+      } else if (fields.change === "pause") {
+        text = `Goal paused: ${fields.reason}.`;
+      } else if (fields.change === "resume") {
+        text = "Goal resumed.";
+      } else if (fields.change === "clear") {
+        text = "Goal cleared.";
+      }
+      model.push({
+        type: "goal",
+        agentId: fields.agent_id,
+        text,
+        output: fields.change === "check" && typeof lastCheck?.output === "string"
+          ? lastCheck.output
+          : "",
       });
       return;
     }

@@ -17,6 +17,11 @@ from symphonai_api.skills import (
     roster_cost,
     roster_text,
 )
+from symphonai_api.extensions import load_extensions
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tools.skill import UseSkillTool
 from scripts.checks.harness import check, fail
 
 
@@ -287,6 +292,97 @@ def body_is_live() -> None:
             fail(f"unreadable body exposed {type(exc).__name__}: {exc!r}")
         else:
             fail("body() accepted a missing skill file")
+
+
+@check("skills.use_skill_tool")
+def use_skill_tool() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        release_path = _write(
+            directory, "release.md",
+            _document("release", "Release steps.", "Use for releases.", "\n# Release body\n"),
+        )
+        review_path = _write(
+            directory, "review.md",
+            _document("review", "Review steps.", "Use for reviews.", "\n# Review body\n"),
+        )
+        skills = {
+            "review": load_skill(review_path),
+            "release": load_skill(release_path),
+        }
+        tool = UseSkillTool(skills)
+        expected = (
+            "Load the full instructions of a skill. Call it when the task matches a skill's when_to_use."
+            "\n\nAvailable skills:\n\n"
+            "name: release\ndescription: Release steps.\nwhen_to_use: Use for releases."
+            "\n\nname: review\ndescription: Review steps.\nwhen_to_use: Use for reviews."
+        )
+        if tool.description != expected:
+            fail(f"skill description was not sorted or exact: {tool.description!r}")
+        if "# Release body" in tool.description or "# Review body" in tool.description:
+            fail("skill body appeared in the always-on description")
+        release_path.write_text(
+            _document("release", "Release steps.", "Use for releases.", "\n# Edited body\n"),
+            encoding="utf-8",
+        )
+        policy = PermissionPolicy(directory)
+        result = tool.execute(ToolCall("call-1", "use_skill", {"name": "release"}), policy)
+        if not result.ok or result.content != "\n# Edited body\n":
+            fail(f"use_skill did not return the exact current body: {result!r}")
+        missing = tool.execute(ToolCall("call-2", "use_skill", {"name": "deploy"}), policy)
+        if missing.ok or missing.error != "unknown skill 'deploy'; available: release, review":
+            fail(f"unknown skill error differed: {missing!r}")
+        if tool.metadata({}).paths is not None:
+            fail("use_skill declared filesystem paths in its metadata")
+        release_path.unlink()
+        unreadable = tool.execute(
+            ToolCall("call-3", "use_skill", {"name": "release"}), policy,
+        )
+        if unreadable.ok or unreadable.error is None or str(release_path) not in unreadable.error:
+            fail(f"use_skill did not surface SkillError from body(): {unreadable!r}")
+
+
+@check("skills.trust_filters_registry")
+def trust_filters_registry() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "project"
+        skill_dir = root / ".symphonai" / "skills"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "private.md").write_text(
+            _document("private", "Private procedure.", "Use privately."),
+            encoding="utf-8",
+        )
+        home = base / "home"
+        user_config = home / ".symphonai" / "config.toml"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(base / "other"))}\nallow = ["skills"]\n',
+            encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        if extensions.skills:
+            fail(f"untrusted skill entered the runtime roster: {extensions.skills!r}")
+        if not any(item.directory.name == "skills" for item in extensions.withheld):
+            fail("untrusted skill was not reported as withheld")
+        tool = UseSkillTool(extensions.skills)
+        result = tool.execute(
+            ToolCall("withheld", "use_skill", {"name": "private"}),
+            PermissionPolicy(root),
+        )
+        if result.ok or result.error != "unknown skill 'private'; available: ":
+            fail(f"withheld skill remained loadable: {result!r}")
+
+
+@check("skills.registry_opt_in")
+def registry_opt_in() -> None:
+    without_skills = standard_tool_registry()
+    if "use_skill" in without_skills:
+        fail("unconfigured standard registry acquired use_skill")
+    fixture = Skill("release", "Release.", "Use for releases.", Path(__file__), 1)
+    with_skills = standard_tool_registry(skills={"release": fixture})
+    if "use_skill" not in with_skills:
+        fail("configured standard registry omitted use_skill")
 
 
 @check("skills.frontmatter_rejections")

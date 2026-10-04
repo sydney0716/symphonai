@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from symphonai_api.identity import new_id
-from symphonai_api.permissions import DenialReason, PermissionDecision, ToolApprovalRequest
+from symphonai_api.permissions import (
+    DenialReason,
+    PermissionDecision,
+    ToolApprovalRequest,
+    shell_grant_prefix,
+)
 
 
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300.0
@@ -20,6 +25,7 @@ class PendingApproval:
     target: str
     details: str
     tool_call_id: str = ""
+    remember: str = ""
 
 
 @dataclass
@@ -27,6 +33,7 @@ class _Pending:
     approval: PendingApproval
     event: threading.Event
     decision: PermissionDecision | None = None
+    grant_prefix: tuple[str, ...] = ()
 
 
 class ApprovalBroker:
@@ -43,17 +50,30 @@ class ApprovalBroker:
         self._publish = publish
         self._timeout = timeout
         self._pending: dict[str, _Pending] = {}
+        self._granted_shell_prefixes: set[tuple[str, ...]] = set()
         self._lock = threading.Lock()
 
     def callback(self, request: ToolApprovalRequest) -> PermissionDecision:
+        grant_prefix = (
+            shell_grant_prefix(request.command)
+            if request.operation == "run_shell" and request.command
+            else ()
+        )
+        with self._lock:
+            if request.operation == "run_shell" and any(
+                request.command[: len(prefix)] == prefix
+                for prefix in self._granted_shell_prefixes
+            ):
+                return PermissionDecision.allow()
         approval = PendingApproval(
             approval_id=new_id("appr"),
             operation=request.operation,
             target=request.target,
             details=request.details,
             tool_call_id=request.tool_call_id,
+            remember=" ".join(grant_prefix),
         )
-        pending = _Pending(approval, threading.Event())
+        pending = _Pending(approval, threading.Event(), grant_prefix=grant_prefix)
         with self._lock:
             self._pending[approval.approval_id] = pending
         try:
@@ -86,7 +106,14 @@ class ApprovalBroker:
                 if self._pending.get(approval.approval_id) is pending:
                     del self._pending[approval.approval_id]
 
-    def resolve(self, approval_id: str, *, allowed: bool, reason: str) -> bool:
+    def resolve(
+        self,
+        approval_id: str,
+        *,
+        allowed: bool,
+        reason: str,
+        remember: bool = False,
+    ) -> bool:
         with self._lock:
             pending = self._pending.get(approval_id)
             if pending is None or pending.decision is not None:
@@ -98,8 +125,14 @@ class ApprovalBroker:
                     reason or "approval denied by user", denial=DenialReason.DENIED_BY_USER
                 )
             )
+            if allowed and remember and pending.approval.remember:
+                self._granted_shell_prefixes.add(pending.grant_prefix)
             pending.event.set()
             return True
+
+    def clear_grants(self) -> None:
+        with self._lock:
+            self._granted_shell_prefixes.clear()
 
     def pending(self) -> tuple[PendingApproval, ...]:
         """Every approval still waiting for a decision, oldest first."""

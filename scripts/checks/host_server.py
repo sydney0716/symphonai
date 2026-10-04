@@ -31,6 +31,7 @@ import symphonai_host.__main__ as host_main
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
+import symphonai_host.goal as goal_module
 from symphonai_api.agent_run import RunNode
 from symphonai_api.config import ConfigError, ResolvedConfig
 from symphonai_api.events import (
@@ -52,11 +53,12 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
-from symphonai_api.session import SessionStore, load_run_for_resume
+from symphonai_api.session import SessionStore, load_run, load_run_for_resume
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_host.broker import EventBroker
+from symphonai_host.goal import GoalChanged
 from symphonai_host.protocol import decode_event, decode_frame
 from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.server import HostServer
@@ -179,6 +181,7 @@ def _host(
     keepalive_seconds: float = 0.05,
     repo_root: Path = REPO_ROOT,
     token: str | None = None,
+    sessions_root: Path | None = None,
 ) -> HostServer:
     host = HostServer(
         provider or FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
@@ -186,6 +189,7 @@ def _host(
         broker=broker,
         keepalive_seconds=keepalive_seconds,
         token=token,
+        sessions_root=sessions_root,
     )
     host.start()
     return host
@@ -429,7 +433,7 @@ def _check_subscribed_stream_helper() -> None:
         fail("an approval check opens an unsubscribed event stream")
     if sources["host_sessions.py"].count("_event" + "_stream(") != 0:
         fail("a session check opens an unsubscribed event stream")
-    if sources["host_server.py"].count("_event" + "_stream(") != 4:
+    if sources["host_server.py"].count("_event" + "_stream(") != 5:
         fail("a host check opens an unsubscribed event stream")
 
     helper_source = inspect.getsource(_subscribed_stream)
@@ -826,6 +830,195 @@ def check_search_settings_credentials_and_registry() -> None:
                 fail(f"unconfigured project search definition escaped dispatch refusal: {result!r}")
         finally:
             session.close()
+
+
+@check("host_server.skills_reach_leader")
+def check_skills_reach_leader() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        home = Path(temporary) / "home"
+        skill_dir = root / ".symphonai" / "skills"
+        skill_dir.mkdir(parents=True)
+        user_config = home / ".symphonai" / "config.toml"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(root))}\nallow = ["skills"]\n',
+            encoding="utf-8",
+        )
+        for name in ("review", "release"):
+            (skill_dir / f"{name}.md").write_text(
+                f'+++\nname = "{name}"\ndescription = "{name} steps."\n'
+                f'when_to_use = "Use for {name}."\n+++\n\n# {name.title()} private body\n',
+                encoding="utf-8",
+            )
+        extensions = load_extensions(repo_root=root, home=home)
+        host = HostRun(
+            FakeModelProvider(), PermissionPolicy(root), EventBroker(),
+            sessions_root=root / "sessions", extensions=extensions,
+        )
+        session = SessionStore(root / "sessions", "skills", repo_root=root)
+        try:
+            leader = host._new_leader(session)
+            tool = leader._agent._tools.get("use_skill")
+            if tool is None:
+                fail("host conversation leader did not receive use_skill")
+            expected_roster = (
+                "Load the full instructions of a skill. Call it when the task matches a skill's when_to_use."
+                "\n\nAvailable skills:\n\n"
+                "name: release\ndescription: release steps.\nwhen_to_use: Use for release."
+                "\n\nname: review\ndescription: review steps.\nwhen_to_use: Use for review."
+            )
+            if tool.description != expected_roster:
+                fail(f"host leader skill roster was not sorted and body-free: {tool.description!r}")
+            if "private body" in tool.description:
+                fail("host leader description exposed a skill body")
+            original_description = tool.description
+            release_path = skill_dir / "release.md"
+            release_path.write_text(
+                release_path.read_text(encoding="utf-8") + "Appended private procedure.\n",
+                encoding="utf-8",
+            )
+            if tool.description != original_description or "Appended private" in tool.description:
+                fail("host leader description changed after a body append")
+            loaded_body = tool.execute(
+                ToolCall("skill-body", "use_skill", {"name": "release"}),
+                PermissionPolicy(root, mode="plan"),
+            )
+            if not loaded_body.ok or loaded_body.content != (
+                "\n# Release private body\nAppended private procedure.\n"
+            ):
+                fail(f"host leader could not load a skill in plan mode: {loaded_body!r}")
+        finally:
+            session.close()
+
+        no_skill_root = Path(temporary) / "no-skills"
+        agent_dir = no_skill_root / ".symphonai" / "agents"
+        agent_dir.mkdir(parents=True)
+        no_skill_home = Path(temporary) / "no-skill-home"
+        trust_config = no_skill_home / ".symphonai" / "config.toml"
+        trust_config.parent.mkdir(parents=True)
+        trust_config.write_text(
+            f'[[trust.repositories]]\nroot = {json.dumps(str(no_skill_root))}\nallow = ["agents"]\n',
+            encoding="utf-8",
+        )
+        (agent_dir / "leader.toml").write_text(
+            'prompt = "Configured leader."\ntools = ["use_skill"]\n'
+            '[model]\nprovider = "fake"\n',
+            encoding="utf-8",
+        )
+        no_skill_extensions = load_extensions(repo_root=no_skill_root, home=no_skill_home)
+        no_skill_run = HostRun(
+            FakeModelProvider(), PermissionPolicy(no_skill_root), EventBroker(),
+            sessions_root=no_skill_root / "sessions", extensions=no_skill_extensions,
+        )
+        no_skill_session = SessionStore(
+            no_skill_root / "sessions", "no-skills", repo_root=no_skill_root,
+        )
+        try:
+            try:
+                no_skill_run._new_leader(no_skill_session)
+            except host_run_module.ProviderSelectionError as exc:
+                if str(exc) != "leader cannot use_skill: no skills are available":
+                    fail(f"host no-skill refusal wording differed: {exc!r}")
+            else:
+                fail("host accepted a defined leader requiring unavailable use_skill")
+        finally:
+            no_skill_session.close()
+
+
+@check("host_server.agent_control_route")
+def check_agent_control_route() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        blocker = _HostControlTool()
+        provider = _HostControlProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent", {
+                    "subagent_name": "worker", "task": "inspect",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "block", blocker.name, {},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            mcp_tools={blocker.name: blocker},
+        )
+        host.start()
+
+        def post(payload):
+            connection, response = _request(
+                host, "POST", "/agent/control", body=payload, headers=_headers(host),
+            )
+            try:
+                body = response.read()
+                return response.status, json.loads(body) if body else {}
+            finally:
+                connection.close()
+
+        try:
+            if post({"agent_id": "missing", "action": "pause"})[0] != 409:
+                fail("control route did not reject a request with no active run")
+            if post({"agent_id": "missing", "action": "unknown"})[0] != 400:
+                fail("control route accepted an unknown action")
+            if post({"agent_id": "missing", "action": "redirect"})[0] != 400:
+                fail("control route accepted redirect without text")
+
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "start"}, headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"control route prompt did not start: {response.status}")
+                response.read()
+            finally:
+                connection.close()
+            if not blocker.entered.wait(3):
+                fail("subagent did not reach the control tool")
+            leader = host.run._conversation[0]
+            child_id = leader._dispatch_tool.pool["worker"].agent_ref.agent_id
+            paused_status, paused = post({"agent_id": child_id, "action": "pause"})
+            if paused_status != 200 or paused != {"agent_id": child_id, "state": "paused"}:
+                fail(f"control route did not pause the subagent: {paused_status}, {paused!r}")
+            if post({"agent_id": child_id, "action": "pause"})[0] != 409:
+                fail("control route accepted a repeated pause")
+            resumed_status, resumed = post({"agent_id": child_id, "action": "resume"})
+            if resumed_status != 200 or resumed != {"agent_id": child_id, "state": "running"}:
+                fail(f"control route did not resume the subagent: {resumed_status}, {resumed!r}")
+            if post({"agent_id": "unknown-agent", "action": "pause"})[0] != 404:
+                fail("control route did not return 404 for an unknown agent")
+            if post({"agent_id": child_id, "action": "redirect"})[0] != 400:
+                fail("control route accepted redirect without text during a run")
+
+            blocker.release.set()
+            if not provider.final_entered.wait(3):
+                fail("leader did not reach its final model request")
+            if post({"agent_id": child_id, "action": "pause"})[0] != 404:
+                fail("control route did not return 404 for a finished agent")
+
+            active = host.run._active
+            leader_id = leader.agent_ref.agent_id
+            stopped_status, stopped = post({"agent_id": leader_id, "action": "stop"})
+            if stopped_status != 200 or stopped != {"agent_id": leader_id, "state": "stopping"}:
+                fail(f"control route did not stop the leader: {stopped_status}, {stopped!r}")
+            provider.release_final.set()
+            assert active is not None
+            active.thread.join(5)
+            if active.thread.is_alive() or not isinstance(active.terminal_event, RunFinished):
+                fail("leader control stop did not end the host run")
+            if active.terminal_event.stopped_reason != "cancelled":
+                fail(f"leader control stop differed from /stop: {active.terminal_event!r}")
+            if post({"agent_id": leader_id, "action": "pause"})[0] != 409:
+                fail("control route did not reject a request after the run ended")
+        finally:
+            blocker.release.set()
+            provider.release_final.set()
+            host.close()
 
 
 @check("host_server.survey_route")
@@ -2131,6 +2324,243 @@ def check_leader_delegates() -> None:
             host.close()
 
 
+@check("host_server.changes_report_and_revert")
+def check_changes_report_and_revert() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "a.py"
+        source.write_text("original\n")
+        provider = FakeModelProvider(
+            [
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    ToolCall("read-a-1", "read_file", {"path": "a.py"}),
+                ])),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    ToolCall("edit-a-1", "edit_file", {
+                        "path": "a.py", "old_string": "original", "new_string": "prompt one",
+                    }),
+                ])),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    ToolCall("write-b", "write_file", {"path": "b.py", "content": "new file\n"}),
+                ])),
+                ModelResponse(Message(Role.ASSISTANT, "first done")),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    ToolCall("read-a-2", "read_file", {"path": "a.py"}),
+                ])),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    ToolCall("edit-a-2", "edit_file", {
+                        "path": "a.py", "old_string": "prompt one", "new_string": "prompt two",
+                    }),
+                ])),
+                ModelResponse(Message(Role.ASSISTANT, "second done")),
+            ]
+        )
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        try:
+            host.run.select_mode("allow")
+            host.run.start("prompt one")
+            _wait_until(lambda: not host.run.active, "first changes prompt did not finish")
+            host.run.start("prompt two")
+            _wait_until(lambda: not host.run.active, "second changes prompt did not finish")
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                data = json.loads(response.read())
+                if response.status != 200:
+                    fail(f"changes route returned {response.status}: {data!r}")
+            finally:
+                connection.close()
+            if (
+                [turn["prompt"] for turn in data["turns"]] != ["prompt one", "prompt two"]
+                or [turn["paths"] for turn in data["turns"]] != [["a.py", "b.py"], ["a.py"]]
+                or [item["path"] for item in data["files"]] != ["a.py", "b.py"]
+                or data["files"][0]["status"] != "modified"
+                or "original" not in data["files"][0]["diff"]
+                or "prompt two" not in data["files"][0]["diff"]
+                or data["files"][1]["status"] != "added"
+            ):
+                leader_messages = host.run._conversation[0]._chat_messages
+                tool_results = [
+                    message.tool_result for message in leader_messages
+                    if message.tool_result is not None
+                ]
+                fail(
+                    "changes report did not describe both prompts: "
+                    f"{data!r}; tool_results={tool_results!r}"
+                )
+
+            second_key = data["turns"][1]["key"]
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"key": second_key}, headers=_headers(host)
+            )
+            try:
+                reverted = json.loads(response.read())
+                if response.status != 200 or reverted != {"reverted": ["a.py"]}:
+                    fail(f"prompt revert returned {response.status}: {reverted!r}")
+            finally:
+                connection.close()
+            if source.read_text() != "prompt one\n" or (root / "b.py").read_text() != "new file\n":
+                fail("reverting prompt two did not preserve prompt one's files")
+
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"path": "b.py"}, headers=_headers(host)
+            )
+            try:
+                reverted_file = json.loads(response.read())
+                if response.status != 200 or reverted_file != {"reverted": ["b.py"]}:
+                    fail(f"file revert returned {response.status}: {reverted_file!r}")
+            finally:
+                connection.close()
+            if (root / "b.py").exists():
+                fail("reverting the added file did not delete it")
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                after_reverts = json.loads(response.read())
+                if response.status != 200 or [item["path"] for item in after_reverts["files"]] != ["a.py"]:
+                    fail(f"changes report after reverts was incorrect: {after_reverts!r}")
+            finally:
+                connection.close()
+        finally:
+            host.close()
+
+
+@check("host_server.changes_external_edit_refused")
+def check_changes_external_edit_refused() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "a.py"
+        source.write_text("original\n")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                ToolCall("read-a", "read_file", {"path": "a.py"}),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                ToolCall("edit-a", "edit_file", {
+                    "path": "a.py", "old_string": "original", "new_string": "agent edit",
+                }),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        try:
+            host.run.select_mode("allow")
+            host.run.start("edit a.py")
+            _wait_until(lambda: not host.run.active, "external-edit prompt did not finish")
+            source.write_text("hand edit\n")
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                changes = json.loads(response.read())
+                if response.status != 200 or changes["files"][0]["changed_outside"] is not True:
+                    fail(f"manual edit was not marked outside: {changes!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"path": "a.py"}, headers=_headers(host)
+            )
+            try:
+                conflict = json.loads(response.read())
+                if response.status != 409 or conflict.get("paths") != ["a.py"]:
+                    fail(f"outside edit was not refused: {response.status}, {conflict!r}")
+            finally:
+                connection.close()
+            if source.read_text() != "hand edit\n":
+                fail("refused revert changed the hand-edited file")
+            connection, response = _request(
+                host,
+                "POST",
+                "/changes/revert",
+                body={"path": "a.py", "force": True},
+                headers=_headers(host),
+            )
+            try:
+                forced = json.loads(response.read())
+                if response.status != 200 or forced != {"reverted": ["a.py"]}:
+                    fail(f"forced revert returned {response.status}: {forced!r}")
+            finally:
+                connection.close()
+            if source.read_text() != "original\n":
+                fail("forced revert did not restore the checkpoint bytes")
+        finally:
+            host.close()
+
+
+@check("host_server.changes_empty_active_and_invalid")
+def check_changes_empty_active_and_invalid() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(repo_root=root),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        try:
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host, "bad"))
+            try:
+                if response.status != 401:
+                    fail(f"unauthorized changes request returned {response.status}")
+            finally:
+                connection.close()
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                empty = json.loads(response.read())
+                if response.status != 200 or empty != {"turns": [], "files": []}:
+                    fail(f"changes without a conversation were not empty: {empty!r}")
+            finally:
+                connection.close()
+            for body in ({}, {"path": "a.py", "key": "key"}, {"path": 3}):
+                connection, response = _request(
+                    host, "POST", "/changes/revert", body=body, headers=_headers(host)
+                )
+                try:
+                    response.read()
+                    if response.status != 400:
+                        fail(f"invalid revert body returned {response.status}: {body!r}")
+                finally:
+                    connection.close()
+            for body in ({"path": "missing.py"}, {"key": "missing-key"}):
+                connection, response = _request(
+                    host, "POST", "/changes/revert", body=body, headers=_headers(host)
+                )
+                try:
+                    response.read()
+                    if response.status != 404:
+                        fail(f"unknown revert target returned {response.status}: {body!r}")
+                finally:
+                    connection.close()
+            active = type("Active", (), {"run_id": "active-run"})()
+            host.run._active = active
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                response.read()
+                if response.status != 409:
+                    fail(f"active changes request returned {response.status}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"path": "a.py"}, headers=_headers(host)
+            )
+            try:
+                response.read()
+                if response.status != 409:
+                    fail(f"active revert request returned {response.status}")
+            finally:
+                connection.close()
+            host.run._active = None
+        finally:
+            host.run._active = None
+            host.close()
+
+
 def _conversation_reply(host: HostServer) -> tuple[bytes, dict]:
     connection, response = _request(host, "GET", "/conversation", headers=_headers(host))
     try:
@@ -2140,6 +2570,17 @@ def _conversation_reply(host: HostServer) -> tuple[bytes, dict]:
         return body, json.loads(body)
     finally:
         connection.close()
+
+
+def _wait_goal_state(host: HostServer, phase: str, *, timeout: float = 8) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _, reply = _conversation_reply(host)
+        goal = reply.get("conversation", {}).get("goal")
+        if goal is not None and goal.get("phase") == phase:
+            return goal
+        time.sleep(0.02)
+    fail(f"goal did not reach {phase!r}: {_conversation_reply(host)[1]!r}")
 
 
 def _send_host_prompt(host: HostServer, prompt: str) -> None:
@@ -2153,6 +2594,584 @@ def _send_host_prompt(host: HostServer, prompt: str) -> None:
     finally:
         connection.close()
     _wait_until(lambda: not host.run.active, "usage prompt did not finish")
+
+
+@check("host_server.goal_rounds_until_check_passes")
+def check_goal_rounds_until_check_passes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        counter = root / "check-count"
+        code = (
+            "from pathlib import Path; import sys; "
+            f"p=Path({str(counter)!r}); n=int(p.read_text())+1 if p.exists() else 1; "
+            "p.write_text(str(n)); print(f'failed-{n}'); sys.exit(0 if n == 3 else 1)"
+        )
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "round one")),
+            ModelResponse(Message(Role.ASSISTANT, "round two")),
+            ModelResponse(Message(Role.ASSISTANT, "round three")),
+        ])
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        connection, response = _event_stream(host)
+        try:
+            request, reply = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish the task", "check": [sys.executable, "-c", code]},
+                headers=_headers(host),
+            )
+            try:
+                accepted = json.loads(reply.read())
+                if reply.status != 200 or accepted["goal"]["rounds"] != 1:
+                    fail(f"goal was not accepted at round one: {reply.status}, {accepted!r}")
+            finally:
+                request.close()
+            goal = _wait_goal_state(host, "complete")
+            if goal["rounds"] != 3 or goal["last_check"] != {"exit": 0, "ok": True, "output": "failed-3\n"}:
+                fail(f"goal did not complete on the passing third check: {goal!r}")
+            if provider.call_count != 3 or counter.read_text(encoding="utf-8") != "3":
+                fail(f"goal ran the wrong number of rounds or checks: {provider.call_count}")
+            session_id = host.run._conversation[1].run_id
+            store = SessionStore.open(host.run.sessions_root, session_id)
+            try:
+                users = [message.text for message in load_run(store).messages if message.role is Role.USER]
+            finally:
+                store.close()
+            if len(users) != 3 or "round 1 of 10" not in users[1] or "failed-1" not in users[1] or "round 2 of 10" not in users[2] or "failed-2" not in users[2]:
+                fail(f"subsequent goal prompts omitted check feedback: {users!r}")
+            seen = []
+            check_events = []
+            goal_events = []
+            while len(check_events) < 3:
+                kind, payload = _next_sse(connection, response, timeout=5)
+                if kind != "event":
+                    continue
+                seen.append(payload.get("type"))
+                if payload.get("type") == "GoalChanged":
+                    goal_events.append(payload)
+                if payload.get("type") == "GoalChanged" and payload.get("change") == "check":
+                    if seen.count("RunFinished") <= len(check_events):
+                        fail(f"goal check event preceded its RunFinished: {seen!r}")
+                    check_events.append(payload)
+            if [event["phase"] for event in check_events] != ["active", "active", "complete"]:
+                fail(f"goal check events had the wrong phases: {check_events!r}")
+            if [event["change"] for event in goal_events] != ["set", "check", "check", "check"]:
+                fail(f"goal state events were missing or out of order: {goal_events!r}")
+        finally:
+            connection.close()
+            host.close()
+
+
+@check("host_server.goal_round_limit_blocks")
+def check_goal_round_limit_blocks() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            code = "print('still failing'); raise SystemExit(1)"
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", code], "max_rounds": 2},
+                headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"goal route rejected a valid two-round goal: {response.status}")
+                response.read()
+            finally:
+                connection.close()
+            goal = _wait_goal_state(host, "blocked")
+            if goal["rounds"] != 2 or goal["reason"] != "rounds exhausted" or provider.call_count != 2:
+                fail(f"goal round limit did not block after two rounds: {goal!r}, calls={provider.call_count}")
+        finally:
+            host.close()
+
+
+@check("host_server.goal_agent_updates")
+def check_goal_agent_updates() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "complete-goal", "update_goal",
+                {"status": "complete", "message": "implemented the requested change"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "The requested change is complete.")),
+        ])
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/goal", body={"objective": "finish"}, headers=_headers(host),
+            )
+            accepted = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or accepted["goal"]["check"] != []:
+                fail(f"check-less goal was not accepted: {response.status}, {accepted!r}")
+            goal = _wait_goal_state(host, "complete")
+            if goal["rounds"] != 1 or goal["reason"] != "implemented the requested change" or provider.call_count != 2:
+                fail(f"agent completion did not finish the check-less goal in one round: {goal!r}")
+        finally:
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        marker = root / "checked"
+        check_code = (
+            "from pathlib import Path; import sys; "
+            f"p=Path({str(marker)!r}); n=int(p.read_text())+1 if p.exists() else 1; "
+            "p.write_text(str(n)); sys.exit(0 if n == 2 else 1)"
+        )
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "defer-completion", "update_goal",
+                {"status": "complete", "message": "the work looks done"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "Run the check.")),
+            ModelResponse(Message(Role.ASSISTANT, "The check now passes.")),
+        ])
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", check_code]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            goal = _wait_goal_state(host, "complete")
+            if goal["rounds"] != 2 or goal["last_check"]["exit"] != 0 or marker.read_text() != "2":
+                fail(f"agent completion bypassed the configured check: {goal!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.goal_agent_blocked")
+def check_goal_agent_blocked() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        marker = root / "should-not-run"
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "block-goal", "update_goal",
+                {"status": "blocked", "message": "the upstream service is unavailable"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "I cannot finish without the service.")),
+        ])
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            code = f"from pathlib import Path; Path({str(marker)!r}).touch()"
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", code]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            goal = _wait_goal_state(host, "blocked")
+            if goal["reason"] != "the upstream service is unavailable" or marker.exists() or provider.call_count != 2:
+                fail(f"agent block did not stop the goal loop before its check: {goal!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.goal_without_check_round_limit")
+def check_goal_without_check_round_limit() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        class RecordingProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__([
+                    ModelResponse(Message(Role.ASSISTANT, "still working")),
+                    ModelResponse(Message(Role.ASSISTANT, "still not done")),
+                ])
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        provider = RecordingProvider()
+        run = HostRun(
+            provider, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions",
+        )
+        try:
+            run.start_goal("finish the work", (), 2)
+            deadline = time.monotonic() + 8
+            goal = run.goal_snapshot()
+            while time.monotonic() < deadline and (goal is None or goal["phase"] != "blocked"):
+                time.sleep(0.02)
+                goal = run.goal_snapshot()
+            expected_prompt = (
+                "Round 1 of 2 ended without the goal reported complete.\n"
+                "Keep working toward the goal: finish the work\n"
+                'If it is done, call update_goal with status "complete"; '
+                'if you cannot finish it, call update_goal with status "blocked".'
+            )
+            user_prompts = [
+                message.text
+                for message in provider.requests[1].messages
+                if message.role is Role.USER
+            ] if len(provider.requests) > 1 else []
+            if (
+                goal is None
+                or goal["phase"] != "blocked"
+                or goal["rounds"] != 2
+                or goal["reason"] != "rounds exhausted"
+                or user_prompts[-1:] != [expected_prompt]
+                or provider.call_count != 2
+            ):
+                fail(f"check-less goal did not continue and block at its limit: {goal!r}, {user_prompts!r}")
+        finally:
+            run.close()
+
+
+@check("host_server.goal_tool_reads_and_rejects_inactive_updates")
+def check_goal_tool_reads_and_rejects_inactive_updates() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sessions = root / "sessions"
+        session_id = "goal-tool-session"
+        session = SessionStore(sessions, session_id, repo_root=root)
+        session.close()
+        run = HostRun(
+            FakeModelProvider(), PermissionPolicy(root), EventBroker(),
+            sessions_root=sessions,
+        )
+        run._goal = goal_module.Goal("finish", (), rounds=1)
+        run._goal_session_id = session_id
+        tools = goal_module.goal_tools(
+            lambda: run._goal_for_session(session_id),
+            lambda status, message: run._update_goal_for_session(session_id, status, message),
+        )
+        read = tools["get_goal"].execute(
+            ToolCall("read-goal", "get_goal", {}), run.policy,
+        )
+        if not read.ok or json.loads(read.content).get("objective") != "finish":
+            fail(f"get_goal did not return the current goal JSON: {read!r}")
+
+        run._goal.phase = "paused"
+        run._save_goal(session_id, run._goal)
+        paused = tools["update_goal"].execute(
+            ToolCall("update-paused", "update_goal", {"status": "blocked", "message": "blocked"}),
+            run.policy,
+        )
+        run._goal = None
+        run._goal_session_id = None
+        missing = tools["update_goal"].execute(
+            ToolCall("update-missing", "update_goal", {"status": "complete", "message": "done"}),
+            run.policy,
+        )
+        if paused.ok or "paused" not in (paused.error or ""):
+            fail(f"update_goal accepted a paused goal: {paused!r}")
+        if missing.ok or "No goal" not in (missing.error or ""):
+            fail(f"update_goal accepted a missing goal: {missing!r}")
+
+
+@check("host_server.goal_stop_and_resume")
+def check_goal_stop_and_resume() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _WaitingProvider()
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        marker = root / "checked"
+        code = f"from pathlib import Path; Path({str(marker)!r}).write_text('ok')"
+        try:
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", code]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            _wait_until(lambda: host.run.active, "goal round did not start")
+            connection, response = _request(host, "POST", "/stop", body={}, headers=_headers(host))
+            response.read()
+            connection.close()
+            goal = _wait_goal_state(host, "paused")
+            if goal["reason"] != "cancelled" or marker.exists():
+                fail(f"stopped goal round did not pause without a check: {goal!r}")
+            connection, response = _request(
+                host, "POST", "/goal/state", body={"action": "resume"}, headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            goal = _wait_goal_state(host, "complete")
+            if not marker.exists() or goal["last_check"]["exit"] != 0:
+                fail(f"resuming the goal did not run its check: {goal!r}")
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_server.goal_check_timeout_kills_group")
+def check_goal_check_timeout_kills_group() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        marker = root / "child-finished"
+        child = (
+            "import time; from pathlib import Path; time.sleep(0.7); "
+            f"Path({str(marker)!r}).write_text('alive')"
+        )
+        parent = (
+            "import subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(10)"
+        )
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            with mock.patch.object(goal_module, "GOAL_CHECK_TIMEOUT_SECONDS", 0.1):
+                connection, response = _request(
+                    host, "POST", "/goal",
+                    body={"objective": "finish", "check": [sys.executable, "-c", parent], "max_rounds": 1},
+                    headers=_headers(host),
+                )
+                response.read()
+                connection.close()
+                goal = _wait_goal_state(host, "blocked")
+            time.sleep(0.8)
+            if goal["last_check"]["exit"] is not None or marker.exists():
+                fail(f"timed out goal check did not kill its process group: {goal!r}, child={marker.exists()}")
+        finally:
+            host.close()
+
+
+@check("host_server.goal_pause_and_clear")
+def check_goal_pause_and_clear() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _WaitingProvider()
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", "pass"]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            _wait_until(lambda: host.run.active, "goal round did not start")
+            connection, response = _request(
+                host, "POST", "/goal/state", body={"action": "pause"}, headers=_headers(host),
+            )
+            paused = json.loads(response.read()).get("goal")
+            connection.close()
+            if response.status != 200 or paused["phase"] != "paused":
+                fail(f"goal pause route failed: {response.status}, {paused!r}")
+            connection, response = _request(
+                host, "POST", "/goal/state", body={"action": "clear"}, headers=_headers(host),
+            )
+            cleared = json.loads(response.read()).get("goal", "missing")
+            connection.close()
+            if response.status != 200 or cleared is not None:
+                fail(f"goal clear route failed: {response.status}, {cleared!r}")
+            provider.release.set()
+            _wait_until(lambda: not host.run.active, "cleared goal round did not finish")
+            if host.run.conversation_stats()["goal"] is not None:
+                fail("cleared goal returned to conversation state")
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_server.goal_check_interrupted_by_prompt")
+def check_goal_check_interrupted_by_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            code = "import time; print('failed'); time.sleep(0.4); raise SystemExit(1)"
+            connection, response = _request(
+                host, "POST", "/goal",
+                body={"objective": "finish", "check": [sys.executable, "-c", code]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            _wait_until(lambda: host.run._goal_check is not None and host.run._goal_check.process is not None, "goal check did not start")
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "continue manually"}, headers=_headers(host),
+            )
+            if response.status != 200:
+                fail(f"prompt during goal check was rejected: {response.status}")
+            response.read()
+            connection.close()
+            goal = _wait_goal_state(host, "paused")
+            _wait_until(lambda: not host.run.active, "manual prompt did not finish")
+            if goal["reason"] != "interrupted" or provider.call_count != 2:
+                fail(f"failed check continued after a new prompt: {goal!r}, calls={provider.call_count}")
+        finally:
+            host.close()
+
+
+@check("host_server.goal_routes_validate")
+def check_goal_routes_validate() -> None:
+    provider = _WaitingProvider()
+    host = _host(provider)
+    try:
+        for body in (
+            {},
+            {"objective": " ", "check": [sys.executable]},
+            {"objective": "x", "check": None},
+            {"objective": "x", "check": [""]},
+            {"objective": "x", "check": [sys.executable], "max_rounds": True},
+            {"objective": "x", "check": [sys.executable], "max_rounds": 101},
+            {"objective": "x", "check": [sys.executable], "other": 1},
+        ):
+            connection, response = _request(host, "POST", "/goal", body=body, headers=_headers(host))
+            response.read()
+            connection.close()
+            if response.status != 400:
+                fail(f"invalid goal body was accepted: {body!r}, status={response.status}")
+        connection, response = _request(
+            host, "POST", "/goal/state", body={"action": "pause"}, headers=_headers(host),
+        )
+        response.read()
+        connection.close()
+        if response.status != 404:
+            fail(f"goal state route without a goal returned {response.status}")
+        connection, response = _request(
+            host, "POST", "/prompt", body={"prompt": "busy"}, headers=_headers(host),
+        )
+        response.read()
+        connection.close()
+        _wait_until(lambda: host.run.active, "busy prompt did not start")
+        connection, response = _request(
+            host, "POST", "/goal",
+            body={"objective": "x", "check": [sys.executable, "-c", "pass"]},
+            headers=_headers(host),
+        )
+        response.read()
+        connection.close()
+        if response.status != 409:
+            fail(f"goal route during a run returned {response.status}")
+    finally:
+        provider.release.set()
+        host.run.stop()
+        host.close()
+
+
+@check("host_server.session_routes_clear_shell_grants")
+def check_session_routes_clear_shell_grants() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "first")),
+            ModelResponse(Message(Role.ASSISTANT, "second")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        stream_connection = None
+        try:
+            stream_connection, stream_response = _subscribed_stream(host)
+
+            def shell_question():
+                result = []
+                thread = threading.Thread(
+                    target=lambda: result.append(host.run.policy.check_shell(["pytest", "-x"]))
+                )
+                thread.start()
+                frame = _await_sse(
+                    stream_connection,
+                    stream_response,
+                    lambda candidate: isinstance(candidate, tuple)
+                    and candidate[0] == "approval_requested",
+                    what="shell approval after session transition",
+                )
+                return result, thread, frame[1]
+
+            def answer_shell(result, thread, payload, *, remember):
+                if payload.get("remember") != "pytest":
+                    fail(f"shell approval offered the wrong grant prefix: {payload!r}")
+                connection, response = _request(
+                    host,
+                    "POST",
+                    "/approval",
+                    body={
+                        "approval_id": payload["approval_id"],
+                        "allowed": remember,
+                        "reason": "no" if not remember else "",
+                        "remember": remember,
+                    },
+                    headers=_headers(host),
+                )
+                try:
+                    body = response.read()
+                    if response.status != 200:
+                        fail(f"shell approval answer failed: {response.status}, {body!r}")
+                finally:
+                    connection.close()
+                thread.join(1)
+                if thread.is_alive() or not result or result[0].allowed != remember:
+                    fail(f"shell approval response was not applied: {result!r}")
+
+            def grant_and_check_transition():
+                result, thread, payload = shell_question()
+                answer_shell(result, thread, payload, remember=True)
+
+            def require_prompt_after_transition():
+                result, thread, payload = shell_question()
+                answer_shell(result, thread, payload, remember=False)
+
+            _send_host_prompt(host, "first session")
+            first_session_id = host.run._conversation[1].run_id
+            grant_and_check_transition()
+            connection, response = _request(
+                host, "POST", "/session/new", body={}, headers=_headers(host)
+            )
+            try:
+                if response.status != 200:
+                    fail(f"session/new failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            require_prompt_after_transition()
+
+            _send_host_prompt(host, "second session")
+            grant_and_check_transition()
+            connection, response = _request(
+                host,
+                "POST",
+                "/session/open",
+                body={"run_id": first_session_id},
+                headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"session/open failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            require_prompt_after_transition()
+
+            store = SessionStore.open(root / "sessions", first_session_id)
+            try:
+                record_id = load_run(store).record_ids[0]
+            finally:
+                store.close()
+            grant_and_check_transition()
+            connection, response = _request(
+                host,
+                "POST",
+                "/session/fork",
+                body={"run_id": first_session_id, "record_id": record_id},
+                headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"session/fork failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            require_prompt_after_transition()
+        finally:
+            if stream_connection is not None:
+                stream_connection.close()
+            host.close()
 
 
 @check("host_server.project_instructions_seeded")
@@ -3059,7 +4078,7 @@ def check_conversation_reopened_parentage() -> None:
                 connection.close()
             conversation = _conversation_reply(host)[1]["conversation"]
             if conversation is None or set(conversation) != {
-                "agents", "mode", "provider", "model", "effort"
+                "agents", "mode", "goal", "provider", "model", "effort"
             }:
                 fail(f"reopened conversation did not report agents without usage: {conversation!r}")
             agents = {agent["name"]: agent for agent in conversation["agents"]}
@@ -3553,6 +4572,47 @@ class _GatedProvider(ModelProvider):
         return self._responses[index]
 
 
+class _HostControlTool(LocalTool):
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    @property
+    def name(self) -> str:
+        return "wait_for_control"
+
+    @property
+    def description(self) -> str:
+        return "Wait until the host control check releases this tool."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(ToolEffect.READ_ONLY, True, ())
+
+    def _execute(self, tool_call, policy, cancel=None):
+        self.entered.set()
+        if not self.release.wait(5):
+            raise RuntimeError("host control check did not release tool")
+        return ToolResult(tool_call_id=tool_call.id, ok=True, content="released")
+
+
+class _HostControlProvider(FakeModelProvider):
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        super().__init__(responses)
+        self.final_entered = threading.Event()
+        self.release_final = threading.Event()
+
+    def create_response(self, request, *, cancel=None) -> ModelResponse:
+        if self.call_count == 3:
+            self.final_entered.set()
+            if not self.release_final.wait(5):
+                raise RuntimeError("host control check did not release final response")
+        return super().create_response(request, cancel=cancel)
+
+
 class _RecordingTool(LocalTool):
     def __init__(self) -> None:
         self.invocations = 0
@@ -3595,6 +4655,7 @@ class _CountingExtensions:
         self.calls = 0
         self.runners: list[_HookProbe] = []
         self.agents = {}
+        self.skills = {}
         self.config = ResolvedConfig({}, {})
 
     def hook_runner(self, *, cwd: Path) -> _HookProbe:
@@ -4788,7 +5849,9 @@ def check_defined_leader_provider_model_and_tools() -> None:
                 fail("leader definition model did not reach the provider request")
             if defined.requests[0].messages[0].text != "defined leader prompt":
                 fail("leader definition prompt did not reach the provider request")
-            if set(leader._agent._tools) != {"dispatch_subagent", "read_file", "read_tool_result"}:
+            if set(leader._agent._tools) != {
+                "dispatch_subagent", "read_file", "read_tool_result", "get_goal", "update_goal",
+            }:
                 fail("leader definition tools did not reach the actual registry")
             if set(leader._leader_spec.tool_names or ()) != set(leader._agent._tools):
                 fail("defined leader run spec did not report its actual registry")

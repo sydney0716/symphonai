@@ -179,6 +179,122 @@ def check_callback_never_raises() -> None:
         fail(f"publisher failure escaped approval callback: {result!r}")
 
 
+def _start_shell_check(policy: PermissionPolicy, argv: list[str]):
+    result = []
+    thread = threading.Thread(target=lambda: result.append(policy.check_shell(argv)))
+    thread.start()
+    return result, thread
+
+
+def _await_pending(broker: ApprovalBroker) -> PendingApproval:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        pending = broker.pending()
+        if pending:
+            return pending[0]
+        time.sleep(0.01)
+    fail("shell approval was not published")
+
+
+@check("host_approvals.remembered_shell_prefix")
+def check_remembered_shell_prefix() -> None:
+    published: list[PendingApproval] = []
+    broker = ApprovalBroker(lambda item: published.append(item) or True, timeout=1)
+    policy = PermissionPolicy(repo_root=ROOT, mode="ask", approval_callback=broker.callback)
+    result, thread = _start_shell_check(policy, ["pytest", "-x"])
+    approval = _await_pending(broker)
+    if approval.remember != "pytest":
+        fail(f"pytest approval offered the wrong remembered prefix: {approval.remember!r}")
+    if not broker.resolve(approval.approval_id, allowed=True, reason="", remember=True):
+        fail("remembered pytest approval did not resolve")
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail(f"remembered pytest approval did not resume: {result!r}")
+
+    for argv in (["pytest"], ["pytest", "-q"], ["pytest", "tests/test_a.py"]):
+        decision = policy.check_shell(argv)
+        if not decision.allowed:
+            fail(f"remembered prefix did not allow {argv!r}: {decision!r}")
+    if len(published) != 1:
+        fail(f"remembered pytest commands published extra approvals: {published!r}")
+
+    result, thread = _start_shell_check(policy, ["ruff", "check", "."])
+    ruff = _await_pending(broker)
+    if ruff.target != "ruff check .":
+        fail(f"ungranted command was not prompted: {ruff!r}")
+    broker.resolve(ruff.approval_id, allowed=True, reason="")
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail(f"unremembered approval did not resume: {result!r}")
+
+
+@check("host_approvals.denied_shell_grant_not_remembered")
+def check_denied_shell_grant_not_remembered() -> None:
+    broker = ApprovalBroker(lambda _: True, timeout=1)
+    policy = PermissionPolicy(repo_root=ROOT, mode="ask", approval_callback=broker.callback)
+    result, thread = _start_shell_check(policy, ["pytest", "-x"])
+    first = _await_pending(broker)
+    if not broker.resolve(first.approval_id, allowed=False, reason="no", remember=True):
+        fail("denied approval did not resolve")
+    thread.join(1)
+    if thread.is_alive() or not result or result[0].allowed:
+        fail(f"denied approval did not refuse its shell call: {result!r}")
+
+    result, thread = _start_shell_check(policy, ["pytest", "-x"])
+    second = _await_pending(broker)
+    if second.approval_id == first.approval_id or second.remember != "pytest":
+        fail(f"denied remembered approval did not prompt again: {second!r}")
+    broker.resolve(second.approval_id, allowed=False, reason="no")
+    thread.join(1)
+
+
+@check("host_approvals.grants_clear")
+def check_grants_clear() -> None:
+    broker = ApprovalBroker(lambda _: True, timeout=1)
+    request = ToolApprovalRequest(
+        "run_shell", "pytest -x", command=("pytest", "-x")
+    )
+    result = []
+    thread = threading.Thread(target=lambda: result.append(broker.callback(request)))
+    thread.start()
+    approval = _await_pending(broker)
+    broker.resolve(approval.approval_id, allowed=True, reason="", remember=True)
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail("remembered shell callback did not finish")
+    if not broker.callback(request).allowed:
+        fail("remembered grant did not bypass publication")
+
+    broker.clear_grants()
+    result.clear()
+    thread = threading.Thread(target=lambda: result.append(broker.callback(request)))
+    thread.start()
+    cleared = _await_pending(broker)
+    broker.resolve(cleared.approval_id, allowed=False, reason="no")
+    thread.join(1)
+    if thread.is_alive() or not result or result[0].allowed:
+        fail("cleared shell grant did not prompt again")
+
+
+@check("host_approvals.always_deny_precedes_remembered_grant")
+def check_always_deny_precedes_remembered_grant() -> None:
+    broker = ApprovalBroker(lambda _: True, timeout=1)
+    request = ToolApprovalRequest("run_shell", "rm", command=("rm",))
+    result = []
+    thread = threading.Thread(target=lambda: result.append(broker.callback(request)))
+    thread.start()
+    approval = _await_pending(broker)
+    broker.resolve(approval.approval_id, allowed=True, reason="", remember=True)
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail("test setup did not grant rm")
+
+    policy = PermissionPolicy(repo_root=ROOT, mode="ask", approval_callback=broker.callback)
+    decision = policy.check_shell(["rm", "-rf", "/"])
+    if decision.allowed or broker.pending():
+        fail(f"always-denied rm consulted or bypassed a remembered grant: {decision!r}")
+
+
 @check("host_approvals.permissions_untouched")
 def check_permissions_untouched() -> None:
     source = ROOT / "symphonai_api" / "permissions.py"

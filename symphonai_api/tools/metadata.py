@@ -55,6 +55,7 @@ _TARGET_KEYS = {
     "glob": ("pattern", _plain_target),
     "grep": ("pattern", _plain_target),
     "web_search": ("query", _plain_target),
+    "use_skill": ("name", _plain_target),
     "run_shell": ("argv", _argv_program),
     "web_fetch": ("url", _url_origin),
 }

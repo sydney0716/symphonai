@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 
 from symphonai_api.cancellation import CancellationToken
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools import filesystem as filesystem_tools
@@ -106,8 +107,13 @@ def _diff_result(tool_call_id: str, path: str, old: str, new: str) -> ToolResult
 class EditFileTool(LocalTool):
     """Replace one exact string, or every occurrence, in a UTF-8 file."""
 
-    def __init__(self, ledger: ReadLedger) -> None:
+    def __init__(
+        self,
+        ledger: ReadLedger,
+        checkpoints: CheckpointStore | None = None,
+    ) -> None:
         self._ledger = ledger
+        self._checkpoints = checkpoints
 
     @property
     def name(self) -> str:
@@ -196,7 +202,11 @@ class EditFileTool(LocalTool):
             old_string, new_string, 1
         )
         try:
+            if self._checkpoints is not None:
+                self._checkpoints.before_write(resolved)
             resolved.write_text(updated, encoding="utf-8")
+            if self._checkpoints is not None:
+                self._checkpoints.after_write(resolved)
             self._ledger.record(resolved, full=True, content=updated)
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
@@ -307,7 +317,11 @@ class MultiEditFileTool(EditFileTool):
                 else updated.replace(old_string, edit["new_string"], 1)
             )
         try:
+            if self._checkpoints is not None:
+                self._checkpoints.before_write(resolved)
             resolved.write_text(updated, encoding="utf-8")
+            if self._checkpoints is not None:
+                self._checkpoints.after_write(resolved)
             self._ledger.record(resolved, full=True, content=updated)
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))

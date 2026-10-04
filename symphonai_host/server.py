@@ -45,6 +45,8 @@ from symphonai_host.protocol import (
     encode_frame,
 )
 from symphonai_host.run import (
+    AgentControlError,
+    ChangedOutsideError,
     HostRun,
     ModeSelectionError,
     NoConversationError,
@@ -207,6 +209,7 @@ class HostServer:
                 target=approval.target,
                 details=approval.details,
                 tool_call_id=approval.tool_call_id,
+                remember=approval.remember,
             )
         )
         return True
@@ -609,6 +612,16 @@ class HostServer:
                         {"conversation": host.run.conversation_stats()},
                     )
                     return
+                if request_path == "/changes":
+                    if not self._authorized():
+                        return
+                    try:
+                        reply = host.run.changes()
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
                 if request_path == "/models":
                     if not self._authorized():
                         return
@@ -890,10 +903,61 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/changes/revert", "/goal", "/goal/state") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
+                    return
+                if self.path == "/goal":
+                    try:
+                        payload = self._read_object()
+                        objective = payload.get("objective")
+                        check = payload.get("check", [])
+                        max_rounds = payload.get("max_rounds", 10)
+                        if (
+                            set(payload) - {"objective", "check", "max_rounds"}
+                            or not isinstance(objective, str)
+                            or not objective.strip()
+                            or not isinstance(check, list)
+                            or not all(isinstance(arg, str) and arg for arg in check)
+                            or type(max_rounds) is not int
+                            or not 1 <= max_rounds <= 100
+                        ):
+                            raise ProtocolError("goal requires a non-blank objective, optional check argv, and max_rounds from 1 to 100")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        run_id = host.run.start_goal(objective, tuple(check), max_rounds)
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ProviderSelectionError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        "accepted": True,
+                        "run_id": run_id,
+                        "goal": host.run.goal_snapshot(),
+                    })
+                    return
+                if self.path == "/goal/state":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"action"} or payload.get("action") not in ("pause", "resume", "clear"):
+                            raise ProtocolError("goal/state requires pause, resume, or clear")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        goal = host.run.goal_state(payload["action"])
+                    except KeyError:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "no goal"})
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {"goal": goal})
                     return
                 if self.path == "/agent":
                     try:
@@ -936,6 +1000,71 @@ class HostServer:
                             "message": "definition saved; it will take effect on the next run",
                         },
                     )
+                    return
+                if self.path == "/agent/control":
+                    try:
+                        payload = self._read_object()
+                        if (
+                            set(payload) - {"agent_id", "action", "text"}
+                            or not isinstance(payload.get("agent_id"), str)
+                            or not payload["agent_id"]
+                            or payload.get("action") not in ("pause", "resume", "redirect", "stop")
+                            or ("text" in payload and not isinstance(payload["text"], str))
+                            or (payload.get("action") == "redirect" and not str(payload.get("text", "")).strip())
+                        ):
+                            raise ProtocolError("agent/control requires agent_id, a valid action, and redirect text")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        reply = host.run.control_agent(
+                            payload["agent_id"], payload["action"], payload.get("text")
+                        )
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    except AgentControlError as exc:
+                        self._json(HTTPStatus(exc.status), {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
+                if self.path == "/changes/revert":
+                    try:
+                        payload = self._read_object()
+                        fields = set(payload)
+                        if (
+                            "force" in payload and not isinstance(payload["force"], bool)
+                        ) or fields - {"path", "key", "force"}:
+                            raise ProtocolError("changes/revert accepts path or key and optional force")
+                        has_path = isinstance(payload.get("path"), str) and bool(payload["path"].strip())
+                        has_key = isinstance(payload.get("key"), str) and bool(payload["key"].strip())
+                        if has_path == has_key or ("path" in payload and not has_path) or ("key" in payload and not has_key):
+                            raise ProtocolError("changes/revert requires one non-empty path or key")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        reply = host.run.revert_changes(
+                            path=payload.get("path"),
+                            key=payload.get("key"),
+                            force=payload.get("force", False),
+                        )
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    except ChangedOutsideError as exc:
+                        self._json(
+                            HTTPStatus.CONFLICT,
+                            {"error": str(exc), "paths": exc.paths},
+                        )
+                        return
+                    except KeyError:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown change"})
+                        return
+                    except (OSError, ValueError) as exc:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
                     return
                 if credential_route:
                     try:
@@ -984,18 +1113,27 @@ class HostServer:
                 if self.path == "/session/fork":
                     try:
                         payload = self._read_object()
-                        if set(payload) != {"run_id", "record_id"} or any(
+                        if set(payload) - {"run_id", "record_id", "force"} or any(
                             type(payload[key]) is not str or not payload[key]
                             for key in ("run_id", "record_id")
-                        ):
+                        ) or ("force" in payload and type(payload["force"]) is not bool):
                             raise ProtocolError("session/fork requires run_id and record_id strings")
                     except ProtocolError as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
                     try:
-                        reply = host.run.fork_session(payload["run_id"], payload["record_id"])
+                        reply = host.run.fork_session(
+                            payload["run_id"], payload["record_id"],
+                            force=payload.get("force", False),
+                        )
                     except RunActiveError as exc:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ChangedOutsideError as exc:
+                        self._json(
+                            HTTPStatus.CONFLICT,
+                            {"error": str(exc), "paths": exc.paths},
+                        )
                         return
                     except SessionError as exc:
                         self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
@@ -1102,7 +1240,10 @@ class HostServer:
                     return
                 if kind == "approval":
                     if not host.run.approvals.resolve(
-                        request.approval_id, allowed=request.allowed, reason=request.reason
+                        request.approval_id,
+                        allowed=request.allowed,
+                        reason=request.reason,
+                        remember=request.remember,
                     ):
                         self._json(HTTPStatus.NOT_FOUND, {"error": "unknown approval id"})
                         return

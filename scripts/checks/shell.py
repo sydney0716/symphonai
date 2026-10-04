@@ -335,3 +335,52 @@ def check_shell_execution_paths() -> None:
         )
         if timing_out.ok or not (timing_out.error or "").startswith("error running command:"):
             fail(f"run_shell timeout path changed: {timing_out!r}")
+
+
+@check("shell.timeout_seconds")
+def check_shell_timeout_seconds() -> None:
+    with workspace() as ws:
+        tool = RunShellTool()
+        argv = [sys.executable, "-c", "pass"]
+
+        class TimedOutProcess:
+            returncode = None
+            pid = 1
+
+            def poll(self):
+                return None
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(argv, timeout)
+
+        cases = (
+            ({}, 120.0),
+            ({"timeout_seconds": 900}, 600.0),
+            ({"timeout_seconds": 5}, 5.0),
+        )
+        for extra, expected in cases:
+            arguments = {"argv": argv, **extra}
+            policy = PermissionPolicy(
+                repo_root=ws.root,
+                shell_enabled=True,
+                shell_allowlist=[(sys.executable,)],
+            )
+            if policy.shell_timeout_seconds != 600.0:
+                fail(f"default shell timeout was {policy.shell_timeout_seconds!r}, expected 600")
+            with (
+                mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=TimedOutProcess()),
+                mock.patch("symphonai_api.tools.shell._terminate_process_group"),
+                mock.patch("symphonai_api.tools.shell.time.monotonic", side_effect=[0, 0, expected]),
+            ):
+                result = tool.execute(
+                    ToolCall(id="shell-timeout-limit", name="run_shell", arguments=arguments),
+                    policy,
+                )
+            if result.ok or f"after {expected:g}" not in (result.error or ""):
+                fail(f"run_shell did not use effective timeout {expected:g}: {result!r}")
+
+        invalid_values = (0, -1, True, "5")
+        for value in invalid_values:
+            error = tool.validate({"argv": argv, "timeout_seconds": value})
+            if not error or "timeout_seconds" not in error:
+                fail(f"run_shell accepted invalid timeout_seconds {value!r}")

@@ -11,6 +11,7 @@ from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tool_schema import to_provider_tool_schema
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import TARGET_LIMIT, _TARGET_KEYS, call_target
+from symphonai_api.skills import Skill
 from symphonai_api.web_search import SearchBackend
 from scripts.checks.harness import check, fail, ok
 
@@ -97,6 +98,7 @@ def check_tools_metadata_contract() -> None:
         "glob": ("**/*.py", {"pattern": "**/*.py"}),
         "grep": ("def login", {"pattern": "def login"}),
         "web_search": ("safe display query", {"query": "safe display query"}),
+        "use_skill": ("release", {"name": "release"}),
         "run_shell": ("deploy.sh", {"argv": ["deploy.sh", "--prod"]}),
         "web_fetch": (
             "https://h",
@@ -306,7 +308,10 @@ def check_tools_metadata_contract() -> None:
 
 @check("tools.target_keys_match_schemas")
 def check_target_keys_match_schemas() -> None:
-    tools = standard_tool_registry(search_backend=_TargetSchemaSearchBackend())
+    skill = Skill("release", "Release.", "Use for releases.", __file__, 1)
+    tools = standard_tool_registry(
+        search_backend=_TargetSchemaSearchBackend(), skills={"release": skill}
+    )
     for tool_name, (argument_key, _) in _TARGET_KEYS.items():
         tool = tools.get(tool_name)
         if tool is None:

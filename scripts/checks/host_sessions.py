@@ -7,6 +7,7 @@ import contextlib
 import io
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -17,8 +18,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from symphonai_api.events import RunFinished, SessionEnded
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.session import SessionStore, load_run, read_records
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.serialization import message_to_json
+from symphonai_api.identity import new_id
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 import symphonai_host.__main__ as host_main
@@ -695,15 +699,231 @@ def check_prune_startup() -> None:
                 fail(f"startup pruning arguments were wrong: {observed!r}")
 
 
-def _fork(host: HostServer, run_id: str, record_id: str) -> tuple[int, dict]:
+def _fork(host: HostServer, run_id: str, record_id: str, *, force: bool = False) -> tuple[int, dict]:
     connection, response = _request(
         host, "POST", "/session/fork",
-        body={"run_id": run_id, "record_id": record_id}, headers=_headers(host),
+        body={"run_id": run_id, "record_id": record_id, **({"force": True} if force else {})},
+        headers=_headers(host),
     )
     try:
         return response.status, json.loads(response.read())
     finally:
         connection.close()
+
+
+def _checkpointed_two_prompt_session(root: Path):
+    host, client, source_id = _finished_session(root)
+    source = SessionStore.open(root / "sessions", source_id)
+    try:
+        user_agent = next(
+            record["agent_id"] for record in read_records(source.directory / "run.jsonl")[0]
+            if record.get("type") == "message"
+            and record.get("data", {}).get("role") == "user"
+        )
+        second_turn = new_id("turn")
+        writer = source.writer_for(user_agent, is_root=True)
+        second_user = writer.append(
+            "message", run_id=source_id, agent_id=user_agent, turn_id=second_turn,
+            data=message_to_json(Message(Role.USER, "second prompt", turn_id=second_turn)),
+        )
+        second_answer = writer.append(
+            "message", run_id=source_id, agent_id=user_agent, turn_id=second_turn,
+            data=message_to_json(Message(Role.ASSISTANT, "second answer", turn_id=second_turn)),
+        )
+        raw_records, _ = read_records(source.directory / "run.jsonl")
+        user_records = [
+            record for record in raw_records
+            if record.get("type") == "message" and record.get("data", {}).get("role") == "user"
+        ]
+        keys = ["prompt-one", "prompt-two"]
+        marked = []
+        for record in raw_records:
+            if record in user_records:
+                key = keys[user_records.index(record)]
+                marker = dict(record)
+                marker.update({"record_id": new_id("rec"), "type": "checkpoint", "turn_id": None, "data": {"key": key}})
+                marked.append(marker)
+            marked.append(record)
+        (source.directory / "run.jsonl").write_text(
+            "".join(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n" for record in marked),
+            encoding="utf-8",
+        )
+    finally:
+        source.close()
+    a = root / "a.py"
+    b = root / "b.py"
+    a.write_text("base\n", encoding="utf-8")
+    checkpoints = CheckpointStore(root / "sessions" / source_id / "checkpoints", root)
+    checkpoints.begin("prompt-one")
+    checkpoints.before_write(a)
+    a.write_text("after one\n", encoding="utf-8")
+    checkpoints.after_write(a)
+    checkpoints.begin("prompt-two")
+    checkpoints.before_write(a)
+    a.write_text("after two\n", encoding="utf-8")
+    checkpoints.after_write(a)
+    checkpoints.before_write(b)
+    b.write_text("new file\n", encoding="utf-8")
+    checkpoints.after_write(b)
+    return host, client, source_id, user_records[0]["record_id"], second_user, second_answer, a, b
+
+
+@check("host_sessions.fork_restores_prefix_checkpoints")
+def check_fork_restores_prefix_checkpoints() -> None:
+    for fork_at, expected_a, expect_b, expected_keys in (
+        ("second-user", "after one\n", False, ["prompt-one"]),
+        ("first-answer", "after one\n", False, ["prompt-one"]),
+        ("second-answer", "after two\n", True, ["prompt-one", "prompt-two"]),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            host, _, source_id, first_user, second_user, second_answer, a, b = _checkpointed_two_prompt_session(root)
+            try:
+                source = SessionStore.open(root / "sessions", source_id)
+                try:
+                    records, _ = read_records(source.directory / "run.jsonl")
+                    first_answer = next(
+                        record["record_id"] for record in records
+                        if record.get("type") == "message"
+                        and record.get("data", {}).get("role") == "assistant"
+                    )
+                finally:
+                    source.close()
+                target = {
+                    "second-user": second_user,
+                    "first-answer": first_answer,
+                    "second-answer": second_answer,
+                }[fork_at]
+                status, reply = _fork(host, source_id, target)
+                if status != 200:
+                    fail(f"checkpoint fork failed at {fork_at}: {status}, {reply!r}")
+                if a.read_text(encoding="utf-8") != expected_a or b.exists() != expect_b:
+                    fail(f"fork at {fork_at} left the wrong files: a={a.read_text()!r}, b={b.exists()}")
+                changes = host.run.changes()
+                keys = [turn["key"] for turn in changes["turns"]]
+                if keys != expected_keys:
+                    fail(f"fork at {fork_at} carried the wrong checkpoint turns: {keys!r}")
+                if fork_at == "second-user" and [file["path"] for file in changes["files"]] != ["a.py"]:
+                    fail(f"fork at prompt two user did not retain only prompt one's file: {changes!r}")
+            finally:
+                host.close()
+
+
+@check("host_sessions.fork_conflict_force_and_rollback")
+def check_fork_conflict_force_and_rollback() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, _, source_id, _, second_user, _, a, b = _checkpointed_two_prompt_session(root)
+        try:
+            b.write_text("hand edited\n", encoding="utf-8")
+            before_files = (a.read_bytes(), b.read_bytes())
+            before_sessions = {path.name for path in (root / "sessions").iterdir() if path.is_dir()}
+            status, reply = _fork(host, source_id, second_user)
+            after_sessions = {path.name for path in (root / "sessions").iterdir() if path.is_dir()}
+            if status != 409 or reply.get("paths") != ["b.py"]:
+                fail(f"outside file edit did not block the fork with its path: {status}, {reply!r}")
+            if (a.read_bytes(), b.read_bytes()) != before_files or after_sessions != before_sessions:
+                fail("conflicted fork changed files or created a session")
+            status, _ = _fork(host, source_id, second_user, force=True)
+            if status != 200 or a.read_text(encoding="utf-8") != "after one\n" or b.exists():
+                fail("forced fork did not restore the requested file state")
+        finally:
+            host.close()
+
+
+@check("host_sessions.fork_without_checkpoints_preserves_files")
+def check_fork_without_checkpoints_preserves_files() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, _, source_id = _finished_session(root)
+        try:
+            source = SessionStore.open(root / "sessions", source_id)
+            try:
+                record_id = load_run(source).record_ids[-1]
+                records, _ = read_records(source.directory / "run.jsonl")
+                without_checkpoints = [record for record in records if record.get("type") != "checkpoint"]
+                (source.directory / "run.jsonl").write_text(
+                    "".join(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n" for record in without_checkpoints),
+                    encoding="utf-8",
+                )
+                shutil.rmtree(source.directory / "checkpoints", ignore_errors=True)
+            finally:
+                source.close()
+            path = root / "untouched.py"
+            path.write_bytes(b"outside checkpoint history\x00\xff")
+            before = path.read_bytes()
+            status, reply = _fork(host, source_id, record_id)
+            if status != 200 or not reply.get("run_id"):
+                fail(f"fork without checkpoints failed: {status}, {reply!r}")
+            if path.read_bytes() != before:
+                fail("fork without checkpoints changed an unrelated file")
+        finally:
+            host.close()
+
+
+
+@check("host_sessions.goal_reopen_and_fork")
+def check_goal_reopen_and_fork() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, _, source_id = _finished_session(root)
+        try:
+            host.run.start_goal(
+                "keep working", (sys.executable, "-c", "import time; time.sleep(20)"), 3,
+            )
+            deadline = time.monotonic() + 5
+            while (
+                (host.run._goal_check is None or host.run._goal_check.process is None)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            if host.run._goal_check is None or host.run._goal_check.process is None:
+                fail("goal completion check did not start")
+            host.run.stop()
+            deadline = time.monotonic() + 5
+            while host.run._goal_check is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            source = SessionStore.open(root / "sessions", source_id)
+            try:
+                meta = source.read_meta()
+                meta["goal"]["phase"] = "active"
+                meta["goal"]["reason"] = ""
+                source.write_meta(meta)
+                last_record = load_run(source).record_ids[-1]
+            finally:
+                source.close()
+            host.run.open_session(source_id)
+            reopened = host.run.conversation_stats()["goal"]
+            if reopened["phase"] != "paused" or reopened["reason"] != "reopened":
+                fail(f"active goal did not pause on reopen: {reopened!r}")
+            host.run.fork_session(source_id, last_record)
+            if host.run.goal_snapshot() is not None:
+                fail("fork inherited its source goal")
+        finally:
+            host.close()
+
+
+@check("host_sessions.fork_reopen_failure_rolls_back_files")
+def check_fork_reopen_failure_rolls_back_files() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        host, _, source_id, _, second_user, _, a, b = _checkpointed_two_prompt_session(root)
+        try:
+            before_files = (a.read_bytes(), b.read_bytes())
+            before_sessions = {path.name for path in (root / "sessions").iterdir() if path.is_dir()}
+            with mock.patch.object(host.run, "open_session", side_effect=RuntimeError("reopen failed")):
+                try:
+                    host.run.fork_session(source_id, second_user)
+                except RuntimeError as exc:
+                    if str(exc) != "reopen failed":
+                        fail(f"fork changed the open failure: {exc!r}")
+                else:
+                    fail("fork succeeded despite open_session failure")
+            after_sessions = {path.name for path in (root / "sessions").iterdir() if path.is_dir()}
+            if (a.read_bytes(), b.read_bytes()) != before_files or after_sessions != before_sessions:
+                fail("failed fork did not roll back restored files and destination session")
+        finally:
+            host.close()
 
 
 @check("host_sessions.fork_prefix_current_parent")

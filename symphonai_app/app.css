@@ -129,10 +129,38 @@ button.session-link {
 
 #status-rail,
 .chat-pane,
-.settings-pane {
+.settings-pane,
+.changes-pane {
   min-height: 100vh;
   padding: 1rem;
   overflow: auto;
+}
+
+.changes-file,
+.changes-turn,
+.changes-conflict {
+  margin: 1rem 0;
+  padding: 0.8rem;
+  border: 1px solid #394150;
+  border-radius: 0.4rem;
+}
+
+.changes-file pre {
+  max-height: 32rem;
+  overflow: auto;
+  padding: 0.8rem;
+  background: #0d1117;
+  white-space: pre-wrap;
+}
+
+.changes-outside,
+.changes-conflict {
+  color: #ffbd66;
+}
+
+.changes-paths {
+  color: #9aa7b8;
+  font-size: 0.9rem;
 }
 
 #status-rail {
@@ -145,6 +173,29 @@ button.session-link {
   margin-left: 0.75rem;
   padding-left: 0.6rem;
   border-left: 1px solid #394150;
+}
+
+.agent-controls,
+.agent-redirect {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.35rem;
+}
+
+.agent-controls button,
+.agent-redirect button {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.8rem;
+}
+
+.agent-redirect input {
+  min-width: 0;
+  flex: 1;
+}
+
+.agent-control-error {
+  margin: 0.35rem 0 0;
+  color: #ff9a9a;
 }
 
 .app-shell.rail-folded #status-rail {
@@ -483,6 +534,19 @@ button.session-link {
 
 .command-output::before {
   content: "⎿ ";
+}
+
+.goal-check-output {
+  margin: 0.25rem 0 0 1.5em;
+}
+
+.goal-check-output summary {
+  cursor: pointer;
+}
+
+.goal-check-output pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .edit summary {

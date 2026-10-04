@@ -40,7 +40,7 @@ test("decodeFrame enumerates malformed frames", () => {
   }
 });
 
-test("decodeEvent recognizes all eighteen documented event types", () => {
+test("decodeEvent recognizes all nineteen documented event types", () => {
   const documented = [
     "RunStarted",
     "RunFinished",
@@ -60,8 +60,9 @@ test("decodeEvent recognizes all eighteen documented event types", () => {
     "SubagentSpawned",
     "SubagentStopped",
     "CompactionApplied",
+    "GoalChanged",
   ];
-  assert.equal(documented.length, 18);
+  assert.equal(documented.length, 19);
   assert.deepEqual(KNOWN_EVENT_TYPES, documented);
   for (const type of documented) {
     assert.deepEqual(decodeEvent({ type, marker: type }), {

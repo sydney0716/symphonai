@@ -775,8 +775,8 @@ def no_runtime_imports() -> None:
             fail(f"import inspection rejected {probe.strip()!r}")
 
 
-@check("agent_file.web_search_allow_and_deny")
-def web_search_allow_and_deny() -> None:
+@check("agent_file.web_search_and_skill_allow_and_deny")
+def web_search_and_skill_allow_and_deny() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         default_model = ModelSelector("fake")
@@ -796,6 +796,24 @@ def web_search_allow_and_deny() -> None:
             fail(f"search deny did not remove the tool: {spec.tool_names!r}")
         if tuple(standard_tool_registry()) != STANDARD_TOOL_NAMES:
             fail("unconfigured standard registry acquired web_search")
+        skill_allowed = _write(
+            directory, "skill.toml",
+            'prompt = "Use skills."\ntools = ["use_skill", "read_file"]\n',
+        )
+        skill_spec = load_agent_file(
+            skill_allowed, repo_root=directory, default_model=default_model,
+        )
+        if skill_spec.tool_names != ("read_file", "use_skill"):
+            fail(f"explicit use_skill was not canonicalized: {skill_spec.tool_names!r}")
+        skill_denied = _write(
+            directory, "no-skill.toml",
+            'prompt = "Do not use skills."\ntools = ["use_skill", "read_file"]\ndeny_tools = ["use_skill"]\n',
+        )
+        denied_spec = load_agent_file(
+            skill_denied, repo_root=directory, default_model=default_model,
+        )
+        if denied_spec.tool_names != ("read_file",):
+            fail(f"use_skill deny did not remove the tool: {denied_spec.tool_names!r}")
 
 
 @check("agent_file.memory_reaches_agent_spec")

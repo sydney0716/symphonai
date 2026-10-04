@@ -18,6 +18,7 @@ Subagent pool state lives only in memory for the duration of one
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -26,6 +27,7 @@ from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent, _message_diges
 from symphonai_api.agent_memory import AgentMemory, MemoryEntry, MemorySettings
 from symphonai_api.agent_run import (
     AgentRun,
+    PauseGate,
     RunNode,
     RunPhase,
     new_agent_run,
@@ -39,6 +41,7 @@ from symphonai_api.cancellation import (
     CancellationToken,
     OperationCancelled,
 )
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.child_context import seed_messages
 from symphonai_api.circuit_breaker import (
     DEFAULT_MAX_CONSECUTIVE_FAILURES,
@@ -69,13 +72,14 @@ from symphonai_api.events import (
 )
 from symphonai_api.extensions import Extensions
 from symphonai_api.hooks import HookRunner
-from symphonai_api.identity import AgentRef, RunRef, new_agent_ref
+from symphonai_api.identity import AgentRef, RunRef, new_agent_ref, new_id
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import Message, ModelRequest, Role, ToolCall, ToolResult
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore
+from symphonai_api.skills import Skill
 from symphonai_api.streaming import StreamAssembler
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
@@ -83,6 +87,14 @@ from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.web_search import SearchBackend
+
+
+class AgentControlError(RuntimeError):
+    """A live agent could not accept a control request."""
+
+    def __init__(self, message: str, *, status: int = 409) -> None:
+        super().__init__(message)
+        self.status = status
 
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
@@ -103,6 +115,7 @@ def builtin_subagent_specs(
     provider: ModelProvider,
     policy: PermissionPolicy,
     search_backend: SearchBackend | None = None,
+    skills: Mapping[str, Skill] | None = None,
 ) -> dict[str, AgentSpec]:
     selector = ModelSelector(
         provider=getattr(provider, "name", None) or "unknown",
@@ -118,8 +131,13 @@ def builtin_subagent_specs(
             call_class=CallClass.BACKGROUND,
         )
         for name, tools in (
-            ("worker", tuple(standard_tool_registry(search_backend=search_backend))),
-            ("explorer", EXPLORER_TOOL_NAMES + (("web_search",) if search_backend is not None else ())),
+            ("worker", tuple(standard_tool_registry(search_backend=search_backend, skills=skills))),
+            (
+                "explorer",
+                EXPLORER_TOOL_NAMES
+                + (("web_search",) if search_backend is not None else ())
+                + (("use_skill",) if skills else ()),
+            ),
         )
     }
 
@@ -230,6 +248,7 @@ class SubagentRecord:
     turns_used: int = 0
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
     runs: list[AgentRun] = field(default_factory=list)
+    pause_gate: PauseGate | None = None
 
 
 class DispatchSubagentTool(LocalTool):
@@ -263,6 +282,8 @@ class DispatchSubagentTool(LocalTool):
         search_backend: SearchBackend | None = None,
         extra_tools: Mapping[str, LocalTool] | None = None,
         memory: AgentMemory | None = None,
+        skills: Mapping[str, Skill] | None = None,
+        checkpoints: CheckpointStore | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -288,6 +309,8 @@ class DispatchSubagentTool(LocalTool):
         self._search_backend = search_backend
         self._extra_tools = extra_tools
         self._memory = memory
+        self._skills = skills
+        self._checkpoints = checkpoints
         self._active_run: AgentRun | None = None
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
@@ -427,6 +450,12 @@ class DispatchSubagentTool(LocalTool):
                 ok=False,
                 error=f"subagent {subagent_name!r} cannot use web_search: search is not configured",
             )
+        if not self._skills and "use_skill" in (spec.tool_names or ()):
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"subagent {subagent_name!r} cannot use use_skill: no skills are available",
+            )
         if self._dispatching_depth >= spec.max_depth:
             return ToolResult(
                 tool_call_id=tool_call.id,
@@ -470,6 +499,8 @@ class DispatchSubagentTool(LocalTool):
                     result_store=self._result_store,
                     search_backend=self._search_backend,
                     memory_tool=memory_tool,
+                    skills=self._skills,
+                    checkpoints=self._checkpoints,
                 ),
                 self._extra_tools,
             )
@@ -537,6 +568,8 @@ class DispatchSubagentTool(LocalTool):
             else CancellationToken(deadline_seconds=spec.deadline_seconds)
         )
         child_run.start(token)
+        pause_gate = PauseGate()
+        record.pause_gate = pause_gate
         if record.messages:
             record.messages.append(Message(role=Role.USER, content=task))
         else:
@@ -561,6 +594,8 @@ class DispatchSubagentTool(LocalTool):
                         else self._parent_run.run.run_id
                     ),
                     cancel=token,
+                    run=child_run,
+                    pause=pause_gate,
                     hooks=self._hooks,
                 )
         except LeaseConflict as exc:
@@ -571,7 +606,7 @@ class DispatchSubagentTool(LocalTool):
             raise
         finally:
             self._active_run = None
-            if child_run.phase is RunPhase.RUNNING:
+            if child_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
                 if run_result is None:
                     if token.cancelled:
                         child_run.cancel()
@@ -580,6 +615,9 @@ class DispatchSubagentTool(LocalTool):
                 elif run_result.stopped_reason == "cancelled":
                     child_run.cancel()
                 else:
+                    if child_run.phase is RunPhase.PAUSED:
+                        child_run.resume()
+                        pause_gate.resume()
                     child_run.finish(run_result)
             if self._event_run_id is not None:
                 emit(
@@ -685,6 +723,8 @@ class LeaderConfig:
     hook_runner: HookRunner | None = None
     memory: AgentMemory | None = None
     model_summary: bool = False
+    checkpoints: CheckpointStore | None = None
+    leader_tools: Mapping[str, LocalTool] | None = None
 
 
 @dataclass
@@ -699,6 +739,47 @@ class LeaderRunResult:
     agent: AgentRef
     usage_by_agent: dict[str, dict[str, UsageTotals]]
     stopped_repairs: tuple[str, ...] = ()
+
+
+class _LeaderTranscript:
+    def __init__(self, writer) -> None:  # noqa: ANN001
+        self._writer = writer
+        self._checkpoint_key: str | None = None
+        self._lock = threading.Lock()
+
+    def begin_checkpoint(self, key: str) -> None:
+        with self._lock:
+            self._checkpoint_key = key
+
+    def append(
+        self,
+        record_type: str,
+        *,
+        run_id: str,
+        agent_id: str,
+        turn_id: str | None,
+        data: dict,
+    ) -> str:
+        record_id = self._writer.append(
+            record_type,
+            run_id=run_id,
+            agent_id=agent_id,
+            turn_id=turn_id,
+            data=data,
+        )
+        if record_type == "run_started":
+            with self._lock:
+                key = self._checkpoint_key
+                self._checkpoint_key = None
+            if key is not None:
+                self._writer.append(
+                    "checkpoint",
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    turn_id=None,
+                    data={"key": key},
+                )
+        return record_id
 
 
 class Leader:
@@ -723,6 +804,13 @@ class Leader:
             fan_out(config.events, self._hook_runner)
         )
         self._last_run_id: str | None = None
+        self._transcript = (
+            None
+            if session is None
+            else _LeaderTranscript(
+                session.writer_for(self._agent_ref.agent_id, is_root=True)
+            )
+        )
         leader_policy = config.leader_policy or PermissionPolicy(
             repo_root=config.repo_root,
             mode=config.permission_mode,
@@ -754,6 +842,8 @@ class Leader:
             else defined_leader.model.effort
         )
         self._leader_run: AgentRun | None = None
+        self._leader_pause_gate: PauseGate | None = None
+        self._control_lock = threading.RLock()
         self._dispatch_tool = DispatchSubagentTool(
             subagent_provider=config.subagent_provider,
             leader_policy=leader_policy,
@@ -774,6 +864,8 @@ class Leader:
             search_backend=config.search_backend,
             extra_tools=config.extra_tools,
             memory=config.memory,
+            skills=(None if config.extensions is None else config.extensions.skills),
+            checkpoints=config.checkpoints,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
@@ -795,10 +887,14 @@ class Leader:
                 result_store=config.result_store,
                 search_backend=config.search_backend,
                 memory_tool=leader_memory_tool,
+                skills=(None if config.extensions is None else config.extensions.skills),
+                checkpoints=config.checkpoints,
             ),
             config.extra_tools,
         )
         leader_tools.update(standard_tools)
+        leader_only_tools = dict(config.leader_tools or {})
+        leader_tools.update(leader_only_tools)
         provider_name = getattr(config.leader_provider, "name", None) or "unknown"
         self._leader_spec = AgentSpec(
             name="leader",
@@ -835,6 +931,10 @@ class Leader:
                     standard_tools,
                     config.leader_provider.wire_format,
                 ),
+                *tool_registry_schemas(
+                    leader_only_tools,
+                    config.leader_provider.wire_format,
+                ),
             ],
             agent_ref=self._agent_ref,
             events=self._event_sink,
@@ -842,9 +942,7 @@ class Leader:
             result_store=config.result_store,
             call_class=CallClass.FOREGROUND,
             transcript=(
-                None
-                if session is None
-                else session.writer_for(self._agent_ref.agent_id, is_root=True)
+                self._transcript
             ),
         )
         self._chat_messages = self._initial_leader_messages()
@@ -931,26 +1029,36 @@ class Leader:
             run_id=leader_run.run.run_id,
             agent_id=self._agent_ref.agent_id,
         )
-        leader_run.start(CancellationToken())
+        leader_token = cancel if cancel is not None else CancellationToken()
+        leader_pause_gate = PauseGate()
+        leader_run.start(leader_token)
         self._leader_run = leader_run
+        self._leader_pause_gate = leader_pause_gate
         self._dispatch_tool.set_parent_context(leader_run, list(messages))
         try:
             result = self._agent.run(
                 messages,
                 model=self._leader_model,
                 effort=self._leader_effort,
-                cancel=cancel,
+                cancel=leader_token,
+                run=leader_run,
+                pause=leader_pause_gate,
                 hooks=self._hook_runner,
             )
         except OperationCancelled:
-            leader_run.cancel()
+            if leader_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
+                leader_run.cancel()
             raise
         except Exception as exc:
             leader_run.fail(str(exc))
             raise
         if result.stopped_reason == "cancelled":
-            leader_run.cancel()
+            if leader_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
+                leader_run.cancel()
         else:
+            if leader_run.phase is RunPhase.PAUSED:
+                leader_run.resume()
+                leader_pause_gate.resume()
             leader_run.finish(result)
         leader_run.run = result.run
         self._last_run_id = result.run.run_id
@@ -972,6 +1080,62 @@ class Leader:
             stopped_repairs=self._stopped_repairs(),
         )
 
+    def _begin_checkpoint(self) -> None:
+        if self._config.checkpoints is None:
+            return
+        key = new_id("chk")
+        self._config.checkpoints.begin(key)
+        if self._transcript is not None:
+            self._transcript.begin_checkpoint(key)
+
+    def control_agent(self, agent_id: str, action: str, text: str | None = None) -> str:
+        """Control one currently live run by its stable agent id."""
+        if action not in ("pause", "resume", "redirect", "stop"):
+            raise ValueError(f"unknown agent action {action!r}")
+        if action == "redirect" and (not isinstance(text, str) or not text.strip()):
+            raise ValueError("redirect text must not be blank")
+        with self._control_lock:
+            run = None
+            gate = None
+            if agent_id == self._agent_ref.agent_id:
+                run, gate = self._leader_run, self._leader_pause_gate
+            else:
+                for record in self._dispatch_tool.pool.values():
+                    if record.agent_ref.agent_id == agent_id:
+                        run = record.runs[-1] if record.runs else None
+                        gate = record.pause_gate
+                        break
+            if run is None or run.phase not in (RunPhase.RUNNING, RunPhase.PAUSED):
+                raise AgentControlError(f"agent {agent_id!r} is not running", status=404)
+            if action == "pause":
+                if run.phase is RunPhase.PAUSED:
+                    raise AgentControlError(f"agent {agent_id!r} is already paused")
+                assert gate is not None
+                gate.pause()
+                try:
+                    run.pause()
+                except ValueError as exc:
+                    gate.resume()
+                    raise AgentControlError(str(exc)) from exc
+                return "paused"
+            if action == "resume":
+                if run.phase is not RunPhase.PAUSED:
+                    raise AgentControlError(f"agent {agent_id!r} is not paused")
+                assert gate is not None
+                run.resume()
+                gate.resume()
+                return "running"
+            if action == "redirect":
+                try:
+                    run.redirect(text or "")
+                except ValueError as exc:
+                    raise AgentControlError(str(exc)) from exc
+                return run.phase.value
+            run.cancel()
+            assert gate is not None
+            gate.resume()
+            return "stopping"
+
     def run_graph(self) -> tuple[RunNode, ...]:
         """The run graph of this leader's session, or () without a session."""
 
@@ -987,6 +1151,7 @@ class Leader:
         cancel: CancellationToken | None = None,
     ) -> LeaderRunResult:
         """Run a single, one-shot task. Each call starts a fresh conversation."""
+        self._begin_checkpoint()
         self.clear_subagents()
         messages = self._initial_leader_messages()
         if system_prompt:
@@ -1244,6 +1409,7 @@ class Leader:
         ones, so the leader (and its view of already-dispatched subagents)
         has full context of the conversation so far.
         """
+        self._begin_checkpoint()
         self._chat_messages.append(Message(role=Role.USER, content=message))
         self._compaction_usage_by_model.clear()
         self._automatic_compact_chat(cancel=cancel)

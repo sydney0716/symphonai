@@ -75,6 +75,14 @@ const RECORDED_EVENTS = Object.freeze({
     after_tokens: 40,
     dropped_messages: 3,
   }),
+  GoalChanged: event("GoalChanged", {
+    change: "set",
+    phase: "active",
+    rounds: 1,
+    max_rounds: 10,
+    reason: "",
+    last_check: null,
+  }),
 });
 
 test("assistant deltas join only while consecutive", () => {
@@ -516,16 +524,32 @@ test("permission questions resolve only on matching answers", () => {
   assert.equal(question.allowed, true);
 });
 
-test("a failed tool completion does not answer its permission question", () => {
+test("a failed tool completion answers its permission question as allowed", () => {
   const transcript = applyAll([
     call("ToolCallStarted", "denied-1"),
     call("PermissionRequested", "denied-1", { mode: "ask" }),
     call("ToolCallFinished", "denied-1", { ok: false }),
   ]);
   const question = transcript.model.find(({ type }) => type === "question");
+  const activity = transcript.model.find(({ type }) => type === "activity");
 
-  assert.equal(question.resolved, false);
-  assert.equal(Object.hasOwn(question, "allowed"), false);
+  assert.equal(question.resolved, true);
+  assert.equal(question.allowed, true);
+  assert.equal(activity.calls[0].status, "failed");
+});
+
+test("a later failed tool completion does not overwrite a denial", () => {
+  const transcript = applyAll([
+    call("ToolCallStarted", "denied-1"),
+    call("PermissionRequested", "denied-1", { mode: "ask" }),
+    call("PermissionDenied", "denied-1", { reason: "user denied" }),
+    call("ToolCallFinished", "denied-1", { ok: false }),
+  ]);
+  const question = transcript.model.find(({ type }) => type === "question");
+
+  assert.equal(question.resolved, true);
+  assert.equal(question.allowed, false);
+  assert.equal(question.reason, "user denied");
 });
 
 test("each dropped frame inserts a positional gap", () => {
@@ -549,7 +573,7 @@ test("each dropped frame inserts a positional gap", () => {
 });
 
 test("all documented event recordings are covered and unknown events survive", () => {
-  assert.equal(KNOWN_EVENT_TYPES.length, 18);
+  assert.equal(KNOWN_EVENT_TYPES.length, 19);
   assert.deepEqual(Object.keys(RECORDED_EVENTS), KNOWN_EVENT_TYPES);
   for (const frame of Object.values(RECORDED_EVENTS)) {
     const transcript = createTranscript();
@@ -567,6 +591,30 @@ test("all documented event recordings are covered and unknown events survive", (
     agentId: "agent-1",
     event: payload,
   }]);
+});
+
+test("goal check events become command-style transcript entries", () => {
+  const transcript = applyAll([
+    event("GoalChanged", {
+      change: "set", phase: "active", rounds: 1, max_rounds: 10, reason: "", last_check: null,
+    }),
+    event("RunFinished"),
+    event("GoalChanged", {
+      change: "check", phase: "active", rounds: 1, max_rounds: 10, reason: "",
+      last_check: { exit: 1, ok: false, output: "1 failed" },
+    }),
+    event("PromptSubmitted", { text: "fix the failures", message_count: 2 }),
+    event("RunFinished"),
+    event("GoalChanged", {
+      change: "check", phase: "complete", rounds: 2, max_rounds: 10, reason: "",
+      last_check: { exit: 0, ok: true, output: "" },
+    }),
+  ]);
+  assert.deepEqual(transcript.model.filter(({ type }) => type === "goal"), [
+    { type: "goal", agentId: "agent-1", text: "Goal set: up to 10 rounds.", output: "" },
+    { type: "goal", agentId: "agent-1", text: "Goal check failed (exit 1). Starting round 2 of 10.", output: "1 failed" },
+    { type: "goal", agentId: "agent-1", text: "Goal check passed. Goal complete after 2 rounds.", output: "" },
+  ]);
 });
 
 test("orphan and post-run tool events are inert", () => {

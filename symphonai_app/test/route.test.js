@@ -7,6 +7,7 @@ import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "../src/route.js";
 test("routes parse, reject junk, and round-trip", () => {
   assert.deepEqual(parseRoute("#/settings"), { page: "settings", section: "" });
   assert.deepEqual(parseRoute("#/settings/mcp"), { page: "settings", section: "mcp" });
+  assert.deepEqual(parseRoute("#/changes"), { page: "changes", section: "" });
   assert.deepEqual(parseRoute("#/roadmap"), DEFAULT_ROUTE);
   assert.deepEqual(parseRoute("#/chat"), { page: "chat", section: "" });
   for (const fragment of ["", "#", "#/nope", "#//", "junk"]) {
@@ -20,7 +21,7 @@ test("routes parse, reject junk, and round-trip", () => {
   for (const route of routes) {
     assert.deepEqual(parseRoute(formatRoute(route)), route);
   }
-  assert.deepEqual(PAGES, ["chat", "settings"]);
+  assert.deepEqual(PAGES, ["chat", "settings", "changes"]);
   assert.ok(Object.isFrozen(PAGES));
 });
 

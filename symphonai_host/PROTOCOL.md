@@ -47,6 +47,7 @@ fields on a known event are ignored for forward compatibility.
 | `SubagentSpawned` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
+| `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (including `update`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -61,11 +62,13 @@ double-count some failures or miss others.
 Requests are validated separately from frame decoding so a transport only needs
 to pass a `kind` and object payload to the host. Required fields must have the
 listed type; `reason` is optional and defaults to `""`.
+An approval request's optional `remember` field must be a boolean and defaults
+to `false`.
 
 | Request kind | Payload |
 | --- | --- |
 | `prompt` | `prompt: str` |
-| `approval` | `approval_id: str`, `allowed: bool`, `reason: str` |
+| `approval` | `approval_id: str`, `allowed: bool`, `reason: str`, `remember: bool` (optional) |
 | `stop` | `reason: str` |
 
 Unknown request kinds and malformed fields are protocol errors. This document
@@ -75,9 +78,11 @@ authentication mechanism.
 ## Approvals
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,
-`details`, and `tool_call_id`. The `tool_call_id` is `""` when the approval
-belongs to no tool call. A client answers with the `approval` request above. An
-approval id is single-use; unknown or expired replies are rejected. After any
+`details`, `tool_call_id`, and `remember`. The `tool_call_id` is `""` when the
+approval belongs to no tool call. `remember` is the shell command prefix the
+client may grant for the current chat, or `""` when no grant applies. A client
+answers with the `approval` request above; `remember: true` grants that prefix
+for this conversation. An approval id is single-use; unknown or expired replies are rejected. After any
 `error` frame carrying `dropped`, a client re-reads `GET /approvals`, because a
 dropped frame may have been a question.
 
@@ -107,10 +112,13 @@ session directory. It returns `409` if a run is active.
 
 Each replayed `HistoryMessage` also carries an opaque `record_id` for the
 message. `POST /session/fork` takes `{"run_id": str, "record_id": str}` and
-copies the source conversation through that message into a new session. It
+optionally `"force": true`. It copies the source conversation through that
+message into a new session and restores files changed by later prompts to the
+state at the fork point. If a file changed outside the agent, it returns `409`
+with the changed `paths`; `force: true` allows the restore to proceed. It
 replays the fork's messages, makes the fork current, and returns the same
 reply shape as `/session/open`, with the new `run_id`. The original session is
-unchanged. A fork inherits the source provider choice and seeded instructions;
+unchanged. A fork inherits the kept prompts' checkpoints, source provider choice, and seeded instructions;
 later prompts continue the fork without reloading instruction files. The new
 session's `parent_session_id` identifies its source in `GET /sessions`;
 `parent_run_id` retains its runtime meaning. Any current message may be
@@ -236,6 +244,40 @@ When every used model has a configured price, usage objects also contain
 price table exists or any used model is unpriced. The payload contains no
 repository paths, credentials, or model request content.
 
+## Goals
+
+Authenticated `POST /goal` takes `{"objective": str, "check": [str, ...]?,
+"max_rounds": int?}`. An omitted or empty check stores as `[]`. A check is an
+argv run by the host in the repository root, outside the agent permission
+policy. The default is 10 rounds; the limit is 1–100. A final response runs a
+configured check with a 600-second timeout. Exit 0 completes the goal. A failed
+check starts another round with its output as feedback until the limit, then
+the goal becomes blocked. Without a check, a final response starts another
+round unless the leader used `update_goal` to report completion or being
+blocked. Non-final round ends pause the goal. Check output in state is limited
+to its last 4,000 characters.
+
+The leader alone receives two tools. `get_goal` takes no arguments and returns
+the current goal as JSON, or `No goal is set.` `update_goal` takes
+`{"status": "blocked" | "complete", "message": str}`. The message must be
+non-blank and at most 2,000 characters. It can update only an active goal.
+`blocked` sets the goal phase and reason to the message. `complete` completes a
+goal without a check; with a configured check, it leaves the goal active and
+the check decides at the end of the round. Goal updates publish
+`GoalChanged(change="update")` with the message in `reason`.
+
+For an unchecked goal, each final response starts the next round with a prompt
+reminding the leader to report `complete` or `blocked`; reaching `max_rounds`
+blocks it with reason `rounds exhausted`.
+
+`POST /goal/state` takes `{"action": "pause" | "resume" | "clear"}`. Resume
+runs the check immediately and continues if needed. `GET /conversation`
+includes `goal`, either the current goal state or `null`. Goal state is stored
+in session metadata; reopening an active goal pauses it with reason `reopened`,
+and a fork starts without a goal. `GoalChanged` reports state transitions.
+When a check fails, its `check` event arrives after the round's terminal event
+and before the next prompt.
+
 ## Packaged sidecar
 
 The packaged host is launched directly by its parent; its first stdout line is
@@ -341,6 +383,32 @@ preserve the loader's file-and-key message. A successful write returns
 `written`, the normalized `name` and `scope`, the target `path`, and a
 message explaining that the definition applies on the next run. Both routes
 require the ordinary bearer token.
+
+Authenticated `POST /agent/control` takes
+`{"agent_id": <id>, "action": <pause|resume|redirect|stop>, "text"?: <text>}`.
+Pause and resume take effect at the agent's next turn boundary; redirect queues
+text as the next user message. Stop on a subagent cancels only that subagent,
+while stop on the leader uses the ordinary host stop path. Success returns
+`{"agent_id": <id>, "state": <paused|running|stopping>}`. Invalid requests
+receive `400`, an absent active run or invalid transition receives `409`, and
+an unknown or finished agent receives `404`.
+
+Authenticated `GET /changes` returns the current conversation's checkpointed
+file changes as `{"turns": [...], "files": [...]}`. Each turn contains its
+checkpoint `key`, the first 80 characters of its prompt, and the paths first
+written in that prompt. Each file contains its repository-relative `path`,
+`status` (`modified`, `added`, or `deleted`), `changed_outside`, a unified
+`diff`, and `truncated`. With no open conversation it returns empty arrays.
+An active run returns `409`.
+
+Authenticated `POST /changes/revert` takes exactly one of `{"path": <path>}`
+or `{"key": <checkpoint key>}`, with optional `"force": true`. A path restores
+its earliest checkpoint; a key restores each affected path to its earliest
+checkpoint at or after that prompt. Success returns `{"reverted": [paths]}`.
+If any target differs from the agent's last write, the host returns `409` with
+the affected `paths` and makes no changes unless `force` is true. An active run
+returns `409`, unknown paths or keys return `404`, and malformed requests return
+`400`.
 
 `GET /app/` returns the browser shell with one inline handshake script setting
 `window.__symphonai` to the running host's `port` and `token`. `GET

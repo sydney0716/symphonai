@@ -125,6 +125,49 @@ test("permission mode refusal preserves the host message", async () => {
   );
 });
 
+test("agent controls post the agent id, action, and optional redirect text", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, { agent_id: "agent-2", state: "paused" });
+  } });
+  assert.deepEqual(await client.controlAgent("agent-2", "pause"), {
+    agent_id: "agent-2", state: "paused",
+  });
+  assert.deepEqual(await client.controlAgent("agent-2", "redirect", "Focus the tests"), {
+    agent_id: "agent-2", state: "paused",
+  });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/agent/control");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(JSON.parse(records[0].options.body), {
+    agent_id: "agent-2", action: "pause",
+  });
+  assert.deepEqual(JSON.parse(records[1].options.body), {
+    agent_id: "agent-2", action: "redirect", text: "Focus the tests",
+  });
+});
+
+test("changes requests are authenticated and retain conflict paths", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return records.length === 1
+      ? response(200, { turns: [], files: [] })
+      : response(409, { error: "changed outside", paths: ["a.py"] });
+  } });
+  assert.deepEqual(await client.changes(), { turns: [], files: [] });
+  await assert.rejects(
+    client.revertChanges({ path: "a.py" }),
+    (error) => error.status === 409 && error.paths[0] === "a.py",
+  );
+  assert.equal(records[0].url, "http://127.0.0.1:4312/changes");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.equal(records[1].url, "http://127.0.0.1:4312/changes/revert");
+  assert.equal(records[1].options.method, "POST");
+  assert.deepEqual(JSON.parse(records[1].options.body), { path: "a.py" });
+});
+
 test("manual compaction uses the authenticated JSON request", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
@@ -200,6 +243,41 @@ test("fork sends opaque session and record ids in the authenticated body", async
   });
 });
 
+test("fork sends force only when explicitly requested", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push(JSON.parse(options.body));
+    return response(200, { run_id: "fork-run", replayed: 1 });
+  } });
+  await client.forkSession("source-run", "rec-opaque", true);
+  assert.deepEqual(records, [{ run_id: "source-run", record_id: "rec-opaque", force: true }]);
+});
+
+test("goal methods use authenticated goal routes and conversation stats", async () => {
+  const records = [];
+  const replies = [
+    { accepted: true, run_id: "goal-run", goal: { objective: "fix parser" } },
+    { goal: { phase: "paused" } },
+    { conversation: { goal: { phase: "paused" } } },
+  ];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, replies[records.length - 1]);
+  } });
+  assert.deepEqual(await client.setGoal("fix parser", ["python3", "-m", "pytest"]), replies[0]);
+  assert.deepEqual(await client.goalState("pause"), replies[1]);
+  assert.deepEqual(await client.conversationStats(), replies[2]);
+  assert.deepEqual(records.map(({ url, options }) => [url, options.method, options.headers.Authorization]), [
+    ["http://127.0.0.1:4312/goal", "POST", `Bearer ${TOKEN}`],
+    ["http://127.0.0.1:4312/goal/state", "POST", `Bearer ${TOKEN}`],
+    ["http://127.0.0.1:4312/conversation", "GET", `Bearer ${TOKEN}`],
+  ]);
+  assert.deepEqual(JSON.parse(records[0].options.body), {
+    objective: "fix parser", check: ["python3", "-m", "pytest"],
+  });
+  assert.deepEqual(JSON.parse(records[1].options.body), { action: "pause" });
+});
+
 test("parseHandshake accepts only a port and nonempty token", () => {
   assert.deepEqual(parseHandshake('{"port":4312,"token":"abc"}'), {
     port: 4312,
@@ -257,6 +335,24 @@ test("all eight calls authorize by header and never by URL", async () => {
     assert.ok(!url.includes(TOKEN));
     assert.equal(new URL(url).search, "");
   }
+});
+
+test("approval sends remember only when requested", async () => {
+  const bodies = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return response(200, { resolved: true });
+    },
+  });
+  await client.approve("approval-1", true, "yes");
+  await client.approve("approval-2", true, "", true);
+  assert.deepEqual(bodies, [
+    { approval_id: "approval-1", allowed: true, reason: "yes" },
+    { approval_id: "approval-2", allowed: true, reason: "", remember: true },
+  ]);
 });
 
 test("sessions accepts only an array while other routes still require objects", async () => {

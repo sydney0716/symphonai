@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import unittest.mock as mock
 from pathlib import Path
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.runner import standard_tool_registry
 import symphonai_api.tools.filesystem as filesystem_tools
+from symphonai_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
+
+
+def _checkpoint_registry(checkpoints: CheckpointStore):
+    return standard_tool_registry(
+        ledger=ReadLedger(),
+        checkpoints=checkpoints,
+    )
 
 
 @check("edit.not_read_refused")
@@ -637,3 +647,247 @@ def check_edit_narrowed_isolated_ledger() -> None:
             fail(f"read ledger leaked between narrowed registries: {narrowed_isolated_edit!r}")
         if ToolResult(tool_call_id="payload-default", ok=True).payload is not None:
             fail("existing ToolResult callers gained a non-empty payload")
+
+
+@check("edit.checkpoint_first_write")
+def check_edit_checkpoint_first_write() -> None:
+    with workspace() as ws:
+        checkpoints = CheckpointStore(ws.root / "checkpoints", ws.root)
+        checkpoints.begin("prompt-1")
+        tools = _checkpoint_registry(checkpoints)
+        path = ws.root / "checkpoint-first.txt"
+        original = "before\n"
+        path.write_text(original)
+        tools["read_file"].execute(
+            ToolCall(id="checkpoint-read", name="read_file", arguments={"path": path.name}),
+            ws.policy,
+        )
+        first = tools["edit_file"].execute(
+            ToolCall(
+                id="checkpoint-edit-1",
+                name="edit_file",
+                arguments={"path": path.name, "old_string": "before", "new_string": "middle"},
+            ),
+            ws.policy,
+        )
+        second = tools["edit_file"].execute(
+            ToolCall(
+                id="checkpoint-edit-2",
+                name="edit_file",
+                arguments={"path": path.name, "old_string": "middle", "new_string": "after"},
+            ),
+            ws.policy,
+        )
+        entries = checkpoints.entries()
+        final = path.read_bytes()
+        if (
+            not first.ok
+            or not second.ok
+            or len(entries) != 1
+            or entries[0].key != "prompt-1"
+            or entries[0].path != path.name
+            or entries[0].backup is None
+            or (checkpoints.directory / entries[0].backup).read_bytes() != original.encode()
+            or checkpoints.last_written(path.name) != hashlib.sha256(final).hexdigest()
+        ):
+            fail(f"first-write checkpoint was incorrect: {entries!r}")
+
+
+@check("edit.checkpoint_create")
+def check_edit_checkpoint_create() -> None:
+    with workspace() as ws:
+        checkpoints = CheckpointStore(ws.root / "checkpoints", ws.root)
+        checkpoints.begin("create-prompt")
+        tools = _checkpoint_registry(checkpoints)
+        created = tools["write_file"].execute(
+            ToolCall(
+                id="checkpoint-create",
+                name="write_file",
+                arguments={"path": "new.py", "content": "created\n"},
+            ),
+            ws.policy,
+        )
+        entries = checkpoints.entries()
+        if not created.ok or len(entries) != 1 or entries[0].backup is not None:
+            fail(f"new-file checkpoint did not record a missing original: {entries!r}")
+
+
+@check("edit.checkpoint_prompt_boundary")
+def check_edit_checkpoint_prompt_boundary() -> None:
+    with workspace() as ws:
+        checkpoints = CheckpointStore(ws.root / "checkpoints", ws.root)
+        tools = _checkpoint_registry(checkpoints)
+        path = ws.root / "checkpoint-prompts.txt"
+        path.write_text("initial\n")
+        tools["read_file"].execute(
+            ToolCall(id="boundary-read", name="read_file", arguments={"path": path.name}),
+            ws.policy,
+        )
+        checkpoints.begin("first")
+        first = tools["edit_file"].execute(
+            ToolCall(
+                id="boundary-edit-1",
+                name="edit_file",
+                arguments={"path": path.name, "old_string": "initial", "new_string": "first"},
+            ),
+            ws.policy,
+        )
+        checkpoints.begin("second")
+        second = tools["edit_file"].execute(
+            ToolCall(
+                id="boundary-edit-2",
+                name="edit_file",
+                arguments={"path": path.name, "old_string": "first", "new_string": "second"},
+            ),
+            ws.policy,
+        )
+        entries = checkpoints.entries()
+        if (
+            not first.ok
+            or not second.ok
+            or checkpoints.keys() != ("first", "second")
+            or tuple(entry.key for entry in entries) != ("first", "second")
+            or (checkpoints.directory / entries[0].backup).read_bytes() != b"initial\n"
+            or (checkpoints.directory / entries[1].backup).read_bytes() != b"first\n"
+        ):
+            fail(f"checkpoint prompt boundary was incorrect: {entries!r}")
+
+
+@check("edit.checkpoint_refused_and_failed")
+def check_edit_checkpoint_refused_and_failed() -> None:
+    with workspace() as ws:
+        checkpoints = CheckpointStore(ws.root / "checkpoints", ws.root)
+        checkpoints.begin("failure-prompt")
+        tools = _checkpoint_registry(checkpoints)
+        denied = tools["write_file"].execute(
+            ToolCall(
+                id="checkpoint-denied",
+                name="write_file",
+                arguments={"path": str(ws.outside / "denied.txt"), "content": "no"},
+            ),
+            ws.policy,
+        )
+        stale_path = ws.root / "checkpoint-stale.txt"
+        stale_path.write_text("before\n")
+        tools["read_file"].execute(
+            ToolCall(id="checkpoint-stale-read", name="read_file", arguments={"path": stale_path.name}),
+            ws.policy,
+        )
+        stale_path.write_text("external\n")
+        stale = tools["edit_file"].execute(
+            ToolCall(
+                id="checkpoint-stale-edit",
+                name="edit_file",
+                arguments={"path": stale_path.name, "old_string": "external", "new_string": "changed"},
+            ),
+            ws.policy,
+        )
+        failed_path = ws.root / "checkpoint-failed.txt"
+        real_write_text = Path.write_text
+
+        def _fail_target(path, *args, **kwargs):  # noqa: ANN001
+            if path == failed_path:
+                raise OSError("simulated write failure")
+            return real_write_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", autospec=True, side_effect=_fail_target):
+            failed = tools["write_file"].execute(
+                ToolCall(
+                    id="checkpoint-failed-write",
+                    name="write_file",
+                    arguments={"path": failed_path.name, "content": "failed"},
+                ),
+                ws.policy,
+            )
+        if denied.ok or stale.ok or failed.ok or checkpoints.entries():
+            fail(f"refused or failed writes were checkpointed: {checkpoints.entries()!r}")
+
+
+@check("edit.checkpoint_reload")
+def check_edit_checkpoint_reload() -> None:
+    with workspace() as ws:
+        directory = ws.root / "checkpoints"
+        checkpoints = CheckpointStore(directory, ws.root)
+        checkpoints.begin("reload-prompt")
+        path = ws.root / "checkpoint-reload.txt"
+        path.write_text("original\n")
+        checkpoints.before_write(path)
+        path.write_text("written\n")
+        checkpoints.after_write(path)
+        expected_entries = checkpoints.entries()
+        expected_keys = checkpoints.keys()
+        expected_digest = checkpoints.last_written(path.name)
+        reopened = CheckpointStore(directory, ws.root)
+        if (
+            reopened.entries() != expected_entries
+            or reopened.keys() != expected_keys
+            or reopened.last_written(path.name) != expected_digest
+        ):
+            fail("reopened checkpoint store did not preserve its data")
+
+
+@check("edit.checkpoint_restore")
+def check_edit_checkpoint_restore() -> None:
+    with workspace() as ws:
+        directory = ws.root / "checkpoints"
+        checkpoints = CheckpointStore(directory, ws.root)
+        checkpoints.begin("restore-prompt")
+        path = ws.root / "checkpoint-restore.txt"
+        path.write_bytes(b"original\x00bytes")
+        checkpoints.before_write(path)
+        path.write_bytes(b"agent bytes")
+        checkpoints.after_write(path)
+        entry_count = len(checkpoints.entries())
+        checkpoints.restore(path.name, b"restored bytes")
+        restored_digest = hashlib.sha256(b"restored bytes").hexdigest()
+        if (
+            path.read_bytes() != b"restored bytes"
+            or len(checkpoints.entries()) != entry_count
+            or checkpoints.last_written(path.name) != restored_digest
+        ):
+            fail("checkpoint restore did not write bytes and update its digest")
+        checkpoints.restore(path.name, None)
+        reopened = CheckpointStore(directory, ws.root)
+        if path.exists() or reopened.last_written(path.name) is not None:
+            fail("checkpoint restore deletion did not persist")
+        outside = ws.outside / "checkpoint-outside.txt"
+        outside.write_bytes(b"outside")
+        symlink = ws.root / "checkpoint-link.txt"
+        symlink.symlink_to(outside)
+        checkpoints.restore(symlink.name, b"inside")
+        if symlink.is_symlink() or symlink.read_bytes() != b"inside" or outside.read_bytes() != b"outside":
+            fail("checkpoint restore followed a symlink outside the repository")
+
+
+@check("edit.checkpoint_restore_marks_ledger_stale")
+def check_edit_checkpoint_restore_marks_ledger_stale() -> None:
+    with workspace() as ws:
+        checkpoints = CheckpointStore(ws.root / "checkpoints", ws.root)
+        checkpoints.begin("restore-stale-prompt")
+        tools = _checkpoint_registry(checkpoints)
+        path = ws.root / "checkpoint-stale-after-restore.txt"
+        path.write_text("original\n")
+        tools["read_file"].execute(
+            ToolCall(id="restore-stale-read", name="read_file", arguments={"path": path.name}),
+            ws.policy,
+        )
+        changed = tools["edit_file"].execute(
+            ToolCall(
+                id="restore-stale-edit",
+                name="edit_file",
+                arguments={"path": path.name, "old_string": "original", "new_string": "agent"},
+            ),
+            ws.policy,
+        )
+        checkpoints.restore(path.name, b"original\n")
+        stale = tools["edit_file"].execute(
+            ToolCall(
+                id="restore-stale-edit-again",
+                name="edit_file",
+                arguments={"path": path.name, "old_string": "original", "new_string": "again"},
+            ),
+            ws.policy,
+        )
+        expected = "file has changed since it was read; read it again before editing it"
+        if not changed.ok or stale.ok or stale.error != expected:
+            fail(f"post-restore edit was not refused as stale: {stale!r}")

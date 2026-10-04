@@ -47,7 +47,10 @@ class RunShellTool(LocalTool):
 
     @property
     def description(self) -> str:
-        return "Run an allowlisted shell command (argv list) and return its output."
+        return (
+            "Run an allowlisted command (argv list) and return its output. "
+            "Timeout defaults to 120 seconds and cannot exceed the policy limit."
+        )
 
     @property
     def parameters(self) -> dict:
@@ -61,6 +64,11 @@ class RunShellTool(LocalTool):
                         "Command and arguments as a list of strings, e.g. "
                         "['git', 'status']. Never a single shell string."
                     ),
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Optional timeout in seconds; defaults to 120 and is capped by policy.",
                 },
             },
             "required": ["argv"],
@@ -90,6 +98,13 @@ class RunShellTool(LocalTool):
                 "missing or invalid required argument: argv "
                 "(must be a non-empty list of strings)"
             )
+        timeout_seconds = arguments.get("timeout_seconds")
+        if "timeout_seconds" in arguments and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not timeout_seconds > 0
+        ):
+            return "invalid optional argument: timeout_seconds (must be a number greater than 0)"
         return None
 
     def _execute(
@@ -99,6 +114,10 @@ class RunShellTool(LocalTool):
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
         argv = tool_call.arguments.get("argv")
+        timeout_seconds = min(
+            tool_call.arguments.get("timeout_seconds") or 120,
+            policy.shell_timeout_seconds,
+        )
         decision = policy.check_shell(argv)
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
@@ -112,7 +131,7 @@ class RunShellTool(LocalTool):
                 text=True,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + policy.shell_timeout_seconds
+            deadline = time.monotonic() + timeout_seconds
             while True:
                 if cancel is not None and cancel.cancelled:
                     _terminate_process_group(proc)
@@ -131,7 +150,7 @@ class RunShellTool(LocalTool):
                         proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
                     except subprocess.TimeoutExpired:
                         pass
-                    raise subprocess.TimeoutExpired(argv, policy.shell_timeout_seconds)
+                    raise subprocess.TimeoutExpired(argv, timeout_seconds)
                 delay = min(CANCEL_POLL_SECONDS, remaining)
                 try:
                     stdout, stderr = proc.communicate(timeout=delay)

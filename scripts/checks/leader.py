@@ -6,6 +6,7 @@ import inspect
 import json
 import math
 import os
+import threading
 from pathlib import Path
 import unittest.mock as mock
 from dataclasses import fields
@@ -21,6 +22,7 @@ from symphonai_api.agent_spec import (
     ModelSelector,
 )
 from symphonai_api.call_class import CallClass
+from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.cost import UsageTotals
 from symphonai_api.cancellation import (
     CancelReason,
@@ -63,7 +65,7 @@ from symphonai_api.providers.openai_provider import (
     _build_request_body as _build_openai_body,
 )
 from symphonai_api.runner import standard_tool_registry
-from symphonai_api.session import SessionStore
+from symphonai_api.session import SessionStore, load_run_for_resume, read_records
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
@@ -74,6 +76,7 @@ from symphonai_api.tools.metadata import (
     ToolMetadata,
 )
 from symphonai_api.web_search import SearchBackend
+from symphonai_api.skills import Skill
 
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -294,6 +297,48 @@ def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
         name="dispatch_subagent",
         arguments={"subagent_name": name, "task": task},
     )
+
+
+class _ControlProvider(FakeModelProvider):
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        super().__init__(responses)
+        self.requests: list[ModelRequest] = []
+        self.second_request = threading.Event()
+
+    def create_response(self, request: ModelRequest, *, cancel=None) -> ModelResponse:
+        self.requests.append(request)
+        if len(self.requests) == 2:
+            self.second_request.set()
+        return super().create_response(request, cancel=cancel)
+
+
+class _BlockingControlTool(LocalTool):
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    @property
+    def name(self) -> str:
+        return "wait_for_control"
+
+    @property
+    def description(self) -> str:
+        return "Wait for the control test."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(ToolEffect.READ_ONLY, True, ())
+
+    def _execute(self, tool_call, policy, cancel=None):
+        self.entered.set()
+        if not self.release.wait(5):
+            raise RuntimeError("control check did not release tool")
+        self.finished.set()
+        return ToolResult(tool_call_id=tool_call.id, ok=True, content="tool result")
 
 
 @check("leader.spec_effort_reaches_requests")
@@ -3229,6 +3274,223 @@ def check_search_roster_dispatch() -> None:
             fail(f"unconfigured search definition did not fail at dispatch: {result!r}")
 
 
+@check("leader.skill_roster_dispatch")
+def check_skill_roster_dispatch() -> None:
+    with workspace() as ws:
+        skill_path = ws.root / "release.md"
+        skill_path.write_text("++API skill fixture", encoding="utf-8")
+        skill = Skill("release", "Release steps.", "Use for releases.", skill_path, 1)
+        skills = {"release": skill}
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "worker done")),
+            ModelResponse(Message(Role.ASSISTANT, "explorer done")),
+        ])
+        roster = builtin_subagent_specs(provider, ws.policy, skills=skills)
+        if "use_skill" not in roster["worker"].tool_names or "use_skill" not in roster["explorer"].tool_names:
+            fail(f"built-in subagents did not receive use_skill: {roster!r}")
+        dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs=roster, skills=skills)
+        for name in ("worker", "explorer"):
+            result = dispatch.execute(_dispatch(name, "inspect", name), ws.policy)
+            if not result.ok or "use_skill" not in dispatch.pool[name].agent._tools:
+                fail(f"{name} did not receive use_skill: {result!r}")
+        if "use_skill" in builtin_subagent_specs(provider, ws.policy)["worker"].tool_names:
+            fail("no-skill worker acquired use_skill")
+        explicit = roster["worker"].with_overrides(tool_names=("use_skill",))
+        unavailable = DispatchSubagentTool(
+            FakeModelProvider(), ws.policy, subagent_specs={"custom": explicit},
+        )
+        refusal = unavailable.execute(_dispatch("custom", "inspect"), ws.policy)
+        if refusal.ok or refusal.error != "subagent 'custom' cannot use use_skill: no skills are available":
+            fail(f"unavailable explicit use_skill did not fail closed: {refusal!r}")
+
+
+@check("leader.pause_resume_gate")
+def check_pause_resume_gate() -> None:
+    with workspace() as ws:
+        blocking_tool = _BlockingControlTool()
+        child_provider = _ControlProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "wait", "wait_for_control", {},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child complete")),
+        ])
+        leader_provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent", {
+                    "subagent_name": "worker", "task": "inspect",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "leader complete")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(ws.root),
+            extra_tools={blocking_tool.name: blocking_tool},
+        ))
+        result_box = []
+        errors = []
+
+        def run() -> None:
+            try:
+                result_box.append(leader.run("goal"))
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            if not blocking_tool.entered.wait(2):
+                fail("subagent did not enter its blocking tool")
+            child_id = leader._dispatch_tool.pool["worker"].agent_ref.agent_id
+            if leader.control_agent(child_id, "pause") != "paused":
+                fail("running subagent did not pause")
+            try:
+                leader.control_agent(child_id, "pause")
+            except leader_module.AgentControlError as exc:
+                if exc.status != 409:
+                    fail(f"repeated pause had wrong control status: {exc.status}")
+            else:
+                fail("already paused subagent accepted pause")
+            blocking_tool.release.set()
+            if not blocking_tool.finished.wait(2):
+                fail("subagent tool did not finish")
+            if child_provider.second_request.wait(0.05):
+                fail("paused subagent sent its next model request before resume")
+            if leader.control_agent(child_id, "resume") != "running":
+                fail("paused subagent did not resume")
+            if not child_provider.second_request.wait(2):
+                fail("resumed subagent did not send its next model request")
+        finally:
+            blocking_tool.release.set()
+            thread.join(5)
+        if thread.is_alive() or errors or not result_box or result_box[0].final_answer != "leader complete":
+            fail(f"leader did not finish after subagent resume: {errors!r}, {result_box!r}")
+        child = result_box[0].subagents["worker"]
+        if child.runs[-1].phase is not RunPhase.FINISHED:
+            fail(f"resumed subagent did not finish normally: {child.runs[-1].phase!r}")
+
+
+@check("leader.redirects_reach_next_requests")
+def check_redirects_reach_next_requests() -> None:
+    with workspace() as ws:
+        blocking_tool = _BlockingControlTool()
+        child_provider = _ControlProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "wait", "wait_for_control", {},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "child complete")),
+        ])
+        leader_provider = _ControlProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent", {
+                    "subagent_name": "worker", "task": "inspect",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "leader complete")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(ws.root),
+            extra_tools={blocking_tool.name: blocking_tool},
+        ))
+        result_box = []
+        errors = []
+
+        def run() -> None:
+            try:
+                result_box.append(leader.run("goal"))
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            if not blocking_tool.entered.wait(2):
+                fail("subagent did not enter its blocking tool")
+            child_id = leader._dispatch_tool.pool["worker"].agent_ref.agent_id
+            if leader.control_agent(child_id, "redirect", "Child: inspect tests") != "running":
+                fail("subagent redirect changed the running state")
+            if leader.control_agent(leader.agent_ref.agent_id, "redirect", "Leader: summarize") != "running":
+                fail("leader redirect changed the running state")
+            blocking_tool.release.set()
+        finally:
+            blocking_tool.release.set()
+            thread.join(5)
+        if thread.is_alive() or errors or not result_box:
+            fail(f"redirected run did not finish: {errors!r}, {result_box!r}")
+        for provider, expected in (
+            (child_provider, "Child: inspect tests"),
+            (leader_provider, "Leader: summarize"),
+        ):
+            messages = provider.requests[1].messages
+            if (
+                len(messages) < 2
+                or messages[-2].tool_result is None
+                or messages[-1].role is not Role.USER
+                or messages[-1].text != expected
+            ):
+                fail(f"redirect did not follow the preceding tool result: {messages!r}")
+
+
+@check("leader.stop_subagent_is_local")
+def check_stop_subagent_is_local() -> None:
+    with workspace() as ws:
+        blocking_tool = _BlockingControlTool()
+        child_provider = _ControlProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "wait", "wait_for_control", {},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "should not be requested")),
+        ])
+        leader_provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent", {
+                    "subagent_name": "worker", "task": "inspect",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "leader continued")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(ws.root),
+            extra_tools={blocking_tool.name: blocking_tool},
+        ))
+        result_box = []
+        errors = []
+
+        def run() -> None:
+            try:
+                result_box.append(leader.run("goal"))
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            if not blocking_tool.entered.wait(2):
+                fail("subagent did not enter its blocking tool")
+            child_id = leader._dispatch_tool.pool["worker"].agent_ref.agent_id
+            if leader.control_agent(child_id, "stop") != "stopping":
+                fail("subagent stop did not report stopping")
+            blocking_tool.release.set()
+        finally:
+            blocking_tool.release.set()
+            thread.join(5)
+        if thread.is_alive() or errors or not result_box:
+            fail(f"leader did not continue after child stop: {errors!r}, {result_box!r}")
+        if result_box[0].final_answer != "leader continued" or len(child_provider.requests) != 1:
+            fail(f"stopping child did not leave leader running: {result_box[0]!r}")
+        results = [message.tool_result for message in result_box[0].leader_messages if message.tool_result]
+        if not any(
+            not item.ok and item.error == "subagent was cancelled explicitly before a final answer"
+            for item in results
+        ):
+            fail(f"leader did not receive the child cancellation result: {results!r}")
+
+
 @check("leader.memory_registry_and_seeding")
 def check_memory_registry_and_seeding() -> None:
     with workspace() as ws:
@@ -3440,3 +3702,158 @@ def check_memory_failures_do_not_fail_run() -> None:
                 )
         finally:
             unavailable_root.chmod(original_mode)
+
+
+@check("leader.checkpoint_subagent")
+def check_leader_checkpoint_subagent() -> None:
+    with workspace() as ws:
+        checkpoints = CheckpointStore(ws.root / "checkpoints", ws.root)
+        leader_provider = FakeModelProvider(
+            [
+                ModelResponse(
+                    Message(
+                        Role.ASSISTANT,
+                        tool_calls=[_dispatch("worker", "write a file", "checkpoint-dispatch")],
+                    )
+                ),
+                ModelResponse(Message(Role.ASSISTANT, "finished")),
+            ]
+        )
+        child_provider = _RecordingFakeProvider(
+            [
+                ModelResponse(
+                    Message(
+                        Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(
+                                "checkpoint-child-write",
+                                "write_file",
+                                {
+                                    "path": str(ws.root / "child-created.txt"),
+                                    "content": "from child\n",
+                                },
+                            )
+                        ],
+                    )
+                ),
+                ModelResponse(Message(Role.ASSISTANT, "file created")),
+            ]
+        )
+        leader = Leader(
+            LeaderConfig(
+                leader_provider=leader_provider,
+                subagent_provider=child_provider,
+                repo_root=str(ws.root),
+                checkpoints=checkpoints,
+                leader_policy=ws.policy,
+                subagent_specs={"worker": _spec(ws.root, "worker", policy=ws.policy)},
+            )
+        )
+        result = leader.chat("delegate the file write")
+        entries = checkpoints.entries()
+        if (
+            result.final_answer != "finished"
+            or len(entries) != 1
+            or entries[0].key != checkpoints.keys()[0]
+            or entries[0].path != "child-created.txt"
+            or entries[0].backup is not None
+        ):
+            fail(
+                "subagent write did not use the leader checkpoint: "
+                f"result={result!r}, entries={entries!r}, "
+                f"child_requests={child_provider.requests!r}"
+            )
+
+
+@check("leader.checkpoint_transcript")
+def check_leader_checkpoint_transcript() -> None:
+    with workspace() as ws:
+        session = SessionStore(ws.root / "sessions", "checkpoint-session", repo_root=ws.root)
+        checkpoints = CheckpointStore(session.directory / "checkpoints", ws.root)
+        provider = FakeModelProvider(
+            [
+                ModelResponse(Message(Role.ASSISTANT, "first answer")),
+                ModelResponse(Message(Role.ASSISTANT, "second answer")),
+                ModelResponse(Message(Role.ASSISTANT, "one-shot answer")),
+            ]
+        )
+        leader = Leader(
+            LeaderConfig(
+                leader_provider=provider,
+                subagent_provider=FakeModelProvider(),
+                repo_root=str(ws.root),
+                checkpoints=checkpoints,
+            ),
+            session=session,
+        )
+        leader.chat("first prompt")
+        leader.chat("second prompt")
+        leader.run("one-shot prompt")
+        records, dropped = read_records(session.directory / "run.jsonl")
+        checkpoint_records = [record for record in records if record.get("type") == "checkpoint"]
+        prompt_records = [
+            (index, record)
+            for index, record in enumerate(records)
+            if record.get("type") == "message"
+            and record.get("data", {}).get("role") == "user"
+        ]
+        if (
+            dropped
+            or records[0].get("type") != "run_started"
+            or len(checkpoint_records) != 3
+            or tuple(record["data"]["key"] for record in checkpoint_records) != checkpoints.keys()
+            or len(prompt_records) != 3
+            or not all(
+                next(i for i, record in enumerate(records) if record is checkpoint_record)
+                < prompt_records[index][0]
+                for index, checkpoint_record in enumerate(checkpoint_records)
+            )
+        ):
+            fail(f"checkpoint records did not precede each chat prompt: {records!r}")
+        try:
+            load_run_for_resume(session)
+        except Exception as exc:
+            fail(f"checkpoint transcript could not load for resume: {exc}")
+
+
+@check("leader.leader_only_tools")
+def check_leader_only_tools() -> None:
+    class LeaderOnlyTool(_BlockingControlTool):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self._name = name
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+    with workspace() as ws:
+        tools = {
+            name: LeaderOnlyTool(name)
+            for name in ("get_goal", "update_goal")
+        }
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch-worker", "dispatch_subagent",
+                {"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "finished")),
+        ])
+        subagent_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "inspection done")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=subagent_provider,
+            repo_root=str(ws.root),
+            leader_tools=tools,
+        ))
+        leader.run("delegate inspection")
+        if not set(tools).issubset(leader._agent._tools):
+            fail("leader registry omitted its leader-only tools")
+        leader_schemas = json.dumps(leader_provider.requests[0].tools)
+        child_schemas = json.dumps(subagent_provider.requests[0].tools)
+        if not all(name in leader_schemas for name in tools):
+            fail("leader request schemas omitted its leader-only tools")
+        if any(name in child_schemas for name in tools):
+            fail("leader-only tools leaked into the subagent tool registry")

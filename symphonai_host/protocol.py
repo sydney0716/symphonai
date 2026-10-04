@@ -36,6 +36,7 @@ class ApprovalReply:
     approval_id: str
     allowed: bool
     reason: str = ""
+    remember: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class ApprovalRequested:
     target: str
     details: str
     tool_call_id: str = ""
+    remember: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,6 +172,12 @@ def _optional_string(payload: dict, kind: str, field: str) -> str:
     return _required(payload, kind, field, str)
 
 
+def _optional_bool(payload: dict, kind: str, field: str) -> bool:
+    if field not in payload:
+        return False
+    return _required(payload, kind, field, bool)
+
+
 def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | StopRequest | OpenSessionRequest:
     """Validate and decode a client request independent of its transport."""
     if not isinstance(payload, dict):
@@ -181,6 +189,7 @@ def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | 
             approval_id=_required(payload, kind, "approval_id", str),
             allowed=_required(payload, kind, "allowed", bool),
             reason=_optional_string(payload, kind, "reason"),
+            remember=_optional_bool(payload, kind, "remember"),
         )
     if kind == "stop":
         return StopRequest(reason=_optional_string(payload, kind, "reason"))
