@@ -338,12 +338,6 @@ button.session-link {
   color: #9aa7b8;
 }
 
-.picker-row-detail {
-  grid-column: 1 / -1;
-  color: #9aa7b8;
-  font-size: 0.8rem;
-}
-
 .roadmap-phase > summary {
   color: #9aa7b8;
   cursor: pointer;
@@ -412,6 +406,37 @@ button.session-link {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   background: #23483c;
+}
+
+.command {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  color: #9aa7b8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  text-align: left;
+  background: none;
+  border-radius: 0;
+}
+
+.command-echo,
+.command-output {
+  margin: 0;
+}
+
+.command-echo::before {
+  content: "❯ ";
+}
+
+.command-output {
+  padding-left: 1.5em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.command-output::before {
+  content: "⎿ ";
 }
 
 .edit summary {

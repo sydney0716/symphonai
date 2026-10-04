@@ -143,6 +143,7 @@ export async function start({ global, document, client }) {
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
+  let commandEntry = null;
   const board = createAgentBoard();
   let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply] = await Promise.all([
     boundary.project(),
@@ -933,7 +934,11 @@ export async function start({ global, document, client }) {
   listen(input, "keydown", handleComposerKeydown);
 
   function answerCommand(text) {
-    transcript.model.push({ type: "text", text });
+    if (!commandEntry || !transcript.model.includes(commandEntry)) {
+      commandEntry = { type: "command", command: "", output: [] };
+      transcript.model.push(commandEntry);
+    }
+    commandEntry.output.push(text);
     showTranscript();
   }
 
@@ -1449,6 +1454,9 @@ export async function start({ global, document, client }) {
   async function runCommand(command) {
     closeCommandMenu();
     input.value = "";
+    commandEntry = { type: "command", command: command.trim(), output: [] };
+    transcript.model.push(commandEntry);
+    showTranscript();
     const parts = command.split(/\s+/);
     const typedName = parts[0];
     const entry = COMMANDS.find((candidate) => (

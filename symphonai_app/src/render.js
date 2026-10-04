@@ -60,6 +60,16 @@ function renderText(document, entry) {
   return element(document, "p", { className: "assistant", text: entry.text });
 }
 
+function renderCommand(document, entry) {
+  const command = element(document, "div", { className: "command" });
+  append(
+    command,
+    element(document, "p", { className: "command-echo", text: entry.command }),
+    ...entry.output.map((text) => element(document, "p", { className: "command-output", text })),
+  );
+  return command;
+}
+
 function renderActivity(document, entry) {
   return element(document, "p", {
     className: "activity",
@@ -113,6 +123,7 @@ function renderUnknown(document, entry) {
 const TRANSCRIPT_RENDERERS = Object.freeze({
   prompt: renderPrompt,
   text: renderText,
+  command: renderCommand,
   activity: renderActivity,
   edit: renderEdit,
   question: renderQuestion,
