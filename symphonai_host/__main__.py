@@ -64,13 +64,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     lsp = LspManager(extensions.lsp_servers, root=arguments.repo_root)
     host = None
     try:
-        host = HostServer(
-            _provider(),
-            PermissionPolicy(
+        policy = PermissionPolicy(
                 repo_root=arguments.repo_root,
+                allowed_write_scope=[arguments.repo_root],
+                shell_enabled=True,
+                shell_allowlist=[()],
                 shell_sandbox=extensions.config.get("sandbox.shell", False),
                 sandbox_network=extensions.config.get("sandbox.network", False),
-            ),
+                fetch_enabled=True,
+            )
+        ceiling = getattr(extensions, "ceiling", None)
+        if ceiling is not None:
+            policy = ceiling.bound(policy)
+        host = HostServer(
+            _provider(),
+            policy,
             max_turns=arguments.max_turns,
             extensions=extensions,
             mcp_tools=mcp_tools,

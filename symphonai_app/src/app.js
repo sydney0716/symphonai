@@ -162,13 +162,14 @@ export async function start({ global, document, client }) {
   const transcript = createTranscript();
   let commandEntry = null;
   const board = createAgentBoard();
-  let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply] = await Promise.all([
+  let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply, initialSpecRuns] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
     boundary.settings(),
     boundary.health().catch(() => null),
     boundary.conversationStats().catch(() => ({ conversation: null })),
+    (boundary.specRuns?.() ?? Promise.resolve([])).catch(() => []),
   ]);
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
   const keymap = parseKeymap(JSON.stringify(keymapDefaults));
@@ -190,8 +191,9 @@ export async function start({ global, document, client }) {
   let lastActivityRefresh = 0;
   let forkConflict = null;
   let conversation = conversationReply?.conversation ?? null;
-  const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
-  const allSpecPaths = roadmap.phases.flatMap((phase) =>
+  let roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
+  let specRuns = initialSpecRuns;
+  let allSpecPaths = roadmap.phases.flatMap((phase) =>
     phase.items.flatMap((item) => specPaths(item))
   );
   const settingsPane = element(document, "section", { className: "settings-pane" });
@@ -1003,8 +1005,93 @@ export async function start({ global, document, client }) {
     }));
   }
 
-  function showSpec(result) {
+  let selectedSpec = null;
+  let specActionError = "";
+
+  function workflow(item, phase, itemIndex) {
+    const paths = specPaths(item);
+    const path = paths[0] ?? null;
+    const plan = specRuns.find((run) => run.kind === "plan" && run.phase === phase.id && run.item === itemIndex);
+    if (path === null) {
+      return { step: plan ? (plan.state === "running" ? "planning" : "unplanned") : "unplanned", plan };
+    }
+    const run = specRuns.find((candidate) => candidate.kind === "implement" && candidate.spec === path);
+    if (!run) return { step: "planned", run: null };
+    if (run.committed) return { step: "committed", run };
+    if (run.review?.verdict === "running") return { step: "in review", run };
+    if (run.review) return { step: "reviewed", run };
+    return { step: run.state === "running" ? "running" : "ran", run };
+  }
+
+  function actionButton(label, callback) {
+    const button = element(document, "button", { text: label });
+    listen(button, "click", callback);
+    return button;
+  }
+
+  async function refreshSpecState() {
+    const [reply, runs] = await Promise.all([
+      boundary.file("docs/roadmap.json"),
+      boundary.specRuns(),
+    ]);
+    if (typeof reply?.text === "string") roadmap = renderRoadmap(parseRoadmap(reply.text));
+    specRuns = runs;
+    allSpecPaths = roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item)));
+    renderRoadmapUI();
+    if (selectedSpec) {
+      const phase = roadmap.phases.find((value) => value.id === selectedSpec.phase.id);
+      const item = phase?.items[selectedSpec.index] ?? selectedSpec.item;
+      selectedSpec = { ...selectedSpec, phase: phase ?? selectedSpec.phase, item };
+      selectedSpec.result = await specView.open(item, { specPaths: allSpecPaths });
+      showSpec(selectedSpec.result, item, selectedSpec.phase, selectedSpec.index);
+    }
+  }
+
+  async function runSpecAction(action) {
+    specActionError = "";
+    try {
+      await action();
+      await refreshSpecState();
+    } catch (error) {
+      specActionError = error?.message || "spec action failed";
+      if (selectedSpec) showSpec(selectedSpec.result, selectedSpec.item, selectedSpec.phase, selectedSpec.index);
+    }
+  }
+
+  function showSpec(result, item = null, phase = null, itemIndex = -1) {
     const children = [];
+    if (item && phase) {
+      const current = workflow(item, phase, itemIndex);
+      const panel = element(document, "section", { className: "spec-workflow" });
+      append(panel, element(document, "p", { className: "spec-step", text: current.step }));
+      const actions = element(document, "div", { className: "spec-actions" });
+      const run = current.run;
+      if (current.step === "unplanned") append(actions, actionButton("Plan", () => runSpecAction(() => boundary.planSpec(phase.id, itemIndex))));
+      if (current.step === "planning" && current.plan) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(current.plan.session_id))));
+      if (current.step === "planned" && result.specs[0]) append(actions, actionButton("Run", () => runSpecAction(() => boundary.runSpec(result.specs[0].path))));
+      if (current.step === "running" && run) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.session_id))));
+      if (current.step === "ran" && run) {
+        append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id))));
+        append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.session_id))));
+      }
+      if (current.step === "in review" && run?.review?.session_id) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.review.session_id))));
+      if (current.step === "reviewed" && run) {
+        append(actions, element(document, "p", { text: run.review.verdict }));
+        if (run.review.follow_ups?.length) append(actions, element(document, "p", { text: run.review.follow_ups.join(", ") }));
+        if (["passed", "follow-ups"].includes(run.review.verdict)) {
+          const message = element(document, "input");
+          message.value = run.commit_message || "";
+          message.setAttribute("aria-label", "Commit message");
+          append(actions, message, actionButton("Commit…", () => runSpecAction(() => boundary.commitSpec(run.session_id, message.value))));
+        }
+        else append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id))));
+        append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.review.session_id))));
+      }
+      if (current.step === "committed" && run) append(actions, element(document, "p", { text: run.committed.sha }));
+      if (specActionError) append(panel, element(document, "p", { className: "error", text: specActionError }));
+      append(panel, actions);
+      children.push(panel);
+    }
     for (const spec of result.specs) {
       children.push(element(document, "h3", { text: filename(spec.path) }));
       children.push(element(document, "pre", { text: spec.text }));
@@ -1026,33 +1113,39 @@ export async function start({ global, document, client }) {
     replace(specRoot, ...children);
   }
 
-  function roadmapItem(item) {
+  function roadmapItem(item, phase, itemIndex) {
+    const state = workflow(item, phase, itemIndex).step;
     const button = element(document, "button", {
       className: "roadmap-item",
-      text: item.title,
+      text: `${item.title} · ${state}`,
     });
     listen(button, "click", async () => {
-      showSpec(await specView.open(item, { specPaths: allSpecPaths }));
+      selectedSpec = { item, phase, index: itemIndex, result: await specView.open(item, { specPaths: allSpecPaths }) };
+      specActionError = "";
+      showSpec(selectedSpec.result, item, phase, itemIndex);
     });
     return button;
   }
 
-  const roadmapChildren = [];
-  let openedCurrentPhase = false;
-  for (const phase of roadmap.phases) {
-    const section = element(document, "details", { className: "roadmap-phase" });
-    section.open = !openedCurrentPhase && phase.status !== "done";
-    openedCurrentPhase ||= section.open;
-    append(
-      section,
-      element(document, "summary", {
-        text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total} · ${phase.status}`,
-      }),
-      ...phase.items.map(roadmapItem),
-    );
-    roadmapChildren.push(section);
+  function renderRoadmapUI() {
+    const roadmapChildren = [];
+    let openedCurrentPhase = false;
+    for (const phase of roadmap.phases) {
+      const section = element(document, "details", { className: "roadmap-phase" });
+      section.open = !openedCurrentPhase && phase.status !== "done";
+      openedCurrentPhase ||= section.open;
+      append(
+        section,
+        element(document, "summary", {
+          text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total} · ${phase.status}`,
+        }),
+        ...phase.items.map((item, index) => roadmapItem(item, phase, index)),
+      );
+      roadmapChildren.push(section);
+    }
+    replace(roadmapRoot, ...roadmapChildren);
   }
-  replace(roadmapRoot, ...roadmapChildren);
+  renderRoadmapUI();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -2228,6 +2321,30 @@ export async function start({ global, document, client }) {
     }
   }
 
+  let lastSpecRefresh = 0;
+  let pendingSpecRefresh = null;
+  async function refreshSpecsForEvent(frame) {
+    const type = frame.kind === "event" ? frame.payload?.type : "";
+    if (!["RunFinished", "RunFailed", "GoalChanged"].includes(type)) return;
+    const sessionId = frame.payload?.session_id;
+    if (typeof sessionId !== "string" || !specRuns.some((run) =>
+      run.session_id === sessionId || run.review?.session_id === sessionId
+    )) return;
+    const now = Date.now();
+    if (now - lastSpecRefresh >= 1000) {
+      lastSpecRefresh = now;
+      await refreshSpecState().catch(() => {});
+      return;
+    }
+    if (pendingSpecRefresh === null) {
+      pendingSpecRefresh = setTimeout(async () => {
+        pendingSpecRefresh = null;
+        lastSpecRefresh = Date.now();
+        await refreshSpecState().catch(() => {});
+      }, 1000 - (now - lastSpecRefresh));
+    }
+  }
+
   async function onFrame(frame) {
     if (frame.kind === "approval_requested") {
       await approvals.onFrame(frame);
@@ -2235,6 +2352,7 @@ export async function start({ global, document, client }) {
       return;
     }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
+    await refreshSpecsForEvent(frame);
     if (typeof frameSessionId === "string" && frameSessionId !== currentSessionId) {
       const now = Date.now();
       if (now - lastActivityRefresh >= 1000) {

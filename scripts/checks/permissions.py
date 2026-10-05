@@ -10,6 +10,7 @@ from dataclasses import fields
 from pathlib import Path
 
 from symphonai_api.events import CollectingSink, PermissionDenied, PermissionRequested
+from symphonai_api.config import CapabilityCeiling
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import (
     ApprovalOutcome,
@@ -22,6 +23,76 @@ from symphonai_api.permissions import (
 )
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
+
+
+@check("permissions.ceiling_bounds_write_and_shell")
+def check_ceiling_bounds_write_and_shell() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "src"
+        source.mkdir()
+        policy = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root],
+            shell_enabled=True,
+            shell_allowlist=[()],
+            fetch_enabled=True,
+        )
+        ceiling = CapabilityCeiling(
+            allowed_write_scope=(source,), shell_allowlist=(("git",),)
+        )
+        bounded = ceiling.bound(policy)
+        if not bounded.check_write("src/a.py").allowed or bounded.check_write("b.py").allowed:
+            fail(f"write scope did not narrow to src: {bounded.allowed_write_scope!r}")
+        if not bounded.check_shell(["git", "status"]).allowed or bounded.check_shell(["pytest"]).allowed:
+            fail(f"shell allowlist did not narrow by prefix: {bounded.shell_allowlist!r}")
+
+        disabled = CapabilityCeiling(shell_enabled=False).bound(policy)
+        if disabled.shell_enabled or disabled.check_shell(["pytest"]).allowed:
+            fail(f"shell_enabled=false did not disable the shell: {disabled!r}")
+        if not policy.check_write("b.py").allowed or not policy.check_shell(["pytest"]).allowed:
+            fail("bounding a policy mutated the original conversation policy")
+
+
+@check("permissions.ceiling_bounds_fetch")
+def check_ceiling_bounds_fetch() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        policy = PermissionPolicy(
+            repo_root=Path(temporary), fetch_enabled=True,
+        )
+        bounded = CapabilityCeiling(fetch_allowlist=("example.com",)).bound(policy)
+        if (
+            bounded.fetch_enabled
+            or not bounded.check_fetch("https://example.com/").allowed
+            or bounded.check_fetch("https://other.org/").allowed
+        ):
+            fail(f"fetch allowlist did not become a host restriction: {bounded!r}")
+        disabled = CapabilityCeiling(fetch_enabled=False).bound(policy)
+        if disabled.fetch_enabled or disabled.fetch_allowlist or disabled.check_fetch("https://example.com/").allowed:
+            fail(f"fetch_enabled=false did not disable fetch: {disabled!r}")
+
+
+@check("permissions.ceiling_without_config_is_copy")
+def check_ceiling_without_config_is_copy() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        policy = PermissionPolicy(
+            repo_root=Path(temporary),
+            allowed_write_scope=[Path(temporary)],
+            shell_enabled=True,
+            shell_allowlist=[()],
+            fetch_enabled=True,
+        )
+        bounded = CapabilityCeiling().bound(policy)
+        if bounded is policy or any(
+            getattr(bounded, name) != getattr(policy, name)
+            for name in (
+                "repo_root", "allowed_write_scope", "forbidden_patterns",
+                "shell_enabled", "shell_allowlist", "shell_sandbox",
+                "sandbox_network", "fetch_enabled", "fetch_allowlist",
+                "mode", "shell_timeout_seconds", "shell_output_limit_chars",
+            )
+        ):
+            fail(f"empty capability ceiling changed the policy: {bounded!r}")
 
 
 @check("permissions.sandbox_narrowing")

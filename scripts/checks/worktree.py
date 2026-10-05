@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from symphonai_api.agent_spec import AgentSpec, ModelSelector
+from symphonai_api.config import ConfigError, load_config
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
@@ -377,3 +378,55 @@ def check_shared_dispatch_stays_shared() -> None:
                 fail("ordinary dispatch unexpectedly created a worktree")
         finally:
             session.close()
+
+
+@check("worktree.configured_symlink_is_added")
+def check_configured_symlink_is_added() -> None:
+    from symphonai_api.worktree import create_worktree, remove_worktree
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = _repository(root / "repo")
+        (repo / ".symphonai").mkdir()
+        (repo / ".symphonai" / "config.toml").write_text('[worktree]\nsymlink = [".venv"]\n')
+        (repo / ".venv").mkdir()
+        (repo / ".venv" / "probe").write_text("ok")
+        admin = root / "sessions" / "worktree"
+        child = create_worktree(repo, admin)
+        try:
+            link = child / ".venv"
+            if not link.is_symlink() or (link / "probe").read_text() != "ok":
+                fail("configured main-tree directory was not linked into its worktree")
+        finally:
+            remove_worktree(repo, admin)
+
+
+@check("worktree.configured_symlink_config_validation")
+def check_configured_symlink_config_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        (repo / ".symphonai").mkdir(parents=True)
+        config = repo / ".symphonai" / "config.toml"
+        config.write_text('[worktree]\nsymlink = [".venv", "tools/cache"]\n')
+        loaded = load_config(repo_root=repo, home=root / "home")
+        if loaded.get("worktree.symlink") != [".venv", "tools/cache"]:
+            fail("configured worktree symlink paths were not loaded")
+
+
+@check("worktree.configured_symlink_escape_refused")
+def check_configured_symlink_escape_refused() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        (repo / ".symphonai").mkdir(parents=True)
+        config = repo / ".symphonai" / "config.toml"
+        for entry in ("../outside", "/absolute"):
+            config.write_text(f'[worktree]\nsymlink = ["{entry}"]\n')
+            try:
+                load_config(repo_root=repo, home=root / "home")
+            except ConfigError as exc:
+                if "worktree.symlink" not in str(exc):
+                    fail(f"invalid symlink path error omitted its key: {exc}")
+            else:
+                fail(f"unsafe worktree symlink path was accepted: {entry}")

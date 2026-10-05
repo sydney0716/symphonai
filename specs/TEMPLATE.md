@@ -75,9 +75,8 @@ the change is pure cost.>
 - `python3 scripts/check.py` — the whole suite, once before you finish.
 - `python3 scripts/checks/_selfcheck.py` — only when this change edits the
   runner itself (`scripts/check.py` or `scripts/checks/harness.py`). Once.
-- `.venv/bin/python scripts/smoke_host.py` — only when the host changed.
-- `.venv/bin/python scripts/smoke_tui.py` — only when the runtime or the TUI
-  changed. A change under `symphonai_app/` cannot reach either.
+- `.venv/bin/python scripts/smoke_host.py` — only when the host changed. A
+  change under `symphonai_app/` cannot reach it.
 - `git status --porcelain` and `git diff --check` — always. Paste the first
   verbatim.
 

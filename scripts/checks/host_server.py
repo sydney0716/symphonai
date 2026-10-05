@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import base64
+import hashlib
 import http.client
 import io
 import inspect
@@ -34,6 +35,8 @@ import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
 import symphonai_host.goal as goal_module
 from symphonai_api.agent_run import RunNode
+from symphonai_api.agent_file import load_agent_file
+from symphonai_api.agent_spec import ModelSelector
 from symphonai_api.config import ConfigError, ResolvedConfig
 from symphonai_api.events import (
     AssistantTextDelta,
@@ -58,17 +61,454 @@ from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore, load_run, load_run_for_resume
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.filesystem import ReadLedger, WriteFileTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.shell import RunShellTool
+from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.worktree import create_worktree
 from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
 from symphonai_host.protocol import decode_event, decode_frame
 from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.server import HostServer
+from symphonai_host.spec_run import bind_roadmap_item, mark_roadmap_spec_done, parse_spec, patch_digest, review_verdict
 from scripts.checks.harness import CheckFailed, check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@check("host_server.spec_parser_title_and_validation")
+def check_spec_parser_title_and_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        spec = root / "specs" / "39" / "39z-sample.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# 39z — sample\n\n## Validation\n\n```bash\none\n\n two\n```\n")
+        parsed = parse_spec(spec, root)
+        if parsed["title"] != "39z — sample" or parsed["validation"] != ["one", " two"]:
+            fail(f"spec title or validation block parsed incorrectly: {parsed!r}")
+
+
+@check("host_server.spec_parser_report_path")
+def check_spec_parser_report_path() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        spec = root / "specs" / "39" / "39z-sample.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# Sample\n\n## Report\n\n`specs/report/39/sample.md`\n")
+        if parse_spec(spec, root)["report"] != "specs/report/39/sample.md":
+            fail("spec report path did not use the first code span")
+
+
+@check("host_server.spec_parser_derived_report")
+def check_spec_parser_derived_report() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        spec = root / "specs" / "39" / "39z-sample.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# Sample\n")
+        if parse_spec(spec, root)["report"] != "specs/report/39/39z-sample-report.md":
+            fail("missing report section did not derive a report path")
+
+
+@check("host_server.spec_parser_requires_specs_markdown")
+def check_spec_parser_requires_specs_markdown() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        bad = root / "other.md"
+        bad.write_text("# No")
+        for path in (bad, root / "specs" / "missing.md"):
+            try:
+                parse_spec(path, root)
+            except ValueError:
+                continue
+            fail(f"invalid spec path was accepted: {path}")
+
+
+@check("host_server.spec_parser_checkless_validation")
+def check_spec_parser_checkless_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        spec = root / "specs" / "39" / "39z-sample.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# Sample\n\n## Validation\n\nNo commands.\n")
+        if parse_spec(spec, root)["validation"]:
+            fail("prose without a fenced validation block became commands")
+
+
+@check("host_server.spec_run_goal_checks_in_its_worktree")
+def check_spec_run_goal_checks_in_its_worktree() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / "a.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        run = HostRun(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root]),
+            EventBroker(), sessions_root=root / "sessions",
+        )
+        try:
+            session_id, _ = run.start_spec_run({
+                "path": "specs/39/39z-check.md", "report": "specs/report/39/39z-check-report.md",
+                "text": "Implement the requested change.", "validation": ["pwd"],
+            })
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                goal = run._goal_for_session(session_id)
+                if goal and goal["phase"] == "complete":
+                    break
+                time.sleep(0.01)
+            goal = run._goal_for_session(session_id)
+            expected = str(root / "sessions" / session_id / "worktree")
+            if not goal or goal["phase"] != "complete" or expected not in goal["last_check"]["output"]:
+                fail(f"spec validation did not run in its worktree: {goal!r}")
+        finally:
+            run.close()
+
+
+@check("host_server.spec_run_review_commit_end_to_end")
+def check_spec_run_review_commit_end_to_end() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / ".gitignore").write_text("specs/\n", encoding="utf-8")
+        (root / "a.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore", "a.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        spec_path = root / "specs" / "39" / "39b-run-a-spec.md"
+        spec_path.parent.mkdir(parents=True)
+        spec_path.write_text(
+            "# 39b — run a spec\n\n## Validation\n\n```bash\npwd\n```\n\n"
+            "## Report\n\n`specs/report/39/39b-run-a-spec-report.md`\n",
+            encoding="utf-8",
+        )
+        docs = root / "docs"
+        docs.mkdir()
+        roadmap = docs / "roadmap.json"
+        roadmap.write_text(json.dumps({"phases": [{
+            "id": "39", "status": "in_progress",
+            "items": [{"title": "run a spec", "spec": ["specs/39/39b-run-a-spec.md"]}],
+        }]}), encoding="utf-8")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("outside-worktree", "write_file", {
+                "path": "../outside-worktree.txt", "content": "must be refused\n",
+            })])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("read", "read_file", {"path": "a.py"})])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("edit", "write_file", {"path": "a.py", "content": "value = 2\n"})])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("report", "write_file", {"path": "specs/report/39/39b-run-a-spec-report.md", "content": "report"})])),
+            ModelResponse(Message(Role.ASSISTANT, "implemented")),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("review-outside-scope", "write_file", {
+                "path": "a.py", "content": "reviewer must not write this\n",
+            })])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("follow-up", "write_file", {
+                "path": "specs/39/39bF-fix.md", "content": "# Follow-up\n",
+            })])),
+            ModelResponse(Message(Role.ASSISTANT, "Verdict: follow-ups: specs/39/39bF-fix.md")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root]),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        try:
+            for invalid_path in ("specs/../a.py", "specs/39/missing.md"):
+                connection, response = _request(host, "POST", "/spec/run", body={"path": invalid_path}, headers=_headers(host))
+                body = response.read()
+                connection.close()
+                if response.status != 400:
+                    fail(f"invalid spec path {invalid_path!r} returned {response.status}: {body!r}")
+            connection, response = _request(host, "POST", "/spec/run", body={"path": "specs/39/39b-run-a-spec.md"}, headers=_headers(host))
+            started = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"spec/run returned {response.status}: {started!r}")
+            connection, response = _request(host, "POST", "/spec/run", body={"path": "specs/39/39b-run-a-spec.md"}, headers=_headers(host))
+            duplicate = json.loads(response.read())
+            connection.close()
+            if response.status != 409:
+                fail(f"duplicate running spec was not refused: {response.status}, {duplicate!r}")
+
+            def spec_run_state():
+                connection, response = _request(host, "GET", "/spec/runs", headers=_headers(host))
+                values = json.loads(response.read())
+                connection.close()
+                return next(item for item in values if item["session_id"] == started["session_id"])
+
+            deadline = time.monotonic() + 8
+            state = spec_run_state()
+            while state["state"] == "running" and time.monotonic() < deadline:
+                time.sleep(0.02)
+                state = spec_run_state()
+            if state["state"] != "finished" or not state["report_copied"] or state["files"] != ["a.py"]:
+                worktree_file = root / "sessions" / started["session_id"] / "worktree" / "a.py"
+                actual = worktree_file.read_text(encoding="utf-8") if worktree_file.exists() else "<missing>"
+                fail(f"spec run did not finish with an isolated edit and copied report: {state!r}; worktree a.py={actual!r}; provider calls={provider.call_count}")
+            if (root / "a.py").read_text(encoding="utf-8") != "value = 1\n":
+                fail("spec implementation changed the main tree before review and commit")
+            if (root / "sessions" / started["session_id"] / "outside-worktree.txt").exists() or host.pending_approvals():
+                fail("spec implementation wrote outside its worktree or asked for approval in allow mode")
+            if state.get("commit_message") != "39b: run a spec":
+                fail(f"spec run default commit message was wrong: {state.get('commit_message')!r}")
+
+            connection, response = _request(host, "POST", "/spec/review", body={"session_id": started["session_id"]}, headers=_headers(host))
+            reviewed = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"spec/review returned {response.status}: {reviewed!r}")
+            deadline = time.monotonic() + 5
+            state = spec_run_state()
+            while (not state.get("review") or state["review"].get("verdict") == "running") and time.monotonic() < deadline:
+                time.sleep(0.02)
+                state = spec_run_state()
+            if state.get("review", {}).get("verdict") != "follow-ups":
+                fail(f"review verdict was not recorded: {state!r}")
+            if state["review"].get("follow_ups") != ["specs/39/39bF-fix.md"] or not (root / "specs/39/39bF-fix.md").is_file():
+                fail(f"eligible reviewer follow-up was not copied to the main tree: {state['review']!r}")
+
+            (root / "staged.txt").write_text("staged\n", encoding="utf-8")
+            subprocess.run(["git", "add", "staged.txt"], cwd=root, check=True)
+            connection, response = _request(host, "POST", "/spec/commit", body={
+                "session_id": started["session_id"], "message": "blocked while staged",
+            }, headers=_headers(host))
+            refusal = json.loads(response.read())
+            connection.close()
+            if response.status != 409 or refusal.get("error") != "the main tree has staged changes":
+                fail(f"commit with an existing staged path was not refused exactly: {response.status}, {refusal!r}")
+            if (root / "a.py").read_text(encoding="utf-8") != "value = 1\n":
+                fail("staged-index refusal applied the worktree prematurely")
+            subprocess.run(["git", "reset", "--", "staged.txt"], cwd=root, check=True, capture_output=True)
+            (root / "staged.txt").unlink()
+
+            connection, response = _request(host, "POST", "/spec/commit", body={
+                "session_id": started["session_id"], "message": "39b: run a spec",
+            }, headers=_headers(host))
+            committed = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or committed.get("paths") != ["a.py"] or not committed.get("commit"):
+                fail(f"spec commit did not commit exactly a.py: {response.status}, {committed!r}")
+            if (root / "a.py").read_text(encoding="utf-8") != "value = 2\n":
+                fail("committed spec change was not applied to the main tree")
+            names = subprocess.run(["git", "show", "--pretty=format:", "--name-only", "HEAD"], cwd=root, capture_output=True, check=True).stdout.decode().splitlines()
+            if names != ["a.py"]:
+                fail(f"spec commit included unexpected paths: {names!r}")
+            committed_state = spec_run_state()
+            phase = json.loads(roadmap.read_text(encoding="utf-8"))["phases"][0]
+            if committed_state.get("committed", {}).get("sha") != committed["commit"] or phase["status"] != "done" or phase["items"][0].get("done") is not True:
+                fail("successful spec commit did not record its SHA and mark the bound roadmap item done")
+        finally:
+            host.close()
+
+
+@check("host_server.spec_plan_binds_one_new_spec")
+def check_spec_plan_binds_one_new_spec() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        docs = root / "docs"
+        docs.mkdir()
+        roadmap = docs / "roadmap.json"
+        roadmap.write_text('{"goal":"test","phases":[{"id":"39","name":"Phase 39","status":"in_progress","items":["New capability","Leave unchanged"]}]}', encoding="utf-8")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("outside", "write_file", {
+                "path": "README.md", "content": "should be denied\n",
+            })])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("shell", "run_shell", {"argv": ["touch", "planner-shell.txt"]})])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("new-spec", "write_file", {
+                "path": "specs/39/39z-new-capability.md", "content": "# 39z — new capability\n",
+            })])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(provider, PermissionPolicy(repo_root=root, allowed_write_scope=[root]), sessions_root=root / "sessions")
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/spec/plan", body={"phase": "39", "item": 0}, headers=_headers(host))
+            reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"spec/plan returned {response.status}: {reply!r}")
+            deadline = time.monotonic() + 5
+            bound = None
+            while time.monotonic() < deadline:
+                connection, response = _request(host, "GET", "/spec/runs", headers=_headers(host))
+                runs = json.loads(response.read())
+                connection.close()
+                bound = next((item for item in runs if item["session_id"] == reply["session_id"]), None)
+                if bound and bound.get("state") != "running":
+                    break
+                time.sleep(0.02)
+            result = json.loads(roadmap.read_text(encoding="utf-8"))
+            items = result["phases"][0]["items"]
+            expected = {"title": "New capability", "spec": ["specs/39/39z-new-capability.md"]}
+            if items[0] != expected or items[1] != "Leave unchanged":
+                fail(f"planner did not bind exactly its new spec or changed a neighbor: {items!r}")
+            if not bound or bound.get("kind") != "plan" or bound.get("bound") != expected["spec"][0]:
+                fail(f"plan session did not record its binding: {bound!r}")
+            if (root / "README.md").exists() or (root / "planner-shell.txt").exists():
+                fail("planner wrote outside specs or ran a shell command")
+        finally:
+            host.close()
+
+
+@check("host_server.spec_review_pass_verdict")
+def check_spec_review_pass_verdict() -> None:
+    if review_verdict("Review looks good.\nVerdict: pass") != ("passed", []):
+        fail("final pass verdict was not recognized")
+
+
+@check("host_server.spec_review_followup_verdict")
+def check_spec_review_followup_verdict() -> None:
+    expected = ("follow-ups", ["specs/39/39zF-fix.md", "specs/39/39zF2-more.md"])
+    if review_verdict("Verdict: follow-ups: specs/39/39zF-fix.md, specs/39/39zF2-more.md") != expected:
+        fail("follow-up verdict paths were not parsed in order")
+
+
+@check("host_server.spec_review_requires_last_line")
+def check_spec_review_requires_last_line() -> None:
+    if review_verdict("Verdict: pass\nA later explanation") != ("no-verdict", []):
+        fail("a verdict before the last non-empty line was accepted")
+
+
+@check("host_server.spec_review_rejects_empty_followups")
+def check_spec_review_rejects_empty_followups() -> None:
+    if review_verdict("Verdict: follow-ups:") != ("no-verdict", []):
+        fail("empty follow-up verdict was accepted")
+
+
+@check("host_server.spec_review_ignores_nonfinal_text")
+def check_spec_review_ignores_nonfinal_text() -> None:
+    if review_verdict("Verdict: pass\n\n") != ("passed", []):
+        fail("trailing blank lines changed a final verdict")
+
+
+@check("host_server.spec_review_unknown_verdict")
+def check_spec_review_unknown_verdict() -> None:
+    if review_verdict("Verdict: maybe") != ("no-verdict", []):
+        fail("unknown verdict was not treated as no-verdict")
+
+
+@check("host_server.spec_review_missing_verdict")
+def check_spec_review_missing_verdict() -> None:
+    if review_verdict("Review is complete, with two points to consider.") != ("no-verdict", []):
+        fail("review prose without a verdict was not rejected")
+
+
+@check("host_server.spec_patch_digest_stable")
+def check_spec_patch_digest_stable() -> None:
+    if patch_digest("patch\n") != patch_digest("patch\n") or patch_digest("patch\n") == patch_digest("other\n"):
+        fail("review baseline digest did not distinguish patch changes")
+
+
+@check("host_server.spec_review_detects_tree_change")
+def check_spec_review_detects_tree_change() -> None:
+    from types import SimpleNamespace
+    from symphonai_api.worktree import create_worktree, worktree_diff
+    from symphonai_host.spec_run import patch_digest
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / "a.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        sessions = root / "sessions"
+        source_id, review_id = "spec-source", "spec-review"
+        worktree = create_worktree(root, sessions / source_id / "worktree")
+        (worktree / "a.py").write_text("value = 2\n", encoding="utf-8")
+        baseline = worktree_diff(worktree)
+        baseline_files = {"a.py": hashlib.sha256((worktree / "a.py").read_bytes()).hexdigest()}
+        (worktree / "a.py").write_text("value = 3\n", encoding="utf-8")
+        source_store = SessionStore(sessions, source_id, repo_root=root)
+        source_meta = source_store.read_meta()
+        source_meta["spec_run"] = {"kind": "implement", "spec": "specs/39/39b.md", "report": "specs/report/39/39b-report.md", "worktree": "worktree"}
+        source_store.write_meta(source_meta)
+        source_store.close()
+        review_store = SessionStore(sessions, review_id, repo_root=root)
+        review_meta = review_store.read_meta()
+        review_meta["spec_run"] = {
+            "kind": "review", "of": source_id, "worktree_path": str(worktree),
+            "baseline": patch_digest(baseline.patch), "baseline_files": baseline_files,
+        }
+        review_store.write_meta(review_meta)
+        review_store.close()
+        run = HostRun(None, PermissionPolicy(repo_root=root), EventBroker(), sessions_root=sessions)
+        try:
+            run._finish_spec_review(review_id, SimpleNamespace(
+                _chat_messages=[Message(Role.ASSISTANT, "Verdict: pass")],
+            ))
+            source_store = SessionStore.open(sessions, source_id)
+            verdict = source_store.read_meta().get("review", {}).get("verdict")
+            source_store.close()
+            if verdict != "tree-changed":
+                fail(f"review verdict did not prioritize a modified worktree: {verdict!r}")
+        finally:
+            run.close()
+
+
+@check("host_server.roadmap_binding_preserves_other_bytes")
+def check_roadmap_binding_preserves_other_bytes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        docs = root / "docs"
+        docs.mkdir()
+        raw = '{\n "goal":"g",\n "phases":[{"id":"39","name":"Phase","status":"in_progress","items":["first", "second"]}]\n}\n'
+        path = docs / "roadmap.json"
+        path.write_text(raw)
+        bind_roadmap_item(root, "39", 1, "specs/39/39b.md")
+        updated = path.read_text()
+        if not updated.startswith(raw[:raw.index('"second"')]) or not updated.endswith(raw[raw.index('"second"') + len('"second"'):]):
+            fail("binding changed bytes outside the selected roadmap item")
+
+
+@check("host_server.roadmap_binding_converts_string_item")
+def check_roadmap_binding_converts_string_item() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "docs").mkdir()
+        path = root / "docs" / "roadmap.json"
+        path.write_text('{"phases":[{"id":"39","items":["Thing"]}]}')
+        bind_roadmap_item(root, "39", 0, "specs/39/39a.md")
+        item = json.loads(path.read_text())["phases"][0]["items"][0]
+        if item != {"title": "Thing", "spec": ["specs/39/39a.md"]}:
+            fail(f"string roadmap item was not bound as an object: {item!r}")
+
+
+@check("host_server.roadmap_binding_rejects_unknown_item")
+def check_roadmap_binding_rejects_unknown_item() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "docs").mkdir()
+        (root / "docs" / "roadmap.json").write_text('{"phases":[{"id":"39","items":["Thing"]}]}')
+        try:
+            bind_roadmap_item(root, "39", 2, "specs/39/39a.md")
+        except ValueError:
+            return
+        fail("unknown roadmap item index was accepted")
+
+
+@check("host_server.roadmap_commit_marks_done_and_phase")
+def check_roadmap_commit_marks_done_and_phase() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "docs").mkdir()
+        path = root / "docs" / "roadmap.json"
+        path.write_text('{"phases":[{"id":"39","status":"in_progress","items":[{"title":"A","spec":["specs/39/a.md"]},{"title":"B","spec":["specs/39/b.md"],"done":true}]}]}')
+        mark_roadmap_spec_done(root, "specs/39/a.md")
+        phase = json.loads(path.read_text())["phases"][0]
+        if phase["status"] != "done" or phase["items"][0].get("done") is not True:
+            fail("commit did not mark its roadmap item and completed phase done")
 _APP_HTML_RESOURCE = re.compile(r"""(?:src|href)=[\"']([^\"']+)[\"']""")
 _APP_STATIC_IMPORT = re.compile(
     r"""\b(?:import|export)\s+(?:[^;\"']*?\s+from\s*)?[\"']([^\"']+)[\"']"""
@@ -7042,3 +7482,228 @@ def check_worktree_unknown_and_active() -> None:
         finally:
             host.run._active = None
             host.close()
+
+
+@check("host_server.allow_mode_full_access_from_main")
+def check_allow_mode_full_access_from_main() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / ".symphonai").mkdir()
+        (root / ".symphonai" / "config.toml").write_text(
+            "[sandbox]\nshell = false\nnetwork = false\n", encoding="utf-8"
+        )
+        extensions = load_extensions(repo_root=root, home=root / "home")
+        fake_host = mock.Mock()
+        with (
+            mock.patch.object(host_main, "apply_to_environment"),
+            mock.patch.object(host_main, "load_extensions", return_value=extensions),
+            mock.patch.object(host_main, "prune_sessions"),
+            mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
+            mock.patch.object(host_main, "McpPool") as pool_class,
+            mock.patch.object(host_main, "LspManager"),
+            mock.patch.object(host_main, "HostServer", return_value=fake_host) as host_class,
+            mock.patch.object(host_main.signal, "signal"),
+        ):
+            pool_class.return_value.start.return_value = {}
+            host_main.main(["--repo-root", str(root)])
+        policy = host_class.call_args.args[1]
+        if (
+            policy.repo_root != root.resolve()
+            or policy.allowed_write_scope != [root.resolve()]
+            or not policy.shell_enabled
+            or policy.shell_allowlist != [()]
+            or not policy.fetch_enabled
+            or policy.shell_sandbox
+            or policy.sandbox_network
+        ):
+            fail(f"host entry point did not build the allow policy: {policy!r}")
+
+        written = WriteFileTool(ReadLedger()).execute(
+            ToolCall("allow-write", "write_file", {"path": "a.py", "content": "ok\n"}),
+            policy,
+        )
+        if not written.ok or (root / "a.py").read_text(encoding="utf-8") != "ok\n":
+            fail(f"allow-mode write_file failed: {written!r}")
+        if policy.check_write(".env").allowed or policy.check_write(root.parent / "outside").allowed:
+            fail("allow mode permitted a forbidden or out-of-repository write")
+
+        shell = RunShellTool().execute(
+            ToolCall(
+                "allow-shell", "run_shell",
+                {"argv": [sys.executable, "--version"], "timeout_seconds": 5},
+            ),
+            policy,
+        )
+        if not shell.ok:
+            fail(f"allow-mode run_shell failed: {shell!r}")
+        if policy.check_shell(["rm", "-rf", "/"]).allowed:
+            fail("allow mode permitted an always-denied command")
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.headers = {"Content-Type": "text/plain", "Content-Length": "2"}
+        response.read.return_value = b"ok"
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch("symphonai_api.web.urllib.request.build_opener", return_value=opener):
+            fetched = WebFetchTool().execute(
+                ToolCall("allow-fetch", "web_fetch", {"url": "https://public.example.invalid/"}),
+                policy,
+            )
+        if not fetched.ok or "ok" not in fetched.content:
+            fail(f"allow-mode public fetch failed: {fetched!r}")
+        if policy.check_fetch("http://127.0.0.1/").allowed:
+            fail("allow mode permitted a local fetch host")
+
+        requests = []
+        ask_policy = replace(
+            policy,
+            mode="ask",
+            approval_callback=lambda request: requests.append(request.operation) or True,
+        )
+        ask_decisions = (
+            ask_policy.check_write("ask.txt"),
+            ask_policy.check_shell(["pytest", "--version"]),
+            ask_policy.check_fetch("https://public.example.invalid/"),
+        )
+        if not all(decision.allowed for decision in ask_decisions) or requests != [
+            "write_file", "run_shell", "web_fetch",
+        ]:
+            fail(f"ask mode did not ask for all three operations: {requests!r}, {ask_decisions!r}")
+
+        plan_policy = replace(policy, mode="plan")
+        plan_decisions = (
+            plan_policy.check_write("plan.txt"),
+            plan_policy.check_shell(["pytest", "--version"]),
+        )
+        if any(decision.allowed for decision in plan_decisions):
+            fail(f"plan mode permitted a side effect: {plan_decisions!r}")
+
+
+@check("host_server.builtin_subagents_keep_allow_access")
+def check_builtin_subagents_keep_allow_access() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        policy = PermissionPolicy(
+            repo_root=root, allowed_write_scope=[root], shell_enabled=True,
+            shell_allowlist=[()], fetch_enabled=True,
+        )
+        specs = leader_module.builtin_subagent_specs(FakeModelProvider(), policy)
+        for name in ("worker", "implementer", "reviewer"):
+            spec = specs[name]
+            if "write_file" not in spec.tool_names or "run_shell" not in spec.tool_names:
+                fail(f"built-in {name} lacks expected write/shell tools: {spec.tool_names!r}")
+            effective = policy.narrowed(spec.policy_ceiling)
+            if not effective.check_write("child.py").allowed or not effective.check_shell(["pytest", "--version"]).allowed:
+                fail(f"built-in {name} lost allow-mode access: {effective!r}")
+            written = WriteFileTool(ReadLedger()).execute(
+                ToolCall(
+                    f"{name}-write", "write_file",
+                    {"path": f"{name}.py", "content": "ok\n"},
+                ),
+                effective,
+            )
+            shell = RunShellTool().execute(
+                ToolCall(
+                    f"{name}-shell", "run_shell",
+                    {"argv": [sys.executable, "--version"], "timeout_seconds": 5},
+                ),
+                effective,
+            )
+            if not written.ok or not shell.ok:
+                fail(f"built-in {name} could not write or run a command: {written!r}, {shell!r}")
+
+
+@check("host_server.capability_ceiling_bounds_conversation")
+def check_capability_ceiling_bounds_conversation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        config_file = root / ".symphonai" / "config.toml"
+        config_file.parent.mkdir()
+
+        def policy_for(content: str) -> tuple[PermissionPolicy, Extensions]:
+            config_file.write_text(content, encoding="utf-8")
+            extensions = load_extensions(repo_root=root, home=root / "home")
+            fake_host = mock.Mock()
+            with (
+                mock.patch.object(host_main, "apply_to_environment"),
+                mock.patch.object(host_main, "load_extensions", return_value=extensions),
+                mock.patch.object(host_main, "prune_sessions"),
+                mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
+                mock.patch.object(host_main, "McpPool") as pool_class,
+                mock.patch.object(host_main, "LspManager"),
+                mock.patch.object(host_main, "HostServer", return_value=fake_host) as host_class,
+                mock.patch.object(host_main.signal, "signal"),
+            ):
+                pool_class.return_value.start.return_value = {}
+                host_main.main(["--repo-root", str(root)])
+            return host_class.call_args.args[1], extensions
+
+        no_shell, extension = policy_for(
+            "[agents.ceiling]\nshell_enabled = false\n"
+        )
+        if no_shell.check_shell(["pytest"]).allowed:
+            fail("conversation policy exceeded shell_enabled=false")
+        agent_path = root / "worker.toml"
+        agent_path.write_text('prompt = "work"\n', encoding="utf-8")
+        inherited = load_agent_file(
+            agent_path,
+            repo_root=root,
+            default_model=ModelSelector("fake"),
+            ceiling=extension.ceiling,
+        )
+        if no_shell.narrowed(inherited.policy_ceiling).check_shell(["pytest"]).allowed:
+            fail("table-less agent exceeded the conversation shell ceiling")
+
+        write_limited, _ = policy_for(
+            '[agents.ceiling]\nallowed_write_scope = ["src"]\n'
+        )
+        (root / "src").mkdir(exist_ok=True)
+        src_write = WriteFileTool(ReadLedger()).execute(
+            ToolCall("ceiling-src", "write_file", {"path": "src/a.py", "content": "ok\n"}),
+            write_limited,
+        )
+        outside_write = WriteFileTool(ReadLedger()).execute(
+            ToolCall("ceiling-outside", "write_file", {"path": "b.py", "content": "no\n"}),
+            write_limited,
+        )
+        if not src_write.ok or outside_write.ok or (root / "b.py").exists():
+            fail(f"write ceiling did not restrict the conversation: {src_write!r}, {outside_write!r}")
+
+        shell_limited, _ = policy_for(
+            '[agents.ceiling]\nshell_allowlist = [["git"]]\n'
+        )
+        subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+        git_status = RunShellTool().execute(
+            ToolCall("ceiling-git", "run_shell", {"argv": ["git", "status"]}),
+            shell_limited,
+        )
+        pytest = RunShellTool().execute(
+            ToolCall("ceiling-pytest", "run_shell", {"argv": ["pytest", "--version"]}),
+            shell_limited,
+        )
+        if not git_status.ok or pytest.ok:
+            fail(f"shell ceiling did not restrict the conversation: {git_status!r}, {pytest!r}")
+
+        fetch_limited, _ = policy_for(
+            '[agents.ceiling]\nfetch_allowlist = ["example.com"]\n'
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.headers = {"Content-Type": "text/plain", "Content-Length": "2"}
+        response.read.return_value = b"ok"
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch("symphonai_api.web.urllib.request.build_opener", return_value=opener):
+            allowed_fetch = WebFetchTool().execute(
+                ToolCall("ceiling-fetch-ok", "web_fetch", {"url": "https://example.com/"}),
+                fetch_limited,
+            )
+            denied_fetch = WebFetchTool().execute(
+                ToolCall("ceiling-fetch-no", "web_fetch", {"url": "https://other.org/"}),
+                fetch_limited,
+            )
+        if not allowed_fetch.ok or denied_fetch.ok or opener.open.call_count != 1:
+            fail(f"fetch ceiling did not restrict network requests: {allowed_fetch!r}, {denied_fetch!r}")

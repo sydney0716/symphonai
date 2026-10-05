@@ -683,3 +683,23 @@ button.session-link {
     display: none;
   }
 }
+.spec-workflow {
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+}
+
+.spec-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.spec-step {
+  font-weight: 600;
+}
+
+.roadmap-item {
+  text-align: left;
+}

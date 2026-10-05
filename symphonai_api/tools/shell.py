@@ -63,6 +63,22 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _sandbox_available() -> bool:
+    if sys.platform != "darwin" or not os.path.isfile(SANDBOX_EXEC):
+        return False
+    try:
+        probe = subprocess.run(
+            [SANDBOX_EXEC, "-p", "(version 1) (allow default)", "/usr/bin/true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
 class RunShellTool(LocalTool):
     """Run an allowlisted command, given as an argv list, and return its output."""
 
@@ -147,13 +163,14 @@ class RunShellTool(LocalTool):
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         command = argv
-        if policy.shell_sandbox:
-            if sys.platform != "darwin" or not os.path.isfile(SANDBOX_EXEC):
-                return ToolResult(
-                    tool_call_id=tool_call.id,
-                    ok=False,
-                    error="sandbox requested but unavailable on this platform",
-                )
+        sandbox_available = _sandbox_available()
+        if policy.shell_sandbox and not sandbox_available:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error="sandbox requested but unavailable on this platform",
+            )
+        if policy.shell_sandbox or (policy.mode == "allow" and sandbox_available):
             command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
         try:
             proc = subprocess.Popen(

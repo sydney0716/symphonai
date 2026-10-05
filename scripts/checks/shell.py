@@ -134,12 +134,101 @@ def check_shell_sandbox_opt_in_preserves_plain_argv() -> None:
         repo_root=Path.cwd(), mode="allow", shell_enabled=True,
         shell_allowlist=[("echo",)],
     )
-    with mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen:
+    with (
+        mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False),
+        mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen,
+    ):
         result = RunShellTool().execute(
             ToolCall(id="plain-shell", name="run_shell", arguments={"argv": argv}), policy,
         )
     if not result.ok or popen.call_args.args[0] != argv:
         fail(f"unsandboxed command argv changed: {popen.call_args!r}, {result!r}")
+
+
+@check("shell.allow_mode_sandboxes_when_available")
+def check_allow_mode_sandboxes_when_available() -> None:
+    policy = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True,
+        shell_allowlist=[()],
+    )
+    process = mock.Mock(returncode=0)
+    process.poll.return_value = 0
+    process.communicate.return_value = ("", "")
+    with (
+        mock.patch("symphonai_api.tools.shell.sys.platform", "darwin"),
+        mock.patch("symphonai_api.tools.shell.os.path.isfile", return_value=True),
+        mock.patch("symphonai_api.tools.shell.subprocess.run", return_value=subprocess.CompletedProcess([], 0)),
+        mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen,
+    ):
+        result = RunShellTool().execute(
+            ToolCall(id="allow-sandbox", name="run_shell", arguments={"argv": ["echo", "ok"]}),
+            policy,
+        )
+    command = popen.call_args.args[0]
+    if not result.ok or command[:2] != ["/usr/bin/sandbox-exec", "-p"] or command[-2:] != ["echo", "ok"]:
+        fail(f"allow mode did not sandbox its command: {command!r}, {result!r}")
+
+
+@check("shell.allow_mode_unavailable_sandbox_falls_back")
+def check_allow_mode_unavailable_sandbox_falls_back() -> None:
+    argv = ["echo", "plain"]
+    process = mock.Mock(returncode=0)
+    process.poll.return_value = 0
+    process.communicate.return_value = ("", "")
+    policy = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True,
+        shell_allowlist=[()],
+    )
+    with (
+        mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+        mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen,
+    ):
+        result = RunShellTool().execute(
+            ToolCall(id="allow-plain", name="run_shell", arguments={"argv": argv}),
+            policy,
+        )
+    if not result.ok or popen.call_args.args[0] != argv:
+        fail(f"allow mode did not run unconfined without a sandbox: {popen.call_args!r}, {result!r}")
+
+    required = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True,
+        shell_allowlist=[()], shell_sandbox=True,
+    )
+    with (
+        mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+        mock.patch("symphonai_api.tools.shell.subprocess.Popen") as strict_popen,
+    ):
+        refused = RunShellTool().execute(
+            ToolCall(id="strict-sandbox", name="run_shell", arguments={"argv": argv}),
+            required,
+        )
+    if refused.ok or refused.error != "sandbox requested but unavailable on this platform" or strict_popen.called:
+        fail(f"explicit sandbox setting did not fail closed: {refused!r}")
+
+
+@check("shell.allow_mode_confinement")
+def check_allow_mode_confinement() -> None:
+    if _sandbox_skip():
+        return
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        tempfile.TemporaryDirectory(dir="/private/var/tmp") as outside_directory,
+    ):
+        root = Path(directory)
+        policy = PermissionPolicy(
+            repo_root=root, mode="allow", shell_enabled=True,
+            shell_allowlist=[(sys.executable,)],
+        )
+        code = "from pathlib import Path; Path(__import__('sys').argv[1]).write_text('ok')"
+        for target, allowed in ((root / "inside", True), (Path(outside_directory) / "outside", False)):
+            result = RunShellTool().execute(
+                ToolCall(id="allow-confined", name="run_shell", arguments={
+                    "argv": [sys.executable, "-c", code, str(target)],
+                }),
+                policy,
+            )
+            if result.ok != allowed or target.exists() != allowed:
+                fail(f"allow-mode sandbox write to {target} returned {result!r}")
 
 
 @check("shell.sandbox_command_exit_is_ordinary")
@@ -246,6 +335,8 @@ def check_shell_cancellation_reaps_child() -> None:
             with mock.patch(
                 "symphonai_api.tools.shell.subprocess.Popen",
                 side_effect=_capturing_popen,
+            ), mock.patch(
+                "symphonai_api.tools.shell._sandbox_available", return_value=False,
             ):
                 try:
                     RunShellTool().execute(
@@ -530,6 +621,7 @@ def check_shell_timeout_seconds() -> None:
             if policy.shell_timeout_seconds != 600.0:
                 fail(f"default shell timeout was {policy.shell_timeout_seconds!r}, expected 600")
             with (
+                mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False),
                 mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=TimedOutProcess()),
                 mock.patch("symphonai_api.tools.shell._terminate_process_group"),
                 mock.patch("symphonai_api.tools.shell.time.monotonic", side_effect=[0, 0, expected]),

@@ -2783,7 +2783,7 @@ test("items in folded and open phases open their specs and reports", async () =>
   ]) {
     const button = find(
       document.getElementById("roadmap"),
-      (value) => value.tagName === "BUTTON" && value.textContent === title,
+      (value) => value.tagName === "BUTTON" && value.textContent.startsWith(title),
     );
     await button.dispatch("click");
     const text = visibleText(document.getElementById("spec"));
@@ -3644,4 +3644,22 @@ test("an empty run notice removes its row while a populated notice keeps the nor
   assert.match(css, /#run-notice:empty\s*\{[^}]*display:\s*none;/);
   assert.match(css, /\.chat-pane:has\(#run-notice:empty\)\s*\{[^}]*grid-template-rows:\s*1fr auto auto;/);
   assert.doesNotMatch(css, /#run-notice\s*\{[^}]*display:\s*none;/);
+});
+
+test("roadmap spec actions expose every workflow step and refresh after events", async () => {
+  const [app, specView, client] = await Promise.all([
+    readFile(new URL("../src/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/spec_view.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/client.js", import.meta.url), "utf8"),
+  ]);
+  for (const step of ["unplanned", "planning", "planned", "running", "ran", "in review", "reviewed", "committed"]) {
+    assert.ok(app.includes(`"${step}"`), `missing ${step} state`);
+  }
+  for (const method of ["planSpec", "runSpec", "reviewSpec", "commitSpec", "openSession"]) {
+    assert.ok(app.includes(`boundary.${method}`), `missing ${method} action`);
+    assert.ok(client.includes(`${method}(`), `client lacks ${method}`);
+  }
+  assert.match(app, /refreshSpecState\(\)/);
+  assert.match(app, /GoalChanged/);
+  assert.ok(specView.includes("specPaths"));
 });

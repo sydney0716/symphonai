@@ -294,7 +294,14 @@ def _policy(
     repo_root: Path,
 ) -> PermissionPolicy:
     if table is None:
-        return PermissionPolicy(repo_root=repo_root)
+        return PermissionPolicy(
+            repo_root=repo_root,
+            allowed_write_scope=[repo_root],
+            shell_enabled=True,
+            shell_allowlist=[()],
+            sandbox_network=True,
+            fetch_enabled=True,
+        )
     values: dict[str, object] = {"repo_root": repo_root}
     if "allowed_write_scope" in table:
         scopes = _strings(path, "allowed_write_scope", table["allowed_write_scope"])
@@ -412,7 +419,7 @@ def load_agent_file(
             if key in str(exc):
                 _raise(source, key, str(exc))
         _raise(source, "agent", str(exc))
-    if ceiling is not None:
+    if ceiling is not None and policy_table is not None:
         try:
             ceiling.refuse(spec.policy_ceiling, source=source)
         except ConfigError as exc:

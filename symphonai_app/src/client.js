@@ -304,6 +304,26 @@ export function createClient({
       });
     },
 
+    planSpec(phase, item) {
+      return request("POST", "/spec/plan", { phase, item }, readReply, { detailOnError: true });
+    },
+
+    runSpec(path) {
+      return request("POST", "/spec/run", { path }, readReply, { detailOnError: true });
+    },
+
+    reviewSpec(session_id) {
+      return request("POST", "/spec/review", { session_id }, readReply, { detailOnError: true });
+    },
+
+    commitSpec(session_id, message) {
+      return request("POST", "/spec/commit", { session_id, message }, readReply, { detailOnError: true });
+    },
+
+    specRuns() {
+      return request("GET", "/spec/runs", undefined, readListReply);
+    },
+
     approve(id, allowed, reason = "", remember = false) {
       return post("approval", {
         approval_id: id,

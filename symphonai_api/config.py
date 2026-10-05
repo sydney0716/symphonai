@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 import math
@@ -71,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "sandbox", "lsp")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "sandbox", "lsp", "worktree")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -146,6 +146,14 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
         for key in ("shell", "network"):
             if key in sandbox:
                 _boolean(source, f"sandbox.{key}", sandbox[key])
+    worktree = _table(source, values, "worktree")
+    if worktree is not None:
+        _unknown_keys(source, "worktree", worktree, {"symlink"})
+        if "symlink" in worktree:
+            for entry in _strings(source, "worktree.symlink", worktree["symlink"]):
+                path = Path(entry)
+                if not entry or path.is_absolute() or ".." in path.parts:
+                    _raise(source, "worktree.symlink", "entries must be relative paths without '..'")
     budgets = _table(source, values, "budgets")
     if budgets is not None:
         _unknown_keys(source, "budgets", budgets, {"leader", "subagent", "price_table"})
@@ -357,6 +365,36 @@ class CapabilityCeiling:
     fetch_enabled: bool | None = None
     fetch_allowlist: tuple[str, ...] | None = None
     modes: tuple[str, ...] | None = None
+
+    def bound(self, policy: PermissionPolicy) -> PermissionPolicy:
+        """Return a copy of a conversation policy limited by this ceiling."""
+        bounded = replace(policy)
+        if self.allowed_write_scope is not None:
+            bounded.allowed_write_scope = _intersect_write_scopes(
+                policy.allowed_write_scope,
+                [Path(path).resolve() for path in self.allowed_write_scope],
+            )
+        if self.shell_enabled is False:
+            bounded.shell_enabled = False
+        if self.shell_allowlist is not None:
+            bounded.shell_allowlist = _intersect_shell_allowlists(
+                policy.shell_allowlist,
+                list(self.shell_allowlist),
+            )
+        if self.fetch_enabled is False:
+            bounded.fetch_enabled = False
+            bounded.fetch_allowlist = []
+        elif self.fetch_allowlist is not None:
+            reachable = (
+                set(self.fetch_allowlist)
+                if policy.fetch_enabled
+                else set(policy.fetch_allowlist).intersection(self.fetch_allowlist)
+            )
+            bounded.fetch_enabled = False
+            bounded.fetch_allowlist = [
+                host for host in self.fetch_allowlist if host in reachable
+            ]
+        return bounded
 
     def meet(self, other: "CapabilityCeiling") -> "CapabilityCeiling":
         """Return the tighter of two ceilings, field by field."""

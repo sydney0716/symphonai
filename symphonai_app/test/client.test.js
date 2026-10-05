@@ -704,3 +704,27 @@ test("ProtocolError messages created by a token-bearing client are sanitized", (
     return true;
   });
 });
+
+test("spec workflow methods send the route payloads", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, url.endsWith("/spec/runs") ? [] : { session_id: "s", run_id: "r" });
+    },
+  });
+  await client.planSpec("39", 2);
+  await client.runSpec("specs/39/39b-run-a-spec.md");
+  await client.reviewSpec("s");
+  await client.commitSpec("s", "39b: run a spec");
+  await client.specRuns();
+  assert.deepEqual(records.map(({ url, options }) => [new URL(url).pathname, options.method, options.body && JSON.parse(options.body)]), [
+    ["/spec/plan", "POST", { phase: "39", item: 2 }],
+    ["/spec/run", "POST", { path: "specs/39/39b-run-a-spec.md" }],
+    ["/spec/review", "POST", { session_id: "s" }],
+    ["/spec/commit", "POST", { session_id: "s", message: "39b: run a spec" }],
+    ["/spec/runs", "GET", undefined],
+  ]);
+});

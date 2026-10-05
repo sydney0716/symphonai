@@ -53,6 +53,7 @@ from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import _diff_result
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.worktree import remove_worktree, worktree_diff
+from symphonai_api.worktree import create_worktree
 from symphonai_api.web_search import HttpJsonSearchBackend, search_endpoint
 from symphonai_host.broker import EventBroker
 from symphonai_host.approvals import ApprovalBroker, PendingApproval
@@ -220,6 +221,8 @@ class HostRun:
     ) -> None:
         self._provider = provider
         self._policy = policy
+        self._repo_root = policy.repo_root
+        self._base_policy = replace(policy)
         self._extensions = extensions
         permitted = self.permitted_modes()
         if not permitted:
@@ -439,6 +442,133 @@ class HostRun:
             goal = Goal(objective, check, max_rounds=max_rounds)
             return self.start(objective, _new_goal=goal)
 
+    def start_spec_run(self, spec: dict) -> tuple[str, str]:
+        """Start an isolated implementation conversation for a parsed spec."""
+        with self._lock:
+            if len(self._active_by_session) >= 4:
+                raise RunActiveError("4 conversations are already running")
+            previous = (self._conversation, self._policy, self._active)
+            self._conversation = None
+            self._active = None
+            self._policy = replace(self._base_policy, repo_root=self._repo_root)
+            self._policy.mode = "allow"
+            objective = f"{spec['text']}\n\nWrite your report at {spec['report']}."
+            check = () if not spec["validation"] else (
+                "/bin/sh", "-c", "set -e\n" + "\n".join(spec["validation"]),
+            )
+            goal = Goal(objective, check, max_rounds=5)
+            try:
+                run_id = self.start(
+                    f"Run {Path(spec['path']).name}", _new_goal=goal,
+                    _session_meta={"spec_run": {
+                        "spec": spec["path"], "report": spec["report"],
+                        "kind": "implement", "worktree": "worktree", "role": "implementer",
+                    }},
+                )
+                return self._conversation[1].run_id, run_id
+            except Exception:
+                self._conversation, self._policy, self._active = previous
+                raise
+
+    def start_spec_review(self, session_id: str) -> tuple[str, str]:
+        from symphonai_host.spec_run import parse_spec, patch_digest
+
+        with self._lock:
+            source = SessionStore.open(self._sessions_root, session_id)
+            try:
+                source_meta = source.read_meta()
+            finally:
+                source.close()
+            info = source_meta.get("spec_run")
+            if not isinstance(info, dict) or info.get("kind") != "implement":
+                raise KeyError(session_id)
+            if info.get("state") not in ("finished", "blocked", "stopped"):
+                raise RunActiveError("spec run has not finished")
+            if session_id in self._active_by_session or session_id in self._goal_checks_by_session:
+                raise RunActiveError("spec run is still active")
+            prior_review = source_meta.get("review")
+            if isinstance(prior_review, dict) and prior_review.get("session_id") in self._active_by_session:
+                raise RunActiveError("review is already running")
+            worktree = self._sessions_root / session_id / "worktree"
+            diff = worktree_diff(worktree)
+            baseline_files = {}
+            for name in diff.files:
+                file_path = worktree / name
+                baseline_files[name] = (
+                    hashlib.sha256(file_path.read_bytes()).hexdigest()
+                    if file_path.is_file() else None
+                )
+            spec = parse_spec(self._repo_root / info["spec"], self._repo_root)
+            report_path = self._repo_root / info["report"]
+            if not report_path.is_file():
+                report_path = worktree / info["report"]
+            report = report_path.read_text(encoding="utf-8") if report_path.is_file() else "No report was written."
+            patch = diff.patch[:MAX_READ_BYTES]
+            prompt = (
+                f"Review this spec:\n\n{spec['text']}\n\nReport:\n\n{report}\n\n"
+                f"Patch:\n\n{patch}\n\nReview the implementation and report. You may write follow-up specs under {Path(info['spec']).parent}/. "
+                "End the final answer with a last line `Verdict: pass` or `Verdict: follow-ups: <path>, <path>`."
+            )
+            previous = (self._conversation, self._policy, self._active)
+            self._conversation = None
+            self._active = None
+            self._policy = replace(self._base_policy, repo_root=worktree)
+            self._policy.allowed_write_scope = [worktree / "specs"]
+            self._policy.mode = "allow"
+            meta = {
+                "spec": info["spec"], "report": info["report"], "kind": "review",
+                "of": session_id, "worktree_path": str(worktree),
+                "baseline": patch_digest(diff.patch), "baseline_files": baseline_files,
+                "role": "reviewer",
+            }
+            try:
+                run_id = self.start(
+                    prompt, _session_meta={"spec_run": meta},
+                    _title=f"Review {Path(info['spec']).name}",
+                )
+                review_id = self._conversation[1].run_id
+                source = SessionStore.open(self._sessions_root, session_id)
+                try:
+                    source_meta = source.read_meta()
+                    source_meta["review"] = {"session_id": review_id, "verdict": "running", "follow_ups": [], "not_copied": []}
+                    source.write_meta(source_meta)
+                finally:
+                    source.close()
+                return review_id, run_id
+            except Exception:
+                self._conversation, self._policy, self._active = previous
+                raise
+
+    def start_spec_plan(
+        self, phase: str, item: int, title: str, phase_name: str,
+        phase_plan: str, prompt: str, baseline: list[str],
+    ) -> tuple[str, str]:
+        with self._lock:
+            if len(self._active_by_session) >= 4:
+                raise RunActiveError("4 conversations are already running")
+            previous = (self._conversation, self._policy, self._active)
+            self._conversation = None
+            self._active = None
+            self._policy = replace(self._base_policy, repo_root=self._repo_root)
+            self._policy.allowed_write_scope = [self._repo_root / "specs"]
+            self._policy.shell_enabled = False
+            self._policy.mode = "allow"
+            full_prompt = (
+                f"Roadmap phase: {phase_name}\nItem: {title}\n\n"
+                f"Phase plan:\n{phase_plan or 'No phase plan is present.'}\n\n"
+                f"{prompt}\n\nWrite exactly one spec under specs/{phase}/."
+            )
+            meta = {"spec_run": {
+                "kind": "plan", "phase": phase, "item": item,
+                "baseline_specs": baseline, "role": "planner",
+            }}
+            try:
+                run_id = self.start(full_prompt, _session_meta=meta, _title=f"Plan {title}")
+                return self._conversation[1].run_id, run_id
+            except Exception:
+                self._conversation, self._policy, self._active = previous
+                raise
+
     def goal_snapshot(self) -> dict | None:
         with self._lock:
             if self._goal is None or self._goal_session_id is None:
@@ -466,6 +596,8 @@ class HostRun:
             goal.phase = status
             goal.reason = message
             self._save_goal(session_id, goal)
+            if status in ("complete", "blocked"):
+                self._finish_spec_run(session_id, status)
             if self._goal_session_id == session_id:
                 self._goal = goal
             active = self._active_by_session.get(session_id)
@@ -628,6 +760,8 @@ class HostRun:
         attachments: tuple[ImageBlock | DocumentBlock, ...] = (),
         _goal_round: bool = False,
         _new_goal: Goal | None = None,
+        _session_meta: dict | None = None,
+        _title: str | None = None,
     ) -> str:
         with self._lock:
             if self._active is not None:
@@ -644,6 +778,12 @@ class HostRun:
                 if self._provider is None:
                     raise ProviderSelectionError("no configured provider; add an API key in Settings")
                 self._policy = replace(self._policy)
+                spec_info = None if not _session_meta else _session_meta.get("spec_run")
+                if isinstance(spec_info, dict) and spec_info.get("kind") == "implement":
+                    worktree_admin = self._sessions_root / run_id / "worktree"
+                    worktree_root = create_worktree(self._repo_root, worktree_admin)
+                    self._policy = self._policy.rerooted(worktree_root)
+                    self._policy.mode = "allow"
                 self.approvals = ApprovalBroker(
                     self._publish_approval_callback,
                     timeout=self._approval_timeout,
@@ -653,12 +793,16 @@ class HostRun:
                 session = SessionStore(
                     self._sessions_root,
                     run_id,
-                    repo_root=self._policy.repo_root,
+                    repo_root=self._repo_root if _session_meta and "spec_run" in _session_meta else self._policy.repo_root,
                     events=fan_out(
                         lambda event, sid=run_id: self._publish_session(event, sid),
                         self._hooks,
                     ),
                 )
+                if _session_meta:
+                    meta = session.read_meta()
+                    meta.update(_session_meta)
+                    session.write_meta(meta)
                 try:
                     leader = self._new_leader(session)
                 except Exception:
@@ -667,7 +811,10 @@ class HostRun:
                 seeded = []
                 if self._system_prompt:
                     seeded.append(Message(role=Role.SYSTEM, content=self._system_prompt))
-                instructions = load_instructions(self._policy, working_dir=self._working_dir)
+                instruction_policy = self._policy
+                if _session_meta and "spec_run" in _session_meta:
+                    instruction_policy = replace(self._policy, repo_root=self._repo_root)
+                instructions = load_instructions(instruction_policy, working_dir=self._working_dir)
                 for warning in instructions.warnings:
                     print(f"instruction warning: {warning}", file=sys.stderr)
                 rendered = instructions.render()
@@ -693,9 +840,11 @@ class HostRun:
                     if attachments and isinstance(attachments[0], DocumentBlock)
                     else None
                 )
-                meta["title"] = _conversation_title(prompt) or attachment_title or (
+                meta["title"] = _title or _conversation_title(prompt) or attachment_title or (
                     "Attachment" if attachments else ""
                 )
+                if _session_meta:
+                    meta.update(_session_meta)
                 if self._provider_choice is not None:
                     meta["provider_choice"] = self._provider_choice
                 session.write_meta(meta)
@@ -822,6 +971,10 @@ class HostRun:
                 )
                 for name, spec in roster.items()
             }
+        meta = session.read_meta()
+        role = meta.get("spec_run", {}).get("role") if isinstance(meta.get("spec_run"), dict) else None
+        if isinstance(role, str) and role in roster:
+            roster["leader"] = roster[role]
         defined_leader = roster.get("leader")
         if (
             defined_leader is not None
@@ -1570,17 +1723,20 @@ class HostRun:
                     })
             return {"turns": turns, "files": files, "worktrees": worktrees}
 
-    def apply_worktree(self, name: str) -> dict:
+    def apply_worktree(
+        self, name: str, *, directory: Path | None = None,
+        checkpoints_override: CheckpointStore | None = None,
+    ) -> dict:
         with self._lock:
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
             if self._conversation is None:
                 raise KeyError(name)
             leader, session = self._conversation
-            directory = session.directory / "worktrees" / name
+            directory = (session.directory / "worktrees" / name) if directory is None else Path(directory)
             if not directory.is_dir():
                 raise KeyError(name)
-            checkpoints = leader._config.checkpoints
+            checkpoints = checkpoints_override or leader._config.checkpoints
             if checkpoints is None:
                 raise RuntimeError("checkpoint store is unavailable")
             diff = worktree_diff(directory)
@@ -1621,9 +1777,76 @@ class HostRun:
                 raise WorktreeApplyConflict(message or "git apply failed")
             for _, target in checkpoint_paths:
                 checkpoints.after_write(target)
-            remove_worktree(root, directory)
-            leader.forget_subagent(name)
+            remove_worktree(git_root, directory)
+            if checkpoints_override is None:
+                leader.forget_subagent(name)
             return {"applied": list(diff.files)}
+
+    def commit_spec(self, session_id: str, message: str) -> dict:
+        if not message.strip():
+            raise ValueError("commit message must not be blank")
+        source = SessionStore.open(self._sessions_root, session_id)
+        try:
+            meta = source.read_meta()
+            info = meta.get("spec_run")
+            review = meta.get("review")
+        finally:
+            source.close()
+        if not isinstance(info, dict) or info.get("kind") != "implement":
+            raise KeyError(session_id)
+        if not isinstance(review, dict) or review.get("verdict") not in ("passed", "follow-ups"):
+            raise RunActiveError("spec run has no passing review")
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=self._repo_root,
+            capture_output=True, check=False,
+        )
+        if staged.returncode != 0:
+            raise WorktreeApplyConflict("the main tree has staged changes")
+        worktree = self._sessions_root / session_id / "worktree"
+        diff = worktree_diff(worktree)
+        if not diff.files:
+            return {"commit": "", "paths": []}
+        checkpoints = CheckpointStore(
+            self._sessions_root / str(review.get("session_id")) / "checkpoints",
+            self._repo_root,
+        )
+        applied = self.apply_worktree(
+            f"spec {session_id}", directory=worktree,
+            checkpoints_override=checkpoints,
+        )
+        paths = applied["applied"]
+        added = subprocess.run(
+            ["git", "add", "--", *paths], cwd=self._repo_root,
+            capture_output=True, check=False,
+        )
+        if added.returncode:
+            raise WorktreeApplyConflict(added.stderr.decode("utf-8", errors="replace").strip())
+        committed = subprocess.run(
+            ["git", "commit", "-m", message], cwd=self._repo_root,
+            capture_output=True, check=False,
+        )
+        if committed.returncode:
+            subprocess.run(["git", "reset", "--", *paths], cwd=self._repo_root, capture_output=True, check=False)
+            detail = (committed.stderr or committed.stdout).decode("utf-8", errors="replace").strip()
+            raise WorktreeApplyConflict(detail or "git commit failed")
+        sha_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self._repo_root,
+            capture_output=True, check=True,
+        )
+        sha = os.fsdecode(sha_result.stdout.strip())
+        source = SessionStore.open(self._sessions_root, session_id)
+        try:
+            meta = source.read_meta()
+            meta["committed"] = {"sha": sha, "message": message}
+            source.write_meta(meta)
+        finally:
+            source.close()
+        try:
+            from symphonai_host.spec_run import mark_roadmap_spec_done
+            mark_roadmap_spec_done(self._repo_root, str(info["spec"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return {"commit": sha, "paths": paths}
 
     def discard_worktree(self, name: str) -> dict:
         with self._lock:
@@ -1723,7 +1946,7 @@ class HostRun:
 
         result = run_check(
             context.goal.check,
-            self._policy.repo_root,
+            self._policy_by_session[context.session_id].repo_root,
             cancelled=context.cancel,
             set_process=set_process,
         )
@@ -1771,6 +1994,8 @@ class HostRun:
                 self._goal_check_thread = None
             self._goal_checks_by_session.pop(context.session_id, None)
             self._goal_event("check", goal, run_id, context.agent_id)
+            if goal.phase in ("complete", "blocked", "paused"):
+                self._finish_spec_run(context.session_id, goal.phase)
             if next_prompt is not None and not self._closing:
                 try:
                     self._start_for_session(context.session_id, next_prompt)
@@ -1781,6 +2006,136 @@ class HostRun:
                     self._goal_event("pause", goal, run_id, self._root_agent_id())
         with self._lock:
             self._close_idle_conversations_locked()
+
+    def _finish_spec_run(self, session_id: str, phase: str) -> None:
+        try:
+            store = SessionStore.open(self._sessions_root, session_id)
+            try:
+                meta = store.read_meta()
+                info = meta.get("spec_run")
+                if not isinstance(info, dict) or info.get("kind") != "implement":
+                    return
+                root = self._sessions_root / session_id / "worktree"
+                report = info.get("report")
+                copied = False
+                if isinstance(report, str):
+                    source = root / report
+                    ignored = subprocess.run(
+                        ["git", "check-ignore", "-q", "--", report], cwd=self._repo_root,
+                        capture_output=True, check=False,
+                    ).returncode == 0
+                    if source.is_file() and ignored and ".env" not in Path(report).parts:
+                        target = self._repo_root / report
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, target)
+                        copied = True
+                info.update({
+                    "state": {"complete": "finished", "blocked": "blocked", "paused": "stopped"}.get(phase, "stopped"),
+                    "report_copied": copied,
+                })
+                meta["spec_run"] = info
+                store.write_meta(meta)
+            finally:
+                store.close()
+        except (OSError, SessionError, ValueError):
+            return
+
+    def _finish_spec_review(self, session_id: str, leader: Leader) -> None:
+        from symphonai_host.spec_run import patch_digest, review_verdict
+
+        review_store = SessionStore.open(self._sessions_root, session_id)
+        try:
+            review_meta = review_store.read_meta()
+            review_info = review_meta.get("spec_run")
+        finally:
+            review_store.close()
+        if not isinstance(review_info, dict) or review_info.get("kind") != "review":
+            return
+        source_id = review_info.get("of")
+        if not isinstance(source_id, str):
+            return
+        source = SessionStore.open(self._sessions_root, source_id)
+        try:
+            source_meta = source.read_meta()
+            original = source_meta.get("spec_run")
+            if not isinstance(original, dict):
+                return
+            worktree = Path(review_info.get("worktree_path", ""))
+            current = worktree_diff(worktree)
+            answer = next((message.text for message in reversed(leader._chat_messages) if message.role == Role.ASSISTANT and message.text.strip()), "")
+            verdict, follow_ups = review_verdict(answer)
+            baseline_files = review_info.get("baseline_files", {})
+            unchanged = isinstance(baseline_files, dict) and all(
+                (
+                    (worktree / name).is_file()
+                    and hashlib.sha256((worktree / name).read_bytes()).hexdigest() == digest
+                    if digest is not None else not (worktree / name).exists()
+                )
+                for name, digest in baseline_files.items()
+            )
+            allowed_additions = set(follow_ups) if verdict == "follow-ups" else set()
+            additions = set(current.files) - set(baseline_files if isinstance(baseline_files, dict) else {})
+            unchanged = unchanged and additions <= allowed_additions
+            if not unchanged:
+                verdict = "tree-changed"
+                follow_ups = []
+            copied: list[str] = []
+            not_copied: list[str] = []
+            spec_directory = Path(str(original.get("spec", ""))).parent
+            if verdict == "follow-ups":
+                for value in follow_ups:
+                    relative = Path(value)
+                    if relative.is_absolute() or ".." in relative.parts or not relative.as_posix().startswith(spec_directory.as_posix() + "/"):
+                        not_copied.append(value)
+                        continue
+                    source_file = worktree / relative
+                    target_file = self._repo_root / relative
+                    if not source_file.is_file() or target_file.exists():
+                        not_copied.append(value)
+                        continue
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_file, target_file)
+                    copied.append(value)
+            source_meta["review"] = {
+                "session_id": session_id, "verdict": verdict,
+                "follow_ups": copied, "not_copied": not_copied,
+            }
+            source.write_meta(source_meta)
+        finally:
+            source.close()
+
+    def _finish_spec_plan(self, session_id: str) -> None:
+        from symphonai_host.spec_run import bind_roadmap_item
+
+        store = SessionStore.open(self._sessions_root, session_id)
+        try:
+            meta = store.read_meta()
+            info = meta.get("spec_run")
+            if not isinstance(info, dict) or info.get("kind") != "plan":
+                return
+            phase = str(info.get("phase", ""))
+            baseline = set(info.get("baseline_specs", []))
+            phase_root = self._repo_root / "specs" / phase
+            created = sorted(
+                path.relative_to(self._repo_root).as_posix()
+                for path in phase_root.rglob("*.md")
+                if path.is_file()
+                and path.relative_to(self._repo_root).as_posix() not in baseline
+                and not path.name.endswith("-PLAN.md")
+                and "specs/report/" not in path.relative_to(self._repo_root).as_posix()
+            ) if phase_root.is_dir() else []
+            bound = created if len(created) == 1 else []
+            if bound:
+                try:
+                    bind_roadmap_item(self._repo_root, phase, int(info["item"]), bound[0])
+                except (OSError, ValueError, KeyError, TypeError):
+                    bound = []
+            info.update({"created": created, "bound": bound[0] if bound else None})
+            info["state"] = "finished"
+            meta["spec_run"] = info
+            store.write_meta(meta)
+        finally:
+            store.close()
 
     def _run(
         self,
@@ -1814,6 +2169,8 @@ class HostRun:
             if terminal_event is not None:
                 self._publish(run_id, terminal_event, session_id=session_id)
         if not goal_round:
+            self._finish_spec_review(session_id, leader)
+            self._finish_spec_plan(session_id)
             with self._lock:
                 self._close_idle_conversations_locked()
             if failure is not None:
@@ -1853,6 +2210,7 @@ class HostRun:
                 goal.phase = "paused"
                 goal.reason = reason
                 self._save_goal(session_id, goal)
+                self._finish_spec_run(session_id, "paused")
                 self._goal_event("pause", goal, run_id, leader.agent_ref.agent_id)
                 run_check_now = False
         if run_check_now:

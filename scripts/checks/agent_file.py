@@ -22,12 +22,15 @@ from symphonai_api.agent_spec import (
     Isolation,
     ModelSelector,
 )
+from symphonai_api.config import CapabilityCeiling
 from symphonai_api.agent_memory import MemorySettings
 from symphonai_api.call_class import CallClass
 from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.identity import SCHEMA_VERSION
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
+from symphonai_api.models import ToolCall
+from symphonai_api.tools.shell import RunShellTool
 from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
@@ -839,3 +842,67 @@ def memory_reaches_agent_spec() -> None:
         )
         if loaded.memory != MemorySettings(enabled=True, max_entries=7):
             fail(f"loaded AgentSpec discarded memory settings: {loaded.memory!r}")
+
+
+@check("agent_file.no_policy_is_neutral_ceiling")
+def no_policy_is_neutral_ceiling() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        path = _write(root, "unrestricted.toml", 'prompt = "Use the conversation policy."\n')
+        loaded = load_agent_file(path, repo_root=root, default_model=ModelSelector("fake"))
+        conversation = PermissionPolicy(
+            repo_root=root,
+            allowed_write_scope=[root],
+            shell_enabled=True,
+            shell_allowlist=[()],
+            fetch_enabled=True,
+        )
+        effective = conversation.narrowed(loaded.policy_ceiling)
+        if (
+            effective.allowed_write_scope != conversation.allowed_write_scope
+            or effective.shell_enabled != conversation.shell_enabled
+            or effective.shell_allowlist != conversation.shell_allowlist
+            or effective.fetch_enabled != conversation.fetch_enabled
+        ):
+            fail(f"agent without a policy table narrowed the conversation: {effective!r}")
+        if not effective.check_write("new-file.txt").allowed or not effective.check_shell(["pytest", "--version"]).allowed:
+            fail(f"agent without a policy table lost write or shell access: {effective!r}")
+        restricted = load_agent_file(
+            path,
+            repo_root=root,
+            default_model=ModelSelector("fake"),
+            ceiling=CapabilityCeiling(shell_enabled=False),
+        )
+        restricted_effective = PermissionPolicy(
+            repo_root=root, shell_enabled=False,
+        ).narrowed(restricted.policy_ceiling)
+        if restricted_effective.check_shell(["pytest"]).allowed:
+            fail("table-less agent escaped the conversation's shell ceiling")
+
+        limited_path = _write(
+            root,
+            "limited.toml",
+            'prompt = "Use only git status."\n[policy]\nshell_enabled = true\nshell_allowlist = [["git", "status"]]\n',
+        )
+        limited = load_agent_file(
+            limited_path, repo_root=REPO_ROOT, default_model=ModelSelector("fake")
+        )
+        limited_conversation = PermissionPolicy(
+            repo_root=REPO_ROOT,
+            allowed_write_scope=[REPO_ROOT],
+            shell_enabled=True,
+            shell_allowlist=[()],
+            fetch_enabled=True,
+        )
+        limited_effective = limited_conversation.narrowed(limited.policy_ceiling)
+        if (
+            not limited_effective.check_shell(["git", "status"]).allowed
+            or limited_effective.check_shell(["pytest"]).allowed
+        ):
+            fail(f"agent policy table did not narrow shell commands: {limited_effective!r}")
+        status = RunShellTool().execute(
+            ToolCall("agent-git-status", "run_shell", {"argv": ["git", "status"]}),
+            limited_effective,
+        )
+        if not status.ok:
+            fail(f"agent policy did not execute its allowed git status command: {status!r}")

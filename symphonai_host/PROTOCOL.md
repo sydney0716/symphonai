@@ -108,6 +108,31 @@ line remains machine-readable for a parent process.
 
 ## Sessions
 
+### Spec runs
+
+`[worktree] symlink = [".venv"]` may list relative paths that should be
+symlinked from the main repository into newly created worktrees. Authenticated
+`POST /spec/run` accepts `{"path":"specs/<phase>/<file>.md"}` and starts an
+isolated implementation conversation. `GET /spec/runs` lists those runs,
+their worktree changes, state, and whether an ignored report was copied into
+the main tree. A spec validation block runs in the worktree; specs without one
+use a checkless goal.
+
+`POST /spec/review` accepts a spec run's `session_id`. The reviewer reads its
+spec, report and patch, and the final non-empty answer line determines `passed`,
+`follow-ups`, or `no-verdict`. A changed implementation tree overrides the
+answer with `tree-changed`. Follow-up specs under the same phase directory are
+copied to the main tree when new. `POST /spec/commit` accepts `session_id` and
+a non-blank `message`; it applies the worktree, stages only its changed paths,
+and commits them after a person requests it. Run entries expose `review`,
+`committed`, and the default `commit_message`.
+
+`POST /spec/plan` accepts a roadmap `phase` id and zero-based `item` index.
+Planner sessions are listed as `kind: "plan"` with `phase`, `item`, and
+`bound`. A single new Markdown spec under that phase binds the roadmap item.
+After a successful spec commit, every roadmap item bound to the spec is marked
+done, and the phase is marked `done` only when every item is done.
+
 Authenticated `GET /files?query=<text>&limit=<n>` searches readable regular
 files under the repository root and returns `{"files": [...], "truncated":
 bool}`. The default limit is 20; valid limits are 1–50. The search skips
@@ -247,6 +272,20 @@ its eventual answer still resolves that request. A host starts in `ask`; if
 `agents.ceiling.modes` excludes ask, it starts in the tightest permitted mode,
 preferring `plan` to `allow`. An empty modes ceiling is a configuration error.
 Starting a new chat or reopening a session resets to that starting mode.
+
+Permission modes have these effects: `ask` requests approval for writes, shell
+commands, and non-preapproved fetches; `plan` refuses writes and shell commands
+while fetches continue to follow the configured fetch rules; `allow` permits
+writes anywhere inside the repository, any command, and public URL fetches
+without asking. Repository boundaries, forbidden files, always-denied
+commands, and local or private fetch hosts remain refused in every mode. In
+`allow`, shell commands run in the configured sandbox when it is available;
+otherwise they run unconfined. `sandbox.shell = true` requires the sandbox and
+refuses shell commands when it is unavailable. Shell network access remains
+controlled by `sandbox.network`. The machine owner's `agents.ceiling` limits
+the conversation's writes, shell commands, and fetches before it starts; all
+per-conversation and subagent policies inherit those limits. In `ask`, the
+person may still approve an operation outside those static limits.
 
 Authenticated `POST /compact` takes `{}` or `{"instructions": str}` and
 returns `{"changed": bool, "before_tokens": int, "after_tokens": int,

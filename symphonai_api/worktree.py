@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from symphonai_api.config import load_config
+
 
 class WorktreeError(RuntimeError):
     """A git worktree could not be created, inspected, or removed."""
@@ -63,7 +65,15 @@ def create_worktree(repo_root: Path, path: Path) -> Path:
             except WorktreeError:
                 pass
         raise
-    return path / relative_root
+    worktree_root = path / relative_root
+    configured = load_config(repo_root=repo_root).get("worktree.symlink", [])
+    for entry in configured if isinstance(configured, list) else ():
+        source = repo_root / entry
+        target = worktree_root / entry
+        if source.exists() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(source, target_is_directory=source.is_dir())
+    return worktree_root
 
 
 def worktree_diff(path: Path) -> WorktreeDiff:
