@@ -53,7 +53,14 @@ function activityText(entry) {
 }
 
 function renderPrompt(document, entry) {
-  return element(document, "p", { className: "prompt", text: entry.text });
+  const prompt = element(document, "p", { className: "prompt", text: entry.text });
+  for (const attachment of entry.attachments ?? []) {
+    const label = attachment.kind === "document"
+      ? `PDF · ${attachment.filename || "document"}`
+      : `Image${attachment.filename ? ` · ${attachment.filename}` : ""}`;
+    append(prompt, element(document, "span", { className: "attachment", text: label }));
+  }
+  return prompt;
 }
 
 function renderInline(document, node) {

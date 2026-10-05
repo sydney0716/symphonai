@@ -15,6 +15,7 @@ from symphonai_api.cancellation import CancellationToken
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.extensions import Extensions
 from symphonai_api.instructions import load_instructions
+from symphonai_api.lsp import LspManager
 from symphonai_api.identity import new_agent_ref
 from symphonai_api.models import Message, Role
 from symphonai_api.permissions import PermissionPolicy
@@ -29,8 +30,10 @@ from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import EditFileTool, MultiEditFileTool
+from symphonai_api.tools.diagnostics import DiagnosticsAfterWrite
 from symphonai_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
 from symphonai_api.tools.memory import MemoryTool
+from symphonai_api.tools.lsp import LspTool
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.tools.search import GlobTool, GrepTool
 from symphonai_api.tools.shell import RunShellTool
@@ -50,6 +53,7 @@ def standard_tool_registry(
     memory_tool: MemoryTool | None = None,
     skills: Mapping[str, Skill] | None = None,
     checkpoints: CheckpointStore | None = None,
+    lsp: LspManager | None = None,
 ) -> dict[str, LocalTool]:
     """The standard tools plus explicitly supplied optional tools.
 
@@ -69,10 +73,19 @@ def standard_tool_registry(
         RunShellTool(),
         WebFetchTool(),
     ]
+    if lsp is not None and lsp.has_enabled_servers:
+        tools = [
+            DiagnosticsAfterWrite(tool, lsp)
+            if tool.name in {"write_file", "edit_file", "multi_edit_file"}
+            else tool
+            for tool in tools
+        ]
     if search_backend is not None:
         tools.append(WebSearchTool(search_backend))
     if skills:
         tools.append(UseSkillTool(skills))
+    if lsp is not None and lsp.has_enabled_servers:
+        tools.append(LspTool(lsp))
     if result_store is not None:
         tools.append(ReadToolResultTool(result_store))
     if names is not None:

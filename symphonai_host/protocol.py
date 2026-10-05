@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import dataclasses
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from symphonai_api.events import Event
+from symphonai_api.content import content_block_from_bytes
+from symphonai_api.models import DocumentBlock, ImageBlock
 
 
 PROTOCOL_VERSION = 1
@@ -29,6 +33,7 @@ class UnknownEvent:
 @dataclass(frozen=True)
 class PromptRequest:
     prompt: str
+    attachments: tuple[ImageBlock | DocumentBlock, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,7 @@ class ApprovalRequested:
     details: str
     tool_call_id: str = ""
     remember: str = ""
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,8 @@ class HistoryMessage:
     text: str
     tool_calls: list[dict[str, str]]
     turn_id: str | None
+    attachments: list[dict] = field(default_factory=list, kw_only=True)
+    session_id: str | None = field(default=None, kw_only=True)
 
     def payload(self) -> dict:
         return {
@@ -75,6 +83,8 @@ class HistoryMessage:
             "text": self.text,
             "tool_calls": self.tool_calls,
             "turn_id": self.turn_id,
+            "attachments": self.attachments,
+            "session_id": self.session_id,
         }
 
 
@@ -183,7 +193,31 @@ def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | 
     if not isinstance(payload, dict):
         raise ProtocolError(f"{kind} request payload must be an object")
     if kind == "prompt":
-        return PromptRequest(prompt=_required(payload, kind, "prompt", str))
+        prompt = _required(payload, kind, "prompt", str)
+        serialized = payload.get("attachments", [])
+        if not isinstance(serialized, list):
+            raise ProtocolError("prompt request field attachments must be a list")
+        if len(serialized) > 10:
+            raise ProtocolError("attachment 10: at most 10 attachments are allowed")
+        attachments = []
+        for index, item in enumerate(serialized):
+            if not isinstance(item, dict):
+                raise ProtocolError(f"attachment {index}: must be an object")
+            data = item.get("data")
+            if not isinstance(data, str):
+                raise ProtocolError(f"attachment {index}: data must be a base64 string")
+            filename = item.get("filename")
+            if "filename" in item and not isinstance(filename, str):
+                raise ProtocolError(f"attachment {index}: filename must be a string")
+            try:
+                raw = base64.b64decode(data, validate=True)
+            except (binascii.Error, ValueError):
+                raise ProtocolError(f"attachment {index}: invalid base64") from None
+            try:
+                attachments.append(content_block_from_bytes(raw, filename=filename))
+            except ValueError as exc:
+                raise ProtocolError(f"attachment {index}: {exc}") from None
+        return PromptRequest(prompt=prompt, attachments=tuple(attachments))
     if kind == "approval":
         return ApprovalReply(
             approval_id=_required(payload, kind, "approval_id", str),

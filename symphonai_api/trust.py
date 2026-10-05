@@ -13,6 +13,7 @@ CAPABILITIES: tuple[str, ...] = (
     "agents",
     "hooks",
     "mcp",
+    "lsp",
     "plugins",
     "skills",
 )

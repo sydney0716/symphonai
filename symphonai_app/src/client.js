@@ -236,8 +236,11 @@ export function createClient({
       };
     },
 
-    async prompt(text) {
-      const encoded = encodeRequest("prompt", { prompt: text });
+    async prompt(text, attachments = []) {
+      const encoded = encodeRequest("prompt", {
+        prompt: text,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      });
       const options = {
         method: "POST",
         headers: headers({ "Content-Type": "application/json" }),
@@ -285,6 +288,18 @@ export function createClient({
 
     revertChanges(payload) {
       return request("POST", "/changes/revert", payload, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    applyWorktree(name) {
+      return request("POST", "/worktree/apply", { name }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    discardWorktree(name) {
+      return request("POST", "/worktree/discard", { name }, readReply, {
         detailOnError: true,
       });
     },
@@ -408,6 +423,15 @@ export function createClient({
 
     health() {
       return request("GET", "/health");
+    },
+
+    files(query = "", limit = 20) {
+      const parameters = new URLSearchParams({ query, limit: String(limit) });
+      return request("GET", `/files?${parameters}`);
+    },
+
+    history(limit = 100) {
+      return request("GET", `/history?limit=${encodeURIComponent(String(limit))}`);
     },
 
     async file(path) {

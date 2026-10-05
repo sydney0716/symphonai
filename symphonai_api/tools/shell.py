@@ -11,7 +11,10 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
+import tempfile
 import time
+from pathlib import Path
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.models import ToolCall, ToolResult
@@ -22,6 +25,28 @@ from symphonai_api.tools.shell_classify import classify
 
 CANCEL_POLL_SECONDS = 0.05
 CLEANUP_TIMEOUT_SECONDS = 1.0
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def _seatbelt_profile(policy: PermissionPolicy) -> str:
+    def quote_path(path: str) -> str:
+        return '"' + path.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
+
+    writable = {
+        str(policy.repo_root.resolve()),
+        str(os.path.realpath(os.environ.get("TMPDIR", tempfile.gettempdir()))),
+        str(Path("/private/tmp").resolve()),
+        str(Path("/private/var/folders").resolve()),
+    }
+    rules = ["(version 1)", "(allow default)", "(deny file-write*)"]
+    rules.extend(
+        f"(allow file-write* (subpath {quote_path(path)}))"
+        for path in sorted(writable)
+    )
+    rules.extend(("(allow file-write* (literal \"/dev/null\"))", "(allow file-write* (literal \"/dev/tty\"))"))
+    if not policy.sandbox_network:
+        rules.extend(("(deny network*)", "(allow network* (local unix))"))
+    return "\n".join(rules)
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:
@@ -121,9 +146,18 @@ class RunShellTool(LocalTool):
         decision = policy.check_shell(argv)
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
+        command = argv
+        if policy.shell_sandbox:
+            if sys.platform != "darwin" or not os.path.isfile(SANDBOX_EXEC):
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error="sandbox requested but unavailable on this platform",
+                )
+            command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
         try:
             proc = subprocess.Popen(
-                argv,
+                command,
                 shell=False,
                 cwd=policy.repo_root,
                 stdout=subprocess.PIPE,
@@ -150,7 +184,7 @@ class RunShellTool(LocalTool):
                         proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
                     except subprocess.TimeoutExpired:
                         pass
-                    raise subprocess.TimeoutExpired(argv, timeout_seconds)
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
                 delay = min(CANCEL_POLL_SECONDS, remaining)
                 try:
                     stdout, stderr = proc.communicate(timeout=delay)

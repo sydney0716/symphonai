@@ -104,6 +104,21 @@ test("rejection restores the in-flight text to the queue front", () => {
   assert.deepEqual(actions, [{ kind: "rejected", error: "offline" }]);
 });
 
+test("attachments survive dispatch, conflict adoption and rejection", () => {
+  const attachments = [{ data: "AQ==", filename: "x.png", kind: "image" }];
+  const adopted = createTurnState();
+  assert.deepEqual(adopted.submit("look", attachments), [{
+    kind: "prompt", id: "message-1", text: "look", attachments,
+  }]);
+  adopted.adopted("active-run");
+  assert.deepEqual(adopted.queue[0].attachments, attachments);
+
+  const rejected = createTurnState();
+  rejected.submit("look", attachments);
+  rejected.rejected("offline");
+  assert.deepEqual(rejected.queue[0].attachments, attachments);
+});
+
 test("submit dispatches a queued message before a newly typed one", () => {
   const turn = createTurnState();
   turn.submit("first");

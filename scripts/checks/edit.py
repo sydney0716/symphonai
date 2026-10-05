@@ -891,3 +891,19 @@ def check_edit_checkpoint_restore_marks_ledger_stale() -> None:
         expected = "file has changed since it was read; read it again before editing it"
         if not changed.ok or stale.ok or stale.error != expected:
             fail(f"post-restore edit was not refused as stale: {stale!r}")
+
+
+@check("edit.checkpoint_label_reload")
+def check_edit_checkpoint_label_reload() -> None:
+    with workspace() as ws:
+        directory = ws.root / "checkpoints"
+        manifest = directory / "manifest.jsonl"
+        directory.mkdir()
+        manifest.write_text('{"type":"begin","key":"legacy"}\n')
+        checkpoints = CheckpointStore(directory, ws.root)
+        if checkpoints.label("legacy") is not None:
+            fail("legacy checkpoint unexpectedly acquired a label")
+        checkpoints.begin("applied", label="Applied worktree w1")
+        reopened = CheckpointStore(directory, ws.root)
+        if reopened.label("applied") != "Applied worktree w1":
+            fail("checkpoint label did not survive reload")

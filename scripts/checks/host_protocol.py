@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import base64
 import gc
 import json
 from dataclasses import dataclass
@@ -177,6 +178,35 @@ def check_request_validation() -> None:
                 fail(f"{kind} validation error omitted its name: {exc}")
         else:
             fail(f"invalid {kind} request was accepted")
+
+
+@check("host_protocol.prompt_attachments")
+def check_prompt_attachments() -> None:
+    png = b"\x89PNG\r\n\x1a\n\x00"
+    encoded = base64.b64encode(png).decode("ascii")
+    request = decode_request("prompt", {
+        "prompt": "what is this",
+        "attachments": [{"data": encoded}],
+    })
+    if not isinstance(request, PromptRequest) or len(request.attachments) != 1:
+        fail(f"PNG attachment was not decoded: {request!r}")
+    image = request.attachments[0]
+    if image.data != encoded or image.media_type != "image/png":
+        fail(f"PNG attachment metadata or data changed: {image!r}")
+    pdf = decode_request("prompt", {
+        "prompt": "",
+        "attachments": [{"data": base64.b64encode(b"%PDF-1.7 test").decode(), "filename": "spec.pdf"}],
+    })
+    if pdf.attachments[0].filename != "spec.pdf":
+        fail(f"PDF filename was lost: {pdf.attachments[0]!r}")
+    for attachments, index in (([{"data": "%%%"}], 0), ([{"data": "a" * 8}] * 11, 10)):
+        try:
+            decode_request("prompt", {"prompt": "bad", "attachments": attachments})
+        except ProtocolError as exc:
+            if f"attachment {index}" not in str(exc):
+                fail(f"attachment error omitted index {index}: {exc}")
+        else:
+            fail("invalid attachments were accepted")
 
 
 @check("host_protocol.approval_remember_validation")

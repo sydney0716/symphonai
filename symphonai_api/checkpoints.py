@@ -25,6 +25,7 @@ class CheckpointStore:
         self._lock = threading.RLock()
         self._key: str | None = None
         self._keys: list[str] = []
+        self._labels: dict[str, str] = {}
         self._entries: list[CheckpointEntry] = []
         self._entry_keys: set[tuple[str, str]] = set()
         self._pending: dict[tuple[str, str], str | None] = {}
@@ -45,6 +46,9 @@ class CheckpointStore:
                 if kind == "begin" and isinstance(record.get("key"), str):
                     self._key = record["key"]
                     self._keys.append(self._key)
+                    label = record.get("label")
+                    if isinstance(label, str):
+                        self._labels[self._key] = label
                 elif kind == "write":
                     key, path, backup = record.get("key"), record.get("path"), record.get("backup")
                     if (
@@ -90,15 +94,21 @@ class CheckpointStore:
             raise ValueError(f"checkpoint path is outside repository: {path}") from None
         return resolved, relative
 
-    def begin(self, key: str) -> None:
+    def begin(self, key: str, *, label: str | None = None) -> None:
         if not isinstance(key, str) or not key:
             raise ValueError("checkpoint key must be a non-empty string")
+        if label is not None and not isinstance(label, str):
+            raise ValueError("checkpoint label must be a string")
         with self._lock:
             for backup in self._pending.values():
                 if backup is not None:
                     (self.directory / backup).unlink(missing_ok=True)
             self._pending.clear()
-            self._append({"type": "begin", "key": key})
+            record = {"type": "begin", "key": key}
+            if label is not None:
+                record["label"] = label
+                self._labels[key] = label
+            self._append(record)
             self._key = key
             self._keys.append(key)
 
@@ -181,6 +191,10 @@ class CheckpointStore:
         with self._lock:
             return tuple(self._keys)
 
+    def label(self, key: str) -> str | None:
+        with self._lock:
+            return self._labels.get(key)
+
     def copy_kept_to(
         self,
         destination: CheckpointStore,
@@ -191,7 +205,7 @@ class CheckpointStore:
         selected = set(keys)
         with self._lock, destination._lock:
             for key in keys:
-                destination.begin(key)
+                destination.begin(key, label=self.label(key))
             for entry in self._entries:
                 if entry.key not in selected:
                     continue

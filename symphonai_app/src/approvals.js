@@ -24,6 +24,7 @@ function questionOf(value) {
       ? { remember: value.remember }
       : {}),
     state: "open",
+    ...(typeof value.session_id === "string" ? { session_id: value.session_id } : {}),
     ...(typeof value.tool_call_id === "string" && value.tool_call_id.length > 0
       ? { tool_call_id: value.tool_call_id }
       : {}),

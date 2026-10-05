@@ -137,6 +137,7 @@ button.session-link {
 }
 
 .changes-file,
+.changes-worktree,
 .changes-turn,
 .changes-conflict {
   margin: 1rem 0;
@@ -145,7 +146,8 @@ button.session-link {
   border-radius: 0.4rem;
 }
 
-.changes-file pre {
+.changes-file pre,
+.changes-worktree pre {
   max-height: 32rem;
   overflow: auto;
   padding: 0.8rem;
@@ -283,6 +285,29 @@ button.session-link {
   gap: 0.75rem;
 }
 
+.prompt-attachments {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.attachment-chip,
+.attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border-radius: 0.4rem;
+  padding: 0.25rem 0.5rem;
+  background: #3b4b5f;
+  color: #eef3f8;
+  font-size: 0.85rem;
+}
+
+.attachment-chip button {
+  margin: 0;
+}
+
 .conversation-usage {
   grid-column: 1 / -1;
   grid-row: 2;
@@ -319,6 +344,23 @@ button.session-link {
   box-shadow: 0 0.5rem 1.5rem #0008;
 }
 
+.file-menu {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 0.2rem;
+  max-height: min(18rem, 45vh);
+  overflow: auto;
+  padding: 0.5rem;
+  border: 1px solid #52647a;
+  border-radius: 0.5rem;
+  background: #171d26;
+  box-shadow: 0 0.5rem 1.5rem #0008;
+}
+
+.file-menu:empty {
+  display: none;
+}
+
 .command-suggestion {
   width: 100%;
   padding: 0.45rem 0.6rem;
@@ -331,6 +373,22 @@ button.session-link {
 }
 
 .command-suggestion.focused {
+  background: #29384a;
+  border-color: #82b5f2;
+}
+
+.file-suggestion {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.3rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-suggestion.focused {
   background: #29384a;
   border-color: #82b5f2;
 }
@@ -574,13 +632,22 @@ button.session-link {
   resize: vertical;
 }
 
+#prompt-attachments {
+  grid-row: 2;
+}
+
+#attach-button {
+  grid-column: 1;
+  grid-row: 3;
+}
+
 .prompt-form button {
   grid-column: 2;
   grid-row: 1;
 }
 
 .prompt-error {
-  grid-column: 1 / -1;
+  grid-column: 2;
   grid-row: 3;
   margin: 0;
 }

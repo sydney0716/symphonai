@@ -74,19 +74,23 @@ from symphonai_api.extensions import Extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import AgentRef, RunRef, new_agent_ref, new_id
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
-from symphonai_api.models import Message, ModelRequest, Role, ToolCall, ToolResult
+from symphonai_api.lsp import LspManager
+from symphonai_api.models import ContentInput, Message, ModelRequest, Role, ToolCall, ToolResult
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
+from symphonai_api.roles import IMPLEMENTER_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT
 from symphonai_api.session import SessionStore
 from symphonai_api.skills import Skill
 from symphonai_api.streaming import StreamAssembler
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.web_search import SearchBackend
+from symphonai_api.worktree import WorktreeError, create_worktree, remove_worktree, worktree_diff
 
 
 class AgentControlError(RuntimeError):
@@ -116,12 +120,13 @@ def builtin_subagent_specs(
     policy: PermissionPolicy,
     search_backend: SearchBackend | None = None,
     skills: Mapping[str, Skill] | None = None,
+    lsp: LspManager | None = None,
 ) -> dict[str, AgentSpec]:
     selector = ModelSelector(
         provider=getattr(provider, "name", None) or "unknown",
         model=getattr(provider, "model", None),
     )
-    return {
+    specs = {
         name: AgentSpec(
             name=name,
             prompt="",
@@ -131,15 +136,38 @@ def builtin_subagent_specs(
             call_class=CallClass.BACKGROUND,
         )
         for name, tools in (
-            ("worker", tuple(standard_tool_registry(search_backend=search_backend, skills=skills))),
+            ("worker", tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp))),
             (
                 "explorer",
                 EXPLORER_TOOL_NAMES
                 + (("web_search",) if search_backend is not None else ())
-                + (("use_skill",) if skills else ()),
+                + (("use_skill",) if skills else ())
+                + (("lsp",) if lsp is not None and lsp.has_enabled_servers else ()),
             ),
         )
     }
+    optional = (("web_search",) if search_backend is not None else ()) + (("use_skill",) if skills else ())
+    specs.update({
+        "planner": AgentSpec(
+            name="planner", prompt=PLANNER_PROMPT, model=selector,
+            policy_ceiling=policy,
+            tool_names=EXPLORER_TOOL_NAMES + ("write_file", "edit_file") + optional,
+            call_class=CallClass.BACKGROUND,
+        ),
+        "implementer": AgentSpec(
+            name="implementer", prompt=IMPLEMENTER_PROMPT, model=selector,
+            policy_ceiling=policy,
+            tool_names=tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp)),
+            call_class=CallClass.BACKGROUND,
+        ),
+        "reviewer": AgentSpec(
+            name="reviewer", prompt=REVIEWER_PROMPT, model=selector,
+            policy_ceiling=policy,
+            tool_names=EXPLORER_TOOL_NAMES + ("run_shell", "write_file") + optional,
+            call_class=CallClass.BACKGROUND,
+        ),
+    })
+    return specs
 
 class _LeaderEventSink:
     """Fan out events and preserve parent identity for subagent spawning."""
@@ -173,8 +201,26 @@ _DISPATCH_DESCRIPTION = (
     "used yet in this run, a new subagent is created. If it has, the same "
     "subagent continues its existing conversation with this new task "
     "instead of starting over -- use the same name to follow up with the "
-    "same subagent."
+    "same subagent. Set isolation to worktree to run from the last commit "
+    "without uncommitted changes; its diff comes back in the result."
 )
+_BUILTIN_PURPOSES = {
+    "worker": "implements coding tasks",
+    "explorer": "reads and searches the repository",
+    "planner": "writes implementation specs",
+    "implementer": "implements a provided spec and reports validation",
+    "reviewer": "reviews changes and writes follow-up specs",
+}
+
+
+def _dispatch_description(subagents: Mapping[str, AgentSpec] | None = None) -> str:
+    names = _BUILTIN_PURPOSES if subagents is None else {
+        name: purpose for name, purpose in _BUILTIN_PURPOSES.items() if name in subagents
+    }
+    available = [f"{name}: {purpose}." for name, purpose in names.items()]
+    if subagents is not None:
+        available.extend(sorted(set(subagents) - set(_BUILTIN_PURPOSES)))
+    return _DISPATCH_DESCRIPTION + " Available subagents: " + "; ".join(available) + "."
 _DISPATCH_PROPERTIES = {
     "subagent_name": {
         "type": "string",
@@ -188,6 +234,11 @@ _DISPATCH_PROPERTIES = {
         "type": "string",
         "description": "The task or follow-up message to give this subagent.",
     },
+    "isolation": {
+        "type": "string",
+        "enum": ["worktree"],
+        "description": "Run the subagent in its own git worktree.",
+    },
 }
 _DISPATCH_REQUIRED = ["subagent_name", "task"]
 
@@ -200,7 +251,10 @@ def _dispatch_parameters_schema() -> dict:
     }
 
 
-def dispatch_subagent_tool_schema(wire_format: int) -> dict:
+def dispatch_subagent_tool_schema(
+    wire_format: int,
+    subagents: Mapping[str, AgentSpec] | None = None,
+) -> dict:
     """Build the dispatch_subagent tool definition in one provider's native shape.
 
     This is deliberately narrow -- a hand-written schema for this one tool,
@@ -208,31 +262,32 @@ def dispatch_subagent_tool_schema(wire_format: int) -> dict:
     symphonai_api.tool_schema.
     """
     parameters = _dispatch_parameters_schema()
+    description = _dispatch_description(subagents)
     if wire_format == 1:
         return {
             "type": "function",
             "function": {
                 "name": DISPATCH_TOOL_NAME,
-                "description": _DISPATCH_DESCRIPTION,
+                "description": description,
                 "parameters": parameters,
             },
         }
     if wire_format == 2:
         return {
             "name": DISPATCH_TOOL_NAME,
-            "description": _DISPATCH_DESCRIPTION,
+            "description": description,
             "input_schema": parameters,
         }
     if wire_format == 3:
         return {
             "name": DISPATCH_TOOL_NAME,
-            "description": _DISPATCH_DESCRIPTION,
+            "description": description,
             "parameters": sanitize_for_gemini(parameters),
         }
     # Other/unclassified providers: keep schemas self-describing for debugging.
     return {
         "name": DISPATCH_TOOL_NAME,
-        "description": _DISPATCH_DESCRIPTION,
+        "description": description,
         "parameters": parameters,
     }
 
@@ -249,6 +304,9 @@ class SubagentRecord:
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
     runs: list[AgentRun] = field(default_factory=list)
     pause_gate: PauseGate | None = None
+    worktree_path: Path | None = None
+    worktree_admin_path: Path | None = None
+    running: bool = False
 
 
 class DispatchSubagentTool(LocalTool):
@@ -284,6 +342,7 @@ class DispatchSubagentTool(LocalTool):
         memory: AgentMemory | None = None,
         skills: Mapping[str, Skill] | None = None,
         checkpoints: CheckpointStore | None = None,
+        lsp: LspManager | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -311,15 +370,21 @@ class DispatchSubagentTool(LocalTool):
         self._memory = memory
         self._skills = skills
         self._checkpoints = checkpoints
-        self._active_run: AgentRun | None = None
+        self._lsp = lsp
+        self._pool_lock = threading.RLock()
+        self._reserved_names: set[str] = set()
+        self._active_runs_lock = threading.Lock()
+        self._active_runs: dict[str, AgentRun] = {}
         self._events: EventSink | None = None
         self._event_agent_id = parent_agent_id or ""
         self._event_run_id: str | None = None
         self._event_turn_id: str | None = None
         self.pool: dict[str, SubagentRecord] = {}
 
-    def _active_run_id(self) -> str | None:
-        return None if self._active_run is None else self._active_run.run.run_id
+    def _active_run_id(self, agent_id: str) -> str | None:
+        with self._active_runs_lock:
+            run = self._active_runs.get(agent_id)
+            return None if run is None else run.run.run_id
 
     def set_parent_context(
         self,
@@ -334,18 +399,13 @@ class DispatchSubagentTool(LocalTool):
 
     def observe_event(self, event: Event) -> None:
         if isinstance(event, RunStarted):
-            if (
-                self._active_run is not None
-                and event.agent_id == self._active_run.agent.agent_id
-            ):
-                self._active_run.run = RunRef(
+            with self._active_runs_lock:
+                active_run = self._active_runs.get(event.agent_id)
+            if active_run is not None:
+                active_run.run = RunRef(
                     run_id=event.run_id,
                     agent_id=event.agent_id,
-                    parent_run_id=(
-                        None
-                        if self._parent_run is None
-                        else self._parent_run.run.run_id
-                    ),
+                    parent_run_id=(None if self._parent_run is None else self._parent_run.run.run_id),
                 )
             elif (
                 self._parent_run is not None
@@ -373,7 +433,7 @@ class DispatchSubagentTool(LocalTool):
 
     @property
     def description(self) -> str:
-        return _DISPATCH_DESCRIPTION
+        return _dispatch_description(self._subagent_specs)
 
     @property
     def parameters(self) -> dict:
@@ -384,16 +444,24 @@ class DispatchSubagentTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        # A dispatched child may use any of its tools, so inherit the worst case.
+        name = arguments.get("subagent_name")
+        with self._pool_lock:
+            record = self.pool.get(name) if isinstance(name, str) else None
+            isolated = (
+                arguments.get("isolation") == "worktree"
+                or (record is not None and record.worktree_path is not None)
+            )
         return ToolMetadata(
             effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=False,
+            concurrency_safe=isolated,
             paths=None,
         )
 
     def validate(self, arguments: dict) -> str | None:
         if not arguments.get("subagent_name") or not arguments.get("task"):
             return "missing required argument: subagent_name and/or task"
+        if arguments.get("isolation") not in (None, "worktree"):
+            return "isolation must be 'worktree' when provided"
         return None
 
     def _spec_for(self, subagent_name: str) -> AgentSpec | None:
@@ -456,6 +524,12 @@ class DispatchSubagentTool(LocalTool):
                 ok=False,
                 error=f"subagent {subagent_name!r} cannot use use_skill: no skills are available",
             )
+        if (self._lsp is None or not self._lsp.has_enabled_servers) and "lsp" in (spec.tool_names or ()):
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"subagent {subagent_name!r} cannot use lsp: no language server is configured",
+            )
         if self._dispatching_depth >= spec.max_depth:
             return ToolResult(
                 tool_call_id=tool_call.id,
@@ -470,25 +544,99 @@ class DispatchSubagentTool(LocalTool):
         except ValueError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
 
-        record = self.pool.get(subagent_name)
-        if record is None:
-            if len(self.pool) >= self._max_subagents:
+        wants_worktree = tool_call.arguments.get("isolation") == "worktree"
+        if wants_worktree and self._session is None:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error="worktree isolation requires a session",
+            )
+        if wants_worktree and (
+            not isinstance(subagent_name, str)
+            or subagent_name in (".", "..")
+            or Path(subagent_name).name != subagent_name
+            or "/" in subagent_name
+            or "\\" in subagent_name
+        ):
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error="subagent name cannot be used as a worktree path",
+            )
+
+        with self._pool_lock:
+            record = self.pool.get(subagent_name)
+            if subagent_name in self._reserved_names or (record is not None and record.running):
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     ok=False,
                     error=(
-                        f"max_subagents ({self._max_subagents}) reached; "
-                        f"cannot create new subagent {subagent_name!r}"
+                        f"subagent {subagent_name} is already running; "
+                        "dispatch it again after it finishes"
                     ),
                 )
+            if record is not None and record.breaker.is_open:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=(
+                        f"subagent {subagent_name!r} failed "
+                        f"{record.breaker.consecutive_failures} times in a row; "
+                        "not dispatching again this run"
+                    ),
+                )
+            if record is not None and wants_worktree and record.worktree_path is None:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=f"subagent {subagent_name!r} already works in the shared tree",
+                )
+            if record is None:
+                if len(self.pool) + len(self._reserved_names) >= self._max_subagents:
+                    return ToolResult(
+                        tool_call_id=tool_call.id,
+                        ok=False,
+                        error=(
+                            f"max_subagents ({self._max_subagents}) reached; "
+                            f"cannot create new subagent {subagent_name!r}"
+                        ),
+                    )
+                self._reserved_names.add(subagent_name)
+            else:
+                record.running = True
+                if record.worktree_path is not None:
+                    effective_policy = effective_policy.rerooted(record.worktree_path)
+                    record.agent._policy = effective_policy
+
+        if record is None and wants_worktree:
+            worktree_admin_path = self._session.directory / "worktrees" / subagent_name
+            try:
+                worktree_root = create_worktree(
+                    effective_policy.repo_root, worktree_admin_path
+                )
+            except WorktreeError as exc:
+                with self._pool_lock:
+                    self._reserved_names.discard(subagent_name)
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=str(exc),
+                )
+            effective_policy = effective_policy.rerooted(worktree_root)
+        else:
+            worktree_admin_path = None
+            worktree_root = None
+
+        if record is None:
             tool_names = spec.tool_names
             if tool_names is not None and self._result_store is not None:
                 tool_names = (*tool_names, "read_tool_result")
+            agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
             memory_tool = (
                 MemoryTool(
                     self._memory,
                     spec.name,
-                    self._active_run_id,
+                    lambda agent_id=agent_ref.agent_id: self._active_run_id(agent_id),
                 )
                 if spec.memory.enabled
                 else None
@@ -500,24 +648,13 @@ class DispatchSubagentTool(LocalTool):
                     search_backend=self._search_backend,
                     memory_tool=memory_tool,
                     skills=self._skills,
-                    checkpoints=self._checkpoints,
+                    lsp=self._lsp,
+                    checkpoints=(
+                        None if worktree_root is not None else self._checkpoints
+                    ),
                 ),
                 self._extra_tools,
             )
-            agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
-            if self._events is not None:
-                if self._event_run_id is None:
-                    raise RuntimeError("dispatch event context was never set")
-                emit(
-                    self._events,
-                    SubagentSpawned(
-                        agent_id=self._event_agent_id,
-                        run_id=self._event_run_id,
-                        turn_id=self._event_turn_id,
-                        subagent_name=subagent_name,
-                        subagent_agent_id=agent_ref.agent_id,
-                    ),
-                )
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=self._subagent_provider,
@@ -542,23 +679,17 @@ class DispatchSubagentTool(LocalTool):
                     f"subagent {subagent_name}",
                     max_consecutive_failures=self._max_consecutive_subagent_failures,
                 ),
+                worktree_path=worktree_root,
+                worktree_admin_path=worktree_admin_path,
+                running=True,
             )
-            self.pool[subagent_name] = record
+            with self._pool_lock:
+                self.pool[subagent_name] = record
+                self._reserved_names.discard(subagent_name)
         else:
             # The ceiling is mutable even though AgentSpec is frozen, so take
             # the meet again for every dispatch instead of retaining authority.
             record.agent._policy = effective_policy
-
-        if record.breaker.is_open:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error=(
-                    f"subagent {subagent_name!r} failed "
-                    f"{record.breaker.consecutive_failures} times in a row; "
-                    "not dispatching again this run"
-                ),
-            )
 
         child_run = self._new_run(spec, record.agent_ref)
         record.runs.append(child_run)
@@ -579,11 +710,26 @@ class DispatchSubagentTool(LocalTool):
                 parent_messages=self._parent_messages,
                 memory=_memory_entries(self._memory, spec),
             )
+        if self._events is not None:
+            if self._event_run_id is None:
+                raise RuntimeError("dispatch event context was never set")
+            emit(
+                self._events,
+                SubagentSpawned(
+                    agent_id=self._event_agent_id,
+                    run_id=self._event_run_id,
+                    turn_id=self._event_turn_id,
+                    subagent_name=subagent_name,
+                    subagent_agent_id=record.agent_ref.agent_id,
+                ),
+            )
         run_result = None
         failure: str | None = None
-        self._active_run = child_run
+        execution_error: Exception | None = None
+        with self._active_runs_lock:
+            self._active_runs[record.agent_ref.agent_id] = child_run
         try:
-            with self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix):
+            if record.worktree_path is not None:
                 run_result = record.agent.run(
                     record.messages,
                     model=spec.model.model,
@@ -598,14 +744,37 @@ class DispatchSubagentTool(LocalTool):
                     pause=pause_gate,
                     hooks=self._hooks,
                 )
+            else:
+                with self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix):
+                    run_result = record.agent.run(
+                        record.messages,
+                        model=spec.model.model,
+                        effort=spec.model.effort,
+                        parent_run_id=(
+                            None
+                            if self._parent_run is None
+                            else self._parent_run.run.run_id
+                        ),
+                        cancel=token,
+                        run=child_run,
+                        pause=pause_gate,
+                        hooks=self._hooks,
+                    )
         except LeaseConflict as exc:
             failure = str(exc)
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
         except Exception as exc:
             failure = str(exc)
-            raise
+            if record.worktree_path is None:
+                raise
+            execution_error = exc
         finally:
-            self._active_run = None
+            with self._active_runs_lock:
+                if self._active_runs.get(record.agent_ref.agent_id) is child_run:
+                    self._active_runs.pop(record.agent_ref.agent_id, None)
+            if record.worktree_path is None:
+                with self._pool_lock:
+                    record.running = False
             if child_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
                 if run_result is None:
                     if token.cancelled:
@@ -630,7 +799,19 @@ class DispatchSubagentTool(LocalTool):
                         subagent_agent_id=record.agent_ref.agent_id,
                     ),
                 )
-        assert run_result is not None
+        if run_result is None:
+            try:
+                content, payload = self._worktree_output(subagent_name, record, "")
+            finally:
+                with self._pool_lock:
+                    record.running = False
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                content=content,
+                error=failure or str(execution_error) or "subagent dispatch failed",
+                payload=payload,
+            )
         record.messages = run_result.messages
         record.turns_used += run_result.turns_used
         for model, usage in run_result.usage_by_model.items():
@@ -639,17 +820,27 @@ class DispatchSubagentTool(LocalTool):
             ).merged(usage)
         if run_result.stopped_reason == "cancelled":
             if token.reason is CancelReason.PARENT:
+                with self._pool_lock:
+                    record.running = False
                 raise OperationCancelled
             record.breaker.record_failure()
             if token.reason is CancelReason.DEADLINE:
                 error = "subagent deadline elapsed before a final answer"
             else:
                 error = "subagent was cancelled explicitly before a final answer"
+            try:
+                content, payload = self._worktree_output(
+                    subagent_name, record, run_result.final_response.message.text
+                )
+            finally:
+                with self._pool_lock:
+                    record.running = False
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=False,
-                content=run_result.final_response.message.text,
+                content=content,
                 error=error,
+                payload=payload,
             )
 
         succeeded = run_result.stopped_reason == "final_response"
@@ -675,12 +866,53 @@ class DispatchSubagentTool(LocalTool):
                 f"subagent stopped because {run_result.stopped_reason} "
                 "before a final answer"
             )
+        try:
+            content, payload = self._worktree_output(
+                subagent_name, record, run_result.final_response.message.text
+            )
+        finally:
+            if record.worktree_path is not None:
+                with self._pool_lock:
+                    record.running = False
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,
-            content=run_result.final_response.message.text,
+            content=content,
             error=error,
+            payload=payload,
         )
+
+    @staticmethod
+    def _worktree_output(
+        subagent_name: str,
+        record: SubagentRecord,
+        output: str,
+    ) -> tuple[str, dict | None]:
+        if record.worktree_path is None:
+            return output, None
+        diff = worktree_diff(record.worktree_path)
+        payload = {
+            "kind": "worktree_diff",
+            "subagent": subagent_name,
+            "worktree": str(record.worktree_path),
+            "files": list(diff.files),
+        }
+        if not diff.files:
+            summary = f"Worktree {record.worktree_path}: no changes"
+        else:
+            patch = diff.patch
+            truncation_note = ""
+            if len(patch) > MAX_READ_BYTES:
+                patch = patch[:MAX_READ_BYTES]
+                truncation_note = f"\n[patch truncated at {MAX_READ_BYTES} characters]"
+            summary = (
+                f"Worktree {record.worktree_path}: {len(diff.files)} files changed\n"
+                + "\n".join(diff.files)
+                + ("\n" + patch if patch else "")
+                + truncation_note
+            )
+        content = f"{output}\n\n{summary}" if output else summary
+        return content, payload
 
 
 @dataclass
@@ -725,6 +957,7 @@ class LeaderConfig:
     model_summary: bool = False
     checkpoints: CheckpointStore | None = None
     leader_tools: Mapping[str, LocalTool] | None = None
+    lsp: LspManager | None = None
 
 
 @dataclass
@@ -866,6 +1099,7 @@ class Leader:
             memory=config.memory,
             skills=(None if config.extensions is None else config.extensions.skills),
             checkpoints=config.checkpoints,
+            lsp=config.lsp,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
@@ -889,6 +1123,7 @@ class Leader:
                 memory_tool=leader_memory_tool,
                 skills=(None if config.extensions is None else config.extensions.skills),
                 checkpoints=config.checkpoints,
+                lsp=config.lsp,
             ),
             config.extra_tools,
         )
@@ -926,7 +1161,9 @@ class Leader:
             max_turns=config.max_leader_turns,
             budget=config.leader_budget,
             tool_schemas=[
-                dispatch_subagent_tool_schema(config.leader_provider.wire_format),
+                dispatch_subagent_tool_schema(
+                    config.leader_provider.wire_format, config.subagent_specs,
+                ),
                 *tool_registry_schemas(
                     standard_tools,
                     config.leader_provider.wire_format,
@@ -976,9 +1213,13 @@ class Leader:
         return math.floor(base / self._token_ratio)
 
     def _stopped_repairs(self) -> tuple[str, ...]:
+        with self._dispatch_tool._pool_lock:
+            subagent_breakers = [
+                record.breaker for record in self._dispatch_tool.pool.values()
+            ]
         breakers = [
             self._automatic_compaction_breaker,
-            *(record.breaker for record in self._dispatch_tool.pool.values()),
+            *subagent_breakers,
         ]
         return tuple(sorted(breaker.name for breaker in breakers if breaker.is_open))
 
@@ -1100,11 +1341,12 @@ class Leader:
             if agent_id == self._agent_ref.agent_id:
                 run, gate = self._leader_run, self._leader_pause_gate
             else:
-                for record in self._dispatch_tool.pool.values():
-                    if record.agent_ref.agent_id == agent_id:
-                        run = record.runs[-1] if record.runs else None
-                        gate = record.pause_gate
-                        break
+                with self._dispatch_tool._pool_lock:
+                    for record in self._dispatch_tool.pool.values():
+                        if record.agent_ref.agent_id == agent_id:
+                            run = record.runs[-1] if record.runs else None
+                            gate = record.pause_gate
+                            break
             if run is None or run.phase not in (RunPhase.RUNNING, RunPhase.PAUSED):
                 raise AgentControlError(f"agent {agent_id!r} is not running", status=404)
             if action == "pause":
@@ -1188,9 +1430,15 @@ class Leader:
     def clear_subagents(self) -> int:
         """Clear all dispatched subagents and return how many were removed."""
 
-        count = len(self._dispatch_tool.pool)
-        self._dispatch_tool.pool.clear()
-        return count
+        with self._dispatch_tool._pool_lock:
+            count = len(self._dispatch_tool.pool)
+            self._dispatch_tool.pool.clear()
+            return count
+
+    def forget_subagent(self, name: str) -> bool:
+        """Remove one named subagent from the current leader pool."""
+        with self._dispatch_tool._pool_lock:
+            return self._dispatch_tool.pool.pop(name, None) is not None
 
     def compact_chat(self, *, cancel: CancellationToken | None = None) -> CompactionResult:
         """Apply context compaction to the persisted multi-turn chat state."""
@@ -1400,7 +1648,7 @@ class Leader:
             pass
 
     def chat(
-        self, message: str, *, cancel: CancellationToken | None = None
+        self, message: ContentInput, *, cancel: CancellationToken | None = None
     ) -> LeaderRunResult:
         """Continue an ongoing conversation with the leader.
 

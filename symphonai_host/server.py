@@ -21,6 +21,7 @@ from symphonai_api.compaction import DEFAULT_RECENT_TURNS
 from symphonai_api.cost import PriceTable
 from symphonai_api.agent_file import AgentFileError, load_agent_file
 from symphonai_api.extensions import Extensions
+from symphonai_api.lsp import LspManager
 from symphonai_api.model_discovery import list_models
 from symphonai_api.model_table import model_capabilities
 from symphonai_api.permissions import PermissionPolicy, _contains_path
@@ -33,8 +34,9 @@ from symphonai_api.paths import symphonai_home
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
-from symphonai_host.broker import EventBroker, Subscription
+from symphonai_host.broker import EventBroker, SessionEvent, Subscription
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
+from symphonai_host.files import repository_files
 from symphonai_host.protocol import (
     ApprovalRequested,
     HistoryMessage,
@@ -52,8 +54,9 @@ from symphonai_host.run import (
     NoConversationError,
     ProviderSelectionError,
     RunActiveError,
+    WorktreeApplyConflict,
 )
-from symphonai_host.sessions import list_sessions
+from symphonai_host.sessions import list_sessions, prompt_history
 
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -150,6 +153,7 @@ class HostServer:
         price_table: PriceTable | None = None,
         chat_token_budget: int | None = None,
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
+        lsp: LspManager | None = None,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
@@ -177,6 +181,7 @@ class HostServer:
             price_table=price_table,
             chat_token_budget=chat_token_budget,
             chat_recent_turns=chat_recent_turns,
+            lsp=lsp,
         )
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
@@ -210,12 +215,13 @@ class HostServer:
                 details=approval.details,
                 tool_call_id=approval.tool_call_id,
                 remember=approval.remember,
+                session_id=approval.session_id,
             )
         )
         return True
 
     def pending_approvals(self) -> list[dict[str, str]]:
-        return [approval.__dict__ for approval in self.run.approvals.pending()]
+        return [approval.__dict__ for approval in self.run.pending_approvals()]
 
     def print_handshake(self) -> None:
         if not self._handshake_printed:
@@ -710,6 +716,26 @@ class HostServer:
                         return
                     self._serve_file()
                     return
+                if request_path == "/files":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True)
+                    query_values = values.get("query", [""])
+                    limit_values = values.get("limit", [])
+                    try:
+                        limit = 20 if not limit_values else int(limit_values[0])
+                    except ValueError:
+                        limit = 0
+                    if len(limit_values) > 1 or not 1 <= limit <= 50:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "limit must be from 1 to 50"})
+                        return
+                    files, truncated = repository_files(
+                        host.run.policy,
+                        query_values[0],
+                        limit,
+                    )
+                    self._json(HTTPStatus.OK, {"files": files, "truncated": truncated})
+                    return
                 if request_path == "/agent":
                     if not self._authorized():
                         return
@@ -858,7 +884,29 @@ class HostServer:
                         limit = None
                     if limit is not None and limit <= 0:
                         limit = None
-                    self._json(HTTPStatus.OK, list_sessions(host.run.sessions_root, limit=limit))
+                    self._json(HTTPStatus.OK, list_sessions(
+                        host.run.sessions_root, limit=limit,
+                        activity=host.run.session_activity(),
+                    ))
+                    return
+                if request_path == "/history":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True).get("limit", [])
+                    try:
+                        limit = 100 if not values else int(values[0])
+                    except ValueError:
+                        limit = 0
+                    if len(values) > 1 or not 1 <= limit <= 500:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "limit must be from 1 to 500"})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        "prompts": prompt_history(
+                            host.run.sessions_root,
+                            host.run.policy.repo_root,
+                            limit=limit,
+                        ),
+                    })
                     return
                 if self.path != "/events":
                     self._not_found()
@@ -890,12 +938,24 @@ class HostServer:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
+                    session_id = None
+                    if isinstance(event, SessionEvent):
+                        session_id = event.session_id
+                        event = event.event
+                    else:
+                        session_id = host.run.event_session_id(event)
                     if isinstance(event, ApprovalRequested):
                         self._sse(encode_frame("approval_requested", event.__dict__))
                     elif isinstance(event, HistoryMessage):
-                        self._sse(encode_frame("event", event.payload()))
+                        payload = event.payload()
+                        if session_id is not None:
+                            payload["session_id"] = session_id
+                        self._sse(encode_frame("event", payload))
                     else:
-                        self._sse(encode_frame("event", encode_event(event)))
+                        payload = encode_event(event)
+                        if session_id is not None:
+                            payload["session_id"] = session_id
+                        self._sse(encode_frame("event", payload))
 
             def _sse(self, frame: str) -> None:
                 self.wfile.write(f"data: {frame}\n\n".encode("utf-8"))
@@ -903,7 +963,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/changes/revert", "/goal", "/goal/state") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -1062,6 +1122,34 @@ class HostServer:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "unknown change"})
                         return
                     except (OSError, ValueError) as exc:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
+                if self.path in ("/worktree/apply", "/worktree/discard"):
+                    try:
+                        payload = self._read_object()
+                        name = payload.get("name")
+                        if set(payload) != {"name"} or not isinstance(name, str) or not name.strip() or Path(name).name != name or name in (".", ".."):
+                            raise ProtocolError("worktree action requires one valid name")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        if self.path == "/worktree/apply":
+                            reply = host.run.apply_worktree(name)
+                        else:
+                            reply = host.run.discard_worktree(name)
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    except KeyError:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown worktree"})
+                        return
+                    except WorktreeApplyConflict as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    except (OSError, ValueError, RuntimeError) as exc:
                         self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                         return
                     self._json(HTTPStatus.OK, reply)
@@ -1229,7 +1317,7 @@ class HostServer:
                     return
                 if kind == "prompt":
                     try:
-                        run_id = host.run.start(request.prompt)
+                        run_id = host.run.start(request.prompt, attachments=request.attachments)
                     except ProviderSelectionError as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
@@ -1239,7 +1327,7 @@ class HostServer:
                     self._json(HTTPStatus.OK, {"accepted": True, "run_id": run_id})
                     return
                 if kind == "approval":
-                    if not host.run.approvals.resolve(
+                    if not host.run.resolve_approval(
                         request.approval_id,
                         allowed=request.allowed,
                         reason=request.reason,

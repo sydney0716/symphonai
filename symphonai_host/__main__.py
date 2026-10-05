@@ -13,6 +13,7 @@ from pathlib import Path
 
 from symphonai_api.config import ConfigError
 from symphonai_api.extensions import load_extensions
+from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
@@ -60,14 +61,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     except McpError as exc:
         print(f"mcp error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
+    lsp = LspManager(extensions.lsp_servers, root=arguments.repo_root)
     host = None
     try:
         host = HostServer(
             _provider(),
-            PermissionPolicy(repo_root=arguments.repo_root),
+            PermissionPolicy(
+                repo_root=arguments.repo_root,
+                shell_sandbox=extensions.config.get("sandbox.shell", False),
+                sandbox_network=extensions.config.get("sandbox.network", False),
+            ),
             max_turns=arguments.max_turns,
             extensions=extensions,
             mcp_tools=mcp_tools,
+            lsp=lsp,
         )
 
         def shutdown(signum, frame) -> None:
@@ -83,6 +90,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         if host is not None:
             host.close()
+        lsp.close()
         pool.close()
 
 

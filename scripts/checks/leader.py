@@ -6,6 +6,8 @@ import inspect
 import json
 import math
 import os
+import subprocess
+import tempfile
 import threading
 from pathlib import Path
 import unittest.mock as mock
@@ -41,15 +43,23 @@ from symphonai_api.events import (
 )
 from symphonai_api.compaction import ContextCompactionError, estimate_messages_tokens
 import symphonai_api.leader as leader_module
-from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig, builtin_subagent_specs
+from symphonai_api.leader import (
+    DispatchSubagentTool,
+    Leader,
+    LeaderConfig,
+    builtin_subagent_specs,
+    dispatch_subagent_tool_schema,
+)
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import (
+    ImageBlock,
     Message,
     ModelRequest,
     ModelResponse,
     Role,
     ToolCall,
     ToolResult,
+    TextBlock,
     Usage,
 )
 from symphonai_api.permissions import PermissionPolicy
@@ -1067,6 +1077,13 @@ def check_dispatch_metadata() -> None:
             )
         if type(tool).execute is not LocalTool.execute:
             fail("dispatch_subagent bypassed the base validation pipeline")
+        schema = dispatch_subagent_tool_schema(1)["function"]["parameters"]
+        if (
+            "isolation" not in schema["properties"]
+            or schema["properties"]["isolation"].get("enum") != ["worktree"]
+            or "isolation" in schema["required"]
+        ):
+            fail(f"dispatch_subagent isolation was not optional in its schema: {schema!r}")
         invalid_dispatch = tool.execute(
             ToolCall(
                 id="invalid-dispatch",
@@ -1599,6 +1616,21 @@ def check_chat_history() -> None:
         contents = [m.text for m in second.leader_messages]
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
+
+
+@check("leader.chat_content_blocks")
+def check_chat_content_blocks() -> None:
+    with workspace() as ws:
+        image = ImageBlock(data="AQ==", media_type="image/png")
+        leader = Leader(LeaderConfig(
+            leader_provider=FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            subagent_provider=FakeModelProvider(),
+            repo_root=str(ws.root),
+        ))
+        result = leader.chat([TextBlock("what is this"), image])
+        user_message = next(message for message in result.leader_messages if message.role == Role.USER)
+        if user_message.content != (TextBlock("what is this"), image):
+            fail(f"Leader.chat did not preserve content blocks: {user_message.content!r}")
 
 
 @check("leader.selection_updates_next_request")
@@ -2663,7 +2695,8 @@ def check_gemini_dispatch_schema() -> None:
             if (
                 not isinstance(parameters, dict)
                 or parameters.get("type") != "object"
-                or set(properties) != {"subagent_name", "task"}
+                or set(properties) != {"subagent_name", "task", "isolation"}
+                or properties["isolation"].get("enum") != ["worktree"]
                 or parameters.get("required") != ["subagent_name", "task"]
             ):
                 fail(f"expected non-empty sanitized Gemini dispatch parameters, got {parameters!r}")
@@ -3304,6 +3337,18 @@ def check_skill_roster_dispatch() -> None:
             fail(f"unavailable explicit use_skill did not fail closed: {refusal!r}")
 
 
+@check("leader.lsp_unavailable_subagent_refusal")
+def check_lsp_unavailable_subagent_refusal() -> None:
+    with workspace() as ws:
+        explicit = _spec(ws.root, "custom").with_overrides(tool_names=("lsp",))
+        dispatch = DispatchSubagentTool(
+            FakeModelProvider(), ws.policy, subagent_specs={"custom": explicit},
+        )
+        result = dispatch.execute(_dispatch("custom", "inspect"), ws.policy)
+        if result.ok or result.error != "subagent 'custom' cannot use lsp: no language server is configured":
+            fail(f"unconfigured explicit lsp use did not fail closed: {result!r}")
+
+
 @check("leader.pause_resume_gate")
 def check_pause_resume_gate() -> None:
     with workspace() as ws:
@@ -3857,3 +3902,452 @@ def check_leader_only_tools() -> None:
             fail("leader request schemas omitted its leader-only tools")
         if any(name in child_schemas for name in tools):
             fail("leader-only tools leaked into the subagent tool registry")
+
+
+def _git_worktree_repository(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    commands = (
+        ("init", "--quiet"),
+        ("config", "user.email", "leader-check@example.test"),
+        ("config", "user.name", "Leader Check"),
+    )
+    for arguments in commands:
+        result = subprocess.run(
+            ["git", *arguments], cwd=root, capture_output=True, check=False, timeout=15,
+        )
+        if result.returncode != 0:
+            fail(f"git {' '.join(arguments)} failed: {result.stderr!r}")
+    (root / "a.py").write_text("value = 1\n", encoding="utf-8")
+    for arguments in (("add", "-A"), ("commit", "--quiet", "-m", "initial")):
+        result = subprocess.run(
+            ["git", *arguments], cwd=root, capture_output=True, check=False, timeout=15,
+        )
+        if result.returncode != 0:
+            fail(f"git {' '.join(arguments)} failed: {result.stderr!r}")
+
+
+class _ParallelWorktreeProvider(FakeModelProvider):
+    def __init__(self, parties: int, *, remember: bool = False) -> None:
+        super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        self.barrier = threading.Barrier(parties)
+        self.remember = remember
+        self.local = threading.local()
+
+    def create_response(self, request: ModelRequest, *, cancel=None) -> ModelResponse:
+        if not hasattr(self.local, "name"):
+            task = next(message.text for message in reversed(request.messages) if message.role is Role.USER)
+            self.local.name = task.rsplit(" ", 1)[-1]
+            self.local.step = 0
+            self.barrier.wait(timeout=4)
+            name = self.local.name
+            calls = []
+            if self.remember:
+                calls.append(ToolCall(f"remember-{name}", "remember", {"text": f"lesson for {name}"}))
+            calls.append(ToolCall(f"read-{name}", "read_file", {"path": f"{name}.py"}))
+            self.local.step = 1
+            return ModelResponse(Message(Role.ASSISTANT, tool_calls=calls))
+        if self.local.step == 1:
+            name = self.local.name
+            self.local.step = 2
+            return ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                f"write-{name}", "write_file", {
+                    "path": f"{name}.py", "content": f"{name} = True\n",
+                },
+            )]))
+        return ModelResponse(Message(Role.ASSISTANT, f"finished {self.local.name}"))
+
+
+def _worktree_leader(
+    root: Path,
+    names: tuple[str, ...],
+    child_provider: FakeModelProvider,
+    *,
+    session: SessionStore | None = None,
+    memory: AgentMemory | None = None,
+    max_subagents: int | None = None,
+) -> tuple[Leader, _RecordingFakeProvider]:
+    policy = PermissionPolicy(root, allowed_write_scope=[root])
+    specs = {
+        name: _spec(
+            root,
+            name,
+            policy=policy,
+            memory=(MemorySettings(enabled=True) if memory is not None else MemorySettings()),
+        )
+        for name in names
+    }
+    calls = [
+        ToolCall(
+            f"dispatch-{name}",
+            "dispatch_subagent",
+            {"subagent_name": name, "task": f"write file for {name}", "isolation": "worktree"},
+        )
+        for name in names
+    ]
+    leader_provider = _RecordingFakeProvider([
+        ModelResponse(Message(Role.ASSISTANT, tool_calls=calls)),
+        ModelResponse(Message(Role.ASSISTANT, "all dispatched")),
+    ])
+    leader = Leader(LeaderConfig(
+        leader_provider=leader_provider,
+        subagent_provider=child_provider,
+        repo_root=str(root),
+        leader_policy=policy,
+        subagent_specs=specs,
+        max_subagents=len(names) if max_subagents is None else max_subagents,
+        memory=memory,
+    ), session=session)
+    return leader, leader_provider
+
+
+@check("leader.parallel_worktree_dispatches")
+def check_parallel_worktree_dispatches() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        _git_worktree_repository(root)
+        session = SessionStore(Path(temporary) / "sessions", "session", repo_root=root)
+        memory = AgentMemory(Path(temporary) / "memory")
+        child_provider = _ParallelWorktreeProvider(3, remember=True)
+        leader, leader_provider = _worktree_leader(
+            root, ("a", "b", "c"), child_provider, session=session, memory=memory,
+        )
+        try:
+            result = leader.run("coordinate three tasks")
+            tool_results = [
+                message.tool_result for message in result.leader_messages
+                if message.role is Role.TOOL and message.tool_result is not None
+            ]
+            if child_provider.barrier.broken:
+                fail("parallel worktree dispatch barrier did not release")
+            if [item.tool_call_id for item in tool_results] != ["dispatch-a", "dispatch-b", "dispatch-c"]:
+                fail(f"parallel dispatch results lost call order: {tool_results!r}")
+            if any(not item.ok or item.payload is None for item in tool_results):
+                fail(f"parallel worktree dispatch failed: {tool_results!r}")
+            for name, item in zip(("a", "b", "c"), tool_results, strict=True):
+                if item.payload["files"] != [f"{name}.py"]:
+                    fail(f"{name} returned another child's diff: {item.payload!r}")
+                entries = memory.read(name)
+                record = result.subagents[name]
+                if len(entries) != 1 or entries[0].run_id != record.runs[-1].run.run_id:
+                    fail(f"{name} memory was attached to the wrong run: {entries!r}")
+            graph = leader.run_graph()
+            if len(graph) != 1:
+                fail(f"parallel child runs had an unexpected graph: {graph!r}")
+            graph_children = {node.agent_name: node for node in graph[0].children}
+            if set(graph_children) != {"a", "b", "c"} or any(
+                graph_children[name].parent_run_id != result.run.run_id
+                or graph_children[name].run_id != result.subagents[name].runs[-1].run.run_id
+                for name in ("a", "b", "c")
+            ):
+                fail(f"parallel child run graph lost parent or run identity: {graph!r}")
+            if leader_provider.requests[1].messages[-1].role is not Role.TOOL:
+                fail("leader did not receive completed parallel tool results")
+        finally:
+            session.close()
+
+
+@check("leader.shared_dispatches_remain_serial")
+def check_shared_dispatches_remain_serial() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        entered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
+
+        class SerialProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+                self._lock = threading.Lock()
+                self._calls = 0
+
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                with self._lock:
+                    self._calls += 1
+                    call = self._calls
+                if call == 1:
+                    entered.set()
+                    release.wait(3)
+                else:
+                    second_started.set()
+                return ModelResponse(Message(Role.ASSISTANT, "done"))
+
+        policy = PermissionPolicy(root)
+        provider = SerialProvider()
+        shared_calls = [
+            ToolCall(f"shared-{name}", "dispatch_subagent", {"subagent_name": name, "task": "inspect"})
+            for name in ("a", "b")
+        ]
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=shared_calls)),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=provider,
+            repo_root=str(root),
+            leader_policy=policy,
+            subagent_specs={name: _spec(root, name, policy=policy) for name in ("a", "b")},
+        ))
+        outcome: dict[str, object] = {}
+        runner = threading.Thread(target=lambda: outcome.setdefault("result", leader.run("serial tasks")))
+        runner.start()
+        try:
+            if not entered.wait(3):
+                fail("first shared dispatch did not start")
+            if second_started.wait(0.1):
+                fail("shared dispatches ran concurrently")
+            release.set()
+            if not second_started.wait(3):
+                fail("second shared dispatch did not run after the first")
+        finally:
+            release.set()
+            runner.join(5)
+        if runner.is_alive() or "result" not in outcome:
+            fail(f"shared dispatch run did not finish: {outcome!r}")
+
+
+@check("leader.same_name_parallel_dispatch_is_refused")
+def check_same_name_parallel_dispatch_is_refused() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        _git_worktree_repository(root)
+        session = SessionStore(base / "sessions", "session", repo_root=root)
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                entered.set()
+                release.wait(3)
+                return ModelResponse(Message(Role.ASSISTANT, "done"))
+
+        leader, _ = _worktree_leader(root, ("a",), BlockingProvider(), session=session)
+        calls = [
+            ToolCall(f"duplicate-{index}", "dispatch_subagent", {
+                "subagent_name": "a", "task": f"duplicate {index}", "isolation": "worktree",
+            })
+            for index in (1, 2)
+        ]
+        leader._agent._provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=calls)),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        outcome: dict[str, object] = {}
+        runner = threading.Thread(target=lambda: outcome.setdefault("result", leader.run("duplicate")))
+        runner.start()
+        try:
+            if not entered.wait(3):
+                fail("worktree child did not start")
+            threading.Event().wait(0.1)
+        finally:
+            release.set()
+            runner.join(5)
+            session.close()
+        if runner.is_alive() or "result" not in outcome:
+            fail(f"duplicate dispatch run did not finish: {outcome!r}")
+        results = [
+            message.tool_result for message in outcome["result"].leader_messages
+            if message.role is Role.TOOL and message.tool_result is not None
+        ]
+        if sum(item.ok for item in results) != 1 or sum(
+            "is already running; dispatch it again after it finishes" in (item.error or "")
+            for item in results
+        ) != 1:
+            fail(f"same-name parallel dispatch did not fail atomically: {results!r}")
+
+
+@check("leader.parallel_dispatch_respects_max_subagents")
+def check_parallel_dispatch_respects_max_subagents() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        _git_worktree_repository(root)
+        session = SessionStore(base / "sessions", "session", repo_root=root)
+        provider = _ParallelWorktreeProvider(2)
+        leader, _ = _worktree_leader(
+            root, ("a", "b", "c"), provider, session=session, max_subagents=2,
+        )
+        try:
+            result = leader.run("limit parallel tasks")
+            results = [
+                message.tool_result for message in result.leader_messages
+                if message.role is Role.TOOL and message.tool_result is not None
+            ]
+            refusals = [
+                item for item in results
+                if "max_subagents (2) reached" in (item.error or "")
+            ]
+            if len(result.subagents) != 2 or len(refusals) != 1 or provider.barrier.broken:
+                fail(f"parallel pool reservations oversubscribed or lost a dispatch: {results!r}")
+        finally:
+            session.close()
+
+
+@check("leader.control_one_parallel_child")
+def check_control_one_parallel_child() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        _git_worktree_repository(root)
+        session = SessionStore(base / "sessions", "session", repo_root=root)
+        entered = {name: threading.Event() for name in ("a", "b")}
+        release = {name: threading.Event() for name in ("a", "b")}
+
+        class ChildProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+                self.local = threading.local()
+
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                if not hasattr(self.local, "name"):
+                    task = next(message.text for message in reversed(request.messages) if message.role is Role.USER)
+                    self.local.name = task.rsplit(" ", 1)[-1]
+                    name = self.local.name
+                    return ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                        f"write-{name}", "write_file", {
+                            "path": f"{name}.py", "content": f"{name} = True\n",
+                        },
+                    )]))
+                entered[self.local.name].set()
+                release[self.local.name].wait(3)
+                return ModelResponse(Message(Role.ASSISTANT, "done"))
+
+        leader, _ = _worktree_leader(root, ("a", "b"), ChildProvider(), session=session)
+        outcome: dict[str, object] = {}
+        runner = threading.Thread(target=lambda: outcome.setdefault("result", leader.run("control children")))
+        runner.start()
+        try:
+            if not all(event.wait(3) for event in entered.values()):
+                fail("parallel children did not reach their active model calls")
+            records = leader.subagents
+            by_name = {name: records[name] for name in ("a", "b")}
+            if leader.control_agent(by_name["a"].agent_ref.agent_id, "pause") != "paused":
+                fail("control_agent did not pause child a")
+            if (
+                by_name["a"].runs[-1].phase is not RunPhase.PAUSED
+                or by_name["b"].runs[-1].phase is not RunPhase.RUNNING
+            ):
+                fail("pausing child a changed child b's run state")
+            leader.control_agent(by_name["a"].agent_ref.agent_id, "resume")
+        finally:
+            for event in release.values():
+                event.set()
+            runner.join(5)
+            session.close()
+        if runner.is_alive() or "result" not in outcome:
+            fail(f"parallel child control run did not finish: {outcome!r}")
+
+
+@check("leader.spec_workflow_role_roster")
+def check_spec_workflow_role_roster() -> None:
+    with workspace() as ws:
+        provider = FakeModelProvider()
+        skill = Skill("release", "Release", "Release steps", ws.root / "release.md", 1)
+        roster = builtin_subagent_specs(provider, ws.policy, object(), {"release": skill})
+        expected = {
+            "worker": tuple(standard_tool_registry(search_backend=object(), skills={"release": skill})),
+            "explorer": leader_module.EXPLORER_TOOL_NAMES + ("web_search", "use_skill"),
+            "planner": leader_module.EXPLORER_TOOL_NAMES + ("write_file", "edit_file", "web_search", "use_skill"),
+            "implementer": tuple(standard_tool_registry(search_backend=object(), skills={"release": skill})),
+            "reviewer": leader_module.EXPLORER_TOOL_NAMES + ("run_shell", "write_file", "web_search", "use_skill"),
+        }
+        if set(roster) != set(expected) or {name: spec.tool_names for name, spec in roster.items()} != expected:
+            fail(f"workflow roles had the wrong tools: {roster!r}")
+        if any(spec.call_class is not CallClass.BACKGROUND for spec in roster.values()):
+            fail("a built-in workflow role was not a background agent")
+        no_optional = builtin_subagent_specs(provider, ws.policy)
+        if no_optional["planner"].tool_names != leader_module.EXPLORER_TOOL_NAMES + ("write_file", "edit_file"):
+            fail("planner acquired optional tools without configured backends")
+
+
+@check("leader.spec_workflow_prompts")
+def check_spec_workflow_prompts() -> None:
+    with workspace() as ws:
+        roster = builtin_subagent_specs(FakeModelProvider(), ws.policy)
+        requirements = {
+            "planner": ("specs/TEMPLATE.md", "specs/<phase>/<id>-<slug>.md", "Write nothing outside specs/", "End by naming the spec path"),
+            "implementer": ("Implement exactly the given spec", "only files in its Scope", "Run every Validation command", "git status --porcelain verbatim"),
+            "reviewer": ("Read the diff before the report", "scratch directory", "<id>F-<slug>.md", "<id>F2-<slug>.md", "Never commit"),
+        }
+        for name, phrases in requirements.items():
+            prompt = roster[name].prompt
+            if any(phrase not in prompt for phrase in phrases):
+                fail(f"{name} prompt omitted required workflow rules: {prompt!r}")
+
+
+@check("leader.spec_workflow_prompt_reaches_child")
+def check_spec_workflow_prompt_reaches_child() -> None:
+    with workspace() as ws:
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        roster = builtin_subagent_specs(provider, ws.policy)
+        for name in ("planner", "implementer", "reviewer"):
+            requests = []
+            dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs=roster)
+            with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response:
+                result = dispatch.execute(_dispatch(name, "inspect role prompt", name), ws.policy)
+            requests.extend(call.args[0] for call in response.call_args_list)
+            prompt = roster[name].prompt
+            if not result.ok or not requests or not any(
+                message.role is Role.SYSTEM and prompt in message.text
+                for message in requests[0].messages
+            ):
+                fail(f"{name} prompt did not reach its first child model request: {requests!r}")
+
+
+@check("leader.dispatch_description_lists_roster")
+def check_dispatch_description_lists_roster() -> None:
+    with workspace() as ws:
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        roster = builtin_subagent_specs(provider, ws.policy)
+        defined = _spec(ws.root, "defined_helper")
+        roster[defined.name] = defined
+        leader = Leader(LeaderConfig(provider, provider, str(ws.root), subagent_specs=roster))
+        requests = []
+        with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response:
+            leader.run("inspect the dispatch roster")
+        requests.extend(call.args[0] for call in response.call_args_list)
+        if not requests:
+            fail("leader did not make its first request")
+        dispatch = next(
+            item for item in requests[0].tools
+            if item.get("name") == "dispatch_subagent"
+            or item.get("function", {}).get("name") == "dispatch_subagent"
+        )
+        description = dispatch.get("description") or dispatch.get("function", {}).get("description", "")
+        for name in ("worker", "explorer", "planner", "implementer", "reviewer", "defined_helper"):
+            if name not in description:
+                fail(f"first model request's dispatch description omitted {name}: {description!r}")
+        if "writes implementation specs" not in description or "reviews changes" not in description:
+            fail(f"built-in role purposes were missing from dispatch description: {description!r}")
+
+        from dataclasses import replace
+        from symphonai_api.extensions import load_extensions
+        from symphonai_api.session import SessionStore
+        from symphonai_host.broker import EventBroker
+        from symphonai_host.run import HostRun
+
+        extensions = load_extensions(repo_root=ws.root, home=ws.root / "home")
+        custom_reviewer = _spec(ws.root, "reviewer", prompt="custom review prompt").with_overrides(
+            tool_names=("read_file",),
+        )
+        extensions = replace(
+            extensions,
+            agents={**extensions.agents, "reviewer": custom_reviewer},
+        )
+        host_run = HostRun(
+            FakeModelProvider(), ws.policy, EventBroker(), extensions=extensions,
+            sessions_root=ws.root / "sessions",
+        )
+        session = SessionStore(ws.root / "sessions", "override-reviewer", repo_root=ws.root)
+        try:
+            configured_leader = host_run._new_leader(session)
+            replacement = configured_leader._dispatch_tool._subagent_specs["reviewer"]
+            if replacement.prompt != "custom review prompt" or replacement.tool_names != ("read_file",):
+                fail(f"defined reviewer did not replace the built-in role: {replacement!r}")
+        finally:
+            host_run.close()
+            session.close()

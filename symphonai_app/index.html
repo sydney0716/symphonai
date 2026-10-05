@@ -21,7 +21,10 @@
           <div id="chat" class="chat-log" aria-live="polite"></div>
           <div id="approvals" class="approvals" aria-live="polite"></div>
           <form id="prompt-form" class="prompt-form">
-            <textarea id="prompt" rows="3" required aria-label="Message"></textarea>
+            <textarea id="prompt" rows="3" aria-label="Message"></textarea>
+            <div id="prompt-attachments" class="prompt-attachments"></div>
+            <input id="attachment-picker" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple hidden>
+            <button id="attach-button" type="button">Attach</button>
             <p id="prompt-error" class="prompt-error" aria-live="polite"></p>
             <button type="submit">Send</button>
           </form>

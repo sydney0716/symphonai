@@ -11,6 +11,7 @@ from symphonai_api.config import CapabilityCeiling, ResolvedConfig, load_config
 from symphonai_api.discovery import Offered, discover
 from symphonai_api.hooks import HookRunner, HookSpec, hooks_from_config
 from symphonai_api.mcp import McpServerSpec, mcp_servers_from_config
+from symphonai_api.lsp import LspServerSpec, lsp_servers_from_config
 from symphonai_api.plugins import Plugin
 from symphonai_api.skills import Skill
 from symphonai_api.trust import TrustList, trust_from_config
@@ -27,6 +28,7 @@ class Extensions:
     skills: Mapping[str, Skill]
     plugins: Mapping[str, Plugin]
     withheld: tuple[Offered, ...]
+    lsp_servers: tuple[LspServerSpec, ...] = ()
 
     def hook_runner(self, *, cwd: Path) -> HookRunner | None:
         """Build a runner over configured hooks, or None when there are none."""
@@ -51,6 +53,7 @@ def load_extensions(
         repo_root=repo_root,
         trust=trust,
     )
+    lsp_servers = lsp_servers_from_config(config, repo_root=repo_root, trust=trust)
     discovered = discover(
         repo_root=repo_root,
         home=home,
@@ -67,4 +70,5 @@ def load_extensions(
         discovered.skills,
         discovered.plugins,
         discovered.withheld,
+        lsp_servers,
     )

@@ -102,7 +102,11 @@ def _tool_result_event_fields(result: ToolResult) -> dict[str, str | int | bool]
         "result_path": path if isinstance(path, str) else "",
         "lines_added": lines_added if type(lines_added) is int else 0,
         "lines_removed": lines_removed if type(lines_removed) is int else 0,
-        "diff": result.content if isinstance(result.content, str) else "",
+        "diff": (
+            payload["diff"]
+            if isinstance(payload.get("diff"), str)
+            else result.content if isinstance(result.content, str) else ""
+        ),
         "truncated": truncated if type(truncated) is bool else False,
     }
 

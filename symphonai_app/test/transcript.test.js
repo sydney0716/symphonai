@@ -16,9 +16,9 @@ function event(type, fields = {}) {
   return { kind: "event", payload: { type, ...BASE, ...fields } };
 }
 
-function history(role, text, tool_calls = []) {
+function history(role, text, tool_calls = [], attachments = []) {
   return { kind: "event", payload: {
-    type: "HistoryMessage", role, text, tool_calls, turn_id: "turn-1",
+    type: "HistoryMessage", role, text, tool_calls, turn_id: "turn-1", attachments,
   } };
 }
 
@@ -593,6 +593,19 @@ test("all documented event recordings are covered and unknown events survive", (
   }]);
 });
 
+test("attachment-only history stays visible with safe metadata", () => {
+  const transcript = applyAll([history("user", "", [], [
+    { kind: "document", media_type: "application/pdf", filename: "spec.pdf" },
+  ])]);
+  assert.deepEqual(transcript.model, [{
+    type: "prompt",
+    agentId: undefined,
+    text: "",
+    messageCount: undefined,
+    attachments: [{ kind: "document", filename: "spec.pdf" }],
+  }]);
+});
+
 test("goal check events become command-style transcript entries", () => {
   const transcript = applyAll([
     event("GoalChanged", {
@@ -719,4 +732,12 @@ test("every event-derived entry is attributed and gaps are not", () => {
   assert.equal(edit.agentId, "edit-agent");
   const gap = entries.find(({ type }) => type === "gap");
   assert.equal(Object.hasOwn(gap, "agentId"), false);
+});
+
+test("transcript ignores events tagged for another open conversation", () => {
+  const transcript = createTranscript();
+  transcript.setSessionId("session-b");
+  transcript.apply(event("AssistantTextDelta", { text: "from A", session_id: "session-a" }));
+  transcript.apply(event("AssistantTextDelta", { text: "from B", session_id: "session-b" }));
+  assert.deepEqual(transcript.model.map((entry) => entry.text), ["from B"]);
 });

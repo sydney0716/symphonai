@@ -71,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "sandbox", "lsp")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -140,6 +140,12 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
                 search_endpoint(key)
             except KeyError:
                 _raise(source, "search.endpoint", f"unknown search endpoint {key!r}")
+    sandbox = _table(source, values, "sandbox")
+    if sandbox is not None:
+        _unknown_keys(source, "sandbox", sandbox, {"shell", "network"})
+        for key in ("shell", "network"):
+            if key in sandbox:
+                _boolean(source, f"sandbox.{key}", sandbox[key])
     budgets = _table(source, values, "budgets")
     if budgets is not None:
         _unknown_keys(source, "budgets", budgets, {"leader", "subagent", "price_table"})

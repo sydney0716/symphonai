@@ -876,3 +876,19 @@ def dropping_all_changes_nothing() -> None:
         ]
         if len(denied) != 1 or denied[0].tool_name != "write_file":
             fail(f"scripted permission denial event differed: {sink.events!r}")
+
+
+@check("agent_events.diagnostics_keep_event_diff_clean")
+def check_diagnostics_keep_event_diff_clean() -> None:
+    from symphonai_api.agent_loop import _tool_result_event_fields
+
+    diff = "--- a.py\n+++ a.py\n-old\n+new"
+    result = ToolResult(
+        tool_call_id="diagnostic-edit",
+        ok=True,
+        content=diff + "\n\nErrors reported by fake after this write (1):\na.py:5:3: broken",
+        payload={"kind": "file_diff", "path": "a.py", "diff": diff, "lines_added": 1, "lines_removed": 1, "truncated": False},
+    )
+    fields = _tool_result_event_fields(result)
+    if fields["diff"] != diff:
+        fail(f"ToolCallFinished diff included diagnostics text: {fields!r}")

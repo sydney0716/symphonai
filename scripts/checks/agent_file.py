@@ -814,6 +814,13 @@ def web_search_and_skill_allow_and_deny() -> None:
         )
         if denied_spec.tool_names != ("read_file",):
             fail(f"use_skill deny did not remove the tool: {denied_spec.tool_names!r}")
+        lsp_allowed = _write(
+            directory, "lsp.toml",
+            'prompt = "Navigate code."\ntools = ["lsp", "read_file"]\n',
+        )
+        lsp_spec = load_agent_file(lsp_allowed, repo_root=directory, default_model=default_model)
+        if lsp_spec.tool_names != ("read_file", "lsp"):
+            fail(f"explicit lsp tool was not canonicalized: {lsp_spec.tool_names!r}")
 
 
 @check("agent_file.memory_reaches_agent_spec")

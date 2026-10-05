@@ -3,18 +3,180 @@
 from __future__ import annotations
 
 import os
+import socket
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest.mock as mock
+from pathlib import Path
+from symphonai_api.config import ConfigError, load_config
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
 from symphonai_api.tools.shell import RunShellTool, _terminate_process_group
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
+
+
+def _sandbox_skip() -> bool:
+    if sys.platform == "darwin" and os.path.isfile("/usr/bin/sandbox-exec"):
+        probe = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1) (allow default)", "/usr/bin/true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return False
+        print(f"SKIP: sandbox-exec could not apply a profile (exit {probe.returncode})")
+        return True
+    print("SKIP: macOS /usr/bin/sandbox-exec is unavailable")
+    return True
+
+
+def _sandbox_policy(root: Path, *, network: bool = False) -> PermissionPolicy:
+    return PermissionPolicy(
+        repo_root=root,
+        mode="allow",
+        shell_enabled=True,
+        shell_allowlist=[("touch",), (sys.executable,), ("rg",)],
+        shell_sandbox=True,
+        sandbox_network=network,
+    )
+
+
+@check("shell.sandbox_write_confinement")
+def check_shell_sandbox_write_confinement() -> None:
+    if _sandbox_skip():
+        return
+    with (
+        tempfile.TemporaryDirectory(prefix='symphonai "sandbox ') as directory,
+        tempfile.TemporaryDirectory(dir="/private/var/tmp") as outside_directory,
+    ):
+        root = Path(directory) / 'repo "root'
+        root.mkdir()
+        policy = _sandbox_policy(root)
+        for path in (
+            root / "ok",
+            Path(os.environ.get("TMPDIR", tempfile.gettempdir())) / "symphonai-sandbox-ok",
+            Path("/tmp") / "symphonai-sandbox-ok",
+        ):
+            result = RunShellTool().execute(
+                ToolCall(id="sandbox-write", name="run_shell", arguments={"argv": ["touch", str(path)]}),
+                policy,
+            )
+            if not result.ok or not path.exists():
+                fail(f"sandbox refused an allowed write to {path}: {result!r}")
+            path.unlink()
+        denied = Path(outside_directory) / "no"
+        result = RunShellTool().execute(
+            ToolCall(id="sandbox-outside", name="run_shell", arguments={"argv": ["touch", str(denied)]}),
+            policy,
+        )
+        if result.ok or denied.exists():
+            fail(f"sandbox allowed a write outside repo and temp roots: {result!r}")
+
+
+@check("shell.sandbox_network_policy")
+def check_shell_sandbox_network_policy() -> None:
+    if _sandbox_skip():
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(2)
+        port = listener.getsockname()[1]
+        code = f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
+        try:
+            for network, allowed in ((False, False), (True, True)):
+                result = RunShellTool().execute(
+                    ToolCall(id="sandbox-network", name="run_shell", arguments={
+                        "argv": [sys.executable, "-c", code],
+                    }),
+                    _sandbox_policy(root, network=network),
+                )
+                if result.ok != allowed:
+                    fail(f"sandbox network={network} returned the wrong result: {result!r}")
+                if allowed:
+                    connection, _ = listener.accept()
+                    connection.close()
+        finally:
+            listener.close()
+
+
+@check("shell.sandbox_unavailable_fails_closed")
+def check_shell_sandbox_unavailable_fails_closed() -> None:
+    policy = _sandbox_policy(Path.cwd())
+    with (
+        mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+        mock.patch("symphonai_api.tools.shell.subprocess.Popen") as popen,
+    ):
+        result = RunShellTool().execute(
+            ToolCall(id="sandbox-unavailable", name="run_shell", arguments={"argv": ["touch", "never"]}),
+            policy,
+        )
+    if result.ok or result.error != "sandbox requested but unavailable on this platform" or popen.called:
+        fail(f"unavailable sandbox did not refuse before spawning: {result!r}")
+
+
+@check("shell.sandbox_opt_in_preserves_plain_argv")
+def check_shell_sandbox_opt_in_preserves_plain_argv() -> None:
+    argv = ["echo", "plain"]
+    process = mock.Mock(returncode=0)
+    process.poll.return_value = 0
+    process.communicate.return_value = ("", "")
+    policy = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True,
+        shell_allowlist=[("echo",)],
+    )
+    with mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen:
+        result = RunShellTool().execute(
+            ToolCall(id="plain-shell", name="run_shell", arguments={"argv": argv}), policy,
+        )
+    if not result.ok or popen.call_args.args[0] != argv:
+        fail(f"unsandboxed command argv changed: {popen.call_args!r}, {result!r}")
+
+
+@check("shell.sandbox_command_exit_is_ordinary")
+def check_shell_sandbox_command_exit_is_ordinary() -> None:
+    if _sandbox_skip():
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        result = RunShellTool().execute(
+            ToolCall(id="sandbox-no-match", name="run_shell", arguments={"argv": ["rg", "absent-pattern", directory]}),
+            _sandbox_policy(Path(directory)),
+        )
+    if result.ok or result.error != "exit code 1" or "sandbox" in (result.error or "").casefold():
+        fail(f"ordinary exit status was misclassified as a sandbox failure: {result!r}")
+
+
+@check("config.sandbox_settings")
+def check_sandbox_settings() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        project_config = root / ".symphonai" / "config.toml"
+        project_config.parent.mkdir()
+        project_config.write_text("[sandbox]\nshell = true\nnetwork = false\n", encoding="utf-8")
+        resolved = load_config(repo_root=root, home=root / "home")
+        if resolved.get("sandbox.shell") is not True or resolved.get("sandbox.network") is not False:
+            fail(f"sandbox settings were not flattened: {resolved.values!r}")
+        for content, key in (
+            ('[sandbox]\nshell = "yes"\n', "sandbox.shell"),
+            ("[sandbox]\nother = true\n", "sandbox.other"),
+        ):
+            project_config.write_text(content, encoding="utf-8")
+            try:
+                load_config(repo_root=root, home=root / "home")
+            except ConfigError as exc:
+                if key not in str(exc):
+                    fail(f"sandbox validation error omitted {key}: {exc!r}")
+            else:
+                fail(f"invalid sandbox setting was accepted for {key}")
 
 
 @check("shell.process_group_fallback")

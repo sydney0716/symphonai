@@ -135,12 +135,28 @@ export async function start({ global, document, client }) {
   const form = document.getElementById("prompt-form");
   const input = document.getElementById("prompt");
   const promptError = document.getElementById("prompt-error");
+  const attachmentList = document.getElementById("prompt-attachments");
+  const attachmentPicker = document.getElementById("attachment-picker");
+  const attachButton = document.getElementById("attach-button");
+  const pendingFiles = [];
+  const promptAttachments = [];
+  input.required = false;
   const commandMenu = element(document, "div", { className: "command-menu" });
+  const fileMenu = element(document, "div", { className: "file-menu" });
   const pickerHost = element(document, "div", { className: "picker-host" });
-  form.before(commandMenu, pickerHost);
+  form.before(commandMenu, fileMenu, pickerHost);
   let commandMatches = [];
   let highlightedCommand = 0;
+  let fileMatches = [];
+  let highlightedFile = 0;
+  let fileFragment = null;
+  let fileSearchSerial = 0;
   const turn = createTurnState();
+  let historyPrompts = null;
+  const pagePrompts = [];
+  let historyIndex = -1;
+  let historyDraft = "";
+  let recalledPrompt = null;
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
@@ -169,7 +185,9 @@ export async function start({ global, document, client }) {
   let currentMode = conversationReply?.conversation?.mode ?? launchMode;
   let rememberedPlanMode = null;
   let sessions = initialSessions;
-  let currentSessionId = null;
+  let currentSessionId = conversationReply?.conversation?.session_id ?? null;
+  transcript.setSessionId(currentSessionId);
+  let lastActivityRefresh = 0;
   let forkConflict = null;
   let conversation = conversationReply?.conversation ?? null;
   const roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
@@ -544,11 +562,44 @@ export async function start({ global, document, client }) {
       }
     }
 
+    async function worktreeAction(name, action, row) {
+      try {
+        await boundary[action](name);
+        await showChanges();
+      } catch (error) {
+        row.append(element(document, "p", {
+          className: "error",
+          text: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    }
+
     const files = Array.isArray(reply?.files) ? reply.files : [];
     const turns = Array.isArray(reply?.turns) ? reply.turns : [];
+    const worktrees = Array.isArray(reply?.worktrees) ? reply.worktrees : [];
     const children = [element(document, "h1", { text: "Changes" })];
-    if (files.length === 0) {
+    if (files.length === 0 && worktrees.length === 0) {
       children.push(element(document, "p", { text: "No changes in this conversation." }));
+    }
+    if (worktrees.length > 0) {
+      children.push(element(document, "h2", { text: "Worktrees" }));
+      for (const worktree of worktrees) {
+        const row = element(document, "section", { className: "changes-worktree" });
+        append(row, element(document, "h3", { text: worktree.name }));
+        append(row, element(document, "p", {
+          className: "changes-paths",
+          text: Array.isArray(worktree.files) ? worktree.files.join(", ") : "",
+        }));
+        append(row, element(document, "pre", { text: worktree.diff ?? "" }));
+        const apply = element(document, "button", { text: "Apply" });
+        apply.type = "button";
+        listen(apply, "click", () => worktreeAction(worktree.name, "applyWorktree", row));
+        const discard = element(document, "button", { text: "Discard" });
+        discard.type = "button";
+        listen(discard, "click", () => worktreeAction(worktree.name, "discardWorktree", row));
+        append(row, apply, discard);
+        children.push(row);
+      }
     }
     if (files.length > 0) {
       children.push(element(document, "h2", { text: "Files" }));
@@ -646,6 +697,7 @@ export async function start({ global, document, client }) {
       const reply = await boundary.forkSession(sourceId, recordId, force);
       forkConflict = null;
       currentSessionId = reply.run_id;
+      transcript.setSessionId(currentSessionId);
       try {
         sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
         showProjects();
@@ -708,6 +760,7 @@ export async function start({ global, document, client }) {
     const previousId = currentSessionId;
     transcript.model.length = 0;
     currentSessionId = runId;
+    transcript.setSessionId(currentSessionId);
     showTranscript();
     try {
       await boundary.openSession(runId);
@@ -720,6 +773,7 @@ export async function start({ global, document, client }) {
     } catch (error) {
       transcript.model.splice(0, transcript.model.length, ...previous);
       currentSessionId = previousId;
+      transcript.setSessionId(currentSessionId);
       showTranscript();
       throw error;
     }
@@ -755,7 +809,7 @@ export async function start({ global, document, client }) {
         const parent = sessions.find((item) => item.run_id === session.parent_session_id);
         const label = (session.title || session.run_id) + (
           session.parent_session_id ? ` · fork of ${parent?.title || session.parent_session_id}` : ""
-        );
+        ) + (["working", "waiting"].includes(session.activity) ? ` · ${session.activity}` : "");
         if (!current) {
           append(section, element(document, "p", {
             className: "session-link unavailable",
@@ -783,6 +837,7 @@ export async function start({ global, document, client }) {
       await boundary.newSession();
       transcript.model.length = 0;
       currentSessionId = null;
+      transcript.setSessionId(null);
       showTranscript();
       conversation = null;
       currentMode = launchMode;
@@ -829,6 +884,123 @@ export async function start({ global, document, client }) {
 
   function showPromptError() {
     promptError.textContent = promptFailure;
+  }
+
+  function rememberPrompt(text) {
+    if (!text) return;
+    if (pagePrompts[0] !== text) pagePrompts.unshift(text);
+    if (historyPrompts !== null && historyPrompts[0] !== text) historyPrompts.unshift(text);
+    historyIndex = -1;
+    recalledPrompt = null;
+    historyDraft = "";
+  }
+
+  async function loadPromptHistory() {
+    if (historyPrompts !== null) return true;
+    try {
+      const reply = await boundary.history(100);
+      const combined = [];
+      for (const prompt of [...pagePrompts, ...(Array.isArray(reply?.prompts) ? reply.prompts : [])]) {
+        if (typeof prompt === "string" && prompt !== "" && combined.at(-1) !== prompt) {
+          combined.push(prompt);
+        }
+      }
+      historyPrompts = combined;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function showHistoryPrompt(prompt) {
+    input.value = prompt;
+    recalledPrompt = prompt;
+    if (typeof input.setSelectionRange === "function") {
+      input.setSelectionRange(prompt.length, prompt.length);
+    }
+  }
+
+  async function handlePromptHistory(event) {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return false;
+    if (historyIndex >= 0 && input.value !== recalledPrompt) {
+      historyIndex = -1;
+      recalledPrompt = null;
+      return false;
+    }
+    if (event.key === "ArrowUp") {
+      if (historyIndex === -1 && input.value !== "") return false;
+      if (!(await loadPromptHistory()) || !historyPrompts?.length) return false;
+      if (historyIndex + 1 >= historyPrompts.length) return false;
+      if (historyIndex === -1) historyDraft = input.value;
+      historyIndex += 1;
+      event.preventDefault();
+      showHistoryPrompt(historyPrompts[historyIndex]);
+      return true;
+    }
+    if (historyIndex === -1) return false;
+    event.preventDefault();
+    if (historyIndex === 0) {
+      historyIndex = -1;
+      recalledPrompt = null;
+      input.value = historyDraft;
+    } else {
+      historyIndex -= 1;
+      showHistoryPrompt(historyPrompts[historyIndex]);
+    }
+    return true;
+  }
+
+  function showPendingAttachments() {
+    replace(attachmentList, ...pendingFiles.map((file, index) => {
+      const chip = element(document, "span", {
+        className: "attachment-chip",
+        text: `${file.name || "image"} · ${file.size}`,
+      });
+      const remove = element(document, "button", { text: "Remove" });
+      remove.type = "button";
+      listen(remove, "click", () => {
+        pendingFiles.splice(index, 1);
+        showPendingAttachments();
+      });
+      return append(chip, remove);
+    }));
+  }
+
+  function addFiles(files) {
+    const allowed = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
+    for (const file of files) {
+      if (pendingFiles.length >= 10) {
+        promptFailure = "You can attach up to 10 files.";
+        break;
+      }
+      if (file.size > 5_000_000) {
+        promptFailure = `${file.name || "File"} is over the 5,000,000 byte limit.`;
+        continue;
+      }
+      if (!allowed.has(file.type)) {
+        promptFailure = `${file.name || "File"} must be a PNG, JPEG, GIF, WEBP or PDF.`;
+        continue;
+      }
+      pendingFiles.push(file);
+      promptFailure = "";
+    }
+    showPendingAttachments();
+    showPromptError();
+  }
+
+  async function encodePendingFiles() {
+    return Promise.all(pendingFiles.map(async (file) => {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = "";
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      }
+      return {
+        data: (global.btoa ?? globalThis.btoa)(binary),
+        filename: file.name || undefined,
+        kind: file.type === "application/pdf" ? "document" : "image",
+      };
+    }));
   }
 
   function showSpec(result) {
@@ -1056,6 +1228,17 @@ export async function start({ global, document, client }) {
     const children = [];
     for (const [id, question] of approvals.state) {
       const row = element(document, "section", { className: `approval ${question.state}` });
+      if (question.session_id && question.session_id !== currentSessionId) {
+        const session = sessions.find((item) => item.run_id === question.session_id);
+        append(row, element(document, "p", {
+          className: "approval-session",
+          text: session?.title || question.session_id,
+        }));
+        const open = element(document, "button", { text: "Open" });
+        open.type = "button";
+        listen(open, "click", () => openSession(question.session_id));
+        append(row, open);
+      }
       append(
         row,
         element(document, "p", {
@@ -1116,9 +1299,19 @@ export async function start({ global, document, client }) {
   async function perform(actions) {
     for (const action of actions) {
       if (action.kind === "prompt") {
+        const presentation = {
+          text: action.text,
+          attachments: (action.attachments ?? []).map(({ kind, filename }) => ({ kind, filename })),
+        };
+        if (presentation.attachments.length > 0) promptAttachments.push(presentation);
         try {
-          const reply = await boundary.prompt(action.text);
+          const reply = await boundary.prompt(
+            action.text,
+            (action.attachments ?? []).map(({ data, filename }) => ({ data, ...(filename ? { filename } : {}) })),
+          );
           if (reply?.conflict === true) {
+            const pendingIndex = promptAttachments.indexOf(presentation);
+            if (pendingIndex !== -1) promptAttachments.splice(pendingIndex, 1);
             const active = await activeRuntimeRun();
             if (active) {
               promptFailure = "A run is already in progress.";
@@ -1128,6 +1321,10 @@ export async function start({ global, document, client }) {
               promptFailure = "The message was not sent. Send it again.";
             }
           } else {
+            if (!currentSessionId && typeof reply?.run_id === "string") {
+              currentSessionId = reply.run_id;
+              transcript.setSessionId(currentSessionId);
+            }
             promptFailure = "";
             await perform(turn.accepted());
             try {
@@ -1138,6 +1335,8 @@ export async function start({ global, document, client }) {
             }
           }
         } catch (error) {
+          const pendingIndex = promptAttachments.indexOf(presentation);
+          if (pendingIndex !== -1) promptAttachments.splice(pendingIndex, 1);
           turn.rejected(String(error));
           promptFailure = "Prompt failed.";
         }
@@ -1149,7 +1348,28 @@ export async function start({ global, document, client }) {
     showPromptError();
   }
 
-  listen(form, "submit", (event) => {
+  listen(attachButton, "click", () => attachmentPicker.click());
+  listen(attachmentPicker, "change", () => {
+    addFiles(Array.from(attachmentPicker.files ?? []));
+    attachmentPicker.value = "";
+  });
+  listen(input, "paste", (event) => {
+    const files = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (files.length > 0) {
+      event.preventDefault();
+      addFiles(files);
+    }
+  });
+  listen(form, "dragover", (event) => event.preventDefault());
+  listen(form, "drop", (event) => {
+    event.preventDefault();
+    addFiles(Array.from(event.dataTransfer?.files ?? []));
+  });
+
+  listen(form, "submit", async (event) => {
     event.preventDefault();
     const text = input.value;
     const command = text.trim();
@@ -1161,14 +1381,34 @@ export async function start({ global, document, client }) {
       showPromptError();
       return;
     }
+    if (text === "" && pendingFiles.length === 0) return;
+    let attachments = [];
+    if (pendingFiles.length > 0) {
+      try {
+        attachments = await encodePendingFiles();
+      } catch {
+        promptFailure = "Could not read the attached file.";
+        showPromptError();
+        return;
+      }
+    }
     input.value = "";
+    pendingFiles.length = 0;
+    showPendingAttachments();
     promptFailure = "";
-    const actions = turn.submit(text);
+    rememberPrompt(text);
+    const actions = turn.submit(text, attachments);
     showPromptError();
     return perform(actions);
   });
 
-  listen(input, "input", renderCommandMenu);
+  listen(input, "input", () => {
+    if (historyIndex >= 0) {
+      historyIndex = -1;
+      recalledPrompt = null;
+    }
+    return renderComposerMenus();
+  });
   listen(input, "keydown", handleComposerKeydown);
 
   function answerCommand(text) {
@@ -1628,6 +1868,81 @@ export async function start({ global, document, client }) {
     replace(commandMenu);
   }
 
+  function closeFileMenu() {
+    fileMatches = [];
+    highlightedFile = 0;
+    fileFragment = null;
+    fileSearchSerial += 1;
+    replace(fileMenu);
+  }
+
+  function fileFragmentAtCursor() {
+    const cursor = input.selectionStart ?? input.value.length;
+    const before = input.value.slice(0, cursor);
+    const match = /(^|\s)@([^\s]*)$/.exec(before);
+    if (!match) return null;
+    const start = before.length - match[0].length + match[1].length;
+    return { query: match[2], start, end: start + match[2].length + 1 };
+  }
+
+  function renderFileRows() {
+    const rows = fileMatches.map((path, index) => {
+      const button = element(document, "button", {
+        className: `file-suggestion${index === highlightedFile ? " focused" : ""}`,
+        text: path,
+      });
+      button.type = "button";
+      button.setAttribute?.("role", "option");
+      button.setAttribute?.("aria-selected", String(index === highlightedFile));
+      listen(button, "mousedown", (event) => event.preventDefault());
+      listen(button, "click", () => insertFileMention(path));
+      return button;
+    });
+    replace(fileMenu, ...rows);
+  }
+
+  function insertFileMention(path) {
+    if (!fileFragment) return;
+    input.value = `${input.value.slice(0, fileFragment.start)}@${path} ${input.value.slice(fileFragment.end)}`;
+    input.focus();
+    closeFileMenu();
+  }
+
+  async function renderComposerMenus() {
+    const fragment = fileFragmentAtCursor();
+    if (!fragment) {
+      closeFileMenu();
+      renderCommandMenu();
+      return;
+    }
+    closeCommandMenu();
+    fileFragment = fragment;
+    highlightedFile = 0;
+    const serial = ++fileSearchSerial;
+    const searchedText = input.value;
+    const searchedCursor = input.selectionStart ?? input.value.length;
+    try {
+      const reply = await boundary.files(fragment.query);
+      if (
+        serial !== fileSearchSerial
+        || input.value !== searchedText
+        || (input.selectionStart ?? input.value.length) !== searchedCursor
+      ) return;
+      fileMatches = Array.isArray(reply?.files) ? reply.files : [];
+      if (fileMatches.length === 0) {
+        replace(fileMenu, element(document, "div", { text: "No files found." }));
+      } else {
+        renderFileRows();
+      }
+    } catch (error) {
+      if (serial !== fileSearchSerial) return;
+      fileMatches = [];
+      replace(fileMenu, element(document, "div", {
+        text: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
   function renderCommandMenuRows() {
     const rows = commandMatches.map((command, index) => {
       const button = element(document, "button", {
@@ -1660,6 +1975,24 @@ export async function start({ global, document, client }) {
   }
 
   async function handleComposerKeydown(event) {
+    if (fileFragment !== null) {
+      if (fileMatches.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+        event.preventDefault();
+        highlightedFile = (highlightedFile + (event.key === "ArrowDown" ? 1 : -1) + fileMatches.length) % fileMatches.length;
+        renderFileRows();
+        return;
+      }
+      if (fileMatches.length > 0 && (event.key === "Tab" || event.key === "Enter")) {
+        event.preventDefault();
+        insertFileMention(fileMatches[highlightedFile]);
+        return;
+      }
+      if (lookup(keymap, event, { platform }) === "cancel") {
+        event.preventDefault();
+        closeFileMenu();
+        return;
+      }
+    }
     if (commandMatches.length > 0) {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
@@ -1683,6 +2016,8 @@ export async function start({ global, document, client }) {
       }
       return;
     }
+    if (fileFragment !== null) return;
+    if (await handlePromptHistory(event)) return;
     if (lookup(keymap, event, { platform }) === "submit") {
       event.preventDefault();
       await form.requestSubmit();
@@ -1691,6 +2026,7 @@ export async function start({ global, document, client }) {
 
   async function runCommand(command) {
     closeCommandMenu();
+    closeFileMenu();
     input.value = "";
     commandEntry = { type: "command", command: command.trim(), output: [] };
     transcript.model.push(commandEntry);
@@ -1893,6 +2229,25 @@ export async function start({ global, document, client }) {
   }
 
   async function onFrame(frame) {
+    if (frame.kind === "approval_requested") {
+      await approvals.onFrame(frame);
+      showApprovals();
+      return;
+    }
+    const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
+    if (typeof frameSessionId === "string" && frameSessionId !== currentSessionId) {
+      const now = Date.now();
+      if (now - lastActivityRefresh >= 1000) {
+        lastActivityRefresh = now;
+        try {
+          sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+          showProjects();
+        } catch {
+          // A transient listing failure does not affect the current transcript.
+        }
+      }
+      return;
+    }
     const previousLength = transcript.model.length;
     transcript.apply(frame);
     if (
@@ -1902,14 +2257,15 @@ export async function start({ global, document, client }) {
     ) {
       transcript.model.at(-1).recordId = frame.payload.record_id;
     }
+    if (frame.kind === "event" && frame.payload?.type === "PromptSubmitted") {
+      const match = promptAttachments.findIndex(({ text }) => text === frame.payload.text);
+      if (match !== -1 && transcript.model.at(-1)?.type === "prompt") {
+        transcript.model.at(-1).attachments = promptAttachments.splice(match, 1)[0].attachments;
+      }
+    }
     board.apply(frame);
     showAgents();
     showTranscript();
-    if (frame.kind === "approval_requested") {
-      await approvals.onFrame(frame);
-      showApprovals();
-      return;
-    }
     const dropped = frame.dropped ?? frame.payload?.dropped;
     if (frame.kind === "error" && Number.isInteger(dropped) && dropped > 0) {
       await approvals.onFrame(frame);

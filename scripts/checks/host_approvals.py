@@ -350,6 +350,40 @@ def check_pending_endpoint() -> None:
         host.close()
 
 
+@check("host_approvals.session_scoped_grants_and_tags")
+def check_session_scoped_grants_and_tags() -> None:
+    published_a: list[PendingApproval] = []
+    published_b: list[PendingApproval] = []
+    broker_a = ApprovalBroker(lambda item: published_a.append(item) or True, timeout=1, session_id="session-a")
+    broker_b = ApprovalBroker(lambda item: published_b.append(item) or True, timeout=1, session_id="session-b")
+    request = ToolApprovalRequest("run_shell", "echo", "run a command", command=("echo", "hello"))
+    result: list = []
+    thread = threading.Thread(target=lambda: result.append(broker_a.callback(request)))
+    thread.start()
+    deadline = time.monotonic() + 1
+    while not published_a and time.monotonic() < deadline:
+        time.sleep(0.005)
+    if not published_a or published_a[0].session_id != "session-a":
+        fail(f"first approval was not tagged with its session: {published_a!r}")
+    if not broker_a.resolve(published_a[0].approval_id, allowed=True, reason="", remember=True):
+        fail("first session's remembered grant did not resolve")
+    thread.join(timeout=1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail("first session's approval did not resume")
+    if not broker_a.callback(request).allowed:
+        fail("first session did not honor its own remembered grant")
+    other: list = []
+    second = threading.Thread(target=lambda: other.append(broker_b.callback(request)))
+    second.start()
+    deadline = time.monotonic() + 1
+    while not published_b and time.monotonic() < deadline:
+        time.sleep(0.005)
+    if not published_b or published_b[0].session_id != "session-b":
+        fail("second session inherited the first session's shell grant")
+    broker_b.resolve(published_b[0].approval_id, allowed=False, reason="no")
+    second.join(timeout=1)
+
+
 @check("host_approvals.transport_tool_call_id")
 def check_transport_tool_call_id() -> None:
     host = _host()
@@ -559,4 +593,92 @@ def check_stop_unparks_over_http() -> None:
         finally:
             connection.close()
     finally:
+        host.close()
+
+
+@check("host_approvals.pending_session_identity_and_activity")
+def check_pending_session_identity_and_activity() -> None:
+    host = _host(approval_timeout=2)
+    thread = None
+    connection = None
+    try:
+        run_id = host.run.start("create conversation")
+        deadline = time.monotonic() + 2
+        while host.run.active and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if host.run.active:
+            fail("setup conversation did not finish")
+        connection, stream = _subscribed_stream(host)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(host.run.approvals.callback(REQUEST)))
+        thread.start()
+        frame = _await_sse(
+            connection, stream,
+            lambda item: isinstance(item, tuple) and item[0] == "approval_requested",
+            what="session-tagged approval",
+        )
+        payload = frame[1]
+        if payload.get("session_id") != run_id:
+            fail(f"approval event did not identify its session: {payload!r}")
+        connection_list, response = _request(host, "GET", "/approvals", headers=_headers(host))
+        try:
+            listing = json.loads(response.read())
+            if response.status != 200 or listing.get("pending") != [payload]:
+                fail(f"approval listing and event differed: {listing!r}, {payload!r}")
+        finally:
+            connection_list.close()
+        connection_list, response = _request(host, "GET", "/sessions", headers=_headers(host))
+        try:
+            sessions = json.loads(response.read())
+            item = next(entry for entry in sessions if entry["run_id"] == run_id)
+            if item.get("activity") != "waiting":
+                fail(f"pending approval did not mark its session waiting: {item!r}")
+        finally:
+            connection_list.close()
+        connection_list, response = _request(
+            host, "POST", "/approval",
+            body={"approval_id": payload["approval_id"], "allowed": True},
+            headers=_headers(host),
+        )
+        try:
+            reply = json.loads(response.read())
+            if response.status != 200 or reply != {"resolved": True}:
+                fail(f"session approval did not resolve: {response.status}, {reply!r}")
+        finally:
+            connection_list.close()
+        thread.join(1)
+        if thread.is_alive() or not result or not result[0].allowed:
+            fail("session-scoped approval callback did not resume")
+    finally:
+        if thread is not None:
+            thread.join(1)
+        if connection is not None:
+            connection.close()
+        host.close()
+
+
+@check("host_approvals.runtime_event_session_tag")
+def check_runtime_event_session_tag() -> None:
+    host = _host()
+    connection = None
+    try:
+        connection, stream = _subscribed_stream(host)
+        connection_prompt, response = _request(
+            host, "POST", "/prompt", body={"prompt": "tag events"}, headers=_headers(host)
+        )
+        try:
+            run_id = json.loads(response.read())["run_id"]
+        finally:
+            connection_prompt.close()
+        terminal = _await_sse(
+            connection, stream,
+            lambda item: isinstance(item, tuple) and item[0] == "event"
+            and item[1].get("type") in ("RunFinished", "RunFailed"),
+            what="tagged terminal event",
+        )
+        if terminal[1].get("session_id") != run_id:
+            fail(f"runtime event frame omitted its conversation id: {terminal[1]!r}")
+    finally:
+        if connection is not None:
+            connection.close()
         host.close()

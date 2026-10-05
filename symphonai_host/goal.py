@@ -91,6 +91,7 @@ class GoalChanged(Event):
     max_rounds: int = 0
     reason: str = ""
     last_check: dict | None = None
+    session_id: str = ""
 
 
 class GetGoalTool(LocalTool):

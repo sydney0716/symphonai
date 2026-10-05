@@ -68,7 +68,7 @@ _STANDARD_TOOL_NAMES = (
     "run_shell",
     "web_fetch",
 )
-_AGENT_TOOL_NAMES = (*_STANDARD_TOOL_NAMES, "web_search", "use_skill")
+_AGENT_TOOL_NAMES = (*_STANDARD_TOOL_NAMES, "web_search", "use_skill", "lsp")
 
 
 def _raise(path: Path, key: str, detail: str) -> None:

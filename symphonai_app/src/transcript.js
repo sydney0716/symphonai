@@ -38,6 +38,7 @@ export function createTranscript() {
   const questions = new Map();
   const endedRuns = new Set();
   let turnSerial = 0;
+  let sessionId = null;
   let activeTurn = null;
   const activityTurns = new WeakMap();
 
@@ -130,16 +131,20 @@ export function createTranscript() {
   function applyEvent(event) {
     const { type, fields } = event;
     if (type === "HistoryMessage") {
-      if (!fields.text) {
+      if (!fields.text && !fields.attachments?.length) {
         return;
       }
       if (fields.role === "user") {
-        model.push({
+        const entry = {
           type: "prompt",
           agentId: fields.agent_id,
           text: fields.text,
           messageCount: fields.message_count,
-        });
+        };
+        if (fields.attachments?.length) {
+          entry.attachments = fields.attachments.map(({ kind, filename }) => ({ kind, filename }));
+        }
+        model.push(entry);
       } else if (fields.role === "assistant") {
         model.push({
           type: "text",
@@ -309,6 +314,10 @@ export function createTranscript() {
   }
 
   function apply(frame) {
+    const frameSessionId = frame?.payload?.session_id;
+    if (typeof frameSessionId === "string" && frameSessionId !== sessionId) {
+      return;
+    }
     const dropped = frame?.dropped ?? frame?.payload?.dropped;
     if (frame?.kind === "error" && Number.isInteger(dropped) && dropped > 0) {
       model.push({ type: "gap", dropped });
@@ -322,6 +331,9 @@ export function createTranscript() {
 
   return {
     apply,
+    setSessionId(value) {
+      sessionId = typeof value === "string" ? value : null;
+    },
     get model() {
       return model;
     },

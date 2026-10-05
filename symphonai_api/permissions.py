@@ -198,6 +198,8 @@ class PermissionPolicy:
     forbidden_patterns: tuple[str, ...] = DEFAULT_FORBIDDEN_PATTERNS
     shell_enabled: bool = False
     shell_allowlist: list[tuple[str, ...]] = field(default_factory=list)
+    shell_sandbox: bool = False
+    sandbox_network: bool = False
     fetch_enabled: bool = False
     fetch_allowlist: list[str] = field(default_factory=list)
     shell_timeout_seconds: float = 600.0
@@ -355,6 +357,8 @@ class PermissionPolicy:
             shell_allowlist=_intersect_shell_allowlists(
                 self.shell_allowlist, ceiling.shell_allowlist
             ),
+            shell_sandbox=self.shell_sandbox or ceiling.shell_sandbox,
+            sandbox_network=self.sandbox_network and ceiling.sandbox_network,
             fetch_enabled=self.fetch_enabled and ceiling.fetch_enabled,
             fetch_allowlist=[
                 host for host in self.fetch_allowlist if host in ceiling.fetch_allowlist
@@ -371,6 +375,32 @@ class PermissionPolicy:
                 if ceiling.approval_callback is not None
                 else self.approval_callback
             ),
+        )
+
+    def rerooted(self, new_root: Path) -> "PermissionPolicy":
+        """Copy this policy under a different repository root."""
+        new_root = Path(new_root).resolve()
+        write_scope = []
+        for path in self.allowed_write_scope:
+            try:
+                relative = path.relative_to(self.repo_root)
+            except ValueError:
+                continue
+            write_scope.append(new_root / relative)
+        return PermissionPolicy(
+            repo_root=new_root,
+            allowed_write_scope=write_scope,
+            forbidden_patterns=self.forbidden_patterns,
+            shell_enabled=self.shell_enabled,
+            shell_allowlist=list(self.shell_allowlist),
+            shell_sandbox=self.shell_sandbox,
+            sandbox_network=self.sandbox_network,
+            fetch_enabled=self.fetch_enabled,
+            fetch_allowlist=list(self.fetch_allowlist),
+            shell_timeout_seconds=self.shell_timeout_seconds,
+            shell_output_limit_chars=self.shell_output_limit_chars,
+            mode=self.mode,
+            approval_callback=self.approval_callback,
         )
 
     # -- path checks ------------------------------------------------------

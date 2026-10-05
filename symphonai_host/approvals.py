@@ -26,6 +26,7 @@ class PendingApproval:
     details: str
     tool_call_id: str = ""
     remember: str = ""
+    session_id: str | None = None
 
 
 @dataclass
@@ -44,11 +45,13 @@ class ApprovalBroker:
         publish: Callable[[PendingApproval], bool],
         *,
         timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+        session_id: str | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("approval timeout must be greater than 0")
         self._publish = publish
         self._timeout = timeout
+        self._session_id = session_id
         self._pending: dict[str, _Pending] = {}
         self._granted_shell_prefixes: set[tuple[str, ...]] = set()
         self._lock = threading.Lock()
@@ -72,6 +75,7 @@ class ApprovalBroker:
             details=request.details,
             tool_call_id=request.tool_call_id,
             remember=" ".join(grant_prefix),
+            session_id=self._session_id,
         )
         pending = _Pending(approval, threading.Event(), grant_prefix=grant_prefix)
         with self._lock:

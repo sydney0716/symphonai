@@ -168,6 +168,22 @@ test("changes requests are authenticated and retain conflict paths", async () =>
   assert.deepEqual(JSON.parse(records[1].options.body), { path: "a.py" });
 });
 
+test("worktree actions post the name and preserve conflict messages", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return records.length === 1
+      ? response(409, { error: "patch does not apply" })
+      : response(200, { applied: ["a.py"] });
+  } });
+  await assert.rejects(client.applyWorktree("w1"), (error) => error.status === 409 && error.message === "patch does not apply");
+  assert.deepEqual(await client.applyWorktree("w1"), { applied: ["a.py"] });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/worktree/apply");
+  assert.deepEqual(JSON.parse(records[0].options.body), { name: "w1" });
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.equal(records[1].options.method, "POST");
+});
+
 test("manual compaction uses the authenticated JSON request", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
@@ -353,6 +369,71 @@ test("approval sends remember only when requested", async () => {
     { approval_id: "approval-1", allowed: true, reason: "yes" },
     { approval_id: "approval-2", allowed: true, reason: "", remember: true },
   ]);
+});
+
+test("prompt adds attachments only when provided", async () => {
+  const bodies = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return response(200, { accepted: true });
+    },
+  });
+  await client.prompt("text");
+  await client.prompt("", [{ data: "AQ==", filename: "a.png" }]);
+  assert.deepEqual(bodies, [
+    { prompt: "text" },
+    { prompt: "", attachments: [{ data: "AQ==", filename: "a.png" }] },
+  ]);
+});
+
+test("files encodes the query and limit as search parameters", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, { files: ["src/a.py"], truncated: false });
+    },
+  });
+  assert.deepEqual(await client.files("a b", 7), { files: ["src/a.py"], truncated: false });
+  assert.equal(new URL(records[0].url).pathname, "/files");
+  assert.deepEqual(Object.fromEntries(new URL(records[0].url).searchParams), {
+    query: "a b", limit: "7",
+  });
+});
+
+test("history requests the selected limit", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, { prompts: ["latest"] });
+    },
+  });
+  assert.deepEqual(await client.history(12), { prompts: ["latest"] });
+  assert.equal(new URL(records[0].url).pathname, "/history");
+  assert.equal(new URL(records[0].url).searchParams.get("limit"), "12");
+});
+
+test("history requests the selected limit", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, { prompts: ["latest"] });
+    },
+  });
+  assert.deepEqual(await client.history(12), { prompts: ["latest"] });
+  assert.equal(new URL(records[0].url).pathname, "/history");
+  assert.equal(new URL(records[0].url).searchParams.get("limit"), "12");
 });
 
 test("sessions accepts only an array while other routes still require objects", async () => {

@@ -9,17 +9,23 @@ from dataclasses import dataclass, field
 from symphonai_api.events import Event
 
 
+@dataclass(frozen=True)
+class SessionEvent:
+    event: Event
+    session_id: str
+
+
 @dataclass
 class Subscription:
     """One independently bounded event queue owned by an EventBroker."""
 
     _broker: "EventBroker"
-    _queue: queue.Queue[Event | None]
+    _queue: queue.Queue[Event | SessionEvent | None]
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _dropped: int = 0
     _closed: bool = False
 
-    def get(self, timeout: float | None = None) -> Event | None:
+    def get(self, timeout: float | None = None) -> Event | SessionEvent | None:
         """Return an event, None on timeout, or None after broker closure."""
         try:
             return self._queue.get(timeout=timeout)
@@ -77,7 +83,8 @@ class EventBroker:
             with subscription._lock:
                 subscription._closed = True
 
-    def publish(self, event: Event) -> None:
+    def publish(self, event: Event, *, session_id: str | None = None) -> None:
+        queued = event
         with self._lock:
             subscriptions = tuple(self._subscriptions)
         for subscription in subscriptions:
@@ -85,13 +92,13 @@ class EventBroker:
                 if subscription._closed:
                     continue
                 try:
-                    subscription._queue.put_nowait(event)
+                    subscription._queue.put_nowait(queued)
                 except queue.Full:
                     # Runtime events are explicitly lossy observation. Removing
                     # the oldest preserves the latest state for a slow client.
                     subscription._queue.get_nowait()
                     subscription._dropped += 1
-                    subscription._queue.put_nowait(event)
+                    subscription._queue.put_nowait(queued)
 
     def close(self) -> None:
         with self._lock:

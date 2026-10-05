@@ -30,7 +30,7 @@ from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
 from symphonai_host.run import ProviderSelectionError
 from symphonai_host.server import HostServer
-from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prune_sessions
+from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prompt_history, prune_sessions
 from scripts.checks.host_server import _WaitingProvider, _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
 
@@ -60,6 +60,16 @@ def _finished_session(root: Path) -> tuple[HostServer, HostClient, str]:
     return host, client, reply["run_id"]
 
 
+def _new_session(host: HostServer) -> None:
+    connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+    try:
+        if response.status != 200:
+            fail(f"session/new returned {response.status}: {response.read()!r}")
+        response.read()
+    finally:
+        connection.close()
+
+
 def _listing_fixture(root: Path) -> None:
     sessions_root = root / "sessions"
     for index, run_id in enumerate(("oldest", "third", "second", "newest")):
@@ -70,6 +80,83 @@ def _listing_fixture(root: Path) -> None:
             encoding="utf-8",
         )
         (directory / "run.jsonl").write_text("not a transcript", encoding="utf-8")
+
+
+def _history_fixture(root: Path, name: str, repo_root: Path, updated_at: str, prompts: list[str]) -> None:
+    directory = root / name
+    directory.mkdir(parents=True)
+    (directory / "meta.json").write_text(json.dumps({
+        "run_id": name,
+        "repo_root": str(repo_root),
+        "updated_at": updated_at,
+    }), encoding="utf-8")
+    records = []
+    for index, prompt in enumerate(prompts):
+        records.append({
+            "schema_version": 1,
+            "record_id": f"rec-{name}-{index}",
+            "ts": updated_at,
+            "type": "message",
+            "run_id": name,
+            "agent_id": "agent-1",
+            "turn_id": None,
+            "data": message_to_json(Message(Role.USER, prompt)),
+        })
+    (directory / "run.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8",
+    )
+
+
+@check("host_sessions.prompt_history_order_and_filtering")
+def check_prompt_history_order_and_filtering() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "sessions"
+        repo = Path(directory) / "project"
+        other_repo = Path(directory) / "other"
+        _history_fixture(root, "older", repo, "2026-01-01T00:00:00Z", ["a", "b"])
+        _history_fixture(root, "newer", repo, "2026-01-02T00:00:00Z", ["c", "c", "d"])
+        _history_fixture(root, "other", other_repo, "2026-01-03T00:00:00Z", ["ignore"])
+        _history_fixture(root, "goal", repo, "2026-01-04T00:00:00Z", [
+            "objective",
+            "Goal check failed (round 1): retry",
+            "Round 2 of 10 ended without the goal reported complete.",
+            "",
+        ])
+        prompts = prompt_history(root, repo)
+        if prompts != ["objective", "d", "c", "b", "a"]:
+            fail(f"prompt history was ordered or filtered incorrectly: {prompts!r}")
+
+
+@check("host_sessions.prompt_history_limits_and_damage")
+def check_prompt_history_limits_and_damage() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        sessions = root / "sessions"
+        _history_fixture(sessions, "new", root.resolve(), "2099-01-02T00:00:00Z", ["c", "d"])
+        unreadable = sessions / "damaged"
+        unreadable.mkdir()
+        (unreadable / "meta.json").write_text(json.dumps({
+            "run_id": "damaged", "repo_root": str(root.resolve()), "updated_at": "2099-01-03T00:00:00Z",
+        }), encoding="utf-8")
+        (unreadable / "run.jsonl").write_text("not a transcript", encoding="utf-8")
+        _history_fixture(sessions, "old", root.resolve(), "2099-01-01T00:00:00Z", ["a", "b"])
+        if prompt_history(sessions, root.resolve(), limit=2) != ["d", "c"]:
+            fail("history limit did not stop in newest-first order")
+        host, _ = _host(root)
+        try:
+            connection, response = _request(host, "GET", "/history?limit=2", headers=_headers(host))
+            payload = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or payload != {"prompts": ["d", "c"]}:
+                fail(f"history route did not skip damage or apply its limit: {response.status}, {payload!r}")
+            for value in ("0", "501", "x"):
+                connection, response = _request(host, "GET", f"/history?limit={value}", headers=_headers(host))
+                response.read()
+                connection.close()
+                if response.status != 400:
+                    fail(f"invalid history limit {value!r} returned {response.status}")
+        finally:
+            host.close()
 
 
 @check("host_sessions.title_set_once")
@@ -179,37 +266,76 @@ def check_current_conversation() -> None:
 
 @check("host_sessions.new_conversation_route")
 def check_new_conversation_route() -> None:
+    class SplitProvider(FakeModelProvider):
+        def __init__(self):
+            super().__init__([])
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            prompt = next(message.text for message in reversed(request.messages) if message.role is Role.USER)
+            if prompt == "first":
+                self.first_started.set()
+                self.release_first.wait(5)
+            return ModelResponse(Message(Role.ASSISTANT, f"answer to {prompt}"))
+
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        provider = _WaitingProvider()
+        provider = SplitProvider()
         host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
         host.start()
         client = HostClient(HostAddress(host.port, host.token))
+        stream_connection, stream_response = _subscribed_stream(host)
         try:
             first = client.send_prompt("first")["run_id"]
-            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
-            try:
-                if response.status != 409 or json.loads(response.read()).get("run_id") != first:
-                    fail("session/new did not preserve the active-run conflict")
-            finally:
-                connection.close()
-            provider.release.set()
-            _wait_idle(client)
+            if not provider.first_started.wait(2):
+                fail("first conversation did not reach the blocking provider")
             connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
             try:
                 if response.status != 200 or json.loads(response.read()) != {"ended": True}:
-                    fail("session/new did not close the finished conversation")
+                    fail("session/new did not succeed while the first run continued")
             finally:
                 connection.close()
             second = client.send_prompt("second")["run_id"]
             _wait_idle(client)
-            loaded = load_run(SessionStore.open(root / "sessions", second))
-            if second == first or len(list((root / "sessions").iterdir())) != 2:
+            if second == first or first not in host.run._active_by_session:
+                fail("second conversation did not finish independently while the first stayed active")
+            leader_a = host.run._open_conversations[first][0]
+            provider.release_first.set()
+            deadline = time.monotonic() + 5
+            while first in host.run._active_by_session and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if first in host.run._active_by_session:
+                fail("first conversation did not finish after it was released")
+            while first in host.run._open_conversations and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if first in host.run._open_conversations:
+                fail("idle noncurrent conversation stayed open after its run finished")
+            host.run.open_session(first)
+            if host.run._conversation[0] is leader_a:
+                fail("reopening a closed conversation reused its old leader")
+            loaded = load_run(SessionStore.open(root / "sessions", first))
+            if "answer to first" not in [message.text for message in loaded.messages]:
+                fail("reopening the first session did not show its completed answer")
+            frames = []
+            for expected in (first, second):
+                frame = _await_sse(
+                    stream_connection, stream_response,
+                    lambda item: item[0] == "event" and item[1].get("type") in ("RunFinished", "RunFailed"),
+                    what=f"terminal event for {expected}",
+                )
+                frames.append(frame[1])
+            if {item.get("session_id") for item in frames} != {first, second}:
+                fail(f"conversation event frames lost their session tags: {frames!r}")
+            if len(list(path for path in (root / "sessions").iterdir() if path.is_dir())) != 2:
                 fail("a new conversation did not create a second session directory")
-            if [message.text for message in loaded.messages if message.role != Role.SYSTEM] != ["second", "done"]:
-                fail(f"new conversation retained prior history: {loaded.messages!r}")
+            loaded_b = load_run(SessionStore.open(root / "sessions", second))
+            if [message.text for message in loaded_b.messages if message.role != Role.SYSTEM] != ["second", "answer to second"]:
+                fail(f"new conversation retained prior history: {loaded_b.messages!r}")
         finally:
-            provider.release.set()
+            provider.release_first.set()
             host.close()
 
 
@@ -220,7 +346,7 @@ def check_list_order_and_fields() -> None:
         host, client, run_id = _finished_session(root)
         try:
             sessions = client.list_sessions()
-            expected_fields = {"run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id", "repo_root", "state", "message_count"}
+            expected_fields = {"run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id", "repo_root", "state", "message_count", "activity"}
             meta = json.loads(
                 (root / "sessions" / run_id / "meta.json").read_text(encoding="utf-8")
             )
@@ -260,6 +386,7 @@ def check_damaged_session_listed() -> None:
                 "repo_root": "",
                 "state": "unreadable",
                 "message_count": 0,
+                "activity": "idle",
             }
             for run_id in ("broken", "legacy")
         }
@@ -355,37 +482,17 @@ def check_open_during_run_409() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         host, client, run_id = _finished_session(root)
-        connection, response = _subscribed_stream(host)
         try:
             client.send_prompt("active")
-            try:
-                client.open_session(run_id)
-            except HostClientError as exc:
-                if "409" not in str(exc):
-                    fail(f"active session did not return 409: {exc}")
-            else:
-                fail("opened while active")
-
-            _await_sse(
-                connection,
-                response,
-                lambda frame: isinstance(frame, tuple)
-                and frame[0] == "event"
-                and isinstance(decode_event(frame[1]), RunFinished),
-                what="active run terminal event",
-            )
+            leader = host.run._open_conversations[run_id][0]
+            client.open_session(run_id)
+            if host.run._conversation[0] is not leader:
+                fail("opening a running session rebuilt its leader")
+            client.stop()
             _wait_idle(client)
-
-            source = inspect.getsource(check_open_during_run_409)
-            if "time." + "sleep(" in source:
-                fail("open-during-run cleanup used time.sleep")
-            if "_await" + "_sse(" not in source or "_wait" + "_idle(client)" not in source:
-                fail("open-during-run cleanup did not wait for a terminal state")
-            for removal in ("rmtree" + "(", ".clean" + "up(", ".un" + "link("):
-                if removal in source:
-                    fail("open-during-run cleanup retries or performs removal directly")
+            if run_id in host.run._active_by_session:
+                fail("stop did not cancel the current conversation")
         finally:
-            connection.close()
             host.close()
 
 
@@ -657,7 +764,11 @@ def check_prune_startup() -> None:
             events: list[str] = []
             observed: list[tuple[Path, int, datetime]] = []
             extensions = SimpleNamespace(
-                config=SimpleNamespace(values=values), mcp_servers=()
+                config=SimpleNamespace(
+                    values=values,
+                    get=lambda key, default=None: values.get(key, default),
+                ),
+                mcp_servers=(), lsp_servers=(),
             )
             host = mock.Mock()
             host.print_handshake.side_effect = lambda: (events.append("handshake"), print("handshake"))
@@ -894,8 +1005,8 @@ def check_goal_reopen_and_fork() -> None:
                 source.close()
             host.run.open_session(source_id)
             reopened = host.run.conversation_stats()["goal"]
-            if reopened["phase"] != "paused" or reopened["reason"] != "reopened":
-                fail(f"active goal did not pause on reopen: {reopened!r}")
+            if host.run._conversation[0] is not host.run._open_conversations[source_id][0]:
+                fail("opening an already-open session rebuilt its leader")
             host.run.fork_session(source_id, last_record)
             if host.run.goal_snapshot() is not None:
                 fail("fork inherited its source goal")
@@ -969,7 +1080,7 @@ def check_fork_prefix_current_parent() -> None:
                     or frame["record_id"] == first_id
                     or "/" in frame["record_id"]
                     or str(root) in json.dumps(frame)
-                    or set(frame) != {"type", "role", "text", "tool_calls", "turn_id", "record_id"}
+                    or set(frame) != {"type", "role", "text", "tool_calls", "turn_id", "attachments", "record_id", "session_id"}
                 ):
                     fail(f"fork history record id was absent or disclosed a path: {frame!r}")
                 fork_store = SessionStore.open(root / "sessions", fork_id)
@@ -1090,8 +1201,10 @@ def check_fork_invalid_and_active() -> None:
             finally:
                 source.close()
             status, body = _fork(host, source_id, record_id)
-            if status != 409 or body.get("run_id") != active_id:
-                fail(f"fork did not refuse an active run: {status}, {body!r}")
+            if status != 200 or body.get("run_id") in (None, source_id):
+                fail(f"fork refused while another conversation was active: {status}, {body!r}")
+            if active_id not in host.run._active_by_session:
+                fail("forking another conversation stopped the active run")
             waiting.release.set()
             _wait_idle(client)
         finally:
@@ -1161,40 +1274,13 @@ def check_reopen_failure_keeps_current_store() -> None:
                 rejected.append(store)
                 raise leader_error
 
+            leader = current[0]
             with mock.patch.object(host.run, "_new_leader", side_effect=reject_leader):
-                try:
-                    host.run.open_session(run_id)
-                except RuntimeError as exc:
-                    if exc is not leader_error:
-                        fail(f"reopen changed the leader exception: {exc!r}")
-                else:
-                    fail("reopen accepted a failed leader construction")
-            if host.run._conversation is not current or current[1]._closed or not rejected[0]._closed:
-                fail("failed leader construction closed the current store or leaked its replacement")
+                host.run.open_session(run_id)
+            if host.run._conversation is not current or current[1]._closed or rejected:
+                fail("opening an already-open conversation rebuilt its leader or store")
             if (host.run._provider, host.run._model, host.run._provider_choice) != provider:
-                fail("failed leader construction changed the current provider")
-
-            original_open = SessionStore.open
-            open_calls = 0
-            store_error = RuntimeError("replacement store failed")
-
-            def fail_replacement(*args, **kwargs):  # noqa: ANN002, ANN003
-                nonlocal open_calls
-                open_calls += 1
-                if open_calls == 2:
-                    raise store_error
-                return original_open(*args, **kwargs)
-
-            with mock.patch.object(SessionStore, "open", side_effect=fail_replacement):
-                try:
-                    host.run.open_session(run_id)
-                except RuntimeError as exc:
-                    if exc is not store_error:
-                        fail(f"reopen changed the store exception: {exc!r}")
-                else:
-                    fail("reopen accepted a failed replacement store")
-            if open_calls != 2 or host.run._conversation is not current or current[1]._closed:
-                fail("failed store open changed or closed the current conversation")
+                fail("reopening an open conversation changed its provider")
 
             client.send_prompt("second")
             _wait_idle(client)
@@ -1205,7 +1291,172 @@ def check_reopen_failure_keeps_current_store() -> None:
                 fail("prompt after failed reopen did not persist a normal turn")
 
             host.run.open_session(run_id)
-            if host.run._conversation is current or not current[1]._closed or host.run._conversation[1]._closed:
-                fail("successful reopen did not replace the conversation and close its old store")
+            if host.run._conversation is not current or host.run._conversation[0] is not leader:
+                fail("opening an already-open conversation did not reuse its leader")
         finally:
+            host.close()
+
+
+@check("host_sessions.concurrent_run_limit_and_release")
+def check_concurrent_run_limit_and_release() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = _WaitingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            run_ids = []
+            for index in range(4):
+                if index:
+                    _new_session(host)
+                run_ids.append(client.send_prompt(f"run {index}")["run_id"])
+            _new_session(host)
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "fifth"}, headers=_headers(host)
+            )
+            try:
+                refusal = json.loads(response.read())
+                if response.status != 409 or refusal.get("error") != "4 conversations are already running":
+                    fail(f"fifth concurrent run was not refused: {response.status}, {refusal!r}")
+            finally:
+                connection.close()
+            client.open_session(run_ids[0])
+            client.stop()
+            deadline = time.monotonic() + 3
+            while run_ids[0] in host.run._active_by_session and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if run_ids[0] in host.run._active_by_session:
+                fail("stopping a conversation did not release a run slot")
+            _new_session(host)
+            reply = client.send_prompt("replacement")
+            if not reply.get("run_id") or reply["run_id"] == run_ids[0]:
+                fail("a new run could not start after a slot was freed")
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_sessions.session_policy_isolation")
+def check_session_policy_isolation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = _WaitingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            first = client.send_prompt("first")["run_id"]
+            policy_a = host.run._open_conversations[first][0]._config.leader_policy
+            _new_session(host)
+            second = client.send_prompt("second")["run_id"]
+            policy_b = host.run._open_conversations[second][0]._config.leader_policy
+            host.run.select_mode("plan")
+            if policy_a.mode != "ask" or policy_b.mode != "plan":
+                fail(f"mode change crossed conversation policies: A={policy_a.mode}, B={policy_b.mode}")
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_sessions.stop_only_current_conversation")
+def check_stop_only_current_conversation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = _WaitingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            first = client.send_prompt("first")["run_id"]
+            _new_session(host)
+            second = client.send_prompt("second")["run_id"]
+            client.open_session(first)
+            client.stop()
+            deadline = time.monotonic() + 3
+            while first in host.run._active_by_session and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if first in host.run._active_by_session or second not in host.run._active_by_session:
+                fail(f"stop did not affect only the current conversation: {host.run._active_by_session!r}")
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_sessions.active_session_activity")
+def check_active_session_activity() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = _WaitingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            run_id = client.send_prompt("working")["run_id"]
+            _new_session(host)
+            connection, response = _request(host, "GET", "/sessions", headers=_headers(host))
+            try:
+                sessions = json.loads(response.read())
+                item = next(entry for entry in sessions if entry["run_id"] == run_id)
+                if response.status != 200 or item.get("activity") != "working":
+                    fail(f"active session was not reported as working: {sessions!r}")
+            finally:
+                connection.close()
+        finally:
+            provider.release.set()
+            host.close()
+
+
+@check("host_sessions.idle_session_activity")
+def check_idle_session_activity() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _listing_fixture(root)
+        sessions = list_sessions(root / "sessions")
+        if any(item.get("activity") != "idle" for item in sessions):
+            fail(f"inactive sessions did not report idle: {sessions!r}")
+
+
+@check("host_sessions.goal_check_continues_in_background")
+def check_goal_check_continues_in_background() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        release = root / "release-check"
+        checker = root / "wait_for_release.py"
+        checker.write_text(
+            "from pathlib import Path\n"
+            f"release = Path({str(release)!r})\n"
+            "while not release.exists():\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "goal round done")),
+            ModelResponse(Message(Role.ASSISTANT, "second conversation done")),
+        ])
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            goal_run_id = host.run.start_goal(
+                "finish the goal", (sys.executable, str(checker)), max_rounds=2,
+            )
+            deadline = time.monotonic() + 3
+            while goal_run_id not in host.run._goal_checks_by_session and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if goal_run_id not in host.run._goal_checks_by_session:
+                fail("goal check did not remain active after its first round")
+            _new_session(host)
+            second_id = client.send_prompt("second conversation")["run_id"]
+            _wait_idle(client)
+            release.touch()
+            deadline = time.monotonic() + 3
+            while host.run._goals_by_session[goal_run_id].phase != "complete" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if host.run._goals_by_session[goal_run_id].phase != "complete":
+                fail("background goal check did not complete while another session was current")
+            if host.run._conversation[1].run_id != second_id:
+                fail("goal completion switched away from the current conversation")
+        finally:
+            release.touch()
             host.close()

@@ -47,7 +47,7 @@ fields on a known event are ignored for forward compatibility.
 | `SubagentSpawned` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
-| `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null` |
+| `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null`, `session_id: str` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -67,7 +67,7 @@ to `false`.
 
 | Request kind | Payload |
 | --- | --- |
-| `prompt` | `prompt: str` |
+| `prompt` | `prompt: str`, `attachments?: [{data: str, filename?: str}]` |
 | `approval` | `approval_id: str`, `allowed: bool`, `reason: str`, `remember: bool` (optional) |
 | `stop` | `reason: str` |
 
@@ -75,14 +75,22 @@ Unknown request kinds and malformed fields are protocol errors. This document
 defines encoding only; it does not define a socket, HTTP endpoint, client, or
 authentication mechanism.
 
+The HTTP `POST /prompt` request may include up to 10 attachments. Each `data`
+value is strict standard base64 for a PNG, JPEG, GIF, WEBP, or PDF no larger
+than 5,000,000 bytes. Invalid base64, unsupported content, oversized content,
+or malformed attachment entries return `400` with the attachment index in the
+error. An empty prompt is allowed when an attachment is present. Replay
+`HistoryMessage` events include `attachments`, an array of `{kind, media_type,
+filename}` metadata for non-text blocks; attachment data is never included.
+
 ## Approvals
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,
-`details`, `tool_call_id`, and `remember`. The `tool_call_id` is `""` when the
+`details`, `tool_call_id`, `remember`, and `session_id`. The `tool_call_id` is `""` when the
 approval belongs to no tool call. `remember` is the shell command prefix the
 client may grant for the current chat, or `""` when no grant applies. A client
 answers with the `approval` request above; `remember: true` grants that prefix
-for this conversation. An approval id is single-use; unknown or expired replies are rejected. After any
+for its conversation. An approval id is single-use; unknown or expired replies are rejected. After any
 `error` frame carrying `dropped`, a client re-reads `GET /approvals`, because a
 dropped frame may have been a question.
 
@@ -100,15 +108,38 @@ line remains machine-readable for a parent process.
 
 ## Sessions
 
+Authenticated `GET /files?query=<text>&limit=<n>` searches readable regular
+files under the repository root and returns `{"files": [...], "truncated":
+bool}`. The default limit is 20; valid limits are 1–50. The search skips
+`.git`, checks each candidate with the read policy, and stops after 20,000
+files. Matching is case-insensitive, ranked by basename prefix, basename
+substring, path substring, then ordered-character subsequence; ties use shorter
+paths and alphabetical order. An empty query returns paths in walk order.
+New conversations tell the agent that `@<path>` references a repository file
+and that it must read it with `read_file` before relying on its contents.
+
+Authenticated `GET /history?limit=<n>` returns `{"prompts": [...]}` in newest
+first order for sessions whose `repo_root` matches this host. The default limit
+is 100; valid limits are 1–500. It excludes empty prompts and host-written goal
+round prompts, collapses consecutive duplicates, skips damaged sessions, and
+stops reading sessions after it has enough prompts.
+
 `GET /sessions` returns a bare array of persisted session metadata newest first.
+Each item includes `activity`: `working` during a run or goal check, `waiting`
+while an approval is pending, and `idle` otherwise.
 An optional positive `limit` query parameter bounds the entries returned and
 classified; missing, empty, non-numeric, zero, and negative values return the
 full listing. `POST /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
-its reply, and makes that conversation current. Later prompts append to the
-same session directory and transcript, while each prompt still has a distinct
-run id. `POST /session/new` takes an empty JSON object, ends the current
-conversation, and returns `{"ended": true}`. The next prompt creates a new
-session directory. It returns `409` if a run is active.
+its reply, and makes that conversation current. Each history and runtime event
+frame includes the originating `session_id`. Later prompts append to the same
+session directory and transcript, while each prompt still has a distinct run
+id. `POST /session/new` takes an empty JSON object, selects a new conversation
+for the next prompt, and returns `{"ended": true}`. Opening, forking, and
+starting another session leave other runs going. Opening a session that is
+already open reuses its leader. At most four conversations may run at once; a
+fifth start returns `409` with `{"error": "4 conversations are already running"}`.
+Busy checks concern the current conversation. `POST /stop` stops only the
+current conversation; open another one first to stop its run.
 
 Each replayed `HistoryMessage` also carries an opaque `record_id` for the
 message. `POST /session/fork` takes `{"run_id": str, "record_id": str}` and
@@ -123,7 +154,7 @@ later prompts continue the fork without reloading instruction files. The new
 session's `parent_session_id` identifies its source in `GET /sessions`;
 `parent_run_id` retains its runtime meaning. Any current message may be
 selected if its prefix has no unanswered tool call. A missing session or
-message returns `404`, and an active run returns `409`.
+message returns `404`.
 
 At a new conversation's first prompt, the host loads the user, project, and
 working-directory `.symphonai/INSTRUCTIONS.md` hierarchy. It seeds the
@@ -398,7 +429,7 @@ receive `400`, an absent active run or invalid transition receives `409`, and
 an unknown or finished agent receives `404`.
 
 Authenticated `GET /changes` returns the current conversation's checkpointed
-file changes as `{"turns": [...], "files": [...]}`. Each turn contains its
+file changes and durable session worktrees as `{"turns": [...], "files": [...], "worktrees": [...]}`. Each turn contains its
 checkpoint `key`, the first 80 characters of its prompt, and the paths first
 written in that prompt. Each file contains its repository-relative `path`,
 `status` (`modified`, `added`, or `deleted`), `changed_outside`, a unified
@@ -413,6 +444,14 @@ If any target differs from the agent's last write, the host returns `409` with
 the affected `paths` and makes no changes unless `force` is true. An active run
 returns `409`, unknown paths or keys return `404`, and malformed requests return
 `400`.
+
+Each worktree contains its `name`, changed `files`, a unified `diff`, and a
+`truncated` flag. `POST /worktree/apply` and `POST /worktree/discard` each take
+`{"name": <worktree name>}`. Apply checks the patch against the main tree,
+records the applied files as a checkpoint labeled `Applied worktree <name>`,
+then removes the worktree. A patch conflict returns `409` with git's error and
+keeps the worktree. Discard removes it without changing the main tree. Both
+actions return `409` during an active run and `404` for an unknown name.
 
 `GET /app/` returns the browser shell with one inline handshake script setting
 `window.__symphonai` to the running host's `port` and `token`. `GET

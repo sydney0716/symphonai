@@ -11,14 +11,20 @@ export function createTurnState() {
   let nextMessageId = 1;
   const queue = [];
 
-  function message(text) {
+  function message(text, attachments = []) {
     const value = { id: `message-${nextMessageId}`, text };
+    if (attachments.length > 0) value.attachments = attachments;
     nextMessageId += 1;
     return value;
   }
 
   function promptAction(value) {
-    return { kind: "prompt", id: value.id, text: value.text };
+    return {
+      kind: "prompt",
+      id: value.id,
+      text: value.text,
+      ...(value.attachments ? { attachments: value.attachments } : {}),
+    };
   }
 
   function dispatch(value) {
@@ -60,8 +66,8 @@ export function createTurnState() {
       return inFlight === null ? null : { ...inFlight };
     },
 
-    submit(text) {
-      queue.push(message(text));
+    submit(text, attachments = []) {
+      queue.push(message(text, attachments));
       return drainOne();
     },
 
@@ -108,7 +114,7 @@ export function createTurnState() {
       if (state !== DISPATCHING || inFlight === null) {
         return [];
       }
-      queue.unshift({ id: inFlight.id, text: inFlight.text });
+      queue.unshift({ ...inFlight });
       inFlight = null;
       activeRunId = typeof runId === "string" && runId.length > 0 ? runId : null;
       state = RUNNING;
@@ -119,7 +125,7 @@ export function createTurnState() {
       if (state !== DISPATCHING || inFlight === null) {
         return [];
       }
-      const rejected = { id: inFlight.id, text: inFlight.text };
+      const rejected = { ...inFlight };
       queue.unshift(rejected);
       inFlight = null;
       activeRunId = null;

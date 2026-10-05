@@ -87,6 +87,11 @@ class FakeElement {
   requestSubmit() {
     return this.dispatch("submit");
   }
+
+  click() {
+    this.clicked = true;
+    return this.dispatch("click");
+  }
 }
 
 export class FakeDocument {
@@ -104,6 +109,9 @@ export class FakeDocument {
       "chat-pane": "main",
       "prompt-form": "form",
       prompt: "textarea",
+      "prompt-attachments": "div",
+      "attachment-picker": "input",
+      "attach-button": "button",
       "send-button": "button",
     };
     this.elements = new Map(
@@ -126,6 +134,9 @@ export class FakeDocument {
         "approvals",
         "prompt-form",
         "prompt",
+        "prompt-attachments",
+        "attachment-picker",
+        "attach-button",
         "send-button",
         "prompt-error",
       ].map((id) => [id, new FakeElement(tags[id] ?? "div", id)]),
@@ -134,9 +145,10 @@ export class FakeDocument {
     get("app-shell").className = "app-shell";
     get("chat-pane").className = "chat-pane";
     get("new-chat").className = "new-chat";
+    get("attachment-picker").type = "file";
     get("sidebar").append(get("home-link"), get("new-chat"), get("page-links"));
     get("status-rail").append(get("agents"), get("roadmap"), get("spec"));
-    get("prompt-form").append(get("prompt"), get("send-button"), get("prompt-error"));
+    get("prompt-form").append(get("prompt"), get("prompt-attachments"), get("attachment-picker"), get("attach-button"), get("send-button"), get("prompt-error"));
     get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
     get("page").append(get("chat-pane"));
     get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"), get("status-rail"), get("rail-toggle"));
@@ -248,10 +260,12 @@ export function fakeClient(
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
     changes = { turns: [], files: [] },
     revertConflictPaths = [],
+    worktreeConflict = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], file: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { agent: [], approve: [], applyWorktree: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], discardWorktree: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
   let changesReply = changes;
+  let worktreeConflictPending = worktreeConflict;
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -280,12 +294,21 @@ export function fakeClient(
       }
       return reply;
     },
+    async files(query, limit = 20) {
+      calls.files.push([query, limit]);
+      return { files: [] };
+    },
+    async history(limit = 100) {
+      calls.history.push(limit);
+      return { prompts: [] };
+    },
     events(callback) {
       eventCallback = callback;
       return { close() {}, done: Promise.resolve() };
     },
-    prompt(text) {
+    prompt(text, attachments = []) {
       calls.prompt.push(text);
+      calls.promptAttachments.push(attachments);
       return promptReply;
     },
     async models(provider, baseUrl) {
@@ -370,6 +393,22 @@ export function fakeClient(
       changesReply = { turns: [], files: [] };
       return { reverted: [payload.path].filter(Boolean) };
     },
+    async applyWorktree(name) {
+      calls.applyWorktree.push(name);
+      if (worktreeConflictPending) {
+        worktreeConflictPending = false;
+        const error = new Error("patch does not apply");
+        error.status = 409;
+        throw error;
+      }
+      changesReply = { turns: [], files: [], worktrees: [] };
+      return { applied: [] };
+    },
+    async discardWorktree(name) {
+      calls.discardWorktree.push(name);
+      changesReply = { turns: [], files: [], worktrees: [] };
+      return { discarded: name };
+    },
     async storeCredential(name, value) {
       calls.credentials.push({ name, value });
       return { stored: true, name };
@@ -451,6 +490,246 @@ test("help lists commands and their aliases in table order", async () => {
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
+});
+
+test("pasted images send with text, clear the chips and render in the transcript", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text, attachments = []) => {
+    client.calls.prompt.push(text);
+    client.calls.promptAttachments.push(attachments);
+    return { accepted: true, run_id: "image-run" };
+  };
+  const app = await start({ global: {}, document, client });
+  const file = {
+    name: "shot.png",
+    type: "image/png",
+    size: 9,
+    async arrayBuffer() { return Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 0]).buffer; },
+  };
+  const input = document.getElementById("prompt");
+  await input.dispatch("paste", {
+    clipboardData: { items: [{ type: "image/png", getAsFile: () => file }] },
+  });
+  assert.equal(document.getElementById("prompt-attachments").children.length, 1);
+  input.value = "what is this";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, ["what is this"]);
+  assert.deepEqual(client.calls.promptAttachments, [[{
+    data: "iVBORw0KGgoA",
+    filename: "shot.png",
+  }]]);
+  assert.equal(document.getElementById("prompt-attachments").children.length, 0);
+
+  await client.emit(eventFrame("PromptSubmitted", { text: "what is this", message_count: 1 }));
+  const prompt = app.transcript.model.at(-1);
+  assert.deepEqual(prompt.attachments, [{ kind: "image", filename: "shot.png" }]);
+  const transcriptPrompt = find(document.getElementById("chat"), (node) => node.className === "prompt");
+  assert.equal(transcriptPrompt.children[0].textContent, "Image · shot.png");
+  await client.emit({
+    kind: "event",
+    payload: {
+      type: "HistoryMessage",
+      role: "user",
+      text: "",
+      tool_calls: [],
+      turn_id: "turn-history",
+      attachments: [{ kind: "document", media_type: "application/pdf", filename: "spec.pdf" }],
+    },
+  });
+  const replayedPrompt = app.transcript.model.at(-1);
+  assert.equal(replayedPrompt.text, "");
+  assert.deepEqual(replayedPrompt.attachments, [{ kind: "document", filename: "spec.pdf" }]);
+  const replayedAttachment = find(document.getElementById("chat"), (node) => node.textContent === "PDF · spec.pdf");
+  assert.ok(replayedAttachment);
+});
+
+test("dropped PDFs allow an empty prompt and removals or invalid files do not send", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text, attachments = []) => {
+    client.calls.prompt.push(text);
+    client.calls.promptAttachments.push(attachments);
+    return { accepted: true, run_id: "pdf-run" };
+  };
+  await start({ global: {}, document, client });
+  const form = document.getElementById("prompt-form");
+  const pdf = {
+    name: "spec.pdf", type: "application/pdf", size: 15,
+    async arrayBuffer() { return Uint8Array.from([...new TextEncoder().encode("%PDF-1.7 sample")]).buffer; },
+  };
+  await form.dispatch("drop", { dataTransfer: { files: [pdf] } });
+  await form.dispatch("submit");
+  assert.deepEqual(client.calls.prompt, [""]);
+  assert.deepEqual(client.calls.promptAttachments[0], [{
+    data: "JVBERi0xLjcgc2FtcGxl",
+    filename: "spec.pdf",
+  }]);
+
+  const remove = document.getElementById("prompt-attachments");
+  await form.dispatch("drop", { dataTransfer: { files: [pdf] } });
+  await remove.children[0].children[0].click();
+  await form.dispatch("submit");
+  assert.equal(client.calls.prompt.length, 1);
+
+  await document.getElementById("attach-button").click();
+  assert.equal(document.getElementById("attachment-picker").clicked, true);
+  document.getElementById("attachment-picker").files = [pdf];
+  await document.getElementById("attachment-picker").dispatch("change");
+  assert.equal(document.getElementById("prompt-attachments").children.length, 1);
+  document.getElementById("prompt").value = "/help";
+  await form.dispatch("submit");
+  assert.equal(document.getElementById("prompt-attachments").children.length, 1);
+  document.getElementById("prompt").value = "";
+  await document.getElementById("prompt-attachments").children[0].children[0].click();
+
+  for (const file of [
+    { name: "large.png", type: "image/png", size: 6_000_000 },
+    { name: "notes.txt", type: "text/plain", size: 12 },
+  ]) {
+    await form.dispatch("drop", { dataTransfer: { files: [file] } });
+    assert.notEqual(document.getElementById("prompt-error").textContent, "");
+    assert.equal(document.getElementById("prompt-attachments").children.length, 0);
+  }
+  await form.dispatch("submit");
+  await form.dispatch("drop", {
+    dataTransfer: { files: Array.from({ length: 11 }, (_, index) => ({ name: `${index}.png`, type: "image/png", size: 9 })) },
+  });
+  assert.equal(document.getElementById("prompt-attachments").children.length, 10);
+  assert.match(document.getElementById("prompt-error").textContent, /up to 10/);
+  for (let index = 0; index < 10; index += 1) {
+    await document.getElementById("prompt-attachments").children[0].children[0].click();
+  }
+  assert.equal(client.calls.prompt.length, 1);
+});
+
+test("@ mentions search paths, insert on Enter and leave slash commands alone", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.files = async (query) => {
+    client.calls.files.push([query, 20]);
+    return { files: ["src/parser.py", "tests/test_parser.py"] };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "look at @pars";
+  await input.dispatch("input");
+  assert.deepEqual(client.calls.files, [["pars", 20]]);
+  const menu = find(document.getElementById("chat-pane"), (node) => node.className === "file-menu");
+  assert.equal(menu.children[0].textContent, "src/parser.py");
+  await input.dispatch("keydown", { key: "Enter" });
+  assert.equal(input.value, "look at @src/parser.py ");
+
+  input.value = "me@example.com";
+  await input.dispatch("input");
+  assert.equal(client.calls.files.length, 1);
+  assert.equal(menu.children.length, 0);
+
+  input.value = "/he";
+  await input.dispatch("input");
+  assert.ok(find(document.getElementById("chat-pane"), (node) => node.className === "command-menu").children.length > 0);
+});
+
+test("prompt arrows recall project history and drafts", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.history = async (limit) => {
+    client.calls.history.push(limit);
+    return { prompts: ["d", "c"] };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "d");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "c");
+  await input.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(input.value, "d");
+  await input.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(input.value, "");
+  assert.deepEqual(client.calls.history, [100]);
+
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  input.value = "edited draft";
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "edited draft");
+
+  input.value = "/he";
+  await input.dispatch("input");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.deepEqual(client.calls.history, [100]);
+  assert.equal(input.value, "/he");
+});
+
+test("a prompt sent from this page becomes the next recalled prompt", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "history-run" };
+  };
+  client.history = async (limit) => {
+    client.calls.history.push(limit);
+    return { prompts: ["older"] };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "from this page";
+  await document.getElementById("prompt-form").dispatch("submit");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "from this page");
+  assert.deepEqual(client.calls.prompt, ["from this page"]);
+});
+
+test("prompt arrows recall project history and drafts", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.history = async (limit) => {
+    client.calls.history.push(limit);
+    return { prompts: ["d", "c"] };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "d");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "c");
+  await input.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(input.value, "d");
+  await input.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(input.value, "");
+  assert.deepEqual(client.calls.history, [100]);
+
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  input.value = "edited draft";
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "edited draft");
+
+  input.value = "/he";
+  await input.dispatch("input");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.deepEqual(client.calls.history, [100]);
+  assert.equal(input.value, "/he");
+});
+
+test("a prompt sent from this page becomes the next recalled prompt", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "history-run" };
+  };
+  client.history = async (limit) => {
+    client.calls.history.push(limit);
+    return { prompts: ["older"] };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "from this page";
+  await document.getElementById("prompt-form").dispatch("submit");
+  await input.dispatch("keydown", { key: "ArrowUp" });
+  assert.equal(input.value, "from this page");
+  assert.deepEqual(client.calls.prompt, ["from this page"]);
 });
 
 test("goal sets a check argv and queues a prompt during its first round", async () => {
@@ -1332,15 +1611,16 @@ test("new chat clears the transcript and the next prompt adds a session link", a
   ]);
 });
 
-test("composer contains only its textbox and send button, with status and error text", async () => {
+test("composer keeps attachment controls inside the form", async () => {
   const document = new FakeDocument();
   await start({ global: {}, document, client: fakeClient() });
   const form = document.getElementById("prompt-form");
   assert.deepEqual(form.children.map((child) => child.id || child.className), [
-    "prompt", "send-button", "prompt-error", "conversation-usage",
+    "prompt", "prompt-attachments", "attachment-picker", "attach-button",
+    "send-button", "prompt-error", "conversation-usage",
   ]);
   assert.equal(walk(form).some((node) => node.tagName === "SELECT"), false);
-  assert.equal(walk(form).some((node) => node.tagName === "INPUT"), false);
+  assert.equal(document.getElementById("attachment-picker").type, "file");
 });
 
 test("mode picker marks the current mode and selects with keyboard without prompting", async () => {
@@ -1870,6 +2150,55 @@ test("Changes page renders files and prompts, retries outside edits, and refresh
     .dispatch("click");
   await Promise.resolve();
   assert.equal(client.calls.changes, 3);
+});
+
+test("Changes page applies worktrees, shows conflicts, and reloads after success", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    changes: {
+      turns: [], files: [],
+      worktrees: [{ name: "w1", files: ["a.py"], diff: "-before\n+after", truncated: false }],
+    },
+    worktreeConflict: true,
+  });
+  await start({ global: {}, document, client });
+  const page = document.getElementById("page");
+  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes")
+    .dispatch("click");
+  await Promise.resolve();
+  assert.match(visibleText(page), /w1/);
+  assert.match(visibleText(page), /-before\n\+after/);
+  await find(page, (value) => value.textContent === "Apply").dispatch("click");
+  await Promise.resolve();
+  assert.deepEqual(client.calls.applyWorktree, ["w1"]);
+  assert.match(visibleText(page), /patch does not apply/);
+  await find(page, (value) => value.textContent === "Apply").dispatch("click");
+  await Promise.resolve();
+  assert.deepEqual(client.calls.applyWorktree, ["w1", "w1"]);
+  assert.equal(client.calls.changes, 2);
+  assert.match(visibleText(page), /No changes in this conversation/);
+});
+
+test("approvals from another conversation show its title and open that session", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [
+      { run_id: "session-a", title: "Background work", repo_root: "/work/current", activity: "waiting" },
+    ],
+  });
+  await start({ global: {}, document, client });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "approval-a", operation: "write_file", target: "a.py",
+    details: "write file", session_id: "session-a",
+  } });
+  const approvals = document.getElementById("approvals");
+  assert.match(visibleText(approvals), /Background work/);
+  await find(approvals, (value) => value.textContent === "Open").dispatch("click");
+  assert.deepEqual(client.calls.openSession, ["session-a"]);
+  const waiting = find(document.getElementById("sidebar"), (value) => (
+    value.className === "session-link" && value.textContent.includes("Background work")
+  ));
+  assert.match(waiting.textContent, /waiting/);
 });
 
 test("status rail keeps the roadmap beside settings and renders live agents", async () => {
@@ -3154,13 +3483,14 @@ test("render stays DOM-only and start does not read window", async () => {
     assert.ok(content);
     const ids = [];
     let depth = 0;
-    for (const [, closing, attributes] of content.matchAll(/<(\/?)[a-z][\w-]*([^>]*)>/gi)) {
+    for (const [, closing, tag, attributes] of content.matchAll(/<(\/?)([a-z][\w-]*)([^>]*)>/gi)) {
       if (closing) {
         depth -= 1;
       } else {
         if (depth === 0) {
           ids.push(attributes.match(/\bid="([^"]+)"/)?.[1] ?? null);
         }
+        if (["input", "img", "br", "hr", "meta", "link"].includes(tag.toLowerCase())) continue;
         depth += 1;
       }
     }

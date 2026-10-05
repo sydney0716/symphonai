@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import http.client
 import io
 import inspect
@@ -48,7 +49,7 @@ from symphonai_api.identity import RunRef
 from symphonai_api.instructions import MAX_INSTRUCTION_FILE_CHARS
 from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
+from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelResponse, Role, TextBlock, ToolCall, ToolResult, Usage
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
@@ -57,6 +58,7 @@ from symphonai_api.session import SessionStore, load_run, load_run_for_resume
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.worktree import create_worktree
 from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
 from symphonai_host.protocol import decode_event, decode_frame
@@ -172,6 +174,203 @@ class _RecordingWireFakeProvider(FakeModelProvider):
     def create_response(self, request, *, cancel=None):
         self.requests.append(request)
         return super().create_response(request, cancel=cancel)
+
+
+@check("host_server.prompt_attachments")
+def check_prompt_attachments() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self):
+            super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    png = b"\x89PNG\r\n\x1a\n\x00"
+    encoded_png = base64.b64encode(png).decode("ascii")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = RecordingProvider()
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/prompt",
+                body={"prompt": "what is this", "attachments": [{"data": encoded_png}]},
+                headers=_headers(host),
+            )
+            reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"PNG prompt was rejected: {response.status}, {reply!r}")
+            _wait_until(lambda: host.run._active is None, "PNG prompt did not finish")
+            user = next(
+                message for message in reversed(provider.requests[0].messages)
+                if message.role == Role.USER
+            )
+            if user.content != (TextBlock("what is this"), ImageBlock(encoded_png, "image/png")):
+                fail(f"PNG prompt reached the provider with the wrong content: {user.content!r}")
+
+            stream_connection, stream_response = _subscribed_stream(host)
+            try:
+                connection, opened = _request(
+                    host, "POST", "/session/open", body={"run_id": reply["run_id"]},
+                    headers=_headers(host),
+                )
+                if opened.status != 200:
+                    fail(f"attachment session did not reopen: {opened.status}, {opened.read()!r}")
+                opened.read()
+                connection.close()
+                frame = _await_sse(
+                    stream_connection, stream_response,
+                    lambda item: item[1].get("type") == "HistoryMessage"
+                    and item[1].get("role") == "user",
+                    what="attachment history",
+                )[1]
+                expected = [{"kind": "image", "media_type": "image/png", "filename": None}]
+                if frame.get("attachments") != expected or encoded_png in json.dumps(frame):
+                    fail(f"attachment replay exposed data or omitted safe metadata: {frame!r}")
+            finally:
+                stream_connection.close()
+        finally:
+            host.close()
+
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = RecordingProvider()
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            encoded_pdf = base64.b64encode(b"%PDF-1.7 sample").decode("ascii")
+            connection, response = _request(
+                host, "POST", "/prompt",
+                body={"prompt": "", "attachments": [{"data": encoded_pdf, "filename": "spec.pdf"}]},
+                headers=_headers(host),
+            )
+            reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"attachment-only PDF prompt was rejected: {response.status}, {reply!r}")
+            _wait_until(lambda: host.run._active is None, "PDF prompt did not finish")
+            user = next(
+                message for message in reversed(provider.requests[0].messages)
+                if message.role == Role.USER
+            )
+            if user.content != (DocumentBlock(encoded_pdf, filename="spec.pdf"),):
+                fail(f"PDF prompt reached the provider with the wrong content: {user.content!r}")
+            title = json.loads(
+                (root / "sessions" / reply["run_id"] / "meta.json").read_text(encoding="utf-8")
+            )["title"]
+            if title != "spec.pdf":
+                fail(f"attachment-only prompt got the wrong title: {title!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.prompt_attachment_errors")
+def check_prompt_attachment_errors() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self):
+            super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00").decode("ascii")
+    too_large = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * (5_000_001 - 8)).decode("ascii")
+    cases = (
+        ([{"data": "%%%"}], "attachment 0"),
+        ([{"data": too_large}], "attachment 0"),
+        ([{"data": base64.b64encode(b"plain text").decode("ascii")}], "attachment 0"),
+        ([{"data": png}] * 11, "attachment 10"),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        provider = RecordingProvider()
+        host = _host(provider, repo_root=root)
+        try:
+            for attachments, expected in cases:
+                connection, response = _request(
+                    host, "POST", "/prompt",
+                    body={"prompt": "should not run", "attachments": attachments},
+                    headers=_headers(host),
+                )
+                reply = json.loads(response.read())
+                connection.close()
+                if response.status != 400 or expected not in reply.get("error", ""):
+                    fail(f"invalid attachment response was wrong: {response.status}, {reply!r}")
+            if provider.requests or host.run._active is not None:
+                fail("invalid attachment request started a run")
+        finally:
+            host.close()
+
+
+@check("host_server.files_ranked_search")
+def check_files_ranked_search() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for relative, text in (
+            ("src/parser.py", "source"),
+            ("tests/test_parser.py", "test"),
+            ("docs/parse.md", "docs"),
+            (".env", "secret"),
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(host, "GET", "/files?query=parser", headers=_headers(host))
+            result = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or result["files"][:2] != ["src/parser.py", "tests/test_parser.py"] or ".env" in result["files"]:
+                fail(f"ranked file search returned unexpected paths: {response.status}, {result!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.files_subsequence_and_forbidden")
+def check_files_subsequence_and_forbidden() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "src").mkdir()
+        (root / "src" / "parser.py").write_text("source", encoding="utf-8")
+        (root / ".env").write_text("secret", encoding="utf-8")
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(host, "GET", "/files?query=spp", headers=_headers(host))
+            result = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or result["files"] != ["src/parser.py"]:
+                fail(f"subsequence search or forbidden file filtering failed: {response.status}, {result!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.files_limits_and_truncation")
+def check_files_limits_and_truncation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name in ("a.py", "b.py", "c.py"):
+            (root / name).write_text("file", encoding="utf-8")
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            for value in ("0", "51", "x"):
+                connection, response = _request(host, "GET", f"/files?limit={value}", headers=_headers(host))
+                response.read()
+                connection.close()
+                if response.status != 400:
+                    fail(f"invalid /files limit {value!r} returned {response.status}")
+            with mock.patch("symphonai_host.files.MAX_SEARCH_FILES", 2):
+                connection, response = _request(host, "GET", "/files?limit=50", headers=_headers(host))
+                result = json.loads(response.read())
+                connection.close()
+            if response.status != 200 or not result["truncated"] or len(result["files"]) != 2:
+                fail(f"file walk did not report its cap: {response.status}, {result!r}")
+        finally:
+            host.close()
 
 
 def _host(
@@ -2513,7 +2712,7 @@ def check_changes_empty_active_and_invalid() -> None:
             connection, response = _request(host, "GET", "/changes", headers=_headers(host))
             try:
                 empty = json.loads(response.read())
-                if response.status != 200 or empty != {"turns": [], "files": []}:
+                if response.status != 200 or empty != {"turns": [], "files": [], "worktrees": []}:
                     fail(f"changes without a conversation were not empty: {empty!r}")
             finally:
                 connection.close()
@@ -2840,6 +3039,7 @@ def check_goal_tool_reads_and_rejects_inactive_updates() -> None:
         )
         run._goal = goal_module.Goal("finish", (), rounds=1)
         run._goal_session_id = session_id
+        run._goals_by_session[session_id] = run._goal
         tools = goal_module.goal_tools(
             lambda: run._goal_for_session(session_id),
             lambda status, message: run._update_goal_for_session(session_id, status, message),
@@ -2858,6 +3058,7 @@ def check_goal_tool_reads_and_rejects_inactive_updates() -> None:
         )
         run._goal = None
         run._goal_session_id = None
+        run._goals_by_session.pop(session_id, None)
         missing = tools["update_goal"].execute(
             ToolCall("update-missing", "update_goal", {"status": "complete", "message": "done"}),
             run.policy,
@@ -3266,6 +3467,7 @@ def check_project_instructions_seeded() -> None:
                         or plain[0] != ("system", "host baseline")
                         or plain[1][0] != "system"
                         or not plain[1][1].startswith("Environment when this conversation started")
+                        or "In the person's messages, @<path> names a file in this repository. Read it with read_file before relying on its contents." not in plain[1][1]
                         or plain[2] != ("user", "plain")
                     ):
                         fail(f"empty hierarchy or CLAUDE.md changed the provider request: {plain!r}")
@@ -3281,6 +3483,7 @@ def check_project_instructions_seeded() -> None:
                         or sent[1] != ("system", "# instructions: project .symphonai/INSTRUCTIONS.md\nproject convention")
                         or sent[2][0] != "system"
                         or not sent[2][1].startswith("Environment when this conversation started")
+                        or "In the person's messages, @<path> names a file in this repository. Read it with read_file before relying on its contents." not in sent[2][1]
                         or sent[3] != ("user", "with instructions")
                     ):
                         fail(f"project instructions or system prompt missed the first request: {sent!r}")
@@ -3333,8 +3536,9 @@ def check_environment_seeded_once() -> None:
                     if (
                         len(systems) != 2
                         or "project convention" not in systems[0]
-                        or systems[1] != environment_text
-                        or environment_messages != [environment_text]
+                        or not systems[1].startswith(environment_text)
+                        or "In the person's messages, @<path> names a file in this repository. Read it with read_file before relying on its contents." not in systems[1]
+                        or len(environment_messages) != 1
                     ):
                         fail(f"request did not carry one environment block after instructions: {messages!r}")
                 if capture.call_count != 1:
@@ -3369,7 +3573,7 @@ def check_instruction_scope_and_warning() -> None:
                 rendered = sent[0].text if sent and sent[0].role == Role.SYSTEM else ""
                 if len(sent) != 3 or "# instructions: project .symphonai/INSTRUCTIONS.md\n" not in rendered or project_text not in rendered:
                     fail("project instruction text or scope did not reach the provider")
-                if "# instructions: directory src/.symphonai/INSTRUCTIONS.md\ndirectory rule" not in rendered or not sent[1].text.startswith("Environment when this conversation started"):
+                if "# instructions: directory src/.symphonai/INSTRUCTIONS.md\ndirectory rule" not in rendered or not sent[1].text.startswith("Environment when this conversation started") or "In the person's messages, @<path> names a file in this repository. Read it with read_file before relying on its contents." not in sent[1].text:
                     fail("directory instruction text or scope did not reach the provider")
                 if "instruction warning:" not in stderr.getvalue() or "loaded in full" not in stderr.getvalue() or provider.call_count != 1:
                     fail("oversize warning was hidden or the run did not complete")
@@ -3952,6 +4156,7 @@ def check_permission_mode_control() -> None:
             _send_host_prompt(host, "open a conversation")
             leader, session = host.run._conversation
             session_id = session.run_id
+            policy = host.run._policy
 
             status, reply = select("plan")
             if status != 200 or reply != {"mode": "plan"}:
@@ -4017,8 +4222,8 @@ def check_permission_mode_control() -> None:
             finally:
                 connection.close()
             _, reopened = _conversation_reply(host)
-            if reopened.get("conversation", {}).get("mode") != "ask" or policy.mode != "ask":
-                fail(f"reopened session did not report the starting mode: {reopened!r}")
+            if reopened.get("conversation", {}).get("mode") != "plan" or policy.mode != "plan":
+                fail(f"reopening the open session did not retain its mode: {reopened!r}")
             select("plan")
             host.run.end_conversation()
             if policy.mode != "ask" or host.run.conversation_stats() is not None:
@@ -4056,10 +4261,10 @@ def check_conversation_usage() -> None:
         terminal_stats = []
         publish = host.broker.publish
 
-        def capture_terminal(event) -> None:  # noqa: ANN001
+        def capture_terminal(event, **kwargs) -> None:  # noqa: ANN001
             if isinstance(event, RunFinished) and event.agent_name == "leader":
                 terminal_stats.append(host.run.conversation_stats())
-            publish(event)
+            publish(event, **kwargs)
 
         host.broker.publish = capture_terminal
         try:
@@ -4151,17 +4356,15 @@ def check_conversation_reopened_parentage() -> None:
             finally:
                 connection.close()
             conversation = _conversation_reply(host)[1]["conversation"]
-            if conversation is None or set(conversation) != {
-                "agents", "mode", "goal", "provider", "model", "effort"
-            }:
-                fail(f"reopened conversation did not report agents without usage: {conversation!r}")
+            if conversation is None or not {"agents", "mode", "goal", "provider", "model", "effort", "context", "usage"}.issubset(conversation):
+                fail(f"reopened conversation did not retain its session usage: {conversation!r}")
             agents = {agent["name"]: agent for agent in conversation["agents"]}
             if set(agents) != {"leader", "worker"}:
                 fail(f"reopened conversation omitted an agent: {agents!r}")
             if agents["leader"]["parent_agent_id"] is not None or agents["worker"]["parent_agent_id"] != agents["leader"]["agent_id"]:
                 fail(f"reopened conversation lost persisted parentage: {agents!r}")
-            if any(set(agent) != {"agent_id", "name", "parent_agent_id"} for agent in agents.values()):
-                fail(f"reopened agents reported unaccounted usage or cost: {agents!r}")
+            if not conversation["usage"]["calls"] or any("calls" not in agent for agent in agents.values()):
+                fail(f"reopened conversation lost its recorded usage: {conversation!r}")
             if host.run._provider.call_count != call_count:
                 fail("reopening ran a new model turn")
         finally:
@@ -4205,6 +4408,7 @@ def check_conversation_repeated_agent_parentage() -> None:
             with mock.patch.object(host.run._conversation[0], "run_graph", return_value=graph), mock.patch.object(
                 host_run_module, "read_records", return_value=(records, 0),
             ):
+                host.run._usage_by_session[host.run._conversation[1].run_id] = {}
                 agents = _conversation_reply(host)[1]["conversation"]["agents"]
             if [agent["agent_id"] for agent in agents] != ["leader", "a", "b", "c", "orphan"]:
                 fail(f"spawn order or repeated-agent folding changed: {agents!r}")
@@ -4260,11 +4464,12 @@ def check_conversation_cost_and_context() -> None:
         provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, "reply " + "y" * 40))
         ])
+        context_budget = 280
         host = HostServer(
             provider,
             PermissionPolicy(compact_root),
             sessions_root=compact_root / "sessions",
-            chat_token_budget=170,
+            chat_token_budget=context_budget,
             chat_recent_turns=1,
         )
         host.start()
@@ -4287,7 +4492,7 @@ def check_conversation_cost_and_context() -> None:
             event.after_tokens < event.before_tokens for event in compactions
         ):
             fail(f"runtime did not report a context reduction: {compactions!r}")
-        if used[-1] > 170:
+        if used[-1] > context_budget:
             fail(f"visible context exceeded its configured budget: {used!r}")
         if used[-1] >= sum(used[:3]):
             fail(f"visible context kept a cumulative total after compaction: {used!r}")
@@ -4801,7 +5006,10 @@ def _host_run_snapshot(
             for message in loaded.messages
             if not (
                 message.role == Role.SYSTEM
-                and message.text.startswith("Environment when this conversation started")
+                and (
+                    message.text.startswith("Environment when this conversation started")
+                    or message.text.startswith("In the person's messages, @<path>")
+                )
             )
         ),
         terminal,
@@ -5514,7 +5722,7 @@ def check_mcp_sigterm_shutdown() -> None:
 @check("host_server.mcp_close_order")
 def check_mcp_close_order() -> None:
     events: list[str] = []
-    extensions = mock.Mock(mcp_servers=())
+    extensions = mock.Mock(mcp_servers=(), lsp_servers=())
     pool = mock.Mock()
     pool.start.side_effect = lambda: events.append("pool.start") or {}
     pool.close.side_effect = lambda: events.append("pool.close")
@@ -6343,4 +6551,177 @@ def check_agent_definition_name_validation_and_auth() -> None:
                 if phrase not in protocol:
                     fail(f"agent definition protocol omitted {phrase!r}")
         finally:
+            host.close()
+
+
+def _worktree_route_fixture(root: Path) -> tuple[HostServer, str, Path]:
+    root.mkdir(parents=True)
+    source = root / "a.py"
+    source.write_text("original\n")
+    for args in (("init", "-q"), ("config", "user.email", "checks@example.test"),
+                 ("config", "user.name", "Checks"), ("add", "a.py"),
+                 ("commit", "-qm", "base")):
+        result = subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        if result.returncode:
+            fail(f"git {' '.join(args)} failed: {result.stderr!r}")
+    host = HostServer(
+        FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "ready"))]),
+        PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+        sessions_root=root / "sessions",
+    )
+    host.start()
+    host.run.start("open conversation")
+    _wait_until(lambda: not host.run.active, "worktree fixture prompt did not finish")
+    session = host.run._conversation[1]
+    return host, session.run_id, session.directory
+
+
+def _create_named_worktree(root: Path, session_directory: Path, name: str = "w1") -> Path:
+    admin_path = session_directory / "worktrees" / name
+    worktree_root = create_worktree(root, admin_path)
+    (worktree_root / "a.py").write_text("worktree\n")
+    (worktree_root / "b.py").write_text("new file\n")
+    return admin_path
+
+
+@check("host_server.worktree_apply_checkpoint_and_revert")
+def check_worktree_apply_checkpoint_and_revert() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, session_directory = _worktree_route_fixture(root)
+        worktree = _create_named_worktree(root, session_directory)
+        try:
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                changes = json.loads(response.read())
+                if response.status != 200 or changes["worktrees"][0]["files"] != ["a.py", "b.py"]:
+                    fail(f"worktree did not appear in Changes: {response.status}, {changes!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/worktree/apply", body={"name": "w1"}, headers=_headers(host)
+            )
+            try:
+                applied = json.loads(response.read())
+                if response.status != 200 or applied != {"applied": ["a.py", "b.py"]}:
+                    fail(f"worktree apply failed: {response.status}, {applied!r}")
+            finally:
+                connection.close()
+            if (root / "a.py").read_text() != "worktree\n" or (root / "b.py").read_text() != "new file\n":
+                fail("apply did not bring worktree files into the main tree")
+            if worktree.exists():
+                fail("apply left the worktree directory behind")
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                changes = json.loads(response.read())
+                turn = next(item for item in changes["turns"] if item["prompt"] == "Applied worktree w1")
+                if turn["paths"] != ["a.py", "b.py"]:
+                    fail(f"applied worktree was not checkpointed: {changes!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"key": turn["key"]}, headers=_headers(host)
+            )
+            try:
+                reverted = json.loads(response.read())
+                if response.status != 200 or reverted["reverted"] != ["a.py", "b.py"]:
+                    fail(f"applied worktree could not be reverted: {response.status}, {reverted!r}")
+            finally:
+                connection.close()
+            if (root / "a.py").read_text() != "original\n" or (root / "b.py").exists():
+                fail("reverting the applied worktree did not restore the original tree")
+        finally:
+            host.close()
+
+
+@check("host_server.worktree_apply_conflict_keeps_worktree")
+def check_worktree_apply_conflict_keeps_worktree() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, session_directory = _worktree_route_fixture(root)
+        worktree = _create_named_worktree(root, session_directory)
+        (root / "a.py").write_text("main tree\n")
+        try:
+            connection, response = _request(
+                host, "POST", "/worktree/apply", body={"name": "w1"}, headers=_headers(host)
+            )
+            try:
+                conflict = json.loads(response.read())
+                if response.status != 409 or "error" not in conflict or not conflict["error"]:
+                    fail(f"worktree conflict did not return git's reason: {response.status}, {conflict!r}")
+            finally:
+                connection.close()
+            if (root / "a.py").read_text() != "main tree\n" or not worktree.exists():
+                fail("conflicting apply changed the main tree or removed its worktree")
+        finally:
+            host.close()
+
+
+@check("host_server.worktree_discard_and_reopen")
+def check_worktree_discard_and_reopen() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, session_id, session_directory = _worktree_route_fixture(root)
+        worktree = _create_named_worktree(root, session_directory)
+        host.close()
+        reopened = HostServer(
+            FakeModelProvider(), PermissionPolicy(repo_root=root, allowed_write_scope=[root]),
+            sessions_root=root / "sessions",
+        )
+        reopened.start()
+        try:
+            reopened.run.open_session(session_id)
+            connection, response = _request(reopened, "GET", "/changes", headers=_headers(reopened))
+            try:
+                changes = json.loads(response.read())
+                if response.status != 200 or [item["name"] for item in changes["worktrees"]] != ["w1"]:
+                    fail(f"unacted worktree did not survive reopening: {response.status}, {changes!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                reopened, "POST", "/worktree/discard", body={"name": "w1"}, headers=_headers(reopened)
+            )
+            try:
+                discarded = json.loads(response.read())
+                if response.status != 200 or discarded != {"discarded": "w1"}:
+                    fail(f"worktree discard failed: {response.status}, {discarded!r}")
+            finally:
+                connection.close()
+            if worktree.exists() or (root / "a.py").read_text() != "original\n" or (root / "b.py").exists():
+                fail("discard changed the main tree or retained the worktree")
+        finally:
+            reopened.close()
+
+
+@check("host_server.worktree_unknown_and_active")
+def check_worktree_unknown_and_active() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, _ = _worktree_route_fixture(root)
+        try:
+            for route in ("/worktree/apply", "/worktree/discard"):
+                connection, response = _request(
+                    host, "POST", route, body={"name": "missing"}, headers=_headers(host)
+                )
+                try:
+                    response.read()
+                    if response.status != 404:
+                        fail(f"unknown worktree returned {response.status} on {route}")
+                finally:
+                    connection.close()
+            host.run._active = type("Active", (), {"run_id": "active-run"})()
+            for method, route, body in (
+                ("GET", "/changes", None),
+                ("POST", "/worktree/apply", {"name": "missing"}),
+                ("POST", "/worktree/discard", {"name": "missing"}),
+            ):
+                connection, response = _request(host, method, route, body=body, headers=_headers(host))
+                try:
+                    response.read()
+                    if response.status != 409:
+                        fail(f"active worktree request returned {response.status} on {route}")
+                finally:
+                    connection.close()
+        finally:
+            host.run._active = None
             host.close()

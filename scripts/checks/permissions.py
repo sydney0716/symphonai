@@ -24,6 +24,23 @@ from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
 
+@check("permissions.sandbox_narrowing")
+def check_sandbox_narrowing() -> None:
+    root = Path.cwd()
+    on = PermissionPolicy(
+        repo_root=root, shell_sandbox=True, sandbox_network=True,
+    ).narrowed(PermissionPolicy(repo_root=root))
+    if not on.shell_sandbox or on.sandbox_network:
+        fail(f"sandbox narrowing did not preserve strict/effective settings: {on!r}")
+    both = PermissionPolicy(
+        repo_root=root, shell_sandbox=True, sandbox_network=True,
+    ).narrowed(PermissionPolicy(
+        repo_root=root, shell_sandbox=True, sandbox_network=True,
+    ))
+    if not both.sandbox_network:
+        fail("sandbox network permission was not retained when both sides allowed it")
+
+
 @check("permissions.shell_grant_prefix")
 def check_shell_grant_prefix() -> None:
     cases = (
