@@ -34,7 +34,7 @@ from symphonai_api.paths import symphonai_home
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
-from symphonai_host.broker import EventBroker, SessionEvent, Subscription
+from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
 from symphonai_host.files import repository_files
 from symphonai_host.protocol import (
@@ -938,12 +938,7 @@ class HostServer:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
-                    session_id = None
-                    if isinstance(event, SessionEvent):
-                        session_id = event.session_id
-                        event = event.event
-                    else:
-                        session_id = host.run.event_session_id(event)
+                    session_id = host.run.event_session_id(event)
                     if isinstance(event, ApprovalRequested):
                         self._sse(encode_frame("approval_requested", event.__dict__))
                     elif isinstance(event, HistoryMessage):

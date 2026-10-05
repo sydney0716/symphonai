@@ -204,7 +204,7 @@ def check_startup_environment_wins() -> None:
         with mock.patch.dict(os.environ, {
             "SYMPHONAI_CREDENTIALS_FILE": str(target),
             "OPENAI_API_KEY": "exported-fixture",
-        }), mock.patch.object(host_main, "load_extensions", return_value=SimpleNamespace(mcp_servers=())), \
+        }), mock.patch.object(host_main, "load_extensions", return_value=SimpleNamespace(mcp_servers=(), lsp_servers=())), \
                 mock.patch.object(host_main, "McpPool") as pool_class, \
                 mock.patch.object(host_main, "HostServer") as host_class, \
                 mock.patch.object(host_main, "_provider"), \

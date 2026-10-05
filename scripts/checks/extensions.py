@@ -268,6 +268,7 @@ def empty_and_runner() -> None:
             "skills",
             "plugins",
             "withheld",
+            "lsp_servers",
         ]
         if [item.name for item in fields(Extensions)] != expected_fields:
             fail("Extensions advertises an unsupported or missing capability")

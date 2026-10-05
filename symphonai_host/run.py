@@ -429,11 +429,12 @@ class HostRun:
             reason="" if goal is None else goal.reason,
             last_check=None if goal is None else goal.last_check,
             session_id=session_id,
-        ), session_id=session_id)
+        ))
 
     def start_goal(self, objective: str, check: tuple[str, ...], max_rounds: int) -> str:
         with self._lock:
-            if self._goal_check is not None:
+            session_id = None if self._conversation is None else self._conversation[1].run_id
+            if session_id is not None and session_id in self._goal_checks_by_session:
                 raise RunActiveError("goal check")
             goal = Goal(objective, check, max_rounds=max_rounds)
             return self.start(objective, _new_goal=goal)
@@ -579,7 +580,7 @@ class HostRun:
 
     def _publish_session(self, event: Event, session_id: str) -> None:
         self._remember_event_session(event, session_id)
-        self._broker.publish(event, session_id=session_id)
+        self._broker.publish(event)
 
     def _remember_event_session(self, event: Event, session_id: str) -> None:
         runtime_run_id = getattr(event, "run_id", None)
@@ -726,8 +727,10 @@ class HostRun:
                 self._goal.rounds += 1
                 self._goals_by_session[session_id] = self._goal
                 self._save_goal(session_id, self._goal)
-            elif not _goal_round and self._goal_check is not None:
-                self._goal_check.interrupted = "interrupted"
+            elif not _goal_round:
+                context = self._goal_checks_by_session.get(session_id)
+                if context is not None:
+                    context.interrupted = "interrupted"
             is_goal_round = _goal_round or _new_goal is not None
             thread = threading.Thread(
                 target=self._run,
@@ -950,7 +953,7 @@ class HostRun:
                             if isinstance(block, (ImageBlock, DocumentBlock))
                         ],
                         session_id=run_id,
-                    ), session_id=run_id)
+                    ))
                 self._close_idle_conversations_locked()
                 return {
                     "run_id": loaded.run_id, "state": diagnosis.state.value,
@@ -1054,7 +1057,7 @@ class HostRun:
                     if isinstance(block, (ImageBlock, DocumentBlock))
                 ],
                 session_id=run_id,
-            ), session_id=run_id)
+            ))
         return {
             "run_id": loaded.run_id,
             "state": diagnosis.state.value,
@@ -1198,8 +1201,11 @@ class HostRun:
                 self._context_report = None
                 self._usage_by_agent.clear()
                 return
-            if self._goal_check is not None:
-                self._goal_check.interrupted = "interrupted"
+            context = (
+                None if session_id is None else self._goal_checks_by_session.get(session_id)
+            )
+            if context is not None:
+                context.interrupted = "interrupted"
             self._goal = None
             self._goal_session_id = None
             self._conversation = None
@@ -1242,7 +1248,8 @@ class HostRun:
     def stop(self) -> None:
         with self._lock:
             active = self._active
-            goal_check = self._goal_check
+            session_id = None if self._conversation is None else self._conversation[1].run_id
+            goal_check = None if session_id is None else self._goal_checks_by_session.get(session_id)
         if active is not None:
             active.cancel.cancel()
         if goal_check is not None:
@@ -1578,27 +1585,42 @@ class HostRun:
                 raise RuntimeError("checkpoint store is unavailable")
             diff = worktree_diff(directory)
             root = checkpoints.repo_root
+            top_result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"], cwd=root, capture_output=True,
+                check=False,
+            )
+            if top_result.returncode:
+                message = top_result.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(message or "could not locate git repository root")
+            git_root = Path(os.fsdecode(top_result.stdout.strip())).resolve()
+            checkpoint_paths: list[tuple[str, Path]] = []
+            for path in diff.files:
+                target = (git_root / path).resolve()
+                try:
+                    target.relative_to(root)
+                except ValueError:
+                    continue
+                checkpoint_paths.append((path, target))
             checked = subprocess.run(
                 ["git", "apply", "--check", "--binary"],
-                input=diff.patch.encode("utf-8", errors="surrogateescape"), cwd=root, capture_output=True,
+                input=diff.patch.encode("utf-8", errors="surrogateescape"), cwd=git_root, capture_output=True,
                 check=False,
             )
             if checked.returncode:
                 message = checked.stderr.decode("utf-8", errors="replace").strip()
                 raise WorktreeApplyConflict(message or "git apply --check failed")
             checkpoints.begin(new_id("chk"), label=f"Applied worktree {name}")
-            for path in diff.files:
-                checkpoints.before_write(root / path)
+            for _, target in checkpoint_paths:
+                checkpoints.before_write(target)
             applied = subprocess.run(
                 ["git", "apply", "--binary"], input=diff.patch.encode("utf-8", errors="surrogateescape"),
-                cwd=root, capture_output=True, check=False,
+                cwd=git_root, capture_output=True, check=False,
             )
             if applied.returncode:
                 message = applied.stderr.decode("utf-8", errors="replace").strip()
                 raise WorktreeApplyConflict(message or "git apply failed")
-            for path in diff.files:
-                if (root / path).is_file():
-                    checkpoints.after_write(root / path)
+            for _, target in checkpoint_paths:
+                checkpoints.after_write(target)
             remove_worktree(root, directory)
             leader.forget_subagent(name)
             return {"applied": list(diff.files)}
@@ -1692,7 +1714,7 @@ class HostRun:
             self._broker.publish(event)
         else:
             self._remember_event_session(event, session_id)
-            self._broker.publish(event, session_id=session_id)
+            self._broker.publish(event)
 
     def _perform_goal_check(self, context: GoalCheck, run_id: str) -> None:
         def set_process(process) -> None:  # noqa: ANN001
@@ -1808,8 +1830,9 @@ class HostRun:
                     context = GoalCheck(
                         goal, session_id, threading.Event(), leader.agent_ref.agent_id,
                     )
-                    self._goal_check = context
-                    self._goal_check_thread = threading.current_thread()
+                    if self._conversation is not None and self._conversation[1].run_id == session_id:
+                        self._goal_check = context
+                        self._goal_check_thread = threading.current_thread()
                     self._goal_checks_by_session[session_id] = context
                     run_check_now = True
                 elif goal.rounds < goal.max_rounds:

@@ -70,10 +70,15 @@ class CheckpointStore:
                         digest = record.get("sha256")
                         if isinstance(digest, str):
                             self._last_written[path] = digest
+                        elif digest is None:
+                            self._last_written.pop(path, None)
                 elif kind == "after_write":
                     path, digest = record.get("path"), record.get("sha256")
-                    if isinstance(path, str) and isinstance(digest, str):
-                        self._last_written[path] = digest
+                    if isinstance(path, str):
+                        if isinstance(digest, str):
+                            self._last_written[path] = digest
+                        elif digest is None:
+                            self._last_written.pop(path, None)
                 elif kind == "restore":
                     path, digest = record.get("path"), record.get("sha256")
                     if isinstance(path, str):
@@ -135,6 +140,23 @@ class CheckpointStore:
             resolved, relative = self._relative_path(path)
             identity = (self._key, relative)
             if identity not in self._entry_keys and identity not in self._pending:
+                return
+            if not resolved.exists():
+                if identity in self._entry_keys:
+                    self._append({"type": "after_write", "path": relative, "sha256": None})
+                else:
+                    backup = self._pending[identity]
+                    self._append({
+                        "type": "write",
+                        "key": self._key,
+                        "path": relative,
+                        "backup": backup,
+                        "sha256": None,
+                    })
+                    self._entries.append(CheckpointEntry(self._key, relative, backup))
+                    self._entry_keys.add(identity)
+                    self._pending.pop(identity, None)
+                self._last_written.pop(relative, None)
                 return
             digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
             if identity in self._entry_keys:

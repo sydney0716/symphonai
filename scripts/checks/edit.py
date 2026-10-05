@@ -826,6 +826,30 @@ def check_edit_checkpoint_reload() -> None:
             fail("reopened checkpoint store did not preserve its data")
 
 
+@check("edit.checkpoint_deletion_reload")
+def check_edit_checkpoint_deletion_reload() -> None:
+    with workspace() as ws:
+        directory = ws.root / "checkpoints"
+        path = ws.root / "checkpoint-deletion.txt"
+        path.write_bytes(b"original bytes")
+        checkpoints = CheckpointStore(directory, ws.root)
+        checkpoints.begin("delete-prompt")
+        checkpoints.before_write(path)
+        path.unlink()
+        checkpoints.after_write(path)
+        entry = checkpoints.entries()[0]
+        if (
+            entry.path != path.name
+            or entry.backup is None
+            or (directory / entry.backup).read_bytes() != b"original bytes"
+            or checkpoints.last_written(path.name) is not None
+        ):
+            fail("deleted file did not retain its backup and clear last_written")
+        reopened = CheckpointStore(directory, ws.root)
+        if reopened.entries() != (entry,) or reopened.last_written(path.name) is not None:
+            fail("reloaded deletion entry or cleared last_written was lost")
+
+
 @check("edit.checkpoint_restore")
 def check_edit_checkpoint_restore() -> None:
     with workspace() as ws:

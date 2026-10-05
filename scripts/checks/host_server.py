@@ -51,6 +51,7 @@ from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelResponse, Role, TextBlock, ToolCall, ToolResult, Usage
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_host.files import repository_files
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
@@ -371,6 +372,63 @@ def check_files_limits_and_truncation() -> None:
                 fail(f"file walk did not report its cap: {response.status}, {result!r}")
         finally:
             host.close()
+
+
+@check("host_server.files_prunes_forbidden_directories")
+def check_files_prunes_forbidden_directories() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "src" / "parser.py"
+        source.parent.mkdir()
+        source.write_text("source", encoding="utf-8")
+        hidden = root / ".venv"
+        hidden.mkdir()
+        for index in range(25_000):
+            (hidden / f"file-{index:05}.py").touch()
+        paths, truncated = repository_files(PermissionPolicy(repo_root=root), "parser", 20)
+        if paths != ["src/parser.py"] or truncated:
+            fail(f"forbidden files consumed the search cap: {paths!r}, truncated={truncated}")
+
+
+@check("host_server.files_breadth_first_cap")
+def check_files_breadth_first_cap() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "src" / "parser.py"
+        source.parent.mkdir()
+        source.write_text("source", encoding="utf-8")
+        deep = root / "vendor" / "deep" / "a" / "b"
+        deep.mkdir(parents=True)
+        for index in range(20_005):
+            (deep / f"file-{index:05}.py").touch()
+        paths, truncated = repository_files(PermissionPolicy(repo_root=root), "parser", 20)
+        if paths != ["src/parser.py"] or not truncated:
+            fail(f"breadth-first cap omitted a shallow file: {paths!r}, truncated={truncated}")
+
+
+@check("host_server.files_candidate_cache_ttl")
+def check_files_candidate_cache_ttl() -> None:
+    from symphonai_host import files as files_module
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "a.py").write_text("a", encoding="utf-8")
+        policy = PermissionPolicy(repo_root=root)
+        clock = iter((100.0, 100.5, 101.0, 111.0, 111.5))
+        with mock.patch.object(files_module, "_walk_candidates", wraps=files_module._walk_candidates) as walk, \
+                mock.patch.object(files_module.time, "monotonic", side_effect=lambda: next(clock)):
+            repository_files(policy, "a", 20)
+            repository_files(policy, "b", 20)
+            repository_files(policy, "a", 20)
+        if walk.call_count != 2:
+            fail(f"candidate cache walked {walk.call_count} times across its TTL")
+
+
+@check("host_server.files_search_reaches_repository")
+def check_files_search_reaches_repository() -> None:
+    paths, _ = repository_files(PermissionPolicy(repo_root=REPO_ROOT), "leader", 20)
+    if not paths or paths[0] != "symphonai_api/leader.py":
+        fail(f"repository search did not rank the runtime leader first: {paths[:5]!r}")
 
 
 def _host(
@@ -2793,6 +2851,155 @@ def _send_host_prompt(host: HostServer, prompt: str) -> None:
     finally:
         connection.close()
     _wait_until(lambda: not host.run.active, "usage prompt did not finish")
+
+
+class _BackgroundGoalProvider(ModelProvider):
+    def __init__(self) -> None:
+        self.goal_round_started = threading.Event()
+        self.release_goal_round = threading.Event()
+        self.feedback_round_started = threading.Event()
+        self.release_feedback_round = threading.Event()
+
+    @property
+    def name(self) -> str:
+        return "background-goal"
+
+    @property
+    def wire_format(self) -> int:
+        return 4
+
+    def create_response(self, request, *, cancel=None) -> ModelResponse:
+        prompt = next(message.text for message in reversed(request.messages) if message.role is Role.USER)
+        if prompt == "finish goal A":
+            self.goal_round_started.set()
+            gate = self.release_goal_round
+        elif prompt.startswith("Goal check failed (round "):
+            self.feedback_round_started.set()
+            gate = self.release_feedback_round
+        else:
+            gate = None
+        while gate is not None and not gate.wait(0.01):
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        return ModelResponse(Message(Role.ASSISTANT, f"answer to {prompt}"))
+
+
+def _background_goal_fixture(root: Path):
+    provider = _BackgroundGoalProvider()
+    host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+    checker = "import time; time.sleep(2); raise SystemExit(1)"
+    connection, response = _request(
+        host,
+        "POST",
+        "/goal",
+        body={"objective": "finish goal A", "check": [sys.executable, "-c", checker], "max_rounds": 3},
+        headers=_headers(host),
+    )
+    try:
+        if response.status != 200:
+            fail(f"background goal was rejected: {response.status}, {response.read()!r}")
+        response.read()
+    finally:
+        connection.close()
+    if not provider.goal_round_started.wait(2):
+        fail("goal A did not start its first round")
+    session_id = host.run._goal_session_id
+    connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+    try:
+        response.read()
+        if response.status != 200:
+            fail(f"new conversation was refused while goal A ran: {response.status}")
+    finally:
+        connection.close()
+    _send_host_prompt(host, "first prompt in B")
+    provider.release_goal_round.set()
+    _wait_until(
+        lambda: session_id in host.run._goal_checks_by_session,
+        "goal A did not enter its check while B was current",
+    )
+    return host, provider, session_id, host.run._goal_checks_by_session[session_id]
+
+
+@check("host_server.background_goal_prompt_is_session_scoped")
+def check_background_goal_prompt_is_session_scoped() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host, provider, session_id, context = _background_goal_fixture(Path(temporary))
+        try:
+            if host.run._conversation[1].run_id == session_id:
+                fail("conversation B was not current during A's check")
+            _send_host_prompt(host, "second prompt in B")
+            if context.interrupted or context.cancel.is_set():
+                fail(f"a prompt in B interrupted goal A's check: {context.interrupted!r}, {context.cancel.is_set()}")
+            if not provider.feedback_round_started.wait(4):
+                fail("goal A did not start its next round after the failing check")
+            goal = host.run._goals_by_session[session_id]
+            if goal.phase != "active" or session_id not in host.run._active_by_session:
+                fail(f"goal A did not remain active in its next round: {goal.payload()!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.background_goal_stop_is_session_scoped")
+def check_background_goal_stop_is_session_scoped() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host, provider, session_id, context = _background_goal_fixture(Path(temporary))
+        try:
+            connection, response = _request(host, "POST", "/stop", body={}, headers=_headers(host))
+            response.read()
+            connection.close()
+            if response.status != 200 or context.cancel.is_set():
+                fail("/stop in B cancelled A's goal check")
+            connection, response = _request(
+                host, "POST", "/session/open", body={"run_id": session_id}, headers=_headers(host)
+            )
+            response.read()
+            connection.close()
+            if response.status != 200:
+                fail(f"opening A during its check failed: {response.status}")
+            connection, response = _request(host, "POST", "/stop", body={}, headers=_headers(host))
+            response.read()
+            connection.close()
+            goal = _wait_goal_state(host, "paused")
+            if (
+                response.status != 200
+                or not context.cancel.is_set()
+                or goal["reason"] != "cancelled"
+            ):
+                fail(f"/stop in A did not cancel A's own check: {goal!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.background_goal_new_chat_is_session_scoped")
+def check_background_goal_new_chat_is_session_scoped() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host, provider, session_id, context = _background_goal_fixture(Path(temporary))
+        try:
+            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+            response.read()
+            connection.close()
+            if response.status != 200 or context.interrupted or context.cancel.is_set():
+                fail(
+                    "new chat in B interrupted goal A's check: "
+                    f"status={response.status}, interrupted={context.interrupted!r}, "
+                    f"cancelled={context.cancel.is_set()}"
+                )
+            _send_host_prompt(host, "new chat prompt in B")
+            if not provider.feedback_round_started.wait(4):
+                fail("goal A did not continue after a new chat in B")
+            goal = host.run._goals_by_session[session_id]
+            if goal.phase != "active" or context.interrupted:
+                fail(f"new chat in B changed goal A: {goal.payload()!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.event_broker_publish_event_only")
+def check_event_broker_publish_event_only() -> None:
+    if tuple(inspect.signature(EventBroker.publish).parameters) != ("self", "event"):
+        fail(f"EventBroker.publish still accepts session identity: {inspect.signature(EventBroker.publish)}")
 
 
 @check("host_server.goal_rounds_until_check_passes")
@@ -6630,6 +6837,116 @@ def check_worktree_apply_checkpoint_and_revert() -> None:
                 connection.close()
             if (root / "a.py").read_text() != "original\n" or (root / "b.py").exists():
                 fail("reverting the applied worktree did not restore the original tree")
+        finally:
+            host.close()
+
+
+@check("host_server.worktree_apply_deletion_and_revert")
+def check_worktree_apply_deletion_and_revert() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, session_directory = _worktree_route_fixture(root)
+        (root / "b.py").write_text("original b\n")
+        subprocess.run(["git", "add", "b.py"], cwd=root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "add b"], cwd=root, check=True, capture_output=True,
+        )
+        directory = session_directory / "worktrees" / "w1"
+        worktree_root = create_worktree(root, directory)
+        (worktree_root / "a.py").unlink()
+        (worktree_root / "b.py").write_text("changed b\n")
+        try:
+            connection, response = _request(
+                host, "POST", "/worktree/apply", body={"name": "w1"}, headers=_headers(host)
+            )
+            try:
+                applied = json.loads(response.read())
+                if response.status != 200 or applied != {"applied": ["a.py", "b.py"]}:
+                    fail(f"deletion worktree apply failed: {response.status}, {applied!r}")
+            finally:
+                connection.close()
+            if (root / "a.py").exists() or (root / "b.py").read_text() != "changed b\n":
+                fail("deletion worktree apply produced the wrong main tree")
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                changes = json.loads(response.read())
+                statuses = {item["path"]: item["status"] for item in changes["files"]}
+                turn = next(item for item in changes["turns"] if item["prompt"] == "Applied worktree w1")
+                if statuses.get("a.py") != "deleted" or statuses.get("b.py") != "modified":
+                    fail(f"applied deletion was absent from Changes: {changes!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"key": turn["key"]}, headers=_headers(host)
+            )
+            try:
+                reverted = json.loads(response.read())
+                if response.status != 200 or set(reverted["reverted"]) != {"a.py", "b.py"}:
+                    fail(f"deletion apply could not be reverted: {response.status}, {reverted!r}")
+            finally:
+                connection.close()
+            if (root / "a.py").read_bytes() != b"original\n" or (root / "b.py").read_text() != "original b\n":
+                fail("reverting the deletion apply did not restore both original files")
+        finally:
+            host.close()
+
+
+@check("host_server.worktree_apply_subdirectory_paths")
+def check_worktree_apply_subdirectory_paths() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        top = Path(temporary) / "top"
+        root = top / "app"
+        root.mkdir(parents=True)
+        (root / "x.py").write_text("original\n")
+        for args in (
+            ("init", "-q"), ("config", "user.email", "checks@example.test"),
+            ("config", "user.name", "Checks"), ("add", "app/x.py"),
+            ("commit", "-qm", "base"),
+        ):
+            result = subprocess.run(["git", *args], cwd=top, capture_output=True, check=False)
+            if result.returncode:
+                fail(f"git {' '.join(args)} failed: {result.stderr!r}")
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "ready"))]),
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            sessions_root=top / "sessions",
+        )
+        host.start()
+        host.run.start("open conversation")
+        _wait_until(lambda: not host.run.active, "subdirectory worktree fixture prompt did not finish")
+        session = host.run._conversation[1]
+        directory = session.directory / "worktrees" / "w1"
+        worktree_root = create_worktree(root, directory)
+        (worktree_root / "x.py").write_text("edited\n")
+        try:
+            connection, response = _request(
+                host, "POST", "/worktree/apply", body={"name": "w1"}, headers=_headers(host)
+            )
+            try:
+                applied = json.loads(response.read())
+                if response.status != 200 or applied != {"applied": ["app/x.py"]}:
+                    fail(f"subdirectory worktree apply failed: {response.status}, {applied!r}")
+            finally:
+                connection.close()
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            try:
+                changes = json.loads(response.read())
+                turn = next(item for item in changes["turns"] if item["prompt"] == "Applied worktree w1")
+                if turn["paths"] != ["x.py"] or (root / "x.py").read_text() != "edited\n":
+                    fail(f"subdirectory path was not mapped to repo_root: {changes!r}")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/changes/revert", body={"key": turn["key"]}, headers=_headers(host)
+            )
+            try:
+                if response.status != 200:
+                    fail(f"subdirectory apply revert failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            if (root / "x.py").read_text() != "original\n":
+                fail("subdirectory apply revert did not restore x.py")
         finally:
             host.close()
 
