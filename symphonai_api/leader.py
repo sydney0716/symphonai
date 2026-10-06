@@ -23,7 +23,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, ApiAgent, _message_digest
+from symphonai_api.agent_loop import ApiAgent, _message_digest
 from symphonai_api.agent_memory import AgentMemory, MemoryEntry, MemorySettings
 from symphonai_api.agent_run import (
     AgentRun,
@@ -102,7 +102,6 @@ class AgentControlError(RuntimeError):
 
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
-DEFAULT_SUBAGENT_MAX_TURNS = 5
 EXPLORER_TOOL_NAMES = ("read_file", "glob", "grep", "list_files", "web_fetch")
 
 
@@ -324,7 +323,7 @@ class DispatchSubagentTool(LocalTool):
         leader_policy: PermissionPolicy,
         *,
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
-        subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
+        subagent_max_turns: int | None = None,
         subagent_tool_names: Sequence[str] | None = None,
         parent_agent_id: str | None = None,
         subagent_budget: RunBudget | None = None,
@@ -930,10 +929,10 @@ class LeaderConfig:
     leader_provider: ModelProvider
     subagent_provider: ModelProvider
     repo_root: str
-    max_leader_turns: int = DEFAULT_MAX_TURNS
+    max_leader_turns: int | None = None
     leader_budget: RunBudget | None = None
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
-    subagent_max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
+    subagent_max_turns: int | None = None
     subagent_budget: RunBudget | None = None
     subagent_tool_names: Sequence[str] | None = None
     subagent_specs: Mapping[str, AgentSpec] | None = None

@@ -60,10 +60,21 @@ def check_rejects_invalid_construction() -> None:
                 fail(f"invalid {field_name} error did not name its field: {exc!r}")
         else:
             fail(f"invalid {field_name} budget was accepted: {arguments!r}")
+    with workspace() as ws:
+        try:
+            ApiAgent(FakeModelProvider(), {}, ws.policy, max_turns=0)
+        except ValueError as exc:
+            if "max_turns" not in str(exc):
+                fail(f"invalid agent turn limit error did not name its field: {exc!r}")
+        else:
+            fail("ApiAgent accepted max_turns=0")
 
 
-@check("budget.none_is_todays_behaviour")
-def check_none_is_todays_behaviour() -> None:
+@check("budget.no_limit_by_default")
+def check_no_limit_by_default() -> None:
+    with workspace() as ws:
+        if RunBudget().max_turns is not None or ApiAgent(FakeModelProvider(), {}, ws.policy)._max_turns is not None:
+            fail("turn limits still have a default value")
     responses = [
         _response(tool_call=ToolCall(id="unknown", name="missing")),
         _response("done", input_tokens=2, output_tokens=3),

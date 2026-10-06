@@ -2194,6 +2194,12 @@ test("sidebar links to Roadmap, Settings and Changes, and keeps a home link", as
 
   assert.deepEqual(links.children.map((link) => link.textContent), ["Settings", "Changes", "Roadmap"]);
   assert.match(visibleText(sidebar), /Roadmap/);
+  assert.deepEqual(sidebar.children, [
+    document.getElementById("home-link"),
+    document.getElementById("new-chat"),
+    links,
+    find(sidebar, (node) => node.className === "projects"),
+  ]);
   assert.equal(sidebar.children[0], document.getElementById("home-link"));
   await document.getElementById("home-link").dispatch("click");
   assert.equal(browser.global.location.hash, "#/chat");
@@ -2201,6 +2207,21 @@ test("sidebar links to Roadmap, Settings and Changes, and keeps a home link", as
   await find(links, (link) => link.textContent === "Roadmap").dispatch("click");
   assert.equal(browser.global.location.hash, "#/roadmap");
   assert.equal(document.getElementById("page").children[0].className, "roadmap-page-pane");
+});
+
+test("session list scrolls below page links inside the fixed sidebar", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const sidebar = css.match(/#sidebar\s*\{([^}]*)\}/)?.[1] ?? "";
+  const projects = css.match(/\.projects\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(sidebar, /display:\s*flex;/);
+  assert.match(sidebar, /flex-direction:\s*column;/);
+  assert.match(sidebar, /height:\s*100vh;/);
+  assert.match(sidebar, /overflow:\s*hidden;/);
+  assert.match(projects, /flex:\s*1;/);
+  assert.match(projects, /min-height:\s*0;/);
+  assert.match(projects, /overflow-y:\s*auto;/);
+  assert.doesNotMatch(css, /#page-links\s*\{[^}]*display:\s*none;/);
 });
 
 test("Changes page renders files and prompts, retries outside edits, and refreshes", async () => {
@@ -2440,6 +2461,53 @@ test("reopened history and conversation stats render a nested agent tree without
   assert.equal(find(document.body, (row) => row.className === "conversation-usage").textContent, "");
   assert.match(visibleText(document.getElementById("chat")), /Prior answer/);
   assert.doesNotMatch(visibleText(agents), /tokens|USD/);
+});
+
+test("opening another conversation and starting a new chat clears prior agents", async () => {
+  const document = new FakeDocument();
+  const sessions = [
+    { run_id: "conversation-a", title: "Conversation A", repo_root: "/work/current" },
+    { run_id: "conversation-b", title: "Conversation B", repo_root: "/work/current" },
+  ];
+  const client = fakeClient(fixtureRoadmap(), { sessions });
+  const agents = document.getElementById("agents");
+  let conversation = null;
+  const replayBoard = [];
+  client.sessions = async () => sessions;
+  client.conversationStats = async () => ({ conversation });
+  client.openSession = async (runId) => {
+    client.calls.openSession.push(runId);
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", role: "assistant", text: `History for ${runId}`,
+      tool_calls: [], turn_id: `turn-${runId}`,
+    } });
+    replayBoard.push(visibleText(agents));
+    conversation = { agents: runId === "conversation-a"
+      ? [
+        { agent_id: "leader-a", name: "leader", parent_agent_id: null },
+        { agent_id: "worker-a", name: "worker", parent_agent_id: "leader-a" },
+      ]
+      : [{ agent_id: "leader-b", name: "leader", parent_agent_id: null }],
+    };
+    return { run_id: runId };
+  };
+  await start({ global: {}, document, client });
+
+  const sessionLink = (title) => find(document.getElementById("sidebar"), (row) =>
+    row.className === "session-link" && row.textContent === title
+  );
+  await sessionLink("Conversation A").dispatch("click");
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · done"]);
+  assert.deepEqual(agents.children[0].children[0].children.map((row) => row.textContent), ["worker · done"]);
+
+  await sessionLink("Conversation B").dispatch("click");
+  assert.deepEqual(client.calls.openSession, ["conversation-a", "conversation-b"]);
+  assert.deepEqual(replayBoard, ["\nNothing is running.", "\nNothing is running."]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · done"]);
+  assert.equal(find(agents, (row) => row.textContent.includes("worker")), undefined);
+
+  await document.getElementById("new-chat").dispatch("click");
+  assert.equal(visibleText(agents), "\nNothing is running.");
 });
 
 test("settings routes render general origins, model presence, and unknown fallback", async () => {
@@ -3477,6 +3545,7 @@ test("session history renders as the original conversation", async () => {
 
 test("replayed messages offer a fork at the message and show the parent in the sidebar", async () => {
   const document = new FakeDocument();
+  const agents = document.getElementById("agents");
   const source = { run_id: "source", title: "Original", repo_root: "/work/current" };
   const fork = { run_id: "fork-run", title: "Original", parent_session_id: "source", repo_root: "/work/current" };
   const client = fakeClient(fixtureRoadmap(), { sessions: [source] });
@@ -3484,8 +3553,10 @@ test("replayed messages offer a fork at the message and show the parent in the s
     client.calls.sessions.push(limit);
     return client.calls.sessions.length === 1 ? [source] : [fork, source];
   };
+  let boardDuringFork;
   client.forkSession = async (runId, recordId) => {
     client.calls.forkSession.push([runId, recordId]);
+    boardDuringFork = visibleText(agents);
     await client.emit({ kind: "event", payload: {
       type: "HistoryMessage", role: "user", text: "What changed?", record_id: "rec-fork",
       tool_calls: [], turn_id: "turn-fork",
@@ -3507,10 +3578,18 @@ test("replayed messages offer a fork at the message and show the parent in the s
     type: "HistoryMessage", role: "assistant", text: "The config changed.", record_id: "rec-answer",
     tool_calls: [], turn_id: "turn-1",
   } });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader-a", agent_name: "leader" }));
+  await client.emit(eventFrame("SubagentSpawned", {
+    agent_id: "leader-a", subagent_agent_id: "worker-a", subagent_name: "worker",
+  }));
+  assert.match(visibleText(agents), /leader · running/);
+  assert.match(visibleText(agents), /worker · running/);
   const controls = walk(chat).filter((value) => value.className === "fork-message");
   assert.equal(controls.length, 2);
   await controls[0].dispatch("click");
   assert.deepEqual(client.calls.forkSession, [["source", "rec-user"]]);
+  assert.equal(boardDuringFork, "\nNothing is running.");
+  assert.equal(visibleText(agents), "\nNothing is running.");
   assert.match(visibleText(chat), /What changed\?/);
   assert.doesNotMatch(visibleText(chat), /The config changed\./);
   assert.match(visibleText(document.getElementById("sidebar")), /Original · fork of Original/);
@@ -3831,6 +3910,19 @@ async function openWorkflowItem(client) {
   return { app, document, roadmapButton };
 }
 
+test("starting a spec plan clears agents from the previous conversation", async () => {
+  const client = specWorkflowClient({ hasSpec: false });
+  const { document } = await openWorkflowItem(client);
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader-a", agent_name: "leader" }));
+  await client.emit(eventFrame("SubagentSpawned", {
+    agent_id: "leader-a", subagent_agent_id: "worker-a", subagent_name: "worker",
+  }));
+  assert.match(visibleText(document.getElementById("agents")), /worker · running/);
+
+  await documentButton(document, "Plan").dispatch("click");
+  assert.equal(visibleText(document.getElementById("agents")), "\nNothing is running.");
+});
+
 function workflowActions(document) {
   const panel = find(document.getElementById("spec"), (node) => node.className === "spec-workflow");
   return {
@@ -3862,6 +3954,21 @@ test("roadmap spec workflow renders the actions for each run state", async () =>
     assert.equal(rendered.step, step);
     assert.deepEqual(rendered.actions, expectedActions, `${step} actions`);
   }
+});
+
+test("unbound planner outcomes show the stop reason and can be reopened or retried", async () => {
+  const stopped = await openWorkflowItem(specWorkflowClient({ hasSpec: false, runs: [
+    { kind: "plan", phase: "18", item: 0, session_id: "plan-budget", state: "stopped", stopped_reason: "budget_turns", created: [] },
+  ] }));
+  const stoppedView = workflowActions(stopped.document);
+  assert.equal(stoppedView.step, "planner stopped: turn limit");
+  assert.deepEqual(stoppedView.actions, ["Plan", "Open"]);
+
+  const empty = await openWorkflowItem(specWorkflowClient({ hasSpec: false, runs: [
+    { kind: "plan", phase: "18", item: 0, session_id: "plan-empty", state: "finished", created: [] },
+  ] }));
+  assert.equal(workflowActions(empty.document).step, "planner wrote no spec");
+  assert.deepEqual(workflowActions(empty.document).actions, ["Plan", "Open"]);
 });
 
 test("roadmap spec actions post their payloads, refresh, open sessions, and show errors", async () => {

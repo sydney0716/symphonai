@@ -560,7 +560,7 @@ def cap_is_phase_guarded() -> None:
             if run.budget is not before:
                 fail("phase-rejected cap changed the stored budget")
 
-        run = _new_run(root)
+        run = _new_run(root, budget=RunBudget(max_turns=5))
         before = run.budget
         try:
             run.cap_budget(max_turns=before.max_turns + 1)

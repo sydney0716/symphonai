@@ -16,7 +16,6 @@ from decimal import Decimal
 
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
 
-DEFAULT_MAX_TURNS = 10
 BUDGET_STOPPED_REASONS = (
     "budget_wall_time",
     "budget_tokens",
@@ -26,14 +25,14 @@ BUDGET_STOPPED_REASONS = (
 
 @dataclass(frozen=True)
 class RunBudget:
-    max_turns: int = DEFAULT_MAX_TURNS
+    max_turns: int | None = None
     wall_seconds: float | None = None
     max_total_tokens: int | None = None
     max_cost: Decimal | None = None
     price_table: PriceTable | None = None
 
     def __post_init__(self) -> None:
-        if self.max_turns < 1:
+        if self.max_turns is not None and self.max_turns < 1:
             raise ValueError("max_turns must be >= 1")
         if self.wall_seconds is not None and self.wall_seconds <= 0:
             raise ValueError("wall_seconds must be positive")

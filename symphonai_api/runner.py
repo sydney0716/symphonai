@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from symphonai_api.agent_loop import DEFAULT_MAX_TURNS, AgentRunResult, ApiAgent
+from symphonai_api.agent_loop import AgentRunResult, ApiAgent
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.checkpoints import CheckpointStore
@@ -131,7 +131,7 @@ def run_task(
     prompt: str,
     *,
     system_prompt: str | None = None,
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int | None = None,
     model: str | None = None,
     cancel: CancellationToken | None = None,
     include_instructions: bool = False,
@@ -210,7 +210,7 @@ def resume_task(
     store: SessionStore,
     new_store: SessionStore,
     model: str | None = None,
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int | None = None,
     cancel: CancellationToken | None = None,
     offload_tool_results: bool = False,
 ) -> AgentRunResult:

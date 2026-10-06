@@ -12,7 +12,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from symphonai_api.agent_loop import DEFAULT_MAX_TURNS
 from symphonai_api.agent_memory import AgentMemory
 from symphonai_api.checkpoints import CheckpointEntry, CheckpointStore
 from symphonai_api.agent_spec import AgentSpec
@@ -29,7 +28,7 @@ from symphonai_api.identity import new_id
 from symphonai_api.instructions import load_instructions
 from symphonai_api.lsp import LspManager
 from symphonai_api.leader import (
-    DEFAULT_SUBAGENT_MAX_TURNS, AgentControlError, Leader, LeaderConfig, LeaderRunResult,
+    AgentControlError, Leader, LeaderConfig, LeaderRunResult,
     builtin_subagent_specs,
 )
 from symphonai_api.model_table import context_window_for_model
@@ -173,7 +172,7 @@ def _narrow_budget(
         raise ValueError("subagent cost budgets use different price tables")
     return RunBudget(
         max_turns=(
-            min(existing.max_turns, ceiling.max_turns)
+            tighter(existing.max_turns, ceiling.max_turns)
             if turn_limit_configured else existing.max_turns
         ),
         wall_seconds=tighter(existing.wall_seconds, ceiling.wall_seconds),
@@ -205,7 +204,7 @@ class HostRun:
         *,
         system_prompt: str | None = None,
         working_dir: Path | None = None,
-        max_turns: int = DEFAULT_MAX_TURNS,
+        max_turns: int | None = None,
         model: str | None = None,
         provider_factory: Callable[[str | None, str | None, str | None], ModelProvider | None] | None = None,
         publish_approval=None,
@@ -266,7 +265,7 @@ class HostRun:
                 extensions.config,
                 repo_root=policy.repo_root,
                 leader_max_turns=max_turns,
-                subagent_max_turns=DEFAULT_SUBAGENT_MAX_TURNS,
+                subagent_max_turns=None,
                 price_table=price_table,
             )
         self._chat_token_budget = chat_token_budget
@@ -1091,7 +1090,7 @@ class HostRun:
                 self._usage_by_agent = dict(self._usage_by_session.get(run_id, {}))
                 if self._goal is not None:
                     self._goals_by_session[run_id] = self._goal
-                for message, record_id in zip(loaded.messages, loaded.record_ids, strict=True):
+                for message, record_id in zip(loaded.messages, loaded.record_ids):
                     self._broker.publish(ForkableHistoryMessage(
                         role=message.role.value,
                         text=message.text,
@@ -1111,7 +1110,7 @@ class HostRun:
                 self._close_idle_conversations_locked()
                 return {
                     "run_id": loaded.run_id, "state": diagnosis.state.value,
-                    "replayed": len(loaded.messages), "repaired_ids": repaired_ids,
+                    "replayed": len(loaded.record_ids), "repaired_ids": repaired_ids,
                     "dropped_bytes": loaded.dropped_bytes,
                 }
             previous_provider = (
@@ -1194,7 +1193,7 @@ class HostRun:
             self._close_idle_conversations_locked()
         if reopened_goal:
             self._goal_event("pause", goal, agent_id=goal_agent_id)
-        for message, record_id in zip(loaded.messages, loaded.record_ids, strict=True):
+        for message, record_id in zip(loaded.messages, loaded.record_ids):
             self._broker.publish(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
@@ -1215,7 +1214,7 @@ class HostRun:
         return {
             "run_id": loaded.run_id,
             "state": diagnosis.state.value,
-            "replayed": len(loaded.messages),
+            "replayed": len(loaded.record_ids),
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
         }
@@ -2063,7 +2062,7 @@ class HostRun:
         except (OSError, SessionError, ValueError):
             return
 
-    def _finish_spec_review(self, session_id: str, leader: Leader) -> None:
+    def _finish_spec_review(self, session_id: str, leader: Leader, terminal_event: RunFinished | RunFailed | None) -> None:
         from symphonai_host.spec_run import patch_digest, review_verdict
 
         review_store = SessionStore.open(self._sessions_root, session_id)
@@ -2119,15 +2118,20 @@ class HostRun:
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source_file, target_file)
                     copied.append(value)
-            source_meta["review"] = {
+            review = {
                 "session_id": session_id, "verdict": verdict,
                 "follow_ups": copied, "not_copied": not_copied,
             }
+            if isinstance(terminal_event, RunFinished):
+                review["stopped_reason"] = terminal_event.stopped_reason
+            elif isinstance(terminal_event, RunFailed):
+                review["error"] = terminal_event.error
+            source_meta["review"] = review
             source.write_meta(source_meta)
         finally:
             source.close()
 
-    def _finish_spec_plan(self, session_id: str) -> None:
+    def _finish_spec_plan(self, session_id: str, terminal_event: RunFinished | RunFailed | None) -> None:
         from symphonai_host.spec_run import bind_roadmap_item
 
         store = SessionStore.open(self._sessions_root, session_id)
@@ -2154,7 +2158,16 @@ class HostRun:
                 except (OSError, ValueError, KeyError, TypeError):
                     bound = []
             info.update({"created": created, "bound": bound[0] if bound else None})
-            info["state"] = "finished"
+            if isinstance(terminal_event, RunFinished) and terminal_event.stopped_reason == "final_response":
+                info["state"] = "finished"
+                info["stopped_reason"] = terminal_event.stopped_reason
+            elif isinstance(terminal_event, RunFailed):
+                info["state"] = "failed"
+                info["error"] = terminal_event.error
+            else:
+                info["state"] = "stopped"
+                if isinstance(terminal_event, RunFinished):
+                    info["stopped_reason"] = terminal_event.stopped_reason
             meta["spec_run"] = info
             store.write_meta(meta)
         finally:
@@ -2192,8 +2205,8 @@ class HostRun:
             if terminal_event is not None:
                 self._publish(run_id, terminal_event, session_id=session_id)
         if not goal_round:
-            self._finish_spec_review(session_id, leader)
-            self._finish_spec_plan(session_id)
+            self._finish_spec_review(session_id, leader, terminal_event)
+            self._finish_spec_plan(session_id, terminal_event)
             with self._lock:
                 self._close_idle_conversations_locked()
             if failure is not None:

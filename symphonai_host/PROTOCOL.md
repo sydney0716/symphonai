@@ -132,8 +132,13 @@ to handle. Run entries expose `review`,
 `committed`, and the default `commit_message`.
 
 `POST /spec/plan` accepts a roadmap `phase` id and zero-based `item` index.
-Planner sessions are listed as `kind: "plan"` with `phase`, `item`, and
-`bound`. A single new Markdown spec under that phase binds the roadmap item.
+Planner sessions are listed as `kind: "plan"` with `phase`, `item`, `created`,
+and `bound`. A planner that ends with `stopped_reason: "final_response"` has
+`state: "finished"`; one stopped for another reason has `state: "stopped"` and
+records its `stopped_reason`. A failed planner has `state: "failed"` and records
+`error`. A single new Markdown spec under that phase binds the roadmap item.
+Review data on an implementation run records its verdict and the review run's
+`stopped_reason`, or `error` if the review run failed.
 After a successful spec commit, every roadmap item bound to the spec is marked
 done, and the phase is marked `done` only when every item is done.
 
@@ -219,9 +224,10 @@ table, relative to the config file containing that key (or the repository root
 for a session override). A host-supplied price table is used when no path is
 configured. A cost limit without either table is a configuration error. A
 subagent definition's own budget is narrowed by the configured subagent
-ceiling. The leader budget's `max_turns` takes precedence over the host's
-`--max-turns`; without a leader budget, the launch limit still applies.
-Limits reset for each prompt. `RunFinished.stopped_reason` reports `max_turns`,
+ceiling. There is no turn limit unless one is configured. The leader budget's
+`max_turns` takes precedence over the host's `--max-turns`; without a leader
+budget, the launch limit applies when set. Limits reset for each prompt.
+`RunFinished.stopped_reason` reports `max_turns`,
 `budget_wall_time`, `budget_tokens`, or `budget_cost` when a limit ends a run;
 the conversation remains available for another prompt.
 

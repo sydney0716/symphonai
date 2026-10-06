@@ -28,7 +28,7 @@ from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--max-turns", type=int, default=20)
+    parser.add_argument("--max-turns", type=int)
     return parser.parse_args(argv)
 
 

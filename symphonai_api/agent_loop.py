@@ -16,7 +16,7 @@ import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 
-from symphonai_api.budgets import BudgetState, RunBudget, DEFAULT_MAX_TURNS
+from symphonai_api.budgets import BudgetState, RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.compaction import estimate_messages_tokens
@@ -64,8 +64,6 @@ from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import call_target
 
-# Re-exported: DEFAULT_MAX_TURNS lives in budgets.py because RunBudget defaults
-# to it, and budgets.py cannot import this module without a cycle.
 _CUT_TOOL_CALL_ERROR = (
     "not run: the reply reached its output limit before this call was complete. "
     "Split the work into smaller calls."
@@ -134,7 +132,7 @@ class ApiAgent:
         provider: ModelProvider,
         tools: dict[str, LocalTool],
         policy: PermissionPolicy,
-        max_turns: int = DEFAULT_MAX_TURNS,
+        max_turns: int | None = None,
         tool_schemas: list[dict] | None = None,
         *,
         result_store: ToolResultStore | None = None,
@@ -146,7 +144,7 @@ class ApiAgent:
         stream: bool = False,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
-        if effective_max_turns < 1:
+        if effective_max_turns is not None and effective_max_turns < 1:
             raise ValueError(f"max_turns must be >= 1, got {effective_max_turns}")
         self._provider = provider
         self._tools = tools
@@ -348,7 +346,9 @@ class ApiAgent:
                     message_count=max(len(messages) - 1, 0),
                 ),
             )
-            for turn in range(1, self._max_turns + 1):
+            turn = 0
+            while self._max_turns is None or turn < self._max_turns:
+                turn += 1
                 turn_ref = new_turn_ref(run_ref.run_id, turn)
                 current_turn_ref = turn_ref
                 append_record(
@@ -379,7 +379,7 @@ class ApiAgent:
                         )
                         self._persisted_digests.append(_message_digest(redirect))
                     boundary_budget = run.budget
-                    if boundary_budget.max_turns <= provider_calls:
+                    if boundary_budget.max_turns is not None and boundary_budget.max_turns <= provider_calls:
                         return finish_for_budget("budget_turns")
                 budget_reason = exceeded_budget(boundary_budget)
                 if budget_reason is not None:
@@ -466,12 +466,15 @@ class ApiAgent:
                             index=turn,
                         ),
                     )
-                    if (
-                        run is not None
-                        and run.has_redirects()
-                        and turn < min(self._max_turns, run.budget.max_turns)
-                    ):
-                        continue
+                    if run is not None and run.has_redirects():
+                        run_limit = run.budget.max_turns
+                        redirect_limit = (
+                            run_limit if self._max_turns is None
+                            else self._max_turns if run_limit is None
+                            else min(self._max_turns, run_limit)
+                        )
+                        if redirect_limit is None or turn < redirect_limit:
+                            continue
                     result = AgentRunResult(
                         final_response=response,
                         messages=conversation,
@@ -671,11 +674,11 @@ class ApiAgent:
                         index=turn,
                     ),
                 )
-            assert response is not None
+            assert response is not None and self._max_turns is not None
             result = AgentRunResult(
                 final_response=response,
                 messages=conversation,
-                turns_used=self._max_turns,
+                turns_used=turn,
                 stopped_reason="max_turns",
                 run=run_ref,
                 agent=self._agent_ref,
@@ -693,7 +696,7 @@ class ApiAgent:
             append_record(
                 "run_finished",
                 turn_id=None,
-                data={"stopped_reason": "max_turns", "turns_used": self._max_turns},
+                data={"stopped_reason": "max_turns", "turns_used": turn},
             )
             return result
         except OperationCancelled:

@@ -1299,7 +1299,7 @@ def check_configured_budget_overrides_turn_limit() -> None:
                 id="invalid", name="dispatch_subagent", arguments={},
             )])),
         ])
-        budget = RunBudget(max_turns=1, max_total_tokens=100)
+        budget = RunBudget(max_turns=3, max_total_tokens=100)
         leader = Leader(LeaderConfig(
             provider, FakeModelProvider(), str(ws.root),
             max_leader_turns=4, leader_budget=budget,
@@ -1307,7 +1307,7 @@ def check_configured_budget_overrides_turn_limit() -> None:
         result = leader.run("bounded")
         if leader._agent._budget is not budget or leader._leader_spec.budget is not budget:
             fail("leader budget did not reach the running agent and run spec")
-        if result.stopped_reason != "max_turns" or provider.call_count != 1:
+        if result.stopped_reason != "max_turns" or provider.call_count != 3:
             fail(f"budget max_turns did not override the launch turn limit: {result.stopped_reason!r}")
 
 
@@ -1375,6 +1375,29 @@ def check_subagent_max_turns() -> None:
                 f"expected exhausted subagent events {expected_exhausted_subagent_events}, "
                 f"got {actual_exhausted_subagent_events}"
             )
+
+        child_responses = [
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                id=f"child-{index}", name="list_files", arguments={"path": "."},
+            )]))
+            for index in range(11)
+        ]
+        child_responses.append(ModelResponse(Message(Role.ASSISTANT, "worker done")))
+        child_provider = FakeModelProvider(child_responses)
+        leader_provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("worker", "list files")])),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        unlimited = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(root),
+            subagent_specs={"worker": _spec(root, "worker")},
+        ))
+        result = unlimited.run("dispatch worker")
+        worker = unlimited.subagents["worker"]
+        if result.stopped_reason != "final_response" or worker.runs[0].turns_used != 12:
+            fail(f"unconfigured subagent did not run all 12 turns: {worker.runs[0]!r}")
 
 
 @check("leader.fresh_run_subagents")

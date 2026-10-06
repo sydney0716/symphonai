@@ -40,6 +40,7 @@ from symphonai_api.config import ConfigError, ResolvedConfig
 from symphonai_api.events import (
     AssistantTextDelta,
     CompactionApplied,
+    RunFailed,
     RunFinished,
     RunStarted,
     SubagentSpawned,
@@ -660,7 +661,11 @@ def check_spec_plan_records_zero_and_multiple_specs_without_binding() -> None:
             sessions_root=sessions,
         )
         try:
-            for session_id, created in (("plan-none", []), ("plan-many", ["39a.md", "39b.md"])):
+            for session_id, created, terminal_event, expected_state in (
+                ("plan-none", [], RunFinished(agent_id="planner", run_id="plan-none", stopped_reason="final_response"), "finished"),
+                ("plan-many", ["39a.md", "39b.md"], RunFinished(agent_id="planner", run_id="plan-many", stopped_reason="final_response"), "finished"),
+                ("plan-budget", [], RunFinished(agent_id="planner", run_id="plan-budget", stopped_reason="budget_turns"), "stopped"),
+            ):
                 for name in ("39a.md", "39b.md"):
                     path = specs / name
                     if name in created:
@@ -672,15 +677,17 @@ def check_spec_plan_records_zero_and_multiple_specs_without_binding() -> None:
                 meta["spec_run"] = {"kind": "plan", "phase": "39", "item": 0, "baseline_specs": []}
                 store.write_meta(meta)
                 store.close()
-                run._finish_spec_plan(session_id)
+                run._finish_spec_plan(session_id, terminal_event)
                 result = SessionStore.open(sessions, session_id)
                 try:
                     outcome = result.read_meta()["spec_run"]
                 finally:
                     result.close()
                 expected = [f"specs/39/{name}" for name in created]
-                if outcome.get("created") != expected or outcome.get("bound") is not None:
+                if outcome.get("created") != expected or outcome.get("bound") is not None or outcome.get("state") != expected_state:
                     fail(f"planner output was not recorded without binding: {outcome!r}")
+                if session_id == "plan-budget" and outcome.get("stopped_reason") != "budget_turns":
+                    fail(f"planner stop reason was not recorded: {outcome!r}")
             if json.loads(roadmap.read_text(encoding="utf-8")) != initial_roadmap:
                 fail("zero or multiple planner specs changed the roadmap")
         finally:
@@ -775,7 +782,7 @@ def check_spec_review_detects_tree_change() -> None:
         try:
             run._finish_spec_review(review_id, SimpleNamespace(
                 _chat_messages=[Message(Role.ASSISTANT, "Verdict: pass")],
-            ))
+            ), RunFinished(agent_id="reviewer", run_id=review_id, stopped_reason="final_response"))
             source_store = SessionStore.open(sessions, source_id)
             verdict = source_store.read_meta().get("review", {}).get("verdict")
             source_store.close()
@@ -7163,6 +7170,49 @@ def check_configured_conversation_and_subagent_budgets() -> None:
                 fail(f"host cost refusal lacked the config source and key: {exc}")
         else:
             fail("host accepted a cost ceiling without a price table")
+
+
+@check("host_server.no_turn_limit_by_default")
+def check_no_turn_limit_by_default() -> None:
+    if host_main._arguments([]).max_turns is not None:
+        fail("host CLI still sets a default --max-turns")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        responses = [
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                f"tool-{index}", "missing_tool", {},
+            )]))
+            for index in range(30)
+        ]
+        responses.append(ModelResponse(Message(Role.ASSISTANT, "done")))
+        provider = FakeModelProvider(responses)
+        host = HostRun(provider, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        session = SessionStore(root / "sessions", "unlimited", repo_root=root)
+        try:
+            result = host._new_leader(session).run("work through 30 tool calls")
+            if result.stopped_reason != "final_response" or provider.call_count != 31:
+                fail(f"default host limit interrupted the 31 turn run: {result!r}")
+        finally:
+            session.close()
+            host.close()
+
+        capped_provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                f"limited-{index}", "missing_tool", {},
+            )]))
+            for index in range(5)
+        ])
+        capped = HostRun(capped_provider, PermissionPolicy(root), EventBroker(), max_turns=4,
+                         sessions_root=root / "capped-sessions")
+        capped_session = SessionStore(root / "capped-sessions", "capped", repo_root=root)
+        try:
+            result = capped._new_leader(capped_session).run("stop after four turns")
+            if result.stopped_reason != "max_turns" or capped_provider.call_count != 4:
+                fail(f"explicit host max_turns=4 did not stop at four: {result!r}")
+        finally:
+            capped_session.close()
+            capped.close()
 
 
 @check("host_server.budget_stop_survives_next_prompt")

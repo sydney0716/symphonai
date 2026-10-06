@@ -715,6 +715,7 @@ export async function start({ global, document, client }) {
   async function forkAt(sourceId, recordId, force, previous) {
     transcript.model.length = 0;
     showTranscript();
+    clearConversationAgents();
     try {
       const reply = await boundary.forkSession(sourceId, recordId, force);
       forkConflict = null;
@@ -726,9 +727,11 @@ export async function start({ global, document, client }) {
       } catch {
         // The fork remains current if refreshing the sidebar fails.
       }
+      await refreshConversation();
       navigate({ page: "chat", section: "" });
     } catch (error) {
       transcript.model.splice(0, transcript.model.length, ...previous);
+      await refreshConversation();
       if (!force && error?.status === 409 && Array.isArray(error.paths)) {
         forkConflict = { sourceId, recordId, paths: error.paths };
         showTranscript();
@@ -784,12 +787,9 @@ export async function start({ global, document, client }) {
     currentSessionId = runId;
     transcript.setSessionId(currentSessionId);
     showTranscript();
+    clearConversationAgents();
     try {
       await boundary.openSession(runId);
-      board.clear();
-      conversation = null;
-      showConversationUsage();
-      showAgents();
       await refreshConversation();
       navigate({ page: "chat", section: "" });
     } catch (error) {
@@ -797,6 +797,7 @@ export async function start({ global, document, client }) {
       currentSessionId = previousId;
       transcript.setSessionId(currentSessionId);
       showTranscript();
+      await refreshConversation();
       throw error;
     }
   }
@@ -855,6 +856,7 @@ export async function start({ global, document, client }) {
   }
   showProjects();
   async function startNewChat() {
+    clearConversationAgents();
     try {
       await boundary.newSession();
       transcript.model.length = 0;
@@ -864,7 +866,6 @@ export async function start({ global, document, client }) {
       conversation = null;
       currentMode = launchMode;
       rememberedPlanMode = null;
-      board.clear();
       showConversationUsage();
       showAgents();
       promptFailure = "";
@@ -872,12 +873,13 @@ export async function start({ global, document, client }) {
       navigate({ page: "chat", section: "" });
       input.value = "";
     } catch {
+      await refreshConversation();
       promptFailure = "Could not start a new chat.";
       showPromptError();
     }
   }
   listen(newChat, "click", startNewChat);
-  replace(sidebar, homeLink, newChat, projectsRoot, pageLinks);
+  replace(sidebar, homeLink, newChat, pageLinks, projectsRoot);
 
   function toggleFold(className, button, label) {
     const classes = shell.className.split(" ");
@@ -1031,9 +1033,18 @@ export async function start({ global, document, client }) {
   function workflow(item, phase, itemIndex) {
     const paths = specPaths(item);
     const path = paths[0] ?? null;
-    const plan = specRuns.find((run) => run.kind === "plan" && run.phase === phase.id && run.item === itemIndex);
+    const plans = specRuns.filter((run) => run.kind === "plan" && run.phase === phase.id && run.item === itemIndex);
+    const plan = plans[plans.length - 1] ?? null;
     if (path === null) {
-      return { step: plan ? (plan.state === "running" ? "planning" : "unplanned") : "unplanned", plan };
+      if (!plan) return { step: "unplanned", plan };
+      if (plan.state === "running") return { step: "planning", plan };
+      if (plan.state === "stopped" || plan.state === "failed") {
+        const reason = plan.stopped_reason === "budget_turns" ? "turn limit" : plan.stopped_reason || plan.error || "unknown reason";
+        return { step: `planner stopped: ${reason}`, plan };
+      }
+      if (plan.state === "finished" && plan.created?.length === 0) return { step: "planner wrote no spec", plan };
+      if (plan.state === "finished" && plan.created?.length > 1) return { step: "planner wrote several specs", plan };
+      return { step: "unplanned", plan };
     }
     const run = specRuns.find((candidate) => candidate.kind === "implement" && candidate.spec === path);
     if (!run) return { step: "planned", run: null };
@@ -1075,12 +1086,15 @@ export async function start({ global, document, client }) {
     }
   }
 
-  async function runSpecAction(action) {
+  async function runSpecAction(action, { newConversation = false } = {}) {
     specActionError = "";
+    if (newConversation) clearConversationAgents();
     try {
       await action();
+      if (newConversation) await refreshConversation();
       await refreshSpecState();
     } catch (error) {
+      if (newConversation) await refreshConversation();
       specActionError = error?.message || "spec action failed";
       if (selectedSpec) showSpec(selectedSpec.result, selectedSpec.item, selectedSpec.phase, selectedSpec.index);
     }
@@ -1094,12 +1108,13 @@ export async function start({ global, document, client }) {
       append(panel, element(document, "p", { className: "spec-step", text: current.step }));
       const actions = element(document, "div", { className: "spec-actions" });
       const run = current.run;
-      if (current.step === "unplanned") append(actions, actionButton("Plan", () => runSpecAction(() => boundary.planSpec(phase.id, itemIndex))));
+      if (current.step === "unplanned" || current.step.startsWith("planner stopped:") || current.step.startsWith("planner wrote ")) append(actions, actionButton("Plan", () => runSpecAction(() => boundary.planSpec(phase.id, itemIndex), { newConversation: true })));
       if (current.step === "planning" && current.plan) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(current.plan.session_id))));
-      if (current.step === "planned" && result.specs[0]) append(actions, actionButton("Run", () => runSpecAction(() => boundary.runSpec(result.specs[0].path))));
+      if (current.plan && current.step !== "planning" && current.step !== "unplanned") append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(current.plan.session_id))));
+      if (current.step === "planned" && result.specs[0]) append(actions, actionButton("Run", () => runSpecAction(() => boundary.runSpec(result.specs[0].path), { newConversation: true })));
       if (current.step === "running" && run) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.session_id))));
       if (current.step === "ran" && run) {
-        append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id))));
+        append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id), { newConversation: true })));
         append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.session_id))));
       }
       if (current.step === "in review" && run?.review?.session_id) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.review.session_id))));
@@ -1112,7 +1127,7 @@ export async function start({ global, document, client }) {
           message.setAttribute("aria-label", "Commit message");
           append(actions, message, actionButton("Commit…", () => runSpecAction(() => boundary.commitSpec(run.session_id, message.value))));
         }
-        else append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id))));
+        else append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id), { newConversation: true })));
         append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.review.session_id))));
       }
       if (current.step === "committed" && run) append(actions, element(document, "p", { text: run.committed.sha }));
@@ -1607,6 +1622,14 @@ export async function start({ global, document, client }) {
     }
     replace(agentsRoot, ...roots);
   }
+
+  function clearConversationAgents() {
+    board.clear();
+    conversation = null;
+    showConversationUsage();
+    showAgents();
+  }
+
   showConversationUsage();
   showAgents();
 

@@ -572,6 +572,59 @@ def check_open_crashed_session() -> None:
             host.close()
 
 
+@check("host_sessions.open_partial_tool_call")
+def check_open_partial_tool_call() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        run_id = "partial-tool-call"
+        agent_id = "agent-root"
+        turn_id = "turn-partial"
+        tool_call_id = "tool-unanswered"
+        store = SessionStore(root / "sessions", run_id, repo_root=root)
+        writer = store.writer_for(agent_id, is_root=True)
+        writer.append(
+            "run_started", run_id=run_id, agent_id=agent_id, turn_id=None,
+            data={"agent_name": "leader", "parent_run_id": None, "model": "fake"},
+        )
+        writer.append("turn_started", run_id=run_id, agent_id=agent_id, turn_id=turn_id, data={})
+        recorded = [
+            Message(Role.USER, "search for this"),
+            Message(Role.ASSISTANT, tool_calls=[ToolCall(tool_call_id, "read_file", {"path": "file.py"})]),
+        ]
+        record_ids = [
+            writer.append(
+                "message", run_id=run_id, agent_id=agent_id, turn_id=turn_id,
+                data=message_to_json(message),
+            )
+            for message in recorded
+        ]
+        writer.append(
+            "tool_started", run_id=run_id, agent_id=agent_id, turn_id=turn_id,
+            data={"tool_call_id": tool_call_id, "tool_name": "read_file"},
+        )
+        store.close()
+
+        host, client = _host(root)
+        subscription = host.broker.subscribe()
+        try:
+            reply = client.open_session(run_id)
+            if reply["state"] != "crashed" or reply["replayed"] != len(recorded):
+                fail(f"partial tool-call session did not open as crashed: {reply!r}")
+            replayed = []
+            while (event := subscription.get(timeout=0.01)) is not None:
+                if type(event).__name__ == "ForkableHistoryMessage":
+                    replayed.append(event)
+            if [event.record_id for event in replayed] != record_ids:
+                fail(f"replay did not pair recorded messages with their ids: {replayed!r}")
+            leader = host.run._open_conversations[run_id][0]
+            repaired = [message for message in leader._chat_messages if message.tool_result]
+            if len(repaired) != 1 or repaired[0].tool_result.tool_call_id != tool_call_id:
+                fail(f"repaired tool result was missing from resumed history: {leader._chat_messages!r}")
+        finally:
+            subscription.close()
+            host.close()
+
+
 @check("host_sessions.continuation_conversation")
 def check_continuation_conversation() -> None:
     with tempfile.TemporaryDirectory() as directory:
