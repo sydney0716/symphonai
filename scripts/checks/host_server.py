@@ -65,7 +65,7 @@ from symphonai_api.tools.filesystem import ReadLedger, WriteFileTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.tools.shell import RunShellTool
 from symphonai_api.tools.web_fetch import WebFetchTool
-from symphonai_api.worktree import create_worktree
+from symphonai_api.worktree import create_worktree, worktree_diff
 from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
 from symphonai_host.protocol import decode_event, decode_frame
@@ -76,6 +76,23 @@ from scripts.checks.harness import CheckFailed, check, fail
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@check("host_server.close_is_prompt")
+def check_host_server_close_is_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root]),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        started = time.monotonic()
+        host.close()
+        elapsed = time.monotonic() - started
+        if elapsed >= 0.2:
+            fail(f"host close took {elapsed:.3f}s")
 
 
 @check("host_server.spec_parser_title_and_validation")
@@ -170,6 +187,64 @@ def check_spec_run_goal_checks_in_its_worktree() -> None:
                 fail(f"spec validation did not run in its worktree: {goal!r}")
         finally:
             run.close()
+
+
+@check("host_server.spec_run_starts_with_full_spec_and_keeps_title")
+def check_spec_run_starts_with_full_spec_and_keeps_title() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self):
+            super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "seed.txt"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        provider = RecordingProvider()
+        host = HostServer(
+            provider, PermissionPolicy(repo_root=root, allowed_write_scope=[root]),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        spec_text = "# 39bF — exact implementer prompt\n\nImplement this exact text."
+        spec_path = "specs/39/39bF-test.md"
+        report_path = "specs/report/39/39bF-test-report.md"
+        try:
+            session_id, _ = host.run.start_spec_run({
+                "path": spec_path, "report": report_path, "text": spec_text, "validation": [],
+            })
+            _wait_until(lambda: bool(provider.requests), "spec provider was not called")
+            prompt = next(
+                message.text for message in provider.requests[0].messages
+                if message.role is Role.USER
+            )
+            if prompt != f"{spec_text}\n\nWrite your report at {report_path}.":
+                fail(f"first spec-run message was not the complete spec: {prompt!r}")
+            store = SessionStore.open(root / "sessions", session_id)
+            try:
+                meta = store.read_meta()
+            finally:
+                store.close()
+            expected_title = f"Run {Path(spec_path).name}"
+            if meta.get("title") != expected_title:
+                fail(f"spec-run title changed: {meta.get('title')!r}")
+            connection, response = _request(host, "GET", "/sessions", headers=_headers(host))
+            sessions = json.loads(response.read())
+            connection.close()
+            listed = next((item for item in sessions if item.get("run_id") == session_id), None)
+            if not listed or listed.get("title") != expected_title:
+                fail(f"GET /sessions did not retain the spec-run title: {listed!r}")
+        finally:
+            host.close()
 
 
 @check("host_server.spec_run_review_commit_end_to_end")
@@ -309,6 +384,213 @@ def check_spec_run_review_commit_end_to_end() -> None:
             host.close()
 
 
+def _spec_commit_route_fixture(root: Path, *, add_file: bool = False):
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+    (root / "a.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
+    (root / "specs" / "39").mkdir(parents=True)
+    (root / "specs" / "39" / "39b.md").write_text("# 39b — test spec\n", encoding="utf-8")
+    (root / "specs" / "39" / "exists.md").write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "a.py", "specs"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+    sessions = root / "sessions"
+    host = _host(FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]), repo_root=root, sessions_root=sessions)
+    host.run.start("seed conversation")
+    _wait_until(lambda: host.run._active is None, "seed conversation did not finish")
+    source_id, review_id = "spec-source", "spec-review"
+    source = SessionStore(sessions, source_id, repo_root=root)
+    meta = source.read_meta()
+    meta["spec_run"] = {"kind": "implement", "state": "finished", "spec": "specs/39/39b.md", "report": "specs/report/39/39b-report.md", "worktree": "worktree"}
+    meta["review"] = {"session_id": review_id, "verdict": "passed", "follow_ups": []}
+    source.write_meta(meta)
+    source.close()
+    worktree = create_worktree(root, sessions / source_id / "worktree")
+    if add_file:
+        (worktree / "new.py").write_text("created = True\n", encoding="utf-8")
+    else:
+        (worktree / "a.py").write_text("a = 100\nb = 2\n", encoding="utf-8")
+    return host, sessions, source_id, review_id, worktree
+
+
+def _post_spec_commit(host, session_id: str, message: str = "spec commit"):
+    connection, response = _request(
+        host, "POST", "/spec/commit", body={"session_id": session_id, "message": message},
+        headers=_headers(host),
+    )
+    body = json.loads(response.read())
+    connection.close()
+    return response.status, body
+
+
+@check("host_server.spec_commit_refuses_unstaged_path_edits")
+def check_spec_commit_refuses_unstaged_path_edits() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, source_id, _, worktree = _spec_commit_route_fixture(root)
+        try:
+            (root / "a.py").write_text("a = 1\nb = 200\n", encoding="utf-8")
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout
+            status, body = _post_spec_commit(host, source_id)
+            if status != 409 or body.get("error") != "uncommitted changes in: a.py":
+                fail(f"unstaged edit was not named on refusal: {status}, {body!r}")
+            if (root / "a.py").read_text(encoding="utf-8") != "a = 1\nb = 200\n" or not worktree.is_dir():
+                fail("unstaged edit refusal changed the main file or removed the worktree")
+            if subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout != head:
+                fail("unstaged edit refusal changed HEAD")
+            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root).returncode != 0:
+                fail("unstaged edit refusal changed the index")
+        finally:
+            host.close()
+
+
+@check("host_server.spec_commit_refuses_untracked_addition_path")
+def check_spec_commit_refuses_untracked_addition_path() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, source_id, _, worktree = _spec_commit_route_fixture(root, add_file=True)
+        try:
+            (root / "new.py").write_text("person's file\n", encoding="utf-8")
+            status, body = _post_spec_commit(host, source_id)
+            if status != 409 or body.get("error") != "uncommitted changes in: new.py":
+                fail(f"untracked collision was not named on refusal: {status}, {body!r}")
+            if (root / "new.py").read_text(encoding="utf-8") != "person's file\n" or not worktree.is_dir():
+                fail("untracked collision refusal applied the run patch")
+        finally:
+            host.close()
+
+
+@check("host_server.spec_commit_hook_failure_leaves_applied_files")
+def check_spec_commit_hook_failure_leaves_applied_files() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, source_id, _, worktree = _spec_commit_route_fixture(root)
+        try:
+            hook = root / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\necho hook failed >&2\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout
+            status, body = _post_spec_commit(host, source_id)
+            if status != 409 or "hook failed" not in body.get("error", ""):
+                fail(f"pre-commit failure was not returned: {status}, {body!r}")
+            if (root / "a.py").read_text(encoding="utf-8") != "a = 100\nb = 2\n" or worktree.exists():
+                fail("hook failure did not leave applied files with the worktree gone")
+            if subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout != head:
+                fail("hook failure changed HEAD")
+            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root).returncode != 0:
+                fail("hook failure left paths staged")
+        finally:
+            host.close()
+
+
+@check("host_server.spec_commit_stale_patch_is_not_applied")
+def check_spec_commit_stale_patch_is_not_applied() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, _, source_id, _, worktree = _spec_commit_route_fixture(root)
+        try:
+            (root / "a.py").write_text("a = 9\nb = 2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "conflicting edit"], cwd=root, check=True)
+            expected = subprocess.run(["git", "apply", "--check", "--binary"], input=worktree_diff(worktree).patch.encode(), cwd=root, capture_output=True).stderr.decode().strip()
+            status, body = _post_spec_commit(host, source_id)
+            if status != 409 or not expected or expected not in body.get("error", ""):
+                fail(f"stale patch did not return git's refusal: {status}, {body!r}, expected {expected!r}")
+            if (root / "a.py").read_text(encoding="utf-8") != "a = 9\nb = 2\n" or not worktree.is_dir():
+                fail("stale patch refusal changed the main tree or removed the worktree")
+        finally:
+            host.close()
+
+
+@check("host_server.spec_review_refuses_second_active_review")
+def check_spec_review_refuses_second_active_review() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        host, sessions, source_id, review_id, _ = _spec_commit_route_fixture(root)
+        try:
+            source = SessionStore.open(sessions, source_id)
+            try:
+                meta = source.read_meta()
+                meta["review"] = {"session_id": review_id, "verdict": "running", "follow_ups": [], "not_copied": []}
+                source.write_meta(meta)
+            finally:
+                source.close()
+            host.run._active_by_session[review_id] = object()
+            connection, response = _request(host, "POST", "/spec/review", body={"session_id": source_id}, headers=_headers(host))
+            body = json.loads(response.read())
+            connection.close()
+            if response.status != 409 or "review is already running" not in body.get("error", ""):
+                fail(f"second active review was not refused: {response.status}, {body!r}")
+        finally:
+            host.run._active_by_session.pop(review_id, None)
+            host.close()
+
+
+@check("host_server.spec_review_lists_ineligible_followups")
+def check_spec_review_lists_ineligible_followups() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / "a.py").write_text("a = 1\n", encoding="utf-8")
+        (root / "specs" / "39").mkdir(parents=True)
+        (root / "specs" / "39" / "39b.md").write_text("# 39b — test spec\n", encoding="utf-8")
+        (root / "specs" / "39" / "exists.md").write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.py", "specs"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        sessions = root / "sessions"
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "seed")),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("outside", "write_file", {
+                "path": "specs/40/outside.md", "content": "outside\n",
+            })])),
+            ModelResponse(Message(Role.ASSISTANT, "Verdict: follow-ups: specs/40/outside.md, specs/39/exists.md")),
+        ])
+        host = _host(provider, repo_root=root, sessions_root=sessions)
+        try:
+            host.run.start("seed")
+            _wait_until(lambda: host.run._active is None, "seed conversation did not finish")
+            source_id = "spec-source"
+            source = SessionStore(sessions, source_id, repo_root=root)
+            meta = source.read_meta()
+            meta["spec_run"] = {
+                "kind": "implement", "state": "finished", "spec": "specs/39/39b.md",
+                "report": "specs/report/39/39b-report.md", "worktree": "worktree",
+            }
+            source.write_meta(meta)
+            source.close()
+            worktree = create_worktree(root, sessions / source_id / "worktree")
+            (worktree / "a.py").write_text("a = 2\n", encoding="utf-8")
+            (worktree / "specs" / "40").mkdir(parents=True)
+            connection, response = _request(host, "POST", "/spec/review", body={"session_id": source_id}, headers=_headers(host))
+            reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"spec review did not start: {response.status}, {reply!r}")
+            def review_finished():
+                store = SessionStore.open(sessions, source_id)
+                try:
+                    return store.read_meta().get("review", {}).get("verdict") != "running"
+                finally:
+                    store.close()
+            _wait_until(review_finished, "spec reviewer did not finish")
+            source = SessionStore.open(sessions, source_id)
+            try:
+                review = source.read_meta().get("review", {})
+            finally:
+                source.close()
+            expected = ["specs/40/outside.md", "specs/39/exists.md"]
+            if review.get("verdict") != "follow-ups" or review.get("not_copied") != expected or review.get("follow_ups"):
+                fail(f"ineligible follow-ups were not reported precisely: {review!r}")
+            if (root / "specs/39/exists.md").read_text(encoding="utf-8") != "original\n":
+                fail("reviewer follow-up overwrote an existing main-tree spec")
+        finally:
+            host.close()
+
+
 @check("host_server.spec_plan_binds_one_new_spec")
 def check_spec_plan_binds_one_new_spec() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -357,6 +639,53 @@ def check_spec_plan_binds_one_new_spec() -> None:
                 fail("planner wrote outside specs or ran a shell command")
         finally:
             host.close()
+
+
+@check("host_server.spec_plan_records_zero_and_multiple_specs_without_binding")
+def check_spec_plan_records_zero_and_multiple_specs_without_binding() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        docs = root / "docs"
+        docs.mkdir()
+        roadmap = docs / "roadmap.json"
+        initial_roadmap = {
+            "phases": [{"id": "39", "status": "in_progress", "items": ["New capability"]}],
+        }
+        roadmap.write_text(json.dumps(initial_roadmap), encoding="utf-8")
+        specs = root / "specs" / "39"
+        specs.mkdir(parents=True)
+        sessions = root / "sessions"
+        run = HostRun(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root]), EventBroker(),
+            sessions_root=sessions,
+        )
+        try:
+            for session_id, created in (("plan-none", []), ("plan-many", ["39a.md", "39b.md"])):
+                for name in ("39a.md", "39b.md"):
+                    path = specs / name
+                    if name in created:
+                        path.write_text(f"# {name}\n", encoding="utf-8")
+                    else:
+                        path.unlink(missing_ok=True)
+                store = SessionStore(sessions, session_id, repo_root=root)
+                meta = store.read_meta()
+                meta["spec_run"] = {"kind": "plan", "phase": "39", "item": 0, "baseline_specs": []}
+                store.write_meta(meta)
+                store.close()
+                run._finish_spec_plan(session_id)
+                result = SessionStore.open(sessions, session_id)
+                try:
+                    outcome = result.read_meta()["spec_run"]
+                finally:
+                    result.close()
+                expected = [f"specs/39/{name}" for name in created]
+                if outcome.get("created") != expected or outcome.get("bound") is not None:
+                    fail(f"planner output was not recorded without binding: {outcome!r}")
+            if json.loads(roadmap.read_text(encoding="utf-8")) != initial_roadmap:
+                fail("zero or multiple planner specs changed the roadmap")
+        finally:
+            run.close()
 
 
 @check("host_server.spec_review_pass_verdict")

@@ -2322,7 +2322,6 @@ export async function start({ global, document, client }) {
   }
 
   let lastSpecRefresh = 0;
-  let pendingSpecRefresh = null;
   async function refreshSpecsForEvent(frame) {
     const type = frame.kind === "event" ? frame.payload?.type : "";
     if (!["RunFinished", "RunFailed", "GoalChanged"].includes(type)) return;
@@ -2331,18 +2330,9 @@ export async function start({ global, document, client }) {
       run.session_id === sessionId || run.review?.session_id === sessionId
     )) return;
     const now = Date.now();
-    if (now - lastSpecRefresh >= 1000) {
-      lastSpecRefresh = now;
-      await refreshSpecState().catch(() => {});
-      return;
-    }
-    if (pendingSpecRefresh === null) {
-      pendingSpecRefresh = setTimeout(async () => {
-        pendingSpecRefresh = null;
-        lastSpecRefresh = Date.now();
-        await refreshSpecState().catch(() => {});
-      }, 1000 - (now - lastSpecRefresh));
-    }
+    if (now - lastSpecRefresh < 1000) return;
+    lastSpecRefresh = now;
+    await refreshSpecState().catch(() => {});
   }
 
   async function onFrame(frame) {

@@ -124,7 +124,11 @@ spec, report and patch, and the final non-empty answer line determines `passed`,
 answer with `tree-changed`. Follow-up specs under the same phase directory are
 copied to the main tree when new. `POST /spec/commit` accepts `session_id` and
 a non-blank `message`; it applies the worktree, stages only its changed paths,
-and commits them after a person requests it. Run entries expose `review`,
+and commits them after a person requests it. It refuses with `409` when a
+changed path has unstaged edits in the main tree, or when a path the run adds
+is already untracked there. If commit fails after the patch was applied, its
+worktree is gone and the applied files remain in the main tree for the person
+to handle. Run entries expose `review`,
 `committed`, and the default `commit_message`.
 
 `POST /spec/plan` accepts a roadmap `phase` id and zero-based `item` index.

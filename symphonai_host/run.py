@@ -459,11 +459,12 @@ class HostRun:
             goal = Goal(objective, check, max_rounds=5)
             try:
                 run_id = self.start(
-                    f"Run {Path(spec['path']).name}", _new_goal=goal,
+                    objective, _new_goal=goal,
                     _session_meta={"spec_run": {
                         "spec": spec["path"], "report": spec["report"],
                         "kind": "implement", "worktree": "worktree", "role": "implementer",
                     }},
+                    _title=f"Run {Path(spec['path']).name}",
                 )
                 return self._conversation[1].run_id, run_id
             except Exception:
@@ -1806,6 +1807,28 @@ class HostRun:
         diff = worktree_diff(worktree)
         if not diff.files:
             return {"commit": "", "paths": []}
+        dirty = []
+        for path in diff.files:
+            unstaged = subprocess.run(
+                ["git", "diff", "--quiet", "--", path], cwd=self._repo_root,
+                capture_output=True, check=False,
+            )
+            main_status = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--", path],
+                cwd=self._repo_root, capture_output=True, check=False,
+            )
+            worktree_status = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all", "--", path],
+                cwd=worktree, capture_output=True, check=False,
+            )
+            main_untracked = main_status.stdout.decode("utf-8", errors="replace").splitlines()
+            worktree_untracked = worktree_status.stdout.decode("utf-8", errors="replace").splitlines()
+            adds_path = any(line.startswith(("?? ", "A ", " A")) for line in worktree_untracked)
+            conflicts_with_untracked = adds_path and any(line.startswith("?? ") for line in main_untracked)
+            if unstaged.returncode != 0 or conflicts_with_untracked:
+                dirty.append(path)
+        if dirty:
+            raise WorktreeApplyConflict(f"uncommitted changes in: {', '.join(dirty)}")
         checkpoints = CheckpointStore(
             self._sessions_root / str(review.get("session_id")) / "checkpoints",
             self._repo_root,

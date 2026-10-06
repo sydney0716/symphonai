@@ -3646,20 +3646,139 @@ test("an empty run notice removes its row while a populated notice keeps the nor
   assert.doesNotMatch(css, /#run-notice\s*\{[^}]*display:\s*none;/);
 });
 
-test("roadmap spec actions expose every workflow step and refresh after events", async () => {
-  const [app, specView, client] = await Promise.all([
-    readFile(new URL("../src/app.js", import.meta.url), "utf8"),
-    readFile(new URL("../src/spec_view.js", import.meta.url), "utf8"),
-    readFile(new URL("../src/client.js", import.meta.url), "utf8"),
-  ]);
-  for (const step of ["unplanned", "planning", "planned", "running", "ran", "in review", "reviewed", "committed"]) {
-    assert.ok(app.includes(`"${step}"`), `missing ${step} state`);
+function specWorkflowRoadmap(hasSpec = true) {
+  return JSON.stringify({ goal: "Spec workflow test", phases: [{
+    id: "18", name: "Workflow", status: "in_progress",
+    items: [hasSpec ? { title: "Boundary", spec: BASE } : "Boundary"],
+  }] });
+}
+
+function specWorkflowClient({ hasSpec = true, runs = [], onAction = {} } = {}) {
+  const client = fakeClient(specWorkflowRoadmap(hasSpec));
+  let currentRuns = runs;
+  let specRunReads = 0;
+  client.specRuns = async () => {
+    specRunReads += 1;
+    return currentRuns;
+  };
+  client.specRunReadCount = () => specRunReads;
+  client.setSpecRuns = (next) => { currentRuns = next; };
+  client.planSpec = async (...args) => onAction.planSpec?.(...args);
+  client.runSpec = async (...args) => onAction.runSpec?.(...args);
+  client.reviewSpec = async (...args) => onAction.reviewSpec?.(...args);
+  client.commitSpec = async (...args) => onAction.commitSpec?.(...args);
+  return client;
+}
+
+async function openWorkflowItem(client) {
+  const document = new FakeDocument();
+  const app = await start({ global: {}, document, client });
+  const roadmapButton = find(document.getElementById("roadmap"), (node) => node.className === "roadmap-item");
+  await roadmapButton.dispatch("click");
+  return { app, document, roadmapButton };
+}
+
+function workflowActions(document) {
+  const panel = find(document.getElementById("spec"), (node) => node.className === "spec-workflow");
+  return {
+    panel,
+    step: find(panel, (node) => node.className === "spec-step")?.textContent,
+    actions: walk(panel).filter((node) => node.tagName === "BUTTON").map((node) => node.textContent),
+  };
+}
+
+test("roadmap spec workflow renders the actions for each run state", async () => {
+  const reviewRun = (verdict) => ({
+    kind: "implement", spec: BASE, session_id: "implement-1", state: "finished",
+    review: { session_id: "review-1", verdict },
+  });
+  const cases = [
+    ["unplanned", false, [], ["Plan"]],
+    ["planning", false, [{ kind: "plan", phase: "18", item: 0, session_id: "plan-1", state: "running" }], ["Open"]],
+    ["planned", true, [], ["Run"]],
+    ["running", true, [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }], ["Open"]],
+    ["ran", true, [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished" }], ["Review", "Open"]],
+    ["in review", true, [{ ...reviewRun("running"), state: "finished" }], ["Open"]],
+    ["reviewed", true, [reviewRun("passed")], ["Commit…", "Open"]],
+    ["reviewed", true, [reviewRun("tree-changed")], ["Review", "Open"]],
+    ["committed", true, [{ ...reviewRun("passed"), committed: { sha: "abc123" } }], []],
+  ];
+  for (const [step, hasSpec, runs, expectedActions] of cases) {
+    const { document } = await openWorkflowItem(specWorkflowClient({ hasSpec, runs }));
+    const rendered = workflowActions(document);
+    assert.equal(rendered.step, step);
+    assert.deepEqual(rendered.actions, expectedActions, `${step} actions`);
   }
-  for (const method of ["planSpec", "runSpec", "reviewSpec", "commitSpec", "openSession"]) {
-    assert.ok(app.includes(`boundary.${method}`), `missing ${method} action`);
-    assert.ok(client.includes(`${method}(`), `client lacks ${method}`);
-  }
-  assert.match(app, /refreshSpecState\(\)/);
-  assert.match(app, /GoalChanged/);
-  assert.ok(specView.includes("specPaths"));
+});
+
+test("roadmap spec actions post their payloads, refresh, open sessions, and show errors", async () => {
+  const planClient = specWorkflowClient({ hasSpec: false, onAction: {
+    planSpec(phase, item) {
+      assert.deepEqual([phase, item], ["18", 0]);
+      planClient.setSpecRuns([{ kind: "plan", phase: "18", item: 0, session_id: "plan-1", state: "running" }]);
+    },
+  } });
+  const plan = await openWorkflowItem(planClient);
+  await documentButton(plan.document, "Plan").dispatch("click");
+  assert.match(find(plan.document.getElementById("roadmap"), (node) => node.className === "roadmap-item").textContent, /planning$/);
+  assert.deepEqual(workflowActions(plan.document).actions, ["Open"]);
+
+  const runClient = specWorkflowClient({ onAction: {
+    runSpec(path) {
+      assert.equal(path, BASE);
+      runClient.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }]);
+    },
+  } });
+  const run = await openWorkflowItem(runClient);
+  await find(run.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Run").dispatch("click");
+  assert.match(find(run.document.getElementById("roadmap"), (node) => node.className === "roadmap-item").textContent, /running$/);
+
+  const reviewClient = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished" }], onAction: {
+    reviewSpec(sessionId) {
+      assert.equal(sessionId, "implement-1");
+      reviewClient.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished", review: { session_id: "review-1", verdict: "running" } }]);
+    },
+  } });
+  const review = await openWorkflowItem(reviewClient);
+  await find(review.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Review").dispatch("click");
+  assert.match(find(review.document.getElementById("roadmap"), (node) => node.className === "roadmap-item").textContent, /in review$/);
+
+  const commitClient = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished", review: { session_id: "review-1", verdict: "passed" } }], onAction: {
+    commitSpec(sessionId, message) {
+      assert.deepEqual([sessionId, message], ["implement-1", "my commit message"]);
+      commitClient.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished", review: { session_id: "review-1", verdict: "passed" }, committed: { sha: "abc123" } }]);
+    },
+  } });
+  const commit = await openWorkflowItem(commitClient);
+  const message = find(commit.document.getElementById("spec"), (node) => node.tagName === "INPUT" && node.attributes.get("aria-label") === "Commit message");
+  message.value = "my commit message";
+  await find(commit.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Commit…").dispatch("click");
+  assert.match(find(commit.document.getElementById("roadmap"), (node) => node.className === "roadmap-item").textContent, /committed$/);
+
+  const openClient = specWorkflowClient({ hasSpec: false, runs: [{ kind: "plan", phase: "18", item: 0, session_id: "plan-1", state: "running" }] });
+  const opened = await openWorkflowItem(openClient);
+  await find(opened.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Open").dispatch("click");
+  assert.deepEqual(openClient.calls.openSession, ["plan-1"]);
+
+  const errorClient = specWorkflowClient({ onAction: { async runSpec() { throw new Error("run rejected"); } } });
+  const failed = await openWorkflowItem(errorClient);
+  await find(failed.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Run").dispatch("click");
+  assert.equal(workflowActions(failed.document).step, "planned");
+  assert.match(visibleText(workflowActions(failed.document).panel), /run rejected/);
+});
+
+function documentButton(document, label) {
+  return find(document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === label);
+}
+
+test("listed GoalChanged events coalesce roadmap run refreshes", async () => {
+  const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
+  const { app } = await openWorkflowItem(client);
+  const before = client.specRunReadCount();
+  const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "round", phase: "active", rounds: 1, max_rounds: 5, reason: "" });
+  await app.onFrame(frame);
+  await app.onFrame(frame);
+  await new Promise((resolve) => setTimeout(resolve, 1050));
+  const after = client.specRunReadCount();
+  assert.equal(after - before, 1);
 });

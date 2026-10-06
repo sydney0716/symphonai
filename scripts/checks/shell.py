@@ -42,7 +42,7 @@ def _sandbox_policy(root: Path, *, network: bool = False) -> PermissionPolicy:
         repo_root=root,
         mode="allow",
         shell_enabled=True,
-        shell_allowlist=[("touch",), (sys.executable,), ("rg",)],
+        shell_allowlist=[("touch",), (sys.executable,), ("rg",), ("/usr/bin/grep",)],
         shell_sandbox=True,
         sandbox_network=network,
     )
@@ -236,8 +236,9 @@ def check_shell_sandbox_command_exit_is_ordinary() -> None:
     if _sandbox_skip():
         return
     with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "empty.txt").write_text("present text\n", encoding="utf-8")
         result = RunShellTool().execute(
-            ToolCall(id="sandbox-no-match", name="run_shell", arguments={"argv": ["rg", "absent-pattern", directory]}),
+            ToolCall(id="sandbox-no-match", name="run_shell", arguments={"argv": ["/usr/bin/grep", "absent-pattern", str(Path(directory) / "empty.txt")]}),
             _sandbox_policy(Path(directory)),
         )
     if result.ok or result.error != "exit code 1" or "sandbox" in (result.error or "").casefold():

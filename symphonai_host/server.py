@@ -248,7 +248,7 @@ class HostServer:
     def serve_forever(self) -> None:
         self._serving = True
         try:
-            self._httpd.serve_forever()
+            self._httpd.serve_forever(poll_interval=0.05)
         finally:
             self._serving = False
 
