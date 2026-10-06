@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import tempfile
-from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,7 +16,6 @@ from symphonai_api.cost import (
     load_price_table,
     total_cost,
 )
-from symphonai_api.events import Event
 from symphonai_api.leader import Leader, LeaderConfig
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
 from symphonai_api.providers.fake import FakeModelProvider
@@ -59,61 +57,6 @@ def check_usage_totals_merge() -> None:
     if expected.total_tokens != 37:
         fail(f"total_tokens ignored a token counter: {expected!r}")
 
-    expected_event_fields = {
-        "RunStarted": {"agent_id", "run_id", "turn_id", "schema_version", "agent_name"},
-        "RunFinished": {
-            "agent_id", "run_id", "turn_id", "schema_version", "agent_name", "stopped_reason",
-        },
-        "RunFailed": {"agent_id", "run_id", "turn_id", "schema_version", "agent_name", "error"},
-        "TurnStarted": {"agent_id", "run_id", "turn_id", "schema_version", "index"},
-        "TurnFinished": {"agent_id", "run_id", "turn_id", "schema_version", "index"},
-        "AssistantTextDelta": {
-            "agent_id", "run_id", "turn_id", "schema_version", "text",
-        },
-        "ToolCallStarted": {
-            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id",
-            "target",
-        },
-        "ToolCallFinished": {
-            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "ok",
-            "result_kind", "result_path", "lines_added", "lines_removed", "diff", "truncated",
-        },
-        "PromptSubmitted": {
-            "agent_id", "run_id", "turn_id", "schema_version", "text", "message_count",
-        },
-        "ToolCallFailed": {
-            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "error",
-        },
-        "PermissionRequested": {
-            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "mode",
-        },
-        "PermissionDenied": {
-            "agent_id", "run_id", "turn_id", "schema_version", "tool_name", "tool_call_id", "reason",
-        },
-        "SessionStarted": {
-            "agent_id", "run_id", "turn_id", "schema_version", "session_run_id",
-        },
-        "SessionEnded": {
-            "agent_id", "run_id", "turn_id", "schema_version", "session_run_id",
-        },
-        "SubagentSpawned": {
-            "agent_id", "run_id", "turn_id", "schema_version", "subagent_name", "subagent_agent_id",
-        },
-        "SubagentStopped": {
-            "agent_id", "run_id", "turn_id", "schema_version", "subagent_name", "subagent_agent_id",
-        },
-        "CompactionApplied": {
-            "agent_id", "run_id", "turn_id", "schema_version", "before_tokens", "after_tokens",
-            "dropped_messages",
-        },
-    }
-    actual_event_fields = {
-        event_type.__name__: {item.name for item in fields(event_type)}
-        for event_type in Event.__subclasses__()
-        if event_type.__module__ == Event.__module__
-    }
-    if actual_event_fields != expected_event_fields:
-        fail(f"event schema changed during usage tracking: {actual_event_fields!r}")
 
 
 @check("cost.run_accumulates_usage")

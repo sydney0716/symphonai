@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ast
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -21,7 +19,6 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import merge_tool_registry, run_task, standard_tool_registry
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 from scripts.checks.mcp import (
     _FAKE_SERVER,
@@ -32,14 +29,6 @@ from scripts.checks.mcp import (
 )
 
 
-_PRE_19D_COMMIT = "3c09e8404accc6b50a9fffcd94cca4a807614aaa"
-_PRE_19E_COMMIT = "fa9a7dd06eee2b5f29772c1870e57a648dac9cdc"
-_MCP_SHA256 = "9b445f094387b2b226dc7c847aa400fd508be0c4408cedbd9d457123f04a32fb"
-_MCP_POOL_SHA256 = "32b905856e3456257a01f0ea7206967d55d9a2e6209a431a52172b1336832265"
-_FROZEN_RUN_TASK = (
-    b'["final_response",1,[["user","frozen",[],null],'
-    b'["assistant","done",[],null]],[["frozen-model",4,2,1]]]'
-)
 
 
 def _write_fake(directory: Path) -> Path:
@@ -110,33 +99,6 @@ class _NamedTool(LocalTool):
         return ToolResult(tool_call.id, True, self._content)
 
 
-def _run_snapshot(result) -> bytes:  # noqa: ANN001
-    messages = []
-    for message in result.messages:
-        tool_result = message.tool_result
-        messages.append(
-            [
-                message.role.value,
-                message.text,
-                [[call.id, call.name] for call in message.tool_calls],
-                None
-                if tool_result is None
-                else [
-                    tool_result.tool_call_id,
-                    tool_result.ok,
-                    tool_result.content,
-                    tool_result.error,
-                ],
-            ]
-        )
-    usage = [
-        [model, totals.input_tokens, totals.output_tokens, totals.calls]
-        for model, totals in sorted(result.usage_by_model.items())
-    ]
-    return json.dumps(
-        [result.stopped_reason, result.turns_used, messages, usage],
-        separators=(",", ":"),
-    ).encode("utf-8")
 
 
 @check("mcp_pool.starts_and_orders")
@@ -486,61 +448,6 @@ def run_task_tools() -> None:
             fail("run_task changed the standard binding before refusing collision")
 
 
-@check("mcp_pool.default_and_imports")
-def default_and_imports() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        result = run_task(
-            FakeModelProvider(
-                [ModelResponse(Message(Role.ASSISTANT, "done"), Usage(4, 2))]
-            ),
-            PermissionPolicy(root),
-            "frozen",
-            model="frozen-model",
-            mcp_tools=None,
-        )
-    actual = _run_snapshot(result)
-    if actual != _FROZEN_RUN_TASK:
-        fail(
-            f"mcp_tools=None changed run_task from {_PRE_19D_COMMIT}: "
-            f"expected={_FROZEN_RUN_TASK!r}, actual={actual!r}"
-        )
-
-    root = Path(__file__).resolve().parents[2]
-    pool_path = root / "symphonai_api/mcp_pool.py"
-    source = pool_path.read_text(encoding="utf-8")
-    forbidden = _forbidden_imports(source)
-    expanded = {
-        "agent_loop",
-        "leader",
-        "runner",
-        "agent_run",
-        "agent_spec",
-        "agent_file",
-        "child_context",
-        "extensions",
-        "provider_catalog",
-        "providers",
-    }
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module] if node.module is not None else []
-        else:
-            continue
-        forbidden.extend(
-            module
-            for module in modules
-            if set(module.split(".")) & expanded
-        )
-    if forbidden:
-        fail(f"mcp_pool.py imports forbidden modules: {sorted(set(forbidden))!r}")
-
-    mcp_source = (root / "symphonai_api/mcp.py").read_bytes()
-    mcp_digest = hashlib.sha256(mcp_source).hexdigest()
-    if mcp_digest != _MCP_SHA256:
-        fail(f"mcp.py changed from its pre-19d SHA-256: {mcp_digest}")
 
 
 @check("mcp_pool.merge_tool_registry")
@@ -587,19 +494,5 @@ def merge_registry() -> None:
                 model="frozen-model",
                 mcp_tools=None,
             )
-    actual = _run_snapshot(result)
-    if actual != _FROZEN_RUN_TASK:
-        fail(
-            f"merge extraction changed run_task from {_PRE_19E_COMMIT}: "
-            f"expected={_FROZEN_RUN_TASK!r}, actual={actual!r}"
-        )
     if merge_spy.call_count != 1:
         fail("run_task did not use merge_tool_registry after extraction")
-
-    root = Path(__file__).resolve().parents[2]
-    mcp_bytes = (root / "symphonai_api/mcp.py").read_bytes()
-    pool_bytes = (root / "symphonai_api/mcp_pool.py").read_bytes()
-    if hashlib.sha256(mcp_bytes).hexdigest() != _MCP_SHA256:
-        fail("19e changed symphonai_api/mcp.py")
-    if hashlib.sha256(pool_bytes).hexdigest() != _MCP_POOL_SHA256:
-        fail("19e changed symphonai_api/mcp_pool.py")

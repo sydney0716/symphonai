@@ -449,6 +449,22 @@ class HostServer:
                     return
                 self._json(HTTPStatus.OK, {"path": requested, "text": text})
 
+            def _serve_spec_files(self) -> None:
+                specs_root = host._repo_root / "specs"
+                paths = []
+                for path in specs_root.rglob("*.md"):
+                    relative = path.relative_to(host._repo_root)
+                    if (
+                        len(relative.parts) < 3
+                        or relative.parts[1] == "report"
+                        or path.name.endswith("-PLAN.md")
+                        or not path.is_file()
+                        or not host.run.policy.check_read(path).allowed
+                    ):
+                        continue
+                    paths.append(relative.as_posix())
+                self._json(HTTPStatus.OK, {"paths": sorted(paths)})
+
             def _definition_target(
                 self,
                 name: object,
@@ -717,6 +733,11 @@ class HostServer:
                     if not self._authorized():
                         return
                     self._serve_file()
+                    return
+                if request_path == "/spec/files":
+                    if not self._authorized():
+                        return
+                    self._serve_spec_files()
                     return
                 if request_path == "/files":
                     if not self._authorized():

@@ -197,8 +197,12 @@ test("malformed roadmaps fail atomically and name the member", () => {
       JSON.stringify({ goal: "bad", phases: [{ id: "18", name: "bad", status: "next", items: [3] }] }),
       /phase 18.*item 0/,
     ],
+    [
+      JSON.stringify({ goal: "bad", phases: [{ id: "18", name: "bad", status: "next", items: [{ title: "bad after", after: "37a" }] }] }),
+      /phase 18 item 0 after/,
+    ],
   ];
-  assert.equal(cases.length, 4);
+  assert.equal(cases.length, 5);
   for (const [json, pattern] of cases) {
     assert.throws(() => parseRoadmap(json), (error) => {
       assert.ok(error instanceof RoadmapError);

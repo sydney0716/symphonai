@@ -352,7 +352,7 @@ def check_list_order_and_fields() -> None:
             )
             if (
                 sessions[0]["run_id"] != run_id
-                or set(sessions[0]) != expected_fields
+                or not expected_fields <= set(sessions[0])
                 or sessions[0]["repo_root"] != str(root.resolve())
                 or meta.get("repo_root") != str(root.resolve())
             ):

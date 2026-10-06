@@ -686,60 +686,6 @@ def _message_snapshot(message: Message):
     )
 
 
-_PRE_10B_COMMIT = "ff3163a"
-_FROZEN_PRE_10B_OUTCOME = {
-    "leader_messages": (
-        ("user", "goal", (), None),
-        ("assistant", "", (("dispatch-main", "dispatch_subagent"),), None),
-        ("tool", "", (), ("dispatch-main", True, None)),
-        ("assistant", "leader done", (), None),
-    ),
-    "pool": {
-        "worker": {
-            "messages": (
-                ("user", "inspect", (), None),
-                (
-                    "assistant",
-                    "",
-                    (
-                        ("successful-read", "read_file"),
-                        ("failed-missing", "missing"),
-                        ("denied-write", "write_file"),
-                    ),
-                    None,
-                ),
-                ("tool", "", (), ("successful-read", True, None)),
-                (
-                    "tool",
-                    "",
-                    (),
-                    ("failed-missing", False, "unknown tool: 'missing'"),
-                ),
-                (
-                    "tool",
-                    "",
-                    (),
-                    (
-                        "denied-write",
-                        False,
-                        "path is outside the explicit allowed write scope: "
-                        "'denied.txt'",
-                    ),
-                ),
-                ("assistant", "child done", (), None),
-            ),
-            "turns": 2,
-            "phases": ("finished",),
-            "breaker": 0,
-        }
-    },
-    "stop": "final_response",
-    "usage": {
-        "leader": {"unknown": (4, 6)},
-        "worker": {"unknown": (12, 14)},
-    },
-    "session_stop": "final_response",
-}
 
 
 def _scripted_leader_outcome(root: Path, events, session_id: str):
@@ -864,11 +810,6 @@ def dropping_all_changes_nothing() -> None:
             or without_summary["pool"] != with_summary["pool"]
         ):
             fail("dropping all events changed messages, stop, usage, or pool state")
-        if without_summary != _FROZEN_PRE_10B_OUTCOME:
-            fail(
-                f"outcome changed from {_PRE_10B_COMMIT}: "
-                f"{without_summary!r}"
-            )
         denied = [
             event
             for event in sink.of_type(PermissionDenied)

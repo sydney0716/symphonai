@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -14,7 +13,6 @@ from symphonai_api.discovery import DiscoveryError, Offered, discover
 from symphonai_api.plugins import PluginError
 from symphonai_api.skills import SkillError
 from symphonai_api.trust import RepositoryTrust, TrustList
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -306,8 +304,8 @@ def ceiling_forwarding() -> None:
             fail(f"unconstrained ceiling rejected the agent: {accepted!r}")
 
 
-@check("discovery.determinism_and_imports")
-def determinism_and_imports() -> None:
+@check("discovery.determinism")
+def determinism() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "repo"
         home = Path(temporary) / "home"
@@ -329,34 +327,3 @@ def determinism_and_imports() -> None:
                     f"{kind} discovery order was not deterministic: "
                     f"{first_names!r}, {second_names!r}"
                 )
-
-    source = Path(discovery_module.__file__ or "").read_text(encoding="utf-8")
-    shared_forbidden = _forbidden_imports(source)
-    forbidden = {
-        "agent_loop",
-        "leader",
-        "runner",
-        "agent_run",
-        "child_context",
-        "extensions",
-        "provider_catalog",
-        "providers",
-    }
-    imported: list[str] = []
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module] if node.module is not None else []
-        else:
-            continue
-        imported.extend(
-            module
-            for module in modules
-            if any(part in forbidden for part in module.split("."))
-        )
-    if shared_forbidden or imported:
-        fail(
-            "discovery imports runtime orchestration: "
-            f"{shared_forbidden + imported!r}"
-        )

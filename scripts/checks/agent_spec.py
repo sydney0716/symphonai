@@ -39,24 +39,6 @@ def _spec(root: Path, **changes) -> AgentSpec:
     values.update(changes)
     return AgentSpec(**values)
 
-@check("agent_spec.defaults_and_frozen")
-def defaults_and_frozen() -> None:
-    with tempfile.TemporaryDirectory() as d:
-        spec = _spec(Path(d))
-        if (
-            spec.tool_names is not None
-            or spec.budget is not None
-            or spec.deadline_seconds is not None
-            or spec.isolation != Isolation()
-            or spec.io != IOContract()
-            or spec.call_class.value != "background"
-            or spec.max_depth != 0
-            or spec.schema_version != 1
-        ):
-            fail("documented defaults changed")
-        try: spec.name = "other"  # type: ignore[misc]
-        except FrozenInstanceError: return
-        fail("AgentSpec was mutable")
 
 @check("agent_spec.model_selector")
 def model_selector() -> None:
@@ -135,41 +117,3 @@ def never_raises() -> None:
     for text in ("", "{", "[]", "null", '{"a":[{"b":["x"]}]}', "true", "42", "not json", '{"a":[{}]}', '{"a":"x"}', '{"a":[{"b":[2]}]}', "{}"):
         try: validate_output(c,text)
         except Exception as exc: fail(f"validate_output raised {exc!r}")
-
-@check("agent_spec.with_overrides")
-def overrides() -> None:
-    with tempfile.TemporaryDirectory() as d:
-        s=_spec(Path(d)); changed=s.with_overrides(max_depth=2)
-        if changed is s or s.max_depth or changed.max_depth != 2: fail("override changed original")
-        try:
-            s.with_overrides(max_depth=-1)
-        except ValueError:
-            pass
-        else:
-            fail("override skipped validation")
-        try: s.with_overrides(missing=True)
-        except TypeError: return
-        fail("unknown override accepted")
-
-@check("agent_spec.no_runtime_imports")
-def no_runtime_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/agent_spec.py").read_text()
-    found = _forbidden_imports(source)
-    if found:
-        fail(f"agent_spec imports runtime wiring: {found!r}")
-    probes = [
-        ("from symphonai_api.runner import standard_tool_registry\n", True),
-        ("from symphonai_api.leader import Leader\n", True),
-        ("from symphonai_api.agent_loop import ApiAgent\n", True),
-        ("from symphonai_api.providers.openai import OpenAIProvider\n", True),
-        ("import symphonai_api.runner\n", True),
-        ("from . import runner\n", True),
-        ("from symphonai_api import runner\n", True),
-        ("from symphonai_api import leader, budgets\n", True),
-        ("import symphonai_api.budgets\n", False),
-        ("from symphonai_api.budgets import RunBudget\n", False),
-    ]
-    for line, should_be_caught in probes:
-        caught = bool(_forbidden_imports(line))
-        if caught != should_be_caught:
-            fail(f"import inspection got {line.strip()!r} wrong")

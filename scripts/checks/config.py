@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import itertools
 import json
 import tempfile
@@ -23,7 +22,6 @@ from symphonai_api.config import (
 )
 from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.permissions import PermissionPolicy
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -427,43 +425,8 @@ def ceiling_applies_to_agent_files() -> None:
             fail("agent directory did not forward its ceiling")
 
 
-def _config_forbidden_imports(source: str) -> list[str]:
-    found = _forbidden_imports(source)
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = ([node.module] if node.module is not None else []) + [
-                alias.name for alias in node.names
-            ]
-        else:
-            continue
-        for module in modules:
-            if (
-                any(part in _FORBIDDEN_CONFIG_IMPORTS for part in module.split("."))
-                and module not in found
-            ):
-                found.append(module)
-    return found
 
 
-@check("config.no_runtime_imports")
-def no_runtime_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/config.py").read_text(encoding="utf-8")
-    found = _config_forbidden_imports(source)
-    if found:
-        fail(f"config imports runtime wiring: {found!r}")
-    probes = tuple(
-        f"from symphonai_api.{module} import Probe\n"
-        for module in sorted(_FORBIDDEN_CONFIG_IMPORTS - {"providers"})
-    ) + ("from symphonai_api.providers.fake import FakeModelProvider\n",)
-    for probe in probes:
-        if not _config_forbidden_imports(probe):
-            fail(f"import inspection missed {probe.strip()!r}")
-    if _config_forbidden_imports(
-        "from symphonai_api.permissions import PermissionPolicy\n"
-    ):
-        fail("import inspection rejected permissions")
 
 
 @check("config.layers_are_per_scope")

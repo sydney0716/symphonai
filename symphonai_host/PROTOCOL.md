@@ -448,6 +448,11 @@ receive `415`, and files larger than 1 MiB receive `413`. The route requires the
 same bearer token as every non-health endpoint and never returns the token or an
 absolute filesystem path.
 
+Authenticated `GET /spec/files` returns `{"paths": [...]}` with sorted paths
+for readable Markdown specs under `specs/<directory>/`. It excludes
+`specs/report/`, files named `*-PLAN.md`, and Markdown files directly under
+`specs/`.
+
 `GET /agent?name=<name>&scope=<user|project>` returns one agent definition as
 `{"name": <stem>, "scope": <scope>, "text": <contents>}`. `POST /agent`
 takes `{"name": <name>, "scope": <user|project>, "text": <contents>}` and

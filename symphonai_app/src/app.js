@@ -4,7 +4,8 @@ import { createClient } from "./client.js";
 import { parseMarkdown } from "./markdown.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
-import { renderRoadmap, parseRoadmap, specPaths } from "./roadmap.js";
+import { renderRoadmap, parseRoadmap, specPaths, followUpsFor } from "./roadmap.js";
+import { layoutPhase } from "./roadmap_graph.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
@@ -162,7 +163,10 @@ export async function start({ global, document, client }) {
   const transcript = createTranscript();
   let commandEntry = null;
   const board = createAgentBoard();
-  let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply, initialSpecRuns] = await Promise.all([
+  const readSpecFiles = () => typeof boundary.specFiles === "function"
+    ? boundary.specFiles().catch(() => ({ paths: [] }))
+    : Promise.resolve({ paths: [] });
+  let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply, initialSpecRuns, initialSpecFiles] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
     boundary.file("docs/roadmap.json"),
@@ -170,6 +174,7 @@ export async function start({ global, document, client }) {
     boundary.health().catch(() => null),
     boundary.conversationStats().catch(() => ({ conversation: null })),
     (boundary.specRuns?.() ?? Promise.resolve([])).catch(() => []),
+    readSpecFiles(),
   ]);
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
   const keymap = parseKeymap(JSON.stringify(keymapDefaults));
@@ -192,9 +197,16 @@ export async function start({ global, document, client }) {
   let conversation = conversationReply?.conversation ?? null;
   let roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   let specRuns = initialSpecRuns;
-  let allSpecPaths = roadmap.phases.flatMap((phase) =>
-    phase.items.flatMap((item) => specPaths(item))
-  );
+  let allSpecPaths = [...new Set([
+    ...roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item))),
+    ...(Array.isArray(initialSpecFiles?.paths) ? initialSpecFiles.paths.filter((path) => typeof path === "string") : []),
+  ])];
+  const graphTitles = new Map();
+  const graphPhaseLoaded = new Set();
+  const graphTitlesReady = new Map();
+  const graphId = (path) => path.split("/").at(-1).replace(/\.md$/, "").split("-", 1)[0];
+  const knownGraphPaths = () => [...new Set(allSpecPaths.flatMap((path) => [path, ...followUpsFor(path, allSpecPaths)]))];
+  for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
   const settingsPane = element(document, "section", { className: "settings-pane" });
   const settingsSections = element(document, "nav", { className: "settings-sections" });
   const settingsContent = element(document, "div", { className: "settings-content" });
@@ -1029,13 +1041,20 @@ export async function start({ global, document, client }) {
   }
 
   async function refreshSpecState() {
-    const [reply, runs] = await Promise.all([
+    const [reply, runs, specFilesReply] = await Promise.all([
       boundary.file("docs/roadmap.json"),
       boundary.specRuns(),
+      readSpecFiles(),
     ]);
     if (typeof reply?.text === "string") roadmap = renderRoadmap(parseRoadmap(reply.text));
     specRuns = runs;
-    allSpecPaths = roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item)));
+    allSpecPaths = [...new Set([
+      ...roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item))),
+      ...(Array.isArray(specFilesReply?.paths) ? specFilesReply.paths.filter((path) => typeof path === "string") : []),
+    ])];
+    graphTitles.clear();
+    for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
+    graphPhaseLoaded.clear();
     renderRoadmapUI();
     if (selectedSpec) {
       const phase = roadmap.phases.find((value) => value.id === selectedSpec.phase.id);
@@ -1126,6 +1145,105 @@ export async function start({ global, document, client }) {
     return button;
   }
 
+  async function loadGraphTitles(phase) {
+    if (graphPhaseLoaded.has(phase.id)) return graphTitlesReady.get(phase.id);
+    graphPhaseLoaded.add(phase.id);
+    const paths = phase.items.flatMap((item) => {
+      const spec = specPaths(item)[0];
+      return spec ? [spec, ...followUpsFor(spec, allSpecPaths)] : [];
+    });
+    const promise = Promise.all(paths.map(async (path) => {
+      try {
+        const reply = await boundary.file(path);
+        const firstLine = reply.text.split(/\r?\n/, 1)[0];
+        const match = /^#\s+[^—]+—\s+(.+)$/.exec(firstLine);
+        if (match) graphTitles.set(graphId(path), match[1].trim());
+      } catch {}
+    })).then(() => renderRoadmapUI());
+    graphTitlesReady.set(phase.id, promise);
+    return promise;
+  }
+
+  function openGraphSpec(item, phase, itemIndex) {
+    selectedSpec = { item, phase, index: itemIndex, result: null };
+    return specView.open(item, { specPaths: allSpecPaths }).then((result) => {
+      selectedSpec = { ...selectedSpec, result };
+      specActionError = "";
+      showSpec(result, item, phase, itemIndex);
+    });
+  }
+
+  function graphView(phase) {
+    const titles = new Map(graphTitles);
+    const followUps = new Map();
+    const states = new Map();
+    const itemById = new Map();
+    phase.items.forEach((item, index) => {
+      const paths = specPaths(item);
+      if (!paths.length) return;
+      const id = graphId(paths[0]);
+      itemById.set(id, { item, index });
+      followUps.set(id, followUpsFor(paths[0], allSpecPaths).map((path) => ({
+        id: graphId(path), path,
+        title: graphTitles.get(graphId(path)) || filename(path).replace(/^[^-]+-/, ""),
+      })));
+      states.set(id, workflow(item, phase, index).step);
+    });
+    const graph = layoutPhase(phase.items, { followUps, titles, states });
+    if (graph.error) {
+      return [element(document, "p", { className: "error roadmap-graph-error", text: graph.error }),
+        ...phase.items.map((item, index) => roadmapItem(item, phase, index))];
+    }
+    const container = element(document, "div", { className: "roadmap-graph" });
+    for (const [rowIndex, row] of graph.rows.entries()) {
+      const boxes = element(document, "div", { className: "roadmap-graph-row" });
+      for (const node of row) {
+        if (node.summary) {
+          append(boxes, element(document, "div", { className: "roadmap-done-summary", text: node.title }));
+          continue;
+        }
+        const widthClass = row.length < 2 || node.group ? "roadmap-box-wide" : "";
+        const box = element(document, "div", { className: ["roadmap-box", widthClass, node.group ? "roadmap-group" : `roadmap-state-${node.state.replaceAll(" ", "-")}`].filter(Boolean).join(" ") });
+        if (node.group) append(box, element(document, "div", { className: "roadmap-group-heading", text: "parallel" }));
+        const entries = node.group ?? [node];
+        for (const entry of entries) {
+          const bound = itemById.get(entry.id);
+          const button = element(document, "button", { className: "roadmap-box-button", text: `${entry.id}  ${entry.title}` });
+          if (bound) {
+            button.setAttribute("title", bound.item.title);
+            listen(button, "click", () => openGraphSpec(bound.item, phase, bound.index));
+          }
+          append(box, button);
+          for (const followUp of entry.followUps ?? []) {
+            const followButton = element(document, "button", { className: "roadmap-follow-up", text: `${followUp.id}  ${followUp.title}` });
+            listen(followButton, "click", () => openGraphSpec({ title: followUp.title, spec: followUp.path }, phase, bound?.index ?? -1));
+            append(box, followButton);
+          }
+          for (const tag of entry.tags ?? []) append(box, element(document, "span", { className: "roadmap-tag", text: tag }));
+        }
+        boxes.append(box);
+      }
+      append(container, boxes);
+      if (rowIndex < graph.rows.length - 1) {
+        const connectorRow = element(document, "div", { className: "roadmap-connector-row" });
+        for (const edge of graph.edges) {
+          const from = graph.rows.flat().find((node) => node.id === edge.from);
+          const to = graph.rows.flat().find((node) => node.id === edge.to);
+          if (!from || !to || from.row > rowIndex || to.row <= rowIndex) continue;
+          const isTargetRow = to.row === rowIndex + 1;
+          const edgeClass = isTargetRow
+            ? `roadmap-edge roadmap-edge-from-${from.column}-to-${to.column}`
+            : `roadmap-edge roadmap-edge-through roadmap-edge-from-${from.column}`;
+          append(connectorRow, element(document, "div", { className: edgeClass }));
+        }
+        append(container, connectorRow);
+      }
+    }
+    return graph.summary
+      ? [element(document, "div", { className: "roadmap-done-summary", text: graph.summary }), container]
+      : [container];
+  }
+
   function renderRoadmapUI() {
     const roadmapChildren = [];
     let openedCurrentPhase = false;
@@ -1133,13 +1251,18 @@ export async function start({ global, document, client }) {
       const section = element(document, "details", { className: "roadmap-phase" });
       section.open = !openedCurrentPhase && phase.status !== "done";
       openedCurrentPhase ||= section.open;
+      const graphEnabled = phase.items.some((item) => Object.hasOwn(item, "after"));
       append(
         section,
         element(document, "summary", {
           text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total} · ${phase.status}`,
         }),
-        ...phase.items.map((item, index) => roadmapItem(item, phase, index)),
+        ...(graphEnabled ? graphView(phase) : phase.items.map((item, index) => roadmapItem(item, phase, index))),
       );
+      if (graphEnabled) {
+        listen(section, "toggle", () => { if (section.open) void loadGraphTitles(phase); });
+        if (section.open) void loadGraphTitles(phase);
+      }
       roadmapChildren.push(section);
     }
     replace(roadmapRoot, ...roadmapChildren);

@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.checks import shell_and_registry  # noqa: E402, F401
+from scripts.checks import layering  # noqa: E402, F401
 from scripts.checks import models_and_content  # noqa: E402, F401
 from scripts.checks import tool_metadata  # noqa: E402, F401
 from scripts.checks import tool_call_ids  # noqa: E402, F401

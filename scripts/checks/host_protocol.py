@@ -240,17 +240,8 @@ def check_document_covers_registry() -> None:
                 fail(f"protocol document omitted {name}.{field.name}")
 
 
-@check("host_protocol.import_direction")
-def check_import_direction() -> None:
-    # Stdlib rather than ripgrep: the suite has to run wherever the package
-    # does, and `rg` is a developer's tool, not a dependency this repo has.
-    offenders = [
-        str(path.relative_to(REPO_ROOT))
-        for path in sorted((REPO_ROOT / "symphonai_api").rglob("*.py"))
-        if "symphonai_host" in path.read_text(encoding="utf-8")
-    ]
-    if offenders:
-        fail(f"runtime imports host code: {offenders}")
+@check("host_protocol.package_contract")
+def check_package_contract() -> None:
     pyproject = (REPO_ROOT / "pyproject.toml").read_text()
     if "dependencies = []" not in pyproject or '"symphonai_host*"' not in pyproject:
         fail("host package changed dependencies or was omitted from package discovery")

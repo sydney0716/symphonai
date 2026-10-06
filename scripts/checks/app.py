@@ -23,6 +23,7 @@ NODE_TESTS = {
     "app.host_handle": "host_handle.test.js",
     "app.turn": "turn.test.js",
     "app.roadmap": "roadmap.test.js",
+    "app.roadmap_graph": "roadmap_graph.test.js",
     "app.agents": "agents.test.js",
     "app.route": "route.test.js",
     "app.spec_view": "spec_view.test.js",
@@ -129,6 +130,11 @@ def roadmap() -> None:
     environment = dict(os.environ)
     environment["SYMPHONAI_ROADMAP_PATH"] = str(REPO_ROOT / "docs" / "roadmap.json")
     _run_node_test("roadmap.test.js", environment=environment)
+
+
+@check("app.roadmap_graph")
+def roadmap_graph() -> None:
+    _run_node_test("roadmap_graph.test.js")
 
 
 @check("app.route")

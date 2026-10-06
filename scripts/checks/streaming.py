@@ -1610,8 +1610,8 @@ def check_non_streaming_path_unchanged() -> None:
         ("openai", OpenAIProvider(), "OPENAI_API_KEY", openai_body, expected_message),
         (
             "compatible",
-            OpenAICompatibleProvider("SYMPHONAI_FROZEN", "https://compatible.invalid/v1"),
-            "SYMPHONAI_FROZEN",
+            OpenAICompatibleProvider("SYMPHONAI_TEST", "https://compatible.invalid/v1"),
+            "SYMPHONAI_TEST",
             {
                 "choices": [{
                     "message": {

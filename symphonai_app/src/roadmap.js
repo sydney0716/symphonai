@@ -29,6 +29,12 @@ export function itemsOf(phase) {
     if (item.desc !== undefined && typeof item.desc !== "string") {
       throw new RoadmapError(`${label} item ${index} desc must be a string`);
     }
+    if (
+      item.after !== undefined &&
+      (!Array.isArray(item.after) || item.after.some((id) => typeof id !== "string"))
+    ) {
+      throw new RoadmapError(`${label} item ${index} after must be a string array`);
+    }
     const specs = item.spec === undefined || item.spec === null
       ? []
       : typeof item.spec === "string"

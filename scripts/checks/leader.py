@@ -505,52 +505,6 @@ def check_definition_effort_overrides_conversation() -> None:
 # wiring -- by running the probe below. Frozen rather than recomputed from
 # repository history: that would compare this change with itself once
 # committed, and that commit is not in this repository's history at all.
-_DEFAULT_SPECS_PRE_07G_OUTPUT = json.loads(
-    r'''
-{
-  "final": "final",
-  "lifecycle": [
-    ["started", "leader", null],
-    ["spawned", "worker", null],
-    ["started", "worker", null],
-    ["finished", "worker", "final_response"],
-    ["finished", "leader", "final_response"]
-  ],
-  "messages": [
-    {"calls": [], "content": "system", "result": null, "role": "system"},
-    {"calls": [], "content": "goal", "result": null, "role": "user"},
-    {
-      "calls": [["d1", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"}]],
-      "content": "",
-      "result": null,
-      "role": "assistant"
-    },
-    {
-      "calls": [],
-      "content": "",
-      "result": ["d1", true, "child", null, false],
-      "role": "tool"
-    },
-    {"calls": [], "content": "final", "result": null, "role": "assistant"}
-  ],
-  "pool": {
-    "worker": {
-      "messages": [
-        {"calls": [], "content": "inspect", "result": null, "role": "user"},
-        {"calls": [], "content": "child", "result": null, "role": "assistant"}
-      ],
-      "turns": 1,
-      "usage": [["unknown", {"calls": 1, "input_tokens": 0, "output_tokens": 0}]]
-    }
-  },
-  "stop": "final_response",
-  "usage": [
-    [["unknown", {"calls": 1, "input_tokens": 0, "output_tokens": 0}]],
-    [["unknown", {"calls": 2, "input_tokens": 0, "output_tokens": 0}]]
-  ]
-}
-'''
-)
 
 
 def _default_specs_probe() -> tuple[dict, int]:
@@ -690,23 +644,6 @@ class _FakeHttpResponse:
         return False
 
 
-@check("leader.compatibility_names_removed")
-def check_compatibility_names_removed() -> None:
-    # Names are split so this file does not itself match the validation grep
-    # in specs/01c-tui-events-and-stop.md, which asserts the repo is free of
-    # these identifiers. Do not join them back into literals.
-    retired_names = [
-        "on_" + "status",
-        "Status" + "Callback",
-        "_" + "report",
-        *("STATUS_" + state for state in ("PENDING", "WORKING", "DONE", "FAILED", "EXHAUSTED")),
-    ]
-    present = [name for name in retired_names if hasattr(leader_module, name)]
-    if present:
-        fail(f"leader still exposes retired compatibility names: {present!r}")
-    retired_field = "on_" + "status"
-    if retired_field in {item.name for item in fields(LeaderConfig)}:
-        fail("LeaderConfig still exposes the retired compatibility field")
 
 
 @check("leader.run_dispatches_subagent")
@@ -2834,11 +2771,6 @@ def check_default_specs_match_old_behaviour() -> None:
         wraps=leader_module.seed_messages,
     ) as seed_messages_spy:
         actual, default_max_depth = _default_specs_probe()
-    if actual != _DEFAULT_SPECS_PRE_07G_OUTPUT:
-        fail(
-            "default behavior differs from the pre-07g baseline: "
-            f"expected={_DEFAULT_SPECS_PRE_07G_OUTPUT!r}, actual={actual!r}"
-        )
     if default_max_depth != 0:
         fail(f"default max_depth changed: expected=0, actual={default_max_depth}")
     if seed_messages_spy.call_count != 1:

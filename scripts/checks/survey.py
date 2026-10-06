@@ -439,13 +439,3 @@ def check_read_only() -> None:
         after = _snapshot(root)
         if after != before:
             fail(f"survey changed its repository: before={before!r}, after={after!r}")
-
-
-@check("survey.import_boundary")
-def check_import_boundary() -> None:
-    from scripts.checks.agent_spec import _forbidden_imports
-
-    source = (ROOT / "symphonai_api" / "survey.py").read_text(encoding="utf-8")
-    forbidden = _forbidden_imports(source)
-    if forbidden:
-        fail(f"survey imported forbidden runtime modules: {forbidden!r}")

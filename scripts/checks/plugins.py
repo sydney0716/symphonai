@@ -24,7 +24,6 @@ from symphonai_api.plugins import (
     load_plugin_directory,
 )
 from symphonai_api.skills import load_skill_directory
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -512,7 +511,7 @@ def agent_ceiling_is_forwarded() -> None:
         )
 
 
-@check("plugins.directory_and_import_boundary")
+@check("plugins.directory_contract")
 def directory_and_import_boundary() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -541,34 +540,7 @@ def directory_and_import_boundary() -> None:
         else:
             fail("plugin directory skipped a malformed direct plugin")
 
-    path = Path(__file__).resolve().parents[2] / "symphonai_api/plugins.py"
-    source = path.read_text(encoding="utf-8")
-    forbidden = _forbidden_imports(source)
-    expanded = {
-        "agent_loop",
-        "leader",
-        "runner",
-        "agent_run",
-        "child_context",
-        "provider_catalog",
-        "providers",
-    }
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module] if node.module is not None else []
-        else:
-            continue
-        forbidden.extend(
-            module
-            for module in modules
-            if set(module.split(".")) & expanded
-        )
-    if forbidden:
-        fail(f"plugins.py imports forbidden runtime modules: {sorted(set(forbidden))!r}")
-
+    tree = ast.parse((Path(__file__).resolve().parents[2] / "symphonai_api/plugins.py").read_text(encoding="utf-8"))
     functions = {
         node.name: node
         for node in tree.body

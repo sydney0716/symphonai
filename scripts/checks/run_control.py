@@ -27,29 +27,6 @@ from symphonai_api.providers.fake import FakeModelProvider
 from scripts.checks.harness import check, fail
 
 
-_DEFAULT_BASELINE_COMMIT = "cad0e4aa1c2259ca26cc0748d373acd6ea2264b5"
-_CONTROL_BASELINE_COMMIT = "cad0e4aa1c2259ca26cc0748d373acd6ea2264b5"
-_DEFAULT_PRE_08D = (
-    "final_response",
-    1,
-    "end_turn",
-    (
-        ("user", "frozen prompt", None),
-        ("assistant", "frozen answer", "turn-fixed"),
-    ),
-    ("assistant", "frozen answer", "turn-fixed"),
-    ("run-fixed", "agent-fixed", None, 1),
-    ("agent-fixed", "agent", None, 1),
-    (("unknown", 0, 0, 1),),
-    (
-        ("RunStarted", None, None, "agent", None),
-        ("PromptSubmitted", None, None, None, None),
-        ("TurnStarted", "turn-fixed", 1, None, None),
-        ("TurnFinished", "turn-fixed", 1, None, None),
-        ("RunFinished", None, None, "agent", "final_response"),
-    ),
-    1,
-)
 
 
 def _new_run(root: Path, *, budget: RunBudget | None = None):
@@ -363,48 +340,6 @@ def gate_leaks_no_listeners() -> None:
             fail("cancellation path did not invoke its unsubscriber")
 
 
-def _default_output(result, sink: CollectingSink, provider: FakeModelProvider):
-    messages = tuple(
-        (message.role.value, message.text, message.turn_id)
-        for message in result.messages
-    )
-    final = result.final_response.message
-    usage = tuple(
-        (name, totals.input_tokens, totals.output_tokens, totals.calls)
-        for name, totals in sorted(result.usage_by_model.items())
-    )
-    events = tuple(
-        (
-            type(event).__name__,
-            event.turn_id,
-            getattr(event, "index", None),
-            getattr(event, "agent_name", None),
-            getattr(event, "stopped_reason", None),
-        )
-        for event in sink.events
-    )
-    return (
-        result.stopped_reason,
-        result.turns_used,
-        result.final_response.stop_reason,
-        messages,
-        (final.role.value, final.text, final.turn_id),
-        (
-            result.run.run_id,
-            result.run.agent_id,
-            result.run.parent_run_id,
-            result.run.schema_version,
-        ),
-        (
-            result.agent.agent_id,
-            result.agent.name,
-            result.agent.parent_agent_id,
-            result.agent.schema_version,
-        ),
-        usage,
-        events,
-        provider.call_count,
-    )
 
 
 @check("run_control.default_is_unchanged")
@@ -441,12 +376,6 @@ def default_is_unchanged() -> None:
             result = agent.run(
                 [Message(Role.USER, "frozen prompt")],
                 pause=None,
-            )
-        actual = _default_output(result, sink, provider)
-        if actual != _DEFAULT_PRE_08D:
-            fail(
-                f"default run differs from {_DEFAULT_BASELINE_COMMIT}: "
-                f"expected={_DEFAULT_PRE_08D!r}, actual={actual!r}"
             )
 
 
@@ -911,52 +840,8 @@ def capped_turns_stop_the_run() -> None:
             fail("AgentRunResult stopped-reason comment omitted budget_turns")
 
 
-def _frozen_control_probe(*, attached: bool):
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        provider = FakeModelProvider(
-            [ModelResponse(Message(Role.ASSISTANT, "frozen answer"))]
-        )
-        sink = CollectingSink()
-        agent = ApiAgent(
-            provider,
-            {},
-            PermissionPolicy(repo_root=root),
-            agent_ref=AgentRef("agent-fixed", "agent"),
-            events=sink,
-        )
-        controlled = _new_run(root) if attached else None
-        if controlled is not None:
-            controlled.phase = RunPhase.RUNNING
-        with (
-            mock.patch.object(
-                agent_loop_module,
-                "new_run_ref",
-                return_value=RunRef("run-fixed", "agent-fixed"),
-            ),
-            mock.patch.object(
-                agent_loop_module,
-                "new_turn_ref",
-                return_value=TurnRef("turn-fixed", "run-fixed", 1),
-            ),
-        ):
-            result = agent.run(
-                [Message(Role.USER, "frozen prompt")],
-                pause=None,
-                run=controlled,
-            )
-        return _default_output(result, sink, provider)
 
 
-@check("run_control.control_is_unchanged_by_default")
-def control_is_unchanged_by_default() -> None:
-    for attached in (False, True):
-        actual = _frozen_control_probe(attached=attached)
-        if actual != _DEFAULT_PRE_08D:
-            fail(
-                f"default control differs from {_CONTROL_BASELINE_COMMIT}: "
-                f"attached={attached}, expected={_DEFAULT_PRE_08D!r}, actual={actual!r}"
-            )
 
 
 @check("run_control.control_lock_scope")

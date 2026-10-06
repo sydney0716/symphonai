@@ -9,7 +9,6 @@ from pathlib import Path
 
 import symphonai_api.leases as leases_module
 from symphonai_api.leases import Lease, LeaseConflict, WorkspaceLeases
-from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -410,18 +409,3 @@ def concurrent_acquire_has_one_winner() -> None:
         if not returned.wait(1):
             fail("holder_for did not return after the registry lock was released")
         thread.join()
-
-
-@check("leases.no_symphonai_imports")
-def no_symphonai_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/leases.py").read_text()
-    original_forbidden = set(FORBIDDEN_IMPORTS)
-    FORBIDDEN_IMPORTS.add("symphonai_api")
-    try:
-        if _forbidden_imports(source):
-            fail("leases imports symphonai_api")
-        if not _forbidden_imports("import symphonai_api\n"):
-            fail("import inspection missed the symphonai_api package")
-    finally:
-        FORBIDDEN_IMPORTS.clear()
-        FORBIDDEN_IMPORTS.update(original_forbidden)

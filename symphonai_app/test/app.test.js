@@ -261,9 +261,12 @@ export function fakeClient(
     changes = { turns: [], files: [] },
     revertConflictPaths = [],
     worktreeConflict = false,
+    fileOverrides = {},
+    specFilesReply = { paths: [] },
+    specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], applyWorktree: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], discardWorktree: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0 };
+  const calls = { agent: [], approve: [], applyWorktree: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], discardWorktree: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0 };
   let changesReply = changes;
   let worktreeConflictPending = worktreeConflict;
   let eventCallback;
@@ -278,6 +281,7 @@ export function fakeClient(
     [OPEN_BASE, { path: OPEN_BASE, text: "open spec text" }],
     [OPEN_REPORT, { path: OPEN_REPORT, text: "open report text" }],
   ]);
+  for (const [path, text] of Object.entries(fileOverrides)) files.set(path, { path, text });
   return {
     calls,
     emit(frame) {
@@ -297,6 +301,11 @@ export function fakeClient(
     async files(query, limit = 20) {
       calls.files.push([query, limit]);
       return { files: [] };
+    },
+    async specFiles() {
+      calls.specFiles += 1;
+      if (specFilesFailure) throw new Error("spec listing unavailable");
+      return specFilesReply;
     },
     async history(limit = 100) {
       calls.history.push(limit);
@@ -1419,6 +1428,97 @@ test("start renders the chat page and prepares the roadmap", async () => {
   assert.ok(app.transcript);
   assert.deepEqual(app.transcript.model, []);
   assert.equal(find(document.body, (value) => value.className === "conversation-usage").textContent, "");
+});
+
+test("graph roadmap loads short spec titles and opens items and follow-ups", async () => {
+  const roadmap = JSON.parse(fixtureRoadmap());
+  roadmap.phases[0].status = "in_progress";
+  delete roadmap.phases[0].items[0].done;
+  roadmap.phases[0].items[0].after = [];
+  roadmap.phases[0].items.push({ title: "Second spec", spec: OPEN_BASE, after: ["18a"] });
+  const client = fakeClient(JSON.stringify(roadmap), {
+    fileOverrides: {
+      [BASE]: "# 18a — A beautifully long title\nbody",
+      [FOLLOW_UP]: "# 18aF — Fix the goal\nbody",
+    },
+  });
+  const originalFile = client.file.bind(client);
+  let releaseFiles;
+  const filesReady = new Promise((resolve) => { releaseFiles = resolve; });
+  client.file = async (path) => {
+    if ([BASE, FOLLOW_UP].includes(path)) await filesReady;
+    return originalFile(path);
+  };
+  const document = new FakeDocument();
+  await start({ global: {}, document, client });
+  const initialGraph = find(document.getElementById("roadmap").children[0], (node) => node.className === "roadmap-graph");
+  assert.equal(find(initialGraph, (node) => node.className === "roadmap-box-button").textContent, "18a  Boundary");
+  releaseFiles();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const phase = document.getElementById("roadmap").children[0];
+  const graph = find(phase, (node) => node.className === "roadmap-graph");
+  assert.ok(graph);
+  assert.equal(walk(graph).filter((node) => node.className === "roadmap-box-button").length, 2);
+  assert.ok(find(graph, (node) => node.className === "roadmap-connector-row"));
+  assert.ok(find(graph, (node) => node.className.startsWith("roadmap-edge ")));
+  assert.equal(find(graph, (node) => node.className === "roadmap-box-button").textContent, "18a  A beautifully lo…");
+  assert.equal(find(graph, (node) => node.className === "roadmap-box-button").attributes.get("title"), "Boundary");
+  assert.equal(find(graph, (node) => node.className === "roadmap-follow-up").textContent, "18aF  Fix the goal");
+
+  await find(graph, (node) => node.className === "roadmap-box-button").dispatch("click");
+  assert.ok(client.calls.file.includes(BASE));
+  await find(graph, (node) => node.className === "roadmap-follow-up").dispatch("click");
+  assert.ok(client.calls.file.includes(FOLLOW_UP));
+  assert.ok(!find(document.getElementById("roadmap"), (node) => node.tagName === "SVG"));
+});
+
+test("spec file listing connects cross-phase follow-ups to the graph and viewer", async () => {
+  const followUpPath = "specs/37/37eF-fix-the-goal.md";
+  const roadmap = {
+    goal: "Show follow-ups",
+    phases: [
+      { id: "37", name: "Sandbox", status: "in_progress", items: [{ title: "Sandbox", spec: "specs/37/37e-test.md", after: [] }] },
+      { id: "39", name: "Workflow", status: "next", items: [{ title: "Run", spec: "specs/39/39b-run.md", after: ["37eF"] }] },
+    ],
+  };
+  const client = fakeClient(JSON.stringify(roadmap), {
+    specFilesReply: { paths: [followUpPath] },
+    fileOverrides: {
+      "specs/37/37e-test.md": "# 37e — Shell sandbox\nbody",
+      [followUpPath]: "# 37eF — Fix the goal\nbody",
+      "specs/39/39b-run.md": "# 39b — Run a spec\nbody",
+    },
+  });
+  const document = new FakeDocument();
+  await start({ global: {}, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const rail = document.getElementById("roadmap");
+  const priorGraph = find(rail.children[0], (node) => node.className === "roadmap-graph");
+  assert.equal(find(priorGraph, (node) => node.className === "roadmap-follow-up").textContent, "37eF  Fix the goal");
+  const currentPhase = rail.children[1];
+  assert.ok(find(currentPhase, (node) => node.className === "roadmap-graph"));
+  assert.ok(!find(currentPhase, (node) => node.className === "roadmap-graph-error"));
+
+  await find(priorGraph, (node) => node.className === "roadmap-box-button").dispatch("click");
+  assert.match(visibleText(document.getElementById("spec")), /37eF-fix-the-goal/);
+  assert.equal(client.calls.specFiles, 1);
+});
+
+test("spec file listing failure keeps the bound roadmap paths", async () => {
+  const roadmap = {
+    goal: "Keep the roadmap available",
+    phases: [{ id: "18", name: "Client", status: "in_progress", items: [{ title: "Open boundary", spec: BASE, after: [] }] }],
+  };
+  const client = fakeClient(JSON.stringify(roadmap), { specFilesFailure: true });
+  const document = new FakeDocument();
+  await start({ global: {}, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const phase = document.getElementById("roadmap").children[0];
+  assert.ok(find(phase, (node) => node.className === "roadmap-graph"));
+  assert.equal(find(phase, (node) => node.className === "roadmap-box-button").textContent, "18a  Open boundary");
 });
 
 test("conversation context and per-agent usage render and refresh after compaction", async () => {

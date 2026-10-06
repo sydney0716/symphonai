@@ -16,8 +16,10 @@ Edit only:
 
 Do not touch: <anything adjacent that could plausibly be dragged in>.
 
-<Registry delta: state `+N` or `0`, never an absolute count — a sibling spec
-landing first moves both numbers. Ask for the before and after to be reported.>
+<Registry delta: the checks the acceptance criteria need, usually one per
+criterion that names new behaviour; `0` is fine. Never "at least +N": a minimum
+invites checks written for the count. Ask for the before and after to be
+reported.>
 
 Never any file under `specs/` except this task's report: a spec is the contract
 the work is graded against, so an implementer that edits it is grading itself.
@@ -70,9 +72,12 @@ name in each criterion the assertion that would fail without the change.>
 <Scope this to what the change can reach. A command that cannot be affected by
 the change is pure cost.>
 
-- `python3 scripts/check.py --only <area>` — matches most changes; match the
-  selector to the surface you touched.
-- `python3 scripts/check.py` — the whole suite, once before you finish.
+- `python3 scripts/check.py` — the whole suite, once, when the change is
+  complete. It already contains every narrower selector, so Validation lists no
+  `--only` line beside it.
+- While working, name the narrow selector to iterate with in the spec's
+  Context or Tests, ending with a dot (`--only app.`). `--only` matches a
+  substring, so `--only app` also picks up `host_approvals.*`.
 - `python3 scripts/checks/_selfcheck.py` — only when this change edits the
   runner itself (`scripts/check.py` or `scripts/checks/harness.py`). Once.
 - `.venv/bin/python scripts/smoke_host.py` — only when the host changed. A

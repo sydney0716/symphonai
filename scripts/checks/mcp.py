@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 from pathlib import Path
@@ -31,7 +30,6 @@ from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect
 from symphonai_api.trust import RepositoryTrust, TrustList
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -730,38 +728,6 @@ def close_is_idempotent() -> None:
             fail("idempotent close left the server process alive")
 
 
-@check("mcp.import_boundary")
-def import_boundary() -> None:
-    path = Path(__file__).resolve().parents[2] / "symphonai_api/mcp.py"
-    source = path.read_text(encoding="utf-8")
-    forbidden = _forbidden_imports(source)
-    expanded = {
-        "agent_loop",
-        "leader",
-        "runner",
-        "agent_run",
-        "agent_spec",
-        "agent_file",
-        "child_context",
-        "hooks",
-        "provider_catalog",
-        "providers",
-    }
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module] if node.module is not None else []
-        else:
-            continue
-        forbidden.extend(
-            module
-            for module in modules
-            if set(module.split(".")) & expanded
-        )
-    if forbidden:
-        fail(f"mcp.py imports forbidden runtime modules: {sorted(set(forbidden))!r}")
 
 
 @check("mcp.trust_grants_a_repository")

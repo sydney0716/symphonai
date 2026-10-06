@@ -295,11 +295,6 @@ def check_always_deny_precedes_remembered_grant() -> None:
         fail(f"always-denied rm consulted or bypassed a remembered grant: {decision!r}")
 
 
-@check("host_approvals.permissions_untouched")
-def check_permissions_untouched() -> None:
-    source = ROOT / "symphonai_api" / "permissions.py"
-    if not source.is_file() or "class PermissionPolicy" not in source.read_text(encoding="utf-8"):
-        fail("permissions module was not present for the approval boundary")
 
 
 @check("host_approvals.approval_records_match")

@@ -539,38 +539,3 @@ def directory_roster() -> None:
             fail(f"roster exposed {type(exc).__name__}: {exc!r}")
         else:
             fail("malformed skill was silently skipped")
-
-
-@check("skills.no_runtime_imports")
-def no_runtime_imports() -> None:
-    path = Path(__file__).resolve().parents[2] / "symphonai_api/skills.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    forbidden = {
-        "agent_loop",
-        "leader",
-        "runner",
-        "agent_run",
-        "agent_spec",
-        "agent_file",
-        "child_context",
-        "hooks",
-        "provider_catalog",
-        "providers",
-    }
-    imported = {
-        node.module.split(".")[1]
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module is not None
-        and node.module.startswith("symphonai_api.")
-    }
-    if imported & forbidden:
-        fail(f"skills.py imports forbidden modules: {sorted(imported & forbidden)!r}")
-    shared_estimator = any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "symphonai_api.compaction"
-        and any(alias.name == "estimate_text_tokens" for alias in node.names)
-        for node in ast.walk(tree)
-    )
-    if not shared_estimator:
-        fail("skills.py does not import compaction.estimate_text_tokens")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import itertools
 import json
 import tempfile
@@ -31,7 +30,6 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.models import ToolCall
 from symphonai_api.tools.shell import RunShellTool
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -731,51 +729,8 @@ effort = "xhigh"
             fail("ModelSelector restricted an opaque provider effort")
 
 
-def _agent_file_forbidden_imports(source: str) -> list[str]:
-    found = _forbidden_imports(source)
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = ([node.module] if node.module is not None else []) + [
-                alias.name for alias in node.names
-            ]
-        else:
-            continue
-        for module in modules:
-            if (
-                any(part in FORBIDDEN_AGENT_FILE_IMPORTS for part in module.split("."))
-                and module not in found
-            ):
-                found.append(module)
-    return found
 
 
-@check("agent_file.no_runtime_imports")
-def no_runtime_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/agent_file.py").read_text(encoding="utf-8")
-    found = _agent_file_forbidden_imports(source)
-    if found:
-        fail(f"agent_file imports runtime wiring: {found!r}")
-    probes = (
-        "from symphonai_api.agent_loop import ApiAgent\n",
-        "from symphonai_api.leader import Leader\n",
-        "import symphonai_api.runner\n",
-        "from symphonai_api import agent_run\n",
-        "from . import child_context\n",
-        "from symphonai_api.provider_catalog import PROVIDERS\n",
-        "from symphonai_api.providers.fake import FakeModelProvider\n",
-    )
-    for probe in probes:
-        if not _agent_file_forbidden_imports(probe):
-            fail(f"import inspection missed {probe.strip()!r}")
-    safe = (
-        "from symphonai_api.agent_spec import AgentSpec\n",
-        "from symphonai_api.budgets import RunBudget\n",
-    )
-    for probe in safe:
-        if _agent_file_forbidden_imports(probe):
-            fail(f"import inspection rejected {probe.strip()!r}")
 
 
 @check("agent_file.web_search_and_skill_allow_and_deny")

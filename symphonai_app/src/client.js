@@ -450,6 +450,10 @@ export function createClient({
       return request("GET", `/files?${parameters}`);
     },
 
+    specFiles() {
+      return request("GET", "/spec/files");
+    },
+
     history(limit = 100) {
       return request("GET", `/history?limit=${encodeURIComponent(String(limit))}`);
     },

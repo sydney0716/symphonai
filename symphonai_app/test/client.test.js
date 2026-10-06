@@ -406,6 +406,22 @@ test("files encodes the query and limit as search parameters", async () => {
   });
 });
 
+test("specFiles requests the authenticated spec path listing", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, { paths: ["specs/37/37eF-fix.md"] });
+    },
+  });
+  assert.deepEqual(await client.specFiles(), { paths: ["specs/37/37eF-fix.md"] });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/spec/files");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+});
+
 test("history requests the selected limit", async () => {
   const records = [];
   const client = createClient({

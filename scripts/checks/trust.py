@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 import tempfile
@@ -14,7 +13,6 @@ from symphonai_api.trust import (
     TrustList,
     trust_from_config,
 )
-from scripts.checks.agent_spec import _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -222,61 +220,3 @@ def matching_is_exact() -> None:
                     f"exact trust differed for {root!s}/{capability}: "
                     f"actual={actual}, expected={expected}"
                 )
-
-
-@check("trust.no_runtime_imports")
-def no_runtime_imports() -> None:
-    root = Path(__file__).resolve().parents[2]
-    path = root / "symphonai_api/trust.py"
-    source = path.read_text(encoding="utf-8")
-    forbidden = _forbidden_imports(source)
-    expanded = {
-        "agent_loop",
-        "leader",
-        "runner",
-        "agent_run",
-        "agent_spec",
-        "agent_file",
-        "child_context",
-        "hooks",
-        "mcp",
-        "skills",
-        "permissions",
-        "provider_catalog",
-        "providers",
-    }
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module] if node.module is not None else []
-        else:
-            continue
-        forbidden.extend(
-            module
-            for module in modules
-            if set(module.split(".")) & expanded
-        )
-    if forbidden:
-        fail(f"trust.py imports forbidden runtime modules: {sorted(set(forbidden))!r}")
-
-    for consumer in ("hooks.py", "mcp.py"):
-        consumer_source = (root / "symphonai_api" / consumer).read_text(
-            encoding="utf-8"
-        )
-        consumer_forbidden = _forbidden_imports(consumer_source)
-        if consumer_forbidden:
-            fail(
-                f"{consumer} imports forbidden runtime modules: "
-                f"{sorted(set(consumer_forbidden))!r}"
-            )
-        consumer_tree = ast.parse(consumer_source)
-        trust_imports = [
-            node
-            for node in ast.walk(consumer_tree)
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "symphonai_api.trust"
-        ]
-        if len(trust_imports) != 1:
-            fail(f"{consumer} did not gain exactly one trust import")

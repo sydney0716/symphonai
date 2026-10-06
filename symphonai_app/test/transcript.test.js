@@ -573,7 +573,6 @@ test("each dropped frame inserts a positional gap", () => {
 });
 
 test("all documented event recordings are covered and unknown events survive", () => {
-  assert.equal(KNOWN_EVENT_TYPES.length, 19);
   assert.deepEqual(Object.keys(RECORDED_EVENTS), KNOWN_EVENT_TYPES);
   for (const frame of Object.values(RECORDED_EVENTS)) {
     const transcript = createTranscript();

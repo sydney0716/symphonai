@@ -17,7 +17,6 @@ from symphonai_api.child_context import seed_messages, tail_start
 from symphonai_api.compaction import recent_window_start
 from symphonai_api.models import Message, Role, ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
-from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -479,30 +478,3 @@ def seeds_memory() -> None:
                     for parent_system in parent_systems
                 ):
                     fail("memory seeding retained a parent system message")
-
-
-@check("child_context.no_runtime_imports")
-def no_runtime_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/child_context.py").read_text()
-    original_forbidden = set(FORBIDDEN_IMPORTS)
-    FORBIDDEN_IMPORTS.add("agent_run")
-    try:
-        found = _forbidden_imports(source)
-        if found:
-            fail(f"child_context imports runtime wiring: {found!r}")
-        probes = [
-            ("from symphonai_api.agent_loop import ApiAgent\n", True),
-            ("from symphonai_api.leader import Leader\n", True),
-            ("from symphonai_api.runner import run_task\n", True),
-            ("from symphonai_api.provider_catalog import providers\n", True),
-            ("from symphonai_api.agent_run import AgentRun\n", True),
-            ("from symphonai_api.providers.openai import OpenAIProvider\n", True),
-            ("from symphonai_api import agent_run\n", True),
-            ("from . import leader\n", True),
-        ]
-        for line, expected in probes:
-            if bool(_forbidden_imports(line)) != expected:
-                fail(f"import inspection got {line.strip()!r} wrong")
-    finally:
-        FORBIDDEN_IMPORTS.clear()
-        FORBIDDEN_IMPORTS.update(original_forbidden)

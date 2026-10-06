@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import http.client
 import io
 import json
@@ -225,21 +224,6 @@ def check_no_token_in_argv() -> None:
         fail("client accepts a bearer token in argv")
 
 
-@check("host_client.stdlib_only")
-def check_stdlib_only() -> None:
-    allowed = {"__future__", "argparse", "dataclasses", "http", "json", "queue", "select", "subprocess", "sys", "threading", "typing"}
-    for path in (ROOT / "symphonai_host").glob("*.py"):
-        if path.name not in {"client.py", "cli.py"}:
-            continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Import):
-                for name in node.names:
-                    if name.name.split(".")[0] not in allowed and not name.name.startswith("symphonai_"):
-                        fail(f"third-party import in {path.name}: {name.name}")
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                root = node.module.split(".")[0]
-                if root not in allowed and not root.startswith("symphonai_"):
-                    fail(f"third-party import in {path.name}: {node.module}")
 
 
 class _ScriptedClient:

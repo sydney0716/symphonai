@@ -14,7 +14,6 @@ from symphonai_api.cost import UsageTotals
 from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.session import SessionStore, TranscriptWriter
-from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -353,34 +352,3 @@ def graph_is_total() -> None:
                     f"{defect} produced {actual_nodes} nodes; "
                     f"expected {expected_nodes}"
                 )
-
-
-@check("agent_run.no_runtime_imports")
-def no_runtime_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/agent_run.py").read_text()
-    found = _forbidden_imports(source)
-    if found:
-        fail(f"agent_run imports runtime wiring: {found!r}")
-    probes = [
-        ("from symphonai_api.runner import z\n", True),
-        ("from symphonai_api.leader import z\n", True),
-        ("from symphonai_api.agent_loop import z\n", True),
-        ("from symphonai_api.providers.openai import z\n", True),
-        ("import symphonai_api.runner\n", True),
-        ("from . import runner\n", True),
-        ("from symphonai_api import runner\n", True),
-        ("from symphonai_api import leader, budgets\n", True),
-        ("import symphonai_api.budgets\n", False),
-        ("from symphonai_api.budgets import RunBudget\n", False),
-    ]
-    if FORBIDDEN_IMPORTS != {
-        "agent_loop",
-        "leader",
-        "runner",
-        "provider_catalog",
-        "providers",
-    }:
-        fail("shared forbidden import set changed")
-    for line, expected in probes:
-        if bool(_forbidden_imports(line)) != expected:
-            fail(f"import inspection got {line.strip()!r} wrong")

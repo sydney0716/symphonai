@@ -23,7 +23,6 @@ from symphonai_api.agent_memory import (
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.memory import MemoryTool
-from scripts.checks.agent_spec import FORBIDDEN_IMPORTS, _forbidden_imports
 from scripts.checks.harness import check, fail
 
 
@@ -366,30 +365,3 @@ def tool_writes_and_reopens() -> None:
         for phrase in ("durable lesson", "person taught", "task state", "finding", "summary"):
             if phrase not in description:
                 fail(f"memory tool description omitted {phrase!r}: {description!r}")
-
-
-@check("agent_memory.no_runtime_imports")
-def no_runtime_imports() -> None:
-    source = (REPO_ROOT / "symphonai_api/agent_memory.py").read_text(encoding="utf-8")
-    original_forbidden = set(FORBIDDEN_IMPORTS)
-    FORBIDDEN_IMPORTS.update({"agent_run", "agent_spec", "child_context"})
-    try:
-        found = _forbidden_imports(source)
-        if found:
-            fail(f"agent_memory imports runtime wiring: {found!r}")
-        probes = (
-            "from symphonai_api.agent_loop import ApiAgent\n",
-            "from symphonai_api.leader import Leader\n",
-            "import symphonai_api.runner\n",
-            "from symphonai_api import agent_run\n",
-            "from . import agent_spec\n",
-            "from symphonai_api.child_context import seed_messages\n",
-            "from symphonai_api.provider_catalog import providers\n",
-            "from symphonai_api.providers.fake import FakeModelProvider\n",
-        )
-        for probe in probes:
-            if not _forbidden_imports(probe):
-                fail(f"import inspection missed {probe.strip()!r}")
-    finally:
-        FORBIDDEN_IMPORTS.clear()
-        FORBIDDEN_IMPORTS.update(original_forbidden)

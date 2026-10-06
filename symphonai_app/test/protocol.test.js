@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 
 import {
   KNOWN_EVENT_TYPES,
@@ -40,30 +43,14 @@ test("decodeFrame enumerates malformed frames", () => {
   }
 });
 
-test("decodeEvent recognizes all nineteen documented event types", () => {
-  const documented = [
-    "RunStarted",
-    "RunFinished",
-    "RunFailed",
-    "TurnStarted",
-    "TurnFinished",
-    "AssistantTextDelta",
-    "ToolCallStarted",
-    "ToolCallFinished",
-    "PromptSubmitted",
-    "HistoryMessage",
-    "ToolCallFailed",
-    "PermissionRequested",
-    "PermissionDenied",
-    "SessionStarted",
-    "SessionEnded",
-    "SubagentSpawned",
-    "SubagentStopped",
-    "CompactionApplied",
-    "GoalChanged",
-  ];
-  assert.equal(documented.length, 19);
-  assert.deepEqual(KNOWN_EVENT_TYPES, documented);
+test("decodeEvent recognizes documented event types", () => {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const hostPackage = ["symphonai", "host"].join("_");
+  const protocol = readFileSync(resolve(testDir, `../../${hostPackage}/PROTOCOL.md`), "utf8");
+  const eventsSection = protocol.split("## Events", 2)[1]?.split("\n## ", 1)[0] ?? "";
+  const documented = [...eventsSection.matchAll(/^\| `([A-Za-z0-9_]+)` \|/gm)].map((match) => match[1]);
+  assert.ok(documented.length > 0, "PROTOCOL.md event table was not found");
+  for (const type of documented) assert.ok(KNOWN_EVENT_TYPES.includes(type), `${type} is undocumented by the app`);
   for (const type of documented) {
     assert.deepEqual(decodeEvent({ type, marker: type }), {
       type,
