@@ -25,6 +25,41 @@ test("lays out splits, follow-ups, and a merge in dependency rows", () => {
   ]);
 });
 
+test("folds items for the same spec into one node without marking partial work done", () => {
+  const first = { ...spec("18b"), title: "Turn state machine", done: true };
+  const second = { ...spec("18b"), title: "Queue input while running", done: false };
+  const result = layoutPhase([first, second]);
+  const node = result.rows.flat().find(({ id }) => id === "18b");
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.rows.flat().filter(({ id }) => id === "18b").length, 1);
+  assert.equal(node.done, false);
+  assert.deepEqual(node.items, ["Turn state machine", "Queue input while running"]);
+});
+
+test("folded spec items union their dependencies", () => {
+  const result = layoutPhase([
+    spec("18a"),
+    { ...spec("18b", ["18a"]), title: "Turn state machine" },
+    { ...spec("18b", ["18c"]), title: "Queue input while running" },
+    spec("18c"),
+  ]);
+
+  assert.deepEqual(result.edges.filter(({ to }) => to === "18b"), [
+    { from: "18a", to: "18b" },
+    { from: "18c", to: "18b" },
+  ]);
+});
+
+test("same task ids from different specs still report a duplicate", () => {
+  const result = layoutPhase([
+    { title: "First", spec: "specs/18/18b-first.md" },
+    { title: "Second", spec: "specs/18/18b-second.md" },
+  ]);
+
+  assert.match(result.error, /duplicate id 18b/);
+});
+
 test("groups four parallel children and attaches their incoming edges to the group", () => {
   const result = layoutPhase([spec("a"), ...["d", "b", "c", "e"].map((id) => spec(id, ["a"]))]);
   assert.equal(result.rows[1].length, 1);
@@ -103,4 +138,16 @@ test("defaults phases to an array-order chain and marks blocked phase edges", ()
     phases[0],
     { ...phases[1], after: ["99"] },
   ]).error, /phase 02.*99/);
+});
+
+test("phase task layouts recognize cross-phase task references", () => {
+  const phases = [
+    { id: "37", name: "Prior", status: "done", progress: { done: 1, total: 1 }, items: [spec("37e")] },
+    { id: "39", name: "Current", status: "next", progress: { done: 0, total: 1 }, items: [spec("39a", ["37eF"])] },
+  ];
+  const result = layoutRoadmap(phases);
+  const current = result.rows.flat().find(({ id }) => id === "39");
+
+  assert.equal(current.taskLayout.error, undefined);
+  assert.ok(current.taskLayout.rows[0][0].tags.includes("← 37eF"));
 });

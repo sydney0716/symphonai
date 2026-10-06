@@ -134,19 +134,32 @@ function layoutNodes(nodes, { collapseDone }) {
 }
 
 export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } = {}) {
-  const nodes = items.map((item, index) => {
+  const itemsBySpec = new Map();
+  items.forEach((item, index) => {
     const id = itemId(item, index);
+    const path = Array.isArray(item.spec) ? item.spec[0] : item.spec;
+    const key = typeof path === "string" ? `spec:${path}` : `item:${index}`;
+    const group = itemsBySpec.get(key) ?? { id, members: [] };
+    group.members.push(item);
+    itemsBySpec.set(key, group);
+  });
+  const nodes = [...itemsBySpec.values()].map(({ id, members }) => {
+    const item = members[0];
     const followUpsForItem = valuesFor(followUps, id) ?? [];
+    const state = valuesFor(states, id) ?? (item.done ? "done" : "todo");
     return {
       id,
       title: shortTitle(valuesFor(titles, id) || item.title),
+      items: members.map(({ title }) => title),
       followUps: followUpsForItem.map((followUp) => typeof followUp === "string"
         ? { id: followUp, title: shortTitle(valuesFor(titles, followUp) || followUp) }
         : { ...followUp, title: shortTitle(valuesFor(titles, followUp.id) || followUp.title || followUp.id) }),
       tags: [],
-      state: valuesFor(states, id) ?? (item.done ? "done" : "todo"),
-      after: Array.isArray(item.after) ? item.after : [],
-      done: item.done === true || valuesFor(states, id) === "done" || valuesFor(states, id) === "committed",
+      state,
+      after: [...new Set(members.flatMap((member) => Array.isArray(member.after) ? member.after : []))],
+      done: members.length === 1
+        ? item.done === true || state === "done" || state === "committed"
+        : members.every((member) => member.done === true),
     };
   });
   const byId = new Set(nodes.map((node) => node.id));
@@ -164,6 +177,10 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
 
 export function layoutRoadmap(phases, { taskOptions = () => ({}) } = {}) {
   const phaseIds = new Set(phases.map((phase) => phase.id));
+  const taskTitles = new Map();
+  for (const phase of phases) {
+    phase.items.forEach((item, index) => taskTitles.set(itemId(item, index), item.title));
+  }
   const nodes = phases.map((phase, index) => {
     const after = phase.after ?? (index > 0 ? [phases[index - 1].id] : []);
     if (!Array.isArray(after) || after.some((id) => typeof id !== "string")) {
@@ -171,13 +188,29 @@ export function layoutRoadmap(phases, { taskOptions = () => ({}) } = {}) {
     }
     const missing = after.find((id) => !phaseIds.has(id));
     if (missing !== undefined) return { error: `phase ${phase.id} after names unknown phase ${missing}` };
+    const options = taskOptions(phase) ?? {};
+    const titles = new Map(taskTitles);
+    if (options.titles instanceof Map) {
+      for (const [id, title] of options.titles) titles.set(id, title);
+    } else {
+      for (const [id, title] of Object.entries(options.titles ?? {})) titles.set(id, title);
+    }
+    for (const candidate of phases) {
+      if (candidate.id === phase.id) continue;
+      for (const item of phase.items) {
+        const dependencies = Array.isArray(item.after) ? item.after : [];
+        for (const dependency of dependencies) {
+          if (dependency.startsWith(candidate.id)) titles.set(dependency, dependency);
+        }
+      }
+    }
     return {
       id: phase.id,
       title: phase.name,
       name: phase.name,
       progress: phase.progress,
       phase,
-      taskLayout: layoutPhase(phase.items, taskOptions(phase) ?? {}),
+      taskLayout: layoutPhase(phase.items, { ...options, titles }),
       tags: [],
       followUps: [],
       state: phase.status,
