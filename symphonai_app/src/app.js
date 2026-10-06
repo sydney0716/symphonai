@@ -188,7 +188,6 @@ export async function start({ global, document, client }) {
   let sessions = initialSessions;
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
-  let lastActivityRefresh = 0;
   let forkConflict = null;
   let conversation = conversationReply?.conversation ?? null;
   let roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
@@ -2321,7 +2320,32 @@ export async function start({ global, document, client }) {
     }
   }
 
-  let lastSpecRefresh = 0;
+  function leadingTrailingRefresh(refresh) {
+    let lastRefresh = null;
+    let trailingTimer = null;
+    return async function requestRefresh() {
+      const now = global.Date?.now() ?? Date.now();
+      if (lastRefresh === null || now - lastRefresh >= 1000) {
+        lastRefresh = now;
+        await refresh();
+        return;
+      }
+      if (trailingTimer === null) {
+        const delay = Math.max(0, 1000 - (now - lastRefresh));
+        const schedule = global.setTimeout ?? setTimeout;
+        trailingTimer = schedule(async () => {
+          trailingTimer = null;
+          lastRefresh = global.Date?.now() ?? Date.now();
+          await refresh();
+        }, delay);
+      }
+    };
+  }
+
+  const requestSpecRefresh = leadingTrailingRefresh(async () => {
+    await refreshSpecState().catch(() => {});
+  });
+
   async function refreshSpecsForEvent(frame) {
     const type = frame.kind === "event" ? frame.payload?.type : "";
     if (!["RunFinished", "RunFailed", "GoalChanged"].includes(type)) return;
@@ -2329,10 +2353,24 @@ export async function start({ global, document, client }) {
     if (typeof sessionId !== "string" || !specRuns.some((run) =>
       run.session_id === sessionId || run.review?.session_id === sessionId
     )) return;
-    const now = Date.now();
-    if (now - lastSpecRefresh < 1000) return;
-    lastSpecRefresh = now;
-    await refreshSpecState().catch(() => {});
+    await requestSpecRefresh();
+  }
+
+  const requestActivityRefresh = leadingTrailingRefresh(async () => {
+    try {
+      sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+      showProjects();
+    } catch {
+      // A transient listing failure does not affect the current transcript.
+    }
+  });
+
+  async function refreshActivityForOtherSession(sessionId) {
+    if (typeof sessionId === "string" && sessionId !== currentSessionId) {
+      await requestActivityRefresh();
+      return true;
+    }
+    return false;
   }
 
   async function onFrame(frame) {
@@ -2343,19 +2381,7 @@ export async function start({ global, document, client }) {
     }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
     await refreshSpecsForEvent(frame);
-    if (typeof frameSessionId === "string" && frameSessionId !== currentSessionId) {
-      const now = Date.now();
-      if (now - lastActivityRefresh >= 1000) {
-        lastActivityRefresh = now;
-        try {
-          sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
-          showProjects();
-        } catch {
-          // A transient listing failure does not affect the current transcript.
-        }
-      }
-      return;
-    }
+    if (await refreshActivityForOtherSession(frameSessionId)) return;
     const previousLength = transcript.model.length;
     transcript.apply(frame);
     if (

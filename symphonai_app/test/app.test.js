@@ -3771,14 +3771,99 @@ function documentButton(document, label) {
   return find(document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === label);
 }
 
-test("listed GoalChanged events coalesce roadmap run refreshes", async () => {
+function fakeClock(start = 10_000) {
+  let now = start;
+  let nextId = 0;
+  const timers = new Map();
+  return {
+    Date: { now: () => now },
+    setTimeout(callback, delay) {
+      const id = ++nextId;
+      timers.set(id, { due: now + delay, callback });
+      return id;
+    },
+    async advance(milliseconds) {
+      const target = now + milliseconds;
+      while (true) {
+        const next = [...timers.entries()].sort((left, right) => left[1].due - right[1].due)[0];
+        if (!next || next[1].due > target) break;
+        timers.delete(next[0]);
+        now = next[1].due;
+        await next[1].callback();
+      }
+      now = target;
+    },
+  };
+}
+
+function withClock(clock) {
+  const browser = fakeGlobal().global;
+  browser.Date = clock.Date;
+  browser.setTimeout = clock.setTimeout;
+  return browser;
+}
+
+test("spec-state refresh fetches immediately and once at the window end", async () => {
+  const clock = fakeClock();
   const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
-  const { app } = await openWorkflowItem(client);
+  const document = new FakeDocument();
+  const app = await start({ global: withClock(clock), document, client });
+  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-item").dispatch("click");
+  const before = client.specRunReadCount();
+  const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "pause", phase: "paused", rounds: 1, max_rounds: 5, reason: "stopped" });
+  await app.onFrame(frame);
+  assert.equal(client.specRunReadCount(), before + 1);
+  await clock.advance(100);
+  client.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished" }]);
+  await app.onFrame(frame);
+  assert.equal(client.specRunReadCount(), before + 1);
+  assert.match(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-item").textContent, /running$/);
+  await clock.advance(900);
+  assert.equal(client.specRunReadCount(), before + 2);
+  assert.match(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-item").textContent, /ran$/);
+});
+
+test("three spec-state events inside one window make one trailing refresh", async () => {
+  const clock = fakeClock();
+  const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
+  const document = new FakeDocument();
+  const app = await start({ global: withClock(clock), document, client });
   const before = client.specRunReadCount();
   const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "round", phase: "active", rounds: 1, max_rounds: 5, reason: "" });
   await app.onFrame(frame);
+  await clock.advance(100);
   await app.onFrame(frame);
-  await new Promise((resolve) => setTimeout(resolve, 1050));
-  const after = client.specRunReadCount();
-  assert.equal(after - before, 1);
+  await clock.advance(100);
+  await app.onFrame(frame);
+  assert.equal(client.specRunReadCount(), before + 1);
+  await clock.advance(800);
+  assert.equal(client.specRunReadCount(), before + 2);
+});
+
+test("sidebar activity refreshes immediately and once at the window end", async () => {
+  const clock = fakeClock();
+  const document = new FakeDocument();
+  const initial = { run_id: "background", title: "Background", repo_root: "/work/current", activity: "working" };
+  const client = fakeClient(fixtureRoadmap(), { sessions: [initial] });
+  const replies = [
+    [initial],
+    [{ ...initial, activity: "working" }],
+    [{ ...initial, activity: "waiting" }],
+  ];
+  client.sessions = async (limit) => {
+    client.calls.sessions.push(limit);
+    return replies[Math.min(client.calls.sessions.length - 1, replies.length - 1)];
+  };
+  await start({ global: withClock(clock), document, client });
+  const before = client.calls.sessions.length;
+  const frame = eventFrame("RunFinished", { session_id: "background" });
+  await client.emit(frame);
+  assert.equal(client.calls.sessions.length, before + 1);
+  await clock.advance(100);
+  await client.emit(frame);
+  assert.equal(client.calls.sessions.length, before + 1);
+  assert.match(find(document.getElementById("sidebar"), (node) => node.className === "session-link").textContent, /working$/);
+  await clock.advance(900);
+  assert.equal(client.calls.sessions.length, before + 2);
+  assert.match(find(document.getElementById("sidebar"), (node) => node.className === "session-link").textContent, /waiting$/);
 });
