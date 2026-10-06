@@ -14,23 +14,7 @@ function valuesFor(source, id) {
   return source instanceof Map ? source.get(id) : source?.[id];
 }
 
-export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } = {}) {
-  const nodes = items.map((item, index) => {
-    const id = itemId(item, index);
-    const title = shortTitle(valuesFor(titles, id) || item.title);
-    const followUpsForItem = valuesFor(followUps, id) ?? [];
-    return {
-      id,
-      title,
-      followUps: followUpsForItem.map((followUp) => typeof followUp === "string"
-        ? { id: followUp, title: shortTitle(valuesFor(titles, followUp) || followUp) }
-        : { ...followUp, title: shortTitle(valuesFor(titles, followUp.id) || followUp.title || followUp.id) }),
-      tags: [],
-      state: valuesFor(states, id) ?? (item.done ? "done" : "todo"),
-      after: Array.isArray(item.after) ? item.after : [],
-      done: item.done === true || valuesFor(states, id) === "done" || valuesFor(states, id) === "committed",
-    };
-  });
+function layoutNodes(nodes, { collapseDone }) {
   const byId = new Map();
   for (const node of nodes) {
     if (byId.has(node.id)) return { error: `duplicate id ${node.id}` };
@@ -39,9 +23,8 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
   const parents = new Map(nodes.map((node) => [node.id, []]));
   for (const node of nodes) {
     for (const dependency of node.after) {
-      if (byId.has(dependency)) parents.get(node.id).push(dependency);
-      else if (valuesFor(titles, dependency) !== undefined) node.tags.push(`← ${dependency}`);
-      else return { error: `unknown dependency ${dependency}` };
+      if (!byId.has(dependency)) return { error: `unknown dependency ${dependency}` };
+      parents.get(node.id).push(dependency);
     }
   }
 
@@ -51,9 +34,10 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
     if (rowsById.has(id)) return rowsById.get(id);
     if (visiting.has(id)) throw new Error(`cycle at ${id}`);
     visiting.add(id);
-    const row = parents.get(id).length === 0
+    const dependencies = parents.get(id);
+    const row = dependencies.length === 0
       ? 0
-      : 1 + Math.max(...parents.get(id).map(rowFor));
+      : 1 + Math.max(...dependencies.map(rowFor));
     visiting.delete(id);
     rowsById.set(id, row);
     return row;
@@ -86,7 +70,7 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
         state: "group",
         row,
         column: 0,
-        group: members.map((member) => ({ id: member.id, title: member.title, followUps: member.followUps, tags: member.tags, state: member.state })),
+        group: members.map((member) => ({ ...member, column: 0 })),
       };
       rows.push([group]);
       for (const [column, member] of members.entries()) {
@@ -96,17 +80,13 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
     } else {
       const positioned = members.map((member, column) => {
         logicalColumns.set(member.id, members.length === 1 ? 0 : column);
-        const positioned = {
-          id: member.id,
-          title: member.title,
-          followUps: member.followUps,
-          tags: member.tags,
-          state: member.state,
+        const positionedNode = {
+          ...member,
           row,
           column: members.length === 1 ? 0 : column,
         };
-        idToRowNode.set(member.id, positioned);
-        return positioned;
+        idToRowNode.set(member.id, positionedNode);
+        return positionedNode;
       });
       rows.push(positioned);
     }
@@ -114,15 +94,17 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
 
   let collapsedIds = [];
   let collapsedRows = 0;
-  while (collapsedRows < rows.length && rows[collapsedRows].length > 0) {
-    const rowIds = nodes.filter((node) => rowsById.get(node.id) === collapsedRows).map((node) => node.id);
-    if (rowIds.length === 0 || rowIds.some((id) => !byId.get(id).done)) break;
-    collapsedIds.push(...rowIds);
-    collapsedRows += 1;
-  }
-  if (collapsedRows === rows.length) {
-    collapsedRows = 0;
-    collapsedIds = [];
+  if (collapseDone) {
+    while (collapsedRows < rows.length && rows[collapsedRows].length > 0) {
+      const rowIds = nodes.filter((node) => rowsById.get(node.id) === collapsedRows).map((node) => node.id);
+      if (rowIds.length === 0 || rowIds.some((id) => !byId.get(id).done)) break;
+      collapsedIds.push(...rowIds);
+      collapsedRows += 1;
+    }
+    if (collapsedRows === rows.length) {
+      collapsedRows = 0;
+      collapsedIds = [];
+    }
   }
   const visibleRows = rows.slice(collapsedRows).map((row, index) => row.map((node) => ({ ...node, row: index })));
   const edges = [];
@@ -135,7 +117,6 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
       const fromRow = rowsById.get(dependency);
       const toRow = rowsById.get(node.id);
       const fromColumn = logicalColumns.get(dependency);
-      const toColumn = logicalColumns.get(node.id);
       const blocked = toRow - fromRow > 1 && nodes.some((candidate) => {
         const candidateRow = rowsById.get(candidate.id);
         return candidateRow > fromRow && candidateRow < toRow &&
@@ -150,4 +131,61 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
     }
   }
   return { rows: visibleRows, edges, summary: collapsedIds.length ? `✓ ${collapsedIds.join(" ")}` : "" };
+}
+
+export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } = {}) {
+  const nodes = items.map((item, index) => {
+    const id = itemId(item, index);
+    const followUpsForItem = valuesFor(followUps, id) ?? [];
+    return {
+      id,
+      title: shortTitle(valuesFor(titles, id) || item.title),
+      followUps: followUpsForItem.map((followUp) => typeof followUp === "string"
+        ? { id: followUp, title: shortTitle(valuesFor(titles, followUp) || followUp) }
+        : { ...followUp, title: shortTitle(valuesFor(titles, followUp.id) || followUp.title || followUp.id) }),
+      tags: [],
+      state: valuesFor(states, id) ?? (item.done ? "done" : "todo"),
+      after: Array.isArray(item.after) ? item.after : [],
+      done: item.done === true || valuesFor(states, id) === "done" || valuesFor(states, id) === "committed",
+    };
+  });
+  const byId = new Set(nodes.map((node) => node.id));
+  for (const node of nodes) {
+    const internal = [];
+    for (const dependency of node.after) {
+      if (byId.has(dependency)) internal.push(dependency);
+      else if (valuesFor(titles, dependency) !== undefined) node.tags.push(`← ${dependency}`);
+      else return { error: `unknown dependency ${dependency}` };
+    }
+    node.after = internal;
+  }
+  return layoutNodes(nodes, { collapseDone: true });
+}
+
+export function layoutRoadmap(phases, { taskOptions = () => ({}) } = {}) {
+  const phaseIds = new Set(phases.map((phase) => phase.id));
+  const nodes = phases.map((phase, index) => {
+    const after = phase.after ?? (index > 0 ? [phases[index - 1].id] : []);
+    if (!Array.isArray(after) || after.some((id) => typeof id !== "string")) {
+      return { error: `phase ${phase.id} after must be a string array` };
+    }
+    const missing = after.find((id) => !phaseIds.has(id));
+    if (missing !== undefined) return { error: `phase ${phase.id} after names unknown phase ${missing}` };
+    return {
+      id: phase.id,
+      title: phase.name,
+      name: phase.name,
+      progress: phase.progress,
+      phase,
+      taskLayout: layoutPhase(phase.items, taskOptions(phase) ?? {}),
+      tags: [],
+      followUps: [],
+      state: phase.status,
+      done: phase.status === "done",
+      after,
+    };
+  });
+  const invalid = nodes.find((node) => node.error);
+  if (invalid) return { error: invalid.error };
+  return layoutNodes(nodes, { collapseDone: false });
 }

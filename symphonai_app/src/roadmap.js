@@ -82,7 +82,21 @@ export function parseRoadmap(json) {
     }
     return { ...phase, items: itemsOf(phase) };
   });
+  const phaseIds = new Set(phases.map((phase) => phase.id));
+  phases.forEach((phase, index) => validatePhaseAfter(phase, index, phaseIds));
   return { goal: value.goal, phases };
+}
+
+function validatePhaseAfter(phase, index, phaseIds) {
+  if (!Object.hasOwn(phase, "after")) return;
+  const label = phaseLabel(phase, index);
+  if (!Array.isArray(phase.after) || phase.after.some((id) => typeof id !== "string")) {
+    throw new RoadmapError(`${label} after must be a string array`);
+  }
+  const missing = phase.after.find((id) => !phaseIds.has(id));
+  if (missing !== undefined) {
+    throw new RoadmapError(`${label} after names unknown phase ${missing}`);
+  }
 }
 
 export function specPaths(item) {
@@ -150,12 +164,16 @@ export function renderRoadmap(state) {
   if (!isObject(state) || !Array.isArray(state.phases)) {
     throw new RoadmapError("render state must contain phases");
   }
+  const phases = state.phases;
+  const phaseIds = new Set(phases.map((phase) => phase.id));
+  phases.forEach((phase, index) => validatePhaseAfter(phase, index, phaseIds));
   return {
     goal: state.goal,
     phases: state.phases.map((phase) => ({
       id: phase.id,
       name: phase.name,
       status: phase.status,
+      ...(Object.hasOwn(phase, "after") ? { after: [...phase.after] } : {}),
       progress: phaseProgress(phase),
       items: itemsOf(phase),
     })),

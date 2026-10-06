@@ -447,13 +447,91 @@ button.session-link {
   color: #9aa7b8;
 }
 
-.roadmap-phase > summary {
-  color: #9aa7b8;
+.roadmap-rail-phase,
+.roadmap-open {
+  display: block;
+  margin: 0.35rem 0;
+  color: #c7d0da;
+  text-decoration: none;
+}
+
+.roadmap-rail-phase:hover,
+.roadmap-open:hover {
+  color: #82b5f2;
+}
+
+.roadmap-page-pane {
+  min-height: 100vh;
+  padding: 1.5rem;
+  overflow: auto;
+}
+
+.roadmap-page-content,
+.roadmap-page-graph {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.roadmap-phase-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  align-items: stretch;
+}
+
+.roadmap-phase-box,
+.roadmap-phase-group,
+.roadmap-phase-chain-summary {
+  grid-column: span 1;
+  min-width: 0;
+}
+
+.roadmap-phase-wide {
+  grid-column: span 2;
+}
+
+.roadmap-phase-box {
+  padding: 0.7rem;
+  border: 1px solid #435263;
+  border-radius: 0.45rem;
+  background: #161d26;
+}
+
+.roadmap-phase-focused {
+  border-color: #82b5f2;
+  box-shadow: 0 0 0 2px #82b5f244;
+}
+
+.roadmap-phase-group {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.roadmap-phase-header,
+.roadmap-phase-chain-summary {
+  display: block;
+  width: 100%;
+  padding: 0.45rem;
+  text-align: left;
+  color: inherit;
+  border: 0;
+  border-radius: 0.3rem;
+  background: #202a36;
   cursor: pointer;
 }
 
-.roadmap-phase {
-  margin: 1rem 0;
+.roadmap-phase-chain-summary {
+  min-height: 2.6rem;
+  color: #7ac99b;
+}
+
+.roadmap-phase-in_progress > .roadmap-phase-header {
+  color: #a9cfff;
+}
+
+.roadmap-phase-tasks {
+  margin-top: 0.35rem;
+  padding-left: 0.35rem;
 }
 
 .roadmap-item {

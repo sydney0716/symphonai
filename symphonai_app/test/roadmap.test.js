@@ -64,6 +64,31 @@ test("both item forms normalize in one fixture", () => {
   ]);
 });
 
+test("phase dependencies are carried and must name existing phases", () => {
+  const parsed = parseRoadmap(JSON.stringify({
+    goal: "phase dependencies",
+    phases: [
+      { id: "36", name: "First", status: "done", items: [] },
+      { id: "38", name: "Second", status: "next", after: ["36"], items: [] },
+    ],
+  }));
+  assert.deepEqual(parsed.phases[1].after, ["36"]);
+  assert.deepEqual(renderRoadmap(parsed).phases[1].after, ["36"]);
+  assert.throws(
+    () => parseRoadmap(JSON.stringify({
+      goal: "bad dependency",
+      phases: [
+        { id: "39", name: "Run", status: "next", after: ["99"], items: [] },
+      ],
+    })),
+    (error) => error instanceof RoadmapError && /phase 39.*99/.test(error.message),
+  );
+  assert.throws(
+    () => renderRoadmap({ phases: [{ id: "39", name: "Run", status: "next", after: ["99"], items: [] }] }),
+    (error) => error instanceof RoadmapError && /phase 39.*99/.test(error.message),
+  );
+});
+
 test("specPaths accepts both binding forms and specPath is gone", () => {
   assert.deepEqual(
     specPaths({ title: "one", spec: "specs/18/18c.md" }),

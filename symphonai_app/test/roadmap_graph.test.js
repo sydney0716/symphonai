@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { layoutPhase } from "../src/roadmap_graph.js";
+import { layoutPhase, layoutRoadmap } from "../src/roadmap_graph.js";
 
 const spec = (id, after = undefined, fields = {}) => ({
   title: id,
@@ -67,4 +67,40 @@ test("keeps the full graph when every node is done", () => {
   ]);
   assert.equal(result.summary, "");
   assert.deepEqual(result.rows.map((row) => row.map((node) => node.id)), [["a"], ["b"], ["c"]]);
+});
+
+test("lays out phase splits and merges with each phase task graph", () => {
+  const phases = [
+    { id: "36", name: "Hand it anything", status: "done", progress: { done: 1, total: 1 }, items: [spec("36a")] },
+    { id: "37", name: "Side by side", status: "next", progress: { done: 0, total: 1 }, items: [spec("37a")] },
+    { id: "38", name: "Code it knows", status: "next", after: ["36"], progress: { done: 0, total: 1 }, items: [spec("38a")] },
+    { id: "39", name: "Specs run", status: "next", after: ["37", "38"], progress: { done: 0, total: 1 }, items: [spec("39a")] },
+  ];
+  const result = layoutRoadmap(phases);
+  assert.deepEqual(result.rows.map((row) => row.map((node) => node.id)), [
+    ["36"], ["37", "38"], ["39"],
+  ]);
+  assert.deepEqual(result.edges, [
+    { from: "36", to: "37" },
+    { from: "36", to: "38" },
+    { from: "37", to: "39" },
+    { from: "38", to: "39" },
+  ]);
+  assert.deepEqual(result.rows[1].map((node) => node.taskLayout.rows[0][0].id), ["37a", "38a"]);
+});
+
+test("defaults phases to an array-order chain and marks blocked phase edges", () => {
+  const phases = ["01", "02", "03", "04"].map((id) => ({
+    id, name: id, status: "next", progress: { done: 0, total: 0 }, items: [],
+  }));
+  const result = layoutRoadmap(phases);
+  assert.deepEqual(result.edges, [
+    { from: "01", to: "02" },
+    { from: "02", to: "03" },
+    { from: "03", to: "04" },
+  ]);
+  assert.match(layoutRoadmap([
+    phases[0],
+    { ...phases[1], after: ["99"] },
+  ]).error, /phase 02.*99/);
 });

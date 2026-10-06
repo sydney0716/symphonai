@@ -5,7 +5,7 @@ import { parseMarkdown } from "./markdown.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths, followUpsFor } from "./roadmap.js";
-import { layoutPhase } from "./roadmap_graph.js";
+import { layoutPhase, layoutRoadmap } from "./roadmap_graph.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
@@ -204,6 +204,10 @@ export async function start({ global, document, client }) {
   const graphTitles = new Map();
   const graphPhaseLoaded = new Set();
   const graphTitlesReady = new Map();
+  const expandedDonePhases = new Set();
+  const expandedDoneGroups = new Set();
+  let roadmapFocusId = "";
+  let roadmapPageReady = false;
   const graphId = (path) => path.split("/").at(-1).replace(/\.md$/, "").split("-", 1)[0];
   const knownGraphPaths = () => [...new Set(allSpecPaths.flatMap((path) => [path, ...followUpsFor(path, allSpecPaths)]))];
   for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
@@ -212,6 +216,9 @@ export async function start({ global, document, client }) {
   const settingsContent = element(document, "div", { className: "settings-content" });
   append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
   const changesPane = element(document, "section", { className: "changes-pane" });
+  const roadmapPane = element(document, "section", { className: "roadmap-page-pane" });
+  const roadmapPageRoot = element(document, "div", { className: "roadmap-page-content" });
+  append(roadmapPane, element(document, "h1", { text: "Roadmap" }), roadmapPageRoot);
   let promptFailure = "";
   let route;
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
@@ -661,8 +668,10 @@ export async function start({ global, document, client }) {
     }
     const pane = route.page === "settings"
       ? settingsPane
-      : route.page === "changes" ? changesPane : chatPane;
+      : route.page === "changes" ? changesPane
+        : route.page === "roadmap" ? roadmapPane : chatPane;
     replace(pageRoot, pane);
+    if (route.page === "roadmap" && roadmapPageReady) renderRoadmapPage();
   }
 
   function navigate(nextRoute, { updateFragment = true } = {}) {
@@ -687,7 +696,7 @@ export async function start({ global, document, client }) {
   });
   replace(settingsSections, ...sectionLinks);
 
-  const links = PAGES.filter((page) => page === "settings" || page === "changes").map((page) => {
+  const links = PAGES.filter((page) => page === "settings" || page === "changes" || page === "roadmap").map((page) => {
     const pageRoute = { page, section: "" };
     const link = element(document, "a", {
       text: page[0].toUpperCase() + page.slice(1),
@@ -1056,6 +1065,7 @@ export async function start({ global, document, client }) {
     for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
     graphPhaseLoaded.clear();
     renderRoadmapUI();
+    if (roadmapPageReady && route.page === "roadmap") renderRoadmapPage();
     if (selectedSpec) {
       const phase = roadmap.phases.find((value) => value.id === selectedSpec.phase.id);
       const item = phase?.items[selectedSpec.index] ?? selectedSpec.item;
@@ -1159,7 +1169,10 @@ export async function start({ global, document, client }) {
         const match = /^#\s+[^—]+—\s+(.+)$/.exec(firstLine);
         if (match) graphTitles.set(graphId(path), match[1].trim());
       } catch {}
-    })).then(() => renderRoadmapUI());
+    })).then(() => {
+      renderRoadmapUI();
+      if (roadmapPageReady && route.page === "roadmap") renderRoadmapPage();
+    });
     graphTitlesReady.set(phase.id, promise);
     return promise;
   }
@@ -1180,10 +1193,9 @@ export async function start({ global, document, client }) {
     const itemById = new Map();
     phase.items.forEach((item, index) => {
       const paths = specPaths(item);
-      if (!paths.length) return;
-      const id = graphId(paths[0]);
+      const id = paths.length ? graphId(paths[0]) : `item-${index}`;
       itemById.set(id, { item, index });
-      followUps.set(id, followUpsFor(paths[0], allSpecPaths).map((path) => ({
+      followUps.set(id, (paths.length ? followUpsFor(paths[0], allSpecPaths) : []).map((path) => ({
         id: graphId(path), path,
         title: graphTitles.get(graphId(path)) || filename(path).replace(/^[^-]+-/, ""),
       })));
@@ -1244,30 +1256,203 @@ export async function start({ global, document, client }) {
       : [container];
   }
 
-  function renderRoadmapUI() {
-    const roadmapChildren = [];
-    let openedCurrentPhase = false;
-    for (const phase of roadmap.phases) {
-      const section = element(document, "details", { className: "roadmap-phase" });
-      section.open = !openedCurrentPhase && phase.status !== "done";
-      openedCurrentPhase ||= section.open;
-      const graphEnabled = phase.items.some((item) => Object.hasOwn(item, "after"));
-      append(
-        section,
-        element(document, "summary", {
-          text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total} · ${phase.status}`,
-        }),
-        ...(graphEnabled ? graphView(phase) : phase.items.map((item, index) => roadmapItem(item, phase, index))),
-      );
-      if (graphEnabled) {
-        listen(section, "toggle", () => { if (section.open) void loadGraphTitles(phase); });
-        if (section.open) void loadGraphTitles(phase);
-      }
-      roadmapChildren.push(section);
-    }
-    replace(roadmapRoot, ...roadmapChildren);
+  function phaseDependencies(phase, index) {
+    return phase.after ?? (index > 0 ? [roadmap.phases[index - 1].id] : []);
   }
+
+  function donePhaseChains() {
+    const dependents = new Map(roadmap.phases.map((phase) => [phase.id, []]));
+    roadmap.phases.forEach((phase, index) => {
+      for (const dependency of phaseDependencies(phase, index)) {
+        dependents.get(dependency)?.push(phase.id);
+      }
+    });
+    const chains = [];
+    for (let index = 0; index < roadmap.phases.length;) {
+      const first = roadmap.phases[index];
+      const members = [first];
+      let nextIndex = index + 1;
+      while (first.status === "done" && nextIndex < roadmap.phases.length) {
+        const previous = members.at(-1);
+        const next = roadmap.phases[nextIndex];
+        const dependencies = phaseDependencies(next, nextIndex);
+        if (
+          next.status !== "done"
+          || dependencies.length !== 1
+          || dependencies[0] !== previous.id
+          || dependents.get(previous.id)?.length !== 1
+          || dependents.get(previous.id)?.[0] !== next.id
+        ) break;
+        members.push(next);
+        nextIndex += 1;
+      }
+      if (members.length > 1) chains.push({ index, members });
+      index += members.length;
+    }
+    return chains;
+  }
+
+  function visibleRoadmapPhases() {
+    const chains = donePhaseChains();
+    const sourceToVisible = new Map();
+    const groups = new Map();
+    for (const chain of chains) {
+      const first = chain.members[0];
+      const last = chain.members.at(-1);
+      const key = `${first.id}..${last.id}`;
+      if (expandedDoneGroups.has(key)) continue;
+      groups.set(chain.index, { ...chain, key, id: `done-${key}` });
+      for (const phase of chain.members) sourceToVisible.set(phase.id, `done-${key}`);
+    }
+    const visible = [];
+    for (let index = 0; index < roadmap.phases.length;) {
+      const group = groups.get(index);
+      if (group) {
+        const first = group.members[0];
+        const total = group.members.reduce((sum, phase) => sum + phase.progress.total, 0);
+        visible.push({
+          id: group.id,
+          name: `✓ ${first.id}–${group.members.at(-1).id} · ${group.members.length} phases`,
+          status: "done",
+          progress: { done: total, total },
+          items: [],
+          after: phaseDependencies(first, index)
+            .filter((id) => !group.members.some((phase) => phase.id === id))
+            .map((id) => sourceToVisible.get(id) ?? id),
+          collapsedMembers: group.members,
+          groupKey: group.key,
+        });
+        index += group.members.length;
+        continue;
+      }
+      const phase = roadmap.phases[index];
+      visible.push({
+        ...phase,
+        after: phaseDependencies(phase, index).map((id) => sourceToVisible.get(id) ?? id),
+      });
+      index += 1;
+    }
+    return visible;
+  }
+
+  function phaseMark(status) {
+    return status === "done" ? "✓" : status === "in_progress" ? "◐" : "○";
+  }
+
+  function phaseBox(node, phaseBoxes, wide = false) {
+    const phase = node.phase;
+    if (phase.collapsedMembers) {
+      const summary = element(document, "button", {
+        className: `roadmap-phase-chain-summary${wide ? " roadmap-phase-wide" : ""}`,
+        text: phase.name,
+      });
+      listen(summary, "click", () => {
+        expandedDoneGroups.add(phase.groupKey);
+        renderRoadmapPage();
+      });
+      return summary;
+    }
+    const box = element(document, "section", {
+      className: `roadmap-phase-box roadmap-phase-${phase.status}${wide ? " roadmap-phase-wide" : ""}`,
+    });
+    box.setAttribute("data-phase-id", phase.id);
+    phaseBoxes.set(phase.id, box);
+    const header = element(document, "button", {
+      className: "roadmap-phase-header",
+      text: `${phaseMark(phase.status)} ${phase.id} ${phase.name} · ${phase.progress.done}/${phase.progress.total}`,
+    });
+    listen(header, "click", () => {
+      if (phase.status !== "done") return;
+      if (expandedDonePhases.has(phase.id)) expandedDonePhases.delete(phase.id);
+      else expandedDonePhases.add(phase.id);
+      renderRoadmapPage();
+    });
+    append(box, header);
+    if (node.tags.length) {
+      append(box, ...node.tags.map((tag) => element(document, "span", { className: "roadmap-tag", text: tag })));
+    }
+    if (phase.status !== "done" || expandedDonePhases.has(phase.id)) {
+      const body = element(document, "div", { className: "roadmap-phase-tasks" });
+      append(body, ...graphView(phase));
+      append(box, body);
+    }
+    return box;
+  }
+
+  function renderRoadmapPage() {
+    if (!roadmapPageReady) return;
+    const phaseBoxes = new Map();
+    const graph = layoutRoadmap(visibleRoadmapPhases());
+    if (graph.error) {
+      replace(roadmapPageRoot, element(document, "p", { className: "error roadmap-graph-error", text: graph.error }));
+      return;
+    }
+    const container = element(document, "div", { className: "roadmap-page-graph" });
+    for (const [rowIndex, row] of graph.rows.entries()) {
+      const boxes = element(document, "div", { className: "roadmap-phase-row" });
+      for (const node of row) {
+        if (node.group) {
+          const group = element(document, "div", { className: "roadmap-phase-group roadmap-phase-wide" });
+          append(group, ...node.group.map((member) => phaseBox(member, phaseBoxes, true)));
+          append(boxes, group);
+        } else {
+          append(boxes, phaseBox(node, phaseBoxes, row.length === 1));
+        }
+      }
+      append(container, boxes);
+      if (rowIndex < graph.rows.length - 1) {
+        const connectorRow = element(document, "div", { className: "roadmap-connector-row" });
+        for (const edge of graph.edges) {
+          const from = graph.rows.flat().find((node) => node.id === edge.from);
+          const to = graph.rows.flat().find((node) => node.id === edge.to);
+          if (!from || !to || from.row > rowIndex || to.row <= rowIndex) continue;
+          const isTargetRow = to.row === rowIndex + 1;
+          const edgeClass = isTargetRow
+            ? `roadmap-edge roadmap-edge-from-${from.column}-to-${to.column}`
+            : `roadmap-edge roadmap-edge-through roadmap-edge-from-${from.column}`;
+          append(connectorRow, element(document, "div", { className: edgeClass }));
+        }
+        append(container, connectorRow);
+      }
+    }
+    replace(roadmapPageRoot, container);
+    const focused = phaseBoxes.get(roadmapFocusId);
+    focused?.className && (focused.className += " roadmap-phase-focused");
+    focused?.scrollIntoView?.({ block: "center" });
+    for (const phase of roadmap.phases) {
+      if (phase.status !== "done" || expandedDonePhases.has(phase.id)) void loadGraphTitles(phase);
+    }
+  }
+
+  function renderRoadmapUI() {
+    const children = [];
+    for (const phase of roadmap.phases) {
+      if (phase.status === "done") continue;
+      const link = element(document, "a", {
+        className: "roadmap-rail-phase",
+        text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total}`,
+      });
+      link.href = "#/roadmap";
+      listen(link, "click", (event) => {
+        event.preventDefault();
+        roadmapFocusId = phase.id;
+        navigate({ page: "roadmap", section: "" });
+      });
+      children.push(link);
+    }
+    const open = element(document, "a", { className: "roadmap-open", text: "Open roadmap" });
+    open.href = "#/roadmap";
+    listen(open, "click", (event) => {
+      event.preventDefault();
+      roadmapFocusId = "";
+      navigate({ page: "roadmap", section: "" });
+    });
+    children.push(open);
+    replace(roadmapRoot, ...children);
+  }
+  roadmapPageReady = true;
   renderRoadmapUI();
+  if (route.page === "roadmap") renderRoadmapPage();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
