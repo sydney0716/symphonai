@@ -1390,7 +1390,7 @@ function toolFinished(id, name, fields = {}) {
   });
 }
 
-test("start renders the chat page and prepares the roadmap", async () => {
+test("start renders the chat page and prepares the whole roadmap graph in the rail", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   const app = await start({ global: {}, document, client });
@@ -1399,21 +1399,14 @@ test("start renders the chat page and prepares the roadmap", async () => {
 
   assert.deepEqual(page.children, [document.getElementById("chat-pane")]);
   assert.equal(app.route().page, "chat");
-  assert.ok(!visibleText(roadmap).includes("Ship a visible app"));
-  assert.equal(find(roadmap, (value) => value.className === "roadmap-goal"), undefined);
-  assert.match(visibleText(roadmap), /18 · Desktop app/);
-  assert.match(visibleText(roadmap), /0\/1/);
-  assert.equal(roadmap.children.length, 3);
+  assert.ok(find(roadmap, (node) => node.className === "roadmap-overview"));
+  assert.equal(find(roadmap, (node) => node.className === "roadmap-graph-error"), undefined);
   assert.deepEqual(
-    roadmap.children.map((line) => line.textContent),
-    [
-      "18 · Desktop app — 0/1",
-      "20 · Readable app — 0/1",
-      "Open roadmap",
-    ],
+    walk(roadmap).filter((node) => node.className.startsWith("roadmap-phase-box"))
+      .map((node) => node.attributes.get("data-phase-id")),
+    ["17", "18", "20"],
   );
-  assert.ok(roadmap.children.every((line) => line.tagName === "A"));
-  assert.equal(roadmap.children.at(-1).href, "#/roadmap");
+  assert.equal(find(roadmap, (node) => node.className === "roadmap-open"), undefined);
   assert.ok(document.getElementById("chat"));
   assert.equal(document.getElementById("turn-state"), null);
   assert.equal(document.getElementById("prompt-error").textContent, "");
@@ -1443,14 +1436,16 @@ test("graph roadmap loads short spec titles and opens items and follow-ups", asy
     return originalFile(path);
   };
   const document = new FakeDocument();
-  await start({ global: fakeGlobal({ fragment: "#/roadmap" }).global, document, client });
-  const initialGraph = find(document.getElementById("page"), (node) => node.className === "roadmap-graph");
+  await start({ global: {}, document, client });
+  const roadmapRail = document.getElementById("roadmap");
+  const phase = find(roadmapRail, (node) => node.attributes.get("data-phase-id") === "17");
+  const initialGraph = find(phase, (node) => node.className === "roadmap-graph");
   assert.equal(find(initialGraph, (node) => node.className === "roadmap-box-button").textContent, "18a  Boundary");
   releaseFiles();
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  const phase = find(document.getElementById("page"), (node) => node.className.startsWith("roadmap-phase-box"));
-  const graph = find(phase, (node) => node.className === "roadmap-graph");
+  const refreshedPhase = find(roadmapRail, (node) => node.attributes.get("data-phase-id") === "17");
+  const graph = find(refreshedPhase, (node) => node.className === "roadmap-graph");
   assert.ok(graph);
   assert.equal(walk(graph).filter((node) => node.className === "roadmap-box-button").length, 2);
   assert.ok(find(graph, (node) => node.className === "roadmap-connector-row"));
@@ -1463,7 +1458,27 @@ test("graph roadmap loads short spec titles and opens items and follow-ups", asy
   assert.ok(client.calls.file.includes(BASE));
   await find(graph, (node) => node.className === "roadmap-follow-up").dispatch("click");
   assert.ok(client.calls.file.includes(FOLLOW_UP));
-  assert.ok(!find(document.getElementById("page"), (node) => node.tagName === "SVG"));
+  assert.ok(!find(roadmapRail, (node) => node.tagName === "SVG"));
+});
+
+test("independent phases stack in a parallel rail group and task clicks open the spec", async () => {
+  const roadmap = {
+    goal: "Parallel roadmap",
+    phases: [
+      { id: "37", name: "Independent A", status: "in_progress", after: [], items: [{ title: "Task A", spec: "specs/37/37a-task-a.md", after: [] }] },
+      { id: "38", name: "Independent B", status: "in_progress", after: [], items: [{ title: "Task B", spec: "specs/38/38a-task-b.md", after: [] }] },
+    ],
+  };
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient(JSON.stringify(roadmap)) });
+
+  const rail = document.getElementById("roadmap");
+  const group = find(rail, (node) => node.className === "roadmap-phase-group");
+  assert.deepEqual(group.children.map((node) => node.attributes.get("data-phase-id")), ["37", "38"]);
+  const phase37 = find(rail, (node) => node.attributes.get("data-phase-id") === "37");
+  const task = find(phase37, (node) => node.className === "roadmap-box-button");
+  await task.dispatch("click");
+  assert.match(visibleText(document.getElementById("spec")), /37a-task-a\.md/);
 });
 
 test("spec file listing connects cross-phase follow-ups to the graph and viewer", async () => {
@@ -1484,13 +1499,14 @@ test("spec file listing connects cross-phase follow-ups to the graph and viewer"
     },
   });
   const document = new FakeDocument();
-  await start({ global: fakeGlobal({ fragment: "#/roadmap" }).global, document, client });
+  await start({ global: {}, document, client });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  const page = document.getElementById("page");
-  const priorGraph = find(page, (node) => node.className === "roadmap-graph");
+  const rail = document.getElementById("roadmap");
+  const priorPhase = find(rail, (node) => node.attributes.get("data-phase-id") === "37");
+  const priorGraph = find(priorPhase, (node) => node.className === "roadmap-graph");
   assert.equal(find(priorGraph, (node) => node.className === "roadmap-follow-up").textContent, "37eF  Fix the goal");
-  const currentPhase = find(page, (node) => node.attributes.get("data-phase-id") === "39");
+  const currentPhase = find(rail, (node) => node.attributes.get("data-phase-id") === "39");
   assert.ok(find(currentPhase, (node) => node.className === "roadmap-graph"));
   assert.ok(!find(currentPhase, (node) => node.className === "roadmap-graph-error"));
 
@@ -1509,8 +1525,7 @@ test("spec file listing failure keeps the bound roadmap paths", async () => {
   await start({ global: {}, document, client });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-open").dispatch("click");
-  const phase = find(document.getElementById("page"), (node) => node.className.startsWith("roadmap-phase-box"));
+  const phase = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "18");
   assert.ok(find(phase, (node) => node.className === "roadmap-graph"));
   assert.equal(find(phase, (node) => node.className === "roadmap-box-button").textContent, "18a  Open boundary");
 });
@@ -1528,16 +1543,16 @@ test("conversation context and per-agent usage render and refresh after compacti
       context: { used_tokens: 120, budget_tokens: 160, remaining_tokens: 40, by_source: { user: 70, assistant: 50 } },
       usage: { input_tokens: 30, output_tokens: 12, calls: 3, total_tokens: 42 },
       agents: [
-        { agent_id: "leader-id", name: "leader", input_tokens: 20, output_tokens: 10, calls: 2, total_tokens: 30, cost: { amount: "0.004", currency: "USD" } },
-        { agent_id: "child-id", name: "researcher", input_tokens: 10, output_tokens: 2, calls: 1, total_tokens: 12 },
+        { agent_id: "leader-id", name: "leader", state: "running", input_tokens: 20, output_tokens: 10, calls: 2, total_tokens: 30, cost: { amount: "0.004", currency: "USD" } },
+        { agent_id: "child-id", name: "researcher", state: "running", input_tokens: 10, output_tokens: 2, calls: 1, total_tokens: 12 },
       ],
     },
     {
       context: { used_tokens: 65, budget_tokens: 160, remaining_tokens: 95, by_source: { user: 35, assistant: 30 } },
       usage: { input_tokens: 35, output_tokens: 15, calls: 4, total_tokens: 50, cost: { amount: "0.007", currency: "USD" } },
       agents: [
-        { agent_id: "leader-id", name: "leader", input_tokens: 25, output_tokens: 13, calls: 3, total_tokens: 38, cost: { amount: "0.005", currency: "USD" } },
-        { agent_id: "child-id", name: "researcher", input_tokens: 10, output_tokens: 2, calls: 1, total_tokens: 12 },
+        { agent_id: "leader-id", name: "leader", state: "running", input_tokens: 25, output_tokens: 13, calls: 3, total_tokens: 38, cost: { amount: "0.005", currency: "USD" } },
+        { agent_id: "child-id", name: "researcher", state: "running", input_tokens: 10, output_tokens: 2, calls: 1, total_tokens: 12 },
       ],
     },
   ];
@@ -1550,8 +1565,8 @@ test("conversation context and per-agent usage render and refresh after compacti
   const usage = find(document.body, (value) => value.className === "conversation-usage");
   assert.equal(usage.textContent, "openai / gpt-test · Mode ask · Context 120 / 160 tokens · 42 tokens");
   assert.doesNotMatch(usage.textContent, /USD|undefined/);
-  assert.match(visibleText(document.getElementById("agents")), /leader · done · 30 tokens · USD 0\.004/);
-  assert.match(visibleText(document.getElementById("agents")), /researcher · done · 12 tokens/);
+  assert.match(visibleText(document.getElementById("agents")), /leader · running · 30 tokens · USD 0\.004/);
+  assert.match(visibleText(document.getElementById("agents")), /researcher · running · 12 tokens/);
   assert.doesNotMatch(visibleText(document.body), new RegExp(`${secret}|${absolutePath}`));
 
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id" }));
@@ -2164,14 +2179,12 @@ test("page navigation preserves the rendered transcript and stores the route", a
   assert.equal(document.getElementById("chat").children[0].textContent, "still here");
 });
 
-test("stored roadmap routes are restored unless a URL fragment wins", async () => {
+test("the removed roadmap route falls back to chat unless a URL fragment wins", async () => {
   const storedDocument = new FakeDocument();
   const stored = fakeGlobal({ stored: "#/roadmap" });
-  await start({ global: stored.global, document: storedDocument, client: fakeClient() });
-  assert.deepEqual(
-    storedDocument.getElementById("page").children,
-    [find(storedDocument.getElementById("page"), (node) => node.className === "roadmap-page-pane")],
-  );
+  const storedApp = await start({ global: stored.global, document: storedDocument, client: fakeClient() });
+  assert.equal(storedDocument.getElementById("page").children[0].className, "chat-pane");
+  assert.equal(storedApp.route().page, "chat");
 
   const fragmentDocument = new FakeDocument();
   const fragment = fakeGlobal({ fragment: "#/settings/mcp", stored: "#/roadmap" });
@@ -2185,15 +2198,19 @@ test("stored roadmap routes are restored unless a URL fragment wins", async () =
   assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
 });
 
-test("sidebar links to Roadmap, Settings and Changes, and keeps a home link", async () => {
+test("sidebar links to Settings and Changes, and keeps a home link", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/general" });
-  await start({ global: browser.global, document, client: fakeClient() });
+  const longTitle = "A very long session title wider than the sidebar";
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [{ run_id: "long", title: longTitle, repo_root: "/work/current" }],
+  });
+  await start({ global: browser.global, document, client });
   const sidebar = document.getElementById("sidebar");
   const links = document.getElementById("page-links");
 
-  assert.deepEqual(links.children.map((link) => link.textContent), ["Settings", "Changes", "Roadmap"]);
-  assert.match(visibleText(sidebar), /Roadmap/);
+  assert.deepEqual(links.children.map((link) => link.textContent), ["Settings", "Changes"]);
+  assert.doesNotMatch(visibleText(sidebar), /Roadmap/);
   assert.deepEqual(sidebar.children, [
     document.getElementById("home-link"),
     document.getElementById("new-chat"),
@@ -2201,12 +2218,12 @@ test("sidebar links to Roadmap, Settings and Changes, and keeps a home link", as
     find(sidebar, (node) => node.className === "projects"),
   ]);
   assert.equal(sidebar.children[0], document.getElementById("home-link"));
+  const sessionLink = find(sidebar, (node) => node.className === "session-link");
+  assert.equal(sessionLink.attributes.get("title"), longTitle);
   await document.getElementById("home-link").dispatch("click");
   assert.equal(browser.global.location.hash, "#/chat");
   assert.deepEqual(document.getElementById("page").children, [document.getElementById("chat-pane")]);
-  await find(links, (link) => link.textContent === "Roadmap").dispatch("click");
-  assert.equal(browser.global.location.hash, "#/roadmap");
-  assert.equal(document.getElementById("page").children[0].className, "roadmap-page-pane");
+  assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-overview"));
 });
 
 test("session list scrolls below page links inside the fixed sidebar", async () => {
@@ -2218,6 +2235,12 @@ test("session list scrolls below page links inside the fixed sidebar", async () 
   assert.match(sidebar, /flex-direction:\s*column;/);
   assert.match(sidebar, /height:\s*100vh;/);
   assert.match(sidebar, /overflow:\s*hidden;/);
+  assert.match(sidebar, /overflow-x:\s*hidden;/);
+  assert.match(projects, /overflow-x:\s*hidden;/);
+  const sessionLink = css.match(/\.session-link\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(sessionLink, /white-space:\s*nowrap;/);
+  assert.match(sessionLink, /overflow:\s*hidden;/);
+  assert.match(sessionLink, /text-overflow:\s*ellipsis;/);
   assert.match(projects, /flex:\s*1;/);
   assert.match(projects, /min-height:\s*0;/);
   assert.match(projects, /overflow-y:\s*auto;/);
@@ -2319,7 +2342,7 @@ test("approvals from another conversation show its title and open that session",
   assert.match(waiting.textContent, /waiting/);
 });
 
-test("status rail keeps the roadmap beside settings and renders live agents", async () => {
+test("status rail renders the whole roadmap beside settings and live agents", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/general" });
   const client = fakeClient();
@@ -2330,12 +2353,9 @@ test("status rail keeps the roadmap beside settings and renders live agents", as
   assert.deepEqual(rail.children, [agents, document.getElementById("roadmap"), document.getElementById("spec")]);
   assert.equal(document.getElementById("page").children[0].className, "settings-pane");
   assert.equal(document.getElementById("page").children.length, 1);
-  assert.equal(document.getElementById("roadmap").children.length, 3);
-  assert.deepEqual(
-    document.getElementById("roadmap").children.map((line) => line.textContent),
-    ["18 · Desktop app — 0/1", "20 · Readable app — 0/1", "Open roadmap"],
-  );
-  assert.match(visibleText(rail), /18 · Desktop app/);
+  assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-overview"));
+  assert.equal(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-open"), undefined);
+  assert.match(visibleText(rail), /18 Desktop app/);
   assert.equal(visibleText(agents), "\nNothing is running.");
 
   await client.emit(eventFrame("RunStarted", { agent_name: "leader" }));
@@ -2353,17 +2373,16 @@ test("status rail keeps the roadmap beside settings and renders live agents", as
   await client.emit(eventFrame("SubagentStopped", { subagent_agent_id: "agent-2" }));
   const root = agents.children[0];
   const children = root.children[0];
-  const worker = children.children[0];
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read"]);
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["worker · done", "sibling · running"]);
-  assert.equal(worker.children[0].className, "agent-children");
-  assert.deepEqual(worker.children[0].children.map((row) => row.textContent), ["grandchild · running · search"]);
+  assert.deepEqual(children.children.map((row) => row.textContent), ["sibling · running"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read", "grandchild · running · search"]);
 
   await client.emit(eventFrame("SubagentSpawned", {
     agent_id: "missing", subagent_agent_id: "orphan", subagent_name: "orphan",
   }));
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read", "orphan · running"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), [
+    "leader · running · read", "grandchild · running · search", "orphan · running",
+  ]);
 });
 
 test("agent rail controls pause, redirect, stop, and disappear when done", async () => {
@@ -2376,35 +2395,21 @@ test("agent rail controls pause, redirect, stop, and disappear when done", async
   let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
   let controls = row.children.find((value) => value.className === "agent-controls");
   assert.deepEqual(controls.children.map((button) => button.textContent), ["Pause", "Redirect", "Stop"]);
-  await controls.children[0].dispatch("click");
-  assert.deepEqual(client.calls.controlAgent[0], { agent_id: "leader-id", action: "pause" });
-  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  assert.match(row.textContent, /leader · paused/);
-  controls = row.children.find((value) => value.className === "agent-controls");
-  assert.equal(controls.children[0].textContent, "Resume");
   await controls.children[1].dispatch("click");
   let redirectInput = find(row, (value) => value.tagName === "INPUT");
-  assert.ok(redirectInput);
-  await redirectInput.dispatch("keydown", { key: "Escape", preventDefault() {} });
-  assert.equal(find(row, (value) => value.tagName === "INPUT"), undefined);
-
-  await controls.children[1].dispatch("click");
-  redirectInput = find(row, (value) => value.tagName === "INPUT");
   redirectInput.value = "Focus on the migration";
   const send = find(row, (value) => value.textContent === "Send");
   await send.dispatch("click");
-  assert.deepEqual(client.calls.controlAgent[1], {
+  assert.deepEqual(client.calls.controlAgent[0], {
     agent_id: "leader-id", action: "redirect", text: "Focus on the migration",
   });
   row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
   controls = row.children.find((value) => value.className === "agent-controls");
   await controls.children[2].dispatch("click");
-  assert.deepEqual(client.calls.controlAgent[2], { agent_id: "leader-id", action: "stop" });
+  assert.deepEqual(client.calls.controlAgent[1], { agent_id: "leader-id", action: "stop" });
 
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id", stopped_reason: "cancelled" }));
-  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  assert.equal(row.textContent, "leader · done");
-  assert.equal(row.children.some((value) => value.className === "agent-controls"), false);
+  assert.equal(visibleText(document.getElementById("agents")), "\nNothing is running.");
 });
 
 test("agent rail keeps state unchanged and shows a control error", async () => {
@@ -2441,10 +2446,10 @@ test("reopened history and conversation stats render a nested agent tree without
       type: "HistoryMessage", role: "assistant", text: "Prior answer", tool_calls: [], turn_id: "prior-turn",
     } });
     conversation = { agents: [
-      { agent_id: "root", name: "leader", parent_agent_id: null },
-      { agent_id: "a", name: "A", parent_agent_id: "root" },
-      { agent_id: "b", name: "B", parent_agent_id: "a" },
-      { agent_id: "c", name: "C", parent_agent_id: "root" },
+      { agent_id: "root", name: "leader", parent_agent_id: null, state: "done" },
+      { agent_id: "a", name: "researcher", parent_agent_id: "root", state: "done" },
+      { agent_id: "b", name: "B", parent_agent_id: "a", state: "done" },
+      { agent_id: "c", name: "C", parent_agent_id: "root", state: "done" },
     ] };
     return { run_id: runId };
   };
@@ -2454,13 +2459,30 @@ test("reopened history and conversation stats render a nested agent tree without
   const link = find(document.getElementById("sidebar"), (row) => row.className === "session-link");
   await link.dispatch("click");
   assert.deepEqual(client.calls.openSession, ["prior"]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · done"]);
-  const children = agents.children[0].children[0];
-  assert.deepEqual(children.children.map((row) => row.textContent), ["A · done", "C · done"]);
-  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["B · done"]);
+  assert.equal(visibleText(agents), "\nNothing is running.");
   assert.equal(find(document.body, (row) => row.className === "conversation-usage").textContent, "");
   assert.match(visibleText(document.getElementById("chat")), /Prior answer/);
   assert.doesNotMatch(visibleText(agents), /tokens|USD/);
+});
+
+test("agent rail hides completed agents and keeps controls on a running worker", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.conversationStats = async () => ({ conversation: { agents: [
+    { agent_id: "leader", name: "leader", state: "done" },
+    { agent_id: "researcher", name: "researcher", parent_agent_id: "leader", state: "done" },
+    { agent_id: "worker", name: "worker", parent_agent_id: "leader", state: "running" },
+  ] } });
+  await start({ global: {}, document, client });
+
+  const agents = document.getElementById("agents");
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["worker · running"]);
+  assert.deepEqual(
+    agents.children[0].children.find((child) => child.className === "agent-controls")
+      .children.map((button) => button.textContent),
+    ["Pause", "Redirect", "Stop"],
+  );
+  assert.doesNotMatch(visibleText(agents), /leader|researcher/);
 });
 
 test("opening another conversation and starting a new chat clears prior agents", async () => {
@@ -2497,13 +2519,12 @@ test("opening another conversation and starting a new chat clears prior agents",
     row.className === "session-link" && row.textContent === title
   );
   await sessionLink("Conversation A").dispatch("click");
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · done"]);
-  assert.deepEqual(agents.children[0].children[0].children.map((row) => row.textContent), ["worker · done"]);
+  assert.equal(visibleText(agents), "\nNothing is running.");
 
   await sessionLink("Conversation B").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["conversation-a", "conversation-b"]);
   assert.deepEqual(replayBoard, ["\nNothing is running.", "\nNothing is running."]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · done"]);
+  assert.equal(visibleText(agents), "\nNothing is running.");
   assert.equal(find(agents, (row) => row.textContent.includes("worker")), undefined);
 
   await document.getElementById("new-chat").dispatch("click");
@@ -2936,7 +2957,7 @@ test("status and sidebar folds are independent", async () => {
   assert.equal(railToggle.textContent, "Hide status");
 });
 
-test("items in folded and open phases open their specs and reports", async () => {
+test("items in folded and open roadmap phases open their specs and reports", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   const app = await start({ global: {}, document, client });
@@ -2946,17 +2967,17 @@ test("items in folded and open phases open their specs and reports", async () =>
     calls.push(arguments_);
     return open(...arguments_);
   };
-  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-open").dispatch("click");
+  const roadmap = document.getElementById("roadmap");
   for (const [title, specText, reportText] of [
     ["Boundary", "base spec text", "base report text"],
     ["Open boundary", "open spec text", "open report text"],
   ]) {
     if (title === "Boundary") {
-      const completed = find(document.getElementById("page"), (node) => node.attributes.get("data-phase-id") === "17");
+      const completed = find(roadmap, (node) => node.attributes.get("data-phase-id") === "17");
       await find(completed, (node) => node.className === "roadmap-phase-header").dispatch("click");
     }
     const button = find(
-      document.getElementById("page"),
+      roadmap,
       (value) => value.tagName === "BUTTON" && value.textContent.includes(title),
     );
     await button.dispatch("click");
@@ -2977,12 +2998,10 @@ test("an all-done roadmap leaves every phase folded", async () => {
     client: fakeClient(fixtureRoadmap({ allDone: true })),
   });
 
-  assert.deepEqual(
-    document.getElementById("roadmap").children.map((line) => line.textContent),
-    ["Open roadmap"],
-  );
-  await find(document.getElementById("roadmap"), (line) => line.className === "roadmap-open").dispatch("click");
-  assert.ok(find(document.getElementById("page"), (node) => node.className.startsWith("roadmap-phase-chain-summary")), visibleText(document.getElementById("page")));
+  const roadmap = document.getElementById("roadmap");
+  const chain = find(roadmap, (node) => node.className.startsWith("roadmap-phase-chain-summary"));
+  assert.ok(chain, visibleText(roadmap));
+  assert.equal(find(roadmap, (node) => node.className === "roadmap-phase-tasks"), undefined);
 });
 
 test("done phase chains expand to one-line phases and then to a task graph", async () => {
@@ -2996,31 +3015,31 @@ test("done phase chains expand to one-line phases and then to a task graph", asy
     ],
   };
   const document = new FakeDocument();
-  await start({ global: fakeGlobal({ fragment: "#/roadmap" }).global, document, client: fakeClient(JSON.stringify(roadmap)) });
-  let page = document.getElementById("page");
+  await start({ global: {}, document, client: fakeClient(JSON.stringify(roadmap)) });
+  let page = document.getElementById("roadmap");
   const chain = find(page, (node) => node.className.startsWith("roadmap-phase-chain-summary"));
   assert.equal(chain?.textContent, "✓ 01–03 · 3 phases", visibleText(page));
   await chain.dispatch("click");
-  page = document.getElementById("page");
+  page = document.getElementById("roadmap");
   for (const id of ["01", "02", "03"]) {
     assert.ok(find(page, (node) => node.attributes.get("data-phase-id") === id));
   }
   const first = find(page, (node) => node.attributes.get("data-phase-id") === "01");
   assert.equal(first.children.length, 1);
   await find(first, (node) => node.className === "roadmap-phase-header").dispatch("click");
-  const expandedFirst = find(document.getElementById("page"), (node) => node.attributes.get("data-phase-id") === "01");
+  const expandedFirst = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "01");
   assert.ok(find(expandedFirst, (node) => node.className === "roadmap-phase-tasks"));
 });
 
-test("the rail opens the Roadmap page focused on the selected open phase", async () => {
+test("the removed roadmap route falls back to chat while the rail keeps its graph", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal();
-  await start({ global: browser.global, document, client: fakeClient() });
-  const line = find(document.getElementById("roadmap"), (node) => node.className === "roadmap-rail-phase");
-  await line.dispatch("click");
-  assert.equal(browser.global.location.hash, "#/roadmap");
-  const phase = find(document.getElementById("page"), (node) => node.className.includes("roadmap-phase-focused"));
-  assert.equal(phase.attributes.get("data-phase-id"), "18");
+  const app = await start({ global: browser.global, document, client: fakeClient() });
+  browser.global.location.hash = "#/roadmap";
+  browser.dispatch("hashchange");
+  assert.equal(document.getElementById("page").children[0].className, "chat-pane");
+  assert.equal(app.route().page, "chat");
+  const phase = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "18");
   assert.ok(find(phase, (node) => node.className === "roadmap-phase-tasks"));
 });
 
@@ -3040,7 +3059,10 @@ test("an additional fixture phase renders without a copied count", async () => {
     client: fakeClient(JSON.stringify(roadmap)),
   });
 
-  assert.equal(document.getElementById("roadmap").children.length, roadmap.phases.length);
+  assert.equal(
+    walk(document.getElementById("roadmap")).filter((node) => node.className.startsWith("roadmap-phase-box")).length,
+    roadmap.phases.length,
+  );
 });
 
 test("submit dispatches once and assistant deltas render in order", async () => {
@@ -3543,29 +3565,12 @@ test("session history renders as the original conversation", async () => {
   assert.doesNotMatch(visibleText(chat), /Received HistoryMessage\./);
 });
 
-test("replayed messages offer a fork at the message and show the parent in the sidebar", async () => {
+test("replayed messages with record ids do not render fork controls", async () => {
   const document = new FakeDocument();
-  const agents = document.getElementById("agents");
   const source = { run_id: "source", title: "Original", repo_root: "/work/current" };
-  const fork = { run_id: "fork-run", title: "Original", parent_session_id: "source", repo_root: "/work/current" };
   const client = fakeClient(fixtureRoadmap(), { sessions: [source] });
-  client.sessions = async (limit) => {
-    client.calls.sessions.push(limit);
-    return client.calls.sessions.length === 1 ? [source] : [fork, source];
-  };
-  let boardDuringFork;
-  client.forkSession = async (runId, recordId) => {
-    client.calls.forkSession.push([runId, recordId]);
-    boardDuringFork = visibleText(agents);
-    await client.emit({ kind: "event", payload: {
-      type: "HistoryMessage", role: "user", text: "What changed?", record_id: "rec-fork",
-      tool_calls: [], turn_id: "turn-fork",
-    } });
-    return { run_id: "fork-run" };
-  };
   await start({ global: {}, document, client });
   const chat = document.getElementById("chat");
-  assert.equal(find(chat, (value) => value.className === "fork-message"), undefined);
   const sourceButton = find(document.getElementById("sidebar"), (value) =>
     value.className === "session-link" && value.textContent === "Original"
   );
@@ -3578,63 +3583,8 @@ test("replayed messages offer a fork at the message and show the parent in the s
     type: "HistoryMessage", role: "assistant", text: "The config changed.", record_id: "rec-answer",
     tool_calls: [], turn_id: "turn-1",
   } });
-  await client.emit(eventFrame("RunStarted", { agent_id: "leader-a", agent_name: "leader" }));
-  await client.emit(eventFrame("SubagentSpawned", {
-    agent_id: "leader-a", subagent_agent_id: "worker-a", subagent_name: "worker",
-  }));
-  assert.match(visibleText(agents), /leader · running/);
-  assert.match(visibleText(agents), /worker · running/);
-  const controls = walk(chat).filter((value) => value.className === "fork-message");
-  assert.equal(controls.length, 2);
-  await controls[0].dispatch("click");
-  assert.deepEqual(client.calls.forkSession, [["source", "rec-user"]]);
-  assert.equal(boardDuringFork, "\nNothing is running.");
-  assert.equal(visibleText(agents), "\nNothing is running.");
+  assert.equal(find(chat, (value) => value.className === "fork-message"), undefined);
   assert.match(visibleText(chat), /What changed\?/);
-  assert.doesNotMatch(visibleText(chat), /The config changed\./);
-  assert.match(visibleText(document.getElementById("sidebar")), /Original · fork of Original/);
-  const forkControl = find(chat, (value) => value.className === "fork-message");
-  await forkControl.dispatch("click");
-  assert.deepEqual(client.calls.forkSession[1], ["fork-run", "rec-fork"]);
-});
-
-test("fork conflicts show paths and Branch anyway retries with force", async () => {
-  const document = new FakeDocument();
-  const source = { run_id: "source", title: "Original", repo_root: "/work/current" };
-  const fork = { run_id: "fork-run", title: "Original", parent_session_id: "source", repo_root: "/work/current" };
-  const client = fakeClient(fixtureRoadmap(), { sessions: [source] });
-  client.sessions = async () => [source, fork];
-  client.forkSession = async (runId, recordId, force = false) => {
-    client.calls.forkSession.push([runId, recordId, ...(force ? [true] : [])]);
-    if (!force) {
-      throw Object.assign(new Error("files changed outside the agent"), {
-        status: 409,
-        paths: ["src/a.py", "src/b.py"],
-      });
-    }
-    await client.emit({ kind: "event", payload: {
-      type: "HistoryMessage", role: "user", text: "Original prompt", record_id: "rec-fork",
-      tool_calls: [], turn_id: "turn-fork",
-    } });
-    return { run_id: "fork-run" };
-  };
-  await start({ global: {}, document, client });
-  const sourceButton = find(document.getElementById("sidebar"), (value) =>
-    value.className === "session-link" && value.textContent === "Original"
-  );
-  await sourceButton.dispatch("click");
-  await client.emit({ kind: "event", payload: {
-    type: "HistoryMessage", role: "user", text: "Original prompt", record_id: "rec-user",
-    tool_calls: [], turn_id: "turn-1",
-  } });
-  const forkButton = find(document.getElementById("chat"), (value) => value.className === "fork-message");
-  await forkButton.dispatch("click");
-  assert.match(visibleText(document.getElementById("chat")), /src\/a\.py, src\/b\.py/);
-  const branchAnyway = find(document.getElementById("chat"), (value) => value.textContent === "Branch anyway");
-  assert.ok(branchAnyway);
-  await branchAnyway.dispatch("click");
-  assert.deepEqual(client.calls.forkSession, [["source", "rec-user"], ["source", "rec-user", true]]);
-  assert.match(visibleText(document.getElementById("chat")), /Original prompt/);
 });
 
 test("unknown events render and do not stop later frames", async () => {
@@ -3902,8 +3852,7 @@ function specWorkflowClient({ hasSpec = true, runs = [], onAction = {} } = {}) {
 async function openWorkflowItem(client) {
   const document = new FakeDocument();
   const app = await start({ global: {}, document, client });
-  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-open").dispatch("click");
-  const roadmapButton = find(document.getElementById("page"), (node) => node.className === "roadmap-box-button");
+  const roadmapButton = find(document.getElementById("roadmap"), (node) => node.className === "roadmap-box-button");
   assert.ok(roadmapButton, visibleText(document.getElementById("page")));
   await roadmapButton.dispatch("click");
   assert.ok(find(document.getElementById("spec"), (node) => node.className === "spec-workflow"), visibleText(document.getElementById("page")));
@@ -4068,8 +4017,7 @@ test("spec-state refresh fetches immediately and once at the window end", async 
   const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
   const document = new FakeDocument();
   const app = await start({ global: withClock(clock), document, client });
-  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-open").dispatch("click");
-  await find(document.getElementById("page"), (node) => node.className === "roadmap-box-button").dispatch("click");
+  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-box-button").dispatch("click");
   const before = client.specRunReadCount();
   const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "pause", phase: "paused", rounds: 1, max_rounds: 5, reason: "stopped" });
   await app.onFrame(frame);

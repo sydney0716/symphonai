@@ -14,7 +14,7 @@ function valuesFor(source, id) {
   return source instanceof Map ? source.get(id) : source?.[id];
 }
 
-function layoutNodes(nodes, { collapseDone }) {
+function layoutNodes(nodes, { collapseDone, maxColumns = 2 }) {
   const byId = new Map();
   for (const node of nodes) {
     if (byId.has(node.id)) return { error: `duplicate id ${node.id}` };
@@ -61,7 +61,7 @@ function layoutNodes(nodes, { collapseDone }) {
       };
       return average(left) - average(right) || left.id.localeCompare(right.id);
     });
-    if (members.length >= 3) {
+    if (members.length > maxColumns) {
       const group = {
         id: `group-${row}`,
         title: "parallel",
@@ -175,7 +175,7 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
   return layoutNodes(nodes, { collapseDone: true });
 }
 
-export function layoutRoadmap(phases, { taskOptions = () => ({}) } = {}) {
+export function layoutRoadmap(phases, { taskOptions = () => ({}), maxColumns = 2 } = {}) {
   const phaseIds = new Set(phases.map((phase) => phase.id));
   const taskTitles = new Map();
   for (const phase of phases) {
@@ -220,5 +220,5 @@ export function layoutRoadmap(phases, { taskOptions = () => ({}) } = {}) {
   });
   const invalid = nodes.find((node) => node.error);
   if (invalid) return { error: invalid.error };
-  return layoutNodes(nodes, { collapseDone: false });
+  return layoutNodes(nodes, { collapseDone: false, maxColumns });
 }

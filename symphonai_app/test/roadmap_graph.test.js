@@ -124,6 +124,28 @@ test("lays out phase splits and merges with each phase task graph", () => {
   assert.deepEqual(result.rows[1].map((node) => node.taskLayout.rows[0][0].id), ["37a", "38a"]);
 });
 
+test("stacks independent roadmap phases in a single parallel group", () => {
+  const phases = ["37", "38"].map((id) => ({
+    id,
+    name: `Phase ${id}`,
+    status: "next",
+    after: [],
+    progress: { done: 0, total: 1 },
+    items: [spec(`${id}a`)],
+  }));
+  const result = layoutRoadmap(phases, { maxColumns: 1 });
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].length, 1);
+  assert.equal(result.rows[0][0].title, "parallel");
+  assert.deepEqual(result.rows[0][0].group.map(({ id, column }) => [id, column]), [
+    ["37", 0], ["38", 0],
+  ]);
+  assert.equal(result.rows[0][0].group[0].taskLayout.error, undefined);
+  assert.equal(result.rows[0][0].group[1].taskLayout.error, undefined);
+});
+
 test("defaults phases to an array-order chain and marks blocked phase edges", () => {
   const phases = ["01", "02", "03", "04"].map((id) => ({
     id, name: id, status: "next", progress: { done: 0, total: 0 }, items: [],

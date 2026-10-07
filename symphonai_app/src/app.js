@@ -193,7 +193,6 @@ export async function start({ global, document, client }) {
   let sessions = initialSessions;
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
-  let forkConflict = null;
   let conversation = conversationReply?.conversation ?? null;
   let roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
   let specRuns = initialSpecRuns;
@@ -206,8 +205,6 @@ export async function start({ global, document, client }) {
   const graphTitlesReady = new Map();
   const expandedDonePhases = new Set();
   const expandedDoneGroups = new Set();
-  let roadmapFocusId = "";
-  let roadmapPageReady = false;
   const graphId = (path) => path.split("/").at(-1).replace(/\.md$/, "").split("-", 1)[0];
   const knownGraphPaths = () => [...new Set(allSpecPaths.flatMap((path) => [path, ...followUpsFor(path, allSpecPaths)]))];
   for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
@@ -216,9 +213,6 @@ export async function start({ global, document, client }) {
   const settingsContent = element(document, "div", { className: "settings-content" });
   append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
   const changesPane = element(document, "section", { className: "changes-pane" });
-  const roadmapPane = element(document, "section", { className: "roadmap-page-pane" });
-  const roadmapPageRoot = element(document, "div", { className: "roadmap-page-content" });
-  append(roadmapPane, element(document, "h1", { text: "Roadmap" }), roadmapPageRoot);
   let promptFailure = "";
   let route;
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
@@ -666,12 +660,9 @@ export async function start({ global, document, client }) {
     } else if (route.page === "changes") {
       void showChanges();
     }
-    const pane = route.page === "settings"
-      ? settingsPane
-      : route.page === "changes" ? changesPane
-        : route.page === "roadmap" ? roadmapPane : chatPane;
+    const pane = route.page === "settings" ? settingsPane
+      : route.page === "changes" ? changesPane : chatPane;
     replace(pageRoot, pane);
-    if (route.page === "roadmap" && roadmapPageReady) renderRoadmapPage();
   }
 
   function navigate(nextRoute, { updateFragment = true } = {}) {
@@ -696,7 +687,7 @@ export async function start({ global, document, client }) {
   });
   replace(settingsSections, ...sectionLinks);
 
-  const links = PAGES.filter((page) => page === "settings" || page === "changes" || page === "roadmap").map((page) => {
+  const links = PAGES.filter((page) => page === "settings" || page === "changes").map((page) => {
     const pageRoute = { page, section: "" };
     const link = element(document, "a", {
       text: page[0].toUpperCase() + page.slice(1),
@@ -712,72 +703,8 @@ export async function start({ global, document, client }) {
   listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
-  async function forkAt(sourceId, recordId, force, previous) {
-    transcript.model.length = 0;
-    showTranscript();
-    clearConversationAgents();
-    try {
-      const reply = await boundary.forkSession(sourceId, recordId, force);
-      forkConflict = null;
-      currentSessionId = reply.run_id;
-      transcript.setSessionId(currentSessionId);
-      try {
-        sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
-        showProjects();
-      } catch {
-        // The fork remains current if refreshing the sidebar fails.
-      }
-      await refreshConversation();
-      navigate({ page: "chat", section: "" });
-    } catch (error) {
-      transcript.model.splice(0, transcript.model.length, ...previous);
-      await refreshConversation();
-      if (!force && error?.status === 409 && Array.isArray(error.paths)) {
-        forkConflict = { sourceId, recordId, paths: error.paths };
-        showTranscript();
-        return;
-      }
-      showTranscript();
-      promptFailure = "Fork failed.";
-      showPromptError();
-    }
-  }
-
   function showTranscript() {
     renderTranscript(document, chatRoot, transcript.model, parseMarkdown);
-    const rows = [...chatRoot.children];
-    const children = [];
-    for (const [index, entry] of transcript.model.entries()) {
-      children.push(rows[index]);
-      if (!currentSessionId || !entry.recordId || !["prompt", "text"].includes(entry.type)) {
-        continue;
-      }
-      const button = element(document, "button", { className: "fork-message", text: "Fork here" });
-      button.type = "button";
-      listen(button, "click", () => {
-        return forkAt(currentSessionId, entry.recordId, false, [...transcript.model]);
-      });
-      children.push(button);
-    }
-    if (forkConflict) {
-      children.push(element(document, "p", {
-        className: "fork-conflict",
-        text: `Files changed outside the agent: ${forkConflict.paths.join(", ")}`,
-      }));
-      const branchAnyway = element(document, "button", {
-        className: "fork-anyway",
-        text: "Branch anyway",
-      });
-      branchAnyway.type = "button";
-      listen(branchAnyway, "click", () => forkAt(
-        forkConflict.sourceId,
-        forkConflict.recordId,
-        true,
-        [...transcript.model],
-      ));
-      children.push(branchAnyway);
-    }
-    replace(chatRoot, ...children);
   }
 
   async function openSession(runId) {
@@ -834,16 +761,19 @@ export async function start({ global, document, client }) {
           session.parent_session_id ? ` · fork of ${parent?.title || session.parent_session_id}` : ""
         ) + (["working", "waiting"].includes(session.activity) ? ` · ${session.activity}` : "");
         if (!current) {
-          append(section, element(document, "p", {
+          const unavailable = element(document, "p", {
             className: "session-link unavailable",
             text: label,
-          }));
+          });
+          unavailable.setAttribute("title", label);
+          append(section, unavailable);
           continue;
         }
         const button = element(document, "button", {
           className: "session-link",
           text: label,
         });
+        button.setAttribute("title", label);
         button.type = "button";
         listen(button, "click", async () => {
           await openSession(session.run_id);
@@ -1076,7 +1006,6 @@ export async function start({ global, document, client }) {
     for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
     graphPhaseLoaded.clear();
     renderRoadmapUI();
-    if (roadmapPageReady && route.page === "roadmap") renderRoadmapPage();
     if (selectedSpec) {
       const phase = roadmap.phases.find((value) => value.id === selectedSpec.phase.id);
       const item = phase?.items[selectedSpec.index] ?? selectedSpec.item;
@@ -1186,7 +1115,6 @@ export async function start({ global, document, client }) {
       } catch {}
     })).then(() => {
       renderRoadmapUI();
-      if (roadmapPageReady && route.page === "roadmap") renderRoadmapPage();
     });
     graphTitlesReady.set(phase.id, promise);
     return promise;
@@ -1354,24 +1282,23 @@ export async function start({ global, document, client }) {
     return status === "done" ? "✓" : status === "in_progress" ? "◐" : "○";
   }
 
-  function phaseBox(node, phaseBoxes, wide = false) {
+  function phaseBox(node) {
     const phase = node.phase;
     if (phase.collapsedMembers) {
       const summary = element(document, "button", {
-        className: `roadmap-phase-chain-summary${wide ? " roadmap-phase-wide" : ""}`,
+        className: "roadmap-phase-chain-summary",
         text: phase.name,
       });
       listen(summary, "click", () => {
         expandedDoneGroups.add(phase.groupKey);
-        renderRoadmapPage();
+        renderRoadmapUI();
       });
       return summary;
     }
     const box = element(document, "section", {
-      className: `roadmap-phase-box roadmap-phase-${phase.status}${wide ? " roadmap-phase-wide" : ""}`,
+      className: `roadmap-phase-box roadmap-phase-${phase.status}`,
     });
     box.setAttribute("data-phase-id", phase.id);
-    phaseBoxes.set(phase.id, box);
     const header = element(document, "button", {
       className: "roadmap-phase-header",
       text: `${phaseMark(phase.status)} ${phase.id} ${phase.name} · ${phase.progress.done}/${phase.progress.total}`,
@@ -1380,7 +1307,7 @@ export async function start({ global, document, client }) {
       if (phase.status !== "done") return;
       if (expandedDonePhases.has(phase.id)) expandedDonePhases.delete(phase.id);
       else expandedDonePhases.add(phase.id);
-      renderRoadmapPage();
+      renderRoadmapUI();
     });
     append(box, header);
     if (node.tags.length) {
@@ -1394,24 +1321,22 @@ export async function start({ global, document, client }) {
     return box;
   }
 
-  function renderRoadmapPage() {
-    if (!roadmapPageReady) return;
-    const phaseBoxes = new Map();
-    const graph = layoutRoadmap(visibleRoadmapPhases());
+  function renderRoadmapUI() {
+    const graph = layoutRoadmap(visibleRoadmapPhases(), { maxColumns: 1 });
     if (graph.error) {
-      replace(roadmapPageRoot, element(document, "p", { className: "error roadmap-graph-error", text: graph.error }));
+      replace(roadmapRoot, element(document, "p", { className: "error roadmap-graph-error", text: graph.error }));
       return;
     }
-    const container = element(document, "div", { className: "roadmap-page-graph" });
+    const container = element(document, "div", { className: "roadmap-overview" });
     for (const [rowIndex, row] of graph.rows.entries()) {
       const boxes = element(document, "div", { className: "roadmap-phase-row" });
       for (const node of row) {
         if (node.group) {
-          const group = element(document, "div", { className: "roadmap-phase-group roadmap-phase-wide" });
-          append(group, ...node.group.map((member) => phaseBox(member, phaseBoxes, true)));
+          const group = element(document, "div", { className: "roadmap-phase-group" });
+          append(group, ...node.group.map((member) => phaseBox(member)));
           append(boxes, group);
         } else {
-          append(boxes, phaseBox(node, phaseBoxes, row.length === 1));
+          append(boxes, phaseBox(node));
         }
       }
       append(container, boxes);
@@ -1430,44 +1355,12 @@ export async function start({ global, document, client }) {
         append(container, connectorRow);
       }
     }
-    replace(roadmapPageRoot, container);
-    const focused = phaseBoxes.get(roadmapFocusId);
-    focused?.className && (focused.className += " roadmap-phase-focused");
-    focused?.scrollIntoView?.({ block: "center" });
+    replace(roadmapRoot, container);
     for (const phase of roadmap.phases) {
       if (phase.status !== "done" || expandedDonePhases.has(phase.id)) void loadGraphTitles(phase);
     }
   }
-
-  function renderRoadmapUI() {
-    const children = [];
-    for (const phase of roadmap.phases) {
-      if (phase.status === "done") continue;
-      const link = element(document, "a", {
-        className: "roadmap-rail-phase",
-        text: `${phase.id} · ${phase.name} — ${phase.progress.done}/${phase.progress.total}`,
-      });
-      link.href = "#/roadmap";
-      listen(link, "click", (event) => {
-        event.preventDefault();
-        roadmapFocusId = phase.id;
-        navigate({ page: "roadmap", section: "" });
-      });
-      children.push(link);
-    }
-    const open = element(document, "a", { className: "roadmap-open", text: "Open roadmap" });
-    open.href = "#/roadmap";
-    listen(open, "click", (event) => {
-      event.preventDefault();
-      roadmapFocusId = "";
-      navigate({ page: "roadmap", section: "" });
-    });
-    children.push(open);
-    replace(roadmapRoot, ...children);
-  }
-  roadmapPageReady = true;
   renderRoadmapUI();
-  if (route.page === "roadmap") renderRoadmapPage();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -1510,25 +1403,32 @@ export async function start({ global, document, client }) {
     const rows = [...board.rows];
     for (const agent of conversation?.agents ?? []) {
       if (!rows.some((row) => row.agentId === agent.agent_id)) {
-        rows.push({ agentId: agent.agent_id, parentAgentId: agent.parent_agent_id ?? null, name: agent.name, state: "done", tool: "" });
+        rows.push({
+          agentId: agent.agent_id,
+          parentAgentId: agent.parent_agent_id ?? null,
+          name: agent.name,
+          state: agent.state ?? "done",
+          tool: "",
+        });
       }
     }
+    const visibleRows = rows.filter((row) => ["running", "waiting"].includes(row.state));
     const usageByAgent = new Map(
       (conversation?.agents ?? []).map((agent) => [agent.agent_id, agent]),
     );
-    if (rows.length === 0) {
+    if (visibleRows.length === 0) {
       replace(agentsRoot, element(document, "p", { text: "Nothing is running." }));
       return;
     }
-    const byId = new Map(rows.map((row) => [row.agentId, row]));
-    const nodes = new Map(rows.map(({ agentId, name, state, tool }) => [agentId, element(document, "div", {
+    const byId = new Map(visibleRows.map((row) => [row.agentId, row]));
+    const nodes = new Map(visibleRows.map(({ agentId, name, state, tool }) => [agentId, element(document, "div", {
       className: "agent-row",
       text: [name, state, tool, usageText(usageByAgent.get(agentId))]
         .filter(Boolean).join(" · "),
     })]));
     const children = new Map();
     const roots = [];
-    for (const row of rows) {
+    for (const row of visibleRows) {
       const seen = new Set([row.agentId]);
       let ancestor = byId.get(row.parentAgentId);
       while (ancestor && !seen.has(ancestor.agentId)) {
@@ -1546,7 +1446,7 @@ export async function start({ global, document, client }) {
       }
       append(children.get(row.parentAgentId), nodes.get(row.agentId));
     }
-    for (const row of rows) {
+    for (const row of visibleRows) {
       if (!["running", "waiting", "paused"].includes(row.state)) continue;
       const node = nodes.get(row.agentId);
       const controls = element(document, "div", { className: "agent-controls" });
