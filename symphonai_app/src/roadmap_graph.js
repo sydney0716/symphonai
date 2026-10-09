@@ -200,7 +200,7 @@ export function layoutRoadmap(phases, { taskOptions = () => ({}), maxColumns = 2
       for (const item of phase.items) {
         const dependencies = Array.isArray(item.after) ? item.after : [];
         for (const dependency of dependencies) {
-          if (dependency.startsWith(candidate.id)) titles.set(dependency, dependency);
+          if (dependency.startsWith(candidate.id) && !titles.has(dependency)) titles.set(dependency, dependency);
         }
       }
     }

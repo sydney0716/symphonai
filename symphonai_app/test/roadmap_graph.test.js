@@ -173,3 +173,19 @@ test("phase task layouts recognize cross-phase task references", () => {
   assert.equal(current.taskLayout.error, undefined);
   assert.ok(current.taskLayout.rows[0][0].tags.includes("← 37eF"));
 });
+
+test("phase dependency fallbacks preserve known task titles", () => {
+  const phases = [
+    { id: "38", name: "Current", status: "next", progress: { done: 0, total: 2 }, items: [
+      spec("39b", undefined, { title: "run a spec" }), spec("39c", ["39b"]),
+    ] },
+    { id: "39", name: "Next", status: "next", progress: { done: 0, total: 1 }, items: [spec("39d", ["39b"])] },
+  ];
+  const result = layoutRoadmap(phases);
+  const current = result.rows.flat().find(({ id }) => id === "38");
+  const next = result.rows.flat().find(({ id }) => id === "39");
+
+  assert.equal(current.taskLayout.error, undefined);
+  assert.equal(current.taskLayout.rows[0][0].title, "run a spec");
+  assert.ok(next.taskLayout.rows[0][0].tags.includes("← 39b"));
+});

@@ -5,7 +5,7 @@ import { parseMarkdown } from "./markdown.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths, followUpsFor } from "./roadmap.js";
-import { layoutPhase, layoutRoadmap } from "./roadmap_graph.js";
+import { layoutRoadmap } from "./roadmap_graph.js";
 import { append, element, listen, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
@@ -1128,22 +1128,27 @@ export async function start({ global, document, client }) {
     });
   }
 
-  function graphView(phase) {
+  function graphTaskOptions(phase) {
     const titles = new Map(graphTitles);
     const followUps = new Map();
     const states = new Map();
-    const itemById = new Map();
     phase.items.forEach((item, index) => {
       const paths = specPaths(item);
       const id = paths.length ? graphId(paths[0]) : `item-${index}`;
-      itemById.set(id, { item, index });
       followUps.set(id, (paths.length ? followUpsFor(paths[0], allSpecPaths) : []).map((path) => ({
         id: graphId(path), path,
         title: graphTitles.get(graphId(path)) || filename(path).replace(/^[^-]+-/, ""),
       })));
       states.set(id, workflow(item, phase, index).step);
     });
-    const graph = layoutPhase(phase.items, { followUps, titles, states });
+    return { followUps, titles, states };
+  }
+
+  function graphView({ phase, taskLayout: graph }) {
+    const itemById = new Map(phase.items.map((item, index) => {
+      const path = specPaths(item)[0];
+      return [path ? graphId(path) : `item-${index}`, { item, index }];
+    }));
     if (graph.error) {
       return [element(document, "p", { className: "error roadmap-graph-error", text: graph.error }),
         ...phase.items.map((item, index) => roadmapItem(item, phase, index))];
@@ -1314,14 +1319,14 @@ export async function start({ global, document, client }) {
     }
     if (phase.status !== "done" || expandedDonePhases.has(phase.id)) {
       const body = element(document, "div", { className: "roadmap-phase-tasks" });
-      append(body, ...graphView(phase));
+      append(body, ...graphView(node));
       append(box, body);
     }
     return box;
   }
 
   function renderRoadmapUI() {
-    const graph = layoutRoadmap(visibleRoadmapPhases(), { maxColumns: 1 });
+    const graph = layoutRoadmap(visibleRoadmapPhases(), { taskOptions: graphTaskOptions, maxColumns: 1 });
     if (graph.error) {
       replace(roadmapRoot, element(document, "p", { className: "error roadmap-graph-error", text: graph.error }));
       return;
