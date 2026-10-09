@@ -1411,23 +1411,45 @@ export async function start({ global, document, client }) {
         });
       }
     }
-    const visibleRows = rows.filter((row) => ["running", "waiting"].includes(row.state));
+    const verbs = {
+      read_file: ["reading", "read"],
+      edit_file: ["editing", "edited"],
+      multi_edit_file: ["editing", "edited"],
+      write_file: ["editing", "edited"],
+      run_shell: ["running", "ran"],
+      grep: ["searching", "searched"],
+      glob: ["searching", "searched"],
+      list_files: ["searching", "searched"],
+      web_fetch: ["fetching", "fetched"],
+      web_search: ["searching the web for", "searched"],
+      dispatch_subagent: ["dispatching", "dispatched"],
+    };
+    const description = (tool, target, past = false) =>
+      [verbs[tool]?.[past ? 1 : 0] ?? tool, target].filter(Boolean).join(" ");
     const usageByAgent = new Map(
       (conversation?.agents ?? []).map((agent) => [agent.agent_id, agent]),
     );
-    if (visibleRows.length === 0) {
+    if (rows.length === 0) {
       replace(agentsRoot, element(document, "p", { text: "Nothing is running." }));
       return;
     }
-    const byId = new Map(visibleRows.map((row) => [row.agentId, row]));
-    const nodes = new Map(visibleRows.map(({ agentId, name, state, tool }) => [agentId, element(document, "div", {
-      className: "agent-row",
-      text: [name, state, tool, usageText(usageByAgent.get(agentId))]
-        .filter(Boolean).join(" · "),
-    })]));
+    const byId = new Map(rows.map((row) => [row.agentId, row]));
+    const nodes = new Map(rows.map(({ agentId, name, state, tool, target, last }) => {
+      const status = ["running", "waiting"].includes(state) ? state : "idle";
+      const activity = status === "running"
+        ? (tool ? description(tool, target) : "thinking")
+        : status === "waiting"
+          ? `approval for ${description(tool, target)}`
+          : last ? `last: ${description(last.tool, last.target, true)}` : "";
+      return [agentId, element(document, "div", {
+        className: "agent-row",
+        text: [name, status, activity, usageText(usageByAgent.get(agentId))]
+          .filter(Boolean).join(" · "),
+      })];
+    }));
     const children = new Map();
     const roots = [];
-    for (const row of visibleRows) {
+    for (const row of rows) {
       const seen = new Set([row.agentId]);
       let ancestor = byId.get(row.parentAgentId);
       while (ancestor && !seen.has(ancestor.agentId)) {
@@ -1445,8 +1467,8 @@ export async function start({ global, document, client }) {
       }
       append(children.get(row.parentAgentId), nodes.get(row.agentId));
     }
-    for (const row of visibleRows) {
-      if (!["running", "waiting", "paused"].includes(row.state)) continue;
+    for (const row of rows) {
+      if (!["running", "waiting"].includes(row.state)) continue;
       const node = nodes.get(row.agentId);
       const controls = element(document, "div", { className: "agent-controls" });
       const controlError = element(document, "p", {
@@ -1464,13 +1486,11 @@ export async function start({ global, document, client }) {
           showAgents();
         }
       };
-      const pauseOrResume = element(document, "button", {
-        text: row.state === "paused" ? "Resume" : "Pause",
+      const pause = element(document, "button", {
+        text: "Pause",
       });
-      pauseOrResume.type = "button";
-      listen(pauseOrResume, "click", () => sendControl(
-        row.state === "paused" ? "resume" : "pause",
-      ));
+      pause.type = "button";
+      listen(pause, "click", () => sendControl("pause"));
       const redirectButton = element(document, "button", { text: "Redirect" });
       redirectButton.type = "button";
       listen(redirectButton, "click", () => {
@@ -1516,7 +1536,7 @@ export async function start({ global, document, client }) {
       const stop = element(document, "button", { text: "Stop" });
       stop.type = "button";
       listen(stop, "click", () => sendControl("stop"));
-      append(controls, pauseOrResume, redirectButton, stop);
+      append(controls, pause, redirectButton, stop);
       append(node, controls, controlError);
     }
     replace(agentsRoot, ...roots);

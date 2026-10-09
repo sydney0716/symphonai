@@ -172,6 +172,10 @@ button.session-link {
   background: #171d26;
 }
 
+.agent-row {
+  overflow-wrap: anywhere;
+}
+
 .agent-children {
   margin-left: 0.75rem;
   padding-left: 0.6rem;

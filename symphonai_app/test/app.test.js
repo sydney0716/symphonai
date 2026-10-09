@@ -1543,8 +1543,8 @@ test("conversation context and per-agent usage render and refresh after compacti
   const usage = find(document.body, (value) => value.className === "conversation-usage");
   assert.equal(usage.textContent, "openai / gpt-test · Mode ask · Context 120 / 160 tokens · 42 tokens");
   assert.doesNotMatch(usage.textContent, /USD|undefined/);
-  assert.match(visibleText(document.getElementById("agents")), /leader · running · 30 tokens · USD 0\.004/);
-  assert.match(visibleText(document.getElementById("agents")), /researcher · running · 12 tokens/);
+  assert.match(visibleText(document.getElementById("agents")), /leader · running · thinking · 30 tokens · USD 0\.004/);
+  assert.match(visibleText(document.getElementById("agents")), /researcher · running · thinking · 12 tokens/);
   assert.doesNotMatch(visibleText(document.body), new RegExp(`${secret}|${absolutePath}`));
 
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id" }));
@@ -2320,6 +2320,81 @@ test("approvals from another conversation show its title and open that session",
   assert.match(waiting.textContent, /waiting/);
 });
 
+test("agent rail keeps every conversation agent with current and last activity", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  let conversation = null;
+  client.conversationStats = async () => ({ conversation });
+  await start({ global: {}, document, client });
+  const agents = document.getElementById("agents");
+  assert.equal(visibleText(agents), "\nNothing is running.");
+
+  await client.emit(eventFrame("RunStarted", { agent_name: "leader" }));
+  await client.emit(eventFrame("ToolCallStarted", { tool_name: "edit_file", target: "app.js" }));
+  await client.emit(eventFrame("SubagentSpawned", { subagent_agent_id: "worker", subagent_name: "worker" }));
+  await client.emit(eventFrame("ToolCallStarted", { agent_id: "worker", tool_name: "run_shell", target: "pytest" }));
+  await client.emit(eventFrame("ToolCallFinished", { agent_id: "worker", tool_name: "run_shell" }));
+  conversation = { agents: [{ agent_id: "researcher", parent_agent_id: "agent-1", name: "researcher" }] };
+  await client.emit(eventFrame("RunFinished", { agent_id: "worker" }));
+
+  let leader = agents.children[0];
+  let children = leader.children.find((row) => row.className === "agent-children");
+  assert.equal(leader.textContent, "leader · running · editing app.js");
+  assert.deepEqual(children.children.map((row) => row.textContent), [
+    "worker · idle · last: ran pytest", "researcher · idle",
+  ]);
+  assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 1);
+  assert.ok(leader.children.some((row) => row.className === "agent-controls"));
+  assert.ok(children.children.every((row) => row.children.length === 0));
+
+  await client.emit(eventFrame("PermissionRequested", { tool_name: "edit_file" }));
+  assert.equal(agents.children[0].textContent, "leader · waiting · approval for editing app.js");
+  assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 1);
+  await client.emit(eventFrame("PermissionDenied", { tool_name: "edit_file" }));
+  await client.emit(eventFrame("ToolCallFinished", { tool_name: "edit_file" }));
+  assert.equal(agents.children[0].textContent, "leader · running · thinking");
+  await client.emit(eventFrame("RunFinished"));
+
+  leader = agents.children[0];
+  children = leader.children.find((row) => row.className === "agent-children");
+  assert.equal(leader.textContent, "leader · idle · last: edited app.js");
+  assert.deepEqual(children.children.map((row) => row.textContent), [
+    "worker · idle · last: ran pytest", "researcher · idle",
+  ]);
+  assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 0);
+  assert.doesNotMatch(visibleText(agents), /Nothing is running/);
+});
+
+test("agent activity uses the tool verbs, past tense, and optional targets", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const agents = document.getElementById("agents");
+  for (const [tool, target, present, past] of [
+    ["read_file", "a.py", "reading a.py", "read a.py"],
+    ["edit_file", "a.py", "editing a.py", "edited a.py"],
+    ["multi_edit_file", "a.py", "editing a.py", "edited a.py"],
+    ["write_file", "a.py", "editing a.py", "edited a.py"],
+    ["run_shell", "pytest", "running pytest", "ran pytest"],
+    ["grep", "src", "searching src", "searched src"],
+    ["glob", "src", "searching src", "searched src"],
+    ["list_files", "src", "searching src", "searched src"],
+    ["web_fetch", "example.com", "fetching example.com", "fetched example.com"],
+    ["web_search", "docs", "searching the web for docs", "searched docs"],
+    ["dispatch_subagent", "worker", "dispatching worker", "dispatched worker"],
+    ["custom_tool", "item", "custom_tool item", "custom_tool item"],
+    ["read_file", undefined, "reading", "read"],
+  ]) {
+    await client.emit(eventFrame("RunStarted", { agent_name: "leader" }));
+    await client.emit(eventFrame("ToolCallStarted", { tool_name: tool, ...(target === undefined ? {} : { target }) }));
+    assert.equal(agents.children[0].textContent, `leader · running · ${present}`, tool);
+    await client.emit(eventFrame("ToolCallFailed", { tool_name: tool }));
+    assert.equal(agents.children[0].textContent, "leader · running · thinking", tool);
+    await client.emit(eventFrame("RunFinished"));
+    assert.equal(agents.children[0].textContent, `leader · idle · last: ${past}`, tool);
+  }
+});
+
 test("status rail renders the whole roadmap beside settings and live agents", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/general" });
@@ -2352,18 +2427,19 @@ test("status rail renders the whole roadmap beside settings and live agents", as
   const root = agents.children[0];
   const children = root.children[0];
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["sibling · running"]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read", "grandchild · running · search"]);
+  assert.deepEqual(children.children.map((row) => row.textContent), ["worker · idle", "sibling · running · thinking"]);
+  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["grandchild · running · search"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read"]);
 
   await client.emit(eventFrame("SubagentSpawned", {
     agent_id: "missing", subagent_agent_id: "orphan", subagent_name: "orphan",
   }));
   assert.deepEqual(agents.children.map((row) => row.textContent), [
-    "leader · running · read", "grandchild · running · search", "orphan · running",
+    "leader · running · read", "orphan · running · thinking",
   ]);
 });
 
-test("agent rail controls pause, redirect, stop, and disappear when done", async () => {
+test("agent rail controls redirect and stop, then disappear while the idle agent remains", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/chat" });
   const client = fakeClient();
@@ -2387,7 +2463,8 @@ test("agent rail controls pause, redirect, stop, and disappear when done", async
   assert.deepEqual(client.calls.controlAgent[1], { agent_id: "leader-id", action: "stop" });
 
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id", stopped_reason: "cancelled" }));
-  assert.equal(visibleText(document.getElementById("agents")), "\nNothing is running.");
+  assert.equal(visibleText(document.getElementById("agents")), "\nleader · idle");
+  assert.equal(find(document.getElementById("agents"), (value) => value.className === "agent-controls"), undefined);
 });
 
 test("agent rail keeps state unchanged and shows a control error", async () => {
@@ -2403,7 +2480,7 @@ test("agent rail keeps state unchanged and shows a control error", async () => {
   const controls = row.children.find((value) => value.className === "agent-controls");
   await controls.children[0].dispatch("click");
   row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  assert.equal(row._textContent, "leader · running");
+  assert.equal(row._textContent, "leader · running · thinking");
   assert.equal(
     row.children.find((value) => value.className === "agent-control-error").textContent,
     "agent is already paused",
@@ -2437,13 +2514,18 @@ test("reopened history and conversation stats render a nested agent tree without
   const link = find(document.getElementById("sidebar"), (row) => row.className === "session-link");
   await link.dispatch("click");
   assert.deepEqual(client.calls.openSession, ["prior"]);
-  assert.equal(visibleText(agents), "\nNothing is running.");
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · idle"]);
+  const children = agents.children[0].children[0];
+  assert.equal(children.className, "agent-children");
+  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · idle", "C · idle"]);
+  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["B · idle"]);
+  assert.equal(find(agents, (row) => row.className === "agent-controls"), undefined);
   assert.equal(find(document.body, (row) => row.className === "conversation-usage").textContent, "");
   assert.match(visibleText(document.getElementById("chat")), /Prior answer/);
   assert.doesNotMatch(visibleText(agents), /tokens|USD/);
 });
 
-test("agent rail hides completed agents and keeps controls on a running worker", async () => {
+test("agent rail keeps idle parents and controls only a running worker", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   client.conversationStats = async () => ({ conversation: { agents: [
@@ -2454,13 +2536,17 @@ test("agent rail hides completed agents and keeps controls on a running worker",
   await start({ global: {}, document, client });
 
   const agents = document.getElementById("agents");
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["worker · running"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · idle"]);
+  const children = agents.children[0].children[0];
+  assert.equal(children.className, "agent-children");
+  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · idle", "worker · running · thinking"]);
   assert.deepEqual(
-    agents.children[0].children.find((child) => child.className === "agent-controls")
+    children.children[1].children.find((child) => child.className === "agent-controls")
       .children.map((button) => button.textContent),
     ["Pause", "Redirect", "Stop"],
   );
-  assert.doesNotMatch(visibleText(agents), /leader|researcher/);
+  assert.equal(agents.children[0].children.some((row) => row.className === "agent-controls"), false);
+  assert.equal(children.children[0].children.length, 0);
 });
 
 test("opening another conversation and starting a new chat clears prior agents", async () => {
@@ -2497,12 +2583,14 @@ test("opening another conversation and starting a new chat clears prior agents",
     row.className === "session-link" && row.textContent === title
   );
   await sessionLink("Conversation A").dispatch("click");
-  assert.equal(visibleText(agents), "\nNothing is running.");
+  assert.deepEqual(walk(agents).filter((row) => row.className === "agent-row").map((row) => row.textContent), [
+    "leader · idle", "worker · idle",
+  ]);
 
   await sessionLink("Conversation B").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["conversation-a", "conversation-b"]);
   assert.deepEqual(replayBoard, ["\nNothing is running.", "\nNothing is running."]);
-  assert.equal(visibleText(agents), "\nNothing is running.");
+  assert.equal(visibleText(agents), "\nleader · idle");
   assert.equal(find(agents, (row) => row.textContent.includes("worker")), undefined);
 
   await document.getElementById("new-chat").dispatch("click");
