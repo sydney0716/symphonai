@@ -6,26 +6,6 @@ import {
 } from "./protocol.js";
 import { isObject } from "./json.js";
 
-export function parseHandshake(line) {
-  let handshake;
-  try {
-    handshake = JSON.parse(line);
-  } catch {
-    throw new ProtocolError("handshake is not valid JSON");
-  }
-  if (
-    !isObject(handshake) ||
-    !Number.isInteger(handshake.port) ||
-    handshake.port < 1 ||
-    handshake.port > 65535 ||
-    typeof handshake.token !== "string" ||
-    handshake.token.length === 0
-  ) {
-    throw new ProtocolError("handshake must contain a valid port and token");
-  }
-  return { port: handshake.port, token: handshake.token };
-}
-
 export async function readEventStream(body, onData) {
   if (!body || typeof body.getReader !== "function") {
     throw new ProtocolError("host event stream has no readable body");

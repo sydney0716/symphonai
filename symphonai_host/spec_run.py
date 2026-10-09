@@ -113,7 +113,6 @@ def mark_roadmap_spec_done(root: Path, spec_path: str) -> None:
         if match is None:
             continue
         phase_start = source.rfind("{", 0, match.start())
-        parsed_phase, _ = decoder.raw_decode(source[phase_start:])
         items_key = re.search(r'"items"\s*:\s*\[', source[phase_start:])
         if items_key is None:
             continue

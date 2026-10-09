@@ -690,57 +690,6 @@ test("a prompt sent from this page becomes the next recalled prompt", async () =
   assert.deepEqual(client.calls.prompt, ["from this page"]);
 });
 
-test("prompt arrows recall project history and drafts", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  client.history = async (limit) => {
-    client.calls.history.push(limit);
-    return { prompts: ["d", "c"] };
-  };
-  await start({ global: {}, document, client });
-  const input = document.getElementById("prompt");
-  await input.dispatch("keydown", { key: "ArrowUp" });
-  assert.equal(input.value, "d");
-  await input.dispatch("keydown", { key: "ArrowUp" });
-  assert.equal(input.value, "c");
-  await input.dispatch("keydown", { key: "ArrowDown" });
-  assert.equal(input.value, "d");
-  await input.dispatch("keydown", { key: "ArrowDown" });
-  assert.equal(input.value, "");
-  assert.deepEqual(client.calls.history, [100]);
-
-  await input.dispatch("keydown", { key: "ArrowUp" });
-  input.value = "edited draft";
-  await input.dispatch("keydown", { key: "ArrowUp" });
-  assert.equal(input.value, "edited draft");
-
-  input.value = "/he";
-  await input.dispatch("input");
-  await input.dispatch("keydown", { key: "ArrowUp" });
-  assert.deepEqual(client.calls.history, [100]);
-  assert.equal(input.value, "/he");
-});
-
-test("a prompt sent from this page becomes the next recalled prompt", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  client.prompt = async (text) => {
-    client.calls.prompt.push(text);
-    return { accepted: true, run_id: "history-run" };
-  };
-  client.history = async (limit) => {
-    client.calls.history.push(limit);
-    return { prompts: ["older"] };
-  };
-  await start({ global: {}, document, client });
-  const input = document.getElementById("prompt");
-  input.value = "from this page";
-  await document.getElementById("prompt-form").dispatch("submit");
-  await input.dispatch("keydown", { key: "ArrowUp" });
-  assert.equal(input.value, "from this page");
-  assert.deepEqual(client.calls.prompt, ["from this page"]);
-});
-
 test("goal sets a check argv and queues a prompt during its first round", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -1414,6 +1363,35 @@ test("start renders the chat page and prepares the whole roadmap graph in the ra
   assert.ok(app.transcript);
   assert.deepEqual(app.transcript.model, []);
   assert.equal(find(document.body, (value) => value.className === "conversation-usage").textContent, "");
+});
+
+test("opening phase 18 loads each primary spec and follow-up once", async () => {
+  const roadmap = {
+    goal: "Shared specs",
+    phases: [{
+      id: "18", name: "Client", status: "done",
+      items: [
+        { title: "First", spec: BASE },
+        { title: "Same spec", spec: BASE },
+        { title: "Second", spec: OPEN_BASE },
+        { title: "Same second spec", spec: OPEN_BASE },
+      ],
+    }],
+  };
+  const client = fakeClient(JSON.stringify(roadmap), {
+    specFilesReply: { paths: [BASE, OPEN_BASE, FOLLOW_UP] },
+    fileOverrides: { [FOLLOW_UP]: "# 18aF — Follow-up\nbody" },
+  });
+  const document = new FakeDocument();
+  await start({ global: {}, document, client });
+  assert.equal(client.calls.file.includes(BASE), false);
+  const rail = document.getElementById("roadmap");
+  await find(rail, (node) => node.className === "roadmap-phase-header").dispatch("click");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (const path of [BASE, OPEN_BASE, FOLLOW_UP]) {
+    assert.equal(client.calls.file.filter((value) => value === path).length, 1, path);
+  }
+  assert.equal(walk(rail).filter((node) => node.className === "roadmap-box-button").length, 2);
 });
 
 test("graph roadmap loads short spec titles and opens items and follow-ups", async () => {

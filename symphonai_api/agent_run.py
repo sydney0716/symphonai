@@ -5,7 +5,6 @@ import time
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 
 from symphonai_api.agent_spec import AgentSpec
 from symphonai_api.budgets import RunBudget

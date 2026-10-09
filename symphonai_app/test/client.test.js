@@ -4,7 +4,6 @@ import { readFile } from "node:fs/promises";
 
 import {
   createClient,
-  parseHandshake,
   readEventStream,
 } from "../src/client.js";
 import { ProtocolError } from "../src/protocol.js";
@@ -294,24 +293,6 @@ test("goal methods use authenticated goal routes and conversation stats", async 
   assert.deepEqual(JSON.parse(records[1].options.body), { action: "pause" });
 });
 
-test("parseHandshake accepts only a port and nonempty token", () => {
-  assert.deepEqual(parseHandshake('{"port":4312,"token":"abc"}'), {
-    port: 4312,
-    token: "abc",
-  });
-  for (const line of [
-    "not json",
-    "[]",
-    "{}",
-    '{"port":4312}',
-    '{"token":"abc"}',
-    '{"port":"4312","token":"abc"}',
-    '{"port":4312,"token":""}',
-  ]) {
-    assert.throws(() => parseHandshake(line), ProtocolError);
-  }
-});
-
 test("all eight calls authorize by header and never by URL", async () => {
   const records = [];
   const fetch = async (url, options) => {
@@ -420,21 +401,6 @@ test("specFiles requests the authenticated spec path listing", async () => {
   assert.equal(records[0].url, "http://127.0.0.1:4312/spec/files");
   assert.equal(records[0].options.method, "GET");
   assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
-});
-
-test("history requests the selected limit", async () => {
-  const records = [];
-  const client = createClient({
-    port: 4312,
-    token: TOKEN,
-    fetch: async (url, options) => {
-      records.push({ url, options });
-      return response(200, { prompts: ["latest"] });
-    },
-  });
-  assert.deepEqual(await client.history(12), { prompts: ["latest"] });
-  assert.equal(new URL(records[0].url).pathname, "/history");
-  assert.equal(new URL(records[0].url).searchParams.get("limit"), "12");
 });
 
 test("history requests the selected limit", async () => {

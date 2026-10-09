@@ -206,8 +206,7 @@ export async function start({ global, document, client }) {
   const expandedDonePhases = new Set();
   const expandedDoneGroups = new Set();
   const graphId = (path) => path.split("/").at(-1).replace(/\.md$/, "").split("-", 1)[0];
-  const knownGraphPaths = () => [...new Set(allSpecPaths.flatMap((path) => [path, ...followUpsFor(path, allSpecPaths)]))];
-  for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
+  for (const path of allSpecPaths) graphTitles.set(graphId(path), "");
   const settingsPane = element(document, "section", { className: "settings-pane" });
   const settingsSections = element(document, "nav", { className: "settings-sections" });
   const settingsContent = element(document, "div", { className: "settings-content" });
@@ -1003,7 +1002,7 @@ export async function start({ global, document, client }) {
       ...(Array.isArray(specFilesReply?.paths) ? specFilesReply.paths.filter((path) => typeof path === "string") : []),
     ])];
     graphTitles.clear();
-    for (const path of knownGraphPaths()) graphTitles.set(graphId(path), "");
+    for (const path of allSpecPaths) graphTitles.set(graphId(path), "");
     graphPhaseLoaded.clear();
     renderRoadmapUI();
     if (selectedSpec) {
@@ -1102,10 +1101,10 @@ export async function start({ global, document, client }) {
   async function loadGraphTitles(phase) {
     if (graphPhaseLoaded.has(phase.id)) return graphTitlesReady.get(phase.id);
     graphPhaseLoaded.add(phase.id);
-    const paths = phase.items.flatMap((item) => {
+    const paths = [...new Set(phase.items.flatMap((item) => {
       const spec = specPaths(item)[0];
       return spec ? [spec, ...followUpsFor(spec, allSpecPaths)] : [];
-    });
+    }))];
     const promise = Promise.all(paths.map(async (path) => {
       try {
         const reply = await boundary.file(path);

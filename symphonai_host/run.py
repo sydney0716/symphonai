@@ -55,7 +55,7 @@ from symphonai_api.worktree import remove_worktree, worktree_diff
 from symphonai_api.worktree import create_worktree
 from symphonai_api.web_search import HttpJsonSearchBackend, search_endpoint
 from symphonai_host.broker import EventBroker
-from symphonai_host.approvals import ApprovalBroker, PendingApproval
+from symphonai_host.approvals import ApprovalBroker
 from symphonai_host.goal import Goal, GoalCheck, GoalChanged, goal_tools, run_check
 from symphonai_host.protocol import HistoryMessage
 
@@ -1187,8 +1187,6 @@ class HostRun:
             self._usage_by_session[run_id] = {}
             if goal is not None:
                 self._goals_by_session[run_id] = goal
-            self._context_report = None
-            self._usage_by_agent.clear()
             goal_agent_id = leader.agent_ref.agent_id
             self._close_idle_conversations_locked()
         if reopened_goal:

@@ -146,37 +146,6 @@ def check_retry_cancel_none_uses_time_sleep() -> None:
 @check("retry.http_503_succeeds")
 def check_retry_http_503_succeeds() -> None:
     basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
-    def _headers(request) -> dict[str, str]:  # noqa: ANN001
-        return {name.lower(): value for name, value in request.header_items()}
-
-    def _http_error(
-        status: int,
-        body: str,
-        *,
-        retry_after: str | None = None,
-    ) -> urllib.error.HTTPError:
-        headers = {"Retry-After": retry_after} if retry_after is not None else {}
-        return urllib.error.HTTPError(
-            url="https://mock.invalid",
-            code=status,
-            msg="mock error",
-            hdrs=headers,
-            fp=io.BytesIO(body.encode("utf-8")),
-        )
-
-    basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
-
-    def _openai_success(content: str) -> _FakeHttpResponse:
-        payload = {
-            "choices": [
-                {
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {},
-        }
-        return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
 
     # -- shared HTTP retry: Gemini retries a transient 503 and parses
     # the successful response without rebuilding the vendor request. --

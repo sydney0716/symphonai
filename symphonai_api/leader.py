@@ -90,7 +90,7 @@ from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.web_search import SearchBackend
-from symphonai_api.worktree import WorktreeError, create_worktree, remove_worktree, worktree_diff
+from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
 
 
 class AgentControlError(RuntimeError):

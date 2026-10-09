@@ -18,7 +18,6 @@ NODE_TESTS = {
     "app.protocol": "protocol.test.js",
     "app.transcript": "transcript.test.js",
     "app.client": "client.test.js",
-    "app.init_flow": "init_flow.test.js",
     "app.keys": "keys.test.js",
     "app.host_handle": "host_handle.test.js",
     "app.turn": "turn.test.js",
@@ -99,11 +98,6 @@ def transcript() -> None:
 @check("app.client")
 def client() -> None:
     _run_node_test("client.test.js")
-
-
-@check("app.init_flow")
-def init_flow() -> None:
-    _run_node_test("init_flow.test.js")
 
 
 @check("app.keys")

@@ -52,8 +52,6 @@ class HostClient:
                 raise HostClientError(f"{path} returned HTTP {response.status}")
             return json.loads(payload) if payload else {}
         except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-            if isinstance(exc, HostClientError):
-                raise
             raise HostClientError(f"{path} connection failed: {type(exc).__name__}") from None
         finally:
             connection.close()

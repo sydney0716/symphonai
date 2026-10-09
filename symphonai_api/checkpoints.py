@@ -72,14 +72,7 @@ class CheckpointStore:
                             self._last_written[path] = digest
                         elif digest is None:
                             self._last_written.pop(path, None)
-                elif kind == "after_write":
-                    path, digest = record.get("path"), record.get("sha256")
-                    if isinstance(path, str):
-                        if isinstance(digest, str):
-                            self._last_written[path] = digest
-                        elif digest is None:
-                            self._last_written.pop(path, None)
-                elif kind == "restore":
+                elif kind in ("after_write", "restore"):
                     path, digest = record.get("path"), record.get("sha256")
                     if isinstance(path, str):
                         if isinstance(digest, str):

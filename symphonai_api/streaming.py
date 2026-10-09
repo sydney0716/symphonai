@@ -12,7 +12,7 @@ from typing import Iterable, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
-from symphonai_api.models import Message, ModelResponse, ToolCall
+from symphonai_api.models import ModelResponse, ToolCall
 from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
 from symphonai_api.retry import (
     _context_token_counts,
