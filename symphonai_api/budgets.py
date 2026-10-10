@@ -20,6 +20,7 @@ BUDGET_STOPPED_REASONS = (
     "budget_wall_time",
     "budget_tokens",
     "budget_cost",
+    "budget_cost_unpriced",
 )
 
 
@@ -40,8 +41,6 @@ class RunBudget:
             raise ValueError("max_total_tokens must be positive")
         if self.max_cost is not None and self.max_cost < 0:
             raise ValueError("max_cost must be non-negative")
-        if self.max_cost is not None and self.price_table is None:
-            raise ValueError("max_cost requires price_table")
 
     def lowered(self, **changes: object) -> "RunBudget":
         """Return a copy whose limits are never more permissive than these."""
@@ -77,7 +76,7 @@ class BudgetState:
     started_monotonic: float
     usage_by_model: Mapping[str, UsageTotals]
 
-    def exceeded(self, budget: RunBudget) -> str | None:
+    def exceeded(self, budget: RunBudget, requested_model: str | None = None) -> str | None:
         if (
             budget.wall_seconds is not None
             and time.monotonic() - self.started_monotonic >= budget.wall_seconds
@@ -92,7 +91,15 @@ class BudgetState:
             return "budget_tokens"
 
         if budget.max_cost is not None:
+            if budget.price_table is None:
+                return "budget_cost_unpriced"
+            if requested_model is not None and budget.price_table.cost(
+                requested_model, UsageTotals()
+            ) is None:
+                return "budget_cost_unpriced"
             cost = total_cost(self.usage_by_model, budget.price_table)
-            if cost is not None and cost >= budget.max_cost:
+            if cost is None:
+                return "budget_cost_unpriced"
+            if cost >= budget.max_cost:
                 return "budget_cost"
         return None

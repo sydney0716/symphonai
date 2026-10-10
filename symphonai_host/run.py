@@ -31,6 +31,7 @@ from symphonai_api.leader import (
     AgentControlError, Leader, LeaderConfig, LeaderRunResult,
     builtin_subagent_specs,
 )
+from symphonai_api.leases import WorkspaceLeases
 from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import ContentInput, DocumentBlock, ImageBlock, Message, Role, TextBlock
 from symphonai_api.permissions import PermissionPolicy
@@ -221,6 +222,7 @@ class HostRun:
         self._provider = provider
         self._policy = policy
         self._repo_root = policy.repo_root
+        self._leases = WorkspaceLeases(policy.repo_root)
         self._base_policy = replace(policy)
         self._extensions = extensions
         permitted = self.permitted_modes()
@@ -1007,6 +1009,18 @@ class HostRun:
                 leader_model = selector.model
             elif selector.model is not None:
                 leader_model = selector.model
+        child_providers: dict[tuple[str, str | None], ModelProvider | None] = {}
+
+        def provider_for(name: str, model: str | None) -> ModelProvider | None:
+            key = (name, model)
+            if key not in child_providers:
+                child_providers[key] = (
+                    None
+                    if self._provider_factory is None
+                    else self._provider_factory(name, model, None)
+                )
+            return child_providers[key]
+
         return Leader(
             LeaderConfig(
                 leader_provider=leader_provider,
@@ -1033,6 +1047,8 @@ class HostRun:
                 hook_runner=self._hooks,
                 memory=self._memory_for(roster),
                 checkpoints=checkpoints,
+                provider_for=provider_for,
+                leases=self._leases,
                 lsp=self._lsp,
                 leader_tools=goal_tools(
                     lambda: self._goal_for_session(session.run_id),
@@ -1964,11 +1980,21 @@ class HostRun:
             with self._lock:
                 context.process = process
 
+        session_store = SessionStore.open(self._sessions_root, context.session_id)
+        try:
+            meta = session_store.read_meta()
+        finally:
+            session_store.close()
+        spec_run = meta.get("spec_run")
+        is_spec_run = isinstance(spec_run, dict) and spec_run.get("kind") == "implement"
+        check_policy = self._policy_by_session[context.session_id]
         result = run_check(
             context.goal.check,
-            self._policy_by_session[context.session_id].repo_root,
+            check_policy.repo_root,
             cancelled=context.cancel,
             set_process=set_process,
+            policy=check_policy,
+            sandboxed=is_spec_run,
         )
         with self._lock:
             goal = context.goal

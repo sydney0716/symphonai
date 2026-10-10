@@ -292,7 +292,7 @@ class ApiAgent:
             effective_budget = self._budget if budget is None else budget
             if budget_state is None or effective_budget is None:
                 return None
-            return budget_state.exceeded(effective_budget)
+            return budget_state.exceeded(effective_budget, requested_model)
 
         try:
             append_record(

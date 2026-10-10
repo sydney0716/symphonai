@@ -17,6 +17,7 @@ Subagent pool state lives only in memory for the duration of one
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 from collections.abc import Mapping, Sequence
@@ -33,7 +34,7 @@ from symphonai_api.agent_run import (
     new_agent_run,
     read_run_graph,
 )
-from symphonai_api.agent_spec import AgentSpec, Isolation, ModelSelector, validate_output
+from symphonai_api.agent_spec import AgentSpec, Isolation, ModelSelector, validate_input, validate_output
 from symphonai_api.budgets import RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import (
@@ -132,6 +133,7 @@ def builtin_subagent_specs(
             model=selector,
             policy_ceiling=policy,
             tool_names=tools,
+            mcp_tool_names=None if name == "worker" else (),
             call_class=CallClass.BACKGROUND,
         )
         for name, tools in (
@@ -151,18 +153,21 @@ def builtin_subagent_specs(
             name="planner", prompt=PLANNER_PROMPT, model=selector,
             policy_ceiling=policy,
             tool_names=EXPLORER_TOOL_NAMES + ("write_file", "edit_file") + optional,
+            mcp_tool_names=(),
             call_class=CallClass.BACKGROUND,
         ),
         "implementer": AgentSpec(
             name="implementer", prompt=IMPLEMENTER_PROMPT, model=selector,
             policy_ceiling=policy,
             tool_names=tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp)),
+            mcp_tool_names=None,
             call_class=CallClass.BACKGROUND,
         ),
         "reviewer": AgentSpec(
             name="reviewer", prompt=REVIEWER_PROMPT, model=selector,
             policy_ceiling=policy,
             tool_names=EXPLORER_TOOL_NAMES + ("run_shell", "write_file") + optional,
+            mcp_tool_names=(),
             call_class=CallClass.BACKGROUND,
         ),
     })
@@ -214,11 +219,22 @@ _BUILTIN_PURPOSES = {
 
 def _dispatch_description(subagents: Mapping[str, AgentSpec] | None = None) -> str:
     names = _BUILTIN_PURPOSES if subagents is None else {
-        name: purpose for name, purpose in _BUILTIN_PURPOSES.items() if name in subagents
+        name: _BUILTIN_PURPOSES.get(name, "") for name in subagents
     }
-    available = [f"{name}: {purpose}." for name, purpose in names.items()]
-    if subagents is not None:
-        available.extend(sorted(set(subagents) - set(_BUILTIN_PURPOSES)))
+    available = []
+    for name, purpose in names.items():
+        entry = f"{name}: {purpose}." if purpose else name
+        spec = None if subagents is None else subagents[name]
+        if spec is not None and spec.io.input_schema is not None:
+            def json_value(value):
+                if isinstance(value, Mapping):
+                    return {key: json_value(item) for key, item in value.items()}
+                if isinstance(value, (tuple, list)):
+                    return [json_value(item) for item in value]
+                return value
+            schema = json.dumps(json_value(spec.io.input_schema), separators=(",", ":"))
+            entry += f" (task must be JSON matching {schema})"
+        available.append(entry)
     return _DISPATCH_DESCRIPTION + " Available subagents: " + "; ".join(available) + "."
 _DISPATCH_PROPERTIES = {
     "subagent_name": {
@@ -342,6 +358,7 @@ class DispatchSubagentTool(LocalTool):
         skills: Mapping[str, Skill] | None = None,
         checkpoints: CheckpointStore | None = None,
         lsp: LspManager | None = None,
+        provider_for: Callable[[str, str | None], ModelProvider | None] | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -370,6 +387,7 @@ class DispatchSubagentTool(LocalTool):
         self._skills = skills
         self._checkpoints = checkpoints
         self._lsp = lsp
+        self._provider_for = provider_for
         self._pool_lock = threading.RLock()
         self._reserved_names: set[str] = set()
         self._active_runs_lock = threading.Lock()
@@ -511,6 +529,47 @@ class DispatchSubagentTool(LocalTool):
                 ok=False,
                 error=f"unknown subagent {subagent_name!r}; known subagents: {known}",
             )
+        _, input_error = validate_input(spec.io, task)
+        if input_error is not None:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=(
+                    f"subagent {subagent_name} input does not match its contract: "
+                    f"{input_error}"
+                ),
+            )
+        available_extra = self._extra_tools or {}
+        named_mcp_tools = spec.mcp_tool_names
+        if named_mcp_tools is not None:
+            unavailable = next((name for name in named_mcp_tools if name not in available_extra), None)
+            if unavailable is not None:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=f"subagent {subagent_name} names unavailable tool {unavailable}",
+                )
+            selected_extra = {name: available_extra[name] for name in named_mcp_tools}
+        else:
+            selected_extra = {
+                name: tool for name, tool in available_extra.items()
+                if name not in spec.denied_mcp_tool_names
+            }
+        child_provider = self._subagent_provider
+        if spec.model.provider != getattr(self._subagent_provider, "name", None):
+            child_provider = (
+                None if self._provider_for is None
+                else self._provider_for(spec.model.provider, spec.model.model)
+            )
+            if child_provider is None:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error=(
+                        f"subagent {subagent_name} needs provider "
+                        f"{spec.model.provider}, which is not configured"
+                    ),
+                )
         if self._search_backend is None and "web_search" in (spec.tool_names or ()):
             return ToolResult(
                 tool_call_id=tool_call.id,
@@ -640,7 +699,7 @@ class DispatchSubagentTool(LocalTool):
                 if spec.memory.enabled
                 else None
             )
-            subagent_tools = merge_tool_registry(
+            standard_tools = (
                 standard_tool_registry(
                     tool_names,
                     result_store=self._result_store,
@@ -651,16 +710,21 @@ class DispatchSubagentTool(LocalTool):
                     checkpoints=(
                         None if worktree_root is not None else self._checkpoints
                     ),
-                ),
-                self._extra_tools,
+                )
+                if tool_names is None or tool_names
+                else ({"memory": memory_tool} if memory_tool is not None else {})
+            )
+            subagent_tools = merge_tool_registry(
+                standard_tools,
+                selected_extra,
             )
             record = SubagentRecord(
                 agent=ApiAgent(
-                    provider=self._subagent_provider,
+                    provider=child_provider,
                     tools=subagent_tools,
                     policy=effective_policy,
                     max_turns=self._subagent_max_turns,
-                    tool_schemas=tool_registry_schemas(subagent_tools, self._subagent_provider.wire_format),
+                    tool_schemas=tool_registry_schemas(subagent_tools, child_provider.wire_format),
                     agent_ref=agent_ref,
                     events=self._events,
                     stream=self._stream,
@@ -957,6 +1021,8 @@ class LeaderConfig:
     checkpoints: CheckpointStore | None = None
     leader_tools: Mapping[str, LocalTool] | None = None
     lsp: LspManager | None = None
+    provider_for: Callable[[str, str | None], ModelProvider | None] | None = None
+    leases: WorkspaceLeases | None = None
 
 
 @dataclass
@@ -1049,7 +1115,7 @@ class Leader:
             approval_callback=config.approval_callback,
         )
         self._leader_policy = leader_policy
-        self._leases = WorkspaceLeases(config.repo_root)
+        self._leases = config.leases or WorkspaceLeases(config.repo_root)
         defined_leader = None if config.subagent_specs is None else config.subagent_specs.get("leader")
         self._leader_prompt = "" if defined_leader is None else defined_leader.prompt
         leader_provider_name = getattr(config.leader_provider, "name", None) or "unknown"
@@ -1099,6 +1165,7 @@ class Leader:
             skills=(None if config.extensions is None else config.extensions.skills),
             checkpoints=config.checkpoints,
             lsp=config.lsp,
+            provider_for=config.provider_for,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}

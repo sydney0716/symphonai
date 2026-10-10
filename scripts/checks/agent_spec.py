@@ -4,7 +4,7 @@ import ast
 import tempfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from symphonai_api.agent_spec import AgentSpec, ContextInheritance, IOContract, Isolation, ModelSelector, validate_output
+from symphonai_api.agent_spec import AgentSpec, ContextInheritance, IOContract, Isolation, ModelSelector, validate_input, validate_output
 from symphonai_api.permissions import PermissionPolicy
 from scripts.checks.harness import check, fail
 
@@ -89,6 +89,11 @@ def field_validation() -> None:
                     fail(f"validation error omitted {field}: {exc!r}")
                 continue
             fail(f"invalid field accepted: {changes!r}")
+        mcp_only = _spec(
+            Path(d), tool_names=(), mcp_tool_names=("mcp__fs__read",),
+        )
+        if mcp_only.tool_names != ():
+            fail("MCP-only tool selection did not retain an empty standard tool set")
 
 @check("agent_spec.validate_output_passthrough")
 def passthrough() -> None:
@@ -117,3 +122,16 @@ def never_raises() -> None:
     for text in ("", "{", "[]", "null", '{"a":[{"b":["x"]}]}', "true", "42", "not json", '{"a":[{}]}', '{"a":"x"}', '{"a":[{"b":[2]}]}', "{}"):
         try: validate_output(c,text)
         except Exception as exc: fail(f"validate_output raised {exc!r}")
+
+
+@check("agent_spec.validate_input_contract")
+def validate_input_contract() -> None:
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+    contract = IOContract(input_schema=schema)
+    if validate_input(contract, '{"path":"a.py"}')[1] is not None:
+        fail("valid input was rejected")
+    for text in ("fix a.py", '{"file":1}'):
+        if validate_input(contract, text)[0] is not None:
+            fail(f"invalid input was accepted: {text!r}")
+    if validate_input(IOContract(), "free text") != ("free text", None):
+        fail("input without a schema did not pass through")

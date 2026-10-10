@@ -228,11 +228,28 @@ def run_check(
     cancelled: threading.Event,
     set_process: Callable[[subprocess.Popen | None], None],
     timeout: float | None = None,
+    policy: PermissionPolicy | None = None,
+    sandboxed: bool = False,
 ) -> dict:
     """Run one configured argv and return its bounded result."""
+    command = list(argv)
+    if sandboxed and policy is not None:
+        from symphonai_api.tools.shell import (
+            SANDBOX_EXEC, _sandbox_available, _seatbelt_profile,
+        )
+
+        available = _sandbox_available()
+        if policy.shell_sandbox and not available:
+            return {
+                "exit": None,
+                "ok": False,
+                "output": "sandbox requested but unavailable on this platform",
+            }
+        if available:
+            command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *command]
     try:
         process = subprocess.Popen(
-            argv,
+            command,
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

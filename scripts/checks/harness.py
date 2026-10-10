@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +18,11 @@ REGISTRY: dict[str, Callable[[], None]] = {}
 NEEDS_REPOSITORY: set[str] = set()
 _CURRENT_LABELS: list[str] | None = None
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CHECK_TIMEOUT_SECONDS = 60
+
+
+class _CheckTimedOut(Exception):
+    """Raised by the alarm handler to end a stuck check."""
 
 
 def fail(msg: str) -> NoReturn:
@@ -90,6 +96,16 @@ def run(selector: str | None = None) -> int:
     failed = 0
     skipped = 0
     previous_sessions_root = os.environ.get("SYMPHONAI_SESSIONS_DIR")
+    timeout_seconds = int(
+        os.environ.get("SYMPHONAI_CHECK_TIMEOUT", DEFAULT_CHECK_TIMEOUT_SECONDS)
+    )
+    if timeout_seconds < 1:
+        raise ValueError("SYMPHONAI_CHECK_TIMEOUT must be at least 1")
+    alarm_available = hasattr(signal, "SIGALRM")
+
+    def timeout_check(signum, frame) -> None:  # noqa: ANN001
+        raise _CheckTimedOut
+
     with tempfile.TemporaryDirectory() as temporary:
         os.environ["SYMPHONAI_SESSIONS_DIR"] = str(Path(temporary) / "sessions")
         try:
@@ -101,13 +117,26 @@ def run(selector: str | None = None) -> int:
                 labels: list[str] = []
                 _CURRENT_LABELS = labels
                 failure: str | None = None
+                previous_handler = None
+                previous_alarm = 0
                 try:
+                    if alarm_available:
+                        previous_handler = signal.signal(signal.SIGALRM, timeout_check)
+                        previous_alarm = signal.alarm(timeout_seconds)
                     function()
+                except _CheckTimedOut:
+                    failure = f"timed out after {timeout_seconds}s"
                 except CheckFailed as exc:
                     failure = str(exc)
                 except Exception as exc:
                     failure = f"{type(exc).__name__}: {exc}"
                 finally:
+                    if alarm_available:
+                        signal.alarm(0)
+                        if previous_handler is not None:
+                            signal.signal(signal.SIGALRM, previous_handler)
+                        if previous_alarm:
+                            signal.alarm(previous_alarm)
                     _CURRENT_LABELS = None
 
                 if failure is None:

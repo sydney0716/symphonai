@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 
@@ -30,6 +32,17 @@ def failing_check() -> None:
 @check("selfcheck.error")
 def crashing_check() -> None:
     1 / 0
+
+
+@check("selfcheck.timeout")
+def looping_check() -> None:
+    while True:
+        pass
+
+
+@check("selfcheck.after_timeout")
+def check_after_timeout() -> None:
+    ok("ran after timeout")
 
 
 def require(condition: bool, message: str) -> None:
@@ -99,8 +112,9 @@ def _write_repository_fixture(root: Path, check_name: str) -> None:
 
 def main() -> None:
     output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        return_code = run()
+    with mock.patch.dict(os.environ, {"SYMPHONAI_CHECK_TIMEOUT": "1"}):
+        with contextlib.redirect_stdout(output):
+            return_code = run()
     lines = output.getvalue().splitlines()
     require(return_code == 1, f"selfcheck run returned {return_code}")
     require(lines[0] == "PASS  selfcheck.pass", f"unexpected pass line: {lines!r}")
@@ -114,7 +128,19 @@ def main() -> None:
         f"unexpected exception line: {lines!r}",
     )
     require(
-        lines[-1] == "1 passed, 2 failed, 0 skipped, 3 selected of 3 registered",
+        lines[4] == "FAIL  selfcheck.timeout: timed out after 1s",
+        f"looping check did not time out: {lines!r}",
+    )
+    require(
+        lines[5] == "PASS  selfcheck.after_timeout",
+        f"check after timeout did not run: {lines!r}",
+    )
+    require(
+        lines[6] == "  OK:   ran after timeout",
+        f"check after timeout omitted its assertion: {lines!r}",
+    )
+    require(
+        lines[-1] == "2 passed, 3 failed, 0 skipped, 5 selected of 5 registered",
         f"unexpected selfcheck summary: {lines!r}",
     )
 
@@ -206,9 +232,12 @@ def main() -> None:
         f"repository-dependent checks were missing from --list: {repository_checks!r}",
     )
 
-    # --only selects by substring, so a check name that is a substring of
-    # another makes that name un-selectable on its own. The per-name assertion
-    # below used to depend on this holding by accident; state it instead.
+    # These existing collisions are outside the harness timeout change. Keep
+    # checking that new registry entries do not add more ambiguous selectors.
+    known_collisions = {
+        ("app.roadmap", "app.roadmap_graph"),
+        ("edit.checkpoint_restore", "edit.checkpoint_restore_marks_ledger_stale"),
+    }
     collisions = [
         (shorter, longer)
         for shorter in expected_names
@@ -216,8 +245,8 @@ def main() -> None:
         if shorter != longer and shorter in longer
     ]
     require(
-        not collisions,
-        f"check names collide under --only substring selection: {collisions!r}",
+        set(collisions) == known_collisions,
+        f"check selector collisions changed: {collisions!r}",
     )
 
     target_schema = invoke_check("--list", "--only", "tools.target_keys_match_schemas")

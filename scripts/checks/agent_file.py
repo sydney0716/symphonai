@@ -861,3 +861,27 @@ def no_policy_is_neutral_ceiling() -> None:
         )
         if not status.ok:
             fail(f"agent policy did not execute its allowed git status command: {status!r}")
+
+
+@check("agent_file.mcp_tool_names")
+def check_mcp_tool_names() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for name, tools, expected in (
+            ("default", "", None),
+            ("limited", 'tools = ["read_file"]\n', ()),
+            ("named", 'tools = ["read_file", "mcp__fs__write"]\n', ("mcp__fs__write",)),
+            ("mcp_only", 'tools = ["mcp__fs__write"]\n', ("mcp__fs__write",)),
+        ):
+            path = _write(root, f"{name}.toml", f'prompt = "Inspect."\n{tools}')
+            spec = load_agent_file(path, repo_root=root, default_model=ModelSelector("fake"))
+            if spec.mcp_tool_names != expected:
+                fail(f"{name} MCP selection mismatch: {spec.mcp_tool_names!r}")
+        malformed = _write(root, "malformed.toml", 'prompt = "Inspect."\ntools = ["mcp_bad"]\n')
+        try:
+            load_agent_file(malformed, repo_root=root, default_model=ModelSelector("fake"))
+        except ValueError as exc:
+            if "unknown tool name" not in str(exc):
+                fail(f"malformed MCP name gave the wrong error: {exc!r}")
+        else:
+            fail("malformed MCP tool name was accepted")

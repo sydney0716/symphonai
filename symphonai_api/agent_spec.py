@@ -105,6 +105,21 @@ def validate_output(contract: IOContract, text: str) -> tuple[object | None, str
         return None, f"output must be valid JSON matching the contract: {exc}"
 
 
+def validate_input(contract: IOContract, text: str) -> tuple[object | None, str | None]:
+    """Parse and check dispatch input, returning an actionable error."""
+    if contract.input_schema is None:
+        return text, None
+    try:
+        source = text.strip()
+        if source.startswith("```json") and source.endswith("```"):
+            source = source[7:-3].strip()
+        value = json.loads(source)
+        error = _validate(value, contract.input_schema, "input")
+        return (value, None) if error is None else (None, error)
+    except Exception as exc:
+        return None, f"input must be valid JSON matching the contract: {exc}"
+
+
 def _validate(value: object, schema: Mapping[str, object], path: str) -> str | None:
     expected = schema.get("type")
     valid = {
@@ -146,6 +161,8 @@ class AgentSpec:
     model: ModelSelector
     policy_ceiling: PermissionPolicy
     tool_names: tuple[str, ...] | None = None
+    mcp_tool_names: tuple[str, ...] | None = None
+    denied_mcp_tool_names: tuple[str, ...] = ()
     budget: RunBudget | None = None
     deadline_seconds: float | None = None
     isolation: Isolation = Isolation()
@@ -159,8 +176,10 @@ class AgentSpec:
         if not isinstance(self.name, str) or not self.name or self.name != self.name.strip():
             raise ValueError("name must be non-empty without surrounding whitespace")
         if self.tool_names is not None:
-            if not self.tool_names:
-                raise ValueError("tool_names must not be empty")
+            if not self.tool_names and not self.mcp_tool_names:
+                raise ValueError(
+                    "tool_names may be empty only when mcp_tool_names names a tool"
+                )
             if len(set(self.tool_names)) != len(self.tool_names):
                 raise ValueError("tool_names must not contain duplicates")
         if self.deadline_seconds is not None and not self.deadline_seconds > 0:

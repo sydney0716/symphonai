@@ -64,6 +64,7 @@ from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import ReadLedger, WriteFileTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.tools.shell import RunShellTool
+import symphonai_api.tools.shell as shell_module
 from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.worktree import create_worktree, worktree_diff
 from symphonai_host.broker import EventBroker
@@ -187,6 +188,63 @@ def check_spec_run_goal_checks_in_its_worktree() -> None:
                 fail(f"spec validation did not run in its worktree: {goal!r}")
         finally:
             run.close()
+
+
+@check("host_server.spec_goal_check_sandbox_policy")
+def check_spec_goal_check_sandbox_policy() -> None:
+    from threading import Event
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "worktree"
+        root.mkdir()
+        policy = PermissionPolicy(repo_root=root, mode="allow")
+
+        def execute(argv, *, sandboxed, run_policy=policy):
+            return goal_module.run_check(
+                tuple(argv), root, cancelled=Event(), set_process=lambda _proc: None,
+                timeout=5, policy=run_policy, sandboxed=sandboxed,
+            )
+
+        inside = root / "inside-marker"
+        inside_result = execute([
+            sys.executable, "-c", "from pathlib import Path; Path('inside-marker').touch()",
+        ], sandboxed=True)
+        if not inside_result["ok"] or not inside.exists():
+            fail(f"sandboxed spec check could not write in its worktree: {inside_result!r}")
+
+        outside = root.parent / "goal-marker"
+        user_goal_result = goal_module.run_check(
+            (sys.executable, "-c", f"from pathlib import Path; Path({str(outside)!r}).touch()"),
+            root, cancelled=Event(), set_process=lambda _proc: None, timeout=5,
+        )
+        if not user_goal_result["ok"] or not outside.exists():
+            fail(f"user-supplied /goal check was not left unsandboxed: {user_goal_result!r}")
+
+        strict = replace(policy, shell_sandbox=True)
+        with mock.patch.object(shell_module, "_sandbox_available", return_value=False):
+            unavailable = execute([sys.executable, "-c", "pass"], sandboxed=True, run_policy=strict)
+        if unavailable["ok"] or "sandbox requested but unavailable on this platform" not in unavailable["output"]:
+            fail(f"strict sandbox request did not fail closed: {unavailable!r}")
+
+        with mock.patch.object(shell_module.sys, "platform", "linux"):
+            linux_result = execute([
+                sys.executable, "-c", "from pathlib import Path; Path('linux-marker').touch()",
+            ], sandboxed=True)
+        if not linux_result["ok"] or not (root / "linux-marker").exists():
+            fail(f"Linux spec validation did not run unconfined: {linux_result!r}")
+
+        if shell_module._sandbox_available():
+            home_marker = Path.home() / f".symphonai-spec-check-{os.getpid()}"
+            try:
+                outside_result = execute([
+                    sys.executable, "-c", f"from pathlib import Path; Path({str(home_marker)!r}).touch()",
+                ], sandboxed=True)
+                if outside_result["ok"] or home_marker.exists():
+                    fail(f"sandboxed spec check wrote outside its worktree: {outside_result!r}")
+            finally:
+                home_marker.unlink(missing_ok=True)
+        else:
+            print("SKIP: sandbox-exec unavailable; macOS confinement check not run")
 
 
 @check("host_server.spec_run_starts_with_full_spec_and_keeps_title")

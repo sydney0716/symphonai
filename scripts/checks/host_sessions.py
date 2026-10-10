@@ -23,12 +23,15 @@ from symphonai_api.session import SessionStore, load_run, read_records
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.serialization import message_to_json
 from symphonai_api.identity import new_id
+from symphonai_api.leases import WorkspaceLeases
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 import symphonai_host.__main__ as host_main
 from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
 from symphonai_host.run import ProviderSelectionError
+from symphonai_host.run import HostRun
+from symphonai_host.broker import EventBroker
 from symphonai_host.server import HostServer
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prompt_history, prune_sessions
 from scripts.checks.host_server import _WaitingProvider, _await_sse, _headers, _request, _subscribed_stream
@@ -68,6 +71,47 @@ def _new_session(host: HostServer) -> None:
         response.read()
     finally:
         connection.close()
+
+
+@check("host_sessions.conversations_share_workspace_leases")
+def check_conversations_share_workspace_leases() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        host = HostRun(
+            provider, PermissionPolicy(repo_root=root), EventBroker(),
+            sessions_root=root / "sessions",
+        )
+        first_session = SessionStore(root / "sessions", "first", repo_root=root)
+        second_session = SessionStore(root / "sessions", "second", repo_root=root)
+        try:
+            first = host._new_leader(first_session)
+            second = host._new_leader(second_session)
+            if first._leases is not second._leases or not isinstance(host._leases, WorkspaceLeases):
+                fail("conversations did not share the host lease owner")
+            second._dispatch_tool._set_event_context(
+                agent_id="agent_second", run_id="run_second", turn_id=None,
+            )
+            with first._leases.held("first-child", None):
+                conflict = second._dispatch_tool.execute(
+                    ToolCall("lease-conflict", "dispatch_subagent", {
+                        "subagent_name": "worker", "task": "inspect",
+                    }),
+                    second._leader_policy,
+                )
+                if conflict.ok or "first-child" not in (conflict.error or ""):
+                    fail(f"second conversation did not see the shared lease: {conflict!r}")
+            success = second._dispatch_tool.execute(
+                ToolCall("lease-released", "dispatch_subagent", {
+                    "subagent_name": "worker", "task": "inspect",
+                }),
+                second._leader_policy,
+            )
+            if not success.ok:
+                fail(f"dispatch did not succeed after lease release: {success!r}")
+        finally:
+            first_session.close()
+            second_session.close()
 
 
 def _listing_fixture(root: Path) -> None:

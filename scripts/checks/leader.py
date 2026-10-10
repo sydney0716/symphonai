@@ -285,12 +285,13 @@ def _spec(
     max_depth: int = 0,
     effort: str | None = None,
     model: str = "test-model",
+    provider: str = "fake",
     memory: MemorySettings = MemorySettings(),
 ) -> AgentSpec:
     return AgentSpec(
         name=name,
         prompt=prompt,
-        model=ModelSelector("fake", model, effort=effort),
+        model=ModelSelector(provider, model, effort=effort),
         policy_ceiling=policy or PermissionPolicy(root),
         deadline_seconds=deadline_seconds,
         isolation=isolation,
@@ -376,10 +377,12 @@ def check_spec_effort_reaches_requests() -> None:
         )
         specs = {
             "quick": _spec(
-                ws.root, "quick", effort="low", model="gpt-5.4-mini"
+                ws.root, "quick", effort="low", model="gpt-5.4-mini",
+                provider=child_provider.name,
             ),
             "deep": _spec(
-                ws.root, "deep", effort="high", model="gpt-5.4-mini"
+                ws.root, "deep", effort="high", model="gpt-5.4-mini",
+                provider=child_provider.name,
             ),
         }
         dispatching_provider = FakeModelProvider(
@@ -3302,6 +3305,117 @@ def check_lsp_unavailable_subagent_refusal() -> None:
         result = dispatch.execute(_dispatch("custom", "inspect"), ws.policy)
         if result.ok or result.error != "subagent 'custom' cannot use lsp: no language server is configured":
             fail(f"unconfigured explicit lsp use did not fail closed: {result!r}")
+
+
+@check("leader.defined_subagent_provider_selection")
+def check_defined_subagent_provider_selection() -> None:
+    with workspace() as ws:
+        from dataclasses import replace
+
+        class RecordingAnthropic(_AnthropicFakeProvider):
+            def __init__(self):
+                super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):  # noqa: ANN001
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        conversation = _RecordingFakeProvider([])
+        child = RecordingAnthropic()
+        spec = replace(
+            _spec(ws.root, "custom"), model=ModelSelector("anthropic", "claude-test"),
+            tool_names=("read_file",),
+        )
+        dispatch = DispatchSubagentTool(
+            conversation, ws.policy, subagent_specs={"custom": spec},
+            provider_for=lambda name, model: child if (name, model) == ("anthropic", "claude-test") else None,
+        )
+        result = dispatch.execute(_dispatch("custom", "inspect"), ws.policy)
+        if not result.ok or not child.requests:
+            fail(f"declared provider did not run the child: {result!r}")
+        if (
+            child.requests[0].model != "claude-test"
+            or not child.requests[0].tools
+            or "input_schema" not in child.requests[0].tools[0]
+        ):
+            fail(f"declared model or Anthropic tool schema was not used: {child.requests[0]!r}")
+        if conversation.requests:
+            fail(f"child request went to the conversation provider: {conversation.requests!r}")
+
+        child.requests.clear()
+        for resolver in (None, lambda _name, _model: None):
+            missing = DispatchSubagentTool(
+                conversation, ws.policy, subagent_specs={"custom": spec}, provider_for=resolver,
+            )
+            refusal = missing.execute(_dispatch("custom", "inspect"), ws.policy)
+            if refusal.ok or refusal.error != "subagent custom needs provider anthropic, which is not configured":
+                fail(f"missing declared provider was not refused: {refusal!r}")
+            if missing.pool or conversation.requests or child.requests:
+                fail("provider refusal happened after a child request")
+
+
+@check("leader.mcp_tools_follow_subagent_allowlist")
+def check_mcp_tools_follow_subagent_allowlist() -> None:
+    class ExtraTool(_CancellingSubagentTool):
+        @property
+        def name(self) -> str:
+            return "mcp__fs__write"
+
+    with workspace() as ws:
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        extra = {"mcp__fs__write": ExtraTool()}
+        roster = {
+            "default": _spec(ws.root, "default"),
+            "limited": _spec(ws.root, "limited").with_overrides(tool_names=("read_file",), mcp_tool_names=()),
+            "named": _spec(ws.root, "named").with_overrides(tool_names=("read_file",), mcp_tool_names=("mcp__fs__write",)),
+            "mcp_only": _spec(ws.root, "mcp_only").with_overrides(tool_names=(), mcp_tool_names=("mcp__fs__write",)),
+            "missing": _spec(ws.root, "missing").with_overrides(mcp_tool_names=("mcp__nope__x",)),
+        }
+        dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs=roster, extra_tools=extra)
+        for name, expected in (("default", True), ("limited", False), ("named", True), ("mcp_only", True)):
+            result = dispatch.execute(_dispatch(name, "inspect", name), ws.policy)
+            has_tool = "mcp__fs__write" in dispatch.pool[name].agent._tools
+            if not result.ok or has_tool != expected or (name == "mcp_only" and dispatch.pool[name].agent._tools.keys() != {"mcp__fs__write"}):
+                fail(f"{name} MCP tool selection mismatch: result={result!r}, tools={dispatch.pool[name].agent._tools!r}")
+        unavailable = dispatch.execute(_dispatch("missing", "inspect", "missing"), ws.policy)
+        if unavailable.ok or unavailable.error != "subagent missing names unavailable tool mcp__nope__x":
+            fail(f"missing named MCP tool was not refused: {unavailable!r}")
+        builtin = builtin_subagent_specs(provider, ws.policy)
+        builtin_dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs=builtin, extra_tools=extra)
+        for name, expected in (("reviewer", False), ("explorer", False), ("worker", True)):
+            result = builtin_dispatch.execute(
+                _dispatch(name, "inspect", name), ws.policy,
+            )
+            actual = "mcp__fs__write" in builtin_dispatch.pool[name].agent._tools
+            if not result.ok or actual != expected:
+                fail(f"built-in {name} did not dispatch: {result!r}")
+
+
+@check("leader.subagent_input_contract")
+def check_subagent_input_contract() -> None:
+    from dataclasses import replace
+    from symphonai_api.leader import _dispatch_description
+
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        spec = replace(_spec(ws.root, "typed"), io=IOContract(input_schema=schema))
+        dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs={"typed": spec})
+        for task in ("fix a.py", '{"file":1}'):
+            result = dispatch.execute(_dispatch("typed", task), ws.policy)
+            if result.ok or "subagent typed input does not match its contract:" not in (result.error or ""):
+                fail(f"invalid input was not rejected: {result!r}")
+        if provider.requests or dispatch.pool:
+            fail("invalid input reached or created a child")
+        result = dispatch.execute(_dispatch("typed", '{"path":"a.py"}'), ws.policy)
+        if not result.ok or not provider.requests:
+            fail(f"valid structured input did not reach child: {result!r}")
+        description = _dispatch_description({"typed": spec, "plain": _spec(ws.root, "plain")})
+        if 'typed (task must be JSON matching {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})' not in description:
+            fail(f"input schema missing from dispatch description: {description!r}")
+        if "plain (task must be JSON" in description:
+            fail(f"schema requirement leaked to a subagent without a schema: {description!r}")
 
 
 @check("leader.pause_resume_gate")

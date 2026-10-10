@@ -70,6 +70,12 @@ _STANDARD_TOOL_NAMES = (
 )
 _AGENT_TOOL_NAMES = (*_STANDARD_TOOL_NAMES, "web_search", "use_skill", "lsp")
 
+def _is_mcp_tool_name(name: str) -> bool:
+    if not name.startswith("mcp__"):
+        return False
+    server, separator, tool = name[5:].partition("__")
+    return bool(separator and server and tool)
+
 
 def _raise(path: Path, key: str, detail: str) -> None:
     raise AgentFileError(f"{path}: {key}: {detail}")
@@ -160,7 +166,7 @@ def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | N
         _raise(path, "tools", "must not be empty")
     for key, names in (("tools", tools), ("deny_tools", denied)):
         for name in names:
-            if name not in _AGENT_TOOL_NAMES:
+            if name not in _AGENT_TOOL_NAMES and not _is_mcp_tool_name(name):
                 _raise(path, key, f"unknown tool name: {name!r}")
     base = set(tools)
     denied_names = set(denied)
@@ -169,10 +175,27 @@ def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | N
         for name in _AGENT_TOOL_NAMES
         if name in base and name not in denied_names
     )
-    if not result:
+    has_mcp_tool = any(
+        _is_mcp_tool_name(name) and name not in denied_names
+        for name in tools
+    )
+    if not result and not has_mcp_tool:
         key = "tools and deny_tools" if deny_present else "tools"
         _raise(path, key, "resolved tool set was empty")
     return result
+
+
+def _mcp_tool_selection(path: Path, values: Mapping[str, object]) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
+    tools_present = "tools" in values
+    tools = _strings(path, "tools", values["tools"]) if tools_present else []
+    denied = _strings(path, "deny_tools", values["deny_tools"]) if "deny_tools" in values else []
+    for key, names in (("tools", tools), ("deny_tools", denied)):
+        for name in names:
+            if name.startswith("mcp__") and not _is_mcp_tool_name(name):
+                _raise(path, key, f"unknown tool name: {name!r}")
+    selected = tuple(name for name in tools if _is_mcp_tool_name(name)) if tools_present else None
+    denied_selected = tuple(name for name in denied if _is_mcp_tool_name(name))
+    return selected, denied_selected
 
 
 def _memory_settings(
@@ -386,12 +409,15 @@ def load_agent_file(
     budget_table = _table(source, data, "budget")
     policy_table = _table(source, data, "policy")
     io_table = _table(source, data, "io")
+    mcp_tools, denied_mcp_tools = _mcp_tool_selection(source, data)
     values: dict[str, object] = {
         "name": source.stem,
         "prompt": prompt,
         "model": _model(source, model_table, default_model),
         "policy_ceiling": _policy(source, policy_table, Path(repo_root)),
         "tool_names": _tool_names(source, data),
+        "mcp_tool_names": mcp_tools,
+        "denied_mcp_tool_names": denied_mcp_tools,
         "budget": _budget(source, budget_table, price_table),
         "isolation": _isolation(source, isolation_table),
         "io": _io(source, io_table),

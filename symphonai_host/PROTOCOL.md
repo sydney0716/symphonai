@@ -222,13 +222,14 @@ positive integers, wall time is a positive finite number of seconds, and cost
 is a quoted non-negative decimal. `price_table` names a version-1 JSON price
 table, relative to the config file containing that key (or the repository root
 for a session override). A host-supplied price table is used when no path is
-configured. A cost limit without either table is a configuration error. A
-subagent definition's own budget is narrowed by the configured subagent
+configured. A cost limit with no price for the requested model stops before
+the first request with `budget_cost_unpriced`. A subagent definition's own budget is narrowed by the configured subagent
 ceiling. There is no turn limit unless one is configured. The leader budget's
 `max_turns` takes precedence over the host's `--max-turns`; without a leader
 budget, the launch limit applies when set. Limits reset for each prompt.
 `RunFinished.stopped_reason` reports `max_turns`,
-`budget_wall_time`, `budget_tokens`, or `budget_cost` when a limit ends a run;
+`budget_wall_time`, `budget_tokens`, `budget_cost`, or
+`budget_cost_unpriced` when a limit ends a run;
 the conversation remains available for another prompt.
 
 Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
@@ -329,7 +330,9 @@ repository paths, credentials, or model request content.
 Authenticated `POST /goal` takes `{"objective": str, "check": [str, ...]?,
 "max_rounds": int?}`. An omitted or empty check stores as `[]`. A check is an
 argv run by the host in the repository root, outside the agent permission
-policy. The default is 10 rounds; the limit is 1–100. A final response runs a
+policy. Checks supplied through `/goal` are the person's commands and run
+unsandboxed. A spec run's Validation check runs in its worktree sandbox, with
+network access following that run's sandbox policy. The default is 10 rounds; the limit is 1–100. A final response runs a
 configured check with a 600-second timeout. Exit 0 completes the goal. A failed
 check starts another round with its output as feedback until the limit, then
 the goal becomes blocked. Without a check, a final response starts another

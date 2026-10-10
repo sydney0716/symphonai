@@ -50,7 +50,6 @@ def check_rejects_invalid_construction() -> None:
         ({"wall_seconds": 0}, "wall_seconds"),
         ({"max_total_tokens": 0}, "max_total_tokens"),
         ({"max_cost": Decimal("-0.01"), "price_table": _price_table()}, "max_cost"),
-        ({"max_cost": Decimal("1")}, "max_cost"),
     ]
     for arguments, field_name in cases:
         try:
@@ -187,18 +186,44 @@ def check_token_and_cost_stops() -> None:
             ws.policy,
             budget=RunBudget(max_cost=Decimal("0.000001"), price_table=_price_table()),
         ).run([Message(role=Role.USER, content="unknown cost")])
-        if unpriced_result.stopped_reason != "final_response":
-            fail(f"unpriced model incorrectly tripped the cost budget: {unpriced_result!r}")
-        if unpriced_provider.call_count != 2:
-            fail("unpriced model did not continue to its final response")
+        if unpriced_result.stopped_reason != "budget_cost_unpriced":
+            fail(f"unpriced model did not stop with the new reason: {unpriced_result!r}")
+        if unpriced_provider.call_count:
+            fail("unpriced model received a request despite a cost cap")
         unknown_cost_state = BudgetState(
             started_monotonic=0.0,
             usage_by_model={"unpriced-model": UsageTotals(10_000_000, 10_000_000, 1)},
         )
         if unknown_cost_state.exceeded(
             RunBudget(max_cost=Decimal(0), price_table=_price_table())
-        ) is not None:
-            fail("unknown cost was treated as a known zero cost")
+        ) != "budget_cost_unpriced":
+            fail("unknown cost did not stop with budget_cost_unpriced")
+
+        unpriced_budget_provider = FakeModelProvider([_response("must not run")])
+        unpriced_budget_provider.model = "missing-model"
+        unpriced_budget_result = ApiAgent(
+            unpriced_budget_provider, {}, ws.policy,
+            budget=RunBudget(max_cost=Decimal("0.50"), price_table=_price_table()),
+        ).run([Message(role=Role.USER, content="unknown price")])
+        if unpriced_budget_result.stopped_reason != "budget_cost_unpriced" or unpriced_budget_provider.call_count:
+            fail(f"unpriced model was not stopped before its first request: {unpriced_budget_result!r}")
+
+        missing_table_provider = FakeModelProvider([_response("must not run")])
+        missing_table_provider.model = "priced-model"
+        missing_table_result = ApiAgent(
+            missing_table_provider, {}, ws.policy,
+            budget=RunBudget(max_cost=Decimal("0.50")),
+        ).run([Message(role=Role.USER, content="missing table")])
+        if missing_table_result.stopped_reason != "budget_cost_unpriced" or missing_table_provider.call_count:
+            fail(f"missing price table did not stop before the first request: {missing_table_result!r}")
+
+        no_cap_provider = FakeModelProvider([_response("normal response")])
+        no_cap_provider.model = "missing-model"
+        no_cap_result = ApiAgent(no_cap_provider, {}, ws.policy).run(
+            [Message(role=Role.USER, content="no cost cap")]
+        )
+        if no_cap_result.stopped_reason != "final_response" or no_cap_provider.call_count != 1:
+            fail("unpriced model without a cost cap did not run normally")
 
 
 @check("budget.reason_precedence")
