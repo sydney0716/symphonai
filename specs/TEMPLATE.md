@@ -18,8 +18,7 @@ Do not touch: <anything adjacent that could plausibly be dragged in>.
 
 <Registry delta: the checks the acceptance criteria need, usually one per
 criterion that names new behaviour; `0` is fine. Never "at least +N": a minimum
-invites checks written for the count. Ask for the before and after to be
-reported.>
+invites checks written for the count.>
 
 Never any file under `specs/` except this task's report: a spec is the contract
 the work is graded against, so an implementer that edits it is grading itself.

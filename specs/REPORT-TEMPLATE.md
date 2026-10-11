@@ -27,8 +27,6 @@ returned. A command whose result is not written down did not happen. Say which
 commands you did not run and why. When a command needs an environment — a
 temporary `SYMPHONAI_SESSIONS_DIR`, local socket access — name it.>
 
-- Registry: <before> before, <after> after, from
-  `python3 scripts/check.py --list | wc -l`.
 - `git status --porcelain`: <verbatim, in a fenced block>
 - `git diff --check`: <result>
 

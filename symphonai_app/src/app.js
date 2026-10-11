@@ -15,7 +15,7 @@ import { createPicker } from "./picker.js";
 import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, rosterRows, serverRows, trustRows } from "./settings.js";
 import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
-import { createTurnState } from "./turn.js";
+import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
 export const INIT_PROMPT = `Please analyze this repository and write .symphonai/INSTRUCTIONS.md, which SymphonAI loads into every conversation in this project.
 
@@ -132,6 +132,8 @@ export async function start({ global, document, client }) {
   const specRoot = document.getElementById("spec");
   const runNotice = document.getElementById("run-notice");
   const chatRoot = document.getElementById("chat");
+  const jumpLatest = document.getElementById("jump-latest");
+  const stopButton = document.getElementById("stop-button");
   const approvalsRoot = document.getElementById("approvals");
   const form = document.getElementById("prompt-form");
   const input = document.getElementById("prompt");
@@ -141,6 +143,8 @@ export async function start({ global, document, client }) {
   const attachButton = document.getElementById("attach-button");
   const pendingFiles = [];
   const promptAttachments = [];
+  let following = true;
+  let savedScrollTop = 0;
   input.required = false;
   const commandMenu = element(document, "div", { className: "command-menu" });
   const fileMenu = element(document, "div", { className: "file-menu" });
@@ -498,9 +502,42 @@ export async function start({ global, document, client }) {
     const rows = generalRows(settingsReply).map(({ key, value, scope }) => [
       key, value, scope,
     ]);
+    let theme = "system";
+    try {
+      const storedTheme = global.localStorage?.getItem("symphonai.theme");
+      if (storedTheme === "light" || storedTheme === "dark") theme = storedTheme;
+    } catch {
+      // Storage is optional in embedded and privacy-restricted browsers.
+    }
+    const themeSelect = document.createElement("select");
+    themeSelect.setAttribute("aria-label", "Theme");
+    for (const [value, label] of [["system", "System"], ["light", "Light"], ["dark", "Dark"]]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      themeSelect.append(option);
+    }
+    themeSelect.value = theme;
+    listen(themeSelect, "change", () => {
+      const selected = ["light", "dark"].includes(themeSelect.value)
+        ? themeSelect.value
+        : "system";
+      try {
+        global.localStorage?.setItem("symphonai.theme", selected);
+      } catch {
+        // Storage is optional in embedded and privacy-restricted browsers.
+      }
+      if (selected === "system") {
+        document.documentElement.removeAttribute("data-theme");
+      } else {
+        document.documentElement.setAttribute("data-theme", selected);
+      }
+    });
     replace(
       settingsContent,
       element(document, "h2", { text: "General" }),
+      element(document, "h3", { text: "Appearance" }),
+      themeSelect,
       settingsTable(["Setting", "Value", "Scope"], rows),
     );
   }
@@ -590,6 +627,22 @@ export async function start({ global, document, client }) {
     const files = Array.isArray(reply?.files) ? reply.files : [];
     const turns = Array.isArray(reply?.turns) ? reply.turns : [];
     const worktrees = Array.isArray(reply?.worktrees) ? reply.worktrees : [];
+    function diffView(diff) {
+      const pre = element(document, "pre", { className: "diff" });
+      if (!diff) return pre;
+      for (const line of diff.split("\n")) {
+        const span = element(document, "span", { text: line });
+        if (line.startsWith("+") && !line.startsWith("+++")) {
+          span.className = "diff-add";
+        } else if (line.startsWith("-") && !line.startsWith("---")) {
+          span.className = "diff-remove";
+        } else if (line.startsWith("@@")) {
+          span.className = "diff-hunk";
+        }
+        append(pre, span);
+      }
+      return pre;
+    }
     const children = [element(document, "h1", { text: "Changes" })];
     if (files.length === 0 && worktrees.length === 0) {
       children.push(element(document, "p", { text: "No changes in this conversation." }));
@@ -603,11 +656,15 @@ export async function start({ global, document, client }) {
           className: "changes-paths",
           text: Array.isArray(worktree.files) ? worktree.files.join(", ") : "",
         }));
-        append(row, element(document, "pre", { text: worktree.diff ?? "" }));
-        const apply = element(document, "button", { text: "Apply" });
+        append(row, element(document, "p", {
+          className: "changes-state",
+          text: "Not applied — these changes are in the worktree, not your files.",
+        }));
+        append(row, diffView(worktree.diff ?? ""));
+        const apply = element(document, "button", { text: "Apply worktree" });
         apply.type = "button";
         listen(apply, "click", () => worktreeAction(worktree.name, "applyWorktree", row));
-        const discard = element(document, "button", { text: "Discard" });
+        const discard = element(document, "button", { text: "Discard worktree" });
         discard.type = "button";
         listen(discard, "click", () => worktreeAction(worktree.name, "discardWorktree", row));
         append(row, apply, discard);
@@ -625,7 +682,7 @@ export async function start({ global, document, client }) {
             text: "Changed outside the agent.",
           }));
         }
-        append(row, element(document, "pre", { text: file.diff ?? "" }));
+        append(row, diffView(file.diff ?? ""));
         const button = element(document, "button", { text: "Revert" });
         button.type = "button";
         listen(button, "click", () => revert({ path: file.path }));
@@ -653,6 +710,9 @@ export async function start({ global, document, client }) {
   }
 
   function showPage(nextRoute) {
+    if (route?.page === "chat") {
+      savedScrollTop = chatRoot.scrollTop;
+    }
     route = nextRoute;
     if (route.page === "settings") {
       showSettings(route.section);
@@ -662,6 +722,10 @@ export async function start({ global, document, client }) {
     const pane = route.page === "settings" ? settingsPane
       : route.page === "changes" ? changesPane : chatPane;
     replace(pageRoot, pane);
+    if (route.page === "chat") {
+      chatRoot.scrollTop = following ? chatRoot.scrollHeight : savedScrollTop;
+      jumpLatest.hidden = following;
+    }
   }
 
   function navigate(nextRoute, { updateFragment = true } = {}) {
@@ -703,8 +767,31 @@ export async function start({ global, document, client }) {
 
   const projectsRoot = element(document, "section", { className: "projects" });
   function showTranscript() {
+    const onChatPage = route.page === "chat";
+    if (onChatPage) {
+      following = chatRoot.scrollHeight - chatRoot.scrollTop - chatRoot.clientHeight <= 24;
+    }
     renderTranscript(document, chatRoot, transcript.model, parseMarkdown);
+    if (!onChatPage) return;
+    if (following) {
+      chatRoot.scrollTop = chatRoot.scrollHeight;
+      jumpLatest.hidden = true;
+    } else {
+      jumpLatest.hidden = false;
+    }
   }
+
+  listen(chatRoot, "scroll", () => {
+    if (route.page !== "chat") return;
+    following = chatRoot.scrollHeight - chatRoot.scrollTop - chatRoot.clientHeight <= 24;
+    jumpLatest.hidden = following;
+  });
+  listen(jumpLatest, "mousedown", (event) => event.preventDefault());
+  listen(jumpLatest, "click", () => {
+    following = true;
+    chatRoot.scrollTop = chatRoot.scrollHeight;
+    jumpLatest.hidden = true;
+  });
 
   async function openSession(runId) {
     const previous = [...transcript.model];
@@ -1411,7 +1498,7 @@ export async function start({ global, document, client }) {
           agentId: agent.agent_id,
           parentAgentId: agent.parent_agent_id ?? null,
           name: agent.name,
-          state: agent.state ?? "done",
+          state: agent.state,
           tool: "",
         });
       }
@@ -1434,18 +1521,32 @@ export async function start({ global, document, client }) {
     const usageByAgent = new Map(
       (conversation?.agents ?? []).map((agent) => [agent.agent_id, agent]),
     );
+    const stateWords = {
+      running: "running",
+      waiting: "waiting for approval",
+      paused: "paused",
+      stopping: "stopping",
+      finished: "finished",
+      failed: "failed",
+      stopped: "stopped",
+    };
+    const displayState = (state) => state === "pending" ? "running"
+      : state === "cancelled" ? "stopped"
+        : stateWords[state] ?? "";
     if (rows.length === 0) {
       replace(agentsRoot, element(document, "p", { text: "Nothing is running." }));
       return;
     }
     const byId = new Map(rows.map((row) => [row.agentId, row]));
     const nodes = new Map(rows.map(({ agentId, name, state, tool, target, last }) => {
-      const status = ["running", "waiting"].includes(state) ? state : "idle";
+      const status = displayState(state);
       const activity = status === "running"
         ? (tool ? description(tool, target) : "thinking")
-        : status === "waiting"
-          ? `approval for ${description(tool, target)}`
-          : last ? `last: ${description(last.tool, last.target, true)}` : "";
+        : status === "waiting for approval"
+          ? description(tool, target)
+          : ["finished", "failed", "stopped"].includes(status) && last
+            ? `last: ${description(last.tool, last.target, true)}`
+            : "";
       return [agentId, element(document, "div", {
         className: "agent-row",
         text: [name, status, activity, usageText(usageByAgent.get(agentId))]
@@ -1473,7 +1574,8 @@ export async function start({ global, document, client }) {
       append(children.get(row.parentAgentId), nodes.get(row.agentId));
     }
     for (const row of rows) {
-      if (!["running", "waiting"].includes(row.state)) continue;
+      const status = displayState(row.state);
+      if (!["running", "waiting for approval", "paused"].includes(status)) continue;
       const node = nodes.get(row.agentId);
       const controls = element(document, "div", { className: "agent-controls" });
       const controlError = element(document, "p", {
@@ -1483,7 +1585,8 @@ export async function start({ global, document, client }) {
       const sendControl = async (action, text) => {
         try {
           const reply = await boundary.controlAgent(row.agentId, action, text);
-          row.state = reply.state;
+          row.state = reply.state === "cancelled" ? "stopped"
+            : reply.state === "pending" ? "running" : reply.state;
           row.controlError = "";
           showAgents();
         } catch (error) {
@@ -1491,14 +1594,22 @@ export async function start({ global, document, client }) {
           showAgents();
         }
       };
-      const pause = element(document, "button", {
-        text: "Pause",
-      });
-      pause.type = "button";
-      listen(pause, "click", () => sendControl("pause"));
-      const redirectButton = element(document, "button", { text: "Redirect" });
-      redirectButton.type = "button";
-      listen(redirectButton, "click", () => {
+      const addControl = (text, action) => {
+        const button = element(document, "button", { text });
+        button.type = "button";
+        listen(button, "click", () => sendControl(action));
+        append(controls, button);
+      };
+      if (status === "paused") {
+        addControl("Resume", "resume");
+        addControl("Stop", "stop");
+      } else {
+        addControl("Pause", "pause");
+      }
+      if (status !== "paused") {
+        const redirectButton = element(document, "button", { text: "Redirect" });
+        redirectButton.type = "button";
+        listen(redirectButton, "click", () => {
         if (node.children.some((child) => child.className === "agent-redirect")) return;
         const redirect = element(document, "div", { className: "agent-redirect" });
         const redirectInput = element(document, "input");
@@ -1537,11 +1648,10 @@ export async function start({ global, document, client }) {
         append(redirect, redirectInput, send);
         append(node, redirect);
         redirectInput.focus?.();
-      });
-      const stop = element(document, "button", { text: "Stop" });
-      stop.type = "button";
-      listen(stop, "click", () => sendControl("stop"));
-      append(controls, pause, redirectButton, stop);
+        });
+        append(controls, redirectButton);
+        addControl("Stop", "stop");
+      }
       append(node, controls, controlError);
     }
     replace(agentsRoot, ...roots);
@@ -1644,6 +1754,7 @@ export async function start({ global, document, client }) {
   }
 
   async function perform(actions) {
+    showStopButton();
     for (const action of actions) {
       if (action.kind === "prompt") {
         const presentation = {
@@ -1692,7 +1803,21 @@ export async function start({ global, document, client }) {
         await boundary.stop("");
       }
     }
+    showStopButton();
     showPromptError();
+  }
+
+  function showStopButton() {
+    stopButton.hidden = turn.state !== DISPATCHING && turn.state !== RUNNING;
+  }
+
+  listen(stopButton, "click", () => perform(turn.stop()));
+  if (typeof global.addEventListener === "function") {
+    global.addEventListener("keydown", async (event) => {
+      if (lookup(keymap, event, { platform }) !== "stop-run") return;
+      event.preventDefault();
+      await perform(turn.stop());
+    });
   }
 
   listen(attachButton, "click", () => attachmentPicker.click());

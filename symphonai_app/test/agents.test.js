@@ -30,11 +30,11 @@ test("agent board follows root and subagent activity in spawn order", () => {
   board.apply(event("PermissionDenied", { agent_id: "worker" }));
   assert.deepEqual(board.rows[1], { agentId: "worker", parentAgentId: "root", name: "reader", state: "running", tool: "write", target: "", last: null });
   board.apply(event("SubagentStopped", { subagent_agent_id: "worker" }));
-  assert.deepEqual(board.rows[1], { agentId: "worker", parentAgentId: "root", name: "reader", state: "done", tool: "", target: "", last: null });
-  board.apply(event("RunFinished", { agent_id: "root" }));
+  assert.deepEqual(board.rows[1], { agentId: "worker", parentAgentId: "root", name: "reader", state: "finished", tool: "", target: "", last: null });
+  board.apply(event("RunFinished", { agent_id: "root", stopped_reason: "final_response" }));
   assert.deepEqual(board.rows, [
-    { agentId: "root", parentAgentId: null, name: "leader", state: "done", tool: "", target: "", last: null },
-    { agentId: "worker", parentAgentId: "root", name: "reader", state: "done", tool: "", target: "", last: null },
+    { agentId: "root", parentAgentId: null, name: "leader", state: "finished", tool: "", target: "", last: null },
+    { agentId: "worker", parentAgentId: "root", name: "reader", state: "finished", tool: "", target: "", last: null },
   ]);
 });
 
@@ -49,7 +49,7 @@ test("a completed tool retains its target as the last activity across turns", ()
   assert.equal(board.rows[0].tool, "");
   assert.equal(board.rows[0].target, "");
   board.apply(event("RunFinished", { agent_id: "root" }));
-  assert.equal(board.rows[0].state, "done");
+  assert.equal(board.rows[0].state, "finished");
   board.apply(event("RunStarted", { agent_id: "root", agent_name: "leader" }));
   assert.deepEqual(board.rows[0].last, { tool: "edit_file", target: "app.js" });
   assert.equal(board.rows[0].state, "running");
@@ -100,8 +100,8 @@ test("a new root replaces the finished run and its subagents", () => {
   board.apply(event("SubagentStopped", { subagent_agent_id: "child-a" }));
   board.apply(event("RunFinished", { agent_id: "root-a" }));
   assert.deepEqual(board.rows, [
-    { agentId: "root-a", parentAgentId: null, name: "first", state: "done", tool: "", target: "", last: null },
-    { agentId: "child-a", parentAgentId: "root-a", name: "reader", state: "done", tool: "", target: "", last: null },
+    { agentId: "root-a", parentAgentId: null, name: "first", state: "finished", tool: "", target: "", last: null },
+    { agentId: "child-a", parentAgentId: "root-a", name: "reader", state: "finished", tool: "", target: "", last: null },
   ]);
 
   board.apply(event("RunStarted", { agent_id: "root-b", agent_name: "second" }));
@@ -138,7 +138,14 @@ test("failed tool and run events clear the active tool", () => {
   assert.equal(board.rows[0].tool, "");
   board.apply(event("ToolCallStarted", { agent_id: "root", tool_name: "write" }));
   board.apply(event("RunFailed", { agent_id: "root" }));
-  assert.deepEqual(board.rows[0], { agentId: "root", parentAgentId: null, name: "agent", state: "done", tool: "", target: "", last: { tool: "read", target: "" } });
+  assert.deepEqual(board.rows[0], { agentId: "root", parentAgentId: null, name: "agent", state: "failed", tool: "", target: "", last: { tool: "read", target: "" } });
+});
+
+test("cancelled runs have the stopped state", () => {
+  const board = createAgentBoard();
+  board.apply(event("RunStarted", { agent_id: "root" }));
+  board.apply(event("RunFinished", { agent_id: "root", stopped_reason: "cancelled" }));
+  assert.equal(board.rows[0].state, "stopped");
 });
 
 test("nested spawn parents and independent activity survive a root reset", () => {
@@ -154,7 +161,7 @@ test("nested spawn parents and independent activity survive a root reset", () =>
   board.apply(event("ToolCallStarted", { agent_id: "b", tool_name: "search" }));
   board.apply(event("SubagentStopped", { subagent_agent_id: "a" }));
   assert.deepEqual(rows.map((row) => [row.state, row.tool]), [
-    ["running", ""], ["done", ""], ["running", ""], ["running", "search"],
+    ["running", ""], ["finished", ""], ["running", ""], ["running", "search"],
   ]);
   board.apply(event("RunStarted", { agent_id: "next", agent_name: "next" }));
   assert.equal(board.rows, rows);

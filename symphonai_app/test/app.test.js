@@ -77,6 +77,10 @@ class FakeElement {
     this.attributes.set(name, String(value));
   }
 
+  removeAttribute(name) {
+    this.attributes.delete(name);
+  }
+
   async dispatch(type, fields = {}) {
     const event = { preventDefault() {}, ...fields };
     for (const listener of this.listeners.get(type) ?? []) {
@@ -96,6 +100,7 @@ class FakeElement {
 
 export class FakeDocument {
   constructor() {
+    this.documentElement = new FakeElement("html");
     const tags = {
       "app-shell": "div",
       sidebar: "nav",
@@ -108,6 +113,8 @@ export class FakeDocument {
       "status-rail": "aside",
       "chat-pane": "main",
       "prompt-form": "form",
+      "jump-latest": "button",
+      "stop-button": "button",
       prompt: "textarea",
       "prompt-attachments": "div",
       "attachment-picker": "input",
@@ -133,6 +140,8 @@ export class FakeDocument {
         "chat",
         "approvals",
         "prompt-form",
+        "jump-latest",
+        "stop-button",
         "prompt",
         "prompt-attachments",
         "attachment-picker",
@@ -146,9 +155,13 @@ export class FakeDocument {
     get("chat-pane").className = "chat-pane";
     get("new-chat").className = "new-chat";
     get("attachment-picker").type = "file";
+    get("jump-latest").type = "button";
+    get("jump-latest").hidden = true;
+    get("stop-button").type = "button";
+    get("stop-button").hidden = true;
     get("sidebar").append(get("home-link"), get("new-chat"), get("page-links"));
     get("status-rail").append(get("agents"), get("roadmap"), get("spec"));
-    get("prompt-form").append(get("prompt"), get("prompt-attachments"), get("attachment-picker"), get("attach-button"), get("send-button"), get("prompt-error"));
+    get("prompt-form").append(get("jump-latest"), get("prompt"), get("prompt-attachments"), get("attachment-picker"), get("attach-button"), get("send-button"), get("prompt-error"), get("stop-button"));
     get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
     get("page").append(get("chat-pane"));
     get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"), get("status-rail"), get("rail-toggle"));
@@ -166,7 +179,7 @@ export class FakeDocument {
   }
 }
 
-function fakeGlobal({ fragment = "", stored = null, storageThrows = false } = {}) {
+function fakeGlobal({ fragment = "", stored = null, themeStored = null, storageThrows = false } = {}) {
   const listeners = new Map();
   const writes = [];
   const global = {
@@ -176,8 +189,9 @@ function fakeGlobal({ fragment = "", stored = null, storageThrows = false } = {}
         if (storageThrows) {
           throw new Error("storage read failed");
         }
-        assert.equal(key, "symphonai.route");
-        return stored;
+        if (key === "symphonai.route") return stored;
+        if (key === "symphonai.theme") return themeStored;
+        assert.fail(`unexpected localStorage key: ${key}`);
       },
       setItem(key, value) {
         if (storageThrows) {
@@ -193,8 +207,8 @@ function fakeGlobal({ fragment = "", stored = null, storageThrows = false } = {}
   return {
     global,
     writes,
-    dispatch(type) {
-      return listeners.get(type)?.();
+    dispatch(type, event = {}) {
+      return listeners.get(type)?.(event);
     },
   };
 }
@@ -266,7 +280,7 @@ export function fakeClient(
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], applyWorktree: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], discardWorktree: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0 };
+  const calls = { agent: [], approve: [], applyWorktree: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], discardWorktree: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [] };
   let changesReply = changes;
   let worktreeConflictPending = worktreeConflict;
   let eventCallback;
@@ -348,7 +362,8 @@ export function fakeClient(
       calls.goalState.push(action);
       return { goal: action === "clear" ? null : { objective: "goal", check: ["make", "test"], phase: action === "pause" ? "paused" : "active", rounds: 1, max_rounds: 10, last_check: null, reason: "" } };
     },
-    async stop() {
+    async stop(runId) {
+      calls.stop.push(runId);
       return { accepted: true };
     },
     async controlAgent(agentId, action, text) {
@@ -1703,8 +1718,8 @@ test("composer keeps attachment controls inside the form", async () => {
   await start({ global: {}, document, client: fakeClient() });
   const form = document.getElementById("prompt-form");
   assert.deepEqual(form.children.map((child) => child.id || child.className), [
-    "prompt", "prompt-attachments", "attachment-picker", "attach-button",
-    "send-button", "prompt-error", "conversation-usage",
+    "jump-latest", "prompt", "prompt-attachments", "attachment-picker", "attach-button",
+    "send-button", "prompt-error", "stop-button", "conversation-usage",
   ]);
   assert.equal(walk(form).some((node) => node.tagName === "SELECT"), false);
   assert.equal(document.getElementById("attachment-picker").type, "file");
@@ -2287,11 +2302,13 @@ test("Changes page applies worktrees, shows conflicts, and reloads after success
   await Promise.resolve();
   assert.match(visibleText(page), /w1/);
   assert.match(visibleText(page), /-before\n\+after/);
-  await find(page, (value) => value.textContent === "Apply").dispatch("click");
+  assert.match(visibleText(page), /Not applied — these changes are in the worktree, not your files\./);
+  assert.ok(find(page, (value) => value.textContent === "Discard worktree"));
+  await find(page, (value) => value.textContent === "Apply worktree").dispatch("click");
   await Promise.resolve();
   assert.deepEqual(client.calls.applyWorktree, ["w1"]);
   assert.match(visibleText(page), /patch does not apply/);
-  await find(page, (value) => value.textContent === "Apply").dispatch("click");
+  await find(page, (value) => value.textContent === "Apply worktree").dispatch("click");
   await Promise.resolve();
   assert.deepEqual(client.calls.applyWorktree, ["w1", "w1"]);
   assert.equal(client.calls.changes, 2);
@@ -2341,14 +2358,14 @@ test("agent rail keeps every conversation agent with current and last activity",
   let children = leader.children.find((row) => row.className === "agent-children");
   assert.equal(leader.textContent, "leader · running · editing app.js");
   assert.deepEqual(children.children.map((row) => row.textContent), [
-    "worker · idle · last: ran pytest", "researcher · idle",
+    "worker · finished · last: ran pytest", "researcher",
   ]);
   assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 1);
   assert.ok(leader.children.some((row) => row.className === "agent-controls"));
   assert.ok(children.children.every((row) => row.children.length === 0));
 
   await client.emit(eventFrame("PermissionRequested", { tool_name: "edit_file" }));
-  assert.equal(agents.children[0].textContent, "leader · waiting · approval for editing app.js");
+  assert.equal(agents.children[0].textContent, "leader · waiting for approval · editing app.js");
   assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 1);
   await client.emit(eventFrame("PermissionDenied", { tool_name: "edit_file" }));
   await client.emit(eventFrame("ToolCallFinished", { tool_name: "edit_file" }));
@@ -2357,12 +2374,26 @@ test("agent rail keeps every conversation agent with current and last activity",
 
   leader = agents.children[0];
   children = leader.children.find((row) => row.className === "agent-children");
-  assert.equal(leader.textContent, "leader · idle · last: edited app.js");
+  assert.equal(leader.textContent, "leader · finished · last: edited app.js");
   assert.deepEqual(children.children.map((row) => row.textContent), [
-    "worker · idle · last: ran pytest", "researcher · idle",
+    "worker · finished · last: ran pytest", "researcher",
   ]);
   assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 0);
   assert.doesNotMatch(visibleText(agents), /Nothing is running/);
+});
+
+test("conversation agents with missing or unknown states show no state word", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.conversationStats = async () => ({ conversation: { agents: [
+    { agent_id: "a", name: "researcher", parent_agent_id: null },
+    { agent_id: "b", name: "reviewer", parent_agent_id: null, state: "blue" },
+  ] } });
+  await start({ global: {}, document, client });
+
+  const agents = document.getElementById("agents");
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["researcher", "reviewer"]);
+  assert.equal(find(agents, (row) => row.className === "agent-controls"), undefined);
 });
 
 test("agent activity uses the tool verbs, past tense, and optional targets", async () => {
@@ -2391,7 +2422,7 @@ test("agent activity uses the tool verbs, past tense, and optional targets", asy
     await client.emit(eventFrame("ToolCallFailed", { tool_name: tool }));
     assert.equal(agents.children[0].textContent, "leader · running · thinking", tool);
     await client.emit(eventFrame("RunFinished"));
-    assert.equal(agents.children[0].textContent, `leader · idle · last: ${past}`, tool);
+    assert.equal(agents.children[0].textContent, `leader · finished · last: ${past}`, tool);
   }
 });
 
@@ -2427,7 +2458,7 @@ test("status rail renders the whole roadmap beside settings and live agents", as
   const root = agents.children[0];
   const children = root.children[0];
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["worker · idle", "sibling · running · thinking"]);
+  assert.deepEqual(children.children.map((row) => row.textContent), ["worker · finished", "sibling · running · thinking"]);
   assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["grandchild · running · search"]);
   assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read"]);
 
@@ -2439,7 +2470,7 @@ test("status rail renders the whole roadmap beside settings and live agents", as
   ]);
 });
 
-test("agent rail controls redirect and stop, then disappear while the idle agent remains", async () => {
+test("agent rail controls redirect and stop, then disappear while the stopped agent remains", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/chat" });
   const client = fakeClient();
@@ -2463,8 +2494,100 @@ test("agent rail controls redirect and stop, then disappear while the idle agent
   assert.deepEqual(client.calls.controlAgent[1], { agent_id: "leader-id", action: "stop" });
 
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id", stopped_reason: "cancelled" }));
-  assert.equal(visibleText(document.getElementById("agents")), "\nleader · idle");
+  assert.equal(visibleText(document.getElementById("agents")), "\nleader · stopped");
   assert.equal(find(document.getElementById("agents"), (value) => value.className === "agent-controls"), undefined);
+});
+
+test("a paused agent can resume and gets its active controls back", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
+
+  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  let controls = row.children.find((value) => value.className === "agent-controls");
+  await controls.children[0].click();
+  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  assert.equal(row._textContent, "leader · paused");
+  controls = row.children.find((value) => value.className === "agent-controls");
+  assert.deepEqual(controls.children.map((button) => button.textContent), ["Resume", "Stop"]);
+
+  await controls.children[0].click();
+  assert.deepEqual(client.calls.controlAgent, [
+    { agent_id: "leader-id", action: "pause" },
+    { agent_id: "leader-id", action: "resume" },
+  ]);
+  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  assert.equal(row._textContent, "leader · running · thinking");
+  assert.deepEqual(
+    row.children.find((value) => value.className === "agent-controls").children.map((button) => button.textContent),
+    ["Pause", "Redirect", "Stop"],
+  );
+  assert.doesNotMatch(visibleText(document.getElementById("agents")), /\bidle\b/);
+});
+
+test("a cancelled redirect reply displays the stopped state", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.controlAgent = async (...args) => {
+    client.calls.controlAgent.push({ agent_id: args[0], action: args[1], ...(args[2] === undefined ? {} : { text: args[2] }) });
+    return { state: "cancelled" };
+  };
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
+  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
+  let controls = row.children.find((value) => value.className === "agent-controls");
+  await controls.children[1].click();
+  const redirectInput = find(row, (value) => value.tagName === "INPUT");
+  redirectInput.value = "Cancel this work";
+  await find(row, (value) => value.textContent === "Send").click();
+  assert.deepEqual(client.calls.controlAgent[0], {
+    agent_id: "leader-id", action: "redirect", text: "Cancel this work",
+  });
+  assert.equal(visibleText(document.getElementById("agents")), "\nleader · stopped");
+  assert.doesNotMatch(visibleText(document.getElementById("agents")), /cancelled|\bidle\b/);
+});
+
+test("Changes renders classified diff lines and an empty diff", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    changes: {
+      turns: [],
+      worktrees: [],
+      files: [
+        {
+          path: "x",
+          status: "modified",
+          diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n+++ b/x\n--- a/x",
+        },
+        { path: "empty", status: "modified", diff: "" },
+      ],
+    },
+  });
+  await start({ global: {}, document, client });
+  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes").click();
+  await Promise.resolve();
+  const page = document.getElementById("page");
+  const sections = page.children[0].children.filter((node) => node.className === "changes-file");
+  const diff = sections[0].children.find((node) => node.tagName === "PRE");
+  assert.equal(diff.className, "diff");
+  assert.deepEqual(diff.children.map((line) => line.className), [
+    "diff-hunk", "diff-remove", "diff-add", "diff-add", "", "",
+  ]);
+  assert.deepEqual(diff.children.map((line) => line.textContent), [
+    "@@ -1 +1,2 @@", "-old", "+new", "+line", "+++ b/x", "--- a/x",
+  ]);
+  const emptyDiff = sections[1].children.find((node) => node.tagName === "PRE");
+  assert.equal(emptyDiff.className, "diff");
+  assert.deepEqual(emptyDiff.children, []);
+
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  assert.match(css, /\.diff\s*\{[^}]*color:\s*var\(--ui-text\)/s);
+  assert.match(css, /\.diff\s*\{[^}]*white-space:\s*pre\s*;/s);
+  assert.match(css, /\.diff\s+span\s*\{[^}]*display:\s*block/s);
+  assert.match(css, /\.diff-add\s*\{[^}]*background:\s*var\(--ui-diff-add\)/s);
+  assert.match(css, /\.diff-remove\s*\{[^}]*background:\s*var\(--ui-diff-remove\)/s);
+  assert.match(css, /\.diff-hunk\s*\{[^}]*color:\s*var\(--ui-text-secondary\)/s);
 });
 
 test("agent rail keeps state unchanged and shows a control error", async () => {
@@ -2501,10 +2624,10 @@ test("reopened history and conversation stats render a nested agent tree without
       type: "HistoryMessage", role: "assistant", text: "Prior answer", tool_calls: [], turn_id: "prior-turn",
     } });
     conversation = { agents: [
-      { agent_id: "root", name: "leader", parent_agent_id: null, state: "done" },
-      { agent_id: "a", name: "researcher", parent_agent_id: "root", state: "done" },
-      { agent_id: "b", name: "B", parent_agent_id: "a", state: "done" },
-      { agent_id: "c", name: "C", parent_agent_id: "root", state: "done" },
+      { agent_id: "root", name: "leader", parent_agent_id: null, state: "finished" },
+      { agent_id: "a", name: "researcher", parent_agent_id: "root", state: "finished" },
+      { agent_id: "b", name: "B", parent_agent_id: "a", state: "finished" },
+      { agent_id: "c", name: "C", parent_agent_id: "root", state: "finished" },
     ] };
     return { run_id: runId };
   };
@@ -2514,32 +2637,32 @@ test("reopened history and conversation stats render a nested agent tree without
   const link = find(document.getElementById("sidebar"), (row) => row.className === "session-link");
   await link.dispatch("click");
   assert.deepEqual(client.calls.openSession, ["prior"]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · idle"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · finished"]);
   const children = agents.children[0].children[0];
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · idle", "C · idle"]);
-  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["B · idle"]);
+  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · finished", "C · finished"]);
+  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["B · finished"]);
   assert.equal(find(agents, (row) => row.className === "agent-controls"), undefined);
   assert.equal(find(document.body, (row) => row.className === "conversation-usage").textContent, "");
   assert.match(visibleText(document.getElementById("chat")), /Prior answer/);
   assert.doesNotMatch(visibleText(agents), /tokens|USD/);
 });
 
-test("agent rail keeps idle parents and controls only a running worker", async () => {
+test("agent rail keeps finished parents and controls only a running worker", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   client.conversationStats = async () => ({ conversation: { agents: [
-    { agent_id: "leader", name: "leader", state: "done" },
-    { agent_id: "researcher", name: "researcher", parent_agent_id: "leader", state: "done" },
+    { agent_id: "leader", name: "leader", state: "finished" },
+    { agent_id: "researcher", name: "researcher", parent_agent_id: "leader", state: "finished" },
     { agent_id: "worker", name: "worker", parent_agent_id: "leader", state: "running" },
   ] } });
   await start({ global: {}, document, client });
 
   const agents = document.getElementById("agents");
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · idle"]);
+  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · finished"]);
   const children = agents.children[0].children[0];
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · idle", "worker · running · thinking"]);
+  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · finished", "worker · running · thinking"]);
   assert.deepEqual(
     children.children[1].children.find((child) => child.className === "agent-controls")
       .children.map((button) => button.textContent),
@@ -2584,13 +2707,13 @@ test("opening another conversation and starting a new chat clears prior agents",
   );
   await sessionLink("Conversation A").dispatch("click");
   assert.deepEqual(walk(agents).filter((row) => row.className === "agent-row").map((row) => row.textContent), [
-    "leader · idle", "worker · idle",
+    "leader", "worker",
   ]);
 
   await sessionLink("Conversation B").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["conversation-a", "conversation-b"]);
   assert.deepEqual(replayBoard, ["\nNothing is running.", "\nNothing is running."]);
-  assert.equal(visibleText(agents), "\nleader · idle");
+  assert.equal(visibleText(agents), "\nleader");
   assert.equal(find(agents, (row) => row.textContent.includes("worker")), undefined);
 
   await document.getElementById("new-chat").dispatch("click");
@@ -3156,6 +3279,84 @@ test("submit dispatches once and assistant deltas render in order", async () => 
   assert.equal(chat.children[0].textContent, "hello world");
   await client.emit(eventFrame("RunFinished", { run_id: "run-runtime" }));
   assert.equal(app.turn.state, "idle");
+});
+
+test("composer Stop is visible only during a turn and stops it", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  const stop = document.getElementById("stop-button");
+  assert.equal(stop.hidden, true);
+
+  document.getElementById("prompt").value = "hello";
+  const submitting = document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(app.turn.state, DISPATCHING);
+  assert.equal(stop.hidden, false);
+  client.resolvePrompt({ accepted: true, run_id: "run-stop-button" });
+  await submitting;
+  assert.equal(app.turn.state, RUNNING);
+  assert.equal(stop.hidden, false);
+
+  await stop.click();
+  assert.deepEqual(client.calls.stop, [""]);
+  await client.emit(eventFrame("RunStarted", { run_id: "run-stop-button" }));
+  await client.emit(eventFrame("RunFinished", { run_id: "run-stop-button" }));
+  assert.equal(app.turn.state, IDLE);
+  assert.equal(stop.hidden, true);
+});
+
+test("Mod+. stops a running turn from Changes and is a no-op while idle", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal({ fragment: "#/changes" });
+  const client = fakeClient();
+  const app = await start({ global: browser.global, document, client });
+  assert.equal(app.route().page, "changes");
+
+  document.getElementById("prompt").value = "hello";
+  const submitting = document.getElementById("prompt-form").dispatch("submit");
+  client.resolvePrompt({ accepted: true, run_id: "run-stop-key" });
+  await submitting;
+  let prevented = 0;
+  await browser.dispatch("keydown", {
+    key: ".",
+    ctrlKey: true,
+    preventDefault() { prevented += 1; },
+  });
+  assert.deepEqual(client.calls.stop, [""]);
+  assert.equal(prevented, 1);
+
+  await client.emit(eventFrame("RunStarted", { run_id: "run-stop-key" }));
+  await client.emit(eventFrame("RunFinished", { run_id: "run-stop-key" }));
+  await browser.dispatch("keydown", {
+    key: ".",
+    ctrlKey: true,
+    preventDefault() { prevented += 1; },
+  });
+  assert.deepEqual(client.calls.stop, [""]);
+  assert.equal(prevented, 2);
+});
+
+test("Mod+. cancels a dispatching prompt and stops it when accepted", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  const app = await start({ global: browser.global, document, client });
+  document.getElementById("prompt").value = "hello";
+  const submitting = document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(app.turn.state, DISPATCHING);
+  await browser.dispatch("keydown", {
+    key: ".",
+    ctrlKey: true,
+    preventDefault() {},
+  });
+  assert.deepEqual(client.calls.stop, []);
+
+  client.resolvePrompt({ accepted: true, run_id: "run-cancel-dispatch" });
+  await submitting;
+  assert.deepEqual(client.calls.stop, [""]);
+  await client.emit(eventFrame("RunStarted", { run_id: "run-cancel-dispatch" }));
+  await client.emit(eventFrame("RunFinished", { run_id: "run-cancel-dispatch" }));
+  assert.equal(document.getElementById("stop-button").hidden, true);
 });
 
 test("a prompt conflict adopts the active runtime run and keeps the message", async () => {
@@ -3768,8 +3969,8 @@ test("render stays DOM-only and start does not read window", async () => {
   const commandOutputRule = cssSource.match(/(?:^|\n)\.command-output\s*\{([^}]*white-space:\s*pre-wrap[^}]*)\}/s)?.[1];
   assert.ok(commandRule);
   assert.ok(commandOutputRule);
-  assert.match(commandRule, /(?:^|;)\s*color:\s*#9aa7b8\s*;/);
-  assert.match(commandRule, /(?:^|;)\s*font-family:\s*ui-monospace, SFMono-Regular, Menlo, monospace\s*;/);
+  assert.match(commandRule, /(?:^|;)\s*color:\s*var\(--ui-text-secondary\)\s*;/);
+  assert.match(commandRule, /(?:^|;)\s*font-family:\s*var\(--font-code\)\s*;/);
   assert.match(commandRule, /(?:^|;)\s*font-size:\s*0\.9rem\s*;/);
   assert.match(commandRule, /(?:^|;)\s*width:\s*100%\s*;/);
   assert.match(commandRule, /(?:^|;)\s*text-align:\s*left\s*;/);
@@ -3801,9 +4002,9 @@ test("render stays DOM-only and start does not read window", async () => {
     let background;
     for (const [, selectors, declarations] of cssSource.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
       if (selectors.split(",").map((selector) => selector.trim()).includes(`.${className}`)) {
-        const match = declarations.match(/(?:^|;)\s*background:\s*(#[0-9a-f]{6})\s*;/i);
+        const match = declarations.match(/(?:^|;)\s*background:\s*(var\(--[\w-]+\))\s*;/i);
         if (match) {
-          background = match[1].toLowerCase();
+          background = match[1];
         }
       }
     }
@@ -3821,8 +4022,12 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.notEqual(promptBackground, neutral);
   assert.notEqual(assistantBackground, neutral);
   assert.notEqual(promptBackground, assistantBackground);
-  assert.notEqual(backgroundFor("command"), promptBackground);
-  assert.notEqual(backgroundFor("command"), assistantBackground);
+  const commandColor = commandRule.match(/(?:^|;)\s*color:\s*(var\(--[\w-]+\))\s*;/)?.[1];
+  assert.equal(promptBackground, "var(--ui-inset)");
+  assert.equal(assistantBackground, "var(--ui-bg)");
+  assert.equal(neutral, "var(--ui-panel)");
+  assert.notEqual(commandColor, promptBackground);
+  assert.notEqual(commandColor, assistantBackground);
   for (const className of ["prompt", "assistant"]) {
     const rule = cssSource.match(new RegExp(`\\.${className}\\s*\\{([^}]*)\\}`))?.[1];
     assert.match(rule, /(?:^|;)\s*white-space:\s*pre-wrap\s*;/);
@@ -3831,8 +4036,8 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.match(cssSource, /\.edit summary\s*{[^}]*cursor:\s*pointer/s);
   assert.match(cssSource, /\.edit pre\s*{[^}]*overflow-x:\s*auto/s);
   assert.match(cssSource, /\.assistant pre\s*{[^}]*overflow-x:\s*auto/s);
-  assert.match(cssSource, /\.assistant pre\s*{[^}]*background:\s*#[0-9a-f]{6}/i);
-  assert.match(cssSource, /\.assistant code\s*{[^}]*font-family:\s*ui-monospace,\s*SFMono-Regular,\s*Menlo,\s*monospace/s);
+  assert.match(cssSource, /\.assistant pre\s*{[^}]*background:\s*var\(--ui-inset\)/);
+  assert.match(cssSource, /\.assistant code\s*{[^}]*font-family:\s*var\(--font-code\)/);
   assert.match(cssSource, /\.assistant ul,\s*\.assistant ol\s*{[^}]*padding-left:\s*1\.35em/s);
   assert.match(cssSource, /\.assistant h1,[\s\S]*?\.assistant h6\s*{[^}]*font-size:\s*1\.1em/s);
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
@@ -4141,4 +4346,197 @@ test("sidebar activity refreshes immediately and once at the window end", async 
   await clock.advance(900);
   assert.equal(client.calls.sessions.length, before + 2);
   assert.match(find(document.getElementById("sidebar"), (node) => node.className === "session-link").textContent, /waiting$/);
+});
+
+test("chat follows new output only at the bottom and jump preserves focus", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const chat = document.getElementById("chat");
+  const jump = document.getElementById("jump-latest");
+  chat.clientHeight = 100;
+  chat.scrollHeight = 300;
+  chat.scrollTop = 176;
+  await client.emit(eventFrame("AssistantTextDelta", { text: "at bottom" }));
+  assert.equal(chat.scrollTop, chat.scrollHeight);
+  assert.equal(jump.hidden, true);
+
+  chat.scrollHeight = 600;
+  chat.scrollTop = 100;
+  await client.emit(eventFrame("AssistantTextDelta", { text: "while reading" }));
+  assert.equal(chat.scrollTop, 100);
+  assert.equal(jump.hidden, false);
+
+  document.getElementById("prompt").focus();
+  const activeElement = document.activeElement;
+  chat.scrollHeight = 720;
+  await jump.click();
+  assert.equal(chat.scrollTop, 720);
+  assert.equal(jump.hidden, true);
+  assert.equal(document.activeElement, activeElement);
+
+  jump.hidden = false;
+  chat.scrollTop = chat.scrollHeight - chat.clientHeight;
+  await chat.dispatch("scroll");
+  assert.equal(jump.hidden, true);
+});
+
+test("chat restores its follow position after visiting Changes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const chat = document.getElementById("chat");
+  const jump = document.getElementById("jump-latest");
+  const changes = find(document.getElementById("page-links"), (value) => value.textContent === "Changes");
+  const home = document.getElementById("home-link");
+
+  chat.clientHeight = 100;
+  chat.scrollHeight = 300;
+  chat.scrollTop = 200;
+  await changes.dispatch("click");
+  chat.scrollTop = 0;
+  chat.scrollHeight = 0;
+  chat.clientHeight = 0;
+  await client.emit(eventFrame("AssistantTextDelta", { text: "while away" }));
+  chat.scrollHeight = 500;
+  chat.clientHeight = 100;
+  await home.dispatch("click");
+  assert.equal(chat.scrollTop, 500);
+  assert.equal(jump.hidden, true);
+
+  chat.scrollHeight = 600;
+  chat.scrollTop = 100;
+  await chat.dispatch("scroll");
+  await changes.dispatch("click");
+  chat.scrollTop = 0;
+  chat.scrollHeight = 0;
+  chat.clientHeight = 0;
+  await client.emit(eventFrame("AssistantTextDelta", { text: "still away" }));
+  chat.scrollHeight = 600;
+  chat.clientHeight = 100;
+  await home.dispatch("click");
+  assert.equal(chat.scrollTop, 100);
+  assert.equal(jump.hidden, false);
+});
+
+test("navigating from Chat to Chat restores the reader position", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const page = document.getElementById("page");
+  const chatPane = document.getElementById("chat-pane");
+  const chat = document.getElementById("chat");
+  const jump = document.getElementById("jump-latest");
+  chat.clientHeight = 100;
+  chat.scrollHeight = 600;
+  chat.scrollTop = 250;
+  await chat.dispatch("scroll");
+
+  const replaceChildren = page.replaceChildren.bind(page);
+  page.replaceChildren = (...children) => {
+    replaceChildren(...children);
+    if (children.includes(chatPane)) chat.scrollTop = 0;
+  };
+  await document.getElementById("home-link").dispatch("click");
+
+  assert.equal(chat.scrollTop, 250);
+  assert.equal(jump.hidden, false);
+});
+
+test("conversation turns use labels, a reading column, and an internal transcript scroller", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const chatPane = css.match(/(?:^|\n)\.chat-pane\s*\{([^}]*)\}/)?.[1];
+  const chatLog = css.match(/(?:^|\n)\.chat-log\s*\{([^}]*)\}/)?.[1];
+  const prompt = css.match(/(?:^|\n)\.prompt\s*\{([^}]*)\}/)?.[1];
+  const assistant = css.match(/(?:^|\n)\.assistant\s*\{([^}]*)\}/)?.[1];
+  assert.match(chatPane, /(?:^|;)\s*height:\s*100vh\s*;/);
+  assert.match(chatLog, /(?:^|;)\s*min-height:\s*0\s*;/);
+  assert.match(chatLog, /(?:^|;)\s*overflow-y:\s*auto\s*;/);
+  for (const rule of [prompt, assistant]) {
+    assert.doesNotMatch(rule, /max-width:\s*80%|margin-(?:left|right):\s*auto/);
+    assert.match(rule, /white-space:\s*pre-wrap/);
+    assert.match(rule, /overflow-wrap:\s*anywhere/);
+  }
+  assert.match(css, /\.prompt::before\s*\{[^}]*content:\s*"You"/s);
+  assert.match(css, /#chat\s*>\s*\.prompt\s*\+\s*:not\(\.prompt\)::before\s*\{[^}]*content:\s*"Assistant"/s);
+  const labelRule = css.match(/\.prompt::before,\s*#chat\s*>\s*\.prompt\s*\+\s*:not\(\.prompt\)::before\s*\{([^}]*)\}/)?.[1];
+  assert.match(labelRule, /display:\s*block/);
+  assert.match(labelRule, /color:\s*var\(--ui-text-secondary\)/);
+  assert.match(labelRule, /font-size:\s*0\.75rem/);
+  assert.match(labelRule, /font-weight:\s*600/);
+  assert.match(css, /#chat,\s*#approvals,\s*#prompt-form\s*\{[^}]*max-width:\s*45rem/);
+  assert.equal((css.match(/#chat,\s*#approvals,\s*#prompt-form\s*\{/) ?? []).length, 1);
+  assert.match(html, /<form id="prompt-form"[^>]*>\s*<button id="jump-latest"[^>]*hidden>Jump to latest<\/button>/);
+});
+
+test("theme tokens cover every app color and match between light and dark blocks", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const light = css.match(/:root\s*\{([^{}]*)\}/)?.[1];
+  const mediaDark = css.match(/:root:not\(\[data-theme="light"\]\)\s*\{([^{}]*)\}/)?.[1];
+  const explicitDark = css.match(/:root\[data-theme="dark"\]\s*\{([^{}]*)\}/)?.[1];
+  assert.ok(light && mediaDark && explicitDark);
+  const tokens = (block) => Object.fromEntries(
+    [...block.matchAll(/(--[\w-]+):\s*([^;]+);/g)].map(([, name, value]) => [name, value.trim()]),
+  );
+  const lightTokens = tokens(light);
+  assert.deepEqual(Object.keys(tokens(mediaDark)).sort(), Object.keys(lightTokens).sort());
+  assert.deepEqual(tokens(explicitDark), tokens(mediaDark));
+  const declared = new Set([...css.matchAll(/(--[\w-]+):/g)].map(([, name]) => name));
+  for (const [, name] of css.matchAll(/var\((--[\w-]+)\)/g)) assert.ok(declared.has(name), name);
+
+  let outside = css
+    .replace(/:root\s*\{[^{}]*\}/, "")
+    .replace(/@media\s*\(prefers-color-scheme:\s*dark\)\s*\{\s*:root:not\(\[data-theme="light"\]\)\s*\{[^{}]*\}\s*\}/, "")
+    .replace(/:root\[data-theme="light"\]\s*\{[^{}]*\}/, "")
+    .replace(/:root\[data-theme="dark"\]\s*\{[^{}]*\}/, "");
+  assert.doesNotMatch(outside, /#[\da-f]{3,8}\b|rgba?\s*\(|hsla?\s*\(/i);
+});
+
+test("inline theme bootstrap applies only valid explicit themes and never throws", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const script = html.match(/<script>\s*([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  assert.ok(html.indexOf("<script>") < html.indexOf('rel="stylesheet"'));
+  const apply = (stored, throws = false) => {
+    const root = new FakeElement("html");
+    const localStorage = { getItem() { if (throws) throw new Error("blocked"); return stored; } };
+    assert.doesNotThrow(() => new Function("document", "localStorage", script)({ documentElement: root }, localStorage));
+    return root.attributes.get("data-theme");
+  };
+  assert.equal(apply("dark"), "dark");
+  assert.equal(apply("light"), "light");
+  for (const stored of ["system", null, "blue"]) assert.equal(apply(stored), undefined);
+  assert.equal(apply("dark", true), undefined);
+});
+
+test("general settings select applies theme even when storage is unavailable", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/general", themeStored: "dark" });
+  const document = new FakeDocument();
+  await start({ global: browser.global, document, client: fakeClient() });
+  const select = find(document.getElementById("page"), (node) => node.attributes.get("aria-label") === "Theme");
+  assert.ok(find(document.getElementById("page"), (node) => node.textContent === "Appearance"));
+  assert.equal(select.value, "dark");
+  document.documentElement.setAttribute("data-theme", "dark");
+  assert.equal(document.documentElement.attributes.get("data-theme"), "dark");
+  select.value = "system";
+  await select.dispatch("change");
+  assert.deepEqual(browser.writes.filter(([key]) => key === "symphonai.theme"), [["symphonai.theme", "system"]]);
+  assert.equal(document.documentElement.attributes.has("data-theme"), false);
+
+  const invalidBrowser = fakeGlobal({ fragment: "#/settings/general", themeStored: "blue" });
+  const invalidDocument = new FakeDocument();
+  await start({ global: invalidBrowser.global, document: invalidDocument, client: fakeClient() });
+  assert.equal(
+    find(invalidDocument.getElementById("page"), (node) => node.attributes.get("aria-label") === "Theme").value,
+    "system",
+  );
+
+  const blockedBrowser = fakeGlobal({ fragment: "#/settings/general", storageThrows: true });
+  const blockedDocument = new FakeDocument();
+  await start({ global: blockedBrowser.global, document: blockedDocument, client: fakeClient() });
+  const blockedSelect = find(blockedDocument.getElementById("page"), (node) => node.attributes.get("aria-label") === "Theme");
+  assert.equal(blockedSelect.value, "system");
+  blockedSelect.value = "light";
+  await blockedSelect.dispatch("change");
+  assert.equal(blockedDocument.documentElement.attributes.get("data-theme"), "light");
 });

@@ -11,7 +11,7 @@ export function createAgentBoard() {
 
   function apply(frame) {
     if (frame?.kind !== "event" || !frame.payload) return;
-    const { type, agent_id, agent_name, subagent_agent_id, subagent_name, tool_name, tool_call_id, target } = frame.payload;
+    const { type, agent_id, agent_name, subagent_agent_id, subagent_name, tool_name, tool_call_id, target, stopped_reason } = frame.payload;
     if (type === "RunStarted") {
       calls.delete(agent_id);
       const row = rows.find((entry) => entry.agentId === agent_id);
@@ -54,7 +54,9 @@ export function createAgentBoard() {
     } else if (type === "PermissionDenied") {
       row.state = "running";
     } else if (type === "SubagentStopped" || type === "RunFinished" || type === "RunFailed") {
-      row.state = "done";
+      row.state = type === "RunFailed" ? "failed"
+        : type === "RunFinished" && stopped_reason === "cancelled" ? "stopped"
+          : "finished";
       row.tool = "";
       row.target = "";
       calls.delete(id);

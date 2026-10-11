@@ -1,8 +1,84 @@
 :root {
   color-scheme: light dark;
-  font-family: ui-sans-serif, system-ui, sans-serif;
-  background: #11151c;
-  color: #e8edf5;
+  --ui-bg: #F7F7F5;
+  --ui-panel: #FFFFFF;
+  --ui-inset: #EFEFED;
+  --ui-raised: #FFFFFF;
+  --ui-hover: #E9E9E6;
+  --ui-selected: #DCE5F5;
+  --ui-text: #202124;
+  --ui-text-secondary: #5D6066;
+  --ui-border: #D4D5D8;
+  --ui-control-border: #7C8088;
+  --ui-accent: #2457C5;
+  --ui-accent-hover: #1D46A0;
+  --ui-on-accent: #FFFFFF;
+  --ui-success: #236B43;
+  --ui-warning: #855100;
+  --ui-danger: #B4232D;
+  --ui-diff-add: #EAF4EC;
+  --ui-diff-remove: #FBECEE;
+  --ui-shadow: 0 4px 16px rgb(0 0 0 / 12%);
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-code: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-family: var(--font-ui);
+  background: var(--ui-bg);
+  color: var(--ui-text);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ui-bg: #18191B;
+    --ui-panel: #202124;
+    --ui-inset: #151618;
+    --ui-raised: #26282B;
+    --ui-hover: #2D2F33;
+    --ui-selected: #303B50;
+    --ui-text: #ECEDEF;
+    --ui-text-secondary: #A1A6AF;
+    --ui-border: #3B3E44;
+    --ui-control-border: #858C96;
+    --ui-accent: #9BB9FF;
+    --ui-accent-hover: #BACDFF;
+    --ui-on-accent: #18191B;
+    --ui-success: #8FCCAA;
+    --ui-warning: #E2B873;
+    --ui-danger: #F3A6AB;
+    --ui-diff-add: #203628;
+    --ui-diff-remove: #3C2529;
+    --ui-shadow: 0 4px 16px rgb(0 0 0 / 28%);
+    --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-code: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ui-bg: #18191B;
+  --ui-panel: #202124;
+  --ui-inset: #151618;
+  --ui-raised: #26282B;
+  --ui-hover: #2D2F33;
+  --ui-selected: #303B50;
+  --ui-text: #ECEDEF;
+  --ui-text-secondary: #A1A6AF;
+  --ui-border: #3B3E44;
+  --ui-control-border: #858C96;
+  --ui-accent: #9BB9FF;
+  --ui-accent-hover: #BACDFF;
+  --ui-on-accent: #18191B;
+  --ui-success: #8FCCAA;
+  --ui-warning: #E2B873;
+  --ui-danger: #F3A6AB;
+  --ui-diff-add: #203628;
+  --ui-diff-remove: #3C2529;
+  --ui-shadow: 0 4px 16px rgb(0 0 0 / 28%);
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-code: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
 }
 
 * {
@@ -33,8 +109,8 @@ textarea {
   padding: 3.5rem 1rem 1rem;
   overflow: hidden;
   overflow-x: hidden;
-  border-right: 1px solid #394150;
-  background: #171d26;
+  border-right: 1px solid var(--ui-border);
+  background: var(--ui-panel);
 }
 
 #sidebar a {
@@ -81,7 +157,7 @@ textarea {
 .project-status,
 .project-empty,
 .session-link.unavailable {
-  color: #9aa7b8;
+  color: var(--ui-text-secondary);
 }
 
 button.session-link {
@@ -143,7 +219,7 @@ button.session-link {
 .changes-conflict {
   margin: 1rem 0;
   padding: 0.8rem;
-  border: 1px solid #394150;
+  border: 1px solid var(--ui-border);
   border-radius: 0.4rem;
 }
 
@@ -152,24 +228,45 @@ button.session-link {
   max-height: 32rem;
   overflow: auto;
   padding: 0.8rem;
-  background: #0d1117;
+  background: var(--ui-inset);
   white-space: pre-wrap;
+}
+
+.diff {
+  color: var(--ui-text);
+  white-space: pre;
+}
+
+.diff span {
+  display: block;
+}
+
+.diff-add {
+  background: var(--ui-diff-add);
+}
+
+.diff-remove {
+  background: var(--ui-diff-remove);
+}
+
+.diff-hunk {
+  color: var(--ui-text-secondary);
 }
 
 .changes-outside,
 .changes-conflict {
-  color: #ffbd66;
+  color: var(--ui-warning);
 }
 
 .changes-paths {
-  color: #9aa7b8;
+  color: var(--ui-text-secondary);
   font-size: 0.9rem;
 }
 
 #status-rail {
   grid-column: 3;
   grid-row: 1;
-  background: #171d26;
+  background: var(--ui-panel);
 }
 
 .agent-row {
@@ -179,7 +276,7 @@ button.session-link {
 .agent-children {
   margin-left: 0.75rem;
   padding-left: 0.6rem;
-  border-left: 1px solid #394150;
+  border-left: 1px solid var(--ui-border);
 }
 
 .agent-controls,
@@ -202,7 +299,7 @@ button.session-link {
 
 .agent-control-error {
   margin: 0.35rem 0 0;
-  color: #ff9a9a;
+  color: var(--ui-danger);
 }
 
 .app-shell.rail-folded #status-rail {
@@ -225,7 +322,7 @@ button.session-link {
 .settings-table th,
 .settings-table td {
   padding: 0.5rem;
-  border-bottom: 1px solid #394150;
+  border-bottom: 1px solid var(--ui-border);
   text-align: left;
   vertical-align: top;
   white-space: pre-wrap;
@@ -254,8 +351,8 @@ button.session-link {
   width: 100%;
   padding: 0.4rem;
   color: inherit;
-  background: #0d1117;
-  border: 1px solid #394150;
+  background: var(--ui-inset);
+  border: 1px solid var(--ui-border);
 }
 
 .agent-form textarea {
@@ -265,7 +362,7 @@ button.session-link {
 
 .agent-status {
   margin: 0;
-  color: #9aa7b8;
+  color: var(--ui-text-secondary);
   white-space: pre-wrap;
 }
 
@@ -273,6 +370,7 @@ button.session-link {
   display: grid;
   grid-template-rows: auto 1fr auto auto;
   gap: 1rem;
+  height: 100vh;
 }
 
 #run-notice:empty {
@@ -284,8 +382,9 @@ button.session-link {
 }
 
 .prompt-form {
+  position: relative;
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 0.75rem;
 }
@@ -304,8 +403,8 @@ button.session-link {
   gap: 0.4rem;
   border-radius: 0.4rem;
   padding: 0.25rem 0.5rem;
-  background: #3b4b5f;
-  color: #eef3f8;
+  background: var(--ui-selected);
+  color: var(--ui-text);
   font-size: 0.85rem;
 }
 
@@ -317,12 +416,12 @@ button.session-link {
   grid-column: 1 / -1;
   grid-row: 2;
   margin: 0;
-  color: #9aa7b8;
+  color: var(--ui-text-secondary);
   font-size: 0.85rem;
 }
 
 .conversation-usage.plan {
-  color: #ffbd66;
+  color: var(--ui-warning);
   font-weight: 700;
 }
 
@@ -343,10 +442,10 @@ button.session-link {
   display: grid;
   gap: 0.2rem;
   padding: 0.5rem;
-  border: 1px solid #52647a;
+  border: 1px solid var(--ui-control-border);
   border-radius: 0.5rem;
-  background: #171d26;
-  box-shadow: 0 0.5rem 1.5rem #0008;
+  background: var(--ui-panel);
+  box-shadow: var(--ui-shadow);
 }
 
 .file-menu {
@@ -356,10 +455,10 @@ button.session-link {
   max-height: min(18rem, 45vh);
   overflow: auto;
   padding: 0.5rem;
-  border: 1px solid #52647a;
+  border: 1px solid var(--ui-control-border);
   border-radius: 0.5rem;
-  background: #171d26;
-  box-shadow: 0 0.5rem 1.5rem #0008;
+  background: var(--ui-panel);
+  box-shadow: var(--ui-shadow);
 }
 
 .file-menu:empty {
@@ -378,8 +477,8 @@ button.session-link {
 }
 
 .command-suggestion.focused {
-  background: #29384a;
-  border-color: #82b5f2;
+  background: var(--ui-hover);
+  border-color: var(--ui-accent);
 }
 
 .file-suggestion {
@@ -394,8 +493,8 @@ button.session-link {
 }
 
 .file-suggestion.focused {
-  background: #29384a;
-  border-color: #82b5f2;
+  background: var(--ui-hover);
+  border-color: var(--ui-accent);
 }
 
 .picker-host {
@@ -406,10 +505,10 @@ button.session-link {
   max-height: min(18rem, 45vh);
   overflow: auto;
   padding: 0.5rem;
-  border: 1px solid #52647a;
+  border: 1px solid var(--ui-control-border);
   border-radius: 0.5rem;
-  background: #171d26;
-  box-shadow: 0 0.5rem 1.5rem #0008;
+  background: var(--ui-panel);
+  box-shadow: var(--ui-shadow);
   outline: none;
 }
 
@@ -417,7 +516,7 @@ button.session-link {
 .picker-message {
   margin: 0;
   padding: 0.45rem 0.6rem;
-  color: #9aa7b8;
+  color: var(--ui-text-secondary);
 }
 
 .picker-list {
@@ -440,8 +539,8 @@ button.session-link {
 }
 
 .picker-row.focused {
-  background: #29384a;
-  border-color: #82b5f2;
+  background: var(--ui-hover);
+  border-color: var(--ui-accent);
 }
 
 .picker-row.current .picker-row-label {
@@ -449,7 +548,7 @@ button.session-link {
 }
 
 .picker-row-description {
-  color: #9aa7b8;
+  color: var(--ui-text-secondary);
 }
 
 .roadmap-overview {
@@ -473,9 +572,9 @@ button.session-link {
 
 .roadmap-phase-box {
   padding: 0.7rem;
-  border: 1px solid #435263;
+  border: 1px solid var(--ui-border);
   border-radius: 0.45rem;
-  background: #161d26;
+  background: var(--ui-panel);
 }
 
 .roadmap-phase-group {
@@ -492,17 +591,17 @@ button.session-link {
   color: inherit;
   border: 0;
   border-radius: 0.3rem;
-  background: #202a36;
+  background: var(--ui-hover);
   cursor: pointer;
 }
 
 .roadmap-phase-chain-summary {
   min-height: 2.6rem;
-  color: #7ac99b;
+  color: var(--ui-success);
 }
 
 .roadmap-phase-in_progress > .roadmap-phase-header {
-  color: #a9cfff;
+  color: var(--ui-accent-hover);
 }
 
 .roadmap-phase-tasks {
@@ -536,7 +635,7 @@ button.session-link {
   grid-column: span 2;
   min-width: 0;
   padding: 0.35rem;
-  border: 1px solid #435263;
+  border: 1px solid var(--ui-border);
   border-radius: 0.35rem;
 }
 
@@ -564,42 +663,42 @@ button.session-link {
   margin-right: 0.35rem;
   content: "";
   border-radius: 50%;
-  background: #687686;
+  background: var(--ui-text-secondary);
 }
 
 .roadmap-state-done .roadmap-box-button::before,
 .roadmap-state-committed .roadmap-box-button::before {
-  background: #7ac99b;
+  background: var(--ui-success);
 }
 
 .roadmap-state-running .roadmap-box-button::before,
 .roadmap-state-in-review .roadmap-box-button::before {
   background: transparent;
-  border: 1px solid #82b5f2;
+  border: 1px solid var(--ui-accent);
 }
 
 .roadmap-follow-up {
   padding-left: 1.2rem;
-  color: #aab6c4;
+  color: var(--ui-text-secondary);
   font-size: 0.82em;
 }
 
 .roadmap-tag {
   display: inline-block;
   margin: 0.1rem 0.25rem;
-  color: #d6b875;
+  color: var(--ui-warning);
   font-size: 0.8em;
 }
 
 .roadmap-group-heading {
   padding: 0.2rem 0.4rem;
-  color: #aab6c4;
+  color: var(--ui-text-secondary);
   font-size: 0.8em;
 }
 
 .roadmap-done-summary {
   grid-column: span 2;
-  color: #7ac99b;
+  color: var(--ui-success);
 }
 
 .roadmap-graph > .roadmap-done-summary {
@@ -637,7 +736,7 @@ button.session-link {
   bottom: 0.25rem;
   left: var(--roadmap-edge-from);
   content: "";
-  border-left: 1px solid #8292a3;
+  border-left: 1px solid var(--ui-text-secondary);
 }
 
 .roadmap-edge-from-0-to-1::before,
@@ -645,8 +744,8 @@ button.session-link {
   left: 25%;
   right: 25%;
   bottom: 0;
-  border-right: 1px solid #8292a3;
-  border-top: 1px solid #8292a3;
+  border-right: 1px solid var(--ui-text-secondary);
+  border-top: 1px solid var(--ui-text-secondary);
 }
 
 .roadmap-edge::after {
@@ -654,7 +753,7 @@ button.session-link {
   bottom: -0.1rem;
   left: var(--roadmap-edge-to);
   content: "▼";
-  color: #8292a3;
+  color: var(--ui-text-secondary);
   font-size: 0.65rem;
   transform: translateX(-50%);
 }
@@ -672,13 +771,23 @@ button.session-link {
   overflow: auto;
   padding: 0.75rem;
   white-space: pre-wrap;
-  background: #0d1117;
+  background: var(--ui-inset);
 }
 
 .chat-log {
   display: flex;
   flex-direction: column;
-  min-height: 12rem;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+#chat,
+#approvals,
+#prompt-form {
+  width: 100%;
+  max-width: 45rem;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .prompt,
@@ -701,23 +810,43 @@ button.session-link {
 .gap,
 .unknown-event,
 .approval {
-  background: #1d2530;
+  background: var(--ui-panel);
 }
 
 .prompt {
-  margin-left: auto;
-  max-width: 80%;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  background: #2f4864;
+  background: var(--ui-inset);
 }
 
 .assistant {
-  margin-right: auto;
-  max-width: 80%;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  background: #23483c;
+  background: var(--ui-bg);
+}
+
+.prompt::before,
+#chat > .prompt + :not(.prompt)::before {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--ui-text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.prompt::before {
+  content: "You";
+}
+
+#chat > .prompt + :not(.prompt)::before {
+  content: "Assistant";
+}
+
+.jump-latest {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.5rem);
+  z-index: 1;
 }
 
 .assistant > * {
@@ -751,18 +880,18 @@ button.session-link {
   overflow-x: auto;
   margin: 0.5em 0;
   padding: 0.6em;
-  background: #17231e;
+  background: var(--ui-inset);
   border-radius: 0.3rem;
   white-space: pre;
 }
 
 .assistant code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
 }
 
 .assistant :not(pre) > code {
   padding: 0.05em 0.25em;
-  background: #17231e;
+  background: var(--ui-inset);
   border-radius: 0.2em;
 }
 
@@ -770,8 +899,8 @@ button.session-link {
   width: 100%;
   margin: 0;
   padding: 0;
-  color: #9aa7b8;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--ui-text-secondary);
+  font-family: var(--font-code);
   font-size: 0.9rem;
   text-align: left;
   background: none;
@@ -822,7 +951,7 @@ button.session-link {
 .gap,
 .error,
 .prompt-error {
-  color: #ffbd66;
+  color: var(--ui-warning);
 }
 
 .approval button {
@@ -847,6 +976,13 @@ button.session-link {
 .prompt-form button {
   grid-column: 2;
   grid-row: 1;
+}
+
+#stop-button {
+  grid-column: 3;
+  grid-row: 1;
+  color: var(--ui-danger);
+  border-color: var(--ui-danger);
 }
 
 .prompt-error {
@@ -887,7 +1023,7 @@ button.session-link {
   }
 }
 .spec-workflow {
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--ui-border);
   margin-bottom: 1rem;
   padding-bottom: 0.75rem;
 }
