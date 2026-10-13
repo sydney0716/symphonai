@@ -17,6 +17,32 @@ import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
+const STATUS_LINE_KEY = "symphonai.status-line";
+const DEFAULT_STATUS_FIELDS = Object.freeze({
+  provider: false, model: true, effort: true, mode: false,
+  goal: false, context: false, usage: false,
+});
+
+function readStatusFields(global) {
+  try {
+    const stored = JSON.parse(global.localStorage?.getItem(STATUS_LINE_KEY) ?? "null");
+    return Object.fromEntries(Object.keys(DEFAULT_STATUS_FIELDS).map((key) => [
+      key,
+      typeof stored?.[key] === "boolean" ? stored[key] : DEFAULT_STATUS_FIELDS[key],
+    ]));
+  } catch {
+    return { ...DEFAULT_STATUS_FIELDS };
+  }
+}
+
+function saveStatusFields(global, fields) {
+  try {
+    global.localStorage?.setItem(STATUS_LINE_KEY, JSON.stringify(fields));
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
+  }
+}
+
 export const INIT_PROMPT = `Please analyze this repository and write .symphonai/INSTRUCTIONS.md, which SymphonAI loads into every conversation in this project.
 
 Include:
@@ -97,7 +123,37 @@ function clientFor(global, supplied) {
 }
 
 const ROUTE_KEY = "symphonai.route";
+const RAIL_KEY = "symphonai.rail-tools";
 const SIDEBAR_SESSION_LIMIT = 200;
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Spec", "Files"];
+const RAIL_TOOL_ICONS = Object.freeze({
+  Agents: "icon-tool-agents",
+  Roadmap: "icon-tool-roadmap",
+  Changes: "icon-tool-changes",
+  Spec: "icon-tool-spec",
+  Files: "icon-tool-files",
+});
+
+function storedRail(global) {
+  try {
+    const value = JSON.parse(global.localStorage?.getItem(RAIL_KEY) ?? "null");
+    const open = Array.isArray(value?.open)
+      ? [...new Set(value.open.filter((name) => RAIL_TOOL_NAMES.includes(name)))]
+      : ["Agents", "Roadmap"];
+    const selected = open.includes(value?.selected) ? value.selected : open[0] ?? "";
+    return { open, selected };
+  } catch {
+    return { open: ["Agents", "Roadmap"], selected: "Agents" };
+  }
+}
+
+function rememberRail(global, open, selected) {
+  try {
+    global.localStorage?.setItem(RAIL_KEY, JSON.stringify({ open, selected }));
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
+  }
+}
 
 function storedRoute(global) {
   try {
@@ -124,23 +180,27 @@ export async function start({ global, document, client }) {
   const newChat = document.getElementById("new-chat");
   const sidebarToggle = document.getElementById("sidebar-toggle");
   const railToggle = document.getElementById("rail-toggle");
+  setToggleLabel(sidebarToggle, "sidebar", false);
+  setToggleLabel(railToggle, "status", false);
   const pageLinks = document.getElementById("page-links");
   const pageRoot = document.getElementById("page");
   const chatPane = document.getElementById("chat-pane");
   const agentsRoot = document.getElementById("agents");
   const roadmapRoot = document.getElementById("roadmap");
+  const changesRoot = document.getElementById("changes");
   const specRoot = document.getElementById("spec");
+  const filesRoot = document.getElementById("files");
+  const railTabsRoot = document.getElementById("rail-tabs");
+  const railToolsRoot = document.getElementById("rail-tools");
+  let { open: openRailTools, selected: selectedRailTool } = storedRail(global);
   const runNotice = document.getElementById("run-notice");
   const chatRoot = document.getElementById("chat");
   const jumpLatest = document.getElementById("jump-latest");
-  const stopButton = document.getElementById("stop-button");
   const approvalsRoot = document.getElementById("approvals");
   const form = document.getElementById("prompt-form");
   const input = document.getElementById("prompt");
   const promptError = document.getElementById("prompt-error");
   const attachmentList = document.getElementById("prompt-attachments");
-  const attachmentPicker = document.getElementById("attachment-picker");
-  const attachButton = document.getElementById("attach-button");
   const pendingFiles = [];
   const promptAttachments = [];
   let following = true;
@@ -215,11 +275,11 @@ export async function start({ global, document, client }) {
   const settingsSections = element(document, "nav", { className: "settings-sections" });
   const settingsContent = element(document, "div", { className: "settings-content" });
   append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
-  const changesPane = element(document, "section", { className: "changes-pane" });
   let promptFailure = "";
   let route;
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
-  append(form, conversationUsage);
+  append(chatPane, conversationUsage);
+  const statusFields = readStatusFields(global);
 
   function settingsTable(headings, rows) {
     const table = element(document, "table", { className: "settings-table" });
@@ -367,7 +427,7 @@ export async function start({ global, document, client }) {
           const tools = field(document, "textarea", "agent-tools", values.tools.join("\n"));
           const denyTools = field(document, "textarea", "agent-deny-tools", values.denyTools.join("\n"));
           const status = element(document, "p", { className: "agent-status", text: message });
-          const save = element(document, "button", { className: "agent-save", text: "Save" });
+          const save = element(document, "button", { className: "agent-save primary", text: "Save" });
           save.type = "submit";
           const labels = [
             ["Name", name], ["Scope", scope], ["Prompt", prompt],
@@ -533,18 +593,38 @@ export async function start({ global, document, client }) {
         document.documentElement.setAttribute("data-theme", selected);
       }
     });
+    const statusOptions = [
+      ["provider", "Provider"], ["model", "Model"], ["effort", "Effort"],
+      ["mode", "Mode"], ["goal", "Goal"], ["context", "Context"], ["usage", "Usage"],
+    ];
+    const statusGroup = element(document, "section", { className: "status-line-settings" });
+    append(statusGroup, element(document, "h3", { text: "Status line" }));
+    for (const [key, label] of statusOptions) {
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = statusFields[key];
+      checkbox.setAttribute("aria-label", label);
+      listen(checkbox, "change", () => {
+        statusFields[key] = checkbox.checked;
+        saveStatusFields(global, statusFields);
+        showConversationUsage();
+      });
+      append(statusGroup, append(element(document, "label"), checkbox, element(document, "span", { text: label })));
+    }
     replace(
       settingsContent,
       element(document, "h2", { text: "General" }),
       element(document, "h3", { text: "Appearance" }),
       themeSelect,
+      statusGroup,
       settingsTable(["Setting", "Value", "Scope"], rows),
     );
   }
 
+  let pageNavLinks = [];
   async function showChanges() {
     replace(
-      changesPane,
+      changesRoot,
       element(document, "h1", { text: "Changes" }),
       element(document, "p", { className: "changes-loading", text: "Loading changes…" }),
     );
@@ -553,7 +633,7 @@ export async function start({ global, document, client }) {
       reply = await boundary.changes();
     } catch (error) {
       replace(
-        changesPane,
+        changesRoot,
         element(document, "h1", { text: "Changes" }),
         element(document, "p", {
           className: "error",
@@ -593,7 +673,7 @@ export async function start({ global, document, client }) {
         }
       });
       append(warning, force);
-      changesPane.append(warning);
+      changesRoot.append(warning);
     }
 
     async function revert(payload) {
@@ -604,7 +684,7 @@ export async function start({ global, document, client }) {
         if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
           showConflict(error.paths, payload);
         } else {
-          changesPane.append(element(document, "p", {
+          changesRoot.append(element(document, "p", {
             className: "error",
             text: error instanceof Error ? error.message : String(error),
           }));
@@ -706,7 +786,7 @@ export async function start({ global, document, client }) {
         children.push(row);
       }
     }
-    replace(changesPane, ...children);
+    replace(changesRoot, ...children);
   }
 
   function showPage(nextRoute) {
@@ -714,13 +794,22 @@ export async function start({ global, document, client }) {
       savedScrollTop = chatRoot.scrollTop;
     }
     route = nextRoute;
+    for (const { page, link } of pageNavLinks) {
+      if (page === route.page) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    }
+    for (const { section, link } of sectionLinks) {
+      const currentSection = route.section || "general";
+      if (route.page === "settings" && section === currentSection) {
+        link.setAttribute("aria-current", "page");
+      } else {
+        link.removeAttribute("aria-current");
+      }
+    }
     if (route.page === "settings") {
       showSettings(route.section);
-    } else if (route.page === "changes") {
-      void showChanges();
     }
-    const pane = route.page === "settings" ? settingsPane
-      : route.page === "changes" ? changesPane : chatPane;
+    const pane = route.page === "settings" ? settingsPane : chatPane;
     replace(pageRoot, pane);
     if (route.page === "chat") {
       chatRoot.scrollTop = following ? chatRoot.scrollHeight : savedScrollTop;
@@ -746,13 +835,15 @@ export async function start({ global, document, client }) {
       event.preventDefault();
       navigate({ page: "settings", section });
     });
-    return link;
+    return { section, link };
   });
-  replace(settingsSections, ...sectionLinks);
+  replace(settingsSections, ...sectionLinks.map(({ link }) => link));
 
-  const links = PAGES.filter((page) => page === "settings" || page === "changes").map((page) => {
+  const pageOrder = ["chat", "settings"];
+  const links = pageOrder.map((page) => {
     const pageRoute = { page, section: "" };
     const link = element(document, "a", {
+      ...(page === "settings" ? { className: "icon-settings" } : {}),
       text: page[0].toUpperCase() + page.slice(1),
     });
     link.href = formatRoute(pageRoute);
@@ -762,7 +853,9 @@ export async function start({ global, document, client }) {
     });
     return link;
   });
-  replace(pageLinks, ...links);
+  pageNavLinks = pageOrder.map((page, index) => ({ page, link: links[index] }));
+  const [chatLink, settingsLink] = links;
+  replace(pageLinks, chatLink);
   listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
@@ -771,13 +864,55 @@ export async function start({ global, document, client }) {
     if (onChatPage) {
       following = chatRoot.scrollHeight - chatRoot.scrollTop - chatRoot.clientHeight <= 24;
     }
-    renderTranscript(document, chatRoot, transcript.model, parseMarkdown);
+    renderTranscript(document, chatRoot, transcript.model, parseMarkdown, {
+      onViewChanges: () => openRailTool("Changes"),
+      onUndo: async (entry, force = false) => {
+        entry.undoing = true;
+        entry.error = "";
+        entry.conflicts = [];
+        showTranscript();
+        try {
+          await boundary.revertChanges({ key: entry.checkpointKey, ...(force ? { force: true } : {}) });
+          entry.undone = true;
+          entry.canUndo = false;
+          entry.conflicts = [];
+        } catch (error) {
+          if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
+            entry.conflicts = error.paths;
+          } else {
+            entry.error = error instanceof Error ? error.message : String(error);
+          }
+        } finally {
+          entry.undoing = false;
+          showTranscript();
+        }
+      },
+      rerender: showTranscript,
+    });
     if (!onChatPage) return;
     if (following) {
       chatRoot.scrollTop = chatRoot.scrollHeight;
       jumpLatest.hidden = true;
     } else {
       jumpLatest.hidden = false;
+    }
+  }
+
+  async function reconcileEditCard(card) {
+    card.canUndo = false;
+    if (!card.checkpointKey || card.undone) return;
+    try {
+      const reply = await boundary.changes();
+      const turn = (Array.isArray(reply?.turns) ? reply.turns : [])
+        .find((entry) => entry?.key === card.checkpointKey);
+      if (!Array.isArray(turn?.paths)) return;
+      const paths = new Set(turn.paths.filter((path) => typeof path === "string"));
+      card.files = card.files.filter((file) => paths.has(file.path));
+      card.added = card.files.reduce((total, file) => total + file.added, 0);
+      card.removed = card.files.reduce((total, file) => total + file.removed, 0);
+      card.canUndo = card.files.length > 0 && paths.size > 0;
+    } catch {
+      card.canUndo = false;
     }
   }
 
@@ -799,16 +934,19 @@ export async function start({ global, document, client }) {
     transcript.model.length = 0;
     currentSessionId = runId;
     transcript.setSessionId(currentSessionId);
+    showProjects();
     showTranscript();
     clearConversationAgents();
     try {
       await boundary.openSession(runId);
       await refreshConversation();
+      await refreshSelectedChanges();
       navigate({ page: "chat", section: "" });
     } catch (error) {
       transcript.model.splice(0, transcript.model.length, ...previous);
       currentSessionId = previousId;
       transcript.setSessionId(currentSessionId);
+      showProjects();
       showTranscript();
       await refreshConversation();
       throw error;
@@ -859,6 +997,9 @@ export async function start({ global, document, client }) {
           className: "session-link",
           text: label,
         });
+        if (session.run_id === currentSessionId) {
+          button.setAttribute("aria-current", "true");
+        }
         button.setAttribute("title", label);
         button.type = "button";
         listen(button, "click", async () => {
@@ -878,12 +1019,14 @@ export async function start({ global, document, client }) {
       transcript.model.length = 0;
       currentSessionId = null;
       transcript.setSessionId(null);
+      showProjects();
       showTranscript();
       conversation = null;
       currentMode = launchMode;
       rememberedPlanMode = null;
       showConversationUsage();
       showAgents();
+      await refreshSelectedChanges();
       promptFailure = "";
       showPromptError();
       navigate({ page: "chat", section: "" });
@@ -895,7 +1038,14 @@ export async function start({ global, document, client }) {
     }
   }
   listen(newChat, "click", startNewChat);
-  replace(sidebar, homeLink, newChat, pageLinks, projectsRoot);
+  replace(sidebar, homeLink, newChat, pageLinks, projectsRoot, settingsLink);
+
+  function setToggleLabel(button, label, folded) {
+    const text = `${folded ? "Show" : "Hide"} ${label}`;
+    button.textContent = "";
+    button.setAttribute("aria-label", text);
+    button.setAttribute("title", text);
+  }
 
   function toggleFold(className, button, label) {
     const classes = shell.className.split(" ");
@@ -903,7 +1053,7 @@ export async function start({ global, document, client }) {
     shell.className = folded
       ? classes.filter((name) => name !== className).join(" ")
       : [...classes, className].join(" ");
-    button.textContent = folded ? `Hide ${label}` : `Show ${label}`;
+    setToggleLabel(button, label, !folded);
   }
 
   listen(sidebarToggle, "click", () => {
@@ -1076,6 +1226,239 @@ export async function start({ global, document, client }) {
     return button;
   }
 
+  let showRailTools = false;
+  const fileListings = new Map();
+  const expandedFileDirectories = new Set();
+  const fileTreeErrors = new Map();
+  let selectedFilePath = null;
+  let fileSourceText = null;
+  let fileSourceError = null;
+  let fileSourceLoading = false;
+
+  function renderFiles() {
+    if (selectedFilePath !== null) {
+      const back = element(document, "button", { className: "files-back", text: "Back" });
+      back.type = "button";
+      listen(back, "click", () => {
+        selectedFilePath = null;
+        fileSourceText = null;
+        fileSourceError = null;
+        fileSourceLoading = false;
+        renderFiles();
+      });
+      const header = element(document, "div", { className: "files-viewer-header" });
+      append(header, back, element(document, "strong", {
+        className: "files-viewer-path",
+        text: selectedFilePath,
+      }));
+      const children = [header];
+      if (fileSourceLoading) {
+        children.push(element(document, "p", { text: "Loading…" }));
+      } else if (fileSourceError) {
+        const message = {
+          404: "Not found",
+          413: "Too large to show (over 1 MiB)",
+          415: "Not a text file",
+        }[fileSourceError.status] ?? "Could not read file";
+        children.push(element(document, "p", { className: "files-source-error", text: message }));
+      } else if (typeof fileSourceText === "string") {
+        const lines = fileSourceText.split("\n");
+        const width = String(lines.length).length;
+        const source = element(document, "div", { className: "files-source" });
+        append(
+          source,
+          element(document, "pre", {
+            className: "files-line-numbers",
+            attributes: { "aria-hidden": "true" },
+            text: lines.map((_, index) => String(index + 1).padStart(width, " ")).join("\n"),
+          }),
+          element(document, "pre", { className: "files-code", text: fileSourceText }),
+        );
+        children.push(source);
+      }
+      replace(filesRoot, ...children);
+      return;
+    }
+
+    const rows = [];
+    function appendDirectory(path, depth) {
+      const listing = fileListings.get(path);
+      if (!listing) return;
+      for (const entry of listing.entries ?? []) {
+        const childPath = path ? `${path}/${entry.name}` : entry.name;
+        const isDirectory = entry.kind === "dir";
+        const row = element(document, "button", {
+          className: `files-tree-row${isDirectory ? " files-directory" : " files-file"}`,
+        });
+        row.type = "button";
+        row.setAttribute("style", `padding-left: calc(var(--space-4) * ${depth})`);
+        if (isDirectory) {
+          const expanded = expandedFileDirectories.has(childPath);
+          append(row,
+            element(document, "span", { className: "files-chevron", text: expanded ? "▾" : "▸" }),
+            element(document, "span", { className: "files-name", text: entry.name }),
+          );
+          row.setAttribute("aria-expanded", String(expanded));
+          listen(row, "click", async () => {
+            if (expandedFileDirectories.has(childPath)) {
+              expandedFileDirectories.delete(childPath);
+              renderFiles();
+              return;
+            }
+            expandedFileDirectories.add(childPath);
+            renderFiles();
+            await loadFileDirectory(childPath);
+          });
+        } else {
+          append(row,
+            element(document, "span", { className: "files-chevron" }),
+            element(document, "span", { className: "files-name", text: entry.name }),
+          );
+          listen(row, "click", () => openSourceFile(childPath));
+        }
+        rows.push(row);
+        if (isDirectory && expandedFileDirectories.has(childPath)) {
+          appendDirectory(childPath, depth + 1);
+          if (fileTreeErrors.has(childPath)) {
+            rows.push(element(document, "p", {
+              className: "files-source-error",
+              text: "Could not load directory",
+            }));
+          }
+        }
+      }
+      if (listing.truncated) {
+        const more = element(document, "p", { className: "files-tree-more", text: "More files not shown" });
+        more.setAttribute("style", `padding-left: calc(var(--space-4) * ${depth})`);
+        rows.push(more);
+      }
+    }
+    appendDirectory("", 0);
+    if (fileTreeErrors.has("")) rows.push(element(document, "p", {
+      className: "files-source-error", text: "Could not load directory",
+    }));
+    if (!fileListings.has("") && !fileTreeErrors.has("")) {
+      rows.push(element(document, "p", { text: "Loading…" }));
+    }
+    replace(filesRoot, ...rows);
+  }
+
+  async function loadFileDirectory(path) {
+    try {
+      fileListings.set(path, await boundary.tree(path));
+      fileTreeErrors.delete(path);
+    } catch {
+      fileTreeErrors.set(path, true);
+    }
+    renderFiles();
+  }
+
+  async function openSourceFile(path) {
+    selectedFilePath = path;
+    fileSourceText = null;
+    fileSourceError = null;
+    fileSourceLoading = true;
+    renderFiles();
+    try {
+      const reply = await boundary.source(path);
+      fileSourceText = reply.text;
+    } catch (error) {
+      fileSourceError = error;
+    } finally {
+      fileSourceLoading = false;
+      renderFiles();
+    }
+  }
+
+  function renderRail() {
+    const tabs = openRailTools.map((name) => {
+      const selected = name === selectedRailTool;
+      const wrapper = element(document, "div", { className: "rail-tab-item" });
+      wrapper.setAttribute("aria-selected", String(selected));
+      const tab = element(document, "button", {
+        className: `rail-tab ${RAIL_TOOL_ICONS[name]}`,
+        text: selected ? name : "",
+      });
+      tab.type = "button";
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", String(selected));
+      tab.setAttribute("aria-label", name);
+      tab.setAttribute("title", name);
+      listen(tab, "click", () => selectRailTool(name));
+      append(wrapper, tab);
+      if (selected) {
+        const close = element(document, "button", { className: "rail-tab-close", text: "×" });
+        close.type = "button";
+        close.setAttribute("aria-label", `Close ${name}`);
+        close.setAttribute("title", `Close ${name}`);
+        listen(close, "click", () => closeRailTool(name));
+        append(wrapper, close);
+      }
+      return wrapper;
+    });
+    const add = element(document, "button", { className: "rail-tab-add", text: "+" });
+    add.type = "button";
+    add.setAttribute("aria-label", "Open a tool");
+    listen(add, "click", () => {
+      showRailTools = !showRailTools;
+      renderRail();
+    });
+    replace(railTabsRoot, ...tabs, add);
+
+    const tools = RAIL_TOOL_NAMES.map((name) => {
+      const row = element(document, "button", { className: "rail-tool", text: name });
+      row.type = "button";
+      listen(row, "click", () => openRailTool(name));
+      return row;
+    });
+    replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Spec: specRoot, Files: filesRoot };
+    if (!selectedSpec) {
+      replace(specRoot, element(document, "p", {
+        className: "spec-empty",
+        text: "Choose a task in Roadmap to open its spec.",
+      }));
+    }
+    for (const [name, pane] of Object.entries(panes)) {
+      pane.hidden = showRailTools || name !== selectedRailTool;
+    }
+    renderFiles();
+    railToolsRoot.hidden = !showRailTools && openRailTools.length > 0;
+  }
+
+  function selectRailTool(name) {
+    if (!openRailTools.includes(name)) return openRailTool(name);
+    const changed = selectedRailTool !== name;
+    selectedRailTool = name;
+    showRailTools = false;
+    rememberRail(global, openRailTools, selectedRailTool);
+    renderRail();
+    if (!changed) return undefined;
+    if (name === "Changes") return showChanges();
+    if (name === "Files") return loadFileDirectory("");
+    return undefined;
+  }
+
+  function openRailTool(name) {
+    if (!RAIL_TOOL_NAMES.includes(name)) return;
+    if (!openRailTools.includes(name)) openRailTools = [...openRailTools, name];
+    return selectRailTool(name);
+  }
+
+  function closeRailTool(name) {
+    openRailTools = openRailTools.filter((tool) => tool !== name);
+    if (selectedRailTool === name) selectedRailTool = openRailTools.at(-1) ?? "";
+    showRailTools = openRailTools.length === 0;
+    rememberRail(global, openRailTools, selectedRailTool);
+    renderRail();
+    if (selectedRailTool === "Changes") return showChanges();
+    return undefined;
+  }
+
+  async function refreshSelectedChanges() {
+    if (selectedRailTool === "Changes") await showChanges();
+  }
+
   async function refreshSpecState() {
     const [reply, runs, specFilesReply] = await Promise.all([
       boundary.file("docs/roadmap.json"),
@@ -1107,15 +1490,18 @@ export async function start({ global, document, client }) {
     try {
       await action();
       if (newConversation) await refreshConversation();
+      await refreshSelectedChanges();
       await refreshSpecState();
     } catch (error) {
       if (newConversation) await refreshConversation();
+      await refreshSelectedChanges();
       specActionError = error?.message || "spec action failed";
       if (selectedSpec) showSpec(selectedSpec.result, selectedSpec.item, selectedSpec.phase, selectedSpec.index);
     }
   }
 
   function showSpec(result, item = null, phase = null, itemIndex = -1) {
+    selectRailTool("Spec");
     const children = [];
     if (item && phase) {
       const current = workflow(item, phase, itemIndex);
@@ -1215,6 +1601,10 @@ export async function start({ global, document, client }) {
     });
   }
 
+  function graphEdgeElement() {
+    return element(document, "div", { className: "roadmap-edge" });
+  }
+
   function graphTaskOptions(phase) {
     const titles = new Map(graphTitles);
     const followUps = new Map();
@@ -1240,54 +1630,35 @@ export async function start({ global, document, client }) {
       return [element(document, "p", { className: "error roadmap-graph-error", text: graph.error }),
         ...phase.items.map((item, index) => roadmapItem(item, phase, index))];
     }
-    const container = element(document, "div", { className: "roadmap-graph" });
-    for (const [rowIndex, row] of graph.rows.entries()) {
-      const boxes = element(document, "div", { className: "roadmap-graph-row" });
+    const container = element(document, "div", { className: "roadmap-waves" });
+    if (graph.summary) append(container, element(document, "div", { className: "roadmap-done-summary", text: graph.summary }));
+    for (const row of graph.rows) {
+      const wave = element(document, "div", { className: "roadmap-wave" });
       for (const node of row) {
-        if (node.summary) {
-          append(boxes, element(document, "div", { className: "roadmap-done-summary", text: node.title }));
-          continue;
+        const bound = itemById.get(node.id);
+        const task = element(document, "button", {
+          className: `roadmap-task roadmap-state-${node.state.replaceAll(" ", "-")}`,
+          text: `${node.id}  ${node.title}`,
+        });
+        task.setAttribute("title", node.title);
+        if (bound) listen(task, "click", () => openGraphSpec(bound.item, phase, bound.index));
+        const waveItem = element(document, "div", { className: "roadmap-wave-item" });
+        append(waveItem, task);
+        for (const tag of node.tags) append(waveItem, element(document, "span", { className: "roadmap-tag", text: tag }));
+        for (const followUp of node.followUps) {
+          const fullTitle = graphTitles.get(followUp.id) || followUp.title;
+          const followButton = element(document, "button", {
+            className: "roadmap-follow-up",
+            text: `${followUp.id}  ${fullTitle}`,
+          });
+          listen(followButton, "click", () => openGraphSpec({ title: fullTitle, spec: followUp.path }, phase, bound?.index ?? -1));
+          append(waveItem, followButton);
         }
-        const widthClass = row.length < 2 || node.group ? "roadmap-box-wide" : "";
-        const box = element(document, "div", { className: ["roadmap-box", widthClass, node.group ? "roadmap-group" : `roadmap-state-${node.state.replaceAll(" ", "-")}`].filter(Boolean).join(" ") });
-        if (node.group) append(box, element(document, "div", { className: "roadmap-group-heading", text: "parallel" }));
-        const entries = node.group ?? [node];
-        for (const entry of entries) {
-          const bound = itemById.get(entry.id);
-          const button = element(document, "button", { className: "roadmap-box-button", text: `${entry.id}  ${entry.title}` });
-          if (bound) {
-            button.setAttribute("title", bound.item.title);
-            listen(button, "click", () => openGraphSpec(bound.item, phase, bound.index));
-          }
-          append(box, button);
-          for (const followUp of entry.followUps ?? []) {
-            const followButton = element(document, "button", { className: "roadmap-follow-up", text: `${followUp.id}  ${followUp.title}` });
-            listen(followButton, "click", () => openGraphSpec({ title: followUp.title, spec: followUp.path }, phase, bound?.index ?? -1));
-            append(box, followButton);
-          }
-          for (const tag of entry.tags ?? []) append(box, element(document, "span", { className: "roadmap-tag", text: tag }));
-        }
-        boxes.append(box);
+        append(wave, waveItem);
       }
-      append(container, boxes);
-      if (rowIndex < graph.rows.length - 1) {
-        const connectorRow = element(document, "div", { className: "roadmap-connector-row" });
-        for (const edge of graph.edges) {
-          const from = graph.rows.flat().find((node) => node.id === edge.from);
-          const to = graph.rows.flat().find((node) => node.id === edge.to);
-          if (!from || !to || from.row > rowIndex || to.row <= rowIndex) continue;
-          const isTargetRow = to.row === rowIndex + 1;
-          const edgeClass = isTargetRow
-            ? `roadmap-edge roadmap-edge-from-${from.column}-to-${to.column}`
-            : `roadmap-edge roadmap-edge-through roadmap-edge-from-${from.column}`;
-          append(connectorRow, element(document, "div", { className: edgeClass }));
-        }
-        append(container, connectorRow);
-      }
+      append(container, wave);
     }
-    return graph.summary
-      ? [element(document, "div", { className: "roadmap-done-summary", text: graph.summary }), container]
-      : [container];
+    return [container];
   }
 
   function phaseDependencies(phase, index) {
@@ -1432,17 +1803,15 @@ export async function start({ global, document, client }) {
       }
       append(container, boxes);
       if (rowIndex < graph.rows.length - 1) {
-        const connectorRow = element(document, "div", { className: "roadmap-connector-row" });
-        for (const edge of graph.edges) {
+        const connectorEdges = graph.edges.flatMap((edge) => {
           const from = graph.rows.flat().find((node) => node.id === edge.from);
           const to = graph.rows.flat().find((node) => node.id === edge.to);
-          if (!from || !to || from.row > rowIndex || to.row <= rowIndex) continue;
-          const isTargetRow = to.row === rowIndex + 1;
-          const edgeClass = isTargetRow
-            ? `roadmap-edge roadmap-edge-from-${from.column}-to-${to.column}`
-            : `roadmap-edge roadmap-edge-through roadmap-edge-from-${from.column}`;
-          append(connectorRow, element(document, "div", { className: edgeClass }));
-        }
+          return from && to && from.row <= rowIndex && to.row > rowIndex
+            ? [{ edge, index: rowIndex - from.row }]
+            : [];
+        });
+        const connectorRow = element(document, "div", { className: "roadmap-connector-row" });
+        if (connectorEdges.length) append(connectorRow, graphEdgeElement());
         append(container, connectorRow);
       }
     }
@@ -1452,6 +1821,9 @@ export async function start({ global, document, client }) {
     }
   }
   renderRoadmapUI();
+  renderRail();
+  if (selectedRailTool === "Changes") void showChanges();
+  if (selectedRailTool === "Files") void loadFileDirectory("");
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -1470,23 +1842,25 @@ export async function start({ global, document, client }) {
     const context = conversation?.context;
     const provider = conversation?.provider;
     const model = conversation?.model;
-    const modelText = typeof model === "string" && model
-      ? `${typeof provider === "string" && provider ? `${provider} / ` : ""}${model}`
-      : "";
+    const modelText = typeof model === "string" && model ? model : "";
     const mode = permittedModes.includes(conversation?.mode) ? conversation.mode : "";
-    const effort = typeof conversation?.effort === "string" && conversation.effort
-      ? `Effort ${conversation.effort}`
-      : "";
-    conversationUsage.textContent = [
-      modelText,
-      effort,
-      mode && `Mode ${mode}`,
-      conversation?.goal && `Goal ${conversation.goal.phase} ${conversation.goal.rounds}/${conversation.goal.max_rounds}`,
-      Number.isInteger(context?.used_tokens) && Number.isInteger(context?.budget_tokens)
+    const providerText = typeof provider === "string" && provider ? provider : "";
+    const effort = typeof conversation?.effort === "string" && conversation.effort ? conversation.effort : "";
+    const identityStatus = [
+      statusFields.provider && providerText,
+      statusFields.model && modelText,
+    ].filter(Boolean).join(" / ");
+    const primaryStatus = [identityStatus, statusFields.effort && effort].filter(Boolean).join(" ");
+    const extraStatus = [
+      mode && mode !== "ask" && (statusFields.mode ? `Mode ${mode}` : mode),
+      mode === "ask" && statusFields.mode && `Mode ${mode}`,
+      statusFields.goal && conversation?.goal && `Goal ${conversation.goal.phase} ${conversation.goal.rounds}/${conversation.goal.max_rounds}`,
+      statusFields.context && Number.isInteger(context?.used_tokens) && Number.isInteger(context?.budget_tokens)
         ? `Context ${context.used_tokens} / ${context.budget_tokens} tokens`
         : "",
-      usageText(conversation?.usage),
-    ].filter(Boolean).join(" · ");
+      statusFields.usage && usageText(conversation?.usage),
+    ].filter(Boolean);
+    conversationUsage.textContent = [primaryStatus, ...extraStatus].filter(Boolean).join(" · ");
     conversationUsage.className = `conversation-usage${mode === "plan" ? " plan" : ""}`;
   }
 
@@ -1516,8 +1890,8 @@ export async function start({ global, document, client }) {
       web_search: ["searching the web for", "searched"],
       dispatch_subagent: ["dispatching", "dispatched"],
     };
-    const description = (tool, target, past = false) =>
-      [verbs[tool]?.[past ? 1 : 0] ?? tool, target].filter(Boolean).join(" ");
+    const description = (tool, target) =>
+      [verbs[tool]?.[0] ?? tool, target].filter(Boolean).join(" ");
     const usageByAgent = new Map(
       (conversation?.agents ?? []).map((agent) => [agent.agent_id, agent]),
     );
@@ -1538,20 +1912,27 @@ export async function start({ global, document, client }) {
       return;
     }
     const byId = new Map(rows.map((row) => [row.agentId, row]));
-    const nodes = new Map(rows.map(({ agentId, name, state, tool, target, last }) => {
+    const nodes = new Map(rows.map(({ agentId, name, state, tool, target }) => {
       const status = displayState(state);
       const activity = status === "running"
         ? (tool ? description(tool, target) : "thinking")
         : status === "waiting for approval"
           ? description(tool, target)
-          : ["finished", "failed", "stopped"].includes(status) && last
-            ? `last: ${description(last.tool, last.target, true)}`
-            : "";
-      return [agentId, element(document, "div", {
-        className: "agent-row",
-        text: [name, status, activity, usageText(usageByAgent.get(agentId))]
-          .filter(Boolean).join(" · "),
-      })];
+          : "";
+      const row = element(document, "div", { className: "agent-row" });
+      append(row, element(document, "span", {
+        className: "agent-name",
+        text: name,
+      }));
+      const detail = [status, activity, usageText(usageByAgent.get(agentId))]
+        .filter(Boolean).join(" · ");
+      if (detail) {
+        append(row, element(document, "span", {
+          className: "agent-detail",
+          text: detail,
+        }));
+      }
+      return [agentId, row];
     }));
     const children = new Map();
     const roots = [];
@@ -1572,87 +1953,6 @@ export async function start({ global, document, client }) {
         append(parent, children.get(row.parentAgentId));
       }
       append(children.get(row.parentAgentId), nodes.get(row.agentId));
-    }
-    for (const row of rows) {
-      const status = displayState(row.state);
-      if (!["running", "waiting for approval", "paused"].includes(status)) continue;
-      const node = nodes.get(row.agentId);
-      const controls = element(document, "div", { className: "agent-controls" });
-      const controlError = element(document, "p", {
-        className: "agent-control-error",
-        text: row.controlError ?? "",
-      });
-      const sendControl = async (action, text) => {
-        try {
-          const reply = await boundary.controlAgent(row.agentId, action, text);
-          row.state = reply.state === "cancelled" ? "stopped"
-            : reply.state === "pending" ? "running" : reply.state;
-          row.controlError = "";
-          showAgents();
-        } catch (error) {
-          row.controlError = error.message || "Agent control failed.";
-          showAgents();
-        }
-      };
-      const addControl = (text, action) => {
-        const button = element(document, "button", { text });
-        button.type = "button";
-        listen(button, "click", () => sendControl(action));
-        append(controls, button);
-      };
-      if (status === "paused") {
-        addControl("Resume", "resume");
-        addControl("Stop", "stop");
-      } else {
-        addControl("Pause", "pause");
-      }
-      if (status !== "paused") {
-        const redirectButton = element(document, "button", { text: "Redirect" });
-        redirectButton.type = "button";
-        listen(redirectButton, "click", () => {
-        if (node.children.some((child) => child.className === "agent-redirect")) return;
-        const redirect = element(document, "div", { className: "agent-redirect" });
-        const redirectInput = element(document, "input");
-        redirectInput.type = "text";
-        redirectInput.setAttribute?.("aria-label", `Redirect ${row.name}`);
-        const send = element(document, "button", { text: "Send" });
-        send.type = "button";
-        const close = () => {
-          const parent = redirect.parentNode;
-          if (parent?.removeChild) {
-            parent.removeChild(redirect);
-          } else if (parent) {
-            parent.children = parent.children.filter(
-              (child) => child !== redirect,
-            );
-          }
-        };
-        const submit = () => {
-          if (!redirectInput.value.trim()) {
-            row.controlError = "Redirect text must not be blank.";
-            showAgents();
-            return;
-          }
-          void sendControl("redirect", redirectInput.value);
-        };
-        listen(send, "click", submit);
-        listen(redirectInput, "keydown", (event) => {
-          if (lookup(keymap, event, { platform }) === "cancel") {
-            event.preventDefault();
-            close();
-          } else if (event.key === "Enter") {
-            event.preventDefault();
-            submit();
-          }
-        });
-        append(redirect, redirectInput, send);
-        append(node, redirect);
-        redirectInput.focus?.();
-        });
-        append(controls, redirectButton);
-        addControl("Stop", "stop");
-      }
-      append(node, controls, controlError);
     }
     replace(agentsRoot, ...roots);
   }
@@ -1754,7 +2054,6 @@ export async function start({ global, document, client }) {
   }
 
   async function perform(actions) {
-    showStopButton();
     for (const action of actions) {
       if (action.kind === "prompt") {
         const presentation = {
@@ -1782,6 +2081,7 @@ export async function start({ global, document, client }) {
             if (!currentSessionId && typeof reply?.run_id === "string") {
               currentSessionId = reply.run_id;
               transcript.setSessionId(currentSessionId);
+              showProjects();
             }
             promptFailure = "";
             await perform(turn.accepted());
@@ -1803,15 +2103,8 @@ export async function start({ global, document, client }) {
         await boundary.stop("");
       }
     }
-    showStopButton();
     showPromptError();
   }
-
-  function showStopButton() {
-    stopButton.hidden = turn.state !== DISPATCHING && turn.state !== RUNNING;
-  }
-
-  listen(stopButton, "click", () => perform(turn.stop()));
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
       if (lookup(keymap, event, { platform }) !== "stop-run") return;
@@ -1820,15 +2113,9 @@ export async function start({ global, document, client }) {
     });
   }
 
-  listen(attachButton, "click", () => attachmentPicker.click());
-  listen(attachmentPicker, "change", () => {
-    addFiles(Array.from(attachmentPicker.files ?? []));
-    attachmentPicker.value = "";
-  });
   listen(input, "paste", (event) => {
     const files = Array.from(event.clipboardData?.items ?? [])
-      .filter((item) => item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
+      .map((item) => item.getAsFile?.())
       .filter(Boolean);
     if (files.length > 0) {
       event.preventDefault();
@@ -2447,6 +2734,7 @@ export async function start({ global, document, client }) {
   }
 
   async function handleComposerKeydown(event) {
+    if (event.isComposing || event.keyCode === 229) return;
     if (fileFragment !== null) {
       if (fileMatches.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
         event.preventDefault();
@@ -2485,14 +2773,31 @@ export async function start({ global, document, client }) {
       if (lookup(keymap, event, { platform }) === "cancel") {
         event.preventDefault();
         closeCommandMenu();
+        return;
       }
       return;
     }
     if (fileFragment !== null) return;
     if (await handlePromptHistory(event)) return;
+    if (lookup(keymap, event, { platform }) === "cancel") {
+      if (turn.state === DISPATCHING || turn.state === RUNNING) {
+        event.preventDefault();
+        await perform(turn.stop());
+      }
+      return;
+    }
     if (lookup(keymap, event, { platform }) === "submit") {
       event.preventDefault();
       await form.requestSubmit();
+      return;
+    }
+    if (lookup(keymap, event, { platform }) === "newline") {
+      const start = input.selectionStart ?? input.value.length;
+      const end = input.selectionEnd ?? start;
+      input.value = `${input.value.slice(0, start)}\n${input.value.slice(end)}`;
+      input.selectionStart = start + 1;
+      input.selectionEnd = start + 1;
+      event.preventDefault();
     }
   }
 
@@ -2764,12 +3069,19 @@ export async function start({ global, document, client }) {
     if (await refreshActivityForOtherSession(frameSessionId)) return;
     const previousLength = transcript.model.length;
     transcript.apply(frame);
+    const newEntries = transcript.model.slice(previousLength);
+    for (const entry of newEntries) {
+      if (entry.type === "edit-card") {
+        await reconcileEditCard(entry);
+      }
+    }
     if (
       frame.kind === "event" && frame.payload?.type === "HistoryMessage"
       && typeof frame.payload.record_id === "string"
-      && transcript.model.length === previousLength + 1
     ) {
-      transcript.model.at(-1).recordId = frame.payload.record_id;
+      const historyEntry = transcript.model.slice(previousLength)
+        .find((entry) => entry.type === "prompt" || entry.type === "text");
+      if (historyEntry) historyEntry.recordId = frame.payload.record_id;
     }
     if (frame.kind === "event" && frame.payload?.type === "PromptSubmitted") {
       const match = promptAttachments.findIndex(({ text }) => text === frame.payload.text);
@@ -2819,6 +3131,7 @@ export async function start({ global, document, client }) {
     await perform(turn.event({ ...event, ...event.fields }));
     if (event.type === "RunFinished" || event.type === "RunFailed") {
       await refreshConversation();
+      await refreshSelectedChanges();
     }
   }
 
@@ -2828,6 +3141,7 @@ export async function start({ global, document, client }) {
     approvals,
     client: boundary,
     onFrame,
+    openTool: openRailTool,
     route: () => route,
     sidebar,
     specPaths: allSpecPaths,

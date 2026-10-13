@@ -14,6 +14,7 @@ from symphonai_api.events import Event
 from symphonai_host.protocol import (
     PROTOCOL_VERSION,
     ApprovalReply,
+    HistoryMessage,
     PromptRequest,
     ProtocolError,
     StopRequest,
@@ -45,6 +46,8 @@ def _event_instance(event_class: type[Event], *, turn_id_none: bool = False) -> 
             values[field.name] = 7
         elif hints[field.name] is bool:
             values[field.name] = True
+        elif hints[field.name] == str | None:
+            values[field.name] = f"{field.name}-value"
         elif hints[field.name] == dict | None:
             values[field.name] = {"exit": 1, "ok": False, "output": "out"}
         else:
@@ -238,6 +241,19 @@ def check_document_covers_registry() -> None:
         for field in dataclasses.fields(event_class):
             if field.name not in row:
                 fail(f"protocol document omitted {name}.{field.name}")
+    message = HistoryMessage(
+        role="user", text="work", tool_calls=[], turn_id="turn",
+        turn_started_at="2026-10-12T17:21:00.000Z",
+        turn_ended_at="2026-10-12T17:27:34.000Z",
+        turn_outcome="finished",
+    )
+    payload = message.payload()
+    if payload["turn_started_at"] != "2026-10-12T17:21:00.000Z" or payload["turn_ended_at"] != "2026-10-12T17:27:34.000Z":
+        fail(f"HistoryMessage dropped its root turn times: {payload!r}")
+    doc = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text()
+    for field in ("turn_started_at", "turn_ended_at", "turn_outcome", "subagent_name", "task"):
+        if field not in doc:
+            fail(f"protocol document omitted replay field {field}")
 
 
 @check("host_protocol.package_contract")

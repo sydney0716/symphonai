@@ -5,16 +5,11 @@ function itemId(item, index) {
   return filename.replace(/\.md$/, "").split("-", 1)[0] || `item-${index}`;
 }
 
-function shortTitle(value) {
-  const title = typeof value === "string" ? value : "";
-  return title.length > 16 ? `${title.slice(0, 16)}…` : title;
-}
-
 function valuesFor(source, id) {
   return source instanceof Map ? source.get(id) : source?.[id];
 }
 
-function layoutNodes(nodes, { collapseDone, maxColumns = 2 }) {
+function layoutNodes(nodes, { collapseDone, maxColumns = 2, waves = false }) {
   const byId = new Map();
   for (const node of nodes) {
     if (byId.has(node.id)) return { error: `duplicate id ${node.id}` };
@@ -54,6 +49,12 @@ function layoutNodes(nodes, { collapseDone, maxColumns = 2 }) {
   const idToRowNode = new Map();
   for (let row = 0; row <= maxRow; row += 1) {
     const members = nodes.filter((node) => rowsById.get(node.id) === row);
+    if (waves) {
+      members.sort((left, right) => left.id.localeCompare(right.id));
+      rows.push(members);
+      for (const member of members) idToRowNode.set(member.id, member);
+      continue;
+    }
     members.sort((left, right) => {
       const average = (node) => {
         const columns = parents.get(node.id).map((id) => logicalColumns.get(id));
@@ -106,6 +107,14 @@ function layoutNodes(nodes, { collapseDone, maxColumns = 2 }) {
       collapsedIds = [];
     }
   }
+  if (waves) {
+    const fields = ({ id, title, state, followUps, tags, items }) => ({ id, title, state, followUps, tags, items });
+    return {
+      rows: rows.slice(collapsedRows).map((row) => row.map(fields)),
+      summary: collapsedIds.length ? `✓ ${collapsedIds.join(" ")}` : "",
+    };
+  }
+
   const visibleRows = rows.slice(collapsedRows).map((row, index) => row.map((node) => ({ ...node, row: index })));
   const edges = [];
   for (const node of nodes) {
@@ -149,11 +158,11 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
     const state = valuesFor(states, id) ?? (item.done ? "done" : "todo");
     return {
       id,
-      title: shortTitle(valuesFor(titles, id) || item.title),
+      title: valuesFor(titles, id) || item.title,
       items: members.map(({ title }) => title),
       followUps: followUpsForItem.map((followUp) => typeof followUp === "string"
-        ? { id: followUp, title: shortTitle(valuesFor(titles, followUp) || followUp) }
-        : { ...followUp, title: shortTitle(valuesFor(titles, followUp.id) || followUp.title || followUp.id) }),
+        ? { id: followUp, title: valuesFor(titles, followUp) || followUp }
+        : { ...followUp, title: valuesFor(titles, followUp.id) || followUp.title || followUp.id }),
       tags: [],
       state,
       after: [...new Set(members.flatMap((member) => Array.isArray(member.after) ? member.after : []))],
@@ -172,7 +181,7 @@ export function layoutPhase(items, { followUps = {}, titles = {}, states = {} } 
     }
     node.after = internal;
   }
-  return layoutNodes(nodes, { collapseDone: true });
+  return layoutNodes(nodes, { collapseDone: true, waves: true });
 }
 
 export function layoutRoadmap(phases, { taskOptions = () => ({}), maxColumns = 2 } = {}) {

@@ -38,7 +38,7 @@ fields on a known event are ignored for forward compatibility.
 | `AssistantTextDelta` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str` |
 | `ToolCallStarted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `target: str` |
 | `ToolCallFinished` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `ok: bool`, `result_kind: str`, `result_path: str`, `lines_added: int`, `lines_removed: int`, `diff: str`, `truncated: bool` |
-| `PromptSubmitted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str`, `message_count: int` |
+| `PromptSubmitted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str`, `message_count: int`, `checkpoint_key: str | null` |
 | `ToolCallFailed` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `error: str` |
 | `PermissionRequested` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `mode: str` |
 | `PermissionDenied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `reason: str` |
@@ -82,6 +82,21 @@ or malformed attachment entries return `400` with the attachment index in the
 error. An empty prompt is allowed when an attachment is present. Replay
 `HistoryMessage` events include `attachments`, an array of `{kind, media_type,
 filename}` metadata for non-text blocks; attachment data is never included.
+They also include `checkpoint_key: str | null`, `edits: [{path: str, added: int,
+removed: int}]`, and `undone: bool`. For a user message these identify its prompt
+checkpoint and the distinct edited paths with summed line counts, in first-edit
+order. `undone` is true when that checkpoint was reverted, including when a
+later checkpoint was reverted and therefore undid this one. Other message roles
+carry a null key, an empty edits list, and false. These fields contain
+repository-relative paths only; they do not include file contents or diffs.
+Replayed tool calls carry `id` and `name`; `dispatch_subagent` calls also carry
+their `subagent_name` and `task` so clients can show the dispatch after reopen.
+Root user messages carry `turn_started_at` as an ISO-8601 UTC string. Exactly
+one replayed record for each root run carries `turn_ended_at` and
+`turn_outcome` (`finished`, `cancelled`, or `failed`): the final assistant
+message when the run has one, or its final user message when it has no
+assistant message. A client can place the turn-time line after that turn's
+last replayed message and any edit card.
 
 ## Approvals
 
@@ -151,6 +166,19 @@ substring, path substring, then ordered-character subsequence; ties use shorter
 paths and alphabetical order. An empty query returns paths in walk order.
 New conversations tell the agent that `@<path>` references a repository file
 and that it must read it with `read_file` before relying on its contents.
+
+Authenticated `GET /tree?path=<repository-relative directory>` returns the
+readable direct children as `{"path": str, "entries": [{"name": str,
+"kind": "dir" | "file"}], "truncated": bool}`. An empty or missing path
+selects the repository root. Entries sort with directories first and then by
+name; non-symlink directories and regular files are included only when the
+read policy allows them. The listing is capped at 2,000 entries and reports
+whether more were omitted. Authenticated `GET /source?path=<repository-relative
+file>` returns `{"path": str, "text": str}` for a file allowed by the read
+policy. Absolute paths, traversal, symlink escapes, and denied paths return
+403; missing paths return 404, files over 1 MiB return 413, and non-UTF-8
+files return 415. Error responses have empty bodies. Neither route returns an
+absolute path.
 
 Authenticated `GET /history?limit=<n>` returns `{"prompts": [...]}` in newest
 first order for sessions whose `repo_root` matches this host. The default limit
@@ -311,7 +339,10 @@ Authenticated `GET /conversation` returns `{"conversation": null}` before a
 conversation is open. Otherwise `conversation` contains the live `provider`,
 `model`, and `effort`, plus an `agents` array whose
 entries identify an agent by opaque id and name, plus `parent_agent_id` (an
-opaque id or `null` for a root), and `mode` reports the mode currently in force.
+opaque id or `null` for a root). When known, each entry also has `state`:
+`running`, `finished`, `failed`, or `stopped`; unknown state is omitted. Folded
+agents report the state of their most recent run. `mode` reports the mode
+currently in force.
 Each agent appears once; the first run in the
 timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,

@@ -82,6 +82,7 @@ class ToolCallFinished(Event):
 class PromptSubmitted(Event):
     text: str = ""
     message_count: int = 0
+    checkpoint_key: str | None = None
 
 
 @dataclass(frozen=True)

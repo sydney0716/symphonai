@@ -16,9 +16,9 @@ function event(type, fields = {}) {
   return { kind: "event", payload: { type, ...BASE, ...fields } };
 }
 
-function history(role, text, tool_calls = [], attachments = []) {
+function history(role, text, tool_calls = [], attachments = [], fields = {}) {
   return { kind: "event", payload: {
-    type: "HistoryMessage", role, text, tool_calls, turn_id: "turn-1", attachments,
+    type: "HistoryMessage", role, text, tool_calls, turn_id: "turn-1", attachments, ...fields,
   } };
 }
 
@@ -346,6 +346,53 @@ test("an edit carries its complete diff immediately", () => {
   }]);
 });
 
+test("finished prompt groups edit counts by path and retains its checkpoint key", () => {
+  const transcript = applyAll([
+    event("RunStarted", { agent_id: "leader" }),
+    event("PromptSubmitted", { agent_id: "leader", text: "change files", checkpoint_key: "chk-live" }),
+    call("ToolCallStarted", "edit-a1", { agent_id: "leader", tool_name: "edit_file" }),
+    call("ToolCallFinished", "edit-a1", {
+      agent_id: "leader", ok: true, result_kind: "file_diff", result_path: "a.py",
+      lines_added: 3, lines_removed: 1, diff: "-x\n+y", truncated: false,
+    }),
+    call("ToolCallStarted", "edit-b", { agent_id: "leader", tool_name: "edit_file" }),
+    call("ToolCallFinished", "edit-b", {
+      agent_id: "leader", ok: true, result_kind: "file_diff", result_path: "b.py",
+      lines_added: 5, lines_removed: 5, diff: "-x\n+y", truncated: false,
+    }),
+    call("ToolCallStarted", "edit-a2", { agent_id: "leader", tool_name: "edit_file" }),
+    call("ToolCallFinished", "edit-a2", {
+      agent_id: "leader", ok: true, result_kind: "file_diff", result_path: "a.py",
+      lines_added: 2, lines_removed: 0, diff: "-x\n+y", truncated: false,
+    }),
+    event("RunFinished", { agent_id: "leader" }),
+  ]);
+  const card = transcript.model.at(-2);
+  assert.equal(transcript.model.at(-1).type, "turn-time");
+  assert.equal(card.type, "edit-card");
+  assert.equal(card.checkpointKey, "chk-live");
+  assert.equal(card.added, 10);
+  assert.equal(card.removed, 6);
+  assert.deepEqual(card.files, [
+    { path: "a.py", added: 5, removed: 1 },
+    { path: "b.py", added: 5, removed: 5 },
+  ]);
+  assert.equal(card.canUndo, true);
+});
+
+test("prompt with no edits has no edit card and replay exposes its checkpoint key", () => {
+  const transcript = applyAll([
+    event("RunStarted", { agent_id: "leader" }),
+    event("PromptSubmitted", { agent_id: "leader", text: "no changes", checkpoint_key: "chk-live" }),
+    event("RunFinished", { agent_id: "leader" }),
+    event("HistoryMessage", {
+      role: "user", text: "reopened", agent_id: "leader", checkpoint_key: "chk-reopened",
+    }),
+  ]);
+  assert.equal(transcript.model.some((entry) => entry.type === "edit-card"), false);
+  assert.equal(transcript.model.at(-1).checkpointKey, "chk-reopened");
+});
+
 test("an edit keeps its arrival position beside concurrent activity", () => {
   const transcript = applyAll([
     call("ToolCallStarted", "edit-first", { tool_name: "edit_file" }),
@@ -668,6 +715,105 @@ test("compaction details are retained as data", () => {
     afterTokens: 40,
     droppedMessages: 3,
   }]);
+});
+
+test("dispatch tasks attach by spawned agent name and stay out of the prompt column", () => {
+  const transcript = applyAll([
+    event("RunStarted", { agent_id: "root", agent_name: "leader" }),
+    event("PromptSubmitted", { agent_id: "root", text: "investigate" }),
+    call("ToolCallStarted", "dispatch-a", {
+      agent_id: "root", tool_name: "dispatch_subagent", target: "a",
+    }),
+    call("ToolCallStarted", "dispatch-b", {
+      agent_id: "root", tool_name: "dispatch_subagent", target: "b",
+    }),
+    event("SubagentSpawned", { agent_id: "root", subagent_name: "a", subagent_agent_id: "agent-a" }),
+    event("SubagentSpawned", { agent_id: "root", subagent_name: "b", subagent_agent_id: "agent-b" }),
+    event("PromptSubmitted", { agent_id: "agent-b", text: "task b" }),
+    event("PromptSubmitted", { agent_id: "agent-a", text: "task a" }),
+  ]);
+  assert.deepEqual(transcript.model.filter(({ type }) => type === "prompt").map(({ text }) => text), ["investigate"]);
+  assert.deepEqual(transcript.model.filter(({ type }) => type === "activity")[0].calls.map(({ target, task }) => ({ target, task })), [
+    { target: "a", task: "task a" },
+    { target: "b", task: "task b" },
+  ]);
+});
+
+test("root turns append duration and local finish time for completed, stopped, and failed runs", () => {
+  const times = [
+    new Date(2026, 9, 12, 17, 21, 0).getTime(), new Date(2026, 9, 12, 17, 27, 34).getTime(),
+    new Date(2026, 9, 12, 17, 30, 0).getTime(), new Date(2026, 9, 12, 17, 30, 42).getTime(),
+    new Date(2026, 9, 12, 17, 40, 0).getTime(), new Date(2026, 9, 12, 17, 41, 3).getTime(),
+  ];
+  const transcript = createTranscript({ now: () => times.shift() });
+  const applyRun = (runId, end = {}) => {
+    transcript.apply(event("RunStarted", { agent_id: "root", run_id: runId }));
+    transcript.apply(event("PromptSubmitted", { agent_id: "root", run_id: runId, text: "work" }));
+    transcript.apply(event(end.type ?? "RunFinished", { agent_id: "root", run_id: runId, ...end.fields }));
+  };
+  applyRun("run-work");
+  applyRun("run-stop", { fields: { stopped_reason: "cancelled" } });
+  applyRun("run-fail", { type: "RunFailed" });
+  const lines = transcript.model.filter(({ type }) => type === "turn-time").map(({ text }) => text);
+  assert.equal(lines[0], `Worked for 6m 34s · ${new Date(2026, 9, 12, 17, 27).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`);
+  assert.match(lines[1], /^Stopped after 42s · /);
+  assert.match(lines[2], /^Failed after 1m 3s · /);
+});
+
+test("replayed turns restore dispatch task and the end-time line", () => {
+  const transcript = applyAll([
+    history("user", "investigate", [], [], {
+      turn_id: null,
+      turn_started_at: "2026-10-12T17:21:00.000Z",
+    }),
+    history("assistant", "", [{ id: "dispatch", name: "dispatch_subagent", subagent_name: "explorer", task: "find the bug" }], [], {
+      turn_ended_at: "2026-10-12T17:27:34.000Z",
+      turn_outcome: "finished",
+    }),
+  ]);
+  assert.deepEqual(transcript.model.map(({ type }) => type), ["prompt", "activity", "turn-time"]);
+  assert.equal(transcript.model[1].calls[0].task, "find the bug");
+  assert.match(transcript.model[2].text, /^Worked for 6m 34s · /);
+});
+
+test("replayed failed turns without assistant replies each get their own time line", () => {
+  const transcript = applyAll([
+    history("user", "first failure", [], [], {
+      turn_id: null,
+      turn_started_at: "2026-10-12T17:21:00.000Z",
+      turn_ended_at: "2026-10-12T17:21:12.000Z",
+      turn_outcome: "failed",
+    }),
+    history("user", "second failure", [], [], {
+      turn_id: null,
+      turn_started_at: "2026-10-12T17:22:00.000Z",
+      turn_ended_at: "2026-10-12T17:22:18.000Z",
+      turn_outcome: "cancelled",
+    }),
+  ]);
+  assert.deepEqual(transcript.model.map(({ type }) => type), [
+    "prompt", "turn-time", "prompt", "turn-time",
+  ]);
+  assert.match(transcript.model[1].text, /^Failed after 12s · /);
+  assert.match(transcript.model[3].text, /^Stopped after 18s · /);
+});
+
+test("a failed replay with a null user turn id has one line after its last message", () => {
+  const transcript = applyAll([
+    history("user", "failure after a reply", [], [], {
+      turn_id: null,
+      turn_started_at: "2026-10-12T17:21:00.000Z",
+    }),
+    history("assistant", "", [{ id: "failed-call", name: "dispatch_subagent", subagent_name: "worker", task: "inspect" }]),
+    history("assistant", "", [], [], {
+      turn_id: "turn-final-model-call",
+      turn_ended_at: "2026-10-12T17:21:12.000Z",
+      turn_outcome: "failed",
+    }),
+  ]);
+  assert.deepEqual(transcript.model.map(({ type }) => type), ["prompt", "activity", "turn-time"]);
+  assert.equal(transcript.model.filter(({ type }) => type === "turn-time").length, 1);
+  assert.match(transcript.model[2].text, /^Failed after 12s · /);
 });
 
 test("every event-derived entry is attributed and gaps are not", () => {

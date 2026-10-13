@@ -680,7 +680,9 @@ def _matching_forbidden_component(
     component: str, patterns: tuple[str, ...]
 ) -> str | None:
     for pattern in patterns:
-        if fnmatch.fnmatch(component, pattern.rstrip("/")):
+        if fnmatch.fnmatchcase(
+            component.casefold(), pattern.rstrip("/").casefold()
+        ):
             return pattern
     return None
 

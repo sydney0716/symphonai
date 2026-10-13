@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import fnmatch
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import PermissionPolicy, _matching_forbidden_component
 from symphonai_api.paths import symphonai_home
 from symphonai_api.tools.read_ledger import ReadLedger
 
@@ -156,12 +155,11 @@ def load_instructions(
             relative_parts = resolved.relative_to(include_root).parts
             forbidden = next(
                 (
-                    pattern
-                    for pattern in policy.forbidden_patterns
-                    if any(
-                        fnmatch.fnmatch(part, pattern.rstrip("/"))
-                        for part in relative_parts
-                    )
+                    match
+                    for part in relative_parts
+                    if (match := _matching_forbidden_component(
+                        part, policy.forbidden_patterns
+                    )) is not None
                 ),
                 None,
             )

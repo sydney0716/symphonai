@@ -10,6 +10,7 @@ from symphonai_api.permissions import PermissionPolicy
 
 
 MAX_SEARCH_FILES = 20_000
+MAX_TREE_ENTRIES = 2_000
 _CACHE_SECONDS = 10.0
 _CACHE_LOCK = threading.Lock()
 _CANDIDATE_CACHE: dict[Path, tuple[float, tuple[str, ...], bool]] = {}
@@ -90,3 +91,33 @@ def repository_files(policy: PermissionPolicy, query: str, limit: int) -> tuple[
     ]
     matches.sort(key=rank)
     return matches[:limit], truncated
+
+
+def repository_tree(policy: PermissionPolicy, directory: Path) -> tuple[list[dict[str, str]], bool]:
+    """Return the readable direct children of a repository directory."""
+    entries: list[dict[str, str]] = []
+    truncated = False
+    try:
+        children = sorted(
+            directory.iterdir(),
+            key=lambda path: (not (path.is_dir() and not path.is_symlink()), path.name),
+        )
+    except OSError:
+        return entries, truncated
+
+    for path in children:
+        if not policy.check_read(path).allowed:
+            continue
+        if path.is_dir():
+            if path.is_symlink():
+                continue
+            kind = "dir"
+        elif path.is_file():
+            kind = "file"
+        else:
+            continue
+        if len(entries) == MAX_TREE_ENTRIES:
+            truncated = True
+            break
+        entries.append({"name": path.name, "kind": kind})
+    return entries, truncated

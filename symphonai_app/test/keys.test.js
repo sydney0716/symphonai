@@ -26,7 +26,10 @@ test("the configured default file returns every binding", async () => {
   const bindings = await loadKeymap(path);
 
   assert.equal(bindings.size, Object.keys(JSON.parse(text)).length);
-  assert.equal(bindings.get("mod+enter"), "submit");
+  assert.equal(bindings.get("enter"), "submit");
+  assert.equal(bindings.get("shift+enter"), "newline");
+  assert.equal(bindings.get("alt+enter"), "newline");
+  assert.equal(bindings.get("mod+enter"), "newline");
   for (const chord of RESERVED) {
     assert.ok(bindings.has(chord), `default keymap omitted reserved chord ${chord}`);
   }

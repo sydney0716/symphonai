@@ -81,7 +81,7 @@ from symphonai_api.permissions import ApprovalCallback, PermissionMode, Permissi
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.roles import IMPLEMENTER_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT
-from symphonai_api.session import SessionStore
+from symphonai_api.session import SessionStore, TranscriptError, load_run, read_records
 from symphonai_api.skills import Skill
 from symphonai_api.streaming import StreamAssembler
 from symphonai_api.tool_schema import tool_registry_schemas
@@ -100,6 +100,46 @@ class AgentControlError(RuntimeError):
     def __init__(self, message: str, *, status: int = 409) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _without_vendor_state(messages: list[Message]) -> list[Message]:
+    return [
+        replace(
+            message,
+            tool_calls=[
+                replace(call, provider_metadata={}, vendor_id=None)
+                for call in message.tool_calls
+            ],
+        )
+        if message.tool_calls
+        else message
+        for message in messages
+    ]
+
+
+def _session_subagent_transcripts(
+    session: SessionStore,
+) -> dict[str, list[tuple[str, str, Path]]]:
+    transcripts: dict[str, list[tuple[str, str, Path]]] = {}
+    for path in session.directory.glob("agent-*.jsonl"):
+        try:
+            records, _ = read_records(path)
+        except (OSError, TranscriptError):
+            continue
+        first_start = next(
+            (record for record in records if record.get("type") == "run_started"),
+            None,
+        )
+        if first_start is None:
+            continue
+        data = first_start.get("data")
+        name = data.get("agent_name") if isinstance(data, dict) else None
+        if isinstance(name, str):
+            agent_id = path.name[len("agent-") : -len(".jsonl")]
+            transcripts.setdefault(name, []).append(
+                (str(first_start.get("ts", "")), agent_id, path)
+            )
+    return transcripts
 
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
@@ -666,30 +706,67 @@ class DispatchSubagentTool(LocalTool):
                     effective_policy = effective_policy.rerooted(record.worktree_path)
                     record.agent._policy = effective_policy
 
-        if record is None and wants_worktree:
-            worktree_admin_path = self._session.directory / "worktrees" / subagent_name
-            try:
-                worktree_root = create_worktree(
-                    effective_policy.repo_root, worktree_admin_path
+        resumed_messages = None
+        resumed_agent_id = None
+        if record is None and self._session is not None:
+            forgotten = self._session.read_meta().get("forgotten_subagents", {})
+            forgotten_ids = set(
+                forgotten.get(subagent_name, ())
+                if isinstance(forgotten, dict)
+                else ()
+            )
+            candidates = [
+                (started_at, agent_id, path)
+                for started_at, agent_id, path
+                in _session_subagent_transcripts(self._session).get(subagent_name, ())
+                if agent_id not in forgotten_ids
+            ]
+            if candidates:
+                _, resumed_agent_id, _ = max(candidates, key=lambda item: item[0])
+                resumed_messages = load_run(
+                    self._session, agent_id=resumed_agent_id
+                ).messages
+
+        worktree_admin_path = None
+        worktree_root = None
+        if record is None and self._session is not None:
+            candidate_path = self._session.directory / "worktrees" / subagent_name
+            if candidate_path.is_dir():
+                from symphonai_api.worktree import _top_level
+
+                relative_root = effective_policy.repo_root.resolve().relative_to(
+                    _top_level(effective_policy.repo_root)
                 )
-            except WorktreeError as exc:
-                with self._pool_lock:
-                    self._reserved_names.discard(subagent_name)
-                return ToolResult(
-                    tool_call_id=tool_call.id,
-                    ok=False,
-                    error=str(exc),
-                )
-            effective_policy = effective_policy.rerooted(worktree_root)
-        else:
-            worktree_admin_path = None
-            worktree_root = None
+                worktree_admin_path = candidate_path
+                worktree_root = candidate_path / relative_root
+                effective_policy = effective_policy.rerooted(worktree_root)
+            elif wants_worktree:
+                worktree_admin_path = candidate_path
+                try:
+                    worktree_root = create_worktree(
+                        effective_policy.repo_root, worktree_admin_path
+                    )
+                except WorktreeError as exc:
+                    with self._pool_lock:
+                        self._reserved_names.discard(subagent_name)
+                    return ToolResult(
+                        tool_call_id=tool_call.id,
+                        ok=False,
+                        error=str(exc),
+                    )
+                effective_policy = effective_policy.rerooted(worktree_root)
 
         if record is None:
             tool_names = spec.tool_names
             if tool_names is not None and self._result_store is not None:
                 tool_names = (*tool_names, "read_tool_result")
-            agent_ref = new_agent_ref(subagent_name, self._parent_agent_id)
+            agent_ref = AgentRef(
+                resumed_agent_id or new_agent_ref(
+                    subagent_name, self._parent_agent_id
+                ).agent_id,
+                subagent_name,
+                self._parent_agent_id,
+            )
             memory_tool = (
                 MemoryTool(
                     self._memory,
@@ -746,6 +823,11 @@ class DispatchSubagentTool(LocalTool):
                 worktree_admin_path=worktree_admin_path,
                 running=True,
             )
+            if resumed_messages is not None:
+                if self._session.read_meta().get("provider_state_reset") is True:
+                    record.messages = _without_vendor_state(resumed_messages)
+                else:
+                    record.messages = resumed_messages
             with self._pool_lock:
                 self.pool[subagent_name] = record
                 self._reserved_names.discard(subagent_name)
@@ -1092,7 +1174,12 @@ class Leader:
     def __init__(self, config: LeaderConfig, session: SessionStore | None = None) -> None:
         self._config = config
         self._session = session
-        self._agent_ref = new_agent_ref("leader")
+        persisted_agent_id = None if session is None else session.read_meta().get("agent_id")
+        self._agent_ref = (
+            AgentRef(persisted_agent_id, "leader")
+            if isinstance(persisted_agent_id, str) and persisted_agent_id
+            else new_agent_ref("leader")
+        )
         self._hook_runner = config.hook_runner or (
             None
             if config.extensions is None
@@ -1498,13 +1585,40 @@ class Leader:
 
         with self._dispatch_tool._pool_lock:
             count = len(self._dispatch_tool.pool)
+            names = set(self._dispatch_tool.pool)
+            if self._session is not None:
+                names.update(_session_subagent_transcripts(self._session))
+                self._remember_forgotten_subagents(names)
             self._dispatch_tool.pool.clear()
             return count
 
     def forget_subagent(self, name: str) -> bool:
         """Remove one named subagent from the current leader pool."""
         with self._dispatch_tool._pool_lock:
-            return self._dispatch_tool.pool.pop(name, None) is not None
+            if self._session is not None:
+                self._remember_forgotten_subagents({name})
+            record = self._dispatch_tool.pool.pop(name, None)
+            return record is not None
+
+    def _remember_forgotten_subagents(self, names: set[str]) -> None:
+        if self._session is None or not names:
+            return
+        meta = self._session.read_meta()
+        forgotten = meta.get("forgotten_subagents")
+        if not isinstance(forgotten, dict):
+            forgotten = {}
+        transcripts = _session_subagent_transcripts(self._session)
+        for name in names:
+            agent_ids = {agent_id for _, agent_id, _ in transcripts.get(name, ())}
+            record = self._dispatch_tool.pool.get(name)
+            if record is not None:
+                agent_ids.add(record.agent_ref.agent_id)
+            previous = forgotten.get(name, ())
+            if isinstance(previous, list):
+                agent_ids.update(item for item in previous if isinstance(item, str))
+            forgotten[name] = sorted(agent_ids)
+        meta["forgotten_subagents"] = forgotten
+        self._session.write_meta(meta)
 
     def compact_chat(self, *, cancel: CancellationToken | None = None) -> CompactionResult:
         """Apply context compaction to the persisted multi-turn chat state."""

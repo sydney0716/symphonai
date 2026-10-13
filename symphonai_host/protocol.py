@@ -71,13 +71,19 @@ class HistoryMessage:
 
     role: str
     text: str
-    tool_calls: list[dict[str, str]]
+    tool_calls: list[dict[str, Any]]
     turn_id: str | None
     attachments: list[dict] = field(default_factory=list, kw_only=True)
     session_id: str | None = field(default=None, kw_only=True)
+    checkpoint_key: str | None = field(default=None, kw_only=True)
+    edits: list[dict[str, str | int]] = field(default_factory=list, kw_only=True)
+    undone: bool = field(default=False, kw_only=True)
+    turn_started_at: str | None = field(default=None, kw_only=True)
+    turn_ended_at: str | None = field(default=None, kw_only=True)
+    turn_outcome: str | None = field(default=None, kw_only=True)
 
     def payload(self) -> dict:
-        return {
+        payload = {
             "type": "HistoryMessage",
             "role": self.role,
             "text": self.text,
@@ -85,7 +91,17 @@ class HistoryMessage:
             "turn_id": self.turn_id,
             "attachments": self.attachments,
             "session_id": self.session_id,
+            "checkpoint_key": self.checkpoint_key,
+            "edits": self.edits,
+            "undone": self.undone,
         }
+        if self.turn_started_at is not None:
+            payload["turn_started_at"] = self.turn_started_at
+        if self.turn_ended_at is not None:
+            payload["turn_ended_at"] = self.turn_ended_at
+        if self.turn_outcome is not None:
+            payload["turn_outcome"] = self.turn_outcome
+        return payload
 
 
 def event_type_name(event_class: type) -> str:

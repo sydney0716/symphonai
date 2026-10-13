@@ -21,7 +21,7 @@ from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
 from symphonai_api.config import resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
-from symphonai_api.events import Event, RunFailed, RunFinished, RunStarted, SubagentSpawned, fan_out
+from symphonai_api.events import Event, PromptSubmitted, RunFailed, RunFinished, RunStarted, SubagentSpawned, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.environment import capture_environment
 from symphonai_api.identity import new_id
@@ -716,6 +716,185 @@ class HostRun:
         self._remember_event_session(event, session_id)
         self._broker.publish(event)
 
+    @staticmethod
+    def _checkpoint_replay_data(
+        records: list[dict], subagent_records: list[list[dict]] | None = None,
+    ) -> tuple[dict[str, str], dict[str, list[dict[str, str | int]]]]:
+        keys: dict[str, str] = {}
+        root_run_keys: dict[str, str] = {}
+        edits: dict[str, list[dict[str, str | int]]] = {}
+        pending_key: str | None = None
+        current_root_run: str | None = None
+        for record in records:
+            if record.get("type") == "run_started":
+                data = record.get("data")
+                if isinstance(data, dict) and data.get("parent_run_id") is None:
+                    current_root_run = record.get("run_id")
+            elif record.get("type") == "checkpoint":
+                key = record.get("data", {}).get("key")
+                pending_key = key if isinstance(key, str) else None
+                if current_root_run is not None and pending_key is not None:
+                    root_run_keys[current_root_run] = pending_key
+            elif pending_key is not None and record.get("type") == "message":
+                try:
+                    message = message_from_json(record.get("data", {}))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if message.role is Role.USER:
+                    record_id = record.get("record_id")
+                    if isinstance(record_id, str):
+                        keys[record_id] = pending_key
+                    pending_key = None
+
+        transcripts = [records, *(subagent_records or [])]
+        runs: dict[str, dict[str, str | None]] = {}
+        worktree_dispatches: set[tuple[str, str]] = set()
+        for transcript in transcripts:
+            for record in transcript:
+                run_id = record.get("run_id")
+                data = record.get("data")
+                if record.get("type") == "run_started" and isinstance(run_id, str) and isinstance(data, dict):
+                    parent_run_id = data.get("parent_run_id")
+                    runs[run_id] = {
+                        "agent_id": record.get("agent_id"),
+                        "agent_name": data.get("agent_name"),
+                        "parent_run_id": parent_run_id if isinstance(parent_run_id, str) else None,
+                    }
+                if record.get("type") != "message" or not isinstance(data, dict):
+                    continue
+                try:
+                    message = message_from_json(data)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if message.role is Role.ASSISTANT and isinstance(run_id, str):
+                    for call in message.tool_calls:
+                        if (
+                            call.name == "dispatch_subagent"
+                            and call.arguments.get("isolation") == "worktree"
+                            and isinstance(call.arguments.get("subagent_name"), str)
+                        ):
+                            worktree_dispatches.add((run_id, call.arguments["subagent_name"]))
+
+        worktree_agents = {
+            run["agent_id"]
+            for run in runs.values()
+            if isinstance(run["agent_id"], str)
+            and isinstance(run["parent_run_id"], str)
+            and isinstance(run["agent_name"], str)
+            and (run["parent_run_id"], run["agent_name"]) in worktree_dispatches
+        }
+        run_keys = dict(root_run_keys)
+        excluded_runs: set[str] = set()
+        for _ in range(len(runs)):
+            changed = False
+            for run_id, run in runs.items():
+                if run_id in run_keys or run_id in excluded_runs:
+                    continue
+                parent_run_id = run["parent_run_id"]
+                if parent_run_id in excluded_runs:
+                    excluded_runs.add(run_id)
+                    changed = True
+                elif parent_run_id in run_keys:
+                    if (
+                        run["agent_id"] in worktree_agents
+                        or (parent_run_id, run["agent_name"]) in worktree_dispatches
+                    ):
+                        excluded_runs.add(run_id)
+                    else:
+                        run_keys[run_id] = run_keys[parent_run_id]
+                    changed = True
+            if not changed:
+                break
+
+        ordered_records = [
+            (index, record)
+            for index, record in enumerate(record for transcript in transcripts for record in transcript)
+            if record.get("type") == "message"
+        ]
+        ordered_records.sort(key=lambda item: (item[1].get("ts", ""), item[0]))
+        for _, record in ordered_records:
+            run_id = record.get("run_id")
+            key = run_keys.get(run_id) if isinstance(run_id, str) else None
+            if key is None:
+                continue
+            try:
+                message = message_from_json(record.get("data", {}))
+            except (KeyError, TypeError, ValueError):
+                continue
+            result = message.tool_result
+            payload = None if result is None else result.payload
+            if (
+                message.role is Role.TOOL
+                and result is not None
+                and result.ok
+                and isinstance(payload, dict)
+                and payload.get("kind") == "file_diff"
+                and isinstance(payload.get("path"), str)
+                and type(payload.get("lines_added")) is int
+                and type(payload.get("lines_removed")) is int
+            ):
+                path = payload["path"]
+                by_path = {edit["path"]: edit for edit in edits.setdefault(key, [])}
+                edit = by_path.get(path)
+                if edit is None:
+                    edit = {"path": path, "added": 0, "removed": 0}
+                    edits[key].append(edit)
+                edit["added"] += payload["lines_added"]
+                edit["removed"] += payload["lines_removed"]
+        return keys, edits
+
+    @staticmethod
+    def _turn_replay_data(records: list[dict]) -> dict[str, dict[str, str | None]]:
+        roots: dict[str, dict[str, str | None]] = {}
+        messages: dict[str, list[tuple[str, object]]] = {}
+        for record in records:
+            run_id = record.get("run_id")
+            record_type = record.get("type")
+            data = record.get("data")
+            if record_type == "run_started" and isinstance(run_id, str) and isinstance(data, dict):
+                if data.get("parent_run_id") is None:
+                    roots[run_id] = {"started_at": record.get("ts"), "ended_at": None, "outcome": None}
+            elif record_type in {"run_finished", "run_failed"} and isinstance(run_id, str) and run_id in roots:
+                roots[run_id]["ended_at"] = record.get("ts")
+                roots[run_id]["outcome"] = (
+                    "failed" if record_type == "run_failed"
+                    else "cancelled" if isinstance(data, dict) and data.get("stopped_reason") == "cancelled"
+                    else "finished"
+                )
+            elif record_type == "message" and isinstance(run_id, str) and isinstance(data, dict):
+                try:
+                    message = message_from_json(data)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if run_id in roots:
+                    messages.setdefault(run_id, []).append((record.get("record_id", ""), message))
+
+        result: dict[str, dict[str, str | None]] = {}
+        for run_id, run in roots.items():
+            root_messages = messages.get(run_id, [])
+            user_ids = [record_id for record_id, message in root_messages if message.role is Role.USER]
+            assistant_ids = [record_id for record_id, message in root_messages if message.role is Role.ASSISTANT]
+            for record_id in user_ids:
+                if isinstance(record_id, str):
+                    result[record_id] = {"turn_started_at": run["started_at"]}
+            last_record_id = (assistant_ids or user_ids)[-1] if assistant_ids or user_ids else None
+            if isinstance(last_record_id, str):
+                result.setdefault(last_record_id, {}).update({
+                    "turn_ended_at": run["ended_at"],
+                    "turn_outcome": run["outcome"],
+                })
+        return result
+
+    @staticmethod
+    def _replay_tool_call(call) -> dict:
+        replay = {"id": call.id, "name": call.name}
+        if call.name == "dispatch_subagent":
+            for key in ("subagent_name", "task"):
+                value = call.arguments.get(key)
+                if isinstance(value, str):
+                    replay[key] = value
+        return replay
+
     def _remember_event_session(self, event: Event, session_id: str) -> None:
         runtime_run_id = getattr(event, "run_id", None)
         if isinstance(runtime_run_id, str) and runtime_run_id:
@@ -1085,7 +1264,22 @@ class HostRun:
             reader = SessionStore.open(self._sessions_root, run_id)
             try:
                 loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
+                records, _ = read_records(reader.directory / "run.jsonl")
+                subagent_records = []
+                for path in sorted(reader.directory.glob("agent-*.jsonl")):
+                    try:
+                        agent_records, _ = read_records(path)
+                    except (OSError, TranscriptError):
+                        continue
+                    subagent_records.append(agent_records)
                 metadata = reader.read_meta()
+                checkpoint_keys, replay_edits = self._checkpoint_replay_data(
+                    records, subagent_records
+                )
+                replay_turns = self._turn_replay_data(records)
+                undone_keys = metadata.get("undone_checkpoint_keys", [])
+                if not isinstance(undone_keys, list):
+                    undone_keys = []
                 choice = metadata.get("provider_choice")
                 provider_state_reset = metadata.get("provider_state_reset") is True
                 goal = Goal.from_payload(metadata.get("goal"))
@@ -1107,10 +1301,11 @@ class HostRun:
                 if self._goal is not None:
                     self._goals_by_session[run_id] = self._goal
                 for message, record_id in zip(loaded.messages, loaded.record_ids):
+                    checkpoint_key = checkpoint_keys.get(record_id)
                     self._broker.publish(ForkableHistoryMessage(
                         role=message.role.value,
                         text=message.text,
-                        tool_calls=[{"id": call.id, "name": call.name} for call in message.tool_calls],
+                        tool_calls=[self._replay_tool_call(call) for call in message.tool_calls],
                         turn_id=message.turn_id, record_id=record_id,
                         attachments=[
                             {
@@ -1121,7 +1316,11 @@ class HostRun:
                             for block in message.content
                             if isinstance(block, (ImageBlock, DocumentBlock))
                         ],
+                        checkpoint_key=checkpoint_key,
+                        edits=[] if checkpoint_key is None else replay_edits.get(checkpoint_key, []),
+                        undone=checkpoint_key in undone_keys,
                         session_id=run_id,
+                        **replay_turns.get(record_id, {}),
                     ))
                 self._close_idle_conversations_locked()
                 return {
@@ -1208,10 +1407,11 @@ class HostRun:
         if reopened_goal:
             self._goal_event("pause", goal, agent_id=goal_agent_id)
         for message, record_id in zip(loaded.messages, loaded.record_ids):
+            checkpoint_key = checkpoint_keys.get(record_id)
             self._broker.publish(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
-                tool_calls=[{"id": call.id, "name": call.name} for call in message.tool_calls],
+                tool_calls=[self._replay_tool_call(call) for call in message.tool_calls],
                 turn_id=message.turn_id,
                 record_id=record_id,
                 attachments=[
@@ -1223,7 +1423,11 @@ class HostRun:
                     for block in message.content
                     if isinstance(block, (ImageBlock, DocumentBlock))
                 ],
+                checkpoint_key=checkpoint_key,
+                edits=[] if checkpoint_key is None else replay_edits.get(checkpoint_key, []),
+                undone=checkpoint_key in undone_keys,
                 session_id=run_id,
+                **replay_turns.get(record_id, {}),
             ))
         return {
             "run_id": loaded.run_id,
@@ -1517,6 +1721,9 @@ class HostRun:
             session_id = conversation[1].run_id
             graph = conversation[0].run_graph()
             leader = conversation[0]
+            active = self._active_by_session.get(session_id)
+            active_root_agent_id = active.root_agent_id if active is not None else None
+            active_runtime_run_id = active.runtime_run_id if active is not None else None
             selection = {
                 "provider": leader._config.leader_provider.name,
                 "model": leader._leader_spec.model.model,
@@ -1574,36 +1781,105 @@ class HostRun:
             return fields
 
         agents = []
-        seen = set()
+        groups = {}
+        agent_groups = {}
 
         def run_order(node):  # noqa: ANN001
             return node.run_id not in started_at, started_at.get(node.run_id, "")
 
-        def add_node(node, parent_agent_id: str | None) -> None:  # noqa: ANN001
-            if node.agent_id not in seen:
-                seen.add(node.agent_id)
-                name, by_model = usage_by_agent.get(node.agent_id, (node.agent_name, None))
-                agent = {
-                    "agent_id": node.agent_id,
-                    "name": name,
-                    "parent_agent_id": parent_agent_id if parent_agent_id != node.agent_id else None,
-                }
-                if by_model is not None and report is not None:
-                    agent.update(usage_fields(by_model))
-                agents.append(agent)
+        latest_runs = {}
+        active_run_ids = set()
+
+        def collect_run_state(node, in_active_run=False):  # noqa: ANN001
+            is_active = in_active_run or (
+                active_runtime_run_id is not None and node.run_id == active_runtime_run_id
+            )
+            previous = latest_runs.get(node.agent_id)
+            if previous is None or run_order(previous[1]) <= run_order(node):
+                latest_runs[node.agent_id] = (run_order(node), node)
+            if is_active:
+                active_run_ids.add(node.run_id)
+            for child in node.children:
+                collect_run_state(child, is_active)
+
+        for root in graph:
+            collect_run_state(root)
+
+        def state_for_agent(agent_id):
+            latest = latest_runs.get(agent_id)
+            if latest is None:
+                return "running" if agent_id == active_root_agent_id else None
+            node = latest[1]
+            if node.failed:
+                return "failed"
+            if node.stopped_reason is not None:
+                return "stopped" if node.stopped_reason == "cancelled" else "finished"
+            if node.run_id in active_run_ids or agent_id == active_root_agent_id:
+                return "running"
+            return None
+
+        def add_node(node, parent_key=None, is_root=False):  # noqa: ANN001
+            is_leader_root = is_root and node.parent_run_id is None
+            name = "leader" if is_leader_root else usage_by_agent.get(
+                node.agent_id, (node.agent_name, None)
+            )[0]
+            key = ("leader",) if is_leader_root else (parent_key, name)
+            group = groups.get(key)
+            if group is None:
+                group = {"name": name, "agent_id": node.agent_id, "parent_key": parent_key, "parts": set()}
+                groups[key] = group
+                agents.append(group)
+            group["agent_id"] = node.agent_id
+            group["parts"].add(node.agent_id)
+            agent_groups[node.agent_id] = key
             for child in sorted(node.children, key=run_order):
-                add_node(child, node.agent_id)
+                add_node(child, key)
 
         for root in sorted(graph, key=run_order):
-            add_node(root, None)
-        for agent_id, (name, by_model) in usage_by_agent.items():
-            if agent_id not in seen:
-                agents.append({
-                    "agent_id": agent_id,
-                    "name": name,
-                    "parent_agent_id": None,
-                    **(usage_fields(by_model) if report is not None else {}),
-                })
+            add_node(root, is_root=True)
+        for agent_id, (name, _) in usage_by_agent.items():
+            if agent_id not in agent_groups:
+                key = (None, name)
+                group = groups.get(key)
+                if group is None:
+                    group = {"name": name, "agent_id": agent_id, "parent_key": None, "parts": set()}
+                    groups[key] = group
+                    agents.append(group)
+                group["agent_id"] = agent_id
+                group["parts"].add(agent_id)
+                agent_groups[agent_id] = key
+
+        folded_agents = []
+        for group in agents:
+            by_model = {}
+            has_usage = False
+            for agent_id in group["parts"]:
+                usage = usage_by_agent.get(agent_id)
+                if usage is not None:
+                    has_usage = True
+                    by_model = self._merge_usage(by_model, usage[1])
+            folded = {
+                "agent_id": group["agent_id"],
+                "name": group["name"],
+                "parent_agent_id": (
+                    None if group["parent_key"] is None
+                    else groups[group["parent_key"]]["agent_id"]
+                ),
+            }
+            latest_states = [
+                (latest_runs[agent_id][0], state_for_agent(agent_id))
+                for agent_id in group["parts"] if agent_id in latest_runs
+            ]
+            if group["agent_id"] == active_root_agent_id and not latest_states:
+                folded["state"] = "running"
+            elif latest_states:
+                _, state = max(latest_states, key=lambda item: item[0])
+                if state is not None:
+                    folded["state"] = state
+            if has_usage and report is not None:
+                folded.update(usage_fields(by_model))
+            folded_agents.append(folded)
+        agents = folded_agents
 
         result = {
             "session_id": conversation[1].run_id,
@@ -1910,7 +2186,7 @@ class HostRun:
                 raise RunActiveError(self._active.run_id)
             if self._conversation is None:
                 raise KeyError(path if path is not None else key)
-            leader, _ = self._conversation
+            leader, session = self._conversation
             checkpoints = leader._config.checkpoints
             if checkpoints is None:
                 raise KeyError(path if path is not None else key)
@@ -1946,6 +2222,17 @@ class HostRun:
                     else (checkpoints.directory / entry.backup).read_bytes()
                 )
                 checkpoints.restore(entry.path, content)
+            if key is not None:
+                metadata = session.read_meta()
+                undone_keys = metadata.get("undone_checkpoint_keys", [])
+                if not isinstance(undone_keys, list):
+                    undone_keys = []
+                first_index = checkpoints.keys().index(key)
+                for reverted_key in checkpoints.keys()[first_index:]:
+                    if reverted_key not in undone_keys:
+                        undone_keys.append(reverted_key)
+                metadata["undone_checkpoint_keys"] = undone_keys
+                session.write_meta(metadata)
             return {"reverted": [entry.path for entry in targets]}
 
     def _publish(self, host_run_id: str, event: Event, *, session_id: str | None = None) -> None:
@@ -1955,6 +2242,13 @@ class HostRun:
                     sid for sid, active in self._active_by_session.items()
                     if active.run_id == host_run_id
                 ), None)
+        if isinstance(event, PromptSubmitted) and session_id is not None:
+            conversation = self._open_conversations.get(session_id)
+            if conversation is not None and event.agent_id == conversation[0].agent_ref.agent_id:
+                checkpoints = conversation[0]._config.checkpoints
+                keys = () if checkpoints is None else checkpoints.keys()
+                if keys:
+                    event = replace(event, checkpoint_key=keys[-1])
         if isinstance(event, RunStarted):
             try:
                 with self._lock:

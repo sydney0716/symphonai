@@ -252,38 +252,6 @@ export function createClient({
       return post("stop", { reason });
     },
 
-    controlAgent(agentId, action, text) {
-      return request(
-        "POST",
-        "/agent/control",
-        { agent_id: agentId, action, ...(text === undefined ? {} : { text }) },
-        readReply,
-        { detailOnError: true },
-      );
-    },
-
-    changes() {
-      return request("GET", "/changes");
-    },
-
-    revertChanges(payload) {
-      return request("POST", "/changes/revert", payload, readReply, {
-        detailOnError: true,
-      });
-    },
-
-    applyWorktree(name) {
-      return request("POST", "/worktree/apply", { name }, readReply, {
-        detailOnError: true,
-      });
-    },
-
-    discardWorktree(name) {
-      return request("POST", "/worktree/discard", { name }, readReply, {
-        detailOnError: true,
-      });
-    },
-
     planSpec(phase, item) {
       return request("POST", "/spec/plan", { phase, item }, readReply, { detailOnError: true });
     },
@@ -315,6 +283,28 @@ export function createClient({
 
     openSession(runId) {
       return post("session/open", { run_id: runId });
+    },
+
+    changes() {
+      return request("GET", "/changes");
+    },
+
+    revertChanges(payload) {
+      return request("POST", "/changes/revert", payload, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    applyWorktree(name) {
+      return request("POST", "/worktree/apply", { name }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    discardWorktree(name) {
+      return request("POST", "/worktree/discard", { name }, readReply, {
+        detailOnError: true,
+      });
     },
 
     forkSession(runId, recordId, force = false) {
@@ -428,6 +418,16 @@ export function createClient({
     files(query = "", limit = 20) {
       const parameters = new URLSearchParams({ query, limit: String(limit) });
       return request("GET", `/files?${parameters}`);
+    },
+
+    tree(path = "") {
+      const parameters = new URLSearchParams({ path });
+      return request("GET", `/tree?${parameters}`);
+    },
+
+    source(path) {
+      const parameters = new URLSearchParams({ path });
+      return request("GET", `/source?${parameters}`);
     },
 
     specFiles() {

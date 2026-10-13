@@ -1087,6 +1087,243 @@ def check_dispatch_pool() -> None:
             fail("expected max_subagents to be enforced once the limit is reached")
 
 
+@check("leader.session_agent_identity_and_subagent_resume")
+def check_session_agent_identity_and_subagent_resume() -> None:
+    with workspace() as ws, tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        session = SessionStore(root, "session", repo_root=ws.root)
+        try:
+            child_provider = _RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, "first child reply")),
+                ModelResponse(Message(Role.ASSISTANT, "second child reply")),
+            ])
+
+            def make_leader(provider: FakeModelProvider, store: SessionStore) -> Leader:
+                return Leader(
+                    LeaderConfig(
+                        leader_provider=provider,
+                        subagent_provider=child_provider,
+                        repo_root=str(ws.root),
+                        subagent_specs={"explorer": _spec(ws.root, "explorer")},
+                    ),
+                    store,
+                )
+
+            first = make_leader(_RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("explorer", "first task")])),
+                ModelResponse(Message(Role.ASSISTANT, "first leader reply")),
+            ]), session)
+            first_id = first.agent_ref.agent_id
+            first.chat("first prompt")
+            reopened = make_leader(_RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("explorer", "second task")])),
+                ModelResponse(Message(Role.ASSISTANT, "second leader reply")),
+            ]), session)
+            if reopened.agent_ref.agent_id != first_id:
+                fail(f"reopened leader changed identity: {first_id!r} -> {reopened.agent_ref.agent_id!r}")
+            _, _, repaired = load_run_for_resume(session)
+            reopened.seed_chat(repaired, persisted=True)
+            reopened.chat("second prompt")
+            root_starts = [
+                record for record in read_records(session.directory / "run.jsonl")[0]
+                if record.get("type") == "run_started"
+            ]
+            if len(root_starts) != 2 or {record.get("agent_id") for record in root_starts} != {first_id}:
+                fail(f"root runs were not written under one leader id: {root_starts!r}")
+            child_starts = [
+                record for path in session.directory.glob("agent-*.jsonl")
+                for record in read_records(path)[0]
+                if record.get("type") == "run_started"
+                and record.get("data", {}).get("agent_name") == "explorer"
+            ]
+            child_files = list(session.directory.glob("agent-*.jsonl"))
+            if len(child_files) != 1 or len(child_starts) != 2:
+                fail(f"subagent runs did not share one transcript: {child_files!r}, {child_starts!r}")
+            second_request = child_provider.requests[-1]
+            if not any(message.role is Role.USER and message.text == "first task" for message in second_request.messages):
+                fail(f"resumed subagent request omitted prior task context: {second_request.messages!r}")
+            fresh_session = SessionStore(root, "fresh", repo_root=ws.root)
+            try:
+                if make_leader(_RecordingFakeProvider([]), fresh_session).agent_ref.agent_id == first_id:
+                    fail("a new session reused the previous leader identity")
+            finally:
+                fresh_session.close()
+        finally:
+            session.close()
+
+
+@check("leader.forgotten_subagents_stay_forgotten")
+def check_forgotten_subagents_stay_forgotten() -> None:
+    with workspace() as ws, tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        def turns(*dispatches: tuple[str, str]) -> list[ModelResponse]:
+            responses = []
+            for name, task in dispatches:
+                responses.extend((
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch(name, task)])),
+                    ModelResponse(Message(Role.ASSISTANT, "leader done")),
+                ))
+            return responses
+
+        def make_leader(
+            session: SessionStore,
+            parent_provider: FakeModelProvider,
+            child_provider: FakeModelProvider,
+            names: tuple[str, ...] = ("explorer",),
+        ) -> Leader:
+            return Leader(
+                LeaderConfig(
+                    leader_provider=parent_provider,
+                    subagent_provider=child_provider,
+                    repo_root=str(ws.root),
+                    subagent_specs={name: _spec(ws.root, name) for name in names},
+                ),
+                session,
+            )
+
+        def transcript_ids(session: SessionStore, name: str) -> list[str]:
+            found = []
+            for path in session.directory.glob("agent-*.jsonl"):
+                records, _ = read_records(path)
+                start = next((record for record in records if record.get("type") == "run_started"), None)
+                if start is not None and start.get("data", {}).get("agent_name") == name:
+                    found.append(path.name[len("agent-") : -len(".jsonl")])
+            return found
+
+        # Forget in a live chat, then make sure a later reopen resumes the new transcript.
+        session = SessionStore(root, "direct", repo_root=ws.root)
+        try:
+            child_provider = _RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, "child reply one")),
+                ModelResponse(Message(Role.ASSISTANT, "child reply two")),
+                ModelResponse(Message(Role.ASSISTANT, "child reply three")),
+            ])
+            leader = make_leader(session, _RecordingFakeProvider(turns(
+                ("explorer", "secret task one"),
+                ("explorer", "secret task two"),
+            )), child_provider)
+            leader.chat("first prompt")
+            old_id = leader.subagents["explorer"].agent_ref.agent_id
+            if not leader.forget_subagent("explorer"):
+                fail("forget_subagent did not remove the active explorer")
+            leader.chat("second prompt")
+            fresh_id = leader.subagents["explorer"].agent_ref.agent_id
+            if fresh_id == old_id:
+                fail("dispatch after forget reused the forgotten explorer id")
+            if any(
+                message.text == "secret task one"
+                for message in child_provider.requests[1].messages
+            ):
+                fail("dispatch after forget restored the forgotten explorer context")
+            ids = transcript_ids(session, "explorer")
+            if len(ids) != 2 or set(ids) != {old_id, fresh_id}:
+                fail(f"forget did not leave two explorer transcripts: {ids!r}")
+            _, _, repaired = load_run_for_resume(session)
+            session.close()
+            reopened_session = SessionStore.open(root, "direct")
+            try:
+                reopened = make_leader(
+                    reopened_session,
+                    _RecordingFakeProvider(turns(("explorer", "third task"))),
+                    child_provider,
+                )
+                reopened.seed_chat(repaired, persisted=True)
+                reopened.chat("third prompt")
+                if reopened.subagents["explorer"].agent_ref.agent_id != fresh_id:
+                    fail("reopen did not resume the fresh post-forget explorer")
+                if not any(
+                    message.text == "secret task two"
+                    for message in child_provider.requests[2].messages
+                ):
+                    fail("reopen did not restore the fresh post-forget explorer context")
+            finally:
+                reopened_session.close()
+        finally:
+            session.close()
+
+        # A forget persists across opening the session before another dispatch.
+        session = SessionStore(root, "reopen", repo_root=ws.root)
+        try:
+            child_provider = _RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, "old reply")),
+                ModelResponse(Message(Role.ASSISTANT, "new reply")),
+            ])
+            first = make_leader(
+                session,
+                _RecordingFakeProvider(turns(("explorer", "secret before reopen"))),
+                child_provider,
+            )
+            first.chat("before reopen")
+            old_id = first.subagents["explorer"].agent_ref.agent_id
+            first.forget_subagent("explorer")
+            _, _, repaired = load_run_for_resume(session)
+            session.close()
+            reopened_session = SessionStore.open(root, "reopen")
+            try:
+                reopened = make_leader(
+                    reopened_session,
+                    _RecordingFakeProvider(turns(("explorer", "after reopen"))),
+                    child_provider,
+                )
+                reopened.seed_chat(repaired, persisted=True)
+                reopened.chat("after reopen")
+                new_id = reopened.subagents["explorer"].agent_ref.agent_id
+                if new_id == old_id or any(
+                    message.text == "secret before reopen"
+                    for message in child_provider.requests[1].messages
+                ):
+                    fail("reopen immediately after forget resumed the old explorer")
+            finally:
+                reopened_session.close()
+        finally:
+            session.close()
+
+        # Clearing the pool forgets every persisted subagent, including after a reopen.
+        session = SessionStore(root, "clear", repo_root=ws.root)
+        try:
+            child_provider = _RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, "explorer old")),
+                ModelResponse(Message(Role.ASSISTANT, "worker old")),
+                ModelResponse(Message(Role.ASSISTANT, "explorer new")),
+                ModelResponse(Message(Role.ASSISTANT, "worker new")),
+            ])
+            leader = make_leader(
+                session,
+                _RecordingFakeProvider(turns(
+                    ("explorer", "old explorer task"),
+                    ("worker", "old worker task"),
+                    ("explorer", "new explorer task"),
+                    ("worker", "new worker task"),
+                )),
+                child_provider,
+                ("explorer", "worker"),
+            )
+            leader.chat("explorer first")
+            leader.chat("worker first")
+            old_ids = {
+                name: leader.subagents[name].agent_ref.agent_id
+                for name in ("explorer", "worker")
+            }
+            if leader.clear_subagents() != 2:
+                fail("clear_subagents did not clear both active agents")
+            leader.chat("explorer again")
+            leader.chat("worker again")
+            for index, name in ((2, "explorer"), (3, "worker")):
+                new_id = leader.subagents[name].agent_ref.agent_id
+                if new_id == old_ids[name]:
+                    fail(f"clear_subagents reused {name}'s old id")
+                if any(
+                    message.text.startswith(f"old {name}")
+                    for message in child_provider.requests[index].messages
+                ):
+                    fail(f"clear_subagents restored {name}'s old context")
+                if len(transcript_ids(session, name)) != 2:
+                    fail(f"clear_subagents did not create a new {name} transcript")
+        finally:
+            session.close()
+
+
 @check("leader.typed_event_lifecycle")
 def check_typed_event_lifecycle() -> None:
     with workspace() as ws:

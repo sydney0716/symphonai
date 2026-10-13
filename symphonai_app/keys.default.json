@@ -1,5 +1,8 @@
 {
-  "mod+enter": "submit",
+  "enter": "submit",
+  "shift+enter": "newline",
+  "alt+enter": "newline",
+  "mod+enter": "newline",
   "escape": "cancel",
   "mod+.": "stop-run",
   "mod+l": "focus-input",

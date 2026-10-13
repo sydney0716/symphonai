@@ -29,28 +29,21 @@ const ACTIVITY_VERBS = Object.freeze({
   multi_edit_file: "edited",
   write_file: "wrote",
   run_shell: "ran",
+  dispatch_subagent: "dispatched",
 });
 
-function proseList(parts) {
-  return parts.length < 2
-    ? parts.join("")
-    : parts.length === 2
-      ? parts.join(" and ")
-      : `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
-}
-
-function activityText(entry) {
-  const parts = entry.calls.map((call) => {
-    const verb = ACTIVITY_VERBS[call.name] ?? `used ${call.name}`;
-    const target = call.target === null ? "" : ` \`${call.target}\``;
-    const failure = call.status === "failed"
-      ? ` (failed${call.error ? `: ${call.error}` : ""})`
-      : "";
-    return `${verb}${target}${failure}`;
-  });
-  const sentence = proseList(parts);
-  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
-}
+const ACTIVITY_KINDS = Object.freeze({
+  read_file: "activity-read",
+  list_files: "activity-read",
+  grep: "activity-search",
+  glob: "activity-search",
+  edit_file: "activity-edit",
+  multi_edit_file: "activity-edit",
+  write_file: "activity-edit",
+  run_shell: "activity-shell",
+  web_fetch: "activity-web",
+  web_search: "activity-web",
+});
 
 function renderPrompt(document, entry) {
   const prompt = element(document, "p", { className: "prompt", text: entry.text });
@@ -136,8 +129,51 @@ function renderHeading(document, block) {
 
 function renderList(document, block) {
   const list = element(document, block.ordered ? "ol" : "ul");
-  append(list, ...block.items.map((children) => renderInlineBlock(document, "li", children)));
+  block.ordered && list.setAttribute("start", String(block.start));
+  append(list, ...block.items.map((item) => {
+    const row = renderInlineBlock(document, "li", item.children);
+    append(row, ...item.blocks.map((nested) => renderBlock(document, nested)));
+    return row;
+  }));
   return list;
+}
+
+function renderTableCell(document, tagName, children, alignment) {
+  const cell = renderInlineBlock(document, tagName, children);
+  alignment && cell.setAttribute("style", `text-align: ${alignment};`);
+  return cell;
+}
+
+function renderTable(document, block) {
+  const header = element(document, "thead");
+  const headerRow = element(document, "tr");
+  append(headerRow, ...block.header.map((cell, index) => renderTableCell(
+    document,
+    "th",
+    cell,
+    block.align[index],
+  )));
+  append(header, headerRow);
+
+  const body = element(document, "tbody");
+  append(body, ...block.rows.map((row) => {
+    const tableRow = element(document, "tr");
+    append(tableRow, ...row.map((cell, index) => renderTableCell(
+      document,
+      "td",
+      cell,
+      block.align[index],
+    )));
+    return tableRow;
+  }));
+
+  const table = element(document, "table");
+  append(table, header, body);
+  return append(element(document, "div", { className: "table-scroll" }), table);
+}
+
+function renderRule(document) {
+  return element(document, "hr");
 }
 
 function renderCodeBlock(document, block) {
@@ -155,6 +191,8 @@ const BLOCK_RENDERERS = Object.freeze({
   paragraph: renderParagraph,
   heading: renderHeading,
   list: renderList,
+  table: renderTable,
+  rule: renderRule,
   "code-block": renderCodeBlock,
   quote: renderQuote,
 });
@@ -189,11 +227,62 @@ function renderGoal(document, entry) {
   return command;
 }
 
-function renderActivity(document, entry) {
-  return element(document, "p", {
-    className: "activity",
-    text: activityText(entry),
+function renderActivity(document, entry, _parseMarkdown, actions) {
+  const failed = entry.calls.some((call) => call.status === "failed");
+  const kind = ACTIVITY_KINDS[entry.calls[0]?.name];
+  const dispatches = entry.calls.filter((call) => call.name === "dispatch_subagent" && typeof call.task === "string");
+  const expandable = dispatches.length > 0;
+  const line = element(document, expandable ? "div" : "p", {
+    className: ["activity", kind, failed ? "failed" : ""].filter(Boolean).join(" "),
   });
+  expandable && line.setAttribute("role", "button");
+  expandable && line.setAttribute("tabindex", "0");
+  expandable && line.setAttribute("aria-expanded", String(entry.expanded === true));
+  const text = element(document, "span", { className: "activity-text" });
+  let sentence = "";
+  append(
+    text,
+    ...entry.calls.flatMap((call, index, calls) => {
+      const verb = ACTIVITY_VERBS[call.name] ?? `used ${call.name}`;
+      const label = index === 0 ? `${verb.charAt(0).toUpperCase()}${verb.slice(1)}` : verb;
+      const separator = index === 0 ? "" : index === calls.length - 1
+        ? calls.length === 2 ? " and " : ", and "
+        : ", ";
+      const failure = call.status === "failed"
+        ? ` (failed${call.error ? `: ${call.error}` : ""})`
+        : "";
+      sentence += `${separator}${label}${call.target === null ? "" : ` ${call.target}`}${failure}`;
+      return [
+        ...(separator ? [element(document, "span", { text: separator })] : []),
+        element(document, "span", { text: label }),
+        ...(call.target === null ? [] : [
+          element(document, "span", { text: " " }),
+          element(document, "code", { text: call.target }),
+        ]),
+        ...(failure ? [element(document, "span", { text: failure })] : []),
+      ];
+    }),
+    element(document, "span", { text: "." }),
+  );
+  append(line, text);
+  line.setAttribute("title", `${sentence}.`);
+  const toggle = () => {
+    entry.expanded = entry.expanded !== true;
+    actions?.rerender?.();
+  };
+  expandable && line.addEventListener("click", toggle);
+  expandable && line.addEventListener("keydown", (event) => (
+    ["Enter", " "].includes(event.key) && (event.preventDefault(), toggle())
+  ));
+  const taskBlock = expandable && entry.expanded
+    ? element(document, "div", { className: "dispatch-tasks" })
+    : null;
+  taskBlock && append(line, taskBlock);
+  taskBlock && dispatches.forEach((call) => append(taskBlock, element(document, "p", {
+    className: "dispatch-task",
+    text: `${call.target}: ${call.task}`,
+  })));
+  return line;
 }
 
 function renderEdit(document, entry) {
@@ -206,6 +295,56 @@ function renderEdit(document, entry) {
     element(document, "pre", { text: entry.diff }),
   );
   return details;
+}
+
+function renderEditCard(document, entry, _parseMarkdown, actions) {
+  const card = element(document, "section", { className: "edit-card" });
+  const heading = element(document, "div", { className: "edit-card-heading" });
+  append(heading,
+    element(document, "strong", { text: `Edited ${entry.files.length} ${entry.files.length === 1 ? "file" : "files"}` }),
+    element(document, "span", { text: `+${entry.added} −${entry.removed}` }),
+  );
+  const undo = element(document, "button", { text: "Undo" });
+  undo.type = "button";
+  undo.disabled = entry.undoing === true;
+  undo.addEventListener("click", () => actions?.onUndo?.(entry));
+  const view = element(document, "button", { text: "View changes" });
+  view.type = "button";
+  view.addEventListener("click", () => actions?.onViewChanges?.());
+  append(heading,
+    ...(entry.undone ? [element(document, "span", { text: "Undone" })] : []),
+    ...(!entry.undone && entry.canUndo && actions?.onUndo ? [undo] : []),
+    ...(actions?.onViewChanges ? [view] : []),
+  );
+  append(card, heading);
+  const rows = element(document, "ul", { className: "edit-card-files" });
+  const visible = entry.expanded ? entry.files : entry.files.slice(0, 3);
+  for (const file of visible) {
+    append(rows, element(document, "li", { text: `${file.path}  +${file.added} −${file.removed}` }));
+  }
+  append(card, rows);
+  const more = element(document, "button", {
+    className: "edit-card-more",
+    text: entry.expanded ? "Show fewer files" : `Show ${entry.files.length - 3} more files`,
+  });
+  more.type = "button";
+  more.addEventListener("click", () => {
+    entry.expanded = !entry.expanded;
+    actions?.rerender?.();
+  });
+  append(card, ...(entry.files.length > 3 ? [more] : []));
+  const conflicts = element(document, "ul");
+  for (const path of entry.conflicts ?? []) append(conflicts, element(document, "li", { text: path }));
+  const force = element(document, "button", { text: "Revert anyway" });
+  force.type = "button";
+  force.addEventListener("click", () => actions?.onUndo?.(entry, true));
+  append(card,
+    ...(entry.conflicts?.length ? [
+      element(document, "p", { text: "These files changed outside the agent:" }), conflicts, force,
+    ] : []),
+    ...(entry.error ? [element(document, "p", { className: "error", text: entry.error })] : []),
+  );
+  return card;
 }
 
 function renderQuestion(document, entry) {
@@ -246,17 +385,22 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
   goal: renderGoal,
   activity: renderActivity,
   edit: renderEdit,
+  "edit-card": renderEditCard,
   question: renderQuestion,
   compaction: renderCompaction,
   gap: renderGap,
   unknown: renderUnknown,
+  "turn-time": (document, entry) => element(document, "p", {
+    className: "turn-time",
+    text: entry.text,
+  }),
 });
 
-export function renderTranscript(document, root, model, parseMarkdown) {
+export function renderTranscript(document, root, model, parseMarkdown, actions) {
   return replace(
     root,
     ...model.map((entry) => (
       TRANSCRIPT_RENDERERS[entry.type] ?? renderUnknown
-    )(document, entry, parseMarkdown)),
+    )(document, entry, parseMarkdown, actions)),
   );
 }

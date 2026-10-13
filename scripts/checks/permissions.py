@@ -203,6 +203,27 @@ def check_permissions_forbidden_read_denied() -> None:
         if r.ok:
             fail("read_file should deny a forbidden-pattern path (.env)")
 
+
+@check("permissions.forbidden_matching_ignores_case")
+def check_forbidden_matching_ignores_case() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        policy = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
+        for path in (
+            ".ENV",
+            ".Env.local",
+            "SUB/ID_RSA",
+            "KEY.PEM",
+            ".GIT/HEAD",
+            "Node_Modules/x.js",
+        ):
+            if policy.check_read(path).allowed:
+                fail(f"case-variant forbidden path was readable: {path!r}")
+        if not policy.check_read("src/a.py").allowed:
+            fail("ordinary source path was denied")
+        if policy.check_write(".ENV").allowed:
+            fail("case-variant forbidden path was writable")
+
 @check("permissions.traversal_denied")
 def check_permissions_traversal_denied() -> None:
     with workspace() as ws:

@@ -32,7 +32,7 @@ function diffResult(fields) {
     : null;
 }
 
-export function createTranscript() {
+export function createTranscript({ now = () => Date.now() } = {}) {
   const model = [];
   const calls = new Map();
   const questions = new Map();
@@ -40,7 +40,31 @@ export function createTranscript() {
   let turnSerial = 0;
   let sessionId = null;
   let activeTurn = null;
+  let rootAgentId = null;
+  let currentPrompt = null;
   const activityTurns = new WeakMap();
+  const promptEdits = new WeakMap();
+  const promptUndone = new WeakMap();
+  const promptStarts = new WeakMap();
+  const dispatchCalls = [];
+
+  function appendTurnTime(prompt, endedAt, outcome) {
+    const startValue = promptStarts.get(prompt);
+    const started = typeof startValue === "number" ? startValue : Date.parse(startValue);
+    const ended = typeof endedAt === "number" ? endedAt : Date.parse(endedAt);
+    if (!Number.isFinite(started) || !Number.isFinite(ended)) return;
+    const seconds = Math.max(0, Math.floor((ended - started) / 1000));
+    const duration = seconds < 60
+      ? `${seconds}s`
+      : seconds < 3600
+        ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+        : `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+    const label = outcome === "failed" ? "Failed after" : outcome === "cancelled" ? "Stopped after" : "Worked for";
+    const time = new Date(ended).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const entry = { type: "turn-time", text: `${label} ${duration} · ${time}` };
+    model.push(entry);
+    return entry;
+  }
 
   function turnKey(fields) {
     const turn = fields.turn_id
@@ -66,6 +90,7 @@ export function createTranscript() {
       status: "running",
     };
     entry.calls.push(call);
+    if (call.name === "dispatch_subagent" && call.target) dispatchCalls.push(call);
     calls.set(fields.tool_call_id, {
       call,
       entry,
@@ -91,6 +116,32 @@ export function createTranscript() {
     question.reason = reason;
   }
 
+  function appendEditCard(prompt, edits, { canUndo = false, undone = false } = {}) {
+    const byPath = new Map();
+    for (const edit of edits) {
+      const file = byPath.get(edit.path) ?? { path: edit.path, added: 0, removed: 0 };
+      file.added += edit.added;
+      file.removed += edit.removed;
+      byPath.set(edit.path, file);
+    }
+    const files = [...byPath.values()];
+    if (!files.length) return null;
+    for (const previous of model) {
+      if (previous.type === "edit-card") previous.canUndo = false;
+    }
+    const card = {
+      type: "edit-card",
+      checkpointKey: prompt.checkpointKey ?? null,
+      files,
+      added: files.reduce((total, file) => total + file.added, 0),
+      removed: files.reduce((total, file) => total + file.removed, 0),
+      canUndo: canUndo && !undone,
+      undone,
+    };
+    model.push(card);
+    return card;
+  }
+
   function replaceWithEdit(record, edit, agentId) {
     const activityIndex = model.indexOf(record.entry);
     const callIndex = record.entry.calls.indexOf(record.call);
@@ -112,6 +163,10 @@ export function createTranscript() {
       name: record.call.name,
       ...edit,
     });
+    const editEntry = replacements.at(-1);
+    if (currentPrompt !== null) {
+      promptEdits.get(currentPrompt)?.push(editEntry);
+    }
     if (after.length > 0) {
       const trailing = {
         type: "activity",
@@ -131,7 +186,7 @@ export function createTranscript() {
   function applyEvent(event) {
     const { type, fields } = event;
     if (type === "HistoryMessage") {
-      if (!fields.text && !fields.attachments?.length) {
+      if (!fields.text && !fields.attachments?.length && !fields.tool_calls?.length && !fields.turn_ended_at) {
         return;
       }
       if (fields.role === "user") {
@@ -141,27 +196,85 @@ export function createTranscript() {
           text: fields.text,
           messageCount: fields.message_count,
         };
+        if (typeof fields.checkpoint_key === "string") entry.checkpointKey = fields.checkpoint_key;
+        promptEdits.set(entry, (fields.edits ?? []).filter((edit) =>
+          typeof edit?.path === "string"
+          && Number.isInteger(edit.added)
+          && Number.isInteger(edit.removed)
+        ));
+        promptUndone.set(entry, fields.undone === true);
+        if (typeof fields.turn_started_at === "string") promptStarts.set(entry, fields.turn_started_at);
         if (fields.attachments?.length) {
           entry.attachments = fields.attachments.map(({ kind, filename }) => ({ kind, filename }));
         }
         model.push(entry);
+        if (rootAgentId === null || fields.agent_id === rootAgentId) {
+          currentPrompt = entry;
+        }
+        if (fields.turn_ended_at) {
+          appendEditCard(entry, promptEdits.get(entry) ?? [], {
+            undone: promptUndone.get(entry) === true,
+          });
+          appendTurnTime(entry, fields.turn_ended_at, fields.turn_outcome);
+          if (currentPrompt === entry) currentPrompt = null;
+        }
       } else if (fields.role === "assistant") {
-        model.push({
+        if (fields.text) model.push({
           type: "text",
           agentId: fields.agent_id,
           runId: fields.run_id,
           text: fields.text,
         });
+        for (const toolCall of fields.tool_calls ?? []) {
+          if (toolCall.name !== "dispatch_subagent") continue;
+          appendActivity({
+            agent_id: fields.agent_id,
+            run_id: fields.run_id,
+            turn_id: fields.turn_id,
+            tool_call_id: toolCall.id,
+            tool_name: toolCall.name,
+            target: toolCall.subagent_name,
+          });
+          const record = calls.get(toolCall.id);
+          if (record && typeof toolCall.task === "string") record.call.task = toolCall.task;
+        }
+        if (
+          currentPrompt !== null
+          && (!fields.tool_calls?.length || fields.turn_ended_at)
+        ) {
+          appendEditCard(currentPrompt, promptEdits.get(currentPrompt) ?? [], {
+            undone: promptUndone.get(currentPrompt) === true,
+          });
+          if (fields.turn_ended_at) {
+            appendTurnTime(currentPrompt, fields.turn_ended_at, fields.turn_outcome);
+          }
+          currentPrompt = null;
+        }
       }
       return;
     }
     if (type === "PromptSubmitted") {
-      model.push({
+      if (rootAgentId !== null && fields.agent_id !== rootAgentId) {
+        const dispatch = [...dispatchCalls].reverse().find((call) => (
+          call.agentId === fields.agent_id
+        ));
+        if (dispatch) dispatch.task = fields.text;
+        return;
+      }
+      const entry = {
         type: "prompt",
         agentId: fields.agent_id,
         text: fields.text,
         messageCount: fields.message_count,
-      });
+      };
+      if (typeof fields.checkpoint_key === "string") entry.checkpointKey = fields.checkpoint_key;
+      promptEdits.set(entry, []);
+      promptStarts.set(entry, now());
+      model.push(entry);
+      if (rootAgentId === null || fields.agent_id === rootAgentId) {
+        rootAgentId ??= fields.agent_id;
+        currentPrompt = entry;
+      }
       return;
     }
     if (type === "AssistantTextDelta") {
@@ -279,14 +392,29 @@ export function createTranscript() {
       return;
     }
     if (type === "RunStarted") {
+      rootAgentId ??= fields.agent_id;
       endedRuns.delete(fields.run_id);
       activeTurn = null;
       turnSerial += 1;
       return;
     }
     if (type === "RunFinished" || type === "RunFailed") {
+      const edits = currentPrompt === null ? [] : promptEdits.get(currentPrompt) ?? [];
+      if (fields.agent_id === rootAgentId && edits.length) {
+        appendEditCard(currentPrompt, edits, {
+          canUndo: Boolean(currentPrompt.checkpointKey),
+        });
+      }
+      if (fields.agent_id === rootAgentId && currentPrompt !== null) {
+        appendTurnTime(
+          currentPrompt,
+          now(),
+          type === "RunFailed" ? "failed" : fields.stopped_reason === "cancelled" ? "cancelled" : "finished",
+        );
+      }
       endedRuns.add(fields.run_id);
       activeTurn = null;
+      if (fields.agent_id === rootAgentId) currentPrompt = null;
       return;
     }
     if (type === "TurnStarted") {
@@ -301,9 +429,15 @@ export function createTranscript() {
     if (
       type === "SessionStarted"
       || type === "SessionEnded"
-      || type === "SubagentSpawned"
       || type === "SubagentStopped"
     ) {
+      return;
+    }
+    if (type === "SubagentSpawned") {
+      const dispatch = [...dispatchCalls].reverse().find((call) => (
+        call.target === fields.subagent_name && !call.agentId
+      ));
+      if (dispatch) dispatch.agentId = fields.subagent_agent_id;
       return;
     }
     model.push({

@@ -37,7 +37,7 @@ from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
-from symphonai_host.files import repository_files
+from symphonai_host.files import repository_files, repository_tree
 from symphonai_host.protocol import (
     ApprovalRequested,
     HistoryMessage,
@@ -449,6 +449,70 @@ class HostServer:
                     return
                 self._json(HTTPStatus.OK, {"path": requested, "text": text})
 
+            def _serve_tree(self) -> None:
+                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                paths = values.get("path", [])
+                if len(paths) > 1:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                requested = paths[0] if paths else ""
+                candidate = Path(requested)
+                if candidate.is_absolute() or ".." in candidate.parts:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    resolved = (host._repo_root / candidate).resolve()
+                except (OSError, RuntimeError):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                if not host.run.policy.check_read(resolved).allowed:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                if not resolved.is_dir():
+                    self._empty(HTTPStatus.NOT_FOUND)
+                    return
+                entries, truncated = repository_tree(host.run.policy, resolved)
+                self._json(HTTPStatus.OK, {
+                    "path": requested,
+                    "entries": entries,
+                    "truncated": truncated,
+                })
+
+            def _serve_source(self) -> None:
+                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                paths = values.get("path", [])
+                if len(paths) != 1:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                requested = paths[0]
+                candidate = Path(requested)
+                if candidate.is_absolute() or ".." in candidate.parts:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    resolved = (host._repo_root / candidate).resolve()
+                except (OSError, RuntimeError):
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                if not host.run.policy.check_read(resolved).allowed:
+                    self._empty(HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    with resolved.open("rb") as source:
+                        data = source.read(MAX_FILE_BYTES + 1)
+                except (OSError, ValueError):
+                    self._empty(HTTPStatus.NOT_FOUND)
+                    return
+                if len(data) > MAX_FILE_BYTES:
+                    self._empty(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    return
+                self._json(HTTPStatus.OK, {"path": requested, "text": text})
+
             def _serve_spec_files(self) -> None:
                 specs_root = host._repo_root / "specs"
                 paths = []
@@ -733,6 +797,16 @@ class HostServer:
                     if not self._authorized():
                         return
                     self._serve_file()
+                    return
+                if request_path == "/tree":
+                    if not self._authorized():
+                        return
+                    self._serve_tree()
+                    return
+                if request_path == "/source":
+                    if not self._authorized():
+                        return
+                    self._serve_source()
                     return
                 if request_path == "/spec/files":
                     if not self._authorized():

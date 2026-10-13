@@ -1177,7 +1177,13 @@ def check_fork_prefix_current_parent() -> None:
                     or frame["record_id"] == first_id
                     or "/" in frame["record_id"]
                     or str(root) in json.dumps(frame)
-                    or set(frame) != {"type", "role", "text", "tool_calls", "turn_id", "attachments", "record_id", "session_id"}
+                    or set(frame) != {
+                        "type", "role", "text", "tool_calls", "turn_id", "attachments",
+                        "record_id", "session_id", "checkpoint_key", "edits", "undone",
+                    }
+                    or not isinstance(frame.get("checkpoint_key"), str)
+                    or not isinstance(frame.get("edits"), list)
+                    or not isinstance(frame.get("undone"), bool)
                 ):
                     fail(f"fork history record id was absent or disclosed a path: {frame!r}")
                 fork_store = SessionStore.open(root / "sessions", fork_id)

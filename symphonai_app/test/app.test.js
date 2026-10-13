@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 
 import { INIT_PROMPT, start } from "../src/app.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
@@ -26,6 +26,16 @@ class FakeElement {
     this.value = "";
     this.listeners = new Map();
     this.attributes = new Map();
+  }
+
+  get href() {
+    return this._href;
+  }
+
+  set href(value) {
+    const attribute = String(value);
+    this.attributes.set("href", attribute);
+    this._href = new URL(attribute, "http://127.0.0.1/app/").href;
   }
 
   append(...children) {
@@ -111,15 +121,14 @@ export class FakeDocument {
       "page-links": "div",
       page: "div",
       "status-rail": "aside",
+      "rail-tabs": "div",
+      "rail-tools": "div",
       "chat-pane": "main",
       "prompt-form": "form",
       "jump-latest": "button",
-      "stop-button": "button",
       prompt: "textarea",
       "prompt-attachments": "div",
-      "attachment-picker": "input",
-      "attach-button": "button",
-      "send-button": "button",
+      files: "div",
     };
     this.elements = new Map(
       [
@@ -132,21 +141,21 @@ export class FakeDocument {
         "page-links",
         "page",
         "status-rail",
+        "rail-tabs",
         "agents",
         "chat-pane",
         "roadmap",
+        "changes",
         "spec",
+        "files",
+        "rail-tools",
         "run-notice",
         "chat",
         "approvals",
         "prompt-form",
         "jump-latest",
-        "stop-button",
         "prompt",
         "prompt-attachments",
-        "attachment-picker",
-        "attach-button",
-        "send-button",
         "prompt-error",
       ].map((id) => [id, new FakeElement(tags[id] ?? "div", id)]),
     );
@@ -154,15 +163,15 @@ export class FakeDocument {
     get("app-shell").className = "app-shell";
     get("chat-pane").className = "chat-pane";
     get("new-chat").className = "new-chat";
-    get("attachment-picker").type = "file";
     get("jump-latest").type = "button";
     get("jump-latest").hidden = true;
-    get("stop-button").type = "button";
-    get("stop-button").hidden = true;
     get("sidebar").append(get("home-link"), get("new-chat"), get("page-links"));
-    get("status-rail").append(get("agents"), get("roadmap"), get("spec"));
-    get("prompt-form").append(get("jump-latest"), get("prompt"), get("prompt-attachments"), get("attachment-picker"), get("attach-button"), get("send-button"), get("prompt-error"), get("stop-button"));
-    get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("prompt-form"));
+    get("status-rail").append(
+      get("rail-tabs"), get("agents"), get("roadmap"), get("changes"),
+      get("spec"), get("files"), get("rail-tools"),
+    );
+    get("prompt-form").append(get("prompt"), get("prompt-attachments"), get("prompt-error"));
+    get("chat-pane").append(get("run-notice"), get("chat"), get("approvals"), get("jump-latest"), get("prompt-form"));
     get("page").append(get("chat-pane"));
     get("app-shell").append(get("sidebar"), get("sidebar-toggle"), get("page"), get("status-rail"), get("rail-toggle"));
     this.body = new FakeElement("body", "body");
@@ -179,7 +188,7 @@ export class FakeDocument {
   }
 }
 
-function fakeGlobal({ fragment = "", stored = null, themeStored = null, storageThrows = false } = {}) {
+function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, storageThrows = false } = {}) {
   const listeners = new Map();
   const writes = [];
   const global = {
@@ -191,6 +200,8 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, storageT
         }
         if (key === "symphonai.route") return stored;
         if (key === "symphonai.theme") return themeStored;
+        if (key === "symphonai.rail-tools") return railStored;
+        if (key === "symphonai.status-line") return statusStored;
         assert.fail(`unexpected localStorage key: ${key}`);
       },
       setItem(key, value) {
@@ -221,8 +232,18 @@ function visibleText(root) {
   return walk(root).map((value) => value.textContent).join("\n");
 }
 
+function textInDocumentOrder(root) {
+  return [root._textContent, ...root.children.map(textInDocumentOrder)].join("");
+}
+
 function find(root, predicate) {
   return walk(root).find(predicate);
+}
+
+function agentRowText(row) {
+  const name = row.children.find((child) => child.className === "agent-name");
+  const detail = row.children.find((child) => child.className === "agent-detail");
+  return [name?.textContent, detail?.textContent].filter(Boolean).join(" · ");
 }
 
 function latestCommandEntry(document) {
@@ -272,17 +293,12 @@ export function fakeClient(
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
     conversation = null,
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
-    changes = { turns: [], files: [] },
-    revertConflictPaths = [],
-    worktreeConflict = false,
     fileOverrides = {},
     specFilesReply = { paths: [] },
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], applyWorktree: [], changes: 0, compact: [], controlAgent: [], conversationStats: 0, credentials: [], discardWorktree: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], revertChanges: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [] };
-  let changesReply = changes;
-  let worktreeConflictPending = worktreeConflict;
+  const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -311,6 +327,22 @@ export function fakeClient(
         throw error;
       }
       return reply;
+    },
+    async changes() {
+      calls.changes += 1;
+      return { files: [], turns: [], worktrees: [] };
+    },
+    async revertChanges(payload) {
+      calls.revertChanges.push(payload);
+      return {};
+    },
+    async applyWorktree(name) {
+      calls.applyWorktree.push(name);
+      return {};
+    },
+    async discardWorktree(name) {
+      calls.discardWorktree.push(name);
+      return {};
     },
     async files(query, limit = 20) {
       calls.files.push([query, limit]);
@@ -366,13 +398,6 @@ export function fakeClient(
       calls.stop.push(runId);
       return { accepted: true };
     },
-    async controlAgent(agentId, action, text) {
-      calls.controlAgent.push({ agent_id: agentId, action, ...(text === undefined ? {} : { text }) });
-      return {
-        agent_id: agentId,
-        state: action === "pause" ? "paused" : action === "stop" ? "stopping" : "running",
-      };
-    },
     async approve(id, allowed, reason, remember = false) {
       calls.approve.push({ id, allowed, reason, ...(remember ? { remember: true } : {}) });
       return { resolved: true };
@@ -401,37 +426,6 @@ export function fakeClient(
     async conversationStats() {
       calls.conversationStats += 1;
       return { conversation };
-    },
-    async changes() {
-      calls.changes += 1;
-      return changesReply;
-    },
-    async revertChanges(payload) {
-      calls.revertChanges.push(payload);
-      if (revertConflictPaths.length > 0 && !payload.force) {
-        const error = new Error("files changed outside the agent");
-        error.status = 409;
-        error.paths = revertConflictPaths;
-        throw error;
-      }
-      changesReply = { turns: [], files: [] };
-      return { reverted: [payload.path].filter(Boolean) };
-    },
-    async applyWorktree(name) {
-      calls.applyWorktree.push(name);
-      if (worktreeConflictPending) {
-        worktreeConflictPending = false;
-        const error = new Error("patch does not apply");
-        error.status = 409;
-        throw error;
-      }
-      changesReply = { turns: [], files: [], worktrees: [] };
-      return { applied: [] };
-    },
-    async discardWorktree(name) {
-      calls.discardWorktree.push(name);
-      changesReply = { turns: [], files: [], worktrees: [] };
-      return { discarded: name };
     },
     async storeCredential(name, value) {
       calls.credentials.push({ name, value });
@@ -596,10 +590,9 @@ test("dropped PDFs allow an empty prompt and removals or invalid files do not se
   await form.dispatch("submit");
   assert.equal(client.calls.prompt.length, 1);
 
-  await document.getElementById("attach-button").click();
-  assert.equal(document.getElementById("attachment-picker").clicked, true);
-  document.getElementById("attachment-picker").files = [pdf];
-  await document.getElementById("attachment-picker").dispatch("change");
+  await document.getElementById("prompt").dispatch("paste", {
+    clipboardData: { items: [{ type: "application/pdf", getAsFile: () => pdf }] },
+  });
   assert.equal(document.getElementById("prompt-attachments").children.length, 1);
   document.getElementById("prompt").value = "/help";
   await form.dispatch("submit");
@@ -625,6 +618,23 @@ test("dropped PDFs allow an empty prompt and removals or invalid files do not se
     await document.getElementById("prompt-attachments").children[0].children[0].click();
   }
   assert.equal(client.calls.prompt.length, 1);
+});
+
+test("composer Escape closes a slash menu before it can stop a running turn", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "hello";
+  const submitting = document.getElementById("prompt-form").dispatch("submit");
+  client.resolvePrompt({ accepted: true, run_id: "escape-menu-run" });
+  await submitting;
+  const input = document.getElementById("prompt");
+  input.value = "/";
+  await input.dispatch("input");
+  await input.dispatch("keydown", { key: "Escape" });
+  assert.equal(app.turn.state, RUNNING);
+  assert.deepEqual(client.calls.stop, []);
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "command-menu").children.length, 0);
 });
 
 test("@ mentions search paths, insert on Enter and leave slash commands alone", async () => {
@@ -726,7 +736,7 @@ test("goal sets a check argv and queues a prompt during its first round", async 
     check: ["python3", "-m", "pytest", "tests/parser"],
   }]);
   assert.match(visibleText(document.getElementById("chat")), /Goal set\. Round 1 of 10 started\./);
-  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal active 1\/10/);
+  assert.doesNotMatch(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal active 1\/10/);
   await submitCommand(document, "please finish the parser");
   assert.equal(app.turn.state, RUNNING);
   assert.deepEqual(app.turn.queue.map(({ text }) => text), ["please finish the parser"]);
@@ -827,13 +837,13 @@ test("goal events render between rounds and update the status line", async () =>
     change, phase, rounds, max_rounds: 10, reason, last_check,
   });
   await app.onFrame(goalEvent("set", "active", 1));
-  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal active 1\/10/);
+  assert.doesNotMatch(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal active 1\/10/);
   await app.onFrame(eventFrame("RunFinished", { stopped_reason: "final_response" }));
   await app.onFrame(goalEvent("check", "active", 1, { exit: 1, ok: false, output: "1 failed" }));
   await app.onFrame(eventFrame("PromptSubmitted", { text: "round two feedback", message_count: 2 }));
   await app.onFrame(eventFrame("RunFinished", { stopped_reason: "final_response" }));
   await app.onFrame(goalEvent("check", "complete", 2, { exit: 0, ok: true, output: "" }));
-  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal complete 2\/10/);
+  assert.doesNotMatch(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal complete 2\/10/);
   const entries = app.transcript.model.filter(({ type }) => type === "goal");
   assert.deepEqual(entries.map(({ text }) => text), [
     "Goal set: up to 10 rounds.",
@@ -1314,7 +1324,7 @@ test("Escape from a command picker keeps its answer under the command echo", asy
   assert.equal(chat.children.some((entry) => entry.className === "assistant"), false);
 });
 
-test("Mod+Enter submits the composer through the form", async () => {
+test("Enter submits the composer through the form", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   client.prompt = async (text) => {
@@ -1325,10 +1335,54 @@ test("Mod+Enter submits the composer through the form", async () => {
   const input = document.getElementById("prompt");
   input.focus();
   input.value = "hello";
-  await input.dispatch("keydown", { key: "Enter", ctrlKey: true });
+  await input.dispatch("keydown", { key: "Enter" });
 
   assert.deepEqual(client.calls.prompt, ["hello"]);
   assert.equal(input.value, "");
+});
+
+test("Shift, Alt, and Ctrl+Enter insert a newline at the cursor", async () => {
+  for (const modifiers of [{ shiftKey: true }, { altKey: true }, { ctrlKey: true }]) {
+    const document = new FakeDocument();
+    const client = fakeClient();
+    await start({ global: {}, document, client });
+    const input = document.getElementById("prompt");
+    input.value = "ab";
+    input.selectionStart = 1;
+    input.selectionEnd = 1;
+    let prevented = false;
+    await input.dispatch("keydown", {
+      key: "Enter",
+      ...modifiers,
+      preventDefault() { prevented = true; },
+    });
+
+    assert.equal(input.value, "a\nb");
+    assert.equal(input.selectionStart, 2);
+    assert.equal(input.selectionEnd, 2);
+    assert.equal(prevented, true);
+    assert.deepEqual(client.calls.prompt, []);
+  }
+});
+
+test("composition Enter events leave the composer alone", async () => {
+  for (const fields of [{ isComposing: true }, { keyCode: 229 }]) {
+    const document = new FakeDocument();
+    const client = fakeClient();
+    await start({ global: {}, document, client });
+    const input = document.getElementById("prompt");
+    input.value = "hello";
+    let prevented = false;
+    await input.dispatch("keydown", {
+      key: "Enter",
+      ...fields,
+      preventDefault() { prevented = true; },
+    });
+
+    assert.equal(input.value, "hello");
+    assert.equal(prevented, false);
+    assert.deepEqual(client.calls.prompt, []);
+  }
 });
 
 function toolStarted(id, name, target = "") {
@@ -1353,6 +1407,171 @@ function toolFinished(id, name, fields = {}) {
     ...fields,
   });
 }
+
+test("turn edit cards collapse files, keep only latest undo, and retry conflicts", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.changes = async () => ({
+    files: [],
+    turns: [
+      { key: "chk-first", paths: ["a.py", "b.py", "c.py", "d.py", "e.py"] },
+      { key: "chk-second", paths: ["z.py"] },
+    ],
+    worktrees: [],
+  });
+  const attempted = [];
+  client.revertChanges = async (payload) => {
+    attempted.push(payload);
+    if (!payload.force) {
+      const error = new Error("changed outside");
+      error.status = 409;
+      error.paths = ["x.py"];
+      throw error;
+    }
+    return {};
+  };
+  const app = await start({ global: {}, document, client });
+  const addEdit = async (id, path, added, removed, run_id) => {
+    await client.emit({ ...toolStarted(id, "edit_file", path), payload: {
+      ...toolStarted(id, "edit_file", path).payload, run_id,
+    } });
+    await client.emit(toolFinished(id, "edit_file", {
+      run_id,
+      result_kind: "file_diff", result_path: path, lines_added: added,
+      lines_removed: removed, diff: "-old\n+new",
+    }));
+  };
+  await client.emit(eventFrame("RunStarted", { agent_id: "agent-1", run_id: "run-1" }));
+  await client.emit(eventFrame("PromptSubmitted", {
+    agent_id: "agent-1", run_id: "run-1", text: "first", checkpoint_key: "chk-first",
+  }));
+  for (const [index, path] of ["a.py", "b.py", "c.py", "d.py", "e.py"].entries()) {
+    await addEdit(`first-${index}`, path, index + 1, 0, "run-1");
+  }
+  await client.emit(eventFrame("RunFinished", { agent_id: "agent-1", run_id: "run-1" }));
+  await client.emit(eventFrame("RunStarted", { agent_id: "agent-1", run_id: "run-2" }));
+  await client.emit(eventFrame("PromptSubmitted", {
+    agent_id: "agent-1", run_id: "run-2", text: "second", checkpoint_key: "chk-second",
+  }));
+  await addEdit("second-edit", "z.py", 3, 1, "run-2");
+  await client.emit(eventFrame("RunFinished", { agent_id: "agent-1", run_id: "run-2" }));
+
+  const cards = () => walk(document.getElementById("chat")).filter((node) => node.className === "edit-card");
+  assert.equal(cards().length, 2);
+  assert.match(visibleText(cards()[1]), /Edited 1 file[\s\S]*\+3 −1/);
+  assert.equal(find(cards()[0], (node) => node.tagName === "BUTTON" && node.textContent === "Undo"), undefined);
+  const more = find(cards()[0], (node) => node.tagName === "BUTTON" && node.textContent === "Show 2 more files");
+  assert.ok(more);
+  await more.dispatch("click");
+  assert.equal(cards()[0].children.find((node) => node.className === "edit-card-files").children.length, 5);
+
+  const view = find(cards()[1], (node) => node.tagName === "BUTTON" && node.textContent === "View changes");
+  await view.dispatch("click");
+  assert.equal(document.getElementById("changes").hidden, false);
+
+  const undo = find(cards()[1], (node) => node.tagName === "BUTTON" && node.textContent === "Undo");
+  await undo.dispatch("click");
+  assert.deepEqual(attempted, [{ key: "chk-second" }]);
+  assert.match(visibleText(cards()[1]), /x\.py[\s\S]*Revert anyway/);
+  await find(cards()[1], (node) => node.tagName === "BUTTON" && node.textContent === "Revert anyway").dispatch("click");
+  assert.deepEqual(attempted, [{ key: "chk-second" }, { key: "chk-second", force: true }]);
+  assert.match(visibleText(cards()[1]), /Undone/);
+  assert.equal(find(cards()[1], (node) => node.tagName === "BUTTON" && node.textContent === "Undo"), undefined);
+});
+
+test("live edit cards only list paths covered by their checkpoint", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.changes = async () => ({
+    files: [], turns: [{ key: "chk-live", paths: ["a.py"] }], worktrees: [],
+  });
+  await start({ global: {}, document, client });
+
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "root-run" }));
+  await client.emit(eventFrame("PromptSubmitted", {
+    agent_id: "leader", run_id: "root-run", text: "edit files", checkpoint_key: "chk-live",
+  }));
+  const addEdit = async (id, agent_id, run_id, path) => {
+    await client.emit(eventFrame("ToolCallStarted", {
+      agent_id, run_id, tool_name: "edit_file", tool_call_id: id, target: path,
+    }));
+    await client.emit(eventFrame("ToolCallFinished", {
+      agent_id, run_id, tool_name: "edit_file", tool_call_id: id, ok: true,
+      result_kind: "file_diff", result_path: path,
+      lines_added: 1, lines_removed: 1, diff: "-old\n+new", truncated: false,
+    }));
+  };
+  await addEdit("leader-edit", "leader", "root-run", "a.py");
+  await addEdit("worktree-edit", "worker", "worktree-run", "b.py");
+  await client.emit(eventFrame("RunFinished", { agent_id: "worker", run_id: "worktree-run" }));
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader", run_id: "root-run" }));
+
+  const card = find(document.getElementById("chat"), (node) => node.className === "edit-card");
+  assert.ok(card);
+  const rows = card.children.find((node) => node.className === "edit-card-files").children;
+  assert.equal(rows.length, 1);
+  assert.match(visibleText(rows[0]), /a\.py/);
+  assert.doesNotMatch(visibleText(card), /b\.py/);
+  assert.ok(find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"));
+});
+
+test("live edit cards retain shared subagent files covered by their checkpoint", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.changes = async () => ({
+    files: [], turns: [{ key: "chk-live", paths: ["a.py", "c.py"] }], worktrees: [],
+  });
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "root-run" }));
+  await client.emit(eventFrame("PromptSubmitted", {
+    agent_id: "leader", run_id: "root-run", text: "edit files", checkpoint_key: "chk-live",
+  }));
+  for (const [id, agent_id, run_id, path] of [
+    ["leader-edit", "leader", "root-run", "a.py"],
+    ["worker-edit", "worker", "worker-run", "c.py"],
+  ]) {
+    await client.emit(eventFrame("ToolCallStarted", {
+      agent_id, run_id, tool_name: "edit_file", tool_call_id: id, target: path,
+    }));
+    await client.emit(eventFrame("ToolCallFinished", {
+      agent_id, run_id, tool_name: "edit_file", tool_call_id: id, ok: true,
+      result_kind: "file_diff", result_path: path,
+      lines_added: 1, lines_removed: 1, diff: "-old\n+new", truncated: false,
+    }));
+  }
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader", run_id: "root-run" }));
+  const card = find(document.getElementById("chat"), (node) => node.className === "edit-card");
+  const rows = card.children.find((node) => node.className === "edit-card-files").children;
+  assert.equal(rows.length, 2);
+  assert.match(visibleText(rows[0]), /a\.py/);
+  assert.match(visibleText(rows[1]), /c\.py/);
+  assert.ok(find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"));
+});
+
+test("live edit cards have no Undo when changes has no matching checkpoint", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.changes = async () => ({
+    files: [], turns: [{ key: "another-checkpoint", paths: ["a.py"] }], worktrees: [],
+  });
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "root-run" }));
+  await client.emit(eventFrame("PromptSubmitted", {
+    agent_id: "leader", run_id: "root-run", text: "edit a file", checkpoint_key: "chk-live",
+  }));
+  await client.emit(eventFrame("ToolCallStarted", {
+    agent_id: "leader", run_id: "root-run", tool_name: "edit_file", tool_call_id: "edit", target: "a.py",
+  }));
+  await client.emit(eventFrame("ToolCallFinished", {
+    agent_id: "leader", run_id: "root-run", tool_name: "edit_file", tool_call_id: "edit", ok: true,
+    result_kind: "file_diff", result_path: "a.py", lines_added: 1, lines_removed: 1,
+    diff: "-old\n+new", truncated: false,
+  }));
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader", run_id: "root-run" }));
+  const card = find(document.getElementById("chat"), (node) => node.className === "edit-card");
+  assert.ok(card);
+  assert.equal(find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"), undefined);
+});
 
 test("start renders the chat page and prepares the whole roadmap graph in the rail", async () => {
   const document = new FakeDocument();
@@ -1406,10 +1625,10 @@ test("opening phase 18 loads each primary spec and follow-up once", async () => 
   for (const path of [BASE, OPEN_BASE, FOLLOW_UP]) {
     assert.equal(client.calls.file.filter((value) => value === path).length, 1, path);
   }
-  assert.equal(walk(rail).filter((node) => node.className === "roadmap-box-button").length, 2);
+  assert.equal(walk(rail).filter((node) => node.className.startsWith("roadmap-task ")).length, 2);
 });
 
-test("graph roadmap loads short spec titles and opens items and follow-ups", async () => {
+test("phase waves load full spec titles and open tasks and follow-ups", async () => {
   const roadmap = JSON.parse(fixtureRoadmap());
   roadmap.phases[0].status = "in_progress";
   delete roadmap.phases[0].items[0].done;
@@ -1432,26 +1651,124 @@ test("graph roadmap loads short spec titles and opens items and follow-ups", asy
   await start({ global: {}, document, client });
   const roadmapRail = document.getElementById("roadmap");
   const phase = find(roadmapRail, (node) => node.attributes.get("data-phase-id") === "17");
-  const initialGraph = find(phase, (node) => node.className === "roadmap-graph");
-  assert.equal(find(initialGraph, (node) => node.className === "roadmap-box-button").textContent, "18a  Boundary");
+  const initialWaves = find(phase, (node) => node.className === "roadmap-waves");
+  assert.equal(find(initialWaves, (node) => node.className.startsWith("roadmap-task ")).textContent, "18a  Boundary");
   releaseFiles();
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   const refreshedPhase = find(roadmapRail, (node) => node.attributes.get("data-phase-id") === "17");
-  const graph = find(refreshedPhase, (node) => node.className === "roadmap-graph");
-  assert.ok(graph);
-  assert.equal(walk(graph).filter((node) => node.className === "roadmap-box-button").length, 2);
-  assert.ok(find(graph, (node) => node.className === "roadmap-connector-row"));
-  assert.ok(find(graph, (node) => node.className.startsWith("roadmap-edge ")));
-  assert.equal(find(graph, (node) => node.className === "roadmap-box-button").textContent, "18a  A beautifully lo…");
-  assert.equal(find(graph, (node) => node.className === "roadmap-box-button").attributes.get("title"), "Boundary");
-  assert.equal(find(graph, (node) => node.className === "roadmap-follow-up").textContent, "18aF  Fix the goal");
+  const waves = find(refreshedPhase, (node) => node.className === "roadmap-waves");
+  assert.ok(waves);
+  assert.equal(walk(waves).filter((node) => node.className.startsWith("roadmap-task ")).length, 2);
+  assert.equal(find(waves, (node) => node.className.startsWith("roadmap-task ")).textContent, "18a  A beautifully long title");
+  assert.equal(find(waves, (node) => node.className.startsWith("roadmap-task ")).attributes.get("title"), "A beautifully long title");
+  assert.equal(walk(waves).some((node) => node.className.startsWith("roadmap-edge")), false);
+  assert.equal(find(waves, (node) => node.className === "roadmap-follow-up").textContent, "18aF  Fix the goal");
 
-  await find(graph, (node) => node.className === "roadmap-box-button").dispatch("click");
+  await find(waves, (node) => node.className.startsWith("roadmap-task ")).dispatch("click");
   assert.ok(client.calls.file.includes(BASE));
-  await find(graph, (node) => node.className === "roadmap-follow-up").dispatch("click");
+  await find(waves, (node) => node.className === "roadmap-follow-up").dispatch("click");
   assert.ok(client.calls.file.includes(FOLLOW_UP));
   assert.ok(!find(roadmapRail, (node) => node.tagName === "SVG"));
+});
+
+test("phase 43 renders task waves with full titles and clickable follow-ups", async () => {
+  const followUpPath = "specs/43/43iF-forks-and-merges-inside-a-phase.md";
+  const phase = {
+    id: "43",
+    name: "Waves",
+    status: "in_progress",
+    progress: { done: 0, total: 10 },
+    after: [],
+    items: [
+      { title: "Root", spec: "specs/43/43a-root.md", after: [] },
+      { title: "Controls: plain and primary buttons", spec: "specs/43/43b-buttons.md", after: ["43a"] },
+      { title: "The sidebar shows where you are", spec: "specs/43/43c-sidebar.md", after: ["43b"] },
+      { title: "Make the primary button clearer", spec: "specs/43/43d-primary.md", after: ["43b"] },
+      { title: "The transcript is flat", spec: "specs/43/43e-transcript.md", after: ["43a"] },
+      { title: "Each column scrolls on its own", spec: "specs/43/43g-columns.md", after: ["43a"] },
+      { title: "Roadmap arrows connect", spec: "specs/43/43i-arrows.md", after: ["43a"] },
+      { title: "A task finishes", spec: "specs/43/43h-finish.md", after: ["43e"] },
+      { title: "One task per line", spec: "specs/43/43j-wave.md", after: ["43i"] },
+      { title: "Roadmap waves", spec: "specs/43/43f-waves.md", after: ["43c", "43d", "43e"] },
+    ],
+  };
+  const roadmap = JSON.stringify({ goal: "Phase 43 graph", phases: [phase] });
+  const client = fakeClient(roadmap, {
+    specFilesReply: { paths: [followUpPath] },
+    fileOverrides: { [followUpPath]: "# 43iF — Forks and merges inside a phase\nbody" },
+  });
+  const document = new FakeDocument();
+  await start({ global: {}, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const phaseNode = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "43");
+  const waves = find(phaseNode, (node) => node.className === "roadmap-waves");
+  const waveNodes = waves.children.filter((node) => node.className === "roadmap-wave");
+  assert.equal(waveNodes.length, 4);
+  const secondWaveTasks = walk(waveNodes[1]).filter((node) => node.className.startsWith("roadmap-task "));
+  assert.deepEqual(secondWaveTasks.map((task) => task.textContent), [
+    "43b  Controls: plain and primary buttons", "43e  The transcript is flat",
+    "43g  Each column scrolls on its own", "43i  Roadmap arrows connect",
+  ]);
+  assert.deepEqual(secondWaveTasks.map((task) => task.attributes.get("title")), secondWaveTasks.map((task) => task.textContent.slice(5)));
+  const followUp = find(waveNodes[1], (node) => node.className === "roadmap-follow-up");
+  assert.equal(followUp.textContent, "43iF  Forks and merges inside a phase");
+  assert.equal(walk(phaseNode).some((node) => node.className.startsWith("roadmap-edge")), false);
+  await followUp.dispatch("click");
+  assert.ok(client.calls.file.includes(followUpPath));
+});
+
+test("two-column phase tasks keep their titles in the buttons", async () => {
+  const roadmap = JSON.stringify({
+    goal: "Two columns",
+    phases: [{
+      id: "43", name: "Two tasks", status: "in_progress", after: [], progress: { done: 0, total: 2 },
+      items: [
+        { title: "Root", spec: "specs/43/43a-root.md", after: [] },
+        { title: "Task B", spec: "specs/43/43b-task.md", after: ["43a"] },
+        { title: "Task C", spec: "specs/43/43c-task.md", after: ["43a"] },
+      ],
+    }],
+  });
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient(roadmap) });
+  const phaseNode = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "43");
+  const graph = find(phaseNode, (node) => node.className === "roadmap-waves");
+  const buttons = walk(graph).filter((node) => node.className.startsWith("roadmap-task "));
+  assert.deepEqual(buttons.slice(1).map((button) => button.textContent), ["43b  Task B", "43c  Task C"]);
+});
+
+test("roadmap phases use waves and the overview arrow stays a CSS shape", async () => {
+  const roadmap = JSON.stringify({ goal: "Waves", phases: [
+    { id: "43", name: "Current", status: "in_progress", after: [], items: [
+      { title: "Root", spec: "specs/43/43a-root.md", after: [] },
+      { title: "Parallel", spec: "specs/43/43b-parallel.md", after: ["43a"] },
+    ] },
+    { id: "44", name: "Next", status: "next", items: [] },
+  ] });
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient(roadmap) });
+  const rail = document.getElementById("roadmap");
+  const phase = find(rail, (node) => node.attributes.get("data-phase-id") === "43");
+  const waves = find(phase, (node) => node.className === "roadmap-waves");
+  assert.ok(waves);
+  assert.equal(walk(phase).some((node) => node.className.startsWith("roadmap-edge")), false);
+  assert.equal(walk(rail).filter((node) => node.className === "roadmap-edge").length, 1);
+
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const rule = (selector) => css.match(
+    new RegExp(`(?:^|\\n)${selector}\\s*\\{([^}]*)\\}`),
+  )?.[1] ?? "";
+  const edge = rule("\\.roadmap-edge");
+  const edgeStem = rule("\\.roadmap-edge::before");
+  const edgeHead = rule("\\.roadmap-edge::after");
+  assert.match(edgeStem, /left:\s*50%;/);
+  assert.match(edgeStem, /border-left:\s*1px solid var\(--ui-text-secondary\);/);
+  assert.match(edgeHead, /border-top:\s*0\.3rem solid var\(--ui-text-secondary\);/);
+  assert.match(edge, /position:\s*relative;/);
+  assert.doesNotMatch(edgeStem + edgeHead, /content:\s*["'][^"']+["']/);
+  assert.doesNotMatch(css, /--edge-bend|roadmap-edge-through|roadmap-graph-compact|\.roadmap-box\b/);
 });
 
 test("independent phases stack in a parallel rail group and task clicks open the spec", async () => {
@@ -1469,7 +1786,7 @@ test("independent phases stack in a parallel rail group and task clicks open the
   const group = find(rail, (node) => node.className === "roadmap-phase-group");
   assert.deepEqual(group.children.map((node) => node.attributes.get("data-phase-id")), ["37", "38"]);
   const phase37 = find(rail, (node) => node.attributes.get("data-phase-id") === "37");
-  const task = find(phase37, (node) => node.className === "roadmap-box-button");
+  const task = find(phase37, (node) => node.className.startsWith("roadmap-task "));
   await task.dispatch("click");
   assert.match(visibleText(document.getElementById("spec")), /37a-task-a\.md/);
 });
@@ -1497,13 +1814,13 @@ test("spec file listing connects cross-phase follow-ups to the graph and viewer"
 
   const rail = document.getElementById("roadmap");
   const priorPhase = find(rail, (node) => node.attributes.get("data-phase-id") === "37");
-  const priorGraph = find(priorPhase, (node) => node.className === "roadmap-graph");
+  const priorGraph = find(priorPhase, (node) => node.className === "roadmap-waves");
   assert.equal(find(priorGraph, (node) => node.className === "roadmap-follow-up").textContent, "37eF  Fix the goal");
   const currentPhase = find(rail, (node) => node.attributes.get("data-phase-id") === "39");
-  assert.ok(find(currentPhase, (node) => node.className === "roadmap-graph"));
+  assert.ok(find(currentPhase, (node) => node.className === "roadmap-waves"));
   assert.ok(!find(currentPhase, (node) => node.className === "roadmap-graph-error"));
 
-  await find(priorGraph, (node) => node.className === "roadmap-box-button").dispatch("click");
+  await find(priorGraph, (node) => node.className.startsWith("roadmap-task ")).dispatch("click");
   assert.match(visibleText(document.getElementById("spec")), /37eF-fix-the-goal/);
   assert.equal(client.calls.specFiles, 1);
 });
@@ -1519,8 +1836,8 @@ test("spec file listing failure keeps the bound roadmap paths", async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   const phase = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "18");
-  assert.ok(find(phase, (node) => node.className === "roadmap-graph"));
-  assert.equal(find(phase, (node) => node.className === "roadmap-box-button").textContent, "18a  Open boundary");
+  assert.ok(find(phase, (node) => node.className === "roadmap-waves"));
+  assert.equal(find(phase, (node) => node.className.startsWith("roadmap-task ")).textContent, "18a  Open boundary");
 });
 
 test("conversation context and per-agent usage render and refresh after compaction", async () => {
@@ -1556,14 +1873,14 @@ test("conversation context and per-agent usage render and refresh after compacti
   await start({ global: {}, document, client });
 
   const usage = find(document.body, (value) => value.className === "conversation-usage");
-  assert.equal(usage.textContent, "openai / gpt-test · Mode ask · Context 120 / 160 tokens · 42 tokens");
+  assert.equal(usage.textContent, "gpt-test");
   assert.doesNotMatch(usage.textContent, /USD|undefined/);
-  assert.match(visibleText(document.getElementById("agents")), /leader · running · thinking · 30 tokens · USD 0\.004/);
-  assert.match(visibleText(document.getElementById("agents")), /researcher · running · thinking · 12 tokens/);
+  assert.match(agentRowText(find(document.getElementById("agents"), (row) => row.className === "agent-row")), /leader · running · thinking · 30 tokens · USD 0\.004/);
+  assert.match(agentRowText(find(document.getElementById("agents"), (row) => row.className === "agent-row" && agentRowText(row).startsWith("researcher"))), /researcher · running · thinking · 12 tokens/);
   assert.doesNotMatch(visibleText(document.body), new RegExp(`${secret}|${absolutePath}`));
 
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id" }));
-  assert.equal(usage.textContent, "Context 65 / 160 tokens · 50 tokens · USD 0.007");
+  assert.equal(usage.textContent, "");
   assert.equal(client.calls.conversationStats, 2);
 });
 
@@ -1713,16 +2030,163 @@ test("new chat clears the transcript and the next prompt adds a session link", a
   ]);
 });
 
-test("composer keeps attachment controls inside the form", async () => {
+test("composer box contains only the text, attachment chips, and error line", async () => {
   const document = new FakeDocument();
   await start({ global: {}, document, client: fakeClient() });
   const form = document.getElementById("prompt-form");
   assert.deepEqual(form.children.map((child) => child.id || child.className), [
-    "jump-latest", "prompt", "prompt-attachments", "attachment-picker", "attach-button",
-    "send-button", "prompt-error", "stop-button", "conversation-usage",
+    "prompt", "prompt-attachments", "prompt-error",
   ]);
   assert.equal(walk(form).some((node) => node.tagName === "SELECT"), false);
-  assert.equal(document.getElementById("attachment-picker").type, "file");
+  assert.equal(walk(form).some((node) => node.tagName === "BUTTON" || node.tagName === "INPUT"), false);
+  const usage = find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage"));
+  assert.equal(usage.parentNode, document.getElementById("chat-pane"));
+  assert.equal(document.getElementById("chat-pane").children.indexOf(usage), document.getElementById("chat-pane").children.indexOf(form) + 1);
+});
+
+test("status line defaults to model and effort and always shows a non-ask mode", async () => {
+  const document = new FakeDocument();
+  let current = {
+    provider: "openai", model: "gpt-5.6-terra", effort: "low", mode: "ask",
+    context: { used_tokens: 4, budget_tokens: 10 }, usage: { total_tokens: 8 },
+  };
+  const client = fakeClient(fixtureRoadmap(), { conversation: current });
+  client.conversationStats = async () => ({ conversation: current });
+  client.selectMode = async (mode) => {
+    client.calls.selectMode.push(mode);
+    current = { ...current, mode };
+    return { mode };
+  };
+  await start({ global: {}, document, client });
+  const status = find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage"));
+  assert.equal(status.textContent, "gpt-5.6-terra low");
+  // The live mode picker path exercises the same status renderer.
+  document.getElementById("prompt").value = "/mode";
+  await document.getElementById("prompt-form").dispatch("submit");
+  const picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
+  await picker.dispatch("keydown", { key: "ArrowDown" });
+  await picker.dispatch("keydown", { key: "Enter" });
+  assert.equal(status.textContent, "gpt-5.6-terra low · plan");
+});
+
+test("status line settings use a heading and provider and model toggle independently", async () => {
+  const document = new FakeDocument();
+  const conversation = {
+    provider: "openai", model: "gpt-5.6-terra", effort: "low", mode: "ask",
+  };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  client.conversationStats = async () => ({ conversation });
+  await start({ global: fakeGlobal({ fragment: "#/settings/general" }).global, document, client });
+
+  const page = document.getElementById("page");
+  const group = find(page, (node) => node.className === "status-line-settings");
+  assert.equal(group.tagName, "SECTION");
+  assert.equal(group.children[0].tagName, "H3");
+  assert.equal(group.children[0].textContent, "Status line");
+  assert.equal(walk(group).some((node) => node.tagName === "LEGEND"), false);
+
+  const status = find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage"));
+  const provider = find(group, (node) => node.attributes.get("aria-label") === "Provider");
+  const model = find(group, (node) => node.attributes.get("aria-label") === "Model");
+  const effort = find(group, (node) => node.attributes.get("aria-label") === "Effort");
+  model.checked = false;
+  await model.dispatch("change");
+  effort.checked = false;
+  await effort.dispatch("change");
+  provider.checked = true;
+  await provider.dispatch("change");
+  assert.equal(status.textContent, "openai");
+  model.checked = true;
+  await model.dispatch("change");
+  assert.equal(status.textContent, "openai / gpt-5.6-terra");
+  effort.checked = true;
+  await effort.dispatch("change");
+  assert.equal(status.textContent, "openai / gpt-5.6-terra low");
+});
+
+test("status line settings persist checked fields and storage failures use defaults", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/general" });
+  const document = new FakeDocument();
+  const conversation = {
+    provider: "openai", model: "gpt-5.6-terra", effort: "low", mode: "ask",
+    context: { used_tokens: 4, budget_tokens: 10 },
+  };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  await start({ global: browser.global, document, client });
+  const context = find(document.getElementById("page"), (node) => node.attributes.get("aria-label") === "Context");
+  assert.equal(context.checked, false);
+  context.checked = true;
+  await context.dispatch("change");
+  const saved = browser.writes.find(([key]) => key === "symphonai.status-line")[1];
+  assert.match(find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage")).textContent, /Context 4 \/ 10 tokens/);
+
+  const reloaded = new FakeDocument();
+  await start({
+    global: fakeGlobal({ fragment: "#/settings/general", statusStored: saved }).global,
+    document: reloaded,
+    client: fakeClient(fixtureRoadmap(), { conversation }),
+  });
+  assert.equal(find(reloaded.getElementById("page"), (node) => node.attributes.get("aria-label") === "Context").checked, true);
+
+  const blockedDocument = new FakeDocument();
+  await start({
+    global: fakeGlobal({ storageThrows: true }).global,
+    document: blockedDocument,
+    client: fakeClient(fixtureRoadmap(), { conversation }),
+  });
+  assert.equal(find(blockedDocument.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage")).textContent, "gpt-5.6-terra low");
+});
+
+test("every CSS id selector targets an element in index.html", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const index = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const selectors = css
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/url\([^)]*\)/gi, "")
+    .replace(/#(?:[\da-f]{3,8})(?![\w-])/gi, "");
+  const ids = new Set([...selectors.matchAll(/#([\w-]+)/g)].map((match) => match[1]));
+  const missing = [...ids].filter((id) => !new RegExp(`\\bid=[\"']${id}[\"']`).test(index));
+  assert.deepEqual(missing, []);
+});
+
+test("every FakeDocument id exists in index.html", async () => {
+  const index = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const indexIds = new Set([...index.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
+  const fakeIds = new FakeDocument().elements.keys();
+  assert.deepEqual([...fakeIds].filter((id) => !indexIds.has(id)), []);
+});
+
+test("composer is one bordered box with the attachments, input, and bottom line in order", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const rule = (selector) => css.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+  const box = rule("#prompt-form");
+  const focusBox = rule("#prompt-form:focus-within");
+  const attachments = rule("#prompt-attachments");
+  const textarea = rule("#prompt-form textarea");
+  const textareaFocus = rule("#prompt-form textarea:focus");
+  const usage = rule("\\.conversation-usage");
+  const error = [...css.matchAll(/\.prompt-error\s*\{([^}]*)\}/g)].at(-1)?.[1] ?? "";
+
+  assert.match(box, /border:\s*1px solid var\(--ui-control-border\);/);
+  assert.match(box, /border-radius:\s*var\(--radius-composer\);/);
+  assert.match(box, /background:\s*var\(--ui-panel\);/);
+  assert.match(box, /padding:\s*var\(--space-2\) var\(--space-3\);/);
+  assert.match(focusBox, /border-color:\s*var\(--ui-accent\);/);
+  assert.match(focusBox, /outline:\s*1px solid var\(--ui-accent\);/);
+
+  const formGrid = rule("\\.prompt-form");
+  assert.match(formGrid, /grid-template-columns:\s*minmax\(0, 1fr\);/);
+  assert.match(usage, /text-align:\s*left;/);
+  assert.match(rule("#prompt-attachments:empty"), /display:\s*none;/);
+
+  assert.match(textarea, /border:\s*0;/);
+  assert.match(textarea, /background:\s*transparent;/);
+  assert.match(textarea, /padding:\s*0;/);
+  assert.match(textarea, /resize:\s*none;/);
+  assert.match(textarea, /min-height:\s*calc\(1\.55em \* 3\);/);
+  assert.match(textareaFocus, /outline:\s*none;/);
+  assert.match(usage, /white-space:\s*nowrap;/);
+  assert.match(usage, /text-overflow:\s*ellipsis;/);
 });
 
 test("mode picker marks the current mode and selects with keyboard without prompting", async () => {
@@ -1751,8 +2215,8 @@ test("mode picker marks the current mode and selects with keyboard without promp
   assert.deepEqual(client.calls.selectMode, ["plan"]);
   assert.deepEqual(client.calls.prompt, []);
   assert.equal(input.focused, true);
-  const status = find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage"));
-  assert.match(status.textContent, /Mode plan/);
+  const status = find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage"));
+  assert.equal(status.textContent, "gpt-old · plan");
   assert.match(status.className, /plan/);
   assert.match(visibleText(document.getElementById("chat")), /Mode set to plan/);
 });
@@ -1971,7 +2435,7 @@ test("effort picker starts at the current level and applies the keyboard choice"
   assert.equal(document.getElementById("prompt").value, "");
   assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
   assert.match(visibleText(document.getElementById("chat")), /Effort set to xhigh\./);
-  assert.match(find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage")).textContent, /Effort xhigh/);
+  assert.match(find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage")).textContent, /xhigh/);
 });
 
 test("typed effort validates listed values and applies valid values without a picker", async () => {
@@ -1998,7 +2462,7 @@ test("typed effort validates listed values and applies valid values without a pi
   assert.deepEqual(client.calls.selectProvider, [{ name: "anthropic", model: "claude-sonnet-5", effort: "low" }]);
   assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
   assert.match(visibleText(document.getElementById("chat")), /claude-sonnet-5 accepts: low, medium, high, xhigh, max\./);
-  assert.match(find(document.getElementById("prompt-form"), (node) => node.className.includes("conversation-usage")).textContent, /Effort low/);
+  assert.match(find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage")).textContent, /low/);
 });
 
 test("effort handles models without effort support and unknown effort listings", async () => {
@@ -2161,7 +2625,7 @@ test("page navigation preserves the rendered transcript and stores the route", a
   const chatPane = document.getElementById("chat-pane");
 
   await client.emit(eventFrame("AssistantTextDelta", { text: "still here" }));
-  await find(links, (value) => value.textContent === "Settings").dispatch("click");
+  await find(document.getElementById("sidebar"), (value) => value.textContent === "Settings").dispatch("click");
   assert.equal(page.children[0].className, "settings-pane");
   assert.equal(app.route().page, "settings");
   assert.equal(browser.global.location.hash, "#/settings");
@@ -2191,7 +2655,7 @@ test("the removed roadmap route falls back to chat unless a URL fragment wins", 
   assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
 });
 
-test("sidebar links to Settings and Changes, and keeps a home link", async () => {
+test("sidebar places Settings after the scrolling conversation list", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/general" });
   const longTitle = "A very long session title wider than the sidebar";
@@ -2202,21 +2666,139 @@ test("sidebar links to Settings and Changes, and keeps a home link", async () =>
   const sidebar = document.getElementById("sidebar");
   const links = document.getElementById("page-links");
 
-  assert.deepEqual(links.children.map((link) => link.textContent), ["Settings", "Changes"]);
+  const settingsLink = sidebar.children.at(-1);
+  assert.deepEqual(links.children.map((link) => link.textContent), ["Chat"]);
+  assert.equal(settingsLink.textContent, "Settings");
+  assert.equal(settingsLink.className, "icon-settings");
+  assert.equal(settingsLink.attributes.get("aria-current"), "page");
+  assert.ok(find(document.getElementById("status-rail"), (node) => node.id === "changes"));
   assert.doesNotMatch(visibleText(sidebar), /Roadmap/);
   assert.deepEqual(sidebar.children, [
     document.getElementById("home-link"),
     document.getElementById("new-chat"),
     links,
     find(sidebar, (node) => node.className === "projects"),
+    settingsLink,
   ]);
   assert.equal(sidebar.children[0], document.getElementById("home-link"));
   const sessionLink = find(sidebar, (node) => node.className === "session-link");
   assert.equal(sessionLink.attributes.get("title"), longTitle);
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  assert.match(css, /\.icon-settings\s*\{[^}]*--icon-image:\s*url\("data:image\/svg\+xml,[^"]*%3Cpath[^}]*%3Ccircle/s);
+  assert.match(css, /\.changes-file,\s*\.changes-worktree,/);
+  await links.children[0].dispatch("click");
+  assert.equal(browser.global.location.hash, "#/chat");
+  assert.deepEqual(document.getElementById("page").children, [document.getElementById("chat-pane")]);
   await document.getElementById("home-link").dispatch("click");
   assert.equal(browser.global.location.hash, "#/chat");
   assert.deepEqual(document.getElementById("page").children, [document.getElementById("chat-pane")]);
   assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-overview"));
+});
+
+test("sidebar tracks the active page and Settings section", async () => {
+  const document = new FakeDocument();
+  const { global } = fakeGlobal();
+  await start({ global, document, client: fakeClient() });
+  const links = document.getElementById("page-links");
+  const settingsLink = find(document.getElementById("sidebar"), (link) => link.className === "icon-settings");
+  const page = document.getElementById("page");
+  const currentPages = () => [...links.children, settingsLink]
+    .filter((link) => link.attributes.get("aria-current") === "page");
+
+  assert.deepEqual(currentPages().map((link) => link.textContent), ["Chat"]);
+  await settingsLink.dispatch("click");
+  assert.deepEqual(currentPages().map((link) => link.textContent), ["Settings"]);
+  const sections = find(page, (node) => node.className === "settings-sections");
+  assert.deepEqual(sections.children.filter((link) => link.attributes.get("aria-current"))
+    .map((link) => link.textContent), ["General"]);
+
+  const mcp = sections.children.find((link) => link.textContent === "Mcp");
+  await mcp.dispatch("click");
+  assert.deepEqual(currentPages().map((link) => link.textContent), ["Settings"]);
+  assert.deepEqual(sections.children.filter((link) => link.attributes.get("aria-current"))
+    .map((link) => link.textContent), ["Mcp"]);
+  await links.children[0].dispatch("click");
+  assert.deepEqual(currentPages().map((link) => link.textContent), ["Chat"]);
+  assert.deepEqual(sections.children.filter((link) => link.attributes.get("aria-current")), []);
+});
+
+test("settings section highlight compares route sections with browser-style hrefs", async () => {
+  const document = new FakeDocument();
+  const { global } = fakeGlobal({ fragment: "#/settings/mcp" });
+  await start({ global, document, client: fakeClient() });
+  const sections = find(document.getElementById("page"), (node) => node.className === "settings-sections");
+  const selected = sections.children.filter((link) => link.attributes.get("aria-current") === "page");
+
+  assert.deepEqual(selected.map((link) => link.textContent), ["Mcp"]);
+  assert.equal(selected[0].href, "http://127.0.0.1/app/#/settings/mcp");
+  assert.equal(selected[0].attributes.get("href"), "#/settings/mcp");
+});
+
+test("session buttons keep the centred navigation row styles", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const buttonRule = css.match(/button\.session-link\s*\{([^}]*)\}/)?.[1] ?? "";
+  const sessionType = [...css.matchAll(/\.session-link\s*\{([^}]*)\}/g)]
+    .find((match) => /font-size:/.test(match[1]))?.[1] ?? "";
+  const metadataSelectors = css.match(/(?:^|\n)(\.conversation-usage,[\s\S]*?\.roadmap-task)\s*\{/)?.[1] ?? "";
+
+  assert.match(buttonRule, /width:\s*calc\(100% - 1rem\);/);
+  assert.match(buttonRule, /text-align:\s*left;/);
+  assert.doesNotMatch(buttonRule, /display:\s*block;|padding:\s*(?:var\(--space-\d+\)|\d+(?:\.\d+)?(?:px|rem)?)\s/);
+  assert.match(sessionType, /font-size:\s*0\.8125rem;/);
+  assert.ok(metadataSelectors);
+  assert.doesNotMatch(metadataSelectors, /\.session-link/);
+});
+
+test("sidebar marks the open conversation and rolls back selection on failure", async () => {
+  const document = new FakeDocument();
+  const sessions = [
+    { run_id: "a", title: "Conversation A", repo_root: "/work/current" },
+    { run_id: "b", title: "Conversation B", repo_root: "/work/current" },
+  ];
+  const client = fakeClient(fixtureRoadmap(), { sessions });
+  const openSession = client.openSession;
+  client.openSession = async (runId) => {
+    if (runId === "a") throw new Error("could not open");
+    return openSession(runId);
+  };
+  await start({ global: {}, document, client });
+  const sidebar = document.getElementById("sidebar");
+  const sessionLink = (title) => find(sidebar, (node) =>
+    node.className === "session-link" && node.textContent === title
+  );
+  const currentSessions = () => walk(sidebar).filter((node) =>
+    node.className === "session-link" && node.attributes.get("aria-current") === "true"
+  );
+
+  assert.deepEqual(currentSessions(), []);
+  await sessionLink("Conversation B").dispatch("click");
+  assert.deepEqual(currentSessions().map((node) => node.textContent), ["Conversation B"]);
+  await assert.rejects(sessionLink("Conversation A").dispatch("click"), /could not open/);
+  assert.deepEqual(currentSessions().map((node) => node.textContent), ["Conversation B"]);
+  await document.getElementById("new-chat").dispatch("click");
+  assert.deepEqual(currentSessions(), []);
+});
+
+test("sidebar navigation rows use selected and hover styles", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const current = css.match(/#page-links a\[aria-current="page"\][\s\S]*?\{([^}]*)\}/)?.[1] ?? "";
+  const settingsCurrent = css.match(/#sidebar > \.icon-settings\[aria-current="page"\][\s\S]*?\{([^}]*)\}/)?.[1] ?? "";
+  const session = css.match(/\.session-link\[aria-current="true"\][\s\S]*?\{([^}]*)\}/)?.[1] ?? "";
+  const rows = css.match(/#page-links a,[\s\S]*?#sidebar > \.icon-settings,[\s\S]*?\.session-link\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(current, /background:\s*var\(--ui-selected\);/);
+  assert.match(settingsCurrent, /background:\s*var\(--ui-selected\);/);
+  assert.match(session, /background:\s*var\(--ui-selected\);/);
+  assert.match(current, /font-weight:\s*600;/);
+  assert.match(session, /font-weight:\s*600;/);
+  assert.match(rows, /min-height:\s*2rem;/);
+  assert.match(rows, /align-items:\s*center;/);
+  assert.match(rows, /padding:\s*0 var\(--space-2\);/);
+  assert.match(rows, /border-radius:\s*var\(--radius-control\);/);
+  assert.match(rows, /text-decoration:\s*none;/);
+  assert.match(css, /#page-links a:hover,[\s\S]*?background:\s*var\(--ui-hover\);/);
+  assert.match(css, /#sidebar > \.icon-settings:hover,[\s\S]*?background:\s*var\(--ui-hover\);/);
+  assert.match(css, /#home-link\s*\{[^}]*font-size:\s*0\.875rem;[^}]*font-weight:\s*600;[^}]*cursor:\s*pointer;/);
 });
 
 test("session list scrolls below page links inside the fixed sidebar", async () => {
@@ -2230,7 +2812,7 @@ test("session list scrolls below page links inside the fixed sidebar", async () 
   assert.match(sidebar, /overflow:\s*hidden;/);
   assert.match(sidebar, /overflow-x:\s*hidden;/);
   assert.match(projects, /overflow-x:\s*hidden;/);
-  const sessionLink = css.match(/\.session-link\s*\{([^}]*)\}/)?.[1] ?? "";
+  const sessionLink = css.match(/\.project-status,\s*\.project-empty,\s*\.session-link\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.match(sessionLink, /white-space:\s*nowrap;/);
   assert.match(sessionLink, /overflow:\s*hidden;/);
   assert.match(sessionLink, /text-overflow:\s*ellipsis;/);
@@ -2240,79 +2822,20 @@ test("session list scrolls below page links inside the fixed sidebar", async () 
   assert.doesNotMatch(css, /#page-links\s*\{[^}]*display:\s*none;/);
 });
 
-test("Changes page renders files and prompts, retries outside edits, and refreshes", async () => {
+test("agent Save remains the primary action", async () => {
   const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), {
-    changes: {
-      turns: [{ key: "chk-one", prompt: "Update the source", paths: ["a.py"] }],
-      files: [{
-        path: "a.py",
-        status: "modified",
-        changed_outside: true,
-        diff: "-before\n+after",
-        truncated: false,
-      }],
-    },
-    revertConflictPaths: ["a.py"],
-  });
+  const client = fakeClient();
   await start({ global: {}, document, client });
-  const page = document.getElementById("page");
-  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes")
-    .dispatch("click");
-  await Promise.resolve();
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.doesNotMatch(html, /id="(?:attach-button|send-button|stop-button|attachment-picker)"/);
+  assert.equal((html.match(/class="[^"]*\bprimary\b[^"]*"/g) ?? []).length, 0);
 
-  assert.equal(client.calls.changes, 1);
-  assert.match(visibleText(page), /a\.py · modified/);
-  assert.match(visibleText(page), /Changed outside the agent/);
-  assert.match(visibleText(page), /Update the source/);
-  assert.match(visibleText(page), /-before\n\+after/);
-  await find(page, (value) => value.textContent === "Revert").dispatch("click");
-  assert.deepEqual(client.calls.revertChanges, [{ path: "a.py" }]);
-  assert.match(visibleText(page), /Revert anyway/);
-  assert.match(visibleText(page), /a\.py/);
-
-  await find(page, (value) => value.textContent === "Revert anyway").dispatch("click");
-  assert.deepEqual(client.calls.revertChanges, [
-    { path: "a.py" },
-    { path: "a.py", force: true },
-  ]);
-  assert.equal(client.calls.changes, 2);
-  assert.match(visibleText(page), /No changes in this conversation/);
-
-  await document.getElementById("home-link").dispatch("click");
-  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes")
-    .dispatch("click");
-  await Promise.resolve();
-  assert.equal(client.calls.changes, 3);
-});
-
-test("Changes page applies worktrees, shows conflicts, and reloads after success", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), {
-    changes: {
-      turns: [], files: [],
-      worktrees: [{ name: "w1", files: ["a.py"], diff: "-before\n+after", truncated: false }],
-    },
-    worktreeConflict: true,
-  });
-  await start({ global: {}, document, client });
-  const page = document.getElementById("page");
-  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes")
-    .dispatch("click");
-  await Promise.resolve();
-  assert.match(visibleText(page), /w1/);
-  assert.match(visibleText(page), /-before\n\+after/);
-  assert.match(visibleText(page), /Not applied — these changes are in the worktree, not your files\./);
-  assert.ok(find(page, (value) => value.textContent === "Discard worktree"));
-  await find(page, (value) => value.textContent === "Apply worktree").dispatch("click");
-  await Promise.resolve();
-  assert.deepEqual(client.calls.applyWorktree, ["w1"]);
-  assert.match(visibleText(page), /patch does not apply/);
-  await find(page, (value) => value.textContent === "Apply worktree").dispatch("click");
-  await Promise.resolve();
-  assert.deepEqual(client.calls.applyWorktree, ["w1", "w1"]);
-  assert.equal(client.calls.changes, 2);
-  assert.match(visibleText(page), /No changes in this conversation/);
+  const settingsLink = find(document.getElementById("sidebar"), (value) => value.className === "icon-settings");
+  await settingsLink.dispatch("click");
+  await find(document.getElementById("page"), (value) => value.textContent === "Agents").dispatch("click");
+  const settings = document.getElementById("page");
+  await find(settings, (value) => value.textContent === "New agent").dispatch("click");
+  assert.equal(find(settings, (value) => value.className === "agent-save primary").textContent, "Save");
 });
 
 test("approvals from another conversation show its title and open that session", async () => {
@@ -2337,7 +2860,323 @@ test("approvals from another conversation show its title and open that session",
   assert.match(waiting.textContent, /waiting/);
 });
 
-test("agent rail keeps every conversation agent with current and last activity", async () => {
+test("agent rail tools replace section headings and keep separated rows", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  assert.match(html, /id="rail-tabs" class="rail-tabs" role="tablist"/);
+  assert.match(html, /id="agents" class="rail-pane"/);
+  assert.match(html, /id="roadmap" class="rail-pane" role="tabpanel" hidden/);
+  assert.match(html, /id="changes" class="rail-pane changes-pane" role="tabpanel" hidden/);
+  assert.match(html, /id="spec" class="rail-pane spec-view"[^>]*hidden/);
+  assert.match(html, /id="files" class="rail-pane files-pane" role="tabpanel" hidden/);
+  assert.match(html, /id="rail-tools" class="rail-tools"/);
+  assert.doesNotMatch(html, /<h2 class="rail-title/);
+  assert.match(css, /\.rail-tab\[aria-selected="true"\]\s*\{[^}]*background:\s*var\(--ui-selected\);/s);
+  assert.match(css, /\.rail-pane,\s*\.rail-tools\s*\{[^}]*overflow:\s*auto;/s);
+  assert.match(css, /\.agent-row\s*\{[^}]*padding:\s*var\(--space-2\) 0;/s);
+  assert.match(css, /#agents\s*>\s*\.agent-row\s*\+\s*\.agent-row\s*\{[^}]*border-top:\s*1px solid var\(--ui-border\);/s);
+  assert.doesNotMatch(css, /\.agent-children\s*>\s*\.agent-row\s*\+\s*\.agent-row\s*\{[^}]*border-top:/s);
+  assert.match(css, /\.icon-tool-files\s*\{[^}]*--icon-image:\s*url\("data:image\/svg\+xml,/s);
+  assert.match(css, /\.files-name\s*\{[^}]*text-overflow:\s*ellipsis/s);
+  assert.match(css, /\.files-source\s*\{[^}]*overflow:\s*auto[^}]*grid-template-columns:/s);
+  assert.match(css, /\.files-line-numbers\s*\{[^}]*user-select:\s*none/s);
+});
+
+test("rail tabs open tools, close to the Tools list, and persist the selected layout", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  await start({ global: browser.global, document, client });
+  const tabs = document.getElementById("rail-tabs");
+  const agents = document.getElementById("agents");
+  const roadmap = document.getElementById("roadmap");
+  const changes = document.getElementById("changes");
+  const tools = document.getElementById("rail-tools");
+  const tabButtons = () => find(tabs, (node) => node.className === "rail-tab-item")
+    ? tabs.children.filter((node) => node.className === "rail-tab-item").map((row) => row.children[0])
+    : [];
+
+  assert.deepEqual(tabButtons().map((tab) => tab.textContent || tab.attributes.get("aria-label")), ["Agents", "Roadmap"]);
+  assert.equal(tabButtons()[0].attributes.get("aria-selected"), "true");
+  assert.equal(agents.hidden, false);
+  assert.equal(roadmap.hidden, true);
+  assert.equal(changes.hidden, true);
+  assert.equal(document.getElementById("spec").hidden, true);
+  assert.equal(document.getElementById("files").hidden, true);
+  assert.equal(tools.hidden, true);
+
+  const add = tabs.children.at(-1);
+  assert.equal(add.attributes.get("aria-label"), "Open a tool");
+  await find(tabs, (node) => node.attributes.get("aria-label") === "Close Agents").dispatch("click");
+  await find(tabs, (node) => node.attributes.get("aria-label") === "Close Roadmap").dispatch("click");
+  assert.equal(tools.hidden, false);
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files"]);
+  await tools.children.find((row) => row.textContent === "Changes").dispatch("click");
+  assert.equal(client.calls.changes, 1);
+  assert.deepEqual(tabButtons().map((tab) => tab.textContent || tab.attributes.get("aria-label")), ["Changes"]);
+  assert.equal(tabButtons()[0].attributes.get("aria-selected"), "true");
+  assert.equal(changes.hidden, false);
+  const saved = browser.writes.filter(([key]) => key === "symphonai.rail-tools").at(-1);
+  assert.deepEqual(JSON.parse(saved[1]), { open: ["Changes"], selected: "Changes" });
+
+  const restoredDocument = new FakeDocument();
+  const restored = fakeGlobal({
+    railStored: JSON.stringify({ open: ["Roadmap", "Changes"], selected: "Changes" }),
+  });
+  const restoredClient = fakeClient();
+  await start({ global: restored.global, document: restoredDocument, client: restoredClient });
+  const restoredTabs = restoredDocument.getElementById("rail-tabs").children;
+  assert.deepEqual(restoredTabs.slice(0, -1).map((row) => row.children[0].attributes.get("aria-label")), ["Roadmap", "Changes"]);
+  assert.equal(restoredTabs[1].children[0].attributes.get("aria-selected"), "true");
+  assert.equal(restoredDocument.getElementById("changes").hidden, false);
+  assert.equal(restoredClient.calls.changes, 1);
+
+  const throwingDocument = new FakeDocument();
+  await start({ global: fakeGlobal({ storageThrows: true }).global, document: throwingDocument, client: fakeClient() });
+  assert.deepEqual(throwingDocument.getElementById("rail-tabs").children.slice(0, -1).map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap"]);
+  assert.equal(throwingDocument.getElementById("agents").hidden, false);
+});
+
+test("roadmap task clicks open and reuse the Spec tool tab", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const tasks = () => walk(document.getElementById("roadmap"))
+    .filter((node) => node.className.startsWith("roadmap-task "));
+  const firstTask = tasks()[0];
+  assert.ok(firstTask);
+  await firstTask.dispatch("click");
+  assert.equal(document.getElementById("spec").hidden, false);
+  assert.deepEqual(
+    document.getElementById("rail-tabs").children.slice(0, -1).map((row) => row.children[0].attributes.get("aria-label")),
+    ["Agents", "Roadmap", "Spec"],
+  );
+  assert.equal(document.getElementById("rail-tabs").children[2].children[0].attributes.get("aria-selected"), "true");
+  await tasks()[1].dispatch("click");
+  assert.equal(
+    document.getElementById("rail-tabs").children.filter((row) => row.children[0]?.attributes.get("aria-label") === "Spec").length,
+    1,
+  );
+});
+
+test("Changes tool restores revert conflict and worktree actions", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const reply = {
+    files: [{ path: "a.py", status: "modified", diff: "@@ -1 +1 @@\n-old\n+new" }],
+    turns: [{ key: "turn-1", prompt: "change a.py", paths: ["a.py"] }],
+    worktrees: [{ name: "w1", files: ["b.py"], diff: "+worktree" }],
+  };
+  client.changes = async () => {
+    client.calls.changes += 1;
+    return reply;
+  };
+  client.revertChanges = async (payload) => {
+    client.calls.revertChanges.push(payload);
+    if (client.calls.revertChanges.length === 1) {
+      const error = new Error("changed outside");
+      error.status = 409;
+      error.paths = ["a.py"];
+      throw error;
+    }
+    return {};
+  };
+  await start({ global: {}, document, client });
+  await find(document.getElementById("rail-tabs"), (node) => node.attributes.get("aria-label") === "Open a tool").dispatch("click");
+  await document.getElementById("rail-tools").children.find((row) => row.textContent === "Changes").dispatch("click");
+  const changes = document.getElementById("changes");
+  await find(changes, (node) => node.textContent === "Revert").dispatch("click");
+  assert.deepEqual(client.calls.revertChanges, [{ path: "a.py" }]);
+  assert.match(visibleText(changes), /These files changed outside the agent:.*a\.py/s);
+  await find(changes, (node) => node.textContent === "Revert anyway").dispatch("click");
+  assert.deepEqual(client.calls.revertChanges[1], { path: "a.py", force: true });
+  await find(changes, (node) => node.textContent === "Revert this prompt and later").dispatch("click");
+  assert.deepEqual(client.calls.revertChanges[2], { key: "turn-1" });
+  await find(changes, (node) => node.textContent === "Apply worktree").dispatch("click");
+  await find(changes, (node) => node.textContent === "Discard worktree").dispatch("click");
+  assert.deepEqual(client.calls.applyWorktree, ["w1"]);
+  assert.deepEqual(client.calls.discardWorktree, ["w1"]);
+  assert.equal(client.calls.changes, 5);
+});
+
+test("rail icon tabs show the selected name and move the only close button", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const tabs = document.getElementById("rail-tabs");
+  const openFromTools = async (name) => {
+    await tabs.children.at(-1).dispatch("click");
+    await document.getElementById("rail-tools").children
+      .find((row) => row.textContent === name).dispatch("click");
+  };
+  await openFromTools("Changes");
+  await openFromTools("Spec");
+  const rows = tabs.children.slice(0, -1);
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["", "", "", "Spec"]);
+  assert.deepEqual(rows.map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap", "Changes", "Spec"]);
+  assert.deepEqual(rows.map((row) => row.children[0].attributes.get("title")), ["Agents", "Roadmap", "Changes", "Spec"]);
+  assert.equal(rows[3].attributes.get("aria-selected"), "true");
+  assert.deepEqual(rows.map((row) => row.children.length), [1, 1, 1, 2]);
+  assert.equal(walk(tabs).filter((node) => node.className === "rail-tab-close").length, 1);
+  assert.match(visibleText(document.getElementById("spec")), /Choose a task in Roadmap to open its spec\./);
+
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const rule = (selector) => css.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+  const railTabs = rule("\\.rail-tabs");
+  const railTab = rule("\\.rail-tab");
+  assert.doesNotMatch(railTabs, /overflow-x:\s*(?:auto|scroll);/);
+  assert.match(railTabs, /width:\s*calc\(100% - var\(--space-8\) - var\(--space-3\)\);/);
+  assert.match(railTab, /width:\s*1\.5rem;/);
+  assert.doesNotMatch(railTab, /text-overflow:\s*ellipsis/);
+  for (const icon of ["agents", "roadmap", "changes", "spec", "files"]) {
+    assert.match(css, new RegExp(`\\.icon-tool-${icon}\\s*\\{[^}]*--icon-image:\\s*url\\("data:image/svg\\+xml,`, "s"));
+  }
+
+  await rows[1].children[0].dispatch("click");
+  const selectedRows = tabs.children.slice(0, -1);
+  assert.deepEqual(selectedRows.map((row) => row.children[0].textContent), ["", "Roadmap", "", ""]);
+  assert.equal(selectedRows[1].children[0].attributes.get("aria-selected"), "true");
+  assert.deepEqual(selectedRows.map((row) => row.children.length), [1, 2, 1, 1]);
+  assert.equal(walk(tabs).filter((node) => node.className === "rail-tab-close").length, 1);
+});
+
+test("Files opens on demand, expands in place, keeps line numbers out of source text, and restores its tree", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  client.calls.tree = [];
+  client.calls.source = [];
+  client.tree = async (path = "") => {
+    client.calls.tree.push(path);
+    return path === ""
+      ? { path, entries: [{ name: "src", kind: "dir" }], truncated: false }
+      : { path, entries: [{ name: "a.py", kind: "file" }], truncated: false };
+  };
+  client.source = async (path) => {
+    client.calls.source.push(path);
+    return { path, text: "alpha\nbeta\ngamma" };
+  };
+  await start({ global: browser.global, document, client });
+
+  const tabs = document.getElementById("rail-tabs");
+  const tools = document.getElementById("rail-tools");
+  const files = document.getElementById("files");
+  assert.deepEqual(tabs.children.slice(0, -1).map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap"]);
+  assert.equal(files.hidden, true);
+  await tabs.children.at(-1).dispatch("click");
+  await tools.children.find((row) => row.textContent === "Files").dispatch("click");
+  assert.deepEqual(client.calls.tree, [""]);
+  assert.equal(files.hidden, false);
+
+  const directory = find(files, (node) => node.className.includes("files-directory"));
+  assert.equal(directory.children[1].textContent, "src");
+  await directory.dispatch("click");
+  assert.deepEqual(client.calls.tree, ["", "src"]);
+  const file = find(files, (node) => node.className.includes("files-file"));
+  assert.equal(file.children[1].textContent, "a.py");
+  assert.match(file.attributes.get("style"), /space-4.*1/);
+  await file.dispatch("click");
+  assert.deepEqual(client.calls.source, ["src/a.py"]);
+  const source = find(files, (node) => node.className === "files-source");
+  assert.equal(find(source, (node) => node.className === "files-code").textContent, "alpha\nbeta\ngamma");
+  assert.equal(find(source, (node) => node.className === "files-line-numbers").textContent, "1\n2\n3");
+  await find(files, (node) => node.className === "files-back").dispatch("click");
+  const expanded = find(files, (node) => node.className.includes("files-directory"));
+  assert.equal(expanded.attributes.get("aria-expanded"), "true");
+  assert.ok(find(files, (node) => node.className.includes("files-file")));
+  assert.deepEqual(client.calls.tree, ["", "src"]);
+
+  const saved = browser.writes.filter(([key]) => key === "symphonai.rail-tools").at(-1);
+  assert.ok(JSON.parse(saved[1]).open.includes("Files"));
+  const restoredDocument = new FakeDocument();
+  const restoredClient = fakeClient();
+  restoredClient.calls.tree = [];
+  restoredClient.tree = async (path = "") => {
+    restoredClient.calls.tree.push(path);
+    return { path, entries: [], truncated: false };
+  };
+  await start({
+    global: fakeGlobal({ railStored: saved[1] }).global,
+    document: restoredDocument,
+    client: restoredClient,
+  });
+  assert.deepEqual(restoredDocument.getElementById("rail-tabs").children.slice(0, -1)
+    .map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap", "Files"]);
+  assert.equal(restoredDocument.getElementById("files").hidden, false);
+  assert.deepEqual(restoredClient.calls.tree, [""]);
+});
+
+test("Files displays readable source errors without throwing", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.tree = async (path = "") => ({
+    path, entries: [{ name: "image.png", kind: "file" }], truncated: false,
+  });
+  client.source = async () => {
+    const error = new Error("host request failed with status 415");
+    error.status = 415;
+    throw error;
+  };
+  await start({ global: {}, document, client });
+  const tabs = document.getElementById("rail-tabs");
+  await tabs.children.at(-1).dispatch("click");
+  await document.getElementById("rail-tools").children.find((row) => row.textContent === "Files").dispatch("click");
+  const files = document.getElementById("files");
+  await find(files, (node) => node.className.includes("files-file")).dispatch("click");
+  assert.equal(find(files, (node) => node.className === "files-source-error").textContent, "Not a text file");
+});
+
+test("selected Changes reloads after opening a session, starting a chat, and finishing a run", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [
+      { run_id: "session-one", title: "First chat", repo_root: "/work/current" },
+      { run_id: "session-two", title: "Second chat", repo_root: "/work/current" },
+    ],
+  });
+  await start({ global: {}, document, client });
+  const tabs = document.getElementById("rail-tabs");
+  await tabs.children.at(-1).dispatch("click");
+  await document.getElementById("rail-tools").children
+    .find((row) => row.textContent === "Changes").dispatch("click");
+  assert.equal(client.calls.changes, 1);
+
+  await find(document.getElementById("sidebar"), (node) =>
+    node.className === "session-link" && node.textContent.startsWith("Second chat")
+  ).dispatch("click");
+  assert.equal(client.calls.changes, 2);
+
+  await document.getElementById("new-chat").dispatch("click");
+  assert.equal(client.calls.changes, 3);
+
+  await client.emit(eventFrame("RunFinished", { run_id: "run-current" }));
+  assert.equal(client.calls.changes, 4);
+});
+
+test("agent name and detail styles are scoped to rail rows", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const selectors = [...css.matchAll(/([^{}]+)\{[^{}]*\}/g)]
+    .flatMap(([, group]) => group.split(",").map((selector) => selector.trim()))
+    .filter((selector) => /\.agent-(?:name|detail)\b/.test(selector));
+  assert.ok(selectors.length > 0);
+  for (const selector of selectors) {
+    assert.match(
+      selector,
+      /(?:^|[\s>+~])(?:\.agent-row|#agents)(?=[\s>+~]|$).*\.agent-(?:name|detail)\b/,
+      selector,
+    );
+  }
+});
+
+test("DOM child collections are not called with array-only methods", async () => {
+  const names = await readdir(new URL("../src/", import.meta.url));
+  const arrayOnlyDomChildMethods = /\b(?:line|parent|element|container|row|root|card|taskBlock)\s*(?:\.|\?\.)\s*(?:children|childNodes)\s*(?:\.|\?\.)\s*(?:at|find|filter|map|some|every|reduce|flatMap|slice|includes|indexOf|findIndex|lastIndexOf|forEach|sort|reverse|concat|join|keys|values|entries|copyWithin|fill|flat|toReversed|toSorted|toSpliced|with)\s*\(/;
+  for (const name of names.filter((file) => file.endsWith(".js"))) {
+    const source = await readFile(new URL(`../src/${name}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, arrayOnlyDomChildMethods, name);
+  }
+});
+
+test("agent rail shows current activity and state without controls", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   let conversation = null;
@@ -2356,29 +3195,30 @@ test("agent rail keeps every conversation agent with current and last activity",
 
   let leader = agents.children[0];
   let children = leader.children.find((row) => row.className === "agent-children");
-  assert.equal(leader.textContent, "leader · running · editing app.js");
-  assert.deepEqual(children.children.map((row) => row.textContent), [
-    "worker · finished · last: ran pytest", "researcher",
+  assert.equal(leader.children.find((row) => row.className === "agent-name").textContent, "leader");
+  assert.equal(leader.children.find((row) => row.className === "agent-detail").textContent, "running · editing app.js");
+  assert.equal(agentRowText(leader), "leader · running · editing app.js");
+  assert.deepEqual(children.children.map(agentRowText), [
+    "worker · finished", "researcher",
   ]);
-  assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 1);
-  assert.ok(leader.children.some((row) => row.className === "agent-controls"));
-  assert.ok(children.children.every((row) => row.children.length === 0));
+  assert.equal(children.children[1].children.some((row) => row.className === "agent-detail"), false);
+  assert.equal(walk(agents).some((row) => ["agent-controls", "agent-redirect", "agent-control-error"].includes(row.className)), false);
 
   await client.emit(eventFrame("PermissionRequested", { tool_name: "edit_file" }));
-  assert.equal(agents.children[0].textContent, "leader · waiting for approval · editing app.js");
-  assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 1);
+  assert.equal(agentRowText(agents.children[0]), "leader · waiting for approval · editing app.js");
+  assert.equal(walk(agents).some((row) => ["agent-controls", "agent-redirect", "agent-control-error"].includes(row.className)), false);
   await client.emit(eventFrame("PermissionDenied", { tool_name: "edit_file" }));
   await client.emit(eventFrame("ToolCallFinished", { tool_name: "edit_file" }));
-  assert.equal(agents.children[0].textContent, "leader · running · thinking");
+  assert.equal(agentRowText(agents.children[0]), "leader · running · thinking");
   await client.emit(eventFrame("RunFinished"));
 
   leader = agents.children[0];
   children = leader.children.find((row) => row.className === "agent-children");
-  assert.equal(leader.textContent, "leader · finished · last: edited app.js");
-  assert.deepEqual(children.children.map((row) => row.textContent), [
-    "worker · finished · last: ran pytest", "researcher",
+  assert.equal(agentRowText(leader), "leader · finished");
+  assert.deepEqual(children.children.map(agentRowText), [
+    "worker · finished", "researcher",
   ]);
-  assert.equal(walk(agents).filter((row) => row.className === "agent-controls").length, 0);
+  assert.equal(walk(agents).some((row) => ["agent-controls", "agent-redirect", "agent-control-error"].includes(row.className)), false);
   assert.doesNotMatch(visibleText(agents), /Nothing is running/);
 });
 
@@ -2392,38 +3232,97 @@ test("conversation agents with missing or unknown states show no state word", as
   await start({ global: {}, document, client });
 
   const agents = document.getElementById("agents");
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["researcher", "reviewer"]);
-  assert.equal(find(agents, (row) => row.className === "agent-controls"), undefined);
+  assert.deepEqual(agents.children.map(agentRowText), ["researcher", "reviewer"]);
+  assert.equal(agents.children.every((row) => !row.children.some((child) => child.className === "agent-detail")), true);
+  assert.equal(find(agents, (row) => ["agent-controls", "agent-redirect", "agent-control-error"].includes(row.className)), undefined);
 });
 
-test("agent activity uses the tool verbs, past tense, and optional targets", async () => {
+test("agent activity uses the tool verbs and optional targets while running", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   await start({ global: {}, document, client });
   const agents = document.getElementById("agents");
-  for (const [tool, target, present, past] of [
-    ["read_file", "a.py", "reading a.py", "read a.py"],
-    ["edit_file", "a.py", "editing a.py", "edited a.py"],
-    ["multi_edit_file", "a.py", "editing a.py", "edited a.py"],
-    ["write_file", "a.py", "editing a.py", "edited a.py"],
-    ["run_shell", "pytest", "running pytest", "ran pytest"],
-    ["grep", "src", "searching src", "searched src"],
-    ["glob", "src", "searching src", "searched src"],
-    ["list_files", "src", "searching src", "searched src"],
-    ["web_fetch", "example.com", "fetching example.com", "fetched example.com"],
-    ["web_search", "docs", "searching the web for docs", "searched docs"],
-    ["dispatch_subagent", "worker", "dispatching worker", "dispatched worker"],
-    ["custom_tool", "item", "custom_tool item", "custom_tool item"],
-    ["read_file", undefined, "reading", "read"],
+  for (const [tool, target, present] of [
+    ["read_file", "a.py", "reading a.py"],
+    ["edit_file", "a.py", "editing a.py"],
+    ["multi_edit_file", "a.py", "editing a.py"],
+    ["write_file", "a.py", "editing a.py"],
+    ["run_shell", "pytest", "running pytest"],
+    ["grep", "src", "searching src"],
+    ["glob", "src", "searching src"],
+    ["list_files", "src", "searching src"],
+    ["web_fetch", "example.com", "fetching example.com"],
+    ["web_search", "docs", "searching the web for docs"],
+    ["dispatch_subagent", "worker", "dispatching worker"],
+    ["custom_tool", "item", "custom_tool item"],
+    ["read_file", undefined, "reading"],
   ]) {
     await client.emit(eventFrame("RunStarted", { agent_name: "leader" }));
     await client.emit(eventFrame("ToolCallStarted", { tool_name: tool, ...(target === undefined ? {} : { target }) }));
-    assert.equal(agents.children[0].textContent, `leader · running · ${present}`, tool);
+    assert.equal(agentRowText(agents.children[0]), `leader · running · ${present}`, tool);
     await client.emit(eventFrame("ToolCallFailed", { tool_name: tool }));
-    assert.equal(agents.children[0].textContent, "leader · running · thinking", tool);
+    assert.equal(agentRowText(agents.children[0]), "leader · running · thinking", tool);
     await client.emit(eventFrame("RunFinished"));
-    assert.equal(agents.children[0].textContent, `leader · finished · last: ${past}`, tool);
+    assert.equal(agentRowText(agents.children[0]), "leader · finished", tool);
   }
+});
+
+test("dispatch activity expands its matched subagent task with click and Enter", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "root-run", agent_name: "leader" }));
+  await client.emit(eventFrame("PromptSubmitted", { agent_id: "leader", run_id: "root-run", text: "investigate" }));
+  await client.emit(eventFrame("ToolCallStarted", {
+    agent_id: "leader", run_id: "root-run", tool_call_id: "dispatch", tool_name: "dispatch_subagent", target: "explorer",
+  }));
+  await client.emit(eventFrame("SubagentSpawned", {
+    agent_id: "leader", run_id: "root-run", subagent_name: "explorer", subagent_agent_id: "child",
+  }));
+  await client.emit(eventFrame("PromptSubmitted", { agent_id: "child", run_id: "child-run", text: "find the bug" }));
+  const chat = document.getElementById("chat");
+  const dispatch = find(chat, (node) => node.className.includes("activity"));
+  assert.equal(find(dispatch, (node) => node.className === "activity-text").children.map((node) => node.textContent).join(""), "Dispatched explorer.");
+  assert.equal(find(chat, (node) => node.className === "prompt" && node.textContent === "find the bug"), undefined);
+  assert.equal(find(dispatch, (node) => node.className === "dispatch-tasks"), undefined);
+  await dispatch.click();
+  assert.equal(visibleText(find(find(chat, (node) => node.className.includes("activity")), (node) => node.className === "dispatch-tasks")).trim(), "explorer: find the bug");
+  const expanded = find(chat, (node) => node.className.includes("activity"));
+  await expanded.dispatch("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(find(find(chat, (node) => node.className.includes("activity")), (node) => node.className === "dispatch-tasks"), undefined);
+});
+
+test("reopened history renders its collapsed dispatch task and turn time", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.changes = async () => {
+    client.calls.changes += 1;
+    return { files: [], turns: [{ key: "checkpoint-replayed", paths: ["a.py"] }], worktrees: [] };
+  };
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("HistoryMessage", {
+    role: "user", text: "investigate", tool_calls: [], turn_id: null,
+    checkpoint_key: "checkpoint-replayed",
+    edits: [{ path: "a.py", added: 1, removed: 0 }],
+    turn_started_at: "2026-10-12T17:21:00.000Z",
+  }));
+  await client.emit(eventFrame("HistoryMessage", {
+    role: "assistant", text: "", turn_id: "turn-replayed",
+    tool_calls: [{ id: "dispatch-replayed", name: "dispatch_subagent", subagent_name: "explorer", task: "find the bug" }],
+    turn_ended_at: "2026-10-12T17:27:34.000Z",
+    turn_outcome: "finished",
+  }));
+  const chat = document.getElementById("chat");
+  const dispatch = find(chat, (node) => node.className.includes("activity"));
+  assert.equal(find(dispatch, (node) => node.className === "dispatch-tasks"), undefined);
+  const card = find(chat, (node) => node.className === "edit-card");
+  assert.ok(card);
+  assert.ok(find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"));
+  assert.ok(chat.children.indexOf(card) < chat.children.indexOf(find(chat, (node) => node.className === "turn-time")));
+  assert.equal(client.calls.changes, 1);
+  assert.match(visibleText(chat), /Worked for 6m 34s ·/);
+  await dispatch.dispatch("keydown", { key: "Enter", preventDefault() {} });
+  assert.match(visibleText(chat), /explorer: find the bug/);
 });
 
 test("status rail renders the whole roadmap beside settings and live agents", async () => {
@@ -2434,7 +3333,11 @@ test("status rail renders the whole roadmap beside settings and live agents", as
   const rail = document.getElementById("status-rail");
   const agents = document.getElementById("agents");
 
-  assert.deepEqual(rail.children, [agents, document.getElementById("roadmap"), document.getElementById("spec")]);
+  assert.deepEqual(rail.children, [
+    document.getElementById("rail-tabs"), agents, document.getElementById("roadmap"),
+    document.getElementById("changes"), document.getElementById("spec"),
+    document.getElementById("files"), document.getElementById("rail-tools"),
+  ]);
   assert.equal(document.getElementById("page").children[0].className, "settings-pane");
   assert.equal(document.getElementById("page").children.length, 1);
   assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-overview"));
@@ -2456,159 +3359,19 @@ test("status rail renders the whole roadmap beside settings and live agents", as
   await client.emit(eventFrame("ToolCallStarted", { agent_id: "agent-4", tool_name: "search" }));
   await client.emit(eventFrame("SubagentStopped", { subagent_agent_id: "agent-2" }));
   const root = agents.children[0];
-  const children = root.children[0];
+  const children = root.children.find((row) => row.className === "agent-children");
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["worker · finished", "sibling · running · thinking"]);
-  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["grandchild · running · search"]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · running · read"]);
+  assert.deepEqual(children.children.map(agentRowText), ["worker · finished", "sibling · running · thinking"]);
+  const workerChildren = children.children[0].children.find((row) => row.className === "agent-children");
+  assert.deepEqual(workerChildren.children.map(agentRowText), ["grandchild · running · search"]);
+  assert.deepEqual(agents.children.map(agentRowText), ["leader · running · read"]);
 
   await client.emit(eventFrame("SubagentSpawned", {
     agent_id: "missing", subagent_agent_id: "orphan", subagent_name: "orphan",
   }));
-  assert.deepEqual(agents.children.map((row) => row.textContent), [
+  assert.deepEqual(agents.children.map(agentRowText), [
     "leader · running · read", "orphan · running · thinking",
   ]);
-});
-
-test("agent rail controls redirect and stop, then disappear while the stopped agent remains", async () => {
-  const document = new FakeDocument();
-  const browser = fakeGlobal({ fragment: "#/chat" });
-  const client = fakeClient();
-  await start({ global: browser.global, document, client });
-  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
-
-  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  let controls = row.children.find((value) => value.className === "agent-controls");
-  assert.deepEqual(controls.children.map((button) => button.textContent), ["Pause", "Redirect", "Stop"]);
-  await controls.children[1].dispatch("click");
-  let redirectInput = find(row, (value) => value.tagName === "INPUT");
-  redirectInput.value = "Focus on the migration";
-  const send = find(row, (value) => value.textContent === "Send");
-  await send.dispatch("click");
-  assert.deepEqual(client.calls.controlAgent[0], {
-    agent_id: "leader-id", action: "redirect", text: "Focus on the migration",
-  });
-  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  controls = row.children.find((value) => value.className === "agent-controls");
-  await controls.children[2].dispatch("click");
-  assert.deepEqual(client.calls.controlAgent[1], { agent_id: "leader-id", action: "stop" });
-
-  await client.emit(eventFrame("RunFinished", { agent_id: "leader-id", stopped_reason: "cancelled" }));
-  assert.equal(visibleText(document.getElementById("agents")), "\nleader · stopped");
-  assert.equal(find(document.getElementById("agents"), (value) => value.className === "agent-controls"), undefined);
-});
-
-test("a paused agent can resume and gets its active controls back", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  await start({ global: {}, document, client });
-  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
-
-  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  let controls = row.children.find((value) => value.className === "agent-controls");
-  await controls.children[0].click();
-  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  assert.equal(row._textContent, "leader · paused");
-  controls = row.children.find((value) => value.className === "agent-controls");
-  assert.deepEqual(controls.children.map((button) => button.textContent), ["Resume", "Stop"]);
-
-  await controls.children[0].click();
-  assert.deepEqual(client.calls.controlAgent, [
-    { agent_id: "leader-id", action: "pause" },
-    { agent_id: "leader-id", action: "resume" },
-  ]);
-  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  assert.equal(row._textContent, "leader · running · thinking");
-  assert.deepEqual(
-    row.children.find((value) => value.className === "agent-controls").children.map((button) => button.textContent),
-    ["Pause", "Redirect", "Stop"],
-  );
-  assert.doesNotMatch(visibleText(document.getElementById("agents")), /\bidle\b/);
-});
-
-test("a cancelled redirect reply displays the stopped state", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  client.controlAgent = async (...args) => {
-    client.calls.controlAgent.push({ agent_id: args[0], action: args[1], ...(args[2] === undefined ? {} : { text: args[2] }) });
-    return { state: "cancelled" };
-  };
-  await start({ global: {}, document, client });
-  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
-  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  let controls = row.children.find((value) => value.className === "agent-controls");
-  await controls.children[1].click();
-  const redirectInput = find(row, (value) => value.tagName === "INPUT");
-  redirectInput.value = "Cancel this work";
-  await find(row, (value) => value.textContent === "Send").click();
-  assert.deepEqual(client.calls.controlAgent[0], {
-    agent_id: "leader-id", action: "redirect", text: "Cancel this work",
-  });
-  assert.equal(visibleText(document.getElementById("agents")), "\nleader · stopped");
-  assert.doesNotMatch(visibleText(document.getElementById("agents")), /cancelled|\bidle\b/);
-});
-
-test("Changes renders classified diff lines and an empty diff", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), {
-    changes: {
-      turns: [],
-      worktrees: [],
-      files: [
-        {
-          path: "x",
-          status: "modified",
-          diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n+++ b/x\n--- a/x",
-        },
-        { path: "empty", status: "modified", diff: "" },
-      ],
-    },
-  });
-  await start({ global: {}, document, client });
-  await find(document.getElementById("page-links"), (value) => value.textContent === "Changes").click();
-  await Promise.resolve();
-  const page = document.getElementById("page");
-  const sections = page.children[0].children.filter((node) => node.className === "changes-file");
-  const diff = sections[0].children.find((node) => node.tagName === "PRE");
-  assert.equal(diff.className, "diff");
-  assert.deepEqual(diff.children.map((line) => line.className), [
-    "diff-hunk", "diff-remove", "diff-add", "diff-add", "", "",
-  ]);
-  assert.deepEqual(diff.children.map((line) => line.textContent), [
-    "@@ -1 +1,2 @@", "-old", "+new", "+line", "+++ b/x", "--- a/x",
-  ]);
-  const emptyDiff = sections[1].children.find((node) => node.tagName === "PRE");
-  assert.equal(emptyDiff.className, "diff");
-  assert.deepEqual(emptyDiff.children, []);
-
-  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
-  assert.match(css, /\.diff\s*\{[^}]*color:\s*var\(--ui-text\)/s);
-  assert.match(css, /\.diff\s*\{[^}]*white-space:\s*pre\s*;/s);
-  assert.match(css, /\.diff\s+span\s*\{[^}]*display:\s*block/s);
-  assert.match(css, /\.diff-add\s*\{[^}]*background:\s*var\(--ui-diff-add\)/s);
-  assert.match(css, /\.diff-remove\s*\{[^}]*background:\s*var\(--ui-diff-remove\)/s);
-  assert.match(css, /\.diff-hunk\s*\{[^}]*color:\s*var\(--ui-text-secondary\)/s);
-});
-
-test("agent rail keeps state unchanged and shows a control error", async () => {
-  const document = new FakeDocument();
-  const browser = fakeGlobal({ fragment: "#/chat" });
-  const client = fakeClient();
-  client.controlAgent = async () => {
-    throw new Error("agent is already paused");
-  };
-  await start({ global: browser.global, document, client });
-  await client.emit(eventFrame("RunStarted", { agent_id: "leader-id", agent_name: "leader" }));
-  let row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  const controls = row.children.find((value) => value.className === "agent-controls");
-  await controls.children[0].dispatch("click");
-  row = find(document.getElementById("agents"), (value) => value.className === "agent-row");
-  assert.equal(row._textContent, "leader · running · thinking");
-  assert.equal(
-    row.children.find((value) => value.className === "agent-control-error").textContent,
-    "agent is already paused",
-  );
-  assert.equal(row.children.find((value) => value.className === "agent-controls").children[0].textContent, "Pause");
 });
 
 test("reopened history and conversation stats render a nested agent tree without run events", async () => {
@@ -2637,18 +3400,19 @@ test("reopened history and conversation stats render a nested agent tree without
   const link = find(document.getElementById("sidebar"), (row) => row.className === "session-link");
   await link.dispatch("click");
   assert.deepEqual(client.calls.openSession, ["prior"]);
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · finished"]);
-  const children = agents.children[0].children[0];
+  assert.deepEqual(agents.children.map(agentRowText), ["leader · finished"]);
+  const children = agents.children[0].children.find((row) => row.className === "agent-children");
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · finished", "C · finished"]);
-  assert.deepEqual(children.children[0].children[0].children.map((row) => row.textContent), ["B · finished"]);
-  assert.equal(find(agents, (row) => row.className === "agent-controls"), undefined);
+  assert.deepEqual(children.children.map(agentRowText), ["researcher · finished", "C · finished"]);
+  const researcherChildren = children.children[0].children.find((row) => row.className === "agent-children");
+  assert.deepEqual(researcherChildren.children.map(agentRowText), ["B · finished"]);
+  assert.equal(find(agents, (row) => ["agent-controls", "agent-redirect", "agent-control-error"].includes(row.className)), undefined);
   assert.equal(find(document.body, (row) => row.className === "conversation-usage").textContent, "");
   assert.match(visibleText(document.getElementById("chat")), /Prior answer/);
   assert.doesNotMatch(visibleText(agents), /tokens|USD/);
 });
 
-test("agent rail keeps finished parents and controls only a running worker", async () => {
+test("agent rail keeps finished parents and shows running worker state", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   client.conversationStats = async () => ({ conversation: { agents: [
@@ -2659,17 +3423,13 @@ test("agent rail keeps finished parents and controls only a running worker", asy
   await start({ global: {}, document, client });
 
   const agents = document.getElementById("agents");
-  assert.deepEqual(agents.children.map((row) => row.textContent), ["leader · finished"]);
-  const children = agents.children[0].children[0];
+  assert.deepEqual(agents.children.map(agentRowText), ["leader · finished"]);
+  const children = agents.children[0].children.find((row) => row.className === "agent-children");
   assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map((row) => row.textContent), ["researcher · finished", "worker · running · thinking"]);
-  assert.deepEqual(
-    children.children[1].children.find((child) => child.className === "agent-controls")
-      .children.map((button) => button.textContent),
-    ["Pause", "Redirect", "Stop"],
-  );
+  assert.deepEqual(children.children.map(agentRowText), ["researcher · finished", "worker · running · thinking"]);
+  assert.equal(find(agents, (row) => ["agent-controls", "agent-redirect", "agent-control-error"].includes(row.className)), undefined);
   assert.equal(agents.children[0].children.some((row) => row.className === "agent-controls"), false);
-  assert.equal(children.children[0].children.length, 0);
+  assert.equal(children.children[0].children.some((child) => child.className === "agent-children"), false);
 });
 
 test("opening another conversation and starting a new chat clears prior agents", async () => {
@@ -2706,15 +3466,15 @@ test("opening another conversation and starting a new chat clears prior agents",
     row.className === "session-link" && row.textContent === title
   );
   await sessionLink("Conversation A").dispatch("click");
-  assert.deepEqual(walk(agents).filter((row) => row.className === "agent-row").map((row) => row.textContent), [
+  assert.deepEqual(walk(agents).filter((row) => row.className === "agent-row").map(agentRowText), [
     "leader", "worker",
   ]);
 
   await sessionLink("Conversation B").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["conversation-a", "conversation-b"]);
   assert.deepEqual(replayBoard, ["\nNothing is running.", "\nNothing is running."]);
-  assert.equal(visibleText(agents), "\nleader");
-  assert.equal(find(agents, (row) => row.textContent.includes("worker")), undefined);
+  assert.deepEqual(agents.children.map(agentRowText), ["leader"]);
+  assert.equal(find(agents, (row) => row.className === "agent-name" && row.textContent.includes("worker")), undefined);
 
   await document.getElementById("new-chat").dispatch("click");
   assert.equal(visibleText(agents), "\nNothing is running.");
@@ -3089,7 +3849,7 @@ test("throwing local storage cannot stop startup or navigation", async () => {
     [document.getElementById("chat-pane")],
   );
   await find(
-    document.getElementById("page-links"),
+    document.getElementById("sidebar"),
     (value) => value.textContent === "Settings",
   ).dispatch("click");
   assert.equal(app.route().page, "settings");
@@ -3102,7 +3862,7 @@ test("frames accumulate while settings is open", async () => {
   await start({ global: browser.global, document, client });
   const links = document.getElementById("page-links");
 
-  await find(links, (value) => value.textContent === "Settings").dispatch("click");
+  await find(document.getElementById("sidebar"), (value) => value.textContent === "Settings").dispatch("click");
   await client.emit(eventFrame("AssistantTextDelta", { text: "while " }));
   await client.emit(eventFrame("AssistantTextDelta", { text: "away" }));
   await document.getElementById("home-link").dispatch("click");
@@ -3118,14 +3878,21 @@ test("folding the sidebar leaves the current page in place", async () => {
   const page = document.getElementById("page");
   const currentPane = page.children[0];
 
+  assert.equal(toggle.textContent, "");
+  assert.equal(toggle.attributes.get("aria-label"), "Hide sidebar");
+  assert.equal(toggle.attributes.get("title"), "Hide sidebar");
   await toggle.dispatch("click");
   assert.equal(shell.className, "app-shell sidebar-folded");
-  assert.equal(toggle.textContent, "Show sidebar");
+  assert.equal(toggle.textContent, "");
+  assert.equal(toggle.attributes.get("aria-label"), "Show sidebar");
+  assert.equal(toggle.attributes.get("title"), "Show sidebar");
   assert.equal(page.children[0], currentPane);
 
   await toggle.dispatch("click");
   assert.equal(shell.className, "app-shell");
-  assert.equal(toggle.textContent, "Hide sidebar");
+  assert.equal(toggle.textContent, "");
+  assert.equal(toggle.attributes.get("aria-label"), "Hide sidebar");
+  assert.equal(toggle.attributes.get("title"), "Hide sidebar");
   assert.equal(page.children[0], currentPane);
 });
 
@@ -3136,14 +3903,51 @@ test("status and sidebar folds are independent", async () => {
   const railToggle = document.getElementById("rail-toggle");
   const sidebarToggle = document.getElementById("sidebar-toggle");
 
+  assert.equal(railToggle.textContent, "");
+  assert.equal(railToggle.attributes.get("aria-label"), "Hide status");
+  assert.equal(railToggle.attributes.get("title"), "Hide status");
+  assert.equal(sidebarToggle.textContent, "");
+  assert.equal(sidebarToggle.attributes.get("aria-label"), "Hide sidebar");
+  assert.equal(sidebarToggle.attributes.get("title"), "Hide sidebar");
   await railToggle.dispatch("click");
   assert.equal(shell.className, "app-shell rail-folded");
-  assert.equal(railToggle.textContent, "Show status");
+  assert.equal(railToggle.textContent, "");
+  assert.equal(railToggle.attributes.get("aria-label"), "Show status");
+  assert.equal(railToggle.attributes.get("title"), "Show status");
   await sidebarToggle.dispatch("click");
   assert.equal(shell.className, "app-shell rail-folded sidebar-folded");
   await railToggle.dispatch("click");
   assert.equal(shell.className, "app-shell sidebar-folded");
-  assert.equal(railToggle.textContent, "Hide status");
+  assert.equal(railToggle.textContent, "");
+  assert.equal(railToggle.attributes.get("aria-label"), "Hide status");
+  assert.equal(railToggle.attributes.get("title"), "Hide status");
+});
+
+test("action icons use current-color SVG masks and hidden buttons stay hidden", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../src/app.js", import.meta.url), "utf8");
+  const icons = [
+    "plus", "pause", "play", "check", "trash",
+    "undo", "left-panel", "right-panel", "settings",
+  ];
+
+  for (const icon of icons) {
+    assert.match(css, new RegExp(`\\.icon-${icon}\\s*\\{[^}]*--icon-image:\\s*url\\("data:image/svg\\+xml,`));
+  }
+  const maskRule = css.match(/\.icon-plus::before,[\s\S]*?\.icon-settings::before\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(maskRule, /background-color:\s*currentColor;/);
+  assert.match(maskRule, /mask:\s*var\(--icon-image\) center \/ 1rem 1rem no-repeat;/);
+
+  for (const [id, icon] of [
+    ["new-chat", "plus"],
+    ["sidebar-toggle", "left-panel"], ["rail-toggle", "right-panel"],
+  ]) {
+    assert.match(html, new RegExp(`<button[^>]*id="${id}"[^>]*class="[^"]*icon-${icon}[^"]*"`));
+  }
+  assert.doesNotMatch(appSource, /controlAgent|agent-controls|agent-redirect|agent-control-error/);
+  assert.match(css, /\[hidden\]\s*\{[^}]*display:\s*none\s*!important;/);
+  assert.match(css, /\.sidebar-toggle,\s*\.rail-toggle\s*\{[^}]*width:\s*2rem;[^}]*height:\s*2rem;/);
 });
 
 test("items in folded and open roadmap phases open their specs and reports", async () => {
@@ -3281,36 +4085,29 @@ test("submit dispatches once and assistant deltas render in order", async () => 
   assert.equal(app.turn.state, "idle");
 });
 
-test("composer Stop is visible only during a turn and stops it", async () => {
+test("Escape stops a running turn from the composer", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   const app = await start({ global: {}, document, client });
-  const stop = document.getElementById("stop-button");
-  assert.equal(stop.hidden, true);
-
   document.getElementById("prompt").value = "hello";
   const submitting = document.getElementById("prompt-form").dispatch("submit");
   assert.equal(app.turn.state, DISPATCHING);
-  assert.equal(stop.hidden, false);
-  client.resolvePrompt({ accepted: true, run_id: "run-stop-button" });
+  client.resolvePrompt({ accepted: true, run_id: "run-stop-key" });
   await submitting;
   assert.equal(app.turn.state, RUNNING);
-  assert.equal(stop.hidden, false);
-
-  await stop.click();
+  await document.getElementById("prompt").dispatch("keydown", { key: "Escape" });
   assert.deepEqual(client.calls.stop, [""]);
-  await client.emit(eventFrame("RunStarted", { run_id: "run-stop-button" }));
-  await client.emit(eventFrame("RunFinished", { run_id: "run-stop-button" }));
+  await client.emit(eventFrame("RunStarted", { run_id: "run-stop-key" }));
+  await client.emit(eventFrame("RunFinished", { run_id: "run-stop-key" }));
   assert.equal(app.turn.state, IDLE);
-  assert.equal(stop.hidden, true);
 });
 
-test("Mod+. stops a running turn from Changes and is a no-op while idle", async () => {
+test("Mod+. stops a running turn from Settings and is a no-op while idle", async () => {
   const document = new FakeDocument();
-  const browser = fakeGlobal({ fragment: "#/changes" });
+  const browser = fakeGlobal({ fragment: "#/settings" });
   const client = fakeClient();
   const app = await start({ global: browser.global, document, client });
-  assert.equal(app.route().page, "changes");
+  assert.equal(app.route().page, "settings");
 
   document.getElementById("prompt").value = "hello";
   const submitting = document.getElementById("prompt-form").dispatch("submit");
@@ -3356,7 +4153,6 @@ test("Mod+. cancels a dispatching prompt and stops it when accepted", async () =
   assert.deepEqual(client.calls.stop, [""]);
   await client.emit(eventFrame("RunStarted", { run_id: "run-cancel-dispatch" }));
   await client.emit(eventFrame("RunFinished", { run_id: "run-cancel-dispatch" }));
-  assert.equal(document.getElementById("stop-button").hidden, true);
 });
 
 test("a prompt conflict adopts the active runtime run and keeps the message", async () => {
@@ -3510,8 +4306,70 @@ test("two tool calls in one turn render as one activity", async () => {
 
   const chat = document.getElementById("chat");
   assert.equal(chat.children.length, 1);
-  assert.equal(chat.children[0].className, "activity");
-  assert.match(chat.children[0].textContent, /Read `one\.txt` and searched for `needle`\./);
+  assert.ok(chat.children[0].className.split(" ").includes("activity"));
+  const activity = chat.children[0];
+  assert.deepEqual(walk(activity).filter((node) => node.tagName === "CODE").map((node) => node.textContent), [
+    "one.txt", "needle",
+  ]);
+  assert.equal(textInDocumentOrder(activity), "Read one.txt and searched for needle.");
+  assert.doesNotMatch(textInDocumentOrder(activity), /`/);
+});
+
+test("activity targets render as code while failures and missing targets keep their wording", async () => {
+  const failedDocument = new FakeDocument();
+  const failedClient = fakeClient();
+  await start({ global: {}, document: failedDocument, client: failedClient });
+  await failedClient.emit(eventFrame("TurnStarted", { index: 1 }));
+  await failedClient.emit(toolStarted("failed-call", "run_shell", "x"));
+  await failedClient.emit(eventFrame("ToolCallFailed", {
+    tool_call_id: "failed-call",
+    error: "boom",
+  }));
+  const failedLine = failedDocument.getElementById("chat").children[0];
+  assert.equal(failedLine.className, "activity activity-shell failed");
+  assert.equal(failedLine.attributes.get("title"), "Ran x (failed: boom).");
+  assert.equal(textInDocumentOrder(failedLine), "Ran x (failed: boom).");
+  assert.deepEqual(walk(failedLine).filter((node) => node.tagName === "CODE").map((node) => node.textContent), ["x"]);
+
+  const untargetedDocument = new FakeDocument();
+  const untargetedClient = fakeClient();
+  await start({ global: {}, document: untargetedDocument, client: untargetedClient });
+  await untargetedClient.emit(eventFrame("TurnStarted", { index: 1 }));
+  await untargetedClient.emit(toolStarted("untargeted-call", "run_shell", null));
+  await untargetedClient.emit(toolFinished("untargeted-call", "run_shell"));
+  const untargetedLine = untargetedDocument.getElementById("chat").children[0];
+  assert.equal(textInDocumentOrder(untargetedLine), "Ran.");
+  assert.deepEqual(walk(untargetedLine).filter((node) => node.tagName === "CODE"), []);
+});
+
+test("activity lines use their first tool kind and keep the full sentence in the title", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("read", "read_file", "src/app.js"));
+  await client.emit(toolFinished("read", "read_file"));
+  await client.emit(toolStarted("unknown", "custom_tool", "a long target"));
+  await client.emit(toolFinished("unknown", "custom_tool"));
+
+  const [readLine] = document.getElementById("chat").children;
+  assert.equal(readLine.className, "activity activity-read");
+  assert.equal(readLine.children.length, 1);
+  assert.equal(readLine.children[0].className, "activity-text");
+  assert.equal(
+    readLine.attributes.get("title"),
+    "Read src/app.js and used custom_tool a long target.",
+  );
+
+  const unknownDocument = new FakeDocument();
+  const unknownClient = fakeClient();
+  await start({ global: {}, document: unknownDocument, client: unknownClient });
+  await unknownClient.emit(eventFrame("TurnStarted", { index: 1 }));
+  await unknownClient.emit(toolStarted("unknown", "custom_tool", "a long target"));
+  await unknownClient.emit(toolFinished("unknown", "custom_tool"));
+  const unknownLine = unknownDocument.getElementById("chat").children[0];
+  assert.equal(unknownLine.className, "activity");
+  assert.equal(unknownLine.attributes.get("title"), "Used custom_tool a long target.");
 });
 
 test("approvals stay separate and dropped frames render one model gap", async () => {
@@ -3613,7 +4471,7 @@ test("assistant runs split around tool activity", async () => {
   const chat = document.getElementById("chat");
   assert.deepEqual(
     chat.children.map((child) => child.className),
-    ["assistant", "activity", "assistant"],
+    ["assistant", "activity activity-read", "assistant"],
   );
   assert.equal(chat.children[0].textContent, "before tool");
   assert.equal(chat.children[2].textContent, "after tool");
@@ -3768,6 +4626,156 @@ test("assistant Markdown renders plain lines and unclosed fences while streaming
   assert.equal(streamDocument.getElementById("chat").children[0].children.length, 6);
 });
 
+test("Markdown parses nested lists, ordered starts, and wrapped list text", () => {
+  assert.deepEqual(parseMarkdown("- a\n  - b\n  - c\n- d"), [{
+    type: "list",
+    ordered: false,
+    start: null,
+    items: [
+      {
+        children: [{ type: "text", text: "a" }],
+        blocks: [{
+          type: "list",
+          ordered: false,
+          start: null,
+          items: [
+            { children: [{ type: "text", text: "b" }], blocks: [] },
+            { children: [{ type: "text", text: "c" }], blocks: [] },
+          ],
+        }],
+      },
+      { children: [{ type: "text", text: "d" }], blocks: [] },
+    ],
+  }]);
+
+  const consecutive = parseMarkdown("1. one\n\n2. two\n\n3. three")[0];
+  assert.equal(consecutive.type, "list");
+  assert.equal(consecutive.ordered, true);
+  assert.equal(consecutive.start, 1);
+  assert.deepEqual(consecutive.items.map((item) => item.children[0].text), ["one", "two", "three"]);
+  const later = parseMarkdown("3. three\n4. four")[0];
+  assert.equal(later.start, 3);
+  assert.deepEqual(later.items.map((item) => item.children[0].text), ["three", "four"]);
+
+  assert.deepEqual(parseMarkdown("- item\n  continues here")[0].items[0].children, [
+    { type: "text", text: "item" },
+    { type: "break" },
+    { type: "text", text: "continues here" },
+  ]);
+});
+
+test("Markdown list items render fenced code blocks and parse list edge cases", async () => {
+  const input = "1. Install:\n   ```bash\n   pip install -e .\n   ```\n2. Run tests";
+  const parsed = parseMarkdown(input);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].type, "list");
+  assert.deepEqual(parsed[0].items[0].children, [{ type: "text", text: "Install:" }]);
+  assert.deepEqual(parsed[0].items[0].blocks, [{
+    type: "code-block",
+    language: "bash",
+    text: "pip install -e .",
+  }]);
+  assert.deepEqual(parsed[0].items.map((item) => item.children[0].text), ["Install:", "Run tests"]);
+
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: input }));
+  const assistant = document.getElementById("chat").children[0];
+  const firstItem = assistant.children[0].children[0];
+  const pre = find(firstItem, (node) => node.tagName === "PRE");
+  assert.ok(pre);
+  assert.equal(pre.children[0].tagName, "CODE");
+  assert.equal(firstItem.textContent.includes("`"), false);
+
+  const unclosed = parseMarkdown("- a\n  ```\n  x")[0].items[0];
+  assert.deepEqual(unclosed.blocks, [{ type: "code-block", language: null, text: "x" }]);
+
+  assert.equal(parseMarkdown("| a | b |\n|-|-|\n| 1 | 2 |")[0].type, "table");
+  assert.deepEqual(parseMarkdown("| a |\n|:-:|\n| 1 |")[0].align, ["center"]);
+
+  const indented = parseMarkdown("  - starts indented\n  - second");
+  assert.equal(indented.length, 1);
+  assert.equal(indented[0].type, "list");
+  assert.deepEqual(indented[0].items.map((item) => item.children[0].text), ["starts indented", "second"]);
+  assert.equal(parseMarkdown("    - four spaces")[0].type, "paragraph");
+});
+
+test("Markdown list code blocks keep blank lines and later item text", async () => {
+  const codeInput = "1. Write the file:\n   ```python\n   def a():\n       return 1\n\n   def b():\n       return 2\n   ```\n2. Run it";
+  const parsedCode = parseMarkdown(codeInput);
+  assert.equal(parsedCode.length, 1);
+  assert.equal(parsedCode[0].items.length, 2);
+  assert.equal(parsedCode[0].items[0].blocks[0].text, "def a():\n    return 1\n\ndef b():\n    return 2");
+  assert.equal(parsedCode[0].items[1].children[0].text, "Run it");
+
+  const continuationInput = "- Run:\n  ```\n  make\n  ```\n  then check the output\n- next";
+  const parsedContinuation = parseMarkdown(continuationInput)[0];
+  assert.deepEqual(parsedContinuation.items[0].children, [{ type: "text", text: "Run:" }]);
+  assert.deepEqual(parsedContinuation.items[0].blocks, [
+    { type: "code-block", language: null, text: "make" },
+    { type: "paragraph", children: [{ type: "text", text: "then check the output" }] },
+  ]);
+
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: continuationInput }));
+  const item = document.getElementById("chat").children[0].children[0].children[0];
+  assert.equal(item.textContent, "Run:");
+  assert.deepEqual(item.children.map((node) => node.tagName), ["PRE", "P"]);
+  assert.equal(item.children[0].children[0].textContent, "make");
+  assert.equal(item.children[1].textContent, "then check the output");
+
+  const underIndented = parseMarkdown("- a\n  ```\nx\n  ```")[0].items[0];
+  assert.deepEqual(underIndented.blocks, [{ type: "code-block", language: null, text: "x" }]);
+});
+
+test("Markdown tables, separators, and incomplete streaming blocks parse safely", async () => {
+  const tableInput = "| a | b |\n|:--|--:|\n| 1 | 2 |";
+  assert.deepEqual(parseMarkdown(tableInput), [{
+    type: "table",
+    align: ["left", "right"],
+    header: [[{ type: "text", text: "a" }], [{ type: "text", text: "b" }]],
+    rows: [[[{ type: "text", text: "1" }], [{ type: "text", text: "2" }]]],
+  }]);
+  assert.deepEqual(parseMarkdown("| a | b |\n| 1 | 2 |")[0].type, "paragraph");
+  assert.deepEqual(parseMarkdown("---"), [{ type: "rule" }]);
+  assert.equal(parseMarkdown("- x")[0].type, "list");
+  for (const partial of ["| a | b |", "| a | b |\n|--", "- a\n  "]) {
+    assert.doesNotThrow(() => parseMarkdown(partial), partial);
+  }
+
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: "3. three\n4. four\n\n" + tableInput + "\n\n---" }));
+  const assistant = document.getElementById("chat").children[0];
+  const ordered = assistant.children[0];
+  assert.equal(ordered.tagName, "OL");
+  assert.equal(ordered.attributes.get("start"), "3");
+  const wrapper = assistant.children[1];
+  assert.equal(wrapper.className, "table-scroll");
+  const table = wrapper.children[0];
+  assert.deepEqual(table.children.map((part) => part.tagName), ["THEAD", "TBODY"]);
+  const header = table.children[0].children[0].children;
+  const cells = table.children[1].children[0].children;
+  assert.deepEqual(header.map((cell) => cell.tagName), ["TH", "TH"]);
+  assert.deepEqual(cells.map((cell) => cell.tagName), ["TD", "TD"]);
+  assert.deepEqual(header.map((cell) => cell.textContent), ["a", "b"]);
+  assert.deepEqual(cells.map((cell) => cell.textContent), ["1", "2"]);
+  assert.deepEqual(header.map((cell) => cell.attributes.get("style")), ["text-align: left;", "text-align: right;"]);
+  assert.deepEqual(cells.map((cell) => cell.attributes.get("style")), ["text-align: left;", "text-align: right;"]);
+  assert.equal(assistant.children[2].tagName, "HR");
+
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  assert.match(css, /\.assistant \.table-scroll\s*\{[^}]*overflow-x:\s*auto;/);
+  assert.match(css, /\.assistant th,\s*\.assistant td\s*\{[^}]*padding:\s*var\(--space-1\) var\(--space-2\);[^}]*border:\s*1px solid var\(--ui-border\);/);
+  assert.match(css, /\.assistant th\s*\{[^}]*font-size:\s*0\.8125rem;[^}]*font-weight:\s*600;/);
+  assert.match(css, /\.assistant hr\s*\{[^}]*border-top:\s*1px solid var\(--ui-border\);/);
+  assert.match(css, /\.assistant li > ul,\s*\.assistant li > ol\s*\{[^}]*margin:\s*0;/);
+});
+
 test("underscores inside words stay literal while standalone emphasis still renders", () => {
   for (const text of [
     "Call standard_tool_registry with skills_dir set.",
@@ -3830,6 +4838,46 @@ test("session history renders as the original conversation", async () => {
     ["assistant", "The config changed."],
   ]);
   assert.doesNotMatch(visibleText(chat), /Received HistoryMessage\./);
+});
+
+test("reopened edit cards keep their rows and reconcile Undo from changes", async () => {
+  async function replay({ turns, undone = false }) {
+    const document = new FakeDocument();
+    const client = fakeClient();
+    client.changes = async () => ({ files: [], turns, worktrees: [] });
+    await start({ global: {}, document, client });
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", role: "user", text: "Edit two files", tool_calls: [],
+      checkpoint_key: "checkpoint-1",
+      edits: [
+        { path: "a.py", added: 2, removed: 1 },
+        { path: "b.py", added: 1, removed: 3 },
+      ],
+      undone,
+    } });
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", role: "assistant", text: "Done", tool_calls: [],
+    } });
+    const card = find(document.getElementById("chat"), (node) => node.className === "edit-card");
+    return { card, document };
+  }
+
+  const available = await replay({ turns: [{ key: "checkpoint-1", paths: ["a.py", "b.py"] }] });
+  assert.ok(available.card);
+  assert.equal(available.card.children.find((node) => node.className === "edit-card-files").children.length, 2);
+  assert.ok(find(available.card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"));
+
+  const noPaths = await replay({ turns: [{ key: "checkpoint-1", paths: [] }] });
+  assert.ok(noPaths.card);
+  assert.equal(find(noPaths.card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"), undefined);
+
+  const alreadyUndone = await replay({
+    turns: [{ key: "checkpoint-1", paths: ["a.py", "b.py"] }],
+    undone: true,
+  });
+  assert.ok(alreadyUndone.card);
+  assert.equal(find(alreadyUndone.card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"), undefined);
+  assert.match(visibleText(alreadyUndone.card), /Undone/);
 });
 
 test("replayed messages with record ids do not render fork controls", async () => {
@@ -3914,6 +4962,83 @@ test("a failed prompt uses its error region and the next submit clears it", asyn
   assert.equal(promptError.textContent, "");
 });
 
+test("transcript prose, activity, approvals, and turns use their assigned surfaces", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const declarations = (selector) => [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selectors]) => selectors.split(",").map((value) => value.trim()).includes(selector))
+    .map(([, , rules]) => rules)
+    .join("\n");
+  const prompt = declarations(".prompt");
+  const approval = declarations(".approval");
+
+  assert.match(prompt, /background:\s*var\(--ui-inset\);/);
+  assert.match(prompt, /border:\s*1px solid var\(--ui-border\);/);
+  assert.match(prompt, /border-radius:\s*var\(--radius-control\);/);
+  assert.match(prompt, /padding:\s*var\(--space-2\) var\(--space-3\);/);
+  assert.match(prompt, /align-self:\s*stretch;/);
+  assert.match(approval, /background:\s*var\(--ui-panel\);/);
+  assert.match(approval, /border:\s*1px solid var\(--ui-control-border\);/);
+  assert.match(approval, /border-radius:\s*var\(--radius-control\);/);
+  assert.match(approval, /padding:\s*var\(--space-3\);/);
+  for (const className of ["activity", "edit", "question", "compaction", "gap", "unknown-event"]) {
+    const rules = declarations(`.${className}`);
+    assert.match(rules, /color:\s*var\(--ui-text-secondary\);/);
+    assert.match(rules, /font-size:\s*0\.8125rem;/);
+  }
+  assert.match(declarations(".gap"), /color:\s*var\(--ui-warning\);/);
+  assert.match(declarations(".activity code"), /font-family:\s*var\(--font-code\);/);
+  assert.match(declarations(".activity code"), /background:\s*none;/);
+  const activityRules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selectors]) => selectors.split(",").some((selector) => /(?:^|[\s>])\.activity(?:[.#:[\s]|$)/.test(selector.trim())));
+  assert.ok(activityRules.length > 0);
+  assert.ok(activityRules.every(([, , rules]) =>
+    [...rules.matchAll(/(?:^|;)\s*overflow(?:-[xy])?\s*:\s*([^;]+);/g)]
+      .every(([, value]) => value.trim() === "visible")
+  ));
+  assert.match(declarations(".activity-text"), /display:\s*block;/);
+  assert.match(declarations(".activity-text"), /white-space:\s*nowrap;/);
+  assert.match(declarations(".activity-text"), /overflow:\s*hidden;/);
+  assert.match(declarations(".activity-text"), /text-overflow:\s*ellipsis;/);
+  assert.match(declarations(".edit pre"), /overflow-x:\s*auto;/);
+  assert.match(declarations(".edit pre"), /background:\s*var\(--ui-inset\);/);
+  assert.match(declarations("#chat"), /gap:\s*var\(--space-3\);/);
+  assert.match(declarations("#chat > .prompt:not(:first-child)"), /margin-top:\s*var\(--space-6\);/);
+});
+
+test("agent turns use colored dots joined only between consecutive blocks", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const entryMargins = css.match(/#chat\s*>\s*:is\(\.prompt,\s*\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\s*\{([^}]*)\}/)?.[1];
+  const dotRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)::before\s*\{([^}]*)\}/)?.[1];
+  const threadRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\):has\(\+ :is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\)::after\s*\{([^}]*)\}/)?.[1];
+  assert.match(entryMargins, /margin-top:\s*0;/);
+  assert.match(entryMargins, /margin-bottom:\s*0;/);
+  assert.match(css, /#chat\s*>\s*\.prompt:not\(:first-child\)\s*\{[^}]*margin-top:\s*var\(--space-6\);/s);
+  assert.match(dotRule, /width:\s*0\.5rem;/);
+  assert.match(dotRule, /height:\s*0\.5rem;/);
+  assert.match(dotRule, /z-index:\s*1;/);
+  assert.match(dotRule, /background:\s*var\(--ui-text-secondary\);/);
+  assert.match(threadRule, /width:\s*1px;/);
+  assert.match(threadRule, /z-index:\s*0;/);
+  assert.match(threadRule, /background:\s*var\(--ui-border\);/);
+  assert.match(css, /--agent-dot-top:\s*calc\(0\.775em - 0\.25rem\);/);
+  assert.match(css, /--agent-dot-center:\s*calc\(var\(--agent-dot-top\) \+ 0\.25rem\);/);
+  assert.match(dotRule, /top:\s*var\(--agent-dot-top\);/);
+  assert.match(threadRule, /top:\s*var\(--agent-dot-center\);/);
+  assert.match(threadRule, /bottom:\s*calc\(0px - var\(--space-3\) - var\(--agent-dot-center\)\);/);
+  assert.match(css, /#chat\s*>\s*\.activity::before,\s*#chat\s*>\s*\.edit::before\s*\{[^}]*background:\s*var\(--ui-success\);/s);
+  assert.match(css, /#chat\s*>\s*\.activity\.failed::before\s*\{[^}]*background-color:\s*var\(--ui-danger\);/);
+  assert.match(css, /#chat\s*>\s*\.question\.open::before\s*\{[^}]*background:\s*var\(--ui-warning\);/);
+  assert.match(css, /#chat\s*>\s*\.question\.resolved::before\s*\{[^}]*background:\s*var\(--ui-text-secondary\);/);
+  for (const icon of ["page", "magnifier", "pencil", "terminal", "globe"]) {
+    assert.match(css, new RegExp(`\\.icon-${icon}\\s*,`));
+  }
+  for (const kind of ["read", "search", "edit", "shell", "web"]) {
+    assert.match(css, new RegExp(`#chat\\s*>\\s*\\.activity-${kind}::before`));
+  }
+  assert.match(css, /#chat\s*>\s*\.edit::before/);
+  assert.match(css, /mask:\s*var\(--icon-image\) center \/ 1rem 1rem no-repeat;/);
+});
+
 test("render stays DOM-only and start does not read window", async () => {
   const appTestSource = await readFile(new URL("./app.test.js", import.meta.url), "utf8");
   const renderSource = await readFile(
@@ -3943,7 +5068,7 @@ test("render stays DOM-only and start does not read window", async () => {
     assert.equal(depth, 0);
     return ids;
   }
-  const expectedChatChildren = ["run-notice", "chat", "approvals", "prompt-form"];
+  const expectedChatChildren = ["run-notice", "chat", "approvals", "jump-latest", "prompt-form"];
   assert.deepEqual(chatPaneChildIds(indexSource), expectedChatChildren);
   const withExtraChild = indexSource.replace(
     /(<main id="chat-pane"[^>]*>)/,
@@ -3961,7 +5086,7 @@ test("render stays DOM-only and start does not read window", async () => {
     ["auto", "1fr", "auto", "auto"],
   );
   const sharedPaneRule = cssSource.match(
-    /#status-rail,\s*\.chat-pane,\s*\.settings-pane,\s*\.changes-pane\s*\{([^}]*)\}/,
+    /#status-rail,\s*\.chat-pane,\s*\.settings-pane\s*\{([^}]*)\}/,
   )?.[1];
   assert.match(sharedPaneRule, /(?:^|;)\s*overflow:\s*auto\s*;/);
 
@@ -3971,7 +5096,7 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.ok(commandOutputRule);
   assert.match(commandRule, /(?:^|;)\s*color:\s*var\(--ui-text-secondary\)\s*;/);
   assert.match(commandRule, /(?:^|;)\s*font-family:\s*var\(--font-code\)\s*;/);
-  assert.match(commandRule, /(?:^|;)\s*font-size:\s*0\.9rem\s*;/);
+  assert.match(commandRule, /(?:^|;)\s*font-size:\s*0\.8125rem\s*;/);
   assert.match(commandRule, /(?:^|;)\s*width:\s*100%\s*;/);
   assert.match(commandRule, /(?:^|;)\s*text-align:\s*left\s*;/);
   assert.match(commandRule, /(?:^|;)\s*background:\s*none\s*;/);
@@ -4001,7 +5126,7 @@ test("render stays DOM-only and start does not read window", async () => {
   function backgroundFor(className) {
     let background;
     for (const [, selectors, declarations] of cssSource.matchAll(/([^{}]+)\{([^{}]+)\}/g)) {
-      if (selectors.split(",").map((selector) => selector.trim()).includes(`.${className}`)) {
+      if (!selectors.includes("::") && selectors.split(",").map((selector) => selector.trim()).includes(`.${className}`)) {
         const match = declarations.match(/(?:^|;)\s*background:\s*(var\(--[\w-]+\))\s*;/i);
         if (match) {
           background = match[1];
@@ -4010,24 +5135,18 @@ test("render stays DOM-only and start does not read window", async () => {
     }
     return background;
   }
-  const neutral = backgroundFor("activity");
   const promptBackground = backgroundFor("prompt");
-  const assistantBackground = backgroundFor("assistant");
-  assert.ok(neutral);
+  const approvalBackground = backgroundFor("approval");
   assert.ok(promptBackground);
-  assert.ok(assistantBackground);
-  for (const className of ["edit", "question", "compaction", "gap", "unknown-event", "approval"]) {
-    assert.equal(backgroundFor(className), neutral);
-  }
-  assert.notEqual(promptBackground, neutral);
-  assert.notEqual(assistantBackground, neutral);
-  assert.notEqual(promptBackground, assistantBackground);
+  assert.ok(approvalBackground);
   const commandColor = commandRule.match(/(?:^|;)\s*color:\s*(var\(--[\w-]+\))\s*;/)?.[1];
   assert.equal(promptBackground, "var(--ui-inset)");
-  assert.equal(assistantBackground, "var(--ui-bg)");
-  assert.equal(neutral, "var(--ui-panel)");
+  assert.equal(approvalBackground, "var(--ui-panel)");
   assert.notEqual(commandColor, promptBackground);
-  assert.notEqual(commandColor, assistantBackground);
+  assert.equal(backgroundFor("assistant"), undefined);
+  for (const className of ["activity", "edit", "question", "compaction", "gap", "unknown-event"]) {
+    assert.equal(backgroundFor(className), undefined);
+  }
   for (const className of ["prompt", "assistant"]) {
     const rule = cssSource.match(new RegExp(`\\.${className}\\s*\\{([^}]*)\\}`))?.[1];
     assert.match(rule, /(?:^|;)\s*white-space:\s*pre-wrap\s*;/);
@@ -4039,7 +5158,8 @@ test("render stays DOM-only and start does not read window", async () => {
   assert.match(cssSource, /\.assistant pre\s*{[^}]*background:\s*var\(--ui-inset\)/);
   assert.match(cssSource, /\.assistant code\s*{[^}]*font-family:\s*var\(--font-code\)/);
   assert.match(cssSource, /\.assistant ul,\s*\.assistant ol\s*{[^}]*padding-left:\s*1\.35em/s);
-  assert.match(cssSource, /\.assistant h1,[\s\S]*?\.assistant h6\s*{[^}]*font-size:\s*1\.1em/s);
+  assert.match(cssSource, /h1\s*\{[^}]*font-size:\s*1\.125rem/s);
+  assert.match(cssSource, /h2,\s*h3,\s*h4,\s*h5,\s*h6\s*\{[^}]*font-size:\s*0\.875rem/s);
   assert.ok(!/\.(?:tool|dropped)\b/.test(cssSource));
   assert.equal((indexSource.match(/class="chat-pane"/g) ?? []).length, 1);
   assert.equal((indexSource.match(/id="status-rail"/g) ?? []).length, 1);
@@ -4089,6 +5209,41 @@ test("narrow columns leave room for chat and move the rail below it", async () =
   assert.match(narrow, /\.app-shell\.rail-folded #status-rail\s*\{[^}]*display:\s*none;/);
 });
 
+test("desktop columns scroll inside the window and narrow pages scroll as a whole", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const [wide, narrow] = css.split("@media (max-width: 760px)");
+  const rule = (source, selector) => source.match(
+    new RegExp(`(?:^|\\n)\\s*${selector}\\s*\\{([^}]*)\\}`),
+  )?.[1] ?? "";
+  const shell = rule(wide, "\\.app-shell");
+  const pane = rule(wide, "#status-rail,\\s*\\.chat-pane,\\s*\\.settings-pane");
+  const overscroll = rule(wide, "#status-rail,\\s*\\.chat-log,\\s*\\.settings-pane,\\s*\\.projects");
+
+  assert.match(shell, /(?:^|;)\s*height:\s*100vh\s*;/);
+  assert.match(shell, /(?:^|;)\s*overflow:\s*hidden\s*;/);
+  for (const selector of ["#status-rail", "\\.settings-pane"]) {
+    assert.ok(pane, selector);
+    assert.match(pane, /(?:^|;)\s*height:\s*100vh\s*;/);
+    assert.match(pane, /(?:^|;)\s*overflow-y:\s*auto\s*;/);
+  }
+  for (const selector of ["#status-rail", "\\.chat-log", "\\.settings-pane", "\\.projects"]) {
+    assert.ok(overscroll, selector);
+    assert.match(overscroll, /(?:^|;)\s*overscroll-behavior:\s*contain\s*;/);
+  }
+
+  assert.match(rule(narrow, "\\.app-shell"), /(?:^|;)\s*height:\s*auto\s*;/);
+  assert.match(rule(narrow, "\\.app-shell"), /(?:^|;)\s*overflow:\s*visible\s*;/);
+  const narrowRail = rule(narrow, "#status-rail");
+  const narrowPanes = rule(narrow, "\\.settings-pane");
+  assert.match(narrowRail, /(?:^|;)\s*height:\s*auto\s*;/);
+  assert.match(narrowRail, /(?:^|;)\s*overflow:\s*visible\s*;/);
+  for (const selector of ["\\.settings-pane"]) {
+    assert.ok(narrowPanes, selector);
+    assert.match(narrowPanes, /(?:^|;)\s*height:\s*auto\s*;/);
+    assert.match(narrowPanes, /(?:^|;)\s*overflow:\s*visible\s*;/);
+  }
+});
+
 test("an empty run notice removes its row while a populated notice keeps the normal rows", async () => {
   const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
   assert.match(css, /#run-notice:empty\s*\{[^}]*display:\s*none;/);
@@ -4123,7 +5278,7 @@ function specWorkflowClient({ hasSpec = true, runs = [], onAction = {} } = {}) {
 async function openWorkflowItem(client) {
   const document = new FakeDocument();
   const app = await start({ global: {}, document, client });
-  const roadmapButton = find(document.getElementById("roadmap"), (node) => node.className === "roadmap-box-button");
+  const roadmapButton = find(document.getElementById("roadmap"), (node) => node.className.startsWith("roadmap-task "));
   assert.ok(roadmapButton, visibleText(document.getElementById("page")));
   await roadmapButton.dispatch("click");
   assert.ok(find(document.getElementById("spec"), (node) => node.className === "spec-workflow"), visibleText(document.getElementById("page")));
@@ -4137,7 +5292,10 @@ test("starting a spec plan clears agents from the previous conversation", async 
   await client.emit(eventFrame("SubagentSpawned", {
     agent_id: "leader-a", subagent_agent_id: "worker-a", subagent_name: "worker",
   }));
-  assert.match(visibleText(document.getElementById("agents")), /worker · running/);
+  assert.match(
+    agentRowText(find(document.getElementById("agents"), (row) => row.className === "agent-row" && agentRowText(row).startsWith("worker"))),
+    /worker · running/,
+  );
 
   await documentButton(document, "Plan").dispatch("click");
   assert.equal(visibleText(document.getElementById("agents")), "\nNothing is running.");
@@ -4288,7 +5446,7 @@ test("spec-state refresh fetches immediately and once at the window end", async 
   const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
   const document = new FakeDocument();
   const app = await start({ global: withClock(clock), document, client });
-  await find(document.getElementById("roadmap"), (node) => node.className === "roadmap-box-button").dispatch("click");
+  await find(document.getElementById("roadmap"), (node) => node.className.startsWith("roadmap-task ")).dispatch("click");
   const before = client.specRunReadCount();
   const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "pause", phase: "paused", rounds: 1, max_rounds: 5, reason: "stopped" });
   await app.onFrame(frame);
@@ -4381,19 +5539,19 @@ test("chat follows new output only at the bottom and jump preserves focus", asyn
   assert.equal(jump.hidden, true);
 });
 
-test("chat restores its follow position after visiting Changes", async () => {
+test("chat restores its follow position after visiting Settings", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   await start({ global: {}, document, client });
   const chat = document.getElementById("chat");
   const jump = document.getElementById("jump-latest");
-  const changes = find(document.getElementById("page-links"), (value) => value.textContent === "Changes");
+  const settings = find(document.getElementById("sidebar"), (value) => value.className === "icon-settings");
   const home = document.getElementById("home-link");
 
   chat.clientHeight = 100;
   chat.scrollHeight = 300;
   chat.scrollTop = 200;
-  await changes.dispatch("click");
+  await settings.dispatch("click");
   chat.scrollTop = 0;
   chat.scrollHeight = 0;
   chat.clientHeight = 0;
@@ -4407,7 +5565,7 @@ test("chat restores its follow position after visiting Changes", async () => {
   chat.scrollHeight = 600;
   chat.scrollTop = 100;
   await chat.dispatch("scroll");
-  await changes.dispatch("click");
+  await settings.dispatch("click");
   chat.scrollTop = 0;
   chat.scrollHeight = 0;
   chat.clientHeight = 0;
@@ -4442,7 +5600,7 @@ test("navigating from Chat to Chat restores the reader position", async () => {
   assert.equal(jump.hidden, false);
 });
 
-test("conversation turns use labels, a reading column, and an internal transcript scroller", async () => {
+test("conversation turns use a reading column and an internal transcript scroller", async () => {
   const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
   const chatPane = css.match(/(?:^|\n)\.chat-pane\s*\{([^}]*)\}/)?.[1];
@@ -4457,16 +5615,12 @@ test("conversation turns use labels, a reading column, and an internal transcrip
     assert.match(rule, /white-space:\s*pre-wrap/);
     assert.match(rule, /overflow-wrap:\s*anywhere/);
   }
-  assert.match(css, /\.prompt::before\s*\{[^}]*content:\s*"You"/s);
-  assert.match(css, /#chat\s*>\s*\.prompt\s*\+\s*:not\(\.prompt\)::before\s*\{[^}]*content:\s*"Assistant"/s);
-  const labelRule = css.match(/\.prompt::before,\s*#chat\s*>\s*\.prompt\s*\+\s*:not\(\.prompt\)::before\s*\{([^}]*)\}/)?.[1];
-  assert.match(labelRule, /display:\s*block/);
-  assert.match(labelRule, /color:\s*var\(--ui-text-secondary\)/);
-  assert.match(labelRule, /font-size:\s*0\.75rem/);
-  assert.match(labelRule, /font-weight:\s*600/);
-  assert.match(css, /#chat,\s*#approvals,\s*#prompt-form\s*\{[^}]*max-width:\s*45rem/);
-  assert.equal((css.match(/#chat,\s*#approvals,\s*#prompt-form\s*\{/) ?? []).length, 1);
-  assert.match(html, /<form id="prompt-form"[^>]*>\s*<button id="jump-latest"[^>]*hidden>Jump to latest<\/button>/);
+  assert.doesNotMatch(css, /content:\s*["'](?:You|Assistant)["']/);
+  assert.match(css, /#chat,\s*#approvals,\s*#prompt-form,\s*\.conversation-usage\s*\{[^}]*max-width:\s*45rem[^}]*margin-left:\s*auto[^}]*margin-right:\s*auto/);
+  assert.equal((css.match(/#chat,\s*#approvals,\s*#prompt-form,\s*\.conversation-usage\s*\{/) ?? []).length, 1);
+  assert.match(css, /\.status-line-settings\s*\{[^}]*display:\s*flex[^}]*flex-wrap:\s*wrap[^}]*gap:\s*var\(--space-2\)\s+var\(--space-4\)/);
+  assert.match(css, /\.status-line-settings\s+h3\s*\{[^}]*flex-basis:\s*100%/);
+  assert.match(html, /<button id="jump-latest"[^>]*hidden>Jump to latest<\/button>\s*<form id="prompt-form"/);
 });
 
 test("theme tokens cover every app color and match between light and dark blocks", async () => {
@@ -4490,6 +5644,121 @@ test("theme tokens cover every app color and match between light and dark blocks
     .replace(/:root\[data-theme="light"\]\s*\{[^{}]*\}/, "")
     .replace(/:root\[data-theme="dark"\]\s*\{[^{}]*\}/, "");
   assert.doesNotMatch(outside, /#[\da-f]{3,8}\b|rgba?\s*\(|hsla?\s*\(/i);
+});
+
+test("app type, spacing, and shape use the design scale", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const rule = (selector, property = "font-size") => {
+    for (const [, selectors, declarations] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (
+        selectors.split(",").map((value) => value.trim()).includes(selector)
+        && new RegExp(`${property}\\s*:`).test(declarations)
+      ) return declarations;
+    }
+    return "";
+  };
+
+  const fontSizes = [...css.matchAll(/font-size\s*:\s*([^;}]+);/g)].map(([, value]) => value.trim());
+  assert.ok(fontSizes.length > 0);
+  for (const value of fontSizes) {
+    assert.ok(["0.75rem", "0.8125rem", "0.875rem", "1.125rem", "inherit"].includes(value), value);
+  }
+  const fontWeights = [...css.matchAll(/font-weight\s*:\s*([^;}]+);/g)].map(([, value]) => value.trim());
+  assert.ok(fontWeights.length > 0);
+  for (const value of fontWeights) assert.ok(["400", "500", "600"].includes(value), value);
+
+  const radii = [...css.matchAll(/border-radius\s*:\s*([^;}]+);/g)].map(([, value]) => value.trim());
+  assert.ok(radii.length > 0);
+  for (const value of radii) {
+    assert.ok(["0", "50%", "var(--radius-control)", "var(--radius-popover)", "var(--radius-composer)"].includes(value), value);
+  }
+  for (const selector of [".command-menu", ".file-menu", ".picker"]) {
+    assert.match(rule(selector, "border-radius"), /border-radius:\s*var\(--radius-popover\);/);
+  }
+
+  const spacing = [...css.matchAll(/(?:^|[;{])\s*(?:padding(?:-[\w-]+)?|margin(?:-[\w-]+)?|gap)\s*:\s*([^;}]+);/g)];
+  assert.ok(spacing.length > 0);
+  for (const [, value] of spacing) assert.doesNotMatch(value, /(?:\d+(?:\.\d+)?)(?:rem|px)\b/, value);
+
+  const expectedTokens = {
+    "--space-1": "0.25rem",
+    "--space-2": "0.5rem",
+    "--space-3": "0.75rem",
+    "--space-4": "1rem",
+    "--space-6": "1.5rem",
+    "--space-8": "2rem",
+    "--radius-control": "0.25rem",
+    "--radius-popover": "0.375rem",
+    "--radius-composer": "0.375rem",
+  };
+  const rootBlocks = [...css.matchAll(/:root\s*\{([^{}]*)\}/g)];
+  const spacingRoot = rootBlocks.find(([, block]) => block.includes("--space-1:"));
+  assert.ok(spacingRoot);
+  assert.ok(rootBlocks.indexOf(spacingRoot) > 0);
+  assert.ok(css.indexOf(spacingRoot[0]) > css.indexOf(':root[data-theme="dark"]'));
+  for (const [name, value] of Object.entries(expectedTokens)) {
+    assert.equal([...css.matchAll(new RegExp(`${name}:`, "g"))].length, 1, name);
+    assert.match(spacingRoot[1], new RegExp(`${name}:\\s*${value.replace(".", "\\.")}\\s*;`));
+  }
+
+  assert.match(rule("body"), /font-size:\s*0\.875rem;/);
+  assert.match(rule("body"), /line-height:\s*1\.55;/);
+  assert.match(rule("h1"), /font-size:\s*1\.125rem;/);
+  assert.match(rule("h1"), /font-weight:\s*600;/);
+  assert.match(rule("h2"), /font-size:\s*0\.875rem;/);
+  assert.match(rule("h2"), /font-weight:\s*600;/);
+  assert.match(rule("button"), /font-size:\s*0\.8125rem;/);
+  assert.match(rule("textarea"), /font-size:\s*0\.875rem;/);
+  assert.match(rule(".conversation-usage"), /font-size:\s*0\.75rem;/);
+  assert.match(rule(".command"), /font-size:\s*0\.8125rem;/);
+  assert.match(rule(".command"), /line-height:\s*1\.55;/);
+});
+
+test("controls, focus, motion, and prose links use the app states", async () => {
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  const button = css.match(/(?:^|\n)button\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(button, /min-height:\s*2rem;/);
+  assert.match(button, /padding:\s*0\s+var\(--space-3\);/);
+  assert.match(button, /border:\s*1px solid var\(--ui-control-border\);/);
+  assert.match(button, /border-radius:\s*var\(--radius-control\);/);
+  assert.match(button, /background:\s*transparent;/);
+  assert.match(button, /color:\s*var\(--ui-text\);/);
+  assert.match(button, /font-weight:\s*500;/);
+  assert.match(button, /cursor:\s*pointer;/);
+  assert.match(button, /transition:\s*background-color 120ms, border-color 120ms, color 120ms;/);
+  assert.match(css, /button:not\(:disabled\):hover\s*\{[^}]*background:\s*var\(--ui-hover\);/s);
+  assert.match(css, /button:disabled\s*\{(?=[^}]*color:\s*var\(--ui-text-secondary\);)(?=[^}]*border-color:\s*var\(--ui-border\);)(?=[^}]*cursor:\s*default;)[^}]*\}/s);
+  const fields = css.match(/input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\):not\(\[type="file"\]\),\s*select,\s*textarea\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(fields, /min-height:\s*2rem;/);
+  assert.match(fields, /padding:\s*var\(--space-1\) var\(--space-2\);/);
+  assert.match(fields, /border:\s*1px solid var\(--ui-control-border\);/);
+  assert.match(fields, /border-radius:\s*var\(--radius-control\);/);
+  assert.match(fields, /background:\s*var\(--ui-panel\);/);
+  assert.match(fields, /color:\s*var\(--ui-text\);/);
+  assert.match(css, /input::placeholder,\s*textarea::placeholder\s*\{[^}]*color:\s*var\(--ui-text-secondary\);/s);
+
+  assert.match(css, /\.primary\s*\{[^}]*background:\s*var\(--ui-accent\);[^}]*color:\s*var\(--ui-on-accent\);/s);
+  assert.match(css, /\.primary:not\(:disabled\):hover\s*\{[^}]*background:\s*var\(--ui-accent-hover\);/s);
+
+  const rowButtons = [
+    "session-link", "command-suggestion", "file-suggestion", "picker-row",
+    "roadmap-phase-header", "roadmap-phase-chain-summary", "roadmap-task",
+    "roadmap-follow-up", "roadmap-item",
+  ];
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
+  for (const className of rowButtons) {
+    const matchingRules = rules.filter(([, selectors]) =>
+      selectors.split(",").map((selector) => selector.trim()).includes(`.${className}`)
+    );
+    assert.ok(matchingRules.some(([, , declarations]) => /border:\s*(?:0|1px solid transparent);/.test(declarations)), className);
+  }
+  assert.match(css, /\.command-suggestion\.focused\s*\{[^}]*background:\s*var\(--ui-hover\);[^}]*border-color:\s*var\(--ui-accent\);/s);
+  assert.match(css, /\.picker-row\.focused\s*\{[^}]*background:\s*var\(--ui-hover\);[^}]*border-color:\s*var\(--ui-accent\);/s);
+
+  assert.match(css, /:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--ui-accent\);[^}]*outline-offset:\s*2px;/s);
+  assert.match(css, /\.picker\s*\{[^}]*outline:\s*none;/s);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[^}]*\*\s*\{[^}]*transition:\s*none;/s);
+  assert.match(css, /\.assistant a\s*\{[^}]*color:\s*var\(--ui-accent\);[^}]*text-decoration:\s*underline;/s);
 });
 
 test("inline theme bootstrap applies only valid explicit themes and never throws", async () => {

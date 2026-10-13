@@ -45,11 +45,11 @@ from symphonai_api.events import (
     RunStarted,
     SubagentSpawned,
 )
-from symphonai_api.cost import ModelPrice, PriceTable
+from symphonai_api.cost import ModelPrice, PriceTable, UsageTotals
 from symphonai_api.extensions import Extensions, load_extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import RunRef
-from symphonai_api.instructions import MAX_INSTRUCTION_FILE_CHARS
+from symphonai_api.instructions import MAX_INSTRUCTION_FILE_CHARS, load_instructions
 from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelResponse, Role, TextBlock, ToolCall, ToolResult, Usage
@@ -1185,6 +1185,109 @@ def check_files_limits_and_truncation() -> None:
                 connection.close()
             if response.status != 200 or not result["truncated"] or len(result["files"]) != 2:
                 fail(f"file walk did not report its cap: {response.status}, {result!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.tree_and_source_policy")
+def check_tree_and_source_policy() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        root.mkdir()
+        source = root / "src"
+        source.mkdir()
+        (source / "a.py").write_text("print('hello')\n", encoding="utf-8")
+        (root / ".env").write_text("secret", encoding="utf-8")
+        git = root / ".git"
+        git.mkdir()
+        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (root / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        (root / "binary.bin").write_bytes(b"\xff\xfe")
+        outside = base / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        (root / "linked-dir").symlink_to(source, target_is_directory=True)
+        (root / "escape.txt").symlink_to(outside)
+        host = _host(repo_root=root, sessions_root=base / "sessions")
+        try:
+            for route in ("/tree", "/source?path=src%2Fa.py"):
+                connection, response = _request(host, "GET", route)
+                response.read()
+                connection.close()
+                if response.status != 401:
+                    fail(f"{route} did not require bearer authorization")
+
+            connection, response = _request(host, "GET", "/tree", headers=_headers(host))
+            tree = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or tree != {
+                "path": "",
+                "entries": [
+                    {"name": "src", "kind": "dir"},
+                    {"name": "big.bin", "kind": "file"},
+                    {"name": "binary.bin", "kind": "file"},
+                ],
+                "truncated": False,
+            }:
+                fail(f"root tree exposed denied paths or was not sorted: {response.status}, {tree!r}")
+
+            connection, response = _request(
+                host, "GET", f"/tree?{urlencode({'path': 'src'})}", headers=_headers(host),
+            )
+            src_tree = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or src_tree["entries"] != [{"name": "a.py", "kind": "file"}]:
+                fail(f"subdirectory tree returned the wrong entries: {response.status}, {src_tree!r}")
+
+            connection, response = _request(
+                host, "GET", f"/source?{urlencode({'path': 'src/a.py'})}", headers=_headers(host),
+            )
+            source_reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or source_reply != {"path": "src/a.py", "text": "print('hello')\n"}:
+                fail(f"source read returned the wrong reply: {response.status}, {source_reply!r}")
+
+            for path in (
+                ".env", ".ENV", ".GIT/HEAD", "../outside.txt", str(outside), "escape.txt"
+            ):
+                connection, response = _request(
+                    host, "GET", f"/source?{urlencode({'path': path})}", headers=_headers(host),
+                )
+                body = response.read()
+                connection.close()
+                if response.status != 403 or body != b"":
+                    fail(f"denied source path {path!r} returned {response.status}, {body!r}")
+
+            for path, expected in (("big.bin", 413), ("binary.bin", 415), ("missing.txt", 404)):
+                connection, response = _request(
+                    host, "GET", f"/source?{urlencode({'path': path})}", headers=_headers(host),
+                )
+                body = response.read()
+                connection.close()
+                if response.status != expected or body != b"":
+                    fail(f"source path {path!r} returned {response.status}, expected {expected}")
+        finally:
+            host.close()
+
+
+@check("host_server.tree_truncation")
+def check_tree_truncation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        root.mkdir()
+        for index in range(2_001):
+            (root / f"{index:04}.txt").touch()
+        host = _host(repo_root=root, sessions_root=base / "sessions")
+        try:
+            connection, response = _request(host, "GET", "/tree", headers=_headers(host))
+            tree = json.loads(response.read())
+            connection.close()
+            names = [entry["name"] for entry in tree.get("entries", [])]
+            if response.status != 200 or len(names) != 2_000 or not tree.get("truncated"):
+                fail(f"tree did not cap its listing: {response.status}, {len(names)}, {tree.get('truncated')}")
+            if names != sorted(names) or names[0] != "0000.txt" or names[-1] != "1999.txt":
+                fail(f"capped tree was not sorted by name: {names[:2]!r}, {names[-2:]!r}")
         finally:
             host.close()
 
@@ -3533,6 +3636,175 @@ def check_changes_report_and_revert() -> None:
             host.close()
 
 
+@check("host_server.prompt_checkpoint_key_live_and_reopened")
+def check_prompt_checkpoint_key_live_and_reopened() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "a.py").write_text("alpha = 1\n")
+        (root / "b.py").write_text("beta = 1\n")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                ToolCall("read-a", "read_file", {"path": "a.py"}),
+                ToolCall("read-b", "read_file", {"path": "b.py"}),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                ToolCall("edit-a", "edit_file", {
+                    "path": "a.py", "old_string": "alpha = 1", "new_string": "alpha = 2",
+                }),
+                ToolCall("edit-b", "edit_file", {
+                    "path": "b.py", "old_string": "beta = 1", "new_string": "beta = 3",
+                }),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        host.run.select_mode("allow")
+        stream_connection, stream_response = _subscribed_stream(host)
+        try:
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "checkpoint prompt"},
+                headers=_headers(host),
+            )
+            reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"checkpoint prompt failed: {response.status}, {reply!r}")
+            _wait_until(lambda: host.run._active is None, "checkpoint prompt did not finish")
+            live = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "PromptSubmitted",
+                what="live prompt checkpoint key",
+            )[1]
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            changes = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or len(changes["turns"]) != 1:
+                fail(f"checkpoint changes listing was invalid: {changes!r}")
+            key = changes["turns"][0]["key"]
+            if live.get("checkpoint_key") != key:
+                fail(f"live prompt key did not match /changes: {live!r}, {changes!r}")
+
+            connection, response = _request(
+                host, "POST", "/session/open", body={"run_id": reply["run_id"]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            reopened = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "HistoryMessage"
+                and item[1].get("role") == "user",
+                what="reopened prompt checkpoint key",
+            )[1]
+            if reopened.get("checkpoint_key") != key:
+                fail(f"reopened prompt key did not match /changes: {reopened!r}, {changes!r}")
+            edits = reopened.get("edits")
+            if edits != [
+                {"path": "a.py", "added": 1, "removed": 1},
+                {"path": "b.py", "added": 1, "removed": 1},
+            ]:
+                fail(f"reopened prompt edits did not match the two file diffs: {reopened!r}")
+        finally:
+            stream_connection.close()
+            host.close()
+
+
+@check("host_server.replayed_subagent_checkpoint_edits")
+def check_replayed_subagent_checkpoint_edits() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "repo"
+        root.mkdir()
+        (root / "c.py").write_text("value = 1\n", encoding="utf-8")
+        (root / "d.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        subprocess.run(["git", "add", "c.py", "d.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch-shared", "dispatch_subagent",
+                {"subagent_name": "worker", "task": "edit c.py"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "read-c", "read_file", {"path": "c.py"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "edit-c", "edit_file", {
+                    "path": "c.py", "old_string": "value = 1", "new_string": "value = 2",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "shared edit done")),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch-worktree", "dispatch_subagent",
+                {"subagent_name": "planner", "task": "edit d.py", "isolation": "worktree"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "read-d", "read_file", {"path": "d.py"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "edit-d", "edit_file", {
+                    "path": "d.py", "old_string": "value = 1", "new_string": "value = 3",
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "worktree edit done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            sessions_root=root / "sessions",
+        )
+        host.start()
+        host.run.select_mode("allow")
+        stream_connection, stream_response = _subscribed_stream(host)
+        try:
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "edit through subagents"},
+                headers=_headers(host),
+            )
+            reply = json.loads(response.read())
+            connection.close()
+            if response.status != 200:
+                fail(f"subagent edit prompt failed: {response.status}, {reply!r}")
+            _wait_until(lambda: host.run._active is None, "subagent edit prompt did not finish")
+
+            connection, response = _request(host, "GET", "/changes", headers=_headers(host))
+            changes = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or len(changes["turns"]) != 1:
+                fail(f"subagent checkpoint changes were invalid: {changes!r}")
+            turn = changes["turns"][0]
+            if turn["paths"] != ["c.py"]:
+                fail(f"checkpoint included the wrong subagent edits: {turn!r}")
+
+            connection, response = _request(
+                host, "POST", "/session/open", body={"run_id": reply["run_id"]},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            replay = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "HistoryMessage"
+                and item[1].get("role") == "user",
+                what="subagent checkpoint edit replay",
+            )[1]
+            expected = [{"path": "c.py", "added": 1, "removed": 1}]
+            if replay.get("checkpoint_key") != turn["key"] or replay.get("edits") != expected:
+                fail(f"shared subagent edit did not replay under its checkpoint: {replay!r}")
+            if any(edit.get("path") == "d.py" for edit in replay.get("edits", [])):
+                fail(f"worktree subagent edit was included in checkpoint replay: {replay!r}")
+        finally:
+            stream_connection.close()
+            host.close()
+
+
 @check("host_server.changes_external_edit_refused")
 def check_changes_external_edit_refused() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -4635,6 +4907,23 @@ def check_instruction_scope_and_warning() -> None:
             finally:
                 host.close()
 
+        user_home = root / "user-home"
+        user_home.mkdir()
+        instruction_file = user_home / "INSTRUCTIONS.md"
+        forbidden_lower = user_home / ".env"
+        forbidden_upper = user_home / ".ENV"
+        instruction_file.write_text("@.env\n@.ENV\nuser rule\n", encoding="utf-8")
+        forbidden_lower.write_text("lower secret", encoding="utf-8")
+        forbidden_upper.write_text("upper secret", encoding="utf-8")
+        loaded = load_instructions(PermissionPolicy(root), user_home=user_home)
+        denial_warnings = [warning for warning in loaded.warnings if "forbidden pattern" in warning]
+        if len(denial_warnings) != 2 or denial_warnings[0] != denial_warnings[1].replace(
+            str(forbidden_upper), str(forbidden_lower)
+        ):
+            fail(f"case-variant user instruction denial warning changed: {loaded.warnings!r}")
+        if "lower secret" in loaded.render() or "upper secret" in loaded.render():
+            fail("case-variant user instruction include leaked forbidden content")
+
 
 @check("host_server.provider_default_and_rejection")
 def check_provider_default_and_rejection() -> None:
@@ -5375,6 +5664,106 @@ def _delegating_conversation_host(root: Path) -> HostServer:
     return host
 
 
+@check("host_server.replay_dispatch_task_and_turn_times")
+def check_replay_dispatch_task_and_turn_times() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host = _delegating_conversation_host(Path(temporary))
+        stream_connection, stream_response = _subscribed_stream(host)
+        try:
+            _send_host_prompt(host, "dispatch")
+            _wait_until(lambda: host.run._active is None, "dispatch run did not finish")
+            run_id = host.run._conversation[1].run_id
+            connection, response = _request(
+                host, "POST", "/session/open", body={"run_id": run_id}, headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"session reopen failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            prompt = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "HistoryMessage" and item[1].get("role") == "user",
+                what="replayed timed prompt",
+            )[1]
+            dispatch = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "HistoryMessage"
+                and any(call.get("name") == "dispatch_subagent" for call in item[1].get("tool_calls", [])),
+                what="replayed subagent dispatch",
+            )[1]
+            times = (prompt.get("turn_started_at"), prompt.get("turn_ended_at"))
+            if not isinstance(times[0], str) or "turn_ended_at" in prompt or "turn_outcome" in prompt:
+                fail(f"replayed user turn has misplaced end metadata: {prompt!r}")
+            call = next(call for call in dispatch["tool_calls"] if call.get("name") == "dispatch_subagent")
+            if call.get("subagent_name") != "worker" or call.get("task") != "inspect":
+                fail(f"replayed dispatch omitted its safe name/task: {dispatch!r}")
+            closing = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "HistoryMessage"
+                and item[1].get("role") == "assistant"
+                and isinstance(item[1].get("turn_ended_at"), str),
+                what="replayed closing assistant message",
+            )[1]
+            if closing.get("turn_outcome") != "finished" or "turn_started_at" in closing:
+                fail(f"replayed closing assistant has incorrect turn metadata: {closing!r}")
+            if closing["turn_ended_at"] <= times[0]:
+                fail(f"replayed root turn end did not follow its start: {closing!r}")
+        finally:
+            stream_connection.close()
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider()
+
+        def fail_before_reply(request, *, cancel=None):  # noqa: ANN001
+            raise ProviderError("scripted failure before reply")
+
+        provider.create_response = fail_before_reply
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        stream_connection, stream_response = _subscribed_stream(host)
+        try:
+            with mock.patch.object(threading, "excepthook", lambda args: None):
+                _send_host_prompt(host, "fail before any reply")
+            run_id = host.run._conversation[1].run_id
+            connection, response = _request(
+                host, "POST", "/session/open", body={"run_id": run_id}, headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"failed session reopen failed: {response.status}, {response.read()!r}")
+                response.read()
+            finally:
+                connection.close()
+            prompt = _await_sse(
+                stream_connection, stream_response,
+                lambda item: item[1].get("type") == "HistoryMessage" and item[1].get("role") == "user",
+                what="replayed failed user prompt",
+            )[1]
+            if (
+                not isinstance(prompt.get("turn_started_at"), str)
+                or not isinstance(prompt.get("turn_ended_at"), str)
+                or prompt.get("turn_outcome") != "failed"
+            ):
+                fail(f"failed run without an assistant reply omitted end metadata on its user record: {prompt!r}")
+            records, _ = host_run_module.read_records(
+                host.run._conversation[1].directory / "run.jsonl"
+            )
+            if any(
+                record.get("type") == "message"
+                and isinstance(record.get("data"), dict)
+                and record["data"].get("role") == Role.ASSISTANT.value
+                for record in records
+            ):
+                fail("scripted failure unexpectedly persisted an assistant message")
+        finally:
+            stream_connection.close()
+            host.close()
+
+
 @check("host_server.conversation_live_parentage")
 def check_conversation_live_parentage() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -5389,6 +5778,60 @@ def check_conversation_live_parentage() -> None:
                 fail(f"live conversation lost dispatch parentage: {agents!r}")
             if "usage" not in conversation or any("total_tokens" not in agent for agent in agents.values()):
                 fail(f"live conversation lost accounted usage: {conversation!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.conversation_agent_state")
+def check_conversation_agent_state() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch-one", "dispatch_subagent", {"subagent_name": "explorer", "task": "inspect one"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "first result")),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch-two", "dispatch_subagent", {"subagent_name": "explorer", "task": "inspect two"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "second result")),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        try:
+            _send_host_prompt(host, "dispatch twice")
+            conversation = _conversation_reply(host)[1]["conversation"]
+            agents = {agent["name"]: agent for agent in conversation["agents"]}
+            if set(agents) != {"leader", "explorer"}:
+                fail(f"repeated dispatch duplicated an agent: {conversation!r}")
+            if any(agent.get("state") != "finished" for agent in agents.values()):
+                fail(f"completed runs omitted finished agent state: {agents!r}")
+        finally:
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _GatedProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        try:
+            host.run.start("cancel this run")
+            if not provider.entered[0].wait(5):
+                fail("cancellation provider did not start")
+            with host.run._lock:
+                active = host.run._active
+            if active is None:
+                fail("cancelled run was not active")
+            host.run.stop()
+            provider.release[0].set()
+            active.thread.join(5)
+            if active.thread.is_alive():
+                fail("cancelled run did not finish")
+            conversation = _conversation_reply(host)[1]["conversation"]
+            agents = {agent["name"]: agent for agent in conversation["agents"]}
+            if agents.get("leader", {}).get("state") != "stopped":
+                fail(f"cancelled run did not report stopped state: {agents!r}")
         finally:
             host.close()
 
@@ -5445,14 +5888,15 @@ def check_conversation_repeated_agent_parentage() -> None:
                 fail(f"reopened conversation without subagents lost its root: {root_only!r}")
 
             graph = (
-                RunNode("r1", "leader", "leader", None, None, False, (
+                RunNode("r1", "leader-old", "leader", None, None, False, (
                     RunNode("r4", "c", "C", "r1", None, False),
                     RunNode("r2", "a", "A", "r1", None, False, (
                         RunNode("r3", "b", "B", "r2", None, False),
                     )),
+                    RunNode("r8", "explorer-old", "explorer", "r1", None, False),
                 )),
-                RunNode("r5", "leader", "leader", None, None, False, (
-                    RunNode("r6", "b", "B", "r5", None, False),
+                RunNode("r5", "leader-new", "leader", None, None, False, (
+                    RunNode("r6", "explorer-new", "explorer", "r5", None, False),
                 )),
                 RunNode("r7", "orphan", "Orphan", "missing", None, False),
             )
@@ -5463,14 +5907,61 @@ def check_conversation_repeated_agent_parentage() -> None:
             with mock.patch.object(host.run._conversation[0], "run_graph", return_value=graph), mock.patch.object(
                 host_run_module, "read_records", return_value=(records, 0),
             ):
-                host.run._usage_by_session[host.run._conversation[1].run_id] = {}
+                host.run._usage_by_session[host.run._conversation[1].run_id] = {
+                    "leader-old": ("leader", {"model": UsageTotals(1, 2, 1)}),
+                    "leader-new": ("leader", {"model": UsageTotals(3, 4, 1)}),
+                    "explorer-old": ("explorer", {"model": UsageTotals(5, 6, 1)}),
+                    "explorer-new": ("explorer", {"model": UsageTotals(7, 8, 1)}),
+                }
                 agents = _conversation_reply(host)[1]["conversation"]["agents"]
-            if [agent["agent_id"] for agent in agents] != ["leader", "a", "b", "c", "orphan"]:
+            if [agent["agent_id"] for agent in agents] != ["leader-new", "a", "b", "c", "explorer-new", "orphan"]:
                 fail(f"spawn order or repeated-agent folding changed: {agents!r}")
-            if [agent["parent_agent_id"] for agent in agents] != [None, "leader", "a", "leader", None]:
+            if [agent["parent_agent_id"] for agent in agents] != [None, "leader-new", "a", "leader-new", "leader-new", None]:
                 fail(f"nested or unknown parent was misplaced: {agents!r}")
+            if agents[0]["input_tokens"] != 4 or agents[0]["output_tokens"] != 6 or agents[0]["calls"] != 2:
+                fail(f"leader usage was not summed across root ids: {agents[0]!r}")
+            explorer = next(agent for agent in agents if agent["name"] == "explorer")
+            if explorer["input_tokens"] != 12 or explorer["output_tokens"] != 14 or explorer["calls"] != 2:
+                fail(f"explorer usage was not summed across ids: {explorer!r}")
         finally:
             host.close()
+
+
+@check("host_server.conversation_agents_keep_identity_after_restart")
+def check_conversation_agents_keep_identity_after_restart() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sessions_root = root / "sessions"
+        first_host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "first reply"))]),
+            PermissionPolicy(root), sessions_root=sessions_root,
+        )
+        first_host.start()
+        try:
+            _send_host_prompt(first_host, "first prompt")
+            first_conversation = _conversation_reply(first_host)[1]["conversation"]
+            first_leaders = [agent for agent in first_conversation["agents"] if agent["name"] == "leader"]
+            if len(first_leaders) != 1:
+                fail(f"first conversation did not have one leader: {first_conversation!r}")
+            session_id = first_conversation["session_id"]
+            first_agent_id = first_leaders[0]["agent_id"]
+        finally:
+            first_host.close()
+
+        second_host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "second reply"))]),
+            PermissionPolicy(root), sessions_root=sessions_root,
+        )
+        second_host.start()
+        try:
+            second_host.run.open_session(session_id)
+            _send_host_prompt(second_host, "second prompt")
+            reopened = _conversation_reply(second_host)[1]["conversation"]
+            leaders = [agent for agent in reopened["agents"] if agent["name"] == "leader"]
+            if len(leaders) != 1 or leaders[0]["agent_id"] != first_agent_id:
+                fail(f"host restart changed or duplicated leader identity: {reopened!r}")
+        finally:
+            second_host.close()
 
 
 @check("host_server.conversation_cost_and_context")

@@ -124,28 +124,6 @@ test("permission mode refusal preserves the host message", async () => {
   );
 });
 
-test("agent controls post the agent id, action, and optional redirect text", async () => {
-  const records = [];
-  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
-    records.push({ url, options });
-    return response(200, { agent_id: "agent-2", state: "paused" });
-  } });
-  assert.deepEqual(await client.controlAgent("agent-2", "pause"), {
-    agent_id: "agent-2", state: "paused",
-  });
-  assert.deepEqual(await client.controlAgent("agent-2", "redirect", "Focus the tests"), {
-    agent_id: "agent-2", state: "paused",
-  });
-  assert.equal(records[0].url, "http://127.0.0.1:4312/agent/control");
-  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
-  assert.deepEqual(JSON.parse(records[0].options.body), {
-    agent_id: "agent-2", action: "pause",
-  });
-  assert.deepEqual(JSON.parse(records[1].options.body), {
-    agent_id: "agent-2", action: "redirect", text: "Focus the tests",
-  });
-});
-
 test("changes requests are authenticated and retain conflict paths", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
@@ -385,6 +363,42 @@ test("files encodes the query and limit as search parameters", async () => {
   assert.deepEqual(Object.fromEntries(new URL(records[0].url).searchParams), {
     query: "a b", limit: "7",
   });
+});
+
+test("tree and source encode paths and use authenticated GET requests", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, records.length === 1
+        ? { path: "src", entries: [{ name: "a.py", kind: "file" }], truncated: false }
+        : { path: "src/a b.py", text: "value\n" });
+    },
+  });
+
+  assert.deepEqual(await client.tree("src"), {
+    path: "src", entries: [{ name: "a.py", kind: "file" }], truncated: false,
+  });
+  assert.deepEqual(await client.source("src/a b.py"), { path: "src/a b.py", text: "value\n" });
+  assert.equal(new URL(records[0].url).pathname, "/tree");
+  assert.deepEqual(Object.fromEntries(new URL(records[0].url).searchParams), { path: "src" });
+  assert.equal(new URL(records[1].url).pathname, "/source");
+  assert.deepEqual(Object.fromEntries(new URL(records[1].url).searchParams), { path: "src/a b.py" });
+  for (const { options } of records) {
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, `Bearer ${TOKEN}`);
+  }
+});
+
+test("source preserves HTTP status on empty error bodies", async () => {
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => response(415, null),
+  });
+  await assert.rejects(client.source("image.png"), (error) => error.status === 415);
 });
 
 test("specFiles requests the authenticated spec path listing", async () => {

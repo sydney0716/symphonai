@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError
 from symphonai_api import FAIL_CLOSED, InterruptBehavior, ResultHint, SCHEMA_VERSION, ToolEffect, ToolMetadata, safe_metadata
+from symphonai_api.leader import dispatch_subagent_tool_schema
 from symphonai_api.cancellation import OperationCancelled
 from symphonai_api.models import ToolResult
 from symphonai_api.runner import standard_tool_registry
@@ -99,6 +100,8 @@ def check_tools_metadata_contract() -> None:
         "grep": ("def login", {"pattern": "def login"}),
         "web_search": ("safe display query", {"query": "safe display query"}),
         "use_skill": ("release", {"name": "release"}),
+        "dispatch_subagent": ("explorer", {"subagent_name": "explorer", "task": "find bug"}),
+        "dispatch_subagent": ("explorer", {"subagent_name": "explorer", "task": "find bug"}),
         "run_shell": ("deploy.sh", {"argv": ["deploy.sh", "--prod"]}),
         "web_fetch": (
             "https://h",
@@ -313,6 +316,11 @@ def check_target_keys_match_schemas() -> None:
         search_backend=_TargetSchemaSearchBackend(), skills={"release": skill}
     )
     for tool_name, (argument_key, _) in _TARGET_KEYS.items():
+        if tool_name == "dispatch_subagent":
+            properties = dispatch_subagent_tool_schema(1)["function"]["parameters"]["properties"]
+            if argument_key not in properties:
+                fail(f"target table maps dispatch_subagent to undeclared parameter {argument_key!r}")
+            continue
         tool = tools.get(tool_name)
         if tool is None:
             fail(f"target table tool {tool_name!r} could not be constructed")

@@ -129,32 +129,199 @@ function fence(line) {
   return line.match(/^```([A-Za-z0-9_-]*)\s*$/);
 }
 
-function bullet(line) {
-  return line.match(/^[-*+] (.*)$/);
+function lineIndent(line) {
+  const prefix = line.match(/^[ \t]*/)?.[0] ?? "";
+  return [...prefix].reduce((total, character) => total + (character === "\t" ? 4 : 1), 0);
 }
 
-function numbered(line) {
-  return line.match(/^(\d+)\. (.*)$/);
+function listMarker(line) {
+  const prefix = line.match(/^[ \t]*/)?.[0] ?? "";
+  const indent = lineIndent(line);
+  const content = line.slice(prefix.length);
+  const ordered = content.match(/^(\d+)\. (.*)$/);
+  const bullet = content.match(/^[-*+] (.*)$/);
+  return ordered
+    ? {
+      indent,
+      textIndent: indent + ordered[0].indexOf(ordered[2]),
+      ordered: true,
+      number: Number(ordered[1]),
+      text: ordered[2],
+    }
+    : bullet
+      ? {
+        indent,
+        textIndent: indent + bullet[0].indexOf(bullet[1]),
+        ordered: false,
+        number: null,
+        text: bullet[1],
+      }
+      : null;
 }
 
 function quote(line) {
   return line.startsWith("> ") ? line.slice(2) : null;
 }
 
-function startsBlock(line) {
-  return Boolean(heading(line) || fence(line) || bullet(line) || numbered(line) || quote(line) !== null);
+function horizontalRule(line) {
+  const value = line.trim();
+  return /^(?:-\s*){3,}$|^(?:\*\s*){3,}$|^(?:_\s*){3,}$/.test(value);
 }
 
-function parseList(lines, start, ordered) {
+function tableCells(line) {
+  const trimmed = line.trim();
+  const cells = trimmed.split("|");
+  if (trimmed.startsWith("|")) cells.shift();
+  if (trimmed.endsWith("|")) cells.pop();
+  return cells.map((cell) => cell.trim());
+}
+
+function tableAlignment(cell) {
+  const left = cell.startsWith(":");
+  const right = cell.endsWith(":");
+  return left && right ? "center" : left ? "left" : right ? "right" : null;
+}
+
+function tableStart(lines, index) {
+  if (index + 1 >= lines.length || !lines[index].includes("|") || !lines[index + 1].includes("|")) {
+    return null;
+  }
+  const header = tableCells(lines[index]);
+  const delimiters = tableCells(lines[index + 1]);
+  return header.length === delimiters.length && delimiters.every((cell) => /^:?-+:?$/.test(cell))
+    ? { header, align: delimiters.map(tableAlignment) }
+    : null;
+}
+
+function startsBlock(lines, index) {
+  const line = lines[index];
+  const marker = listMarker(line);
+  return Boolean(
+    heading(line)
+    || fence(line)
+    || (marker && marker.indent <= 3)
+    || quote(line) !== null
+    || horizontalRule(line)
+    || tableStart(lines, index),
+  );
+}
+
+function sameList(marker, indent, ordered) {
+  return marker && marker.indent === indent && marker.ordered === ordered;
+}
+
+function parseList(lines, start) {
+  const first = listMarker(lines[start]);
   const items = [];
+  const { indent, ordered } = first;
   let index = start;
+
   while (index < lines.length) {
-    const match = ordered ? numbered(lines[index]) : bullet(lines[index]);
-    if (!match) break;
-    items.push(parseInline(match[ordered ? 2 : 1]));
+    const marker = listMarker(lines[index]);
+    if (!sameList(marker, indent, ordered)) break;
+    const item = { text: [marker.text], blocks: [] };
+    let paragraphLines = [];
+    const flushParagraph = () => {
+      if (!paragraphLines.length) return;
+      item.blocks.push({ type: "paragraph", children: parseInline(paragraphLines.join("\n")) });
+      paragraphLines = [];
+    };
+    index += 1;
+
+    while (index < lines.length) {
+      const line = lines[index];
+      if (!line.trim()) {
+        let next = index;
+        while (next < lines.length && !lines[next].trim()) next += 1;
+        const nextMarker = listMarker(lines[next] ?? "");
+        if (nextMarker && nextMarker.indent > indent) {
+          index = next;
+          continue;
+        }
+        break;
+      }
+
+      const nestedMarker = listMarker(line);
+      if (nestedMarker) {
+        if (nestedMarker.indent > indent) {
+          flushParagraph();
+          const nested = parseList(lines, index);
+          item.blocks.push(nested.block);
+          index = nested.next;
+          continue;
+        }
+        break;
+      }
+
+      if (lineIndent(line) >= marker.textIndent) {
+        const openingFence = fence(line.trimStart());
+        if (openingFence) {
+          flushParagraph();
+          const codeLines = [];
+          index += 1;
+          while (index < lines.length && !/^```\s*$/.test(lines[index].trim())) {
+            const codeLine = lines[index];
+            const prefixLength = codeLine.match(/^[ \t]*/)?.[0].length ?? 0;
+            const content = codeLine.slice(Math.min(marker.textIndent, prefixLength));
+            codeLines.push(content);
+            index += 1;
+          }
+          index += Number(index < lines.length);
+          item.blocks.push({
+            type: "code-block",
+            language: openingFence[1] || null,
+            text: codeLines.join("\n"),
+          });
+          continue;
+        }
+        if (item.blocks.length) paragraphLines.push(line.slice(Math.min(marker.textIndent, line.match(/^[ \t]*/)?.[0].length ?? 0)));
+        else item.text.push(line.trimStart());
+        index += 1;
+        continue;
+      }
+      break;
+    }
+    flushParagraph();
+    items.push({
+      children: parseInline(item.text.join("\n")),
+      blocks: item.blocks,
+    });
+
+    if (index < lines.length && !lines[index].trim()) {
+      let next = index;
+      while (next < lines.length && !lines[next].trim()) next += 1;
+      if (sameList(listMarker(lines[next] ?? ""), indent, ordered)) index = next;
+    }
+  }
+
+  return {
+    block: {
+      type: "list",
+      ordered,
+      start: ordered ? first.number : null,
+      items,
+    },
+    next: index,
+  };
+}
+
+function parseTable(lines, start, table) {
+  const rows = [];
+  let index = start + 2;
+  while (index < lines.length && lines[index].trim() && lines[index].includes("|")) {
+    const cells = tableCells(lines[index]).slice(0, table.header.length);
+    rows.push([...cells, ...Array(Math.max(0, table.header.length - cells.length)).fill("")].map(parseInline));
     index += 1;
   }
-  return { block: { type: "list", ordered, items }, next: index };
+  return {
+    block: {
+      type: "table",
+      align: table.align,
+      header: table.header.map(parseInline),
+      rows,
+    },
+    next: index,
+  };
 }
 
 export function parseMarkdown(text) {
@@ -164,6 +331,8 @@ export function parseMarkdown(text) {
   while (index < lines.length) {
     const line = lines[index];
     const openingFence = fence(line);
+    const marker = listMarker(line);
+    const table = tableStart(lines, index);
     if (!line.trim()) {
       index += 1;
     } else if (openingFence) {
@@ -182,12 +351,15 @@ export function parseMarkdown(text) {
     } else if (heading(line)) {
       blocks.push(heading(line));
       index += 1;
-    } else if (bullet(line)) {
-      const result = parseList(lines, index, false);
+    } else if (horizontalRule(line)) {
+      blocks.push({ type: "rule" });
+      index += 1;
+    } else if (marker && marker.indent <= 3) {
+      const result = parseList(lines, index);
       blocks.push(result.block);
       index = result.next;
-    } else if (numbered(line)) {
-      const result = parseList(lines, index, true);
+    } else if (table) {
+      const result = parseTable(lines, index, table);
       blocks.push(result.block);
       index = result.next;
     } else if (quote(line) !== null) {
@@ -199,7 +371,7 @@ export function parseMarkdown(text) {
       blocks.push({ type: "quote", children: parseInline(quoteLines.join("\n")) });
     } else {
       const paragraph = [];
-      while (index < lines.length && lines[index].trim() && !startsBlock(lines[index])) {
+      while (index < lines.length && lines[index].trim() && !startsBlock(lines, index)) {
         paragraph.push(lines[index]);
         index += 1;
       }

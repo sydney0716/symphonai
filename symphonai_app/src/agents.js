@@ -21,13 +21,18 @@ export function createAgentBoard() {
         if (!subagents.has(agent_id)) {
           clear();
         }
-        rows.unshift({ agentId: agent_id, parentAgentId: null, name: agent_name || "agent", state: "running", tool: "", target: "", last: null });
+        rows.unshift({ agentId: agent_id, parentAgentId: null, name: agent_name || "agent", state: "running", tool: "", target: "" });
       }
       return;
     }
     if (type === "SubagentSpawned") {
       subagents.add(subagent_agent_id);
-      rows.push({ agentId: subagent_agent_id, parentAgentId: agent_id ?? null, name: subagent_name, state: "running", tool: "", target: "", last: null });
+      const row = rows.find((entry) => entry.agentId === subagent_agent_id);
+      if (row) {
+        Object.assign(row, { parentAgentId: agent_id ?? null, name: subagent_name, state: "running", tool: "", target: "" });
+      } else {
+        rows.push({ agentId: subagent_agent_id, parentAgentId: agent_id ?? null, name: subagent_name, state: "running", tool: "", target: "" });
+      }
       return;
     }
     const id = type === "SubagentStopped" ? subagent_agent_id : agent_id;
@@ -41,8 +46,6 @@ export function createAgentBoard() {
       calls.get(id).set(tool_call_id, { tool: row.tool, target: row.target });
     } else if (type === "ToolCallFinished" || type === "ToolCallFailed") {
       const pending = calls.get(id);
-      const finished = pending?.get(tool_call_id);
-      if (finished) row.last = finished;
       pending?.delete(tool_call_id);
       const current = pending ? [...pending.values()].at(-1) : null;
       row.tool = current?.tool ?? "";
