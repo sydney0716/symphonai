@@ -112,6 +112,37 @@ test("permission mode uses an authenticated JSON request", async () => {
   assert.deepEqual(JSON.parse(records[0].options.body), { mode: "plan" });
 });
 
+test("memory listing, update, and delete use authenticated host routes", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      if (url.endsWith("/memory")) {
+        return response(200, { project: { entries: [] }, global: { entries: [] } });
+      }
+      if (url.endsWith("/memory/update")) {
+        return response(400, { error: "text must be non-blank and at most 500 characters" });
+      }
+      return response(200, { deleted: "memory-1" });
+    },
+  });
+  assert.deepEqual(await client.memory(), { project: { entries: [] }, global: { entries: [] } });
+  await assert.rejects(
+    client.updateMemory("memory-1", ""),
+    /text must be non-blank and at most 500 characters/,
+  );
+  assert.deepEqual(await client.deleteMemory("memory-1"), { deleted: "memory-1" });
+  assert.deepEqual(records.map(({ url, options }) => [url, options.method, options.headers.Authorization]), [
+    ["http://127.0.0.1:4312/memory", "GET", `Bearer ${TOKEN}`],
+    ["http://127.0.0.1:4312/memory/update", "POST", `Bearer ${TOKEN}`],
+    ["http://127.0.0.1:4312/memory/delete", "POST", `Bearer ${TOKEN}`],
+  ]);
+  assert.deepEqual(JSON.parse(records[1].options.body), { id: "memory-1", text: "" });
+  assert.deepEqual(JSON.parse(records[2].options.body), { id: "memory-1" });
+});
+
 test("permission mode refusal preserves the host message", async () => {
   const client = createClient({
     port: 4312,

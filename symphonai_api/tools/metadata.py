@@ -59,6 +59,8 @@ _TARGET_KEYS = {
     "dispatch_subagent": ("subagent_name", _plain_target),
     "run_shell": ("argv", _argv_program),
     "web_fetch": ("url", _url_origin),
+    "remember": ("text", _plain_target),
+    "forget": ("text", _plain_target),
 }
 
 

@@ -11,6 +11,7 @@ from symphonai_api.models import ToolResult
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tool_schema import to_provider_tool_schema
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import TARGET_LIMIT, _TARGET_KEYS, call_target
 from symphonai_api.skills import Skill
 from symphonai_api.web_search import SearchBackend
@@ -107,6 +108,8 @@ def check_tools_metadata_contract() -> None:
             "https://h",
             {"url": "https://h/v1/x?access_token=t"},
         ),
+        "remember": ("a durable preference", {"text": "a durable preference"}),
+        "forget": ("a durable preference", {"text": "a durable preference", "id": "entry-id"}),
         "future_tool": ("", {"path": "not trusted for an unknown tool"}),
     }
     for tool_name, (expected, arguments) in expected_targets.items():
@@ -313,7 +316,8 @@ def check_tools_metadata_contract() -> None:
 def check_target_keys_match_schemas() -> None:
     skill = Skill("release", "Release.", "Use for releases.", __file__, 1)
     tools = standard_tool_registry(
-        search_backend=_TargetSchemaSearchBackend(), skills={"release": skill}
+        search_backend=_TargetSchemaSearchBackend(), skills={"release": skill},
+        memory_tool=MemoryTool(None, "leader", lambda: None),
     )
     for tool_name, (argument_key, _) in _TARGET_KEYS.items():
         if tool_name == "dispatch_subagent":

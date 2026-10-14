@@ -251,7 +251,10 @@ def check_document_covers_registry() -> None:
     if payload["turn_started_at"] != "2026-10-12T17:21:00.000Z" or payload["turn_ended_at"] != "2026-10-12T17:27:34.000Z":
         fail(f"HistoryMessage dropped its root turn times: {payload!r}")
     doc = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text()
-    for field in ("turn_started_at", "turn_ended_at", "turn_outcome", "subagent_name", "task"):
+    for field in (
+        "turn_started_at", "turn_ended_at", "turn_outcome", "subagent_name", "task",
+        "/memory", "/memory/update", "/memory/delete", "written_at",
+    ):
         if field not in doc:
             fail(f"protocol document omitted replay field {field}")
 

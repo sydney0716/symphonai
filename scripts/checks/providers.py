@@ -33,6 +33,7 @@ from symphonai_api.providers.openai_provider import (
     OpenAIProvider,
     _build_request_body as _build_openai_body,
     _build_responses_request_body,
+    _parse_response as _parse_openai_response,
 )
 from scripts.checks.harness import check, fail
 
@@ -457,6 +458,12 @@ def check_cache_usage_accounting() -> None:
         ).create_response(request)
     if chat.usage != Usage(1000, 10, 800, 0):
         fail(f"OpenAI Chat cache usage was wrong: {chat.usage!r}")
+    deepseek_chat = _parse_openai_response({
+        "choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 10, "prompt_cache_hit_tokens": 700},
+    })
+    if deepseek_chat.usage != Usage(1000, 10, 700, 0):
+        fail(f"DeepSeek Chat cache usage fallback was wrong: {deepseek_chat.usage!r}")
 
     def malformed_usage_urlopen(http_request, timeout=None):  # noqa: ANN001
         return _FakeHttpResponse(

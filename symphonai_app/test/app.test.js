@@ -290,6 +290,8 @@ export function fakeClient(
     project = { repo_root: "/work/current", name: "current" },
     sessions = [],
     settings = { settings: {} },
+    memory = { project: { entries: [] }, global: { entries: [] } },
+    memoryFailure = false,
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
     conversation = null,
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
@@ -298,7 +300,8 @@ export function fakeClient(
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  let memoryData = memory;
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -411,6 +414,28 @@ export function fakeClient(
     async settings() {
       calls.settings += 1;
       return settings;
+    },
+    async memory() {
+      calls.memory += 1;
+      if (memoryFailure) throw new Error("memory unavailable");
+      return memoryData;
+    },
+    async updateMemory(id, text) {
+      calls.updateMemory.push({ id, text });
+      for (const group of Object.values(memoryData)) {
+        group.entries = group.entries.map((entry) => entry.id === id ? { ...entry, text } : entry);
+      }
+      return {
+        entry: Object.values(memoryData).flatMap((group) => group.entries)
+          .find((entry) => entry.id === id),
+      };
+    },
+    async deleteMemory(id) {
+      calls.deleteMemory.push({ id });
+      for (const group of Object.values(memoryData)) {
+        group.entries = group.entries.filter((entry) => entry.id !== id);
+      }
+      return { deleted: id };
     },
     async agent(name, scope) {
       calls.agent.push([name, scope]);
@@ -3561,7 +3586,7 @@ test("settings navigation renders hooks, ceiling, and trust before inventory", a
 
   assert.deepEqual(sections.children.map((link) => link.textContent), [
     "General", "Models", "Mcp", "Skills", "Plugins", "Agents",
-    "Hooks", "Ceiling", "Trust", "Inventory",
+    "Memory", "Hooks", "Ceiling", "Trust", "Inventory",
   ]);
   assert.equal(content.children[0].textContent, "Hooks");
   assert.deepEqual(rowCells(), [
@@ -3589,6 +3614,147 @@ test("settings navigation renders hooks, ceiling, and trust before inventory", a
   browser.dispatch("hashchange");
   assert.equal(content.children[0].textContent, "General");
   assert.deepEqual(rowCells(), [["visible.setting", "on", "user"]]);
+});
+
+test("Memory settings loads project and global entries each time it opens", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/agents" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    memory: {
+      project: { entries: [{ id: "p1", text: "Keep reports concise.", written_at: "2026-10-13T00:00:00.000Z", agent_name: "leader" }] },
+      global: { entries: [{ id: "g1", text: "Use metric units.", written_at: "2026-10-12T00:00:00.000Z", agent_name: "reviewer" }] },
+    },
+  });
+  await start({ global: browser.global, document, client });
+  const pane = document.getElementById("page").children[0];
+  const sections = find(pane, (node) => node.className === "settings-sections");
+  const content = find(pane, (node) => node.className === "settings-content");
+  const memoryLink = sections.children.find((link) => link.textContent === "Memory");
+
+  assert.deepEqual(sections.children.slice(5, 8).map((link) => link.textContent), ["Agents", "Memory", "Hooks"]);
+  await memoryLink.dispatch("click");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(client.calls.memory, 1);
+  assert.deepEqual(content.children.slice(0, 2).map((node) => node.textContent), [
+    "Memory",
+    "What the agent remembered from your conversations. It reads these at the start of each new conversation.",
+  ]);
+  const groups = content.children.filter((node) => node.className === "memory-group");
+  assert.deepEqual(groups.map((group) => group.children[0].textContent), ["Project", "Global"]);
+  assert.match(visibleText(groups[0]), /Keep reports concise\./);
+  assert.match(visibleText(groups[0]), /leader/);
+  assert.match(visibleText(groups[1]), /Use metric units\./);
+  await sections.children.find((link) => link.textContent === "Hooks").dispatch("click");
+  await memoryLink.dispatch("click");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(client.calls.memory, 2);
+});
+
+test("Memory settings explains unreadable groups without offering changes", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/memory" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    memory: {
+      project: { entries: [], error: "unreadable" },
+      global: { entries: [{ id: "g1", text: "Use metric units.", agent_name: "leader" }] },
+    },
+  });
+  await start({ global: browser.global, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const content = find(document.getElementById("page"), (node) => node.className === "settings-content");
+  const groups = content.children.filter((node) => node.className === "memory-group");
+  const project = groups[0];
+  const global = groups[1];
+
+  assert.match(visibleText(project), /This memory file couldn't be read, so nothing in it was changed\./);
+  assert.equal(walk(project).some((node) => ["Edit", "Delete"].includes(node.textContent)), false);
+  assert.equal(walk(project).some((node) => node.textContent === "Nothing remembered yet."), false);
+  assert.match(visibleText(global), /Use metric units\./);
+  assert.equal(walk(global).some((node) => node.textContent === "Edit"), true);
+  assert.equal(walk(global).some((node) => node.textContent === "Delete"), true);
+});
+
+test("Memory settings edits entries and keeps a rejected edit open", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/memory" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    memory: {
+      project: { entries: [{ id: "p1", text: "Original note", written_at: "2026-10-13T00:00:00.000Z", agent_name: "leader" }] },
+      global: { entries: [] },
+    },
+  });
+  const update = client.updateMemory.bind(client);
+  let saves = 0;
+  client.updateMemory = async (id, text) => {
+    saves += 1;
+    if (saves === 2) throw new Error("text is too long");
+    return update(id, text);
+  };
+  await start({ global: browser.global, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const content = find(document.getElementById("page"), (node) => node.className === "settings-content");
+  let row = find(content, (node) => node.className === "memory-entry");
+  await find(row, (node) => node.textContent === "Edit").dispatch("click");
+  let textarea = find(content, (node) => node.className === "memory-edit-input");
+  textarea.value = "Updated note";
+  await find(content, (node) => node.textContent === "Save").dispatch("click");
+  assert.match(visibleText(content), /Updated note/);
+  assert.deepEqual(client.calls.updateMemory, [{ id: "p1", text: "Updated note" }]);
+
+  row = find(content, (node) => node.className === "memory-entry");
+  await find(row, (node) => node.textContent === "Edit").dispatch("click");
+  textarea = find(content, (node) => node.className === "memory-edit-input");
+  textarea.value = "Rejected note";
+  await find(content, (node) => node.textContent === "Save").dispatch("click");
+  assert.ok(find(content, (node) => node.className === "memory-edit-input"));
+  assert.equal(find(content, (node) => node.className === "memory-edit-error").textContent, "text is too long");
+});
+
+test("Memory settings confirms deletion inline and cancellation preserves the entry", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/memory" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    memory: {
+      project: { entries: [{ id: "p1", text: "Delete carefully.", written_at: "2026-10-13T00:00:00.000Z", agent_name: "leader" }] },
+      global: { entries: [] },
+    },
+  });
+  await start({ global: browser.global, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const content = find(document.getElementById("page"), (node) => node.className === "settings-content");
+  let row = find(content, (node) => node.className === "memory-entry");
+  await find(row, (node) => node.textContent === "Delete").dispatch("click");
+  row = find(content, (node) => node.className === "memory-entry");
+  assert.match(visibleText(row), /Delete this memory\?/);
+  await find(row, (node) => node.textContent === "Cancel").dispatch("click");
+  assert.match(visibleText(content), /Delete carefully\./);
+  assert.deepEqual(client.calls.deleteMemory, []);
+
+  row = find(content, (node) => node.className === "memory-entry");
+  await find(row, (node) => node.textContent === "Delete").dispatch("click");
+  row = find(content, (node) => node.className === "memory-entry");
+  await find(row, (node) => node.textContent === "Delete").dispatch("click");
+  assert.deepEqual(client.calls.deleteMemory, [{ id: "p1" }]);
+  assert.match(visibleText(content), /Nothing remembered yet\./);
+});
+
+test("Memory settings shows empty and retry states", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/memory" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { memoryFailure: true });
+  let attempts = 0;
+  client.memory = async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("offline");
+    return { project: { entries: [] }, global: { entries: [] } };
+  };
+  await start({ global: browser.global, document, client });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const content = find(document.getElementById("page"), (node) => node.className === "settings-content");
+  assert.match(visibleText(content), /Couldn't load memory\./);
+  await find(content, (node) => node.textContent === "Retry").dispatch("click");
+  assert.equal(walk(content).filter((node) => node.className === "memory-empty").length, 2);
+  assert.equal(walk(content).filter((node) => node.textContent === "Nothing remembered yet.").length, 2);
 });
 
 test("empty hooks and trust show messages while an empty ceiling keeps six rows", async () => {
@@ -4313,6 +4479,33 @@ test("two tool calls in one turn render as one activity", async () => {
   ]);
   assert.equal(textInDocumentOrder(activity), "Read one.txt and searched for needle.");
   assert.doesNotMatch(textInDocumentOrder(activity), /`/);
+});
+
+test("remember activity reads as a successful memory save", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("remember-1", "remember", "Prefer concise answers"));
+  await client.emit(toolFinished("remember-1", "remember"));
+  const line = document.getElementById("chat").children[0];
+  assert.equal(textInDocumentOrder(line), "Remembered Prefer concise answers.");
+  assert.ok(line.className.includes("activity-memory"));
+});
+
+test("forget activity reads as a successful memory removal", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("forget-1", "forget", "Prefer concise answers"));
+  await client.emit(toolFinished("forget-1", "forget"));
+  const line = document.getElementById("chat").children[0];
+  assert.equal(textInDocumentOrder(line), "Forgot Prefer concise answers.");
+  assert.ok(line.className.includes("activity-memory"));
+  assert.deepEqual(walk(line).filter((node) => node.tagName === "CODE").map((node) => node.textContent), [
+    "Prefer concise answers",
+  ]);
 });
 
 test("activity targets render as code while failures and missing targets keep their wording", async () => {

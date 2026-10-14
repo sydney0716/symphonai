@@ -96,6 +96,7 @@ def run(selector: str | None = None) -> int:
     failed = 0
     skipped = 0
     previous_sessions_root = os.environ.get("SYMPHONAI_SESSIONS_DIR")
+    previous_memory_root = os.environ.get("SYMPHONAI_MEMORY_DIR")
     timeout_seconds = int(
         os.environ.get("SYMPHONAI_CHECK_TIMEOUT", DEFAULT_CHECK_TIMEOUT_SECONDS)
     )
@@ -108,12 +109,16 @@ def run(selector: str | None = None) -> int:
 
     with tempfile.TemporaryDirectory() as temporary:
         os.environ["SYMPHONAI_SESSIONS_DIR"] = str(Path(temporary) / "sessions")
+        os.environ["SYMPHONAI_MEMORY_DIR"] = str(Path(temporary) / "memory")
         try:
-            for name, function in selected:
+            for index, (name, function) in enumerate(selected):
                 if not repository_present and name in NEEDS_REPOSITORY:
                     skipped += 1
                     print(f"SKIP  {name}: needs the working repository")
                     continue
+                os.environ["SYMPHONAI_MEMORY_DIR"] = str(
+                    Path(temporary) / str(index) / "memory"
+                )
                 labels: list[str] = []
                 _CURRENT_LABELS = labels
                 failure: str | None = None
@@ -152,6 +157,10 @@ def run(selector: str | None = None) -> int:
                 os.environ.pop("SYMPHONAI_SESSIONS_DIR", None)
             else:
                 os.environ["SYMPHONAI_SESSIONS_DIR"] = previous_sessions_root
+            if previous_memory_root is None:
+                os.environ.pop("SYMPHONAI_MEMORY_DIR", None)
+            else:
+                os.environ["SYMPHONAI_MEMORY_DIR"] = previous_memory_root
 
     print(
         f"{passed} passed, {failed} failed, {skipped} skipped, "

@@ -289,6 +289,22 @@ export function createClient({
       return request("GET", "/changes");
     },
 
+    memory() {
+      return request("GET", "/memory");
+    },
+
+    updateMemory(id, text) {
+      return request("POST", "/memory/update", { id, text }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    deleteMemory(id) {
+      return request("POST", "/memory/delete", { id }, readReply, {
+        detailOnError: true,
+      });
+    },
+
     revertChanges(payload) {
       return request("POST", "/changes/revert", payload, readReply, {
         detailOnError: true,

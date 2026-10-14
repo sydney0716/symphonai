@@ -10,6 +10,7 @@ import sys
 import subprocess
 import threading
 import tempfile
+from datetime import datetime, timezone
 from collections.abc import Mapping
 from http.cookies import CookieError, SimpleCookie
 from http import HTTPStatus
@@ -20,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from symphonai_api.compaction import DEFAULT_RECENT_TURNS
 from symphonai_api.cost import PriceTable
+from symphonai_api.agent_memory import MemoryUnavailable
 from symphonai_api.agent_file import AgentFileError, load_agent_file
 from symphonai_api.extensions import Extensions
 from symphonai_api.lsp import LspManager
@@ -106,6 +108,20 @@ def _model_listing(
     }
 
 
+def _memory_entry_reply(entry) -> dict[str, str]:  # noqa: ANN001
+    written_at = (
+        datetime.fromtimestamp(entry.written_at, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    return {
+        "id": entry.id,
+        "text": entry.text,
+        "written_at": written_at,
+        "agent_name": entry.agent_name,
+    }
+
+
 def _provider(name: str | None = None, model: str | None = None, base_url: str | None = None) -> ModelProvider | None:
     if name is None:
         name = next((vendor for vendor, key, _ in PROVIDERS if os.environ.get(key, "").strip()), None)
@@ -149,6 +165,8 @@ class HostServer:
         model: str | None = None,
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
+        memory_root: Path | None = None,
+        memory_extraction_enabled: bool | None = None,
         home: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
@@ -178,6 +196,8 @@ class HostServer:
             publish_approval=self._publish_approval,
             approval_timeout=approval_timeout,
             sessions_root=sessions_root,
+            memory_root=memory_root,
+            memory_extraction_enabled=memory_extraction_enabled,
             extensions=extensions,
             mcp_tools=mcp_tools,
             price_table=price_table,
@@ -710,6 +730,23 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, reply)
                     return
+                if request_path == "/memory":
+                    if not self._authorized():
+                        return
+                    memory = host.run.memory_store()
+                    if memory is None:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "memory is unavailable"})
+                        return
+                    reply = {}
+                    for scope in ("project", "global"):
+                        entries, unreadable = memory.read_status(scope)
+                        reply[scope] = (
+                            {"entries": [], "error": "unreadable"}
+                            if unreadable
+                            else {"entries": [_memory_entry_reply(entry) for entry in entries]}
+                        )
+                    self._json(HTTPStatus.OK, reply)
+                    return
                 if request_path == "/models":
                     if not self._authorized():
                         return
@@ -1118,10 +1155,65 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
+                    return
+                if self.path == "/memory/update":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"id", "text"} or not all(
+                            isinstance(payload.get(key), str) for key in ("id", "text")
+                        ):
+                            raise ProtocolError("memory/update requires id and text")
+                        if not payload["text"].strip() or len(payload["text"]) > 500:
+                            raise ProtocolError("text must be non-blank and at most 500 characters")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    memory = host.run.memory_store()
+                    if memory is None:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "memory is unavailable"})
+                        return
+                    try:
+                        entry = memory.update(payload["id"], payload["text"])
+                    except MemoryUnavailable:
+                        self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    if entry is None:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown memory id"})
+                        return
+                    self._json(HTTPStatus.OK, {"entry": _memory_entry_reply(entry)})
+                    return
+                if self.path == "/memory/delete":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"id"} or not isinstance(payload.get("id"), str):
+                            raise ProtocolError("memory/delete requires id")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    memory = host.run.memory_store()
+                    if memory is None:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "memory is unavailable"})
+                        return
+                    try:
+                        deleted = memory.delete(payload["id"])
+                    except MemoryUnavailable:
+                        self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if not deleted:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown memory id"})
+                        return
+                    self._json(HTTPStatus.OK, {"deleted": payload["id"]})
                     return
                 if self.path == "/spec/plan":
                     try:

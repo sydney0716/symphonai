@@ -30,6 +30,8 @@ const ACTIVITY_VERBS = Object.freeze({
   write_file: "wrote",
   run_shell: "ran",
   dispatch_subagent: "dispatched",
+  remember: "remembered",
+  forget: "Forgot",
 });
 
 const ACTIVITY_KINDS = Object.freeze({
@@ -43,6 +45,8 @@ const ACTIVITY_KINDS = Object.freeze({
   run_shell: "activity-shell",
   web_fetch: "activity-web",
   web_search: "activity-web",
+  remember: "activity-memory",
+  forget: "activity-memory",
 });
 
 function renderPrompt(document, entry) {

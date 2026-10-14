@@ -1247,6 +1247,21 @@ def check_stream_cache_usage_accounting() -> None:
     if responses.usage != Usage(1000, 10, 800, 0):
         fail(f"streamed OpenAI Responses cache usage was wrong: {responses.usage!r}")
 
+    deepseek_stream = _LinesResponse(
+        [
+            b'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":10,"prompt_cache_hit_tokens":700}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    with mock.patch.dict(os.environ, {"SYMPHONAI_DEEPSEEK_STREAM_KEY": "deepseek-stream-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=deepseek_stream
+    ):
+        deepseek = _assemble(OpenAICompatibleProvider(
+            "SYMPHONAI_DEEPSEEK_STREAM_KEY", "https://deepseek.invalid/v1"
+        ).create_response_stream(request))
+    if deepseek.usage != Usage(1000, 10, 700, 0):
+        fail(f"streamed DeepSeek cache usage fallback was wrong: {deepseek.usage!r}")
+
     compatible_env = "SYMPHONAI_STREAM_CACHE_KEY"
     chat_stream = _LinesResponse(
         [

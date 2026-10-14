@@ -105,6 +105,7 @@ def standard_tool_registry(
     }
     if memory_tool is not None:
         registry[memory_tool.name] = memory_tool
+        registry[memory_tool.forget_tool.name] = memory_tool.forget_tool
     return registry
 
 

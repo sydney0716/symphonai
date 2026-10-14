@@ -154,17 +154,26 @@ def check_base_url_reaches_provider() -> None:
                 if not request_seen.wait(5):
                     fail("selected OpenAI endpoint was not called")
                 request_input = requests[0][1].get("input") if len(requests) == 1 else None
+                memory_input = [
+                    item for item in request_input or []
+                    if item.get("role") == "system"
+                    and "Memory persists across conversations" in str(item.get("content"))
+                ]
+                request_input_without_memory = [
+                    item for item in request_input or [] if item not in memory_input
+                ]
                 valid_input = (
                     isinstance(request_input, list)
-                    and len(request_input) == 2
-                    and request_input[0].get("role") == "system"
-                    and isinstance(request_input[0].get("content"), list)
-                    and len(request_input[0]["content"]) == 1
-                    and request_input[0]["content"][0].get("type") == "input_text"
-                    and request_input[0]["content"][0].get("text", "").startswith(
+                    and len(memory_input) == 1
+                    and len(request_input_without_memory) == 2
+                    and request_input_without_memory[0].get("role") == "system"
+                    and isinstance(request_input_without_memory[0].get("content"), list)
+                    and len(request_input_without_memory[0]["content"]) == 1
+                    and request_input_without_memory[0]["content"][0].get("type") == "input_text"
+                    and request_input_without_memory[0]["content"][0].get("text", "").startswith(
                         "Environment when this conversation started (it does not update):"
                     )
-                    and request_input[1] == {
+                    and request_input_without_memory[1] == {
                         "role": "user",
                         "content": [{"type": "input_text", "text": "hello"}],
                     }

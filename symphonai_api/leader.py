@@ -77,6 +77,7 @@ from symphonai_api.identity import AgentRef, RunRef, new_agent_ref, new_id
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.lsp import LspManager
 from symphonai_api.models import ContentInput, Message, ModelRequest, Role, ToolCall, ToolResult
+from symphonai_api.memory_extract import MemoryExtractor
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
@@ -150,9 +151,31 @@ def _memory_entries(
     store: AgentMemory | None,
     spec: AgentSpec,
 ) -> tuple[MemoryEntry, ...]:
+    return _memory_seed(store, spec)[0]
+
+
+def _memory_seed(
+    store: AgentMemory | None,
+    spec: AgentSpec,
+) -> tuple[tuple[MemoryEntry, ...], tuple[str, ...]]:
     if store is None or not spec.memory.enabled:
-        return ()
-    return store.read(spec.name)[-spec.memory.max_entries:]
+        return (), ()
+    limit = spec.memory.max_entries
+    global_entries, global_unreadable = store.read_status("global")
+    project_entries, project_unreadable = store.read_status("project")
+    entries = (
+        *reversed(global_entries[-limit:]),
+        *reversed(project_entries[-limit:]),
+    )
+    unreadable = tuple(
+        scope
+        for scope, failed in (
+            ("global", global_unreadable),
+            ("project", project_unreadable),
+        )
+        if failed
+    )
+    return entries, unreadable
 
 
 def builtin_subagent_specs(
@@ -773,7 +796,7 @@ class DispatchSubagentTool(LocalTool):
                     spec.name,
                     lambda agent_id=agent_ref.agent_id: self._active_run_id(agent_id),
                 )
-                if spec.memory.enabled
+                if spec.memory.enabled and self._memory is not None
                 else None
             )
             standard_tools = (
@@ -789,7 +812,14 @@ class DispatchSubagentTool(LocalTool):
                     ),
                 )
                 if tool_names is None or tool_names
-                else ({"memory": memory_tool} if memory_tool is not None else {})
+                else (
+                    {
+                        memory_tool.name: memory_tool,
+                        memory_tool.forget_tool.name: memory_tool.forget_tool,
+                    }
+                    if memory_tool is not None
+                    else {}
+                )
             )
             subagent_tools = merge_tool_registry(
                 standard_tools,
@@ -849,11 +879,14 @@ class DispatchSubagentTool(LocalTool):
         if record.messages:
             record.messages.append(Message(role=Role.USER, content=task))
         else:
+            memory, unreadable_memory = _memory_seed(self._memory, spec)
             record.messages = seed_messages(
                 spec,
                 task,
                 parent_messages=self._parent_messages,
-                memory=_memory_entries(self._memory, spec),
+                memory=memory,
+                memory_available=self._memory is not None,
+                unreadable_memory=unreadable_memory,
             )
         if self._events is not None:
             if self._event_run_id is None:
@@ -1099,6 +1132,10 @@ class LeaderConfig:
     leader_effort: str | None = None
     hook_runner: HookRunner | None = None
     memory: AgentMemory | None = None
+    memory_provider: ModelProvider | None = None
+    memory_model: str | None = None
+    memory_extraction_enabled: bool = True
+    memory_usage_callback: Callable[[str, UsageTotals], None] | None = None
     model_summary: bool = False
     checkpoints: CheckpointStore | None = None
     leader_tools: Mapping[str, LocalTool] | None = None
@@ -1265,7 +1302,8 @@ class Leader:
                 "leader",
                 self._leader_run_id,
             )
-            if defined_leader is not None and defined_leader.memory.enabled
+            if config.memory is not None
+            and (defined_leader is None or defined_leader.memory.enabled)
             else None
         )
         standard_tools = merge_tool_registry(
@@ -1302,7 +1340,7 @@ class Leader:
             memory=(
                 defined_leader.memory
                 if defined_leader is not None
-                else MemorySettings()
+                else MemorySettings(enabled=True)
             ),
             call_class=CallClass.FOREGROUND,
             max_depth=0,
@@ -1336,6 +1374,22 @@ class Leader:
             ),
         )
         self._chat_messages = self._initial_leader_messages()
+        self._memory_extractor = (
+            MemoryExtractor(
+                config.memory,
+                self._leader_spec,
+                leader_policy,
+                agent_id=self._agent_ref.agent_id,
+                events=self._event_sink,
+                usage_callback=config.memory_usage_callback,
+            )
+            if config.memory is not None
+            and self._leader_spec.memory.enabled
+            and config.memory_extraction_enabled
+            else None
+        )
+        if self._memory_extractor is not None:
+            self._memory_extractor.set_cursor(self._chat_messages)
         self._compaction_usage_by_model: dict[str, UsageTotals] = {}
         self._automatic_compaction_breaker = ConsecutiveFailureBreaker(
             "automatic compaction",
@@ -1401,16 +1455,19 @@ class Leader:
         )
 
     def _initial_leader_messages(self) -> list[Message]:
-        if not self._leader_spec.memory.enabled:
+        if not self._leader_spec.memory.enabled or self._config.memory is None:
             return (
                 [Message(role=Role.SYSTEM, content=self._leader_prompt)]
                 if self._leader_prompt
                 else []
             )
+        memory, unreadable = _memory_seed(self._config.memory, self._leader_spec)
         messages = seed_messages(
             self._leader_spec,
             "",
-            memory=_memory_entries(self._config.memory, self._leader_spec),
+            memory=memory,
+            memory_available=True,
+            unreadable_memory=unreadable,
         )
         return messages[:-1]
 
@@ -1563,6 +1620,8 @@ class Leader:
         """
 
         self._chat_messages = self._initial_leader_messages()
+        if self._memory_extractor is not None:
+            self._memory_extractor.set_cursor([])
         self._automatic_compaction_breaker.reset()
         self._context_overflow_repair_failed = False
         return self.clear_subagents()
@@ -1579,6 +1638,8 @@ class Leader:
             self._agent._persisted_digests = [
                 _message_digest(message) for message in messages
             ]
+        if self._memory_extractor is not None:
+            self._memory_extractor.set_cursor(self._chat_messages)
 
     def clear_subagents(self) -> int:
         """Clear all dispatched subagents and return how many were removed."""
@@ -1883,6 +1944,20 @@ class Leader:
             self._automatic_compaction_breaker.record_success()
             self._context_overflow_repair_failed = False
         self._chat_messages = result.leader_messages
+        extraction_messages = list(result.leader_messages)
+        if (
+            result.stopped_reason == "final_response"
+            and self._memory_extractor is not None
+        ):
+            self._memory_extractor.submit(
+                extraction_messages,
+                leader_provider=self._config.leader_provider,
+                leader_model=self._leader_model,
+                leader_effort=self._leader_effort,
+                leader_tool_schemas=list(self._agent._tool_schemas),
+                memory_provider=self._config.memory_provider,
+                memory_model=self._config.memory_model,
+            )
         self._automatic_compact_chat(cancel=cancel)
         leader_usage = result.usage_by_agent.setdefault(
             self._agent_ref.agent_id, {}
@@ -1892,3 +1967,7 @@ class Leader:
         self._compaction_usage_by_model.clear()
         result.stopped_repairs = self._stopped_repairs()
         return result
+
+    def close(self) -> None:
+        if self._memory_extractor is not None:
+            self._memory_extractor.close()

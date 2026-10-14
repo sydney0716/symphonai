@@ -71,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "sandbox", "lsp", "worktree")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "memory", "sandbox", "lsp", "worktree")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -126,6 +126,17 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    memory = _table(source, values, "memory")
+    if memory is not None:
+        _unknown_keys(source, "memory", memory, {"model", "provider", "extract"})
+        if "model" in memory and not _string(source, "memory.model", memory["model"]).strip():
+            _raise(source, "memory.model", "must be a non-empty string")
+        if "extract" in memory:
+            _boolean(source, "memory.extract", memory["extract"])
+        if "provider" in memory:
+            provider = _string(source, "memory.provider", memory["provider"])
+            if provider not in {"anthropic", "gemini", "openai"}:
+                _raise(source, "memory.provider", f"unknown provider {provider!r}")
     models = _table(source, values, "models")
     if models is not None:
         _unknown_keys(source, "models", models, {"anthropic", "gemini", "openai"})

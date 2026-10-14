@@ -143,7 +143,7 @@ def check_registry_subsets() -> None:
         ["read_file"],
         memory_tool=MemoryTool(None, "reviewer", lambda: None),
     )
-    if list(memory_tools) != ["read_file", "remember"]:
+    if list(memory_tools) != ["read_file", "remember", "forget"]:
         fail(f"opt-in memory tool was not added after the selected tools: {list(memory_tools)!r}")
     if "remember" in metadata_tools:
         fail("unconfigured standard registry acquired the memory tool")

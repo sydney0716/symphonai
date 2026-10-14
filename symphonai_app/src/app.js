@@ -280,6 +280,13 @@ export async function start({ global, document, client }) {
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
   append(chatPane, conversationUsage);
   const statusFields = readStatusFields(global);
+  let memoryReply = null;
+  let memoryLoadError = null;
+  let memoryLoading = false;
+  let memoryLoadSequence = 0;
+  let editingMemoryId = null;
+  let memoryEditError = "";
+  let confirmingMemoryDeleteId = null;
 
   function settingsTable(headings, rows) {
     const table = element(document, "table", { className: "settings-table" });
@@ -294,7 +301,159 @@ export async function start({ global, document, client }) {
     return table;
   }
 
+  function renderMemoryContent() {
+    const children = [
+      element(document, "h2", { text: "Memory" }),
+      element(document, "p", {
+        text: "What the agent remembered from your conversations. It reads these at the start of each new conversation.",
+      }),
+    ];
+    if (memoryLoading) {
+      children.push(element(document, "p", { text: "Loading memory…" }));
+    } else if (memoryLoadError) {
+      const retry = element(document, "button", { text: "Retry" });
+      retry.type = "button";
+      listen(retry, "click", () => loadMemory());
+      children.push(
+        element(document, "p", { className: "memory-load-error", text: "Couldn't load memory." }),
+        retry,
+      );
+    } else if (memoryReply) {
+      for (const [scope, label] of [["project", "Project"], ["global", "Global"]]) {
+        const group = element(document, "section", { className: "memory-group" });
+        append(group, element(document, "h3", { text: label }));
+        const memorySet = memoryReply[scope] ?? {};
+        const entries = memorySet.entries ?? [];
+        if (memorySet.error === "unreadable") {
+          append(group, element(document, "p", {
+            className: "memory-load-error",
+            text: "This memory file couldn't be read, so nothing in it was changed.",
+          }));
+        } else if (entries.length === 0) {
+          append(group, element(document, "p", { className: "memory-empty", text: "Nothing remembered yet." }));
+        }
+        for (const entry of memorySet.error === "unreadable" ? [] : entries) {
+          const row = element(document, "article", { className: "memory-entry" });
+          if (entry.id === editingMemoryId) {
+            const textarea = element(document, "textarea", { className: "memory-edit-input" });
+            textarea.value = entry.text;
+            const save = element(document, "button", { text: "Save" });
+            save.type = "button";
+            const cancel = element(document, "button", { text: "Cancel" });
+            cancel.type = "button";
+            listen(save, "click", async () => {
+              try {
+                const reply = await boundary.updateMemory(entry.id, textarea.value);
+                memoryReply[scope].entries = entries.map((item) =>
+                  item.id === entry.id ? reply.entry : item
+                );
+                editingMemoryId = null;
+                memoryEditError = "";
+              } catch (error) {
+                memoryEditError = error instanceof Error ? error.message : String(error);
+              }
+              if (route?.page === "settings" && route.section === "memory") {
+                renderMemoryContent();
+              }
+            });
+            listen(cancel, "click", () => {
+              editingMemoryId = null;
+              memoryEditError = "";
+              renderMemoryContent();
+            });
+            append(row, textarea, save, cancel);
+            if (memoryEditError) {
+              append(row, element(document, "p", {
+                className: "memory-edit-error",
+                text: memoryEditError,
+              }));
+            }
+          } else if (entry.id === confirmingMemoryDeleteId) {
+            const confirm = element(document, "p", { text: "Delete this memory?" });
+            const remove = element(document, "button", { text: "Delete" });
+            remove.type = "button";
+            const cancel = element(document, "button", { text: "Cancel" });
+            cancel.type = "button";
+            listen(remove, "click", async () => {
+              try {
+                await boundary.deleteMemory(entry.id);
+                memoryReply[scope].entries = entries.filter((item) => item.id !== entry.id);
+                confirmingMemoryDeleteId = null;
+              } catch (error) {
+                memoryEditError = error instanceof Error ? error.message : String(error);
+              }
+              renderMemoryContent();
+            });
+            listen(cancel, "click", () => {
+              confirmingMemoryDeleteId = null;
+              memoryEditError = "";
+              renderMemoryContent();
+            });
+            append(row, element(document, "p", { className: "memory-entry-text", text: entry.text }), confirm, remove, cancel);
+            if (memoryEditError) {
+              append(row, element(document, "p", {
+                className: "memory-edit-error",
+                text: memoryEditError,
+              }));
+            }
+          } else {
+            const date = typeof entry.written_at === "string"
+              ? new Date(entry.written_at).toLocaleDateString()
+              : "";
+            const metadata = [date, entry.agent_name].filter(Boolean).join(" · ");
+            const edit = element(document, "button", { text: "Edit" });
+            edit.type = "button";
+            const remove = element(document, "button", { text: "Delete" });
+            remove.type = "button";
+            listen(edit, "click", () => {
+              editingMemoryId = entry.id;
+              memoryEditError = "";
+              renderMemoryContent();
+            });
+            listen(remove, "click", () => {
+              confirmingMemoryDeleteId = entry.id;
+              memoryEditError = "";
+              renderMemoryContent();
+            });
+            append(
+              row,
+              element(document, "p", { className: "memory-entry-text", text: entry.text }),
+              element(document, "p", { className: "memory-entry-meta", text: metadata }),
+              append(element(document, "div", { className: "memory-entry-actions" }), edit, remove),
+            );
+          }
+          append(group, row);
+        }
+        children.push(group);
+      }
+    }
+    replace(settingsContent, ...children);
+  }
+
+  async function loadMemory() {
+    const sequence = ++memoryLoadSequence;
+    memoryLoading = true;
+    memoryLoadError = null;
+    renderMemoryContent();
+    try {
+      const reply = await boundary.memory();
+      if (sequence !== memoryLoadSequence) return;
+      memoryReply = reply;
+    } catch {
+      if (sequence !== memoryLoadSequence) return;
+      memoryLoadError = true;
+    }
+    memoryLoading = false;
+    if (route?.page === "settings" && route.section === "memory") {
+      renderMemoryContent();
+    }
+  }
+
   function showSettings(section) {
+    if (section === "memory") {
+      void loadMemory();
+      return;
+    }
     if (section === "models") {
       const models = modelRows(settingsReply);
       const rows = models.map(({ name, envVar, present }) => [
@@ -826,7 +985,7 @@ export async function start({ global, document, client }) {
     }
   }
 
-  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "hooks", "ceiling", "trust", "inventory"].map((section) => {
+  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "memory", "hooks", "ceiling", "trust", "inventory"].map((section) => {
     const link = element(document, "a", {
       text: section[0].toUpperCase() + section.slice(1),
     });

@@ -229,6 +229,7 @@ button:disabled {
 
 .icon-pencil,
 .activity-edit,
+.activity-memory,
 #chat > .edit {
   --icon-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4 16.75-.75 4 4-.75L19 8.25 15.75 5z'/%3E%3Cpath d='m14.5 6.25 3.25 3.25M4 20.75h16'/%3E%3C/svg%3E");
 }
@@ -791,6 +792,45 @@ button.session-link {
 
 .settings-table td button {
   margin-left: var(--space-3);
+}
+
+.memory-group {
+  margin-top: var(--space-6);
+}
+
+.memory-entry {
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--ui-border);
+}
+
+.memory-entry-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.memory-entry-meta {
+  margin: var(--space-1) 0 0;
+  color: var(--ui-text-secondary);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.memory-entry-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.memory-edit-input {
+  display: block;
+  width: 100%;
+  min-height: 5rem;
+}
+
+.memory-load-error,
+.memory-edit-error {
+  color: var(--ui-danger);
 }
 
 .agent-form {

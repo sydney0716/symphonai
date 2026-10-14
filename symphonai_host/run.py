@@ -212,6 +212,7 @@ class HostRun:
         approval_timeout: float = 300.0,
         sessions_root: Path | None = None,
         memory_root: Path | None = None,
+        memory_extraction_enabled: bool | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
         price_table: PriceTable | None = None,
@@ -241,6 +242,34 @@ class HostRun:
         self._model = model
         self._effort: str | None = None
         self._provider_factory = provider_factory
+        memory_config = None if extensions is None else extensions.config
+        self._memory_model = None if memory_config is None else memory_config.get("memory.model")
+        configured_memory_provider = (
+            None if memory_config is None else memory_config.get("memory.provider")
+        )
+        self._memory_provider: ModelProvider | None = None
+        self._memory_extraction_enabled = (
+            True if memory_config is None else memory_config.get("memory.extract", True)
+        )
+        if memory_extraction_enabled is not None:
+            self._memory_extraction_enabled = memory_extraction_enabled
+        if configured_memory_provider is not None:
+            try:
+                self._memory_provider = (
+                    None
+                    if provider_factory is None
+                    else provider_factory(
+                        configured_memory_provider, self._memory_model, None
+                    )
+                )
+            except Exception:
+                self._memory_provider = None
+            if self._memory_provider is None:
+                print(
+                    "memory extraction disabled: configured provider is unavailable",
+                    file=sys.stderr,
+                )
+                self._memory_extraction_enabled = False
         self._provider_choice = (
             {"name": provider.name, "model": model, "base_url": getattr(provider, "base_url", None)}
             if provider is not None and provider.name in ("anthropic", "gemini", "openai")
@@ -1089,16 +1118,27 @@ class HostRun:
                 raise
             return run_id
 
-    def _memory_for(self, roster: Mapping[str, AgentSpec]) -> AgentMemory | None:
-        if not any(spec.memory.enabled for spec in roster.values()):
-            return None
+    def memory_store(self) -> AgentMemory | None:
+        """Return the shared project and global memory store if it opens."""
         if not self._memory_open_attempted:
             self._memory_open_attempted = True
             try:
-                self._memory = AgentMemory(self._memory_root)
+                self._memory = AgentMemory(
+                    self._memory_root, self._policy.repo_root
+                )
             except OSError:
                 self._memory = None
         return self._memory
+
+    def _memory_for(
+        self,
+        roster: Mapping[str, AgentSpec],
+        *,
+        leader_enabled: bool = True,
+    ) -> AgentMemory | None:
+        if not leader_enabled and not any(spec.memory.enabled for spec in roster.values()):
+            return None
+        return self.memory_store()
 
     def _close_idle_conversations_locked(self) -> None:
         current_id = None if self._conversation is None else self._conversation[1].run_id
@@ -1110,6 +1150,7 @@ class HostRun:
             ):
                 continue
             conversation[1].close()
+            conversation[0].close()
             self._open_conversations.pop(session_id, None)
             self._policy_by_session.pop(session_id, None)
             self._approvals_by_session.pop(session_id, None)
@@ -1224,7 +1265,18 @@ class HostRun:
                 subagent_specs=roster,
                 subagent_budget=self._subagent_budget,
                 hook_runner=self._hooks,
-                memory=self._memory_for(roster),
+                memory=self._memory_for(
+                    roster,
+                    leader_enabled=(
+                        "leader" not in roster or roster["leader"].memory.enabled
+                    ),
+                ),
+                memory_provider=self._memory_provider,
+                memory_model=self._memory_model,
+                memory_extraction_enabled=self._memory_extraction_enabled,
+                memory_usage_callback=lambda model, usage: self._record_background_usage(
+                    session.run_id, model, usage
+                ),
                 checkpoints=checkpoints,
                 provider_for=provider_for,
                 leases=self._leases,
@@ -1586,6 +1638,7 @@ class HostRun:
             self._usage_by_agent.clear()
             self.approvals.clear_grants()
         if conversation is not None:
+            conversation[0].close()
             conversation[1].close()
             self._open_conversations.pop(conversation[1].run_id, None)
             self._policy_by_session.pop(conversation[1].run_id, None)
@@ -1613,7 +1666,8 @@ class HostRun:
             self._open_conversations.clear()
         if self._lsp is not None:
             self._lsp.close()
-        for _, session in conversations:
+        for leader, session in conversations:
+            leader.close()
             session.close()
 
     def stop(self) -> None:
@@ -1655,6 +1709,24 @@ class HostRun:
         for model, totals in incoming.items():
             merged[model] = merged.get(model, UsageTotals()).merged(totals)
         return merged
+
+    def _record_background_usage(
+        self, session_id: str, model: str, usage: UsageTotals
+    ) -> None:
+        with self._lock:
+            conversation = self._open_conversations.get(session_id)
+            if conversation is None and self._conversation is not None and self._conversation[1].run_id == session_id:
+                conversation = self._conversation
+            if conversation is None:
+                return
+            agent_id = conversation[0].agent_ref.agent_id
+            usage_by_agent = self._usage_by_session.setdefault(session_id, {})
+            name, by_model = usage_by_agent.get(agent_id, ("leader", {}))
+            updated = dict(by_model)
+            updated[model] = updated.get(model, UsageTotals()).merged(usage)
+            usage_by_agent[agent_id] = (name, updated)
+            if self._conversation is not None and self._conversation[1].run_id == session_id:
+                self._usage_by_agent = dict(usage_by_agent)
 
     def _record_result(
         self, leader: Leader, result: LeaderRunResult, session_id: str | None = None,

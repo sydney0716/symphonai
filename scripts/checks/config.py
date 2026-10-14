@@ -1055,6 +1055,24 @@ def model_preferences() -> None:
             fail(f"empty model preference or provenance was lost: {resolved.values!r}")
         if resolved.get("models.gemini") is not None:
             fail("an omitted provider unexpectedly gained a model preference")
+        _write(source, '[memory]\nmodel = "extractor-model"\nprovider = "openai"\nextract = false\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("memory.model") != "extractor-model" or resolved.get("memory.provider") != "openai":
+            fail(f"memory extraction settings were not resolved: {resolved.values!r}")
+        if resolved.get("memory.extract") is not False:
+            fail(f"memory extraction switch was not resolved: {resolved.values!r}")
+        for invalid in (
+            '[memory]\nmodel = " "\n',
+            '[memory]\nprovider = "unknown"\n',
+            '[memory]\nother = "value"\n',
+            '[memory]\nextract = "false"\n',
+        ):
+            _write(source, invalid)
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError:
+                continue
+            fail(f"invalid memory settings were accepted: {invalid!r}")
 
 
 @check("config.invalid_model_preferences")

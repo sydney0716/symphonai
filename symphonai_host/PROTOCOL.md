@@ -98,6 +98,16 @@ message when the run has one, or its final user message when it has no
 assistant message. A client can place the turn-time line after that turn's
 last replayed message and any edit card.
 
+Authenticated `GET /memory` returns the project and global memory sets. Entries
+contain `id`, `text`, `written_at` (ISO-8601 UTC), and `agent_name`; no storage
+paths are exposed. If a set cannot be read, it returns `{"entries": [],
+"error": "unreadable"}` while the other set is still returned normally.
+Authenticated `POST /memory/update` accepts `{ "id", "text" }` and returns
+`{ "entry" }`; `POST /memory/delete` accepts `{ "id" }` and returns
+`{ "deleted" }`. Unknown ids return 404. Blank or over-500-character memory
+text returns 400. An update or delete targeting an unreadable set returns 503
+with an empty body.
+
 ## Approvals
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,

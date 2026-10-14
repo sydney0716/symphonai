@@ -1357,6 +1357,7 @@ def _host(
     repo_root: Path = REPO_ROOT,
     token: str | None = None,
     sessions_root: Path | None = None,
+    memory_extraction_enabled: bool | None = False,
 ) -> HostServer:
     host = HostServer(
         provider or FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
@@ -1365,6 +1366,7 @@ def _host(
         keepalive_seconds=keepalive_seconds,
         token=token,
         sessions_root=sessions_root,
+        memory_extraction_enabled=memory_extraction_enabled,
     )
     host.start()
     return host
@@ -2755,6 +2757,7 @@ def check_provider_effort_reaches_request() -> None:
                 None,
                 PermissionPolicy(root),
                 sessions_root=root / "sessions",
+                memory_extraction_enabled=False,
             )
             host.start()
             try:
@@ -2870,6 +2873,82 @@ def check_unknown_model_effort_can_be_set() -> None:
             fail(f"unknown model effort was not forwarded: {request!r}")
     finally:
         host.close()
+
+
+@check("host_server.memory_extraction_can_be_disabled")
+def check_memory_extraction_can_be_disabled() -> None:
+    provider = _RecordingWireFakeProvider(
+        "openai", 1, [ModelResponse(Message(Role.ASSISTANT, "done"))]
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            memory_root=root / "memory",
+            memory_extraction_enabled=False,
+        )
+        host.start()
+        try:
+            memory = host.run.memory_store()
+            if memory is None:
+                fail("disabled extraction made the memory store unavailable")
+            memory.write(
+                "seeded memory survives extraction-off", agent_name="leader", run_id="seed"
+            )
+            _send_host_prompt(host, "answer without background extraction")
+            if len(provider.requests) != 1:
+                fail(f"disabled extraction made {len(provider.requests) - 1} background requests")
+            tool_names = {tool["function"]["name"] for tool in provider.requests[0].tools}
+            if not {"remember", "forget"}.issubset(tool_names):
+                fail(f"disabling extraction removed memory tools: {tool_names!r}")
+            prompt_text = "\n".join(message.text for message in provider.requests[0].messages)
+            if "Memory persists across conversations" not in prompt_text:
+                fail("disabling extraction removed the memory guide")
+            if "seeded memory survives extraction-off" not in prompt_text:
+                fail("disabling extraction removed seeded memory")
+        finally:
+            host.close()
+
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self):
+            super().__init__([
+                ModelResponse(Message(Role.ASSISTANT, "leader final reply")),
+                ModelResponse(Message(Role.ASSISTANT, "extraction complete")),
+            ])
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = RecordingProvider()
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            sessions_root=root / "sessions",
+            memory_root=root / "memory",
+        )
+        host.start()
+        try:
+            _send_host_prompt(host, "remember the preference")
+            _wait_until(lambda: len(provider.requests) >= 2, "memory extraction did not run")
+            if len(provider.requests) != 2:
+                fail(f"enabled extraction made {len(provider.requests)} requests")
+            extraction_messages = provider.requests[1].messages
+            if not any(
+                message.role is Role.ASSISTANT and message.text == "leader final reply"
+                for message in extraction_messages
+            ) or not any(
+                message.role is Role.USER and "Analyze the most recent" in message.text
+                for message in extraction_messages
+            ):
+                fail(f"extraction did not fork the completed leader history: {extraction_messages!r}")
+        finally:
+            host.close()
 
 
 @check("host_server.settings_roster_paths")
@@ -3567,6 +3646,7 @@ def check_changes_report_and_revert() -> None:
             provider,
             PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
             sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
         )
         host.start()
         try:
@@ -4320,6 +4400,7 @@ def check_goal_without_check_round_limit() -> None:
         provider = RecordingProvider()
         run = HostRun(
             provider, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
         )
         try:
             run.start_goal("finish the work", (), 2)
@@ -4783,12 +4864,13 @@ def check_project_instructions_seeded() -> None:
         (root / "CLAUDE.md").write_text("legacy rule must stay absent", encoding="utf-8")
         provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
         with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-user-home")}):
-            host = HostServer(provider, PermissionPolicy(root), system_prompt="host baseline", sessions_root=root / "sessions")
+            host = HostServer(provider, PermissionPolicy(root), system_prompt="host baseline", sessions_root=root / "sessions", memory_extraction_enabled=False)
             host.start()
             try:
                 with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy:
                     _send_host_prompt(host, "plain")
                     plain = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
+                    plain = [item for item in plain if "Memory persists across conversations" not in (item[1] or "")]
                     if (
                         len(plain) != 3
                         or plain[0] != ("system", "host baseline")
@@ -4804,6 +4886,7 @@ def check_project_instructions_seeded() -> None:
                     instructions.write_text("project convention", encoding="utf-8")
                     _send_host_prompt(host, "with instructions")
                     sent = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
+                    sent = [item for item in sent if "Memory persists across conversations" not in (item[1] or "")]
                     if (
                         len(sent) != 4
                         or sent[0] != ("system", "host baseline")
@@ -4856,18 +4939,21 @@ def check_environment_seeded_once() -> None:
                     second = list(response_spy.call_args.args[0].messages)
                 for messages in (first, second):
                     systems = [message.text for message in messages if message.role == Role.SYSTEM]
+                    memory_messages = [text for text in systems if "Memory persists across conversations" in text]
+                    systems = [text for text in systems if "Memory persists across conversations" not in text]
                     environment_messages = [
                         text for text in systems
                         if text.startswith("Environment when this conversation started")
                     ]
                     if (
-                        len(systems) != 2
+                        len(memory_messages) != 1
+                        or len(systems) != 2
                         or "project convention" not in systems[0]
                         or not systems[1].startswith(environment_text)
                         or "In the person's messages, @<path> names a file in this repository. Read it with read_file before relying on its contents." not in systems[1]
                         or len(environment_messages) != 1
                     ):
-                        fail(f"request did not carry one environment block after instructions: {messages!r}")
+                        fail(f"request did not carry one memory guide and one environment block after instructions: {messages!r}")
                 if capture.call_count != 1:
                     fail(f"environment was captured {capture.call_count} times in one conversation")
                 first_system = [message for message in first if message.role == Role.SYSTEM]
@@ -4890,13 +4976,14 @@ def check_instruction_scope_and_warning() -> None:
         (nested / ".symphonai" / "INSTRUCTIONS.md").write_text("directory rule", encoding="utf-8")
         provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
         with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-user-home")}):
-            host = HostServer(provider, PermissionPolicy(root), working_dir=nested, sessions_root=root / "sessions", chat_token_budget=1_000_000)
+            host = HostServer(provider, PermissionPolicy(root), working_dir=nested, sessions_root=root / "sessions", chat_token_budget=1_000_000, memory_extraction_enabled=False)
             host.start()
             try:
                 stderr = io.StringIO()
                 with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy, contextlib.redirect_stderr(stderr):
                     _send_host_prompt(host, "check scopes")
                 sent = response_spy.call_args.args[0].messages
+                sent = [message for message in sent if "Memory persists across conversations" not in (message.text or "")]
                 rendered = sent[0].text if sent and sent[0].role == Role.SYSTEM else ""
                 if len(sent) != 3 or "# instructions: project .symphonai/INSTRUCTIONS.md\n" not in rendered or project_text not in rendered:
                     fail("project instruction text or scope did not reach the provider")
@@ -4975,7 +5062,7 @@ def check_provider_choice_per_conversation() -> None:
     )
     providers = {"anthropic": first, "gemini": second}
     with tempfile.TemporaryDirectory() as temporary:
-        host = HostServer(None, PermissionPolicy(Path(temporary)), sessions_root=Path(temporary) / "sessions")
+        host = HostServer(None, PermissionPolicy(Path(temporary)), sessions_root=Path(temporary) / "sessions", memory_extraction_enabled=False)
         host.start()
         try:
             with mock.patch.object(host_server_module, "_provider", side_effect=lambda name, model, base_url: providers[name]):
@@ -5053,6 +5140,7 @@ def check_provider_change_rebuilds_schema_and_keeps_history() -> None:
             EventBroker(),
             model="anthropic-before",
             sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
         )
         try:
             run.start("first provider turn")
@@ -5296,7 +5384,7 @@ def check_conversation_reports_model_selection() -> None:
     )
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        run = HostRun(provider, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        run = HostRun(provider, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions", memory_extraction_enabled=False)
         try:
             run.start("first turn")
             _wait_until(lambda: not run.active, "first model turn did not finish")
@@ -5405,6 +5493,7 @@ def check_permission_mode_control() -> None:
             HostServer(
                 FakeModelProvider(), PermissionPolicy(root),
                 sessions_root=root / "empty-sessions", extensions=empty_modes,
+                memory_extraction_enabled=False,
             )
         except host_run_module.ModeSelectionError as exc:
             if "agents.ceiling.modes" not in str(exc):
@@ -5443,6 +5532,7 @@ def check_permission_mode_control() -> None:
                 FakeModelProvider(), PermissionPolicy(root, mode="allow"),
                 sessions_root=root / f"sessions-{'-'.join(modes)}",
                 extensions=configured,
+                memory_extraction_enabled=False,
             )
             try:
                 if candidate.run.policy.mode != expected:
@@ -5477,6 +5567,7 @@ def check_permission_mode_control() -> None:
             policy,
             sessions_root=root / "sessions",
             extensions=extensions,
+            memory_extraction_enabled=False,
         )
         host.start()
 
@@ -5600,6 +5691,7 @@ def check_conversation_usage() -> None:
             PermissionPolicy(root),
             token=secret,
             sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
         )
         host.start()
         terminal_stats = []
@@ -5984,6 +6076,7 @@ def check_conversation_cost_and_context() -> None:
             PermissionPolicy(root),
             sessions_root=root / "sessions",
             price_table=table,
+            memory_extraction_enabled=False,
         )
         host.start()
         try:
@@ -6010,20 +6103,21 @@ def check_conversation_cost_and_context() -> None:
         provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, "reply " + "y" * 40))
         ])
-        context_budget = 280
+        context_budget = 8_000
         host = HostServer(
             provider,
             PermissionPolicy(compact_root),
             sessions_root=compact_root / "sessions",
             chat_token_budget=context_budget,
             chat_recent_turns=1,
+            memory_extraction_enabled=False,
         )
         host.start()
         subscription = host.broker.subscribe()
         used = []
         try:
             for index in range(6):
-                _send_host_prompt(host, f"prompt {index} " + "x" * 80)
+                _send_host_prompt(host, f"prompt {index} " + "x" * 6_000)
                 used.append(_conversation_reply(host)[1]["conversation"]["context"]["used_tokens"])
             if host.run._conversation is None or not host.run._conversation[0]._config.model_summary:
                 fail("host-built leader did not enable model summaries")
@@ -7004,6 +7098,7 @@ def check_mcp_start_and_schema() -> None:
 
         def construct(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
             nonlocal captured_process
+            kwargs["memory_extraction_enabled"] = False
             tools = kwargs.get("mcp_tools")
             if not isinstance(tools, dict) or tuple(tools) != ("mcp__docs__search",):
                 fail(f"main did not hand MCP tools to HostServer: {tools!r}")
@@ -7535,6 +7630,153 @@ def check_agent_memory_survives_new_host() -> None:
             second_session.close()
 
 
+@check("host_server.memory_routes")
+def check_memory_routes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            memory = host.run.memory_store()
+            if memory is None:
+                fail("host memory store was unavailable")
+            project_entry = memory.write(
+                "project note", agent_name="leader", run_id="project-run"
+            )
+            global_entry = memory.write(
+                "global note", agent_name="reviewer", run_id="global-run", scope="global"
+            )
+
+            for method, path, body in (
+                ("GET", "/memory", None),
+                ("POST", "/memory/update", {"id": project_entry.id, "text": "changed"}),
+                ("POST", "/memory/delete", {"id": project_entry.id}),
+            ):
+                connection, response = _request(host, method, path, body=body)
+                response.read()
+                connection.close()
+                if response.status != 401:
+                    fail(f"{method} {path} did not require bearer auth: {response.status}")
+
+            connection, response = _request(host, "GET", "/memory", headers=_headers(host))
+            listing = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or set(listing) != {"project", "global"}:
+                fail(f"memory listing had the wrong shape: {response.status}, {listing!r}")
+            if [entry["id"] for entry in listing["project"]["entries"]] != [project_entry.id]:
+                fail(f"project memory listing omitted its id: {listing!r}")
+            if [entry["id"] for entry in listing["global"]["entries"]] != [global_entry.id]:
+                fail(f"global memory listing omitted its id: {listing!r}")
+            serialized = json.dumps(listing)
+            if str(root) in serialized or str(Path(temporary)) in serialized:
+                fail(f"memory listing exposed an absolute path: {listing!r}")
+            listed_entry = listing["project"]["entries"][0]
+            if set(listed_entry) != {"id", "text", "written_at", "agent_name"} or not listed_entry["written_at"].endswith("Z"):
+                fail(f"memory entry had invalid public fields: {listed_entry!r}")
+
+            connection, response = _request(
+                host, "POST", "/memory/update",
+                body={"id": project_entry.id, "text": "updated note"},
+                headers=_headers(host),
+            )
+            updated = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or updated.get("entry", {}).get("text") != "updated note":
+                fail(f"memory update failed: {response.status}, {updated!r}")
+
+            for text in ("", "x" * 501):
+                connection, response = _request(
+                    host, "POST", "/memory/update",
+                    body={"id": project_entry.id, "text": text}, headers=_headers(host),
+                )
+                response.read()
+                connection.close()
+                if response.status != 400:
+                    fail(f"invalid memory text returned {response.status}")
+
+            connection, response = _request(
+                host, "POST", "/memory/update",
+                body={"id": "unknown", "text": "valid"}, headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            if response.status != 404:
+                fail(f"unknown memory update id returned {response.status}")
+
+            connection, response = _request(
+                host, "POST", "/memory/delete", body={"id": project_entry.id},
+                headers=_headers(host),
+            )
+            deleted = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or deleted != {"deleted": project_entry.id}:
+                fail(f"memory delete failed: {response.status}, {deleted!r}")
+            connection, response = _request(
+                host, "POST", "/memory/delete", body={"id": "unknown"},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            if response.status != 404:
+                fail(f"unknown memory delete id returned {response.status}")
+
+            unreadable_entry = memory.write(
+                "keep this memory", agent_name="leader", run_id="unreadable-run"
+            )
+            project_path = memory._path("project")
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+            payload[0]["schema_version"] = 999
+            project_path.write_text(json.dumps(payload), encoding="utf-8")
+            connection, response = _request(host, "GET", "/memory", headers=_headers(host))
+            unreadable_listing = json.loads(response.read())
+            connection.close()
+            if (
+                response.status != 200
+                or unreadable_listing.get("project")
+                != {"entries": [], "error": "unreadable"}
+                or [entry["id"] for entry in unreadable_listing["global"]["entries"]]
+                != [global_entry.id]
+            ):
+                fail(f"memory listing did not isolate its unreadable set: {unreadable_listing!r}")
+
+            connection, response = _request(
+                host, "POST", "/memory/update",
+                body={"id": unreadable_entry.id, "text": "changed"},
+                headers=_headers(host),
+            )
+            body = response.read()
+            connection.close()
+            if response.status != 503 or body:
+                fail(f"update against unreadable memory returned {response.status}, {body!r}")
+
+            connection, response = _request(
+                host, "POST", "/memory/delete", body={"id": unreadable_entry.id},
+                headers=_headers(host),
+            )
+            body = response.read()
+            connection.close()
+            if response.status != 503 or body:
+                fail(f"delete against unreadable memory returned {response.status}, {body!r}")
+
+            memory._write_entries(project_path, (unreadable_entry,))
+            global_path = memory._path("global")
+            global_payload = json.loads(global_path.read_text(encoding="utf-8"))
+            global_payload[0]["written_at"] = 1.7e12
+            global_path.write_text(json.dumps(global_payload), encoding="utf-8")
+            connection, response = _request(host, "GET", "/memory", headers=_headers(host))
+            timestamp_listing = json.loads(response.read())
+            connection.close()
+            if (
+                response.status != 200
+                or [entry["id"] for entry in timestamp_listing["project"]["entries"]]
+                != [unreadable_entry.id]
+                or timestamp_listing.get("global") != {"entries": [], "error": "unreadable"}
+            ):
+                fail(f"timestamp made the memory route unreadable: {timestamp_listing!r}")
+        finally:
+            host.close()
+
+
 @check("host_server.defined_leader_provider_model_and_tools")
 def check_defined_leader_provider_model_and_tools() -> None:
     class RecordingProvider(FakeModelProvider):
@@ -7632,7 +7874,12 @@ def check_configured_conversation_and_subagent_budgets() -> None:
                 plain_leader.run("plain prompt")
             if plain_leader._agent._budget is not None or plain_leader._agent._max_turns != 7:
                 fail("omitting budgets changed the host launch turn limit")
-            if [(item.role, item.text) for item in sent.call_args.args[0].messages] != [(Role.USER, "plain prompt")]:
+            sent_messages = [
+                (item.role, item.text)
+                for item in sent.call_args.args[0].messages
+                if "Memory persists across conversations" not in (item.text or "")
+            ]
+            if sent_messages != [(Role.USER, "plain prompt")]:
                 fail("omitting budgets changed the provider messages")
         finally:
             plain_session.close()
@@ -7782,7 +8029,7 @@ def check_budget_stop_survives_next_prompt() -> None:
         ])
         host = HostServer(provider, PermissionPolicy(root),
                           sessions_root=root / "sessions",
-                          extensions=load_extensions(repo_root=root, home=home))
+                          extensions=load_extensions(repo_root=root, home=home), memory_extraction_enabled=False)
         host.start()
         connection, response = _subscribed_stream(host)
         try:

@@ -230,6 +230,13 @@ def _usage_count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _cached_prompt_tokens(usage: dict[str, Any]) -> int:
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        return _usage_count(details.get("cached_tokens"))
+    return _usage_count(usage.get("prompt_cache_hit_tokens"))
+
+
 def _parse_response(data: dict[str, Any]) -> ModelResponse:
     choices = data.get("choices") or []
     if not choices:
@@ -257,12 +264,7 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     usage_raw = data.get("usage")
     if not isinstance(usage_raw, dict):
         usage_raw = {}
-    prompt_details = usage_raw.get("prompt_tokens_details")
-    cache_read_tokens = _usage_count(
-        prompt_details.get("cached_tokens")
-        if isinstance(prompt_details, dict)
-        else 0
-    )
+    cache_read_tokens = _cached_prompt_tokens(usage_raw)
     message = Message(role=Role.ASSISTANT, content=message_raw.get("content") or "", tool_calls=tool_calls)
     return ModelResponse(
         message=message,
@@ -432,11 +434,7 @@ def _openai_stream_chunks(
             usage = Usage(
                 input_tokens=_usage_count(usage_raw.get("prompt_tokens")),
                 output_tokens=_usage_count(usage_raw.get("completion_tokens")),
-                cache_read_tokens=_usage_count(
-                    usage_raw.get("prompt_tokens_details", {}).get("cached_tokens")
-                    if isinstance(usage_raw.get("prompt_tokens_details"), dict)
-                    else 0
-                ),
+                cache_read_tokens=_cached_prompt_tokens(usage_raw),
             )
         # Unlike _parse_response, this accepts an empty choices list because
         # include_usage makes the final usage payload legitimately choice-less.

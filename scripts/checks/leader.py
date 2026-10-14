@@ -50,6 +50,7 @@ from symphonai_api.leader import (
     builtin_subagent_specs,
     dispatch_subagent_tool_schema,
 )
+from symphonai_api.memory_prompt import MEMORY_GUIDE
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.models import (
     ImageBlock,
@@ -89,6 +90,7 @@ from symphonai_api.web_search import SearchBackend
 from symphonai_api.skills import Skill
 
 from scripts.checks.harness import check, fail
+from scripts.checks import memory_extract as _memory_extract_checks  # noqa: F401
 from scripts.checks.workspace import workspace
 
 
@@ -300,6 +302,10 @@ def _spec(
         call_class=CallClass.BACKGROUND,
         max_depth=max_depth,
     )
+
+
+def _leader_without_memory(root: Path) -> dict[str, AgentSpec]:
+    return {"leader": _spec(root, "leader", memory=MemorySettings(enabled=False))}
 
 
 def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
@@ -1809,13 +1815,37 @@ def check_chat_history() -> None:
         )
         first = chat_leader.chat("hello")
         if len(first.leader_messages) != 2:
-            fail(f"expected 2 messages after first chat() call, got {len(first.leader_messages)}")
+            fail(f"expected user message and reply without a memory store, got {first.leader_messages!r}")
         second = chat_leader.chat("do you remember what I said?")
         if len(second.leader_messages) != 4:
             fail(f"expected 4 messages after second chat() call (history carried forward), got {len(second.leader_messages)}")
         contents = [m.text for m in second.leader_messages]
         if "hello" not in contents:
             fail("expected the first call's user message to still be present in the second call's context")
+
+        extraction_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "The answer is 42.")),
+            ModelResponse(Message(Role.ASSISTANT, "No durable memory.")),
+        ])
+        usage_reported = threading.Event()
+        extraction_leader = Leader(LeaderConfig(
+            leader_provider=extraction_provider,
+            subagent_provider=FakeModelProvider(),
+            repo_root=str(root),
+            leader_policy=ws.policy,
+            memory=AgentMemory(root / "memory", root),
+            memory_usage_callback=lambda _model, _usage: usage_reported.set(),
+        ))
+        try:
+            extracted_result = extraction_leader.chat("What is 6 times 7?")
+            if extracted_result.final_answer != "The answer is 42.":
+                fail(f"leader final answer changed: {extracted_result.final_answer!r}")
+            if not usage_reported.wait(1) or len(extraction_provider.requests) != 2:
+                fail("background extraction did not run and report its provider call")
+            if any("Minimum signal gate" in message.text for message in extracted_result.leader_messages):
+                fail("extractor prompt was written into the leader transcript")
+        finally:
+            extraction_leader.close()
 
 
 @check("leader.chat_content_blocks")
@@ -2231,6 +2261,7 @@ def check_budget_compaction_keeps_recent_window() -> None:
             str(ws.root),
             chat_token_budget=100,
             chat_recent_turns=2,
+            subagent_specs=_leader_without_memory(ws.root),
         ))
         recent_window = [
             Message(Role.USER, "recent request one"),
@@ -2294,6 +2325,7 @@ def check_compaction_strips_anthropic_thinking_only_when_changed() -> None:
         compacted = Leader(LeaderConfig(
             FakeModelProvider(), FakeModelProvider(), str(ws.root),
             chat_token_budget=100, chat_recent_turns=1,
+            subagent_specs=_leader_without_memory(ws.root),
         ))
         compacted.seed_chat(history())
         changed_result = compacted.compact_chat()
@@ -2336,6 +2368,10 @@ def check_model_summary_request_and_usage() -> None:
             chat_token_budget=150,
             chat_recent_turns=1,
             model_summary=True,
+            subagent_specs={"leader": _spec(
+                ws.root, "leader", model="leader-summary-model",
+                memory=MemorySettings(enabled=False),
+            )},
         ))
         leader.seed_chat([
             Message(Role.USER, "first request"),
@@ -2370,6 +2406,7 @@ def check_model_summary_request_and_usage() -> None:
             str(ws.root),
             chat_token_budget=150,
             chat_recent_turns=1,
+            subagent_specs=_leader_without_memory(ws.root),
         ))
         default_leader.seed_chat([
             Message(Role.USER, "first request"),
@@ -2396,6 +2433,10 @@ def check_model_summary_request_and_usage() -> None:
             chat_token_budget=150,
             chat_recent_turns=1,
             model_summary=True,
+            subagent_specs={"leader": _spec(
+                ws.root, "leader", model="leader-summary-model",
+                memory=MemorySettings(enabled=False),
+            )},
         ))
         post_leader.seed_chat([
             Message(Role.USER, "first request"),
@@ -2612,7 +2653,11 @@ def check_leader_seeded_chat() -> None:
             fail("seeding chat changed the subagent pool")
         leader.chat("third")
         sent = [(message.role, message.text) for message in provider.requests[-1].messages]
-        if sent != [(Role.USER, "first"), (Role.ASSISTANT, "second"), (Role.USER, "third")]:
+        if sent != [
+            (Role.USER, "first"),
+            (Role.ASSISTANT, "second"),
+            (Role.USER, "third"),
+        ]:
             fail(f"seeded history did not reach the next model request: {sent!r}")
 
 
@@ -2648,6 +2693,7 @@ def check_host_tools_and_compaction() -> None:
         compacting = Leader(LeaderConfig(
             compact_provider, FakeModelProvider(), str(ws.root),
             chat_token_budget=150, chat_recent_turns=1, events=events,
+            subagent_specs=_leader_without_memory(ws.root),
         ))
         for index in range(6):
             result = compacting.chat(f"prompt {index} " + "x" * 80)
@@ -3036,9 +3082,9 @@ def check_default_specs_match_old_behaviour() -> None:
         actual, default_max_depth = _default_specs_probe()
     if default_max_depth != 0:
         fail(f"default max_depth changed: expected=0, actual={default_max_depth}")
-    if seed_messages_spy.call_count != 1:
+    if seed_messages_spy.call_count < 1:
         fail(
-            "default first dispatch did not seed exactly once: "
+            "default first dispatch did not seed memory context: "
             f"calls={seed_messages_spy.call_count}"
         )
     default_config = LeaderConfig(FakeModelProvider(), FakeModelProvider(), ".")
@@ -3846,9 +3892,10 @@ def check_stop_subagent_is_local() -> None:
 def check_memory_registry_and_seeding() -> None:
     with workspace() as ws:
         store = AgentMemory(ws.root / "memory")
-        store.write("enabled", "older lesson", run_id="old-1")
-        store.write("enabled", "latest lesson", run_id="old-2")
-        store.write("leader", "leader preference", run_id="old-3")
+        store.write("older lesson", agent_name="enabled", run_id="old-1")
+        store.write("latest lesson", agent_name="enabled", run_id="old-2")
+        store.write("older global preference", agent_name="leader", run_id="old-3", scope="global")
+        store.write("leader preference", agent_name="leader", run_id="new-3", scope="global")
         enabled = _spec(
             ws.root,
             "enabled",
@@ -3870,20 +3917,23 @@ def check_memory_registry_and_seeding() -> None:
             result = dispatch.execute(_dispatch(name, "same task", name), ws.policy)
             if not result.ok:
                 fail(f"{name} memory dispatch failed: {result!r}")
-        if "remember" not in dispatch.pool["enabled"].agent._tools:
-            fail("memory-enabled agent registry omitted remember")
-        if "remember" in dispatch.pool["disabled"].agent._tools:
-            fail("memory-disabled agent registry exposed remember")
+        if not {"remember", "forget"} <= dispatch.pool["enabled"].agent._tools.keys():
+            fail("memory-enabled agent registry omitted remember or forget")
+        if {"remember", "forget"} & dispatch.pool["disabled"].agent._tools.keys():
+            fail("memory-disabled agent registry exposed remember or forget")
         enabled_text = [message.text for message in provider.requests[0].messages]
         if (
             enabled_text[0] != "enabled prompt"
+            or MEMORY_GUIDE not in enabled_text[1]
+            or "[" + store.read("global")[1].id + "] leader preference" not in enabled_text[1]
+            or "older global preference" in enabled_text[1]
             or "latest lesson" not in enabled_text[1]
             or "older lesson" in enabled_text[1]
             or enabled_text[-1] != "same task"
         ):
             fail(f"enabled memory seed was wrong: {enabled_text!r}")
         disabled_text = [message.text for message in provider.requests[1].messages]
-        if disabled_text != ["disabled prompt", "same task"]:
+        if disabled_text != ["disabled prompt", "same task"] or MEMORY_GUIDE in "\n".join(disabled_text):
             fail(f"disabled memory changed context seeding: {disabled_text!r}")
 
         leader_spec = _spec(
@@ -3903,19 +3953,144 @@ def check_memory_registry_and_seeding() -> None:
             memory=store,
         ))
         leader.run("lead")
-        if "remember" not in leader._agent._tools:
-            fail("memory-enabled leader registry omitted remember")
+        if not {"remember", "forget"} <= leader._agent._tools.keys():
+            fail("memory-enabled leader registry omitted remember or forget")
         leader_text = [message.text for message in leader_provider.requests[0].messages]
         if (
             leader_text[0] != "leader prompt"
+            or MEMORY_GUIDE not in leader_text[1]
             or "leader preference" not in leader_text[1]
             or leader_text[-1] != "lead"
         ):
             fail(f"leader did not follow memory seeding: {leader_text!r}")
 
 
-@check("leader.memory_round_trip_and_isolation")
-def check_memory_round_trip_and_isolation() -> None:
+@check("leader.default_memory_enabled")
+def check_default_memory_enabled() -> None:
+    with workspace() as ws:
+        empty_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "empty done")),
+        ])
+        empty_leader = Leader(LeaderConfig(
+            empty_provider,
+            FakeModelProvider(),
+            str(ws.root),
+            memory=AgentMemory(ws.root / "empty-memory", ws.root),
+        ))
+        empty_leader.run("start empty")
+        empty_messages = empty_provider.requests[0].messages
+        if (
+            [message.role for message in empty_messages] != [Role.SYSTEM, Role.USER]
+            or MEMORY_GUIDE not in empty_messages[0].text
+            or "Nothing is saved yet." not in empty_messages[0].text
+        ):
+            fail(f"empty default leader did not receive one memory guide: {empty_messages!r}")
+
+        store = AgentMemory(ws.root / "memory", ws.root)
+        store.write("project lesson", agent_name="leader", run_id="saved-project")
+        store.write(
+            "global preference", agent_name="leader", run_id="saved-global", scope="global"
+        )
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "default done")),
+        ])
+        leader = Leader(LeaderConfig(
+            provider,
+            FakeModelProvider(),
+            str(ws.root),
+            memory=store,
+        ))
+        leader.run("start")
+        seeded = [message.text for message in provider.requests[0].messages]
+        if not {"remember", "forget"} <= leader._agent._tools.keys() or len(seeded) != 2:
+            fail(f"undefined leader did not receive default memory: {seeded!r}")
+        if "global preference" not in seeded[0] or "project lesson" not in seeded[0]:
+            fail(f"undefined leader was not seeded from both sets: {seeded!r}")
+
+        disabled_spec = _spec(
+            ws.root, "leader", memory=MemorySettings(enabled=False)
+        )
+        disabled_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "disabled done")),
+        ])
+        disabled = Leader(LeaderConfig(
+            disabled_provider,
+            FakeModelProvider(),
+            str(ws.root),
+            subagent_specs={"leader": disabled_spec},
+            memory=store,
+        ))
+        disabled.run("start")
+        disabled_seed = [message.text for message in disabled_provider.requests[0].messages]
+        if {"remember", "forget"} & disabled._agent._tools.keys() or any(
+            MEMORY_GUIDE in text or "global preference" in text or "project lesson" in text
+            for text in disabled_seed
+        ):
+            fail(f"leader memory.enabled=false was ignored: {disabled_seed!r}")
+
+
+@check("leader.memory_requires_store")
+def check_memory_requires_store() -> None:
+    with workspace() as ws:
+        child_spec = _spec(
+            ws.root, "reviewer", prompt="child prompt",
+            memory=MemorySettings(enabled=True),
+        )
+        child_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+        ])
+        dispatch = DispatchSubagentTool(
+            child_provider, ws.policy, subagent_specs={"reviewer": child_spec}
+        )
+        child_result = dispatch.execute(_dispatch("reviewer", "review"), ws.policy)
+        child = dispatch.pool["reviewer"]
+        child_text = [message.text for message in child_provider.requests[0].messages]
+        if (
+            not child_result.ok
+            or {"remember", "forget"} & child.agent._tools.keys()
+            or any(MEMORY_GUIDE in text for text in child_text)
+        ):
+            fail(f"child without a store received memory: {child_text!r}")
+
+        leader_spec = _spec(
+            ws.root, "leader", prompt="leader prompt",
+            memory=MemorySettings(enabled=True),
+        )
+        no_store_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "no store done")),
+        ])
+        no_store_leader = Leader(LeaderConfig(
+            no_store_provider, FakeModelProvider(), str(ws.root),
+            subagent_specs={"leader": leader_spec},
+        ))
+        no_store_leader.run("start")
+        no_store_text = [message.text for message in no_store_provider.requests[0].messages]
+        if (
+            {"remember", "forget"} & no_store_leader._agent._tools.keys()
+            or any(MEMORY_GUIDE in text for text in no_store_text)
+            or no_store_text[0] != "leader prompt"
+        ):
+            fail(f"leader without a store received memory: {no_store_text!r}")
+
+        stored_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "stored done")),
+        ])
+        stored_leader = Leader(LeaderConfig(
+            stored_provider, FakeModelProvider(), str(ws.root),
+            subagent_specs={"leader": leader_spec},
+            memory=AgentMemory(ws.root / "memory", ws.root),
+        ))
+        stored_leader.run("start")
+        stored_text = [message.text for message in stored_provider.requests[0].messages]
+        if (
+            not {"remember", "forget"} <= stored_leader._agent._tools.keys()
+            or not any(MEMORY_GUIDE in text for text in stored_text)
+        ):
+            fail(f"leader with a store did not receive memory: {stored_text!r}")
+
+
+@check("leader.memory_shared_scope_round_trip")
+def check_memory_shared_scope_round_trip() -> None:
     with workspace() as ws:
         store = AgentMemory(ws.root / "memory")
         spec = _spec(
@@ -3938,7 +4113,7 @@ def check_memory_round_trip_and_isolation() -> None:
             memory=store,
         )
         result = first.execute(_dispatch("reviewer", "review", "first"), ws.policy)
-        entries = store.read("reviewer")
+        entries = store.read()
         if not result.ok or len(entries) != 1:
             fail(f"memory tool did not complete its dispatch: {result!r}, {entries!r}")
         current_run_id = first.pool["reviewer"].runs[0].run.run_id
@@ -3964,19 +4139,19 @@ def check_memory_round_trip_and_isolation() -> None:
             "analyzer",
             memory=MemorySettings(enabled=True),
         )
-        isolated_provider = _RecordingFakeProvider([
+        shared_provider = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, "isolated")),
         ])
-        isolated = DispatchSubagentTool(
-            isolated_provider,
+        shared = DispatchSubagentTool(
+            shared_provider,
             ws.policy,
             subagent_specs={"analyzer": other_spec},
             memory=store,
         )
-        result = isolated.execute(_dispatch("analyzer", "review", "other"), ws.policy)
-        other_seed = [message.text for message in isolated_provider.requests[0].messages]
-        if not result.ok or any(entries[0].text in text for text in other_seed):
-            fail(f"another agent received reviewer's memory: {other_seed!r}")
+        result = shared.execute(_dispatch("analyzer", "review", "other"), ws.policy)
+        other_seed = [message.text for message in shared_provider.requests[0].messages]
+        if not result.ok or not any(entries[0].text in text for text in other_seed):
+            fail(f"project memory was not shared with another agent: {other_seed!r}")
 
 
 @check("leader.memory_failures_do_not_fail_run")
@@ -4013,11 +4188,12 @@ def check_memory_failures_do_not_fail_run() -> None:
             or len(tool_results) != 1
             or tool_results[0].ok
             or "MAX_ENTRY_CHARS" not in (tool_results[0].error or "")
-            or store.read("reviewer")
+            or store.read()
         ):
             fail(f"overlong memory did not fail only its tool call: {result!r}, {tool_results!r}")
 
         unavailable_root = ws.root / "unavailable-memory"
+        unavailable_root.mkdir()
         unavailable = AgentMemory(unavailable_root)
         original_mode = unavailable_root.stat().st_mode
         unavailable_root.chmod(0o500)
@@ -4045,7 +4221,9 @@ def check_memory_failures_do_not_fail_run() -> None:
                 not result.ok
                 or len(unavailable_results) != 1
                 or unavailable_results[0].ok
-                or initial != ["review prompt", "review"]
+                or not any("review prompt" == text for text in initial)
+                or not any(text == "review" for text in initial)
+                or not any(MEMORY_GUIDE in text for text in initial)
             ):
                 fail(
                     "unavailable memory did not degrade to an empty seed and failed tool: "
@@ -4332,7 +4510,7 @@ def check_parallel_worktree_dispatches() -> None:
             for name, item in zip(("a", "b", "c"), tool_results, strict=True):
                 if item.payload["files"] != [f"{name}.py"]:
                     fail(f"{name} returned another child's diff: {item.payload!r}")
-                entries = memory.read(name)
+                entries = [entry for entry in memory.read() if entry.agent_name == name]
                 record = result.subagents[name]
                 if len(entries) != 1 or entries[0].run_id != record.runs[-1].run.run_id:
                     fail(f"{name} memory was attached to the wrong run: {entries!r}")

@@ -51,6 +51,7 @@ def _host(root: Path, responses=None) -> tuple[HostServer, HostClient]:
         FakeModelProvider(responses or [ModelResponse(Message(Role.ASSISTANT, "done"))]),
         PermissionPolicy(repo_root=root),
         sessions_root=root / "sessions",
+        memory_extraction_enabled=False,
     )
     host.start()
     return host, HostClient(HostAddress(host.port, host.token))
@@ -264,7 +265,10 @@ def check_current_conversation() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         provider = RecordingProvider()
-        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host = HostServer(
+            provider, PermissionPolicy(root), sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
+        )
         host.start()
         subscription = host.broker.subscribe()
         try:
@@ -557,7 +561,7 @@ def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[di
             for kind, payload in client.events():
                 if kind == "event" and payload.get("type") == "HistoryMessage":
                     frames.append(payload)
-                    if len(frames) == 5:
+                    if len(frames) == 6:
                         return
         except Exception:
             return
@@ -574,7 +578,7 @@ def check_replay_order() -> None:
     with tempfile.TemporaryDirectory() as directory:
         host, _, _, frames, _ = _open_with_history(Path(directory))
         try:
-            expected = ["system", "user", "assistant", "tool", "assistant"]
+            expected = ["system", "system", "user", "assistant", "tool", "assistant"]
             deadline = time.monotonic() + 5
             while len(frames) < len(expected) and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -724,6 +728,8 @@ def check_instructions_not_reloaded() -> None:
                     for message in initial_spy.call_args.args[0].messages
                     if message.role == Role.SYSTEM
                 ]
+                if sum("Memory persists across conversations" in text for text in initial_system) != 1:
+                    fail(f"initial request did not include one memory guide: {initial_system!r}")
                 instructions.write_text("changed convention", encoding="utf-8")
                 client.open_session(run_id)
                 with mock.patch.object(host.run._provider, "create_response", wraps=host.run._provider.create_response) as response_spy:
@@ -731,12 +737,20 @@ def check_instructions_not_reloaded() -> None:
                     _wait_idle(client)
                 sent = response_spy.call_args.args[0].messages
                 system = [message.text for message in sent if message.role == Role.SYSTEM]
+                memory_messages = [text for text in system if "Memory persists across conversations" in text]
+                system = [text for text in system if "Memory persists across conversations" not in text]
+                initial_without_memory = [
+                    text for text in initial_system
+                    if "Memory persists across conversations" not in text
+                ]
                 if (
+                    len(memory_messages) != 1
+                    or
                     len(system) != 2
                     or "original convention" not in system[0]
                     or "changed convention" in system[0]
                     or not system[1].startswith("Environment when this conversation started")
-                    or system != initial_system
+                    or system != initial_without_memory
                 ):
                     fail(f"reopening reloaded or duplicated instructions: {system!r}")
             finally:
@@ -778,7 +792,7 @@ def check_client_session_calls() -> None:
     with tempfile.TemporaryDirectory() as directory:
         host, client, run_id = _finished_session(Path(directory))
         try:
-            if not client.list_sessions() or client.open_session(run_id)["replayed"] != 3:
+            if not client.list_sessions() or client.open_session(run_id)["replayed"] != 4:
                 fail("client session calls did not round-trip")
         finally:
             host.close()
@@ -1162,7 +1176,7 @@ def check_fork_prefix_current_parent() -> None:
             stream_connection, stream_response = _subscribed_stream(host)
             try:
                 status, reply = _fork(host, source_id, first_id)
-                if status != 200 or reply["run_id"] == source_id or reply["replayed"] != 2:
+                if status != 200 or reply["run_id"] == source_id or reply["replayed"] != 3:
                     fail(f"fork did not create and reopen the prefix: {status}, {reply!r}")
                 fork_id = reply["run_id"]
                 _, frame = _await_sse(
@@ -1261,12 +1275,16 @@ def check_fork_last_message_inherits_context() -> None:
                     _wait_idle(client)
                 sent = response_spy.call_args.args[0].messages
                 system = [message.text for message in sent if message.role == Role.SYSTEM]
+                memory_messages = [text for text in system if "Memory persists across conversations" in text]
+                system = [text for text in system if "Memory persists across conversations" not in text]
                 source_system = [
                     message.text for message in loaded.messages
                     if message.role == Role.SYSTEM
+                    and "Memory persists across conversations" not in (message.text or "")
                 ]
                 if (
-                    len(system) != 2
+                    len(memory_messages) != 1
+                    or len(system) != 2
                     or "original fork convention" not in system[0]
                     or "changed fork convention" in system[0]
                     or not system[1].startswith("Environment when this conversation started")
