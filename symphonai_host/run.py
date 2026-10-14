@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from symphonai_api.agent_memory import AgentMemory
@@ -192,6 +192,7 @@ class _ActiveRun:
     goal_round: bool = False
     runtime_run_id: str | None = None
     terminal_event: RunFinished | RunFailed | None = None
+    deferred_memory_events: list[Event] = field(default_factory=list)
 
 
 class HostRun:
@@ -1300,6 +1301,14 @@ class HostRun:
                 session_id = next(iter(self._active_by_session))
             active = self._active_by_session.get(session_id) if session_id is not None else None
             run_id = None if active is None else active.run_id
+            event_run_id = getattr(event, "run_id", None)
+            if (
+                active is not None
+                and isinstance(event_run_id, str)
+                and event_run_id.startswith("memory_run_")
+            ):
+                active.deferred_memory_events.append(event)
+                return
             if (
                 active is not None
                 and event.agent_id == active.root_agent_id
@@ -1309,6 +1318,8 @@ class HostRun:
                 return
         if run_id is not None:
             self._publish(run_id, event, session_id=session_id)
+        elif session_id is not None and isinstance(event_run_id, str):
+            self._publish(event_run_id, event, session_id=session_id)
 
     def open_session(self, run_id: str) -> dict:
         """Load and replay a finished transcript without ever rewriting it."""
@@ -2573,6 +2584,7 @@ class HostRun:
         session_id: str = "",
     ) -> None:
         terminal_event = None
+        active_to_finish = None
         failure: Exception | None = None
         try:
             result = leader.chat(prompt, cancel=cancel)
@@ -2586,14 +2598,23 @@ class HostRun:
                 active = self._active_by_session.get(session_id)
                 if active is not None and active.run_id == run_id:
                     terminal_event = active.terminal_event
+                    active_to_finish = active
+                if (
+                    active_to_finish is not None
+                    and self._active_by_session.get(session_id) is active_to_finish
+                ):
                     self._active_by_session.pop(session_id, None)
                     if self._conversation is not None and self._conversation[1].run_id == session_id:
                         self._active = None
+                    if terminal_event is not None:
+                        self._publish(run_id, terminal_event, session_id=session_id)
+                    for event in active_to_finish.deferred_memory_events:
+                        event_run_id = getattr(event, "run_id", run_id)
+                        self._publish(event_run_id, event, session_id=session_id)
+                    active_to_finish.deferred_memory_events.clear()
                 if self._closing and self._conversation is not None and self._conversation[1].run_id == session_id:
                     self._conversation = None
                     self._active = None
-            if terminal_event is not None:
-                self._publish(run_id, terminal_event, session_id=session_id)
         if not goal_round:
             self._finish_spec_review(session_id, leader, terminal_event)
             self._finish_spec_plan(session_id, terminal_event)

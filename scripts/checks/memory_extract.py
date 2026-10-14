@@ -10,7 +10,7 @@ from pathlib import Path
 from symphonai_api.agent_memory import AgentMemory, MemorySettings
 from symphonai_api.agent_spec import AgentSpec, ModelSelector
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.events import CollectingSink, ToolCallFailed
+from symphonai_api.events import CollectingSink, ToolCallFailed, ToolCallFinished, ToolCallStarted
 from symphonai_api.memory_extract import (
     MemoryExtractor,
     _cursor_digest,
@@ -202,6 +202,19 @@ def only_memory_tools_execute_and_save() -> None:
         failures = [event for event in events.events if isinstance(event, ToolCallFailed)]
         if len(failures) != 1 or failures[0].tool_name != "read_file":
             fail(f"non-memory tool call was not refused: {events.events!r}")
+        saved = [
+            event for event in events.events
+            if isinstance(event, (ToolCallStarted, ToolCallFinished))
+            and event.tool_call_id == "save"
+        ]
+        if (
+            len(saved) != 2
+            or not isinstance(saved[0], ToolCallStarted)
+            or saved[0].target != "Prefer concise answers."
+            or not isinstance(saved[1], ToolCallFinished)
+            or not saved[1].ok
+        ):
+            fail(f"saved memory did not emit its started/finished events: {saved!r}")
         extractor.close()
 
 

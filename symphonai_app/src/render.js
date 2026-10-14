@@ -255,21 +255,30 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
       const failure = call.status === "failed"
         ? ` (failed${call.error ? `: ${call.error}` : ""})`
         : "";
-      sentence += `${separator}${label}${call.target === null ? "" : ` ${call.target}`}${failure}`;
+      const memoryTarget = call.target !== null && ["remember", "forget"].includes(call.name);
+      const targetText = call.target === null
+        ? ""
+        : memoryTarget ? ` "${call.target}"` : ` ${call.target}`;
+      sentence += `${separator}${label}${targetText}${failure}`;
       return [
         ...(separator ? [element(document, "span", { text: separator })] : []),
         element(document, "span", { text: label }),
         ...(call.target === null ? [] : [
-          element(document, "span", { text: " " }),
-          element(document, "code", { text: call.target }),
+          element(document, "span", { text: memoryTarget ? ` "${call.target}"` : " " }),
+          ...(memoryTarget ? [] : [element(document, "code", { text: call.target })]),
         ]),
         ...(failure ? [element(document, "span", { text: failure })] : []),
       ];
     }),
-    element(document, "span", { text: "." }),
+    ...(entry.calls.at(-1)?.target !== null
+      && ["remember", "forget"].includes(entry.calls.at(-1)?.name)
+      ? []
+      : [element(document, "span", { text: "." })]),
   );
   append(line, text);
-  line.setAttribute("title", `${sentence}.`);
+  const endsWithQuotedMemory = entry.calls.at(-1)?.target !== null
+    && ["remember", "forget"].includes(entry.calls.at(-1)?.name);
+  line.setAttribute("title", `${sentence}${endsWithQuotedMemory ? "" : "."}`);
   const toggle = () => {
     entry.expanded = entry.expanded !== true;
     actions?.rerender?.();

@@ -296,12 +296,14 @@ export function fakeClient(
     conversation = null,
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
     fileOverrides = {},
+    roadmapFailure = null,
     specFilesReply = { paths: [] },
     specFilesFailure = false,
   } = {},
 ) {
   const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
+  let currentRoadmapFailure = roadmapFailure;
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
@@ -320,9 +322,17 @@ export function fakeClient(
     emit(frame) {
       return eventCallback(frame);
     },
+    setRoadmapFailure(failure) {
+      currentRoadmapFailure = failure;
+    },
     resolvePrompt,
     async file(path) {
       calls.file.push(path);
+      if (path === "docs/roadmap.json" && currentRoadmapFailure !== null) {
+        const error = new Error(currentRoadmapFailure.message ?? "roadmap unavailable");
+        if (currentRoadmapFailure.status !== undefined) error.status = currentRoadmapFailure.status;
+        throw error;
+      }
       const reply = files.get(path);
       if (reply === undefined) {
         const error = new Error("missing");
@@ -1622,6 +1632,50 @@ test("start renders the chat page and prepares the whole roadmap graph in the ra
   assert.ok(app.transcript);
   assert.deepEqual(app.transcript.model, []);
   assert.equal(find(document.body, (value) => value.className === "conversation-usage").textContent, "");
+});
+
+test("missing roadmap does not stop the chat app from starting", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    roadmapFailure: { status: 404, message: "host file request failed with status 404" },
+  });
+  await start({ global: {}, document, client });
+
+  assert.ok(document.getElementById("prompt-form"));
+  assert.equal(
+    find(document.getElementById("roadmap"), (node) => node.className === "roadmap-message").textContent,
+    "No roadmap in this repository.",
+  );
+});
+
+test("invalid roadmap does not stop startup and reports the parse error", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient("not json") });
+
+  assert.ok(document.getElementById("prompt-form"));
+  assert.equal(
+    find(document.getElementById("roadmap"), (node) => node.className === "roadmap-message").textContent,
+    "The roadmap couldn't be read: roadmap is not valid JSON",
+  );
+});
+
+test("a missing roadmap during refresh updates the tool without replacing the page", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.specRuns = async () => [{ session_id: "spec-session", kind: "implement", state: "running", spec: "specs/18/example.md" }];
+  const app = await start({ global: {}, document, client });
+  const chatPane = document.getElementById("page").children[0];
+  const composer = document.getElementById("prompt-form");
+
+  client.setRoadmapFailure({ status: 404, message: "host file request failed with status 404" });
+  await client.emit(eventFrame("RunFinished", { session_id: "spec-session" }));
+
+  assert.equal(document.getElementById("page").children[0], chatPane);
+  assert.equal(document.getElementById("prompt-form"), composer);
+  assert.equal(
+    find(document.getElementById("roadmap"), (node) => node.className === "roadmap-message").textContent,
+    "No roadmap in this repository.",
+  );
 });
 
 test("opening phase 18 loads each primary spec and follow-up once", async () => {
@@ -4465,7 +4519,7 @@ test("two tool calls in one turn render as one activity", async () => {
   await start({ global: {}, document, client });
 
   await client.emit(eventFrame("TurnStarted", { index: 1 }));
-  await client.emit(toolStarted("call-1", "read_file", "one.txt"));
+  await client.emit(toolStarted("call-1", "read_file", "README.md"));
   await client.emit(toolFinished("call-1", "read_file"));
   await client.emit(toolStarted("call-2", "grep", "needle"));
   await client.emit(toolFinished("call-2", "grep"));
@@ -4475,22 +4529,39 @@ test("two tool calls in one turn render as one activity", async () => {
   assert.ok(chat.children[0].className.split(" ").includes("activity"));
   const activity = chat.children[0];
   assert.deepEqual(walk(activity).filter((node) => node.tagName === "CODE").map((node) => node.textContent), [
-    "one.txt", "needle",
+    "README.md", "needle",
   ]);
-  assert.equal(textInDocumentOrder(activity), "Read one.txt and searched for needle.");
+  assert.equal(textInDocumentOrder(activity), "Read README.md and searched for needle.");
   assert.doesNotMatch(textInDocumentOrder(activity), /`/);
 });
 
-test("remember activity reads as a successful memory save", async () => {
+test("late extractor memory activity follows the finished turn as quoted prose", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
   await start({ global: {}, document, client });
-  await client.emit(eventFrame("TurnStarted", { index: 1 }));
-  await client.emit(toolStarted("remember-1", "remember", "Prefer concise answers"));
-  await client.emit(toolFinished("remember-1", "remember"));
-  const line = document.getElementById("chat").children[0];
-  assert.equal(textInDocumentOrder(line), "Remembered Prefer concise answers.");
+  await client.emit(eventFrame("RunStarted", {
+    agent_id: "leader", run_id: "leader-run", agent_name: "leader",
+  }));
+  await client.emit(eventFrame("PromptSubmitted", {
+    agent_id: "leader", run_id: "leader-run", text: "remember Run checks.",
+  }));
+  await client.emit(eventFrame("RunFinished", {
+    agent_id: "leader", run_id: "leader-run", stopped_reason: "final_response",
+  }));
+  await client.emit(eventFrame("ToolCallStarted", {
+    agent_id: "leader", run_id: "memory_run_1", tool_call_id: "remember-1",
+    tool_name: "remember", target: "Run checks.",
+  }));
+  await client.emit(eventFrame("ToolCallFinished", {
+    agent_id: "leader", run_id: "memory_run_1", tool_call_id: "remember-1",
+    tool_name: "remember", ok: true,
+  }));
+  const chat = document.getElementById("chat");
+  const line = chat.children.at(-1);
+  assert.equal(chat.children.at(-2).className, "turn-time");
+  assert.equal(textInDocumentOrder(line), 'Remembered "Run checks."');
   assert.ok(line.className.includes("activity-memory"));
+  assert.deepEqual(walk(line).filter((node) => node.tagName === "CODE"), []);
 });
 
 test("forget activity reads as a successful memory removal", async () => {
@@ -4501,11 +4572,9 @@ test("forget activity reads as a successful memory removal", async () => {
   await client.emit(toolStarted("forget-1", "forget", "Prefer concise answers"));
   await client.emit(toolFinished("forget-1", "forget"));
   const line = document.getElementById("chat").children[0];
-  assert.equal(textInDocumentOrder(line), "Forgot Prefer concise answers.");
+  assert.equal(textInDocumentOrder(line), 'Forgot "Prefer concise answers"');
   assert.ok(line.className.includes("activity-memory"));
-  assert.deepEqual(walk(line).filter((node) => node.tagName === "CODE").map((node) => node.textContent), [
-    "Prefer concise answers",
-  ]);
+  assert.deepEqual(walk(line).filter((node) => node.tagName === "CODE"), []);
 });
 
 test("activity targets render as code while failures and missing targets keep their wording", async () => {

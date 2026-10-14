@@ -11,7 +11,7 @@ export function createAgentBoard() {
 
   function apply(frame) {
     if (frame?.kind !== "event" || !frame.payload) return;
-    const { type, agent_id, agent_name, subagent_agent_id, subagent_name, tool_name, tool_call_id, target, stopped_reason } = frame.payload;
+    const { type, agent_id, agent_name, subagent_agent_id, subagent_name, tool_name, tool_call_id, target, stopped_reason, run_id } = frame.payload;
     if (type === "RunStarted") {
       calls.delete(agent_id);
       const row = rows.find((entry) => entry.agentId === agent_id);
@@ -35,6 +35,7 @@ export function createAgentBoard() {
       }
       return;
     }
+    if (typeof run_id === "string" && run_id.startsWith("memory_run_")) return;
     const id = type === "SubagentStopped" ? subagent_agent_id : agent_id;
     const row = rows.find((entry) => entry.agentId === id);
     if (!row) return;

@@ -230,10 +230,30 @@ export async function start({ global, document, client }) {
   const readSpecFiles = () => typeof boundary.specFiles === "function"
     ? boundary.specFiles().catch(() => ({ paths: [] }))
     : Promise.resolve({ paths: [] });
-  let [project, initialSessions, roadmapReply, settingsReply, healthReply, conversationReply, initialSpecRuns, initialSpecFiles] = await Promise.all([
+  const roadmapResult = (reply, error = null) => {
+    try {
+      if (error !== null) throw error;
+      return { roadmap: renderRoadmap(parseRoadmap(reply?.text)), message: "" };
+    } catch (failure) {
+      return {
+        roadmap: renderRoadmap({ goal: "", phases: [] }),
+        message: failure?.status === 404
+          ? "No roadmap in this repository."
+          : `The roadmap couldn't be read: ${failure?.message ?? String(failure)}`,
+      };
+    }
+  };
+  const readRoadmap = async () => {
+    try {
+      return roadmapResult(await boundary.file("docs/roadmap.json"));
+    } catch (error) {
+      return roadmapResult(null, error);
+    }
+  };
+  let [project, initialSessions, initialRoadmap, settingsReply, healthReply, conversationReply, initialSpecRuns, initialSpecFiles] = await Promise.all([
     boundary.project(),
     boundary.sessions(SIDEBAR_SESSION_LIMIT),
-    boundary.file("docs/roadmap.json"),
+    readRoadmap(),
     boundary.settings(),
     boundary.health().catch(() => null),
     boundary.conversationStats().catch(() => ({ conversation: null })),
@@ -258,7 +278,8 @@ export async function start({ global, document, client }) {
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
   let conversation = conversationReply?.conversation ?? null;
-  let roadmap = renderRoadmap(parseRoadmap(roadmapReply.text));
+  let roadmap = initialRoadmap.roadmap;
+  let roadmapMessage = initialRoadmap.message;
   let specRuns = initialSpecRuns;
   let allSpecPaths = [...new Set([
     ...roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item))),
@@ -1619,12 +1640,13 @@ export async function start({ global, document, client }) {
   }
 
   async function refreshSpecState() {
-    const [reply, runs, specFilesReply] = await Promise.all([
-      boundary.file("docs/roadmap.json"),
+    const [roadmapReply, runs, specFilesReply] = await Promise.all([
+      readRoadmap(),
       boundary.specRuns(),
       readSpecFiles(),
     ]);
-    if (typeof reply?.text === "string") roadmap = renderRoadmap(parseRoadmap(reply.text));
+    roadmap = roadmapReply.roadmap;
+    roadmapMessage = roadmapReply.message;
     specRuns = runs;
     allSpecPaths = [...new Set([
       ...roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item))),
@@ -1943,6 +1965,10 @@ export async function start({ global, document, client }) {
   }
 
   function renderRoadmapUI() {
+    if (roadmapMessage) {
+      replace(roadmapRoot, element(document, "p", { className: "roadmap-message", text: roadmapMessage }));
+      return;
+    }
     const graph = layoutRoadmap(visibleRoadmapPhases(), { taskOptions: graphTaskOptions, maxColumns: 1 });
     if (graph.error) {
       replace(roadmapRoot, element(document, "p", { className: "error roadmap-graph-error", text: graph.error }));

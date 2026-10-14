@@ -2951,6 +2951,88 @@ def check_memory_extraction_can_be_disabled() -> None:
             host.close()
 
 
+@check("host_server.memory_extraction_streams_after_turn")
+def check_memory_extraction_streams_after_turn() -> None:
+    provider = _RecordingWireFakeProvider("fake", 4, [
+        ModelResponse(Message(Role.ASSISTANT, "leader answer")),
+        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+            "extract-save", "remember", {"text": "Run checks."},
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "extraction complete")),
+    ])
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            provider,
+            PermissionPolicy(root, mode="allow"),
+            sessions_root=root / "sessions",
+            memory_root=root / "memory",
+            memory_extraction_enabled=True,
+        )
+        host.start()
+        connection, response = _subscribed_stream(host)
+        try:
+            prompt_connection, prompt = _request(
+                host, "POST", "/prompt", body={"prompt": "remember Run checks."},
+                headers=_headers(host),
+            )
+            try:
+                reply = json.loads(prompt.read())
+                if prompt.status != 200:
+                    fail(f"memory prompt was rejected: {prompt.status}, {reply!r}")
+            finally:
+                prompt_connection.close()
+
+            streamed = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                frame = _await_sse(
+                    connection,
+                    response,
+                    lambda candidate: isinstance(candidate, tuple)
+                    and candidate[0] == "event",
+                    deadline=min(1, deadline - time.monotonic()),
+                    what="memory extraction event",
+                )
+                streamed.append(frame[1])
+                if frame[1].get("type") == "RunFinished":
+                    _, conversation = _conversation_reply(host)
+                    leader = next(
+                        (agent for agent in conversation.get("conversation", {}).get("agents", [])
+                         if agent.get("name") == "leader"),
+                        None,
+                    )
+                    if leader is None or leader.get("state") == "running":
+                        fail(f"conversation still reported a running leader after RunFinished: {conversation!r}")
+                if (
+                    frame[1].get("type") == "ToolCallFinished"
+                    and frame[1].get("tool_call_id") == "extract-save"
+                ):
+                    break
+            matching = [
+                (index, event)
+                for index, event in enumerate(streamed)
+                if event.get("tool_call_id") == "extract-save"
+                and event.get("type") in {"ToolCallStarted", "ToolCallFinished"}
+            ]
+            start = next((index for index, event in matching if event["type"] == "ToolCallStarted"), None)
+            finish = next((index for index, event in matching if event["type"] == "ToolCallFinished"), None)
+            terminal = next(
+                (index for index, event in enumerate(streamed) if event.get("type") == "RunFinished"),
+                None,
+            )
+            if terminal is None or start is None or finish is None or not terminal < start < finish:
+                fail(f"extractor events were missing or preceded RunFinished: {streamed!r}")
+            if any(
+                event.get("session_id") != reply.get("run_id")
+                for _, event in matching
+            ):
+                fail(f"extractor events were not routed to their conversation: {matching!r}")
+        finally:
+            connection.close()
+            host.close()
+
+
 @check("host_server.settings_roster_paths")
 def check_settings_roster_paths() -> None:
     with tempfile.TemporaryDirectory() as temporary:

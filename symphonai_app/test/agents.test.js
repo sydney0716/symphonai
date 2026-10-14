@@ -53,6 +53,32 @@ test("a completed tool clears its current activity", () => {
   assert.equal(board.rows[0].state, "running");
 });
 
+test("memory extraction tools do not change the finished leader row", () => {
+  const board = createAgentBoard();
+  board.apply(event("RunStarted", { agent_id: "root", agent_name: "leader" }));
+  board.apply(event("RunFinished", { agent_id: "root", stopped_reason: "final_response" }));
+  board.apply(event("ToolCallStarted", {
+    agent_id: "root", run_id: "memory_run_extract", tool_call_id: "remember",
+    tool_name: "remember", target: "Run checks.",
+  }));
+  board.apply(event("ToolCallFinished", {
+    agent_id: "root", run_id: "memory_run_extract", tool_call_id: "remember",
+    tool_name: "remember", target: "Run checks.",
+  }));
+  assert.deepEqual(board.rows[0], {
+    agentId: "root", parentAgentId: null, name: "leader", state: "finished", tool: "", target: "",
+  });
+
+  board.apply(event("RunStarted", { agent_id: "root", agent_name: "leader" }));
+  board.apply(event("ToolCallStarted", {
+    agent_id: "root", run_id: "run_live", tool_call_id: "read",
+    tool_name: "read_file", target: "notes.md",
+  }));
+  assert.deepEqual(board.rows[0], {
+    agentId: "root", parentAgentId: null, name: "leader", state: "running", tool: "read_file", target: "notes.md",
+  });
+});
+
 test("failed tools clear current activity", () => {
   const board = createAgentBoard();
   board.apply(event("RunStarted", { agent_id: "root" }));
