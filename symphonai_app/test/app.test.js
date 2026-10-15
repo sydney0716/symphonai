@@ -115,6 +115,7 @@ class FakeElement {
 
 export class FakeDocument {
   constructor() {
+    this.listeners = new Map();
     this.documentElement = new FakeElement("html");
     const tags = {
       "app-shell": "div",
@@ -188,6 +189,14 @@ export class FakeDocument {
     return new FakeElement(tagName);
   }
 
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  dispatch(type, event = {}) {
+    return this.listeners.get(type)?.(event);
+  }
+
   getElementById(id) {
     return this.elements.get(id) ?? null;
   }
@@ -196,8 +205,9 @@ export class FakeDocument {
 function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, storageThrows = false } = {}) {
   const listeners = new Map();
   const writes = [];
+  const reloads = [];
   const global = {
-    location: { hash: fragment },
+    location: { hash: fragment, reload() { reloads.push(true); } },
     localStorage: {
       getItem(key) {
         if (storageThrows) {
@@ -223,6 +233,7 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStor
   return {
     global,
     writes,
+    reloads,
     dispatch(type, event = {}) {
       return listeners.get(type)?.(event);
     },
@@ -293,6 +304,7 @@ export function fakeClient(
   roadmapText = fixtureRoadmap(),
   {
     project = { repo_root: "/work/current", name: "current" },
+    projects = { current: project, open: [], recent: [] },
     sessions = [],
     settings = { settings: {} },
     memory = { project: { entries: [] }, global: { entries: [] } },
@@ -306,7 +318,7 @@ export function fakeClient(
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
   let eventCallback;
@@ -438,6 +450,19 @@ export function fakeClient(
     async project() {
       return project;
     },
+    async openProject(path) {
+      calls.openProject.push(path);
+      calls.projectActions.push(["openProject", path]);
+      return { repo_root: path, name: path.split("/").at(-1) };
+    },
+    async projects() {
+      calls.projects += 1;
+      return projects;
+    },
+    async directories(path) {
+      calls.directoryPaths.push(path);
+      return { path: path ?? "/home/person", parent: path === "/" ? null : "/", entries: [] };
+    },
     async settings() {
       calls.settings += 1;
       return settings;
@@ -497,6 +522,7 @@ export function fakeClient(
     },
     async openSession(runId) {
       calls.openSession.push(runId);
+      calls.projectActions.push(["openSession", runId]);
       return { run_id: runId };
     },
     async forkSession(runId, recordId, force = false) {
@@ -599,6 +625,99 @@ test("prompt and stop actions behave while a user command is pending", async () 
   finishCommand({ exit_code: null, output: "partial", timed_out: false, stopped: true });
   await running;
   assert.deepEqual(latestCommandOutput(document), ["partial", "stopped"]);
+});
+
+test("startup waits for the event stream before replaying the open conversation", async () => {
+  const document = new FakeDocument();
+  const native = fakeGlobal();
+  native.global.navigator = { platform: "MacIntel" };
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: {
+      session_id: "run-1",
+      agents: [{ agent_id: "leader", name: "leader", parent_agent_id: null, state: "running" }],
+    },
+    health: {
+      protocol_version: 1, state: "active", run_id: "run-1", runtime_run_id: "runtime-1",
+    },
+  });
+  const originalEvents = client.events;
+  let announceEvents;
+  const eventsCalled = new Promise((resolve) => { announceEvents = resolve; });
+  let resolveReady;
+  let readyResolved = false;
+  const ready = new Promise((resolve) => {
+    resolveReady = () => {
+      readyResolved = true;
+      resolve();
+    };
+  });
+  client.events = (callback) => {
+    announceEvents();
+    return { ...originalEvents(callback), ready };
+  };
+  client.openSession = async (runId) => {
+    assert.equal(readyResolved, true);
+    client.calls.openSession.push(runId);
+    await client.emit({ kind: "event", payload: {
+      type: "HistoryMessage", session_id: runId, role: "assistant",
+      text: "Back after reload", tool_calls: [], turn_id: "turn-1",
+    } });
+    return { run_id: runId };
+  };
+  client.steer = async (text) => { client.calls.steer.push(text); return { accepted: true }; };
+  const opening = start({ global: native.global, document, client });
+  await eventsCalled;
+  assert.deepEqual(client.calls.openSession, []);
+  resolveReady();
+  const app = await opening;
+
+  assert.deepEqual(client.calls.openSession, ["run-1"]);
+  assert.match(visibleText(document.getElementById("chat")), /Back after reload/);
+  assert.equal(app.turn.state, RUNNING);
+  document.getElementById("prompt").value = "continue after reload";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.steer, ["continue after reload"]);
+  await native.dispatch("keydown", { key: ".", metaKey: true, preventDefault() {} });
+  assert.deepEqual(client.calls.stop, [""]);
+
+  const emptyDocument = new FakeDocument();
+  const emptyClient = fakeClient(fixtureRoadmap(), { conversation: null });
+  const emptyEvents = emptyClient.events;
+  emptyClient.events = (callback) => ({ ...emptyEvents(callback), ready: Promise.resolve() });
+  await start({ global: {}, document: emptyDocument, client: emptyClient });
+  assert.deepEqual(emptyClient.calls.openSession, []);
+});
+
+test("the current sidebar row refreshes when its root run ends", async () => {
+  const document = new FakeDocument();
+  const session = {
+    run_id: "run-1", title: "Current conversation", repo_root: "/work/current",
+    updated_at: "2026-10-15", activity: "working",
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [session],
+    conversation: {
+      session_id: "run-1",
+      agents: [
+        { agent_id: "leader", name: "leader", parent_agent_id: null, state: "running" },
+        { agent_id: "worker", name: "worker", parent_agent_id: "leader", state: "running" },
+      ],
+    },
+  });
+  client.sessions = async (limit) => {
+    client.calls.sessions.push(limit);
+    return [{ ...session, activity: client.calls.sessions.length > 1 ? "idle" : "working" }];
+  };
+  await start({ global: {}, document, client });
+  const rowLabel = () => walk(document.getElementById("sidebar"))
+    .find((node) => node.className === "session-link")?.textContent;
+  assert.match(rowLabel(), /· working/);
+
+  await client.emit(eventFrame("RunFinished", { agent_id: "worker", session_id: "run-1" }));
+  assert.equal(client.calls.sessions.length, 1);
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader", session_id: "run-1" }));
+  assert.equal(client.calls.sessions.length, 2);
+  assert.doesNotMatch(rowLabel(), /· working/);
 });
 
 test("pasted images send with text, clear the chips and render in the transcript", async () => {
@@ -1221,6 +1340,42 @@ test("cost prints agent and total usage with optional cache counts and cost", as
   assert.deepEqual(latestCommandOutput(document), ["No usage recorded in this conversation yet."]);
   await submitCommand(document, "/cost extra");
   assert.deepEqual(latestCommandOutput(document), ["Usage: /cost"]);
+});
+
+test("background usage and fresh cost replies update the rail and status line", async () => {
+  const document = new FakeDocument();
+  const native = fakeGlobal({ statusStored: JSON.stringify({ usage: true }) });
+  let conversation = {
+    session_id: "run-1",
+    agents: [{ agent_id: "leader", name: "leader", input_tokens: 400, output_tokens: 200, total_tokens: 600 }],
+    usage: { input_tokens: 400, output_tokens: 200, total_tokens: 600 },
+  };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  client.conversationStats = async () => {
+    client.calls.conversationStats += 1;
+    return { conversation };
+  };
+  await start({ global: native.global, document, client });
+  conversation = {
+    ...conversation,
+    agents: [{ ...conversation.agents[0], input_tokens: 480, output_tokens: 240, total_tokens: 720 }],
+    usage: { input_tokens: 480, output_tokens: 240, total_tokens: 720 },
+  };
+  await client.emit(eventFrame("BackgroundUsageRecorded", { session_id: "run-1" }));
+  assert.equal(client.calls.conversationStats, 2);
+  assert.match(visibleText(document.getElementById("agents")), /720 tokens/);
+  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /720 tokens/);
+
+  conversation = {
+    ...conversation,
+    agents: [{ ...conversation.agents[0], input_tokens: 600, output_tokens: 300, total_tokens: 900 }],
+    usage: { input_tokens: 600, output_tokens: 300, total_tokens: 900 },
+  };
+  await submitCommand(document, "/cost");
+  assert.equal(client.calls.conversationStats, 3);
+  assert.match(visibleText(document.getElementById("agents")), /900 tokens/);
+  assert.match(find(document.body, (node) => node.className === "conversation-usage").textContent, /900 tokens/);
+  assert.match(latestCommandOutput(document)[0], /Total: 900 tokens/);
 });
 
 test("resume and continue appear in command suggestions", async () => {
@@ -2114,8 +2269,9 @@ test("context command omits an unknown window and handles unmeasured context", a
   assert.deepEqual(latestCommandOutput(document), ["No context measured yet. Send a message first."]);
 });
 
-test("sidebar groups sessions and keeps only the current project openable", async () => {
+test("sidebar lets the person switch projects and keeps unknown projects unopenable", async () => {
   const document = new FakeDocument();
+  const browser = fakeGlobal();
   const client = fakeClient(fixtureRoadmap(), {
     project: { repo_root: "/work/current", name: "Current project" },
     sessions: [
@@ -2125,11 +2281,11 @@ test("sidebar groups sessions and keeps only the current project openable", asyn
     ],
   });
 
-  await start({ global: {}, document, client });
+  await start({ global: browser.global, document, client });
   const projects = find(document.getElementById("sidebar"), (value) =>
     value.className === "projects"
   );
-  const groups = projects.children;
+  const groups = projects.children.filter((node) => node.tagName === "DETAILS");
 
   assert.deepEqual(groups.map((group) => group.children[0].textContent), [
     "Current project",
@@ -2137,9 +2293,12 @@ test("sidebar groups sessions and keeps only the current project openable", asyn
     "Unknown project",
   ]);
   assert.deepEqual(groups.map((group) => group.open), [true, false, false]);
-  assert.match(visibleText(groups[1]), /Not openable from this host\./);
   assert.match(visibleText(groups[2]), /legacy/);
-  assert.equal(find(groups[1], (value) => value.tagName === "BUTTON"), undefined);
+  const openOther = find(groups[1], (value) => value.tagName === "BUTTON" && value.textContent === "Open project");
+  assert.ok(openOther);
+  assert.equal(openOther.parentNode, groups[1].children[0]);
+  assert.equal(groups[1].open, false);
+  assert.equal(find(groups[2], (value) => value.tagName === "BUTTON" && value.textContent === "Open project"), undefined);
   const sessionLinks = walk(projects).filter((value) => value.className.includes("session-link"));
   assert.deepEqual(sessionLinks.map((value) => value.textContent), [
     "Current chat",
@@ -2148,8 +2307,117 @@ test("sidebar groups sessions and keeps only the current project openable", asyn
   ]);
   assert.equal(document.getElementById("new-chat").className, "new-chat");
 
+  let prevented = false;
+  let propagationStopped = false;
+  await openOther.dispatch("click", {
+    preventDefault() { prevented = true; },
+    stopPropagation() { propagationStopped = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(propagationStopped, true);
+  assert.equal(groups[1].open, false);
+  assert.deepEqual(client.calls.openProject, ["/work/other"]);
+  assert.deepEqual(browser.reloads, [true]);
+
   await find(groups[0], (value) => value.tagName === "BUTTON").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["current-old"]);
+});
+
+test("opening another project's conversation switches, opens it, then reloads", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [{ run_id: "other-run", title: "Other", repo_root: "/work/other", updated_at: "2026-03-01" }],
+  });
+  await start({ global: browser.global, document, client });
+  const session = find(document.getElementById("sidebar"), (node) => node.className === "session-link");
+  await session.click();
+  assert.deepEqual(client.calls.projectActions, [
+    ["openProject", "/work/other"],
+    ["openSession", "other-run"],
+  ]);
+  assert.deepEqual(browser.reloads, [true]);
+});
+
+test("projectless startup shows recent projects without chat or composer", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient(fixtureRoadmap(), {
+    project: { repo_root: null, name: null },
+    projects: { current: null, open: [], recent: [
+      { repo_root: "/work/recent", name: "recent", exists: true },
+      { repo_root: "/work/gone", name: "gone", exists: false },
+    ] },
+  });
+  await start({ global: browser.global, document, client });
+  const page = document.getElementById("page");
+  assert.equal(find(page, (node) => node.className === "project-start") !== undefined, true);
+  assert.equal(find(page, (node) => node.className === "chat-pane"), undefined);
+  assert.equal(find(page, (node) => node.className === "prompt-form"), undefined);
+  assert.match(visibleText(page), /Open a project/);
+  assert.match(visibleText(page), /recent/);
+  assert.match(visibleText(page), /gone · missing/);
+  const recent = find(page, (node) => node.tagName === "BUTTON" && node.textContent === "recent");
+  await recent.click();
+  assert.deepEqual(client.calls.openProject, ["/work/recent"]);
+  assert.deepEqual(browser.reloads, [true]);
+  assert.equal(client.calls.projects, 1);
+  assert.deepEqual(client.calls.sessions, []);
+});
+
+test("folder picker browses down and up, opens the shown path, and Escape cancels", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  client.directories = async (path) => {
+    client.calls.directoryPaths.push(path);
+    if (path === undefined) return { path: "/home/person", parent: "/home", entries: [{ name: "repo", path: "/home/person/repo" }] };
+    if (path === "/home/person/repo") return { path, parent: "/home/person", entries: [] };
+    return { path, parent: null, entries: [] };
+  };
+  await start({ global: browser.global, document, client });
+  const openFolder = find(document.getElementById("sidebar"), (node) => node.tagName === "BUTTON" && node.textContent === "Open folder…");
+  await openFolder.click();
+  await Promise.resolve();
+  let dialog = find(document.getElementById("page"), (node) => node.className === "folder-picker");
+  assert.ok(dialog);
+  await find(dialog, (node) => node.tagName === "BUTTON" && node.textContent === "repo").click();
+  await Promise.resolve();
+  assert.deepEqual(client.calls.directoryPaths, [undefined, "/home/person/repo"]);
+  dialog = find(document.getElementById("page"), (node) => node.className === "folder-picker");
+  assert.match(visibleText(dialog), /\/home\/person\/repo/);
+  await find(dialog, (node) => node.tagName === "BUTTON" && node.textContent === "Up").click();
+  await Promise.resolve();
+  assert.deepEqual(client.calls.directoryPaths.at(-1), "/home/person");
+  dialog = find(document.getElementById("page"), (node) => node.className === "folder-picker");
+  await find(dialog, (node) => node.tagName === "BUTTON" && node.textContent === "Open this folder").click();
+  assert.deepEqual(client.calls.openProject, ["/home/person"]);
+
+  const cancelClient = fakeClient();
+  const cancelDocument = new FakeDocument();
+  await start({ global: fakeGlobal().global, document: cancelDocument, client: cancelClient });
+  await find(cancelDocument.getElementById("sidebar"), (node) => node.tagName === "BUTTON" && node.textContent === "Open folder…").click();
+  await Promise.resolve();
+  await cancelDocument.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(find(cancelDocument.getElementById("page"), (node) => node.className === "folder-picker"), undefined);
+  assert.deepEqual(cancelClient.calls.openProject, []);
+});
+
+test("failed project opening shows the host error without reloading", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const client = fakeClient();
+  client.openProject = async (path) => {
+    client.calls.openProject.push(path);
+    throw new Error("invalid project config");
+  };
+  await start({ global: browser.global, document, client });
+  await find(document.getElementById("sidebar"), (node) => node.tagName === "BUTTON" && node.textContent === "Open folder…").click();
+  await Promise.resolve();
+  const dialog = find(document.getElementById("page"), (node) => node.className === "folder-picker");
+  await find(dialog, (node) => node.tagName === "BUTTON" && node.textContent === "Open this folder").click();
+  assert.match(visibleText(document.getElementById("page")), /invalid project config/);
+  assert.deepEqual(browser.reloads, []);
 });
 
 test("sidebar manages and searches conversations without changing the session link", async () => {
@@ -2165,8 +2433,8 @@ test("sidebar manages and searches conversations without changing the session li
   };
   await start({ global: {}, document, client });
   const projects = find(document.getElementById("sidebar"), (value) => value.className === "projects");
-  const currentGroup = () => projects.children[0];
-  assert.equal(find(currentGroup(), (value) => value.tagName === "BUTTON").className, "session-link");
+  const currentGroup = () => find(projects, (value) => value.className === "project openable");
+  assert.equal(find(currentGroup(), (value) => value.className === "session-link").tagName, "BUTTON");
 
   const rename = find(currentGroup(), (value) => value.attributes.get("aria-label") === "Rename");
   await rename.dispatch("click");
@@ -2976,10 +3244,10 @@ test("sidebar shows the current project when it has no sessions", async () => {
   const projects = find(document.getElementById("sidebar"), (value) =>
     value.className === "projects"
   );
-  assert.equal(projects.children.length, 1);
-  assert.equal(projects.children[0].open, true);
-  assert.equal(projects.children[0].children[0].textContent, "empty");
-  assert.match(visibleText(projects.children[0]), /No chats yet\./);
+  const currentProject = find(projects, (value) => value.className === "project openable");
+  assert.equal(currentProject.open, true);
+  assert.equal(currentProject.children[0].textContent, "empty");
+  assert.match(visibleText(currentProject), /No chats yet\./);
 });
 
 test("sidebar requests 200 sessions without a limit notice", async () => {
@@ -3672,6 +3940,44 @@ test("dispatch activity expands its matched subagent task with click and Enter",
   const expanded = find(chat, (node) => node.className.includes("activity"));
   await expanded.dispatch("keydown", { key: "Enter", preventDefault() {} });
   assert.equal(find(find(chat, (node) => node.className.includes("activity")), (node) => node.className === "dispatch-tasks"), undefined);
+});
+
+test("tool output expands on click and Enter, and replay restores it", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "output-run", agent_name: "leader" }));
+  await client.emit(eventFrame("ToolCallStarted", {
+    agent_id: "leader", run_id: "output-run", turn_id: "output-turn",
+    tool_call_id: "shell-output", tool_name: "run_shell", target: "true",
+  }));
+  await client.emit(eventFrame("ToolCallFinished", {
+    agent_id: "leader", run_id: "output-run", turn_id: "output-turn",
+    tool_call_id: "shell-output", tool_name: "run_shell", ok: true,
+    output: "click output", output_truncated: false,
+  }));
+  const chat = document.getElementById("chat");
+  let line = find(chat, (node) => node.className.includes("activity"));
+  assert.equal(line.tagName, "DIV");
+  assert.equal(find(line, (node) => node.tagName === "PRE"), undefined);
+  await line.click();
+  line = find(chat, (node) => node.className.includes("activity"));
+  assert.equal(find(line, (node) => node.tagName === "PRE").textContent, "click output");
+  await line.dispatch("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(find(find(chat, (node) => node.className.includes("activity")), (node) => node.tagName === "PRE"), undefined);
+
+  await client.emit(eventFrame("HistoryMessage", {
+    role: "assistant", text: "", turn_id: "replayed-output",
+    tool_calls: [{
+      id: "replayed-shell", name: "run_shell", target: "true", ok: true,
+      output: "replayed output", output_truncated: false,
+    }],
+  }));
+  line = [...chat.children].filter((node) => node.className.includes("activity")).at(-1);
+  assert.match(visibleText(line).replace(/\s+/g, " "), /Ran\s+true\s*\./);
+  await line.click();
+  line = [...chat.children].filter((node) => node.className.includes("activity")).at(-1);
+  assert.equal(find(line, (node) => node.tagName === "PRE").textContent, "replayed output");
 });
 
 test("reopened history renders its collapsed dispatch task and turn time", async () => {

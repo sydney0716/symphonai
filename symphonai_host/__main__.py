@@ -20,15 +20,17 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import default_sessions_root
-from symphonai_host.server import HostServer, _provider
+from symphonai_host.server import HostServer, _provider, _provider_for_start, symphonai_home
 from symphonai_host.run import ModeSelectionError
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
+from symphonai_host.projects import build_project, choose_start_root, record_recent_project
+from symphonai_host.broker import EventBroker
 
 
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument("--repo-root", type=Path)
     parser.add_argument("--max-turns", type=int)
     return parser.parse_args(argv)
 
@@ -40,53 +42,80 @@ def main(argv: Sequence[str] | None = None) -> None:
     except CredentialError as exc:
         print(f"credential error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
-    try:
-        extensions = load_extensions(repo_root=arguments.repo_root)
-    except ConfigError as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
-        raise SystemExit(2) from None
-    try:
-        period = extensions.config.values.get(
-            "sessions.cleanup_period_days", DEFAULT_CLEANUP_PERIOD_DAYS
-        )
-        prune_sessions(default_sessions_root(), period_days=period, now=datetime.now(timezone.utc))
-    except Exception:
-        pass
-    pool = McpPool(
-        extensions.mcp_servers,
-        cwd=arguments.repo_root,
-        reserved_names=set(standard_tool_registry()),
-    )
-    try:
-        mcp_tools = pool.start()
-    except McpError as exc:
-        print(f"mcp error: {exc}", file=sys.stderr)
-        raise SystemExit(2) from None
-    lsp = LspManager(extensions.lsp_servers, root=arguments.repo_root)
     host = None
+    runtime = None
     try:
-        policy = PermissionPolicy(
-                repo_root=arguments.repo_root,
-                allowed_write_scope=[arguments.repo_root],
-                shell_enabled=True,
-                shell_allowlist=[()],
-                shell_sandbox=extensions.config.get("sandbox.shell", False),
-                sandbox_network=extensions.config.get("sandbox.network", False),
-                fetch_enabled=True,
+        provider, saved_selection = _provider_for_start(_provider)
+        broker = EventBroker()
+        sessions_root = default_sessions_root()
+        host_holder = {}
+        start_root = choose_start_root(arguments.repo_root, Path.cwd(), Path.home(), symphonai_home())
+
+        def publish_approval(approval) -> bool:
+            current_host = host_holder.get("host")
+            return False if current_host is None else current_host._publish_approval(approval)
+
+        if start_root is not None:
+            runtime = build_project(
+                start_root,
+                broker,
+                provider,
+                publish_approval=publish_approval,
+                base_prompt=LEADER_BASE_PROMPT,
+                subagent_base_prompt=SUBAGENT_BASE_PROMPT,
+                max_turns=arguments.max_turns,
+                sessions_root=sessions_root,
+                provider_factory=lambda name, model, base_url: _provider(name, model, base_url),
+                extensions_loader=load_extensions,
+                pool_factory=McpPool,
+                lsp_factory=LspManager,
+                policy_factory=PermissionPolicy,
             )
-        ceiling = getattr(extensions, "ceiling", None)
-        if ceiling is not None:
-            policy = ceiling.bound(policy)
+            try:
+                period = runtime.run.extensions.config.values.get(
+                    "sessions.cleanup_period_days", DEFAULT_CLEANUP_PERIOD_DAYS
+                )
+                prune_sessions(runtime.run.sessions_root, period_days=period, now=datetime.now(timezone.utc))
+            except Exception:
+                pass
         host = HostServer(
-            _provider(),
-            policy,
+            provider,
+            None if runtime is None else runtime.run._base_policy,
+            broker=broker,
             base_prompt=LEADER_BASE_PROMPT,
             subagent_base_prompt=SUBAGENT_BASE_PROMPT,
             max_turns=arguments.max_turns,
-            extensions=extensions,
-            mcp_tools=mcp_tools,
-            lsp=lsp,
+            extensions=None if runtime is None else runtime.run.extensions,
+            mcp_tools=None if runtime is None else runtime.run._mcp_tools,
+            lsp=None if runtime is None else runtime.lsp,
+            runtime=runtime,
+            provider_selection=saved_selection,
+            project_factory=lambda root, broker, publish_approval: build_project(
+                root,
+                broker,
+                provider,
+                publish_approval=publish_approval,
+                base_prompt=LEADER_BASE_PROMPT,
+                subagent_base_prompt=SUBAGENT_BASE_PROMPT,
+                max_turns=arguments.max_turns,
+                sessions_root=sessions_root,
+                provider_factory=lambda name, model, base_url: _provider(name, model, base_url),
+                extensions_loader=load_extensions,
+                pool_factory=McpPool,
+                lsp_factory=LspManager,
+                policy_factory=PermissionPolicy,
+            ),
         )
+        host_holder["host"] = host
+        if runtime is not None:
+            record_recent_project(symphonai_home(), runtime.root)
+        if saved_selection is not None and provider is not None:
+            host.run.select_provider(
+                provider,
+                saved_selection.get("model"),
+                saved_selection.get("effort"),
+                saved_selection,
+            )
 
         def shutdown(signum, frame) -> None:
             threading.Thread(target=host.close, daemon=True).start()
@@ -98,11 +127,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ModeSelectionError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except McpError as exc:
+        print(f"mcp error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     finally:
-        if host is not None:
-            host.close()
-        lsp.close()
-        pool.close()
+        try:
+            if host is not None:
+                host.close()
+        finally:
+            if runtime is not None:
+                runtime.close()
 
 
 if __name__ == "__main__":

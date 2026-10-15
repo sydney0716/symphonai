@@ -529,6 +529,38 @@ test("sessions accepts only an array while other routes still require objects", 
   });
 });
 
+test("project opening, listing, and directory browsing use their routes", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ path: new URL(url).pathname + new URL(url).search, options });
+      return response(200, { repo_root: "/work/project", entries: [] });
+    },
+  });
+  await client.openProject("/work/project");
+  await client.projects();
+  await client.directories();
+  await client.directories("/work/project/sub folder");
+  assert.deepEqual(records.map(({ path, options }) => [path, options.method, options.body]), [
+    ["/project/open", "POST", JSON.stringify({ path: "/work/project" })],
+    ["/projects", "GET", undefined],
+    ["/directories", "GET", undefined],
+    ["/directories?path=%2Fwork%2Fproject%2Fsub+folder", "GET", undefined],
+  ]);
+});
+
+test("project actions surface host error text", async () => {
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => response(400, { error: "invalid project config" }),
+  });
+  await assert.rejects(client.openProject("/work/bad"), /invalid project config/);
+  await assert.rejects(client.directories("relative"), /invalid project config/);
+});
+
 test("session rename and delete send their host route payloads", async () => {
   const records = [];
   const client = createClient({
@@ -631,12 +663,36 @@ test("keepalive comments never become frames", async () => {
         `: keepalive\n\ndata: ${frame()}\n\n`,
       ]),
   });
-  await client.events((value) => delivered.push(value)).done;
+  const subscription = client.events((value) => delivered.push(value));
+  await subscription.ready;
+  await subscription.done;
   assert.equal(delivered.length, 1);
   assert.deepEqual(delivered[0], {
     kind: "event",
     payload: { type: "RunStarted" },
   });
+});
+
+test("event stream ready resolves for success and rejects for unauthorized", async () => {
+  const readyClient = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => streamResponse([]),
+  });
+  const subscription = readyClient.events(() => {});
+  await subscription.ready;
+  await subscription.done;
+
+  const unauthorizedClient = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async () => response(401, null),
+  });
+  const unauthorized = unauthorizedClient.events(() => {});
+  await Promise.all([
+    assert.rejects(unauthorized.ready, /401/),
+    assert.rejects(unauthorized.done, /401/),
+  ]);
 });
 
 test("multiple data lines join and strip exactly one leading space", async () => {

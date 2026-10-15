@@ -76,6 +76,8 @@ class ToolCallFinished(Event):
     lines_removed: int = 0
     diff: str = ""
     truncated: bool = False
+    output: str = ""
+    output_truncated: bool = False
 
 
 @dataclass(frozen=True)

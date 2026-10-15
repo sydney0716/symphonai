@@ -223,6 +223,7 @@ def check_events_tool_bracketing() -> None:
         ):
             fail(f"edit result did not reach its finish event: {edit_events.events!r}")
 
+
         failed_payload = {
             "kind": "file_diff",
             "path": "decoy.txt",
@@ -324,6 +325,50 @@ def check_events_tool_bracketing() -> None:
             or unknown_terminals[0].stopped_reason != "max_turns"
         ):
             fail(f"max-turn event terminal is invalid: {unknown_events.events!r}")
+
+@check("events.tool_output")
+def check_events_tool_output() -> None:
+    with workspace() as ws:
+        ws.policy.shell_enabled = True
+        ws.policy.shell_allowlist = [("python3", "-c")]
+
+        def run_call(tool_call: ToolCall) -> CollectingSink:
+            sink = CollectingSink()
+            ApiAgent(
+                FakeModelProvider(responses=[
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[tool_call])),
+                    ModelResponse(Message(Role.ASSISTANT, "done")),
+                ]),
+                ws.tools,
+                ws.policy,
+                events=sink,
+            ).run([Message(Role.USER, "tool output")])
+            return sink
+
+        shell = run_call(ToolCall(
+            id="long-output",
+            name="run_shell",
+            arguments={"argv": ["python3", "-c", "print('x' * 5000)"]},
+        )).of_type(ToolCallFinished)
+        if len(shell) != 1 or len(shell[0].output) != 4000 or not shell[0].output_truncated:
+            fail(f"long tool output was not capped at 4,000 characters: {shell!r}")
+
+        failed = run_call(ToolCall(
+            id="failed-output",
+            name="read_file",
+            arguments={"path": "missing.txt"},
+        )).of_type(ToolCallFinished)
+        if len(failed) != 1 or failed[0].ok or "missing.txt" not in failed[0].output:
+            fail(f"failed tool output omitted its error: {failed!r}")
+
+        edited = run_call(ToolCall(
+            id="edit-output",
+            name="edit_file",
+            arguments={"path": "existing.txt", "old_string": "hello", "new_string": "goodbye"},
+        )).of_type(ToolCallFinished)
+        if len(edited) != 1 or edited[0].output != "":
+            fail(f"edit diff was duplicated into ordinary tool output: {edited!r}")
+
 
 @check("events.provider_failure")
 def check_events_provider_failure() -> None:

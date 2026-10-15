@@ -88,6 +88,9 @@ const RECORDED_EVENTS = Object.freeze({
     explanation: "Start here.",
     session_id: "session-1",
   }),
+  BackgroundUsageRecorded: event("BackgroundUsageRecorded", {
+    session_id: "session-1",
+  }),
 });
 
 test("assistant deltas join only while consecutive", () => {
@@ -214,6 +217,7 @@ test("tool-call-only history adds no prose and replay keeps message order", () =
 
   assert.deepEqual(replay.map(({ type, text }) => ({ type, text })), [
     { type: "prompt", text: "first" },
+    { type: "activity", text: undefined },
     { type: "text", text: "second" },
     { type: "text", text: "third" },
   ]);
@@ -299,6 +303,38 @@ test("activity entries contain parts and no rendered sentence", () => {
     name: "read_file",
     target: "src/auth.py",
     status: "succeeded",
+    output: "",
+    outputTruncated: false,
+  });
+});
+
+test("a finished tool call keeps its output and truncation flag", () => {
+  const transcript = applyAll([
+    call("ToolCallStarted", "shell-output", { tool_name: "run_shell", target: "true" }),
+    call("ToolCallFinished", "shell-output", {
+      tool_name: "run_shell", ok: true, output: "hello", output_truncated: true,
+    }),
+  ]);
+  assert.deepEqual(transcript.model[0].calls[0], {
+    toolCallId: "shell-output", name: "run_shell", target: "true", status: "succeeded",
+    output: "hello", outputTruncated: true,
+  });
+});
+
+test("replayed ordinary tools become finished activities with output", () => {
+  const transcript = createTranscript();
+  transcript.apply(event("HistoryMessage", {
+    role: "assistant", text: "", turn_id: "history-turn",
+    tool_calls: [{
+      id: "history-shell", name: "run_shell", target: "true", ok: true,
+      output: "hello", output_truncated: false,
+    }],
+  }));
+  assert.deepEqual(transcript.model[0], {
+    type: "activity", agentId: "agent-1", calls: [{
+      toolCallId: "history-shell", name: "run_shell", target: "true", status: "succeeded",
+      output: "hello", outputTruncated: false,
+    }],
   });
 });
 
@@ -529,6 +565,8 @@ test("captured runtime frames produce reachable targets and edits", async () => 
         name: "read_file",
         target: "README.md",
         status: "succeeded",
+        output: "",
+        outputTruncated: false,
       }],
     },
   ]);

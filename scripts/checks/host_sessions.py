@@ -634,10 +634,23 @@ def check_open_during_run_409() -> None:
 
 def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[dict], dict]:
     marker = "history-secret-argument"
-    host, client = _host(root, [
-        ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall("history-tool", "run_shell", {"argv": [marker]})])),
-        ModelResponse(Message(Role.ASSISTANT, "done")),
-    ])
+    host = HostServer(
+        FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                ToolCall("history-tool", "run_shell", {"argv": ["true", marker]}),
+                ToolCall("history-edit", "edit_file", {"path": "history.txt", "old_string": "old", "new_string": "new"}),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ]),
+        PermissionPolicy(
+            repo_root=root, shell_enabled=True, shell_allowlist=[("true",)], mode="allow",
+        ),
+        sessions_root=root / "sessions",
+        memory_extraction_enabled=False,
+    )
+    host.run.select_mode("allow")
+    host.start()
+    client = HostClient(HostAddress(host.port, host.token))
     run_id = client.send_prompt("first")["run_id"]
     _wait_idle(client)
     frames: list[dict] = []
@@ -649,7 +662,7 @@ def _open_with_history(root: Path) -> tuple[HostServer, HostClient, str, list[di
             for kind, payload in client.events():
                 if kind == "event" and payload.get("type") == "HistoryMessage":
                     frames.append(payload)
-                    if len(frames) == 6:
+                    if len(frames) == 7:
                         return
         except Exception:
             return
@@ -666,7 +679,7 @@ def check_replay_order() -> None:
     with tempfile.TemporaryDirectory() as directory:
         host, _, _, frames, _ = _open_with_history(Path(directory))
         try:
-            expected = ["system", "system", "user", "assistant", "tool", "assistant"]
+            expected = ["system", "system", "user", "assistant", "tool", "tool", "assistant"]
             deadline = time.monotonic() + 5
             while len(frames) < len(expected) and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -674,10 +687,38 @@ def check_replay_order() -> None:
                 fail(f"history replay timed out with {len(frames)} frames: {frames!r}")
             if [frame["role"] for frame in frames] != expected:
                 fail(f"history replay was out of order: {frames!r}")
-            if any(set(call) != {"id", "name"} for frame in frames for call in frame["tool_calls"]):
+            if any(
+                set(call) != (
+                    {"id", "name", "target", "ok", "output", "output_truncated"}
+                    if call["name"] == "run_shell" else {"id", "name"}
+                )
+                for frame in frames for call in frame["tool_calls"]
+            ):
                 fail(f"history tool calls leaked fields: {frames!r}")
             if "history-secret-argument" in json.dumps(frames):
                 fail(f"history replay was unsafe or out of order: {frames!r}")
+        finally:
+            host.close()
+
+
+@check("host_sessions.replayed_tool_output")
+def check_replayed_tool_output() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        host, _, _, frames, _ = _open_with_history(Path(directory))
+        try:
+            expected = ["system", "system", "user", "assistant", "tool", "tool", "assistant"]
+            deadline = time.monotonic() + 5
+            while len(frames) < len(expected) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            calls = [call for frame in frames for call in frame["tool_calls"]]
+            run_call = next((call for call in calls if call["name"] == "run_shell"), None)
+            edit_call = next((call for call in calls if call["name"] == "edit_file"), None)
+            if run_call is None or run_call.get("target") != "true" or run_call.get("ok") is not True or run_call.get("output") != "" or run_call.get("output_truncated") is not False:
+                fail(f"replayed shell call omitted its safe result: {frames!r}")
+            if edit_call is not None and any(key in edit_call for key in ("target", "ok", "output", "output_truncated")):
+                fail(f"replayed edit call exposed ordinary activity fields: {edit_call!r}")
+            if "history-secret-argument" in json.dumps(frames):
+                fail(f"history replay exposed a tool argument: {frames!r}")
         finally:
             host.close()
 

@@ -23,6 +23,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "CompactionApplied",
   "GoalChanged",
   "PlanChanged",
+  "BackgroundUsageRecorded",
 ]);
 
 const FRAME_KINDS = new Set([

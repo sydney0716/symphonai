@@ -74,8 +74,10 @@ from symphonai_api.worktree import create_worktree, worktree_diff
 from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
 from symphonai_host.plan import PlanChanged
-from symphonai_host.protocol import decode_event, decode_frame
+from symphonai_host.protocol import ApprovalRequested, decode_event, decode_frame
 from symphonai_host.run import HostRun, RunActiveError
+from symphonai_host.projects import ProjectRuntime
+from symphonai_host.projects import choose_start_root
 from symphonai_host.server import HostServer
 from symphonai_host.spec_run import bind_roadmap_item, mark_roadmap_spec_done, parse_spec, patch_digest, review_verdict
 from scripts.checks.harness import CheckFailed, check, fail
@@ -3461,6 +3463,29 @@ def check_memory_extraction_streams_after_turn() -> None:
             host.close()
 
 
+@check("host_server.background_usage_is_announced")
+def check_background_usage_is_announced() -> None:
+    host = _host()
+    connection, response = _subscribed_stream(host)
+    try:
+        _send_host_prompt(host, "finish before recording background usage")
+        session_id = host.run.conversation_stats()["session_id"]
+        host.run._record_background_usage(session_id, "memory-model", UsageTotals(12, 8, 1))
+        frame = _await_sse(
+            connection,
+            response,
+            lambda candidate: isinstance(candidate, tuple)
+            and candidate[0] == "event"
+            and candidate[1].get("type") == "BackgroundUsageRecorded",
+            what="background usage event",
+        )
+        if not isinstance(frame, tuple) or frame[1].get("session_id") != session_id:
+            fail(f"background usage event omitted its conversation id: {frame!r}")
+    finally:
+        connection.close()
+        host.close()
+
+
 @check("host_server.settings_roster_paths")
 def check_settings_roster_paths() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -3919,6 +3944,41 @@ def check_event_stream_delivers() -> None:
         finally:
             connection.close()
     finally:
+        host.close()
+
+
+@check("host_server.events_subscribe_before_reply")
+def check_events_subscribe_before_reply() -> None:
+    host = _host()
+    handler_type = host._httpd.RequestHandlerClass
+    original_end_headers = handler_type.end_headers
+
+    def publish_after_headers(handler) -> None:
+        original_end_headers(handler)
+        if handler.path == "/events":
+            host.broker.publish(
+                RunStarted(agent_id="agent", run_id="immediate", agent_name="agent")
+            )
+
+    handler_type.end_headers = publish_after_headers
+    try:
+        connection, response = _request(host, "GET", "/events", headers=_headers(host))
+        try:
+            frame = _await_sse(
+                connection,
+                response,
+                lambda candidate: isinstance(candidate, tuple)
+                and candidate[0] == "event",
+                what="event published as response headers arrive",
+            )
+            if not isinstance(frame, tuple) or decode_event(frame[1]) != RunStarted(
+                agent_id="agent", run_id="immediate", agent_name="agent"
+            ):
+                fail(f"event published with the SSE headers was lost: {frame!r}")
+        finally:
+            connection.close()
+    finally:
+        handler_type.end_headers = original_end_headers
         host.close()
 
 
@@ -7937,6 +7997,90 @@ def main_passes_base_prompts() -> None:
         fake_host.close.assert_called_once_with()
 
 
+@check("host_server.selection_is_remembered")
+def selection_is_remembered() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "post-home"
+        repo = root / "repo"
+        home.mkdir()
+        repo.mkdir()
+        choice = {"name": "openai", "model": "gpt-5.4-mini", "effort": "high"}
+        with mock.patch.dict(os.environ, {
+            "HOME": str(home), "SYMPHONAI_HOME": "", "OPENAI_API_KEY": "test-key",
+        }, clear=True):
+            host = HostServer(FakeModelProvider(), PermissionPolicy(repo), sessions_root=root / "sessions")
+            host.start()
+            try:
+                connection, response = _request(
+                    host, "POST", "/provider", body=choice, headers=_headers(host),
+                )
+                reply = json.loads(response.read())
+                connection.close()
+                if response.status != 200 or reply != {"selected": True}:
+                    fail(f"provider selection failed: {response.status}, {reply!r}")
+                selection_path = home / ".symphonai" / "selection.json"
+                if json.loads(selection_path.read_text(encoding="utf-8")) != choice:
+                    fail("provider selection was not atomically saved with its chosen fields")
+                connection, response = _request(host, "GET", "/settings", headers=_headers(host))
+                settings = json.loads(response.read())
+                connection.close()
+                if response.status != 200 or settings.get("settings", {}).get("selection") != {
+                    "provider": "openai", "model": "gpt-5.4-mini", "effort": "high",
+                }:
+                    fail(f"settings did not report the applied selection: {settings!r}")
+            finally:
+                host.close()
+
+        def run_main(test_home: Path, environment: dict[str, str]):
+            fake_host = mock.Mock()
+            fake_pool = mock.Mock()
+            fake_pool.start.return_value = {}
+            with mock.patch.dict(os.environ, {
+                "HOME": str(test_home), "PATH": os.defpath,
+                "SYMPHONAI_HOME": "", **environment,
+            }, clear=True), mock.patch.object(host_main, "HostServer", return_value=fake_host) as host_factory, mock.patch.object(
+                host_main, "McpPool", return_value=fake_pool,
+            ), mock.patch.object(host_main, "LspManager", return_value=mock.Mock()), mock.patch.object(
+                host_main, "prune_sessions",
+            ):
+                host_main.main(["--repo-root", str(repo)])
+            return host_factory.call_args.args[0], fake_host
+
+        keyed_home = root / "keyed-home"
+        keyed_home.mkdir()
+        (keyed_home / ".symphonai").mkdir()
+        (keyed_home / ".symphonai" / "selection.json").write_text(
+            json.dumps(choice), encoding="utf-8",
+        )
+        selected_provider, selected_host = run_main(keyed_home, {"OPENAI_API_KEY": "test-key"})
+        if selected_provider.name != "openai" or selected_provider.model != "gpt-5.4-mini":
+            fail(f"main did not start with the remembered provider and model: {selected_provider!r}")
+        selected_host.run.select_provider.assert_called_once_with(
+            selected_provider, "gpt-5.4-mini", "high", choice,
+        )
+
+        fallback_home = root / "fallback-home"
+        fallback_home.mkdir()
+        (fallback_home / ".symphonai").mkdir()
+        (fallback_home / ".symphonai" / "selection.json").write_text(
+            json.dumps(choice), encoding="utf-8",
+        )
+        fallback_provider, fallback_host = run_main(
+            fallback_home, {"ANTHROPIC_API_KEY": "test-key"},
+        )
+        if fallback_provider.name != "anthropic" or fallback_host.run.select_provider.called:
+            fail(f"main did not silently use the keyed default provider: {fallback_provider!r}")
+
+        malformed_home = root / "malformed-home"
+        malformed_home.mkdir()
+        (malformed_home / ".symphonai").mkdir()
+        (malformed_home / ".symphonai" / "selection.json").write_text("not json", encoding="utf-8")
+        malformed_provider, _ = run_main(malformed_home, {"ANTHROPIC_API_KEY": "test-key"})
+        if malformed_provider.name != "anthropic":
+            fail(f"main did not start with today's default after malformed selection: {malformed_provider!r}")
+
+
 
 
 _HOST_MCP_SERVER = r'''import json
@@ -8085,7 +8229,7 @@ def check_mcp_start_and_schema() -> None:
 
         def construct(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
             nonlocal captured_process
-            kwargs["memory_extraction_enabled"] = False
+            kwargs["runtime"].run._memory_extraction_enabled = False
             tools = kwargs.get("mcp_tools")
             if not isinstance(tools, dict) or tuple(tools) != ("mcp__docs__search",):
                 fail(f"main did not hand MCP tools to HostServer: {tools!r}")
@@ -8284,34 +8428,46 @@ def check_mcp_sigterm_shutdown() -> None:
 
 @check("host_server.mcp_close_order")
 def check_mcp_close_order() -> None:
-    events: list[str] = []
-    extensions = mock.Mock(mcp_servers=(), lsp_servers=())
-    pool = mock.Mock()
-    pool.start.side_effect = lambda: events.append("pool.start") or {}
-    pool.close.side_effect = lambda: events.append("pool.close")
-    host = mock.Mock()
-    host.close.side_effect = lambda: events.append("host.close")
+    with tempfile.TemporaryDirectory() as temporary:
+        events: list[str] = []
+        pool = mock.Mock()
+        pool.close.side_effect = lambda: events.append("pool.close")
+        lsp = mock.Mock()
+        lsp.close.side_effect = lambda: events.append("lsp.close")
+        extensions = mock.Mock(config=mock.Mock(values={}))
+        run = mock.Mock(
+            policy=PermissionPolicy(REPO_ROOT),
+            extensions=extensions,
+            _mcp_tools={},
+            sessions_root=Path(temporary) / "sessions",
+        )
+        run.close.side_effect = lambda: events.append("run.close")
+        runtime = ProjectRuntime(REPO_ROOT, run, pool, lsp)
+        host = mock.Mock()
+        host.run = mock.Mock()
+        host.close.side_effect = lambda: (events.append("host.close"), runtime.close())
 
-    def construct_host(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
-        events.append("host.construct")
-        return host
+        def build(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            events.append("project.build")
+            return runtime
 
-    standard = standard_tool_registry()
-    with (
-        mock.patch.object(host_main, "load_extensions", return_value=extensions),
-        mock.patch.object(host_main, "McpPool", return_value=pool) as pool_factory,
-        mock.patch.object(host_main, "standard_tool_registry", return_value=standard),
-        mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
-        mock.patch.object(host_main, "HostServer", side_effect=construct_host),
-        mock.patch.object(host_main.signal, "signal"),
-    ):
-        host_main.main(["--repo-root", str(REPO_ROOT)])
-    if events != ["pool.start", "host.construct", "host.close", "pool.close"]:
-        fail(f"host and MCP pool lifetime order changed: {events!r}")
-    if pool.close.call_count != 1:
-        fail(f"MCP pool had more than one owner: {pool.close.call_count} closes")
-    if pool_factory.call_args.kwargs.get("reserved_names") != set(standard):
-        fail("main did not inject the live standard registry keys")
+        def construct_host(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            events.append("host.construct")
+            return host
+
+        with (
+            mock.patch.object(host_main, "build_project", side_effect=build),
+            mock.patch.object(host_main, "_provider", return_value=FakeModelProvider()),
+            mock.patch.object(host_main, "HostServer", side_effect=construct_host),
+            mock.patch.object(host_main, "prune_sessions"),
+            mock.patch.object(host_main, "symphonai_home", return_value=Path(temporary) / "home" / ".symphonai"),
+            mock.patch.object(host_main.signal, "signal"),
+        ):
+            host_main.main(["--repo-root", str(REPO_ROOT)])
+        if events != ["project.build", "host.construct", "host.close", "run.close", "lsp.close", "pool.close"]:
+            fail(f"project runtime resource lifetime order changed: {events!r}")
+        if pool.close.call_count != 1:
+            fail(f"MCP pool had more than one owner: {pool.close.call_count} closes")
 
 
 @check("host_server.mcp_pass_through_and_ownership")
@@ -9602,6 +9758,7 @@ def check_allow_mode_full_access_from_main() -> None:
             mock.patch.object(host_main, "LspManager"),
             mock.patch.object(host_main, "HostServer", return_value=fake_host) as host_class,
             mock.patch.object(host_main.signal, "signal"),
+            mock.patch.dict(os.environ, {"HOME": str(root / "home"), "SYMPHONAI_HOME": ""}),
         ):
             pool_class.return_value.start.return_value = {}
             host_main.main(["--repo-root", str(root)])
@@ -9734,6 +9891,7 @@ def check_capability_ceiling_bounds_conversation() -> None:
                 mock.patch.object(host_main, "LspManager"),
                 mock.patch.object(host_main, "HostServer", return_value=fake_host) as host_class,
                 mock.patch.object(host_main.signal, "signal"),
+                mock.patch.dict(os.environ, {"HOME": str(root / "home")}),
             ):
                 pool_class.return_value.start.return_value = {}
                 host_main.main(["--repo-root", str(root)])
@@ -9806,3 +9964,367 @@ def check_capability_ceiling_bounds_conversation() -> None:
             )
         if not allowed_fetch.ok or denied_fetch.ok or opener.open.call_count != 1:
             fail(f"fetch ceiling did not restrict network requests: {allowed_fetch!r}, {denied_fetch!r}")
+
+
+class _ClosedMarker:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _project_runtime(root: Path, broker: EventBroker, sessions_root: Path, *, provider=None, policy=None, pool=None, lsp=None, approval=None) -> ProjectRuntime:
+    run = HostRun(
+        provider or FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+        policy or PermissionPolicy(repo_root=root),
+        broker,
+        sessions_root=sessions_root,
+        memory_extraction_enabled=False,
+        publish_approval=approval,
+    )
+    return ProjectRuntime(root.resolve(), run, pool, lsp)
+
+
+@check("host_server.project_open_and_switch")
+def check_project_open_and_switch() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        a, b, bad = (base / name for name in ("a", "b", "bad"))
+        for root in (a, b, bad): root.mkdir()
+        (a / "a.py").write_text("a\n")
+        (b / "b.py").write_text("b\n")
+        sessions_root = base / "sessions"
+        created: list[Path] = []
+        def factory(root, broker, approval):
+            if root == bad.resolve():
+                raise ValueError("invalid project config")
+            created.append(root)
+            return _project_runtime(root, broker, sessions_root, approval=approval)
+        host = HostServer(FakeModelProvider(), PermissionPolicy(repo_root=a), sessions_root=sessions_root, project_factory=factory)
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/project/open", body={"path": str(b)}, headers=_headers(host))
+            body = response
+            reply = json.loads(body.read())
+            connection.close()
+            if response.status != 200 or reply != {"repo_root": str(b.resolve()), "name": "b"}:
+                fail(f"project switch returned {response.status}: {reply!r}")
+            _, project = _request(host, "GET", "/project", headers=_headers(host))
+            project_reply = json.loads(project.read())
+            _, files = _request(host, "GET", "/files", headers=_headers(host))
+            files_reply = json.loads(files.read())
+            if project_reply.get("repo_root") != str(b.resolve()) or "b.py" not in json.dumps(files_reply):
+                fail(f"current-project routes did not move to B: {project_reply!r}, {files_reply!r}")
+            host.open_project(a)
+            if host.run.policy.repo_root != a.resolve():
+                fail("opening an already-open A did not switch back to A")
+            before = host._current_root
+            for path in ("relative", "/"):
+                connection, response = _request(host, "POST", "/project/open", body={"path": path}, headers=_headers(host))
+                response.read(); connection.close()
+                if response.status != 400 or host._current_root != before:
+                    fail(f"invalid project path changed current project: {path!r}")
+            connection, response = _request(host, "POST", "/project/open", body={"path": str(bad)}, headers=_headers(host))
+            error = json.loads(response.read()); connection.close()
+            if response.status != 400 or error.get("error") != "invalid project config" or host._current_root != before:
+                fail(f"invalid config changed current project: {response.status}, {error!r}")
+            if len(created) != 2:
+                fail(f"unexpected project factory calls: {created!r}")
+        finally:
+            host.close()
+        host = HostServer(FakeModelProvider(), PermissionPolicy(repo_root=a), sessions_root=sessions_root)
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/project/open", body={"path": str(b)}, headers=_headers(host))
+            error = json.loads(response.read()); connection.close()
+            if response.status != 400 or error.get("error") != "this host cannot open other projects":
+                fail(f"one-project host allowed project opening: {response.status}, {error!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.project_keeps_running_in_background")
+def check_project_keeps_running_in_background() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); a = base / "a"; b = base / "b"
+        a.mkdir(); b.mkdir(); sessions_root = base / "sessions"
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall("ask-shell", "run_shell", {"argv": ["true"]})])),
+            ModelResponse(Message(Role.ASSISTANT, "finished")),
+        ])
+        policy = PermissionPolicy(repo_root=a, shell_enabled=True, shell_allowlist=[], mode="ask")
+        pool_marker, lsp_marker = _ClosedMarker(), _ClosedMarker()
+        broker = EventBroker(); subscription = broker.subscribe()
+        def factory(root, event_broker, approval):
+            if root == a.resolve():
+                return _project_runtime(root, event_broker, sessions_root, provider=provider, policy=policy,
+                                        pool=pool_marker, lsp=lsp_marker, approval=approval)
+            return _project_runtime(root, event_broker, sessions_root, approval=approval)
+        host = HostServer(None, None, broker=broker, sessions_root=sessions_root, project_factory=factory)
+        initial, _ = host.open_project(a)
+        assert initial is not None
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "wait for approval"}, headers=_headers(host))
+            response.read(); connection.close()
+            approval = None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and approval is None:
+                pending = host.pending_approvals()
+                approval = pending[0] if pending else None
+                time.sleep(0.01)
+            if approval is None:
+                fail("background project did not request shell approval")
+            host.open_project(b)
+            if not host.run.pending_approvals() and not host.pending_approvals():
+                fail("background approval disappeared after switching projects")
+            connection, response = _request(host, "POST", "/approval", body={
+                "approval_id": approval["approval_id"], "allowed": True, "reason": "",
+            }, headers=_headers(host))
+            result = json.loads(response.read()); connection.close()
+            if response.status != 200 or not result.get("resolved"):
+                fail(f"background approval did not resolve: {response.status}, {result!r}")
+            _wait_until(lambda: not initial.run.active, "background run did not finish")
+            terminal = None
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and terminal is None:
+                event = subscription.get(timeout=0.05)
+                if isinstance(event, RunFinished): terminal = event
+            if terminal is None or host.event_session_id(terminal) is None:
+                fail("background RunFinished did not reach the shared broker with its session")
+            _wait_until(lambda: a.resolve() not in host._runtimes, "finished background project was not closed")
+            if not pool_marker.closed or not lsp_marker.closed:
+                fail("background MCP or LSP resource was not closed")
+        finally:
+            subscription.close(); host.close()
+
+
+@check("host_server.project_closes_when_idle")
+def check_project_closes_when_idle() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); a = base / "a"; b = base / "b"
+        a.mkdir(); b.mkdir(); sessions_root = base / "sessions"
+        pool_marker, lsp_marker = _ClosedMarker(), _ClosedMarker()
+        broker = EventBroker()
+        initial = _project_runtime(a, broker, sessions_root, pool=pool_marker, lsp=lsp_marker)
+        host = HostServer(FakeModelProvider(), initial.run.policy, broker=broker, sessions_root=sessions_root, runtime=initial,
+                          project_factory=lambda root, event_broker, approval: _project_runtime(root, event_broker, sessions_root, approval=approval))
+        host.start()
+        try:
+            host.open_project(b)
+            if a.resolve() in host._runtimes or not pool_marker.closed or not lsp_marker.closed:
+                fail("idle project resources remained open after switching away")
+        finally:
+            host.close()
+
+
+@check("host_server.project_with_background_conversation_stays_open")
+def check_project_with_background_conversation_stays_open() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); a = base / "a"; b = base / "b"
+        a.mkdir(); b.mkdir(); sessions_root = base / "sessions"
+        entered, release = threading.Event(), threading.Event()
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "finished"))])
+        original_create_response = provider.create_response
+
+        def slow_response(request, *, cancel=None):
+            entered.set()
+            if not release.wait(5):
+                fail("slow fake provider was not released")
+            return original_create_response(request, cancel=cancel)
+
+        provider.create_response = slow_response
+        def factory(root, broker, approval):
+            return _project_runtime(
+                root, broker, sessions_root,
+                provider=provider if root == a.resolve() else None,
+                approval=approval,
+            )
+        host = HostServer(None, None, sessions_root=sessions_root, project_factory=factory)
+        initial, _ = host.open_project(a)
+        assert initial is not None
+        subscription = host.broker.subscribe()
+        host.start()
+        try:
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "slow turn"}, headers=_headers(host),
+            )
+            response.read(); connection.close()
+            if not entered.wait(2):
+                fail("slow provider did not start")
+            connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+            response.read(); connection.close()
+            host.open_project(b)
+            if a.resolve() not in host._runtimes:
+                fail("project with a background conversation closed during its turn")
+            release.set()
+            terminal = None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and terminal is None:
+                event = subscription.get(timeout=0.05)
+                if isinstance(event, RunFinished):
+                    terminal = event
+            if terminal is None or terminal.stopped_reason != "final_response":
+                fail(f"background turn did not finish normally: {terminal!r}")
+            _wait_until(lambda: a.resolve() not in host._runtimes, "finished project was not closed")
+        finally:
+            release.set(); subscription.close(); host.close()
+
+
+@check("host_server.approval_without_client_refuses")
+def check_approval_without_client_refuses() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary); root.mkdir(exist_ok=True)
+        sessions_root = root / "sessions"
+        ask_shell = lambda call_id: ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+            call_id, "run_shell", {"argv": ["true"]},
+        )]))
+        provider = FakeModelProvider([
+            ask_shell("no-client"), ModelResponse(Message(Role.ASSISTANT, "done")),
+            ask_shell("with-client"), ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        def factory(project, broker, approval):
+            return _project_runtime(
+                project, broker, sessions_root, provider=provider,
+                policy=PermissionPolicy(repo_root=project, shell_enabled=True, shell_allowlist=[], mode="ask"),
+                approval=approval,
+            )
+        host = HostServer(None, None, sessions_root=sessions_root, project_factory=factory)
+        runtime, _ = host.open_project(root)
+        assert runtime is not None
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "ask"}, headers=_headers(host))
+            response.read(); connection.close()
+            _wait_until(
+                lambda: provider.call_count >= 2 and not runtime.run.pending_approvals(),
+                "approval without an app client remained pending",
+                timeout=1,
+            )
+            client = host.broker.subscribe()
+            try:
+                connection, response = _request(host, "POST", "/session/new", body={}, headers=_headers(host))
+                response.read(); connection.close()
+                connection, response = _request(host, "POST", "/prompt", body={"prompt": "ask with client"}, headers=_headers(host))
+                response.read(); connection.close()
+                event = None
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and event is None:
+                    value = client.get(timeout=0.05)
+                    if isinstance(value, ApprovalRequested):
+                        event = value
+                if event is None:
+                    fail("approval was not published with a connected client")
+            finally:
+                client.close()
+        finally:
+            host.close()
+
+
+@check("host_server.session_belongs_to_project")
+def check_session_belongs_to_project() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); a = base / "a"; b = base / "b"
+        a.mkdir(); b.mkdir(); sessions_root = base / "sessions"
+        host = HostServer(FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]), PermissionPolicy(repo_root=a),
+                          sessions_root=sessions_root,
+                          project_factory=lambda root, broker, approval: _project_runtime(root, broker, sessions_root, approval=approval))
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "create A session"}, headers=_headers(host))
+            session_id = json.loads(response.read())["run_id"]; connection.close()
+            _wait_until(lambda: not host.run.active, "A session did not finish")
+            host.open_project(b)
+            connection, response = _request(host, "POST", "/session/open", body={"run_id": session_id}, headers=_headers(host))
+            error = json.loads(response.read()); connection.close()
+            if response.status != 409 or error.get("error") != "that conversation belongs to another project":
+                fail(f"cross-project session open was not rejected: {response.status}, {error!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.start_project_rule")
+def check_start_project_rule() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); home = base / "home"; project_home = base / ".symphonai"
+        project = base / "repo"; home.mkdir(); project.mkdir(); project_home.mkdir()
+        (project_home / "projects.json").write_text(json.dumps([str(project), str(base / "missing")]))
+        if choose_start_root(None, Path("/"), home, project_home) != project.resolve():
+            fail("startup from / did not choose the first existing recent project")
+        (project_home / "projects.json").unlink()
+        if choose_start_root(None, home, home, project_home) is not None:
+            fail("startup from home without a recent project did not remain projectless")
+        if choose_start_root(None, project, home, project_home) != project.resolve():
+            fail("startup inside a repository did not choose the current directory")
+        if choose_start_root(project, Path("/"), home, project_home) != project.resolve():
+            fail("explicit --repo-root did not take precedence")
+
+
+@check("host_server.no_project_routes")
+def check_no_project_routes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); repo = base / "repo"; repo.mkdir(); sessions = base / "sessions"
+        host = HostServer(
+            None, None, sessions_root=sessions,
+            project_factory=lambda root, broker, approval: _project_runtime(root, broker, sessions, approval=approval),
+        )
+        host.start()
+        try:
+            _, response = _request(host, "GET", "/project", headers=_headers(host))
+            project = json.loads(response.read())
+            if response.status != 200 or project != {"repo_root": None, "name": None}:
+                fail(f"projectless /project reply was wrong: {response.status}, {project!r}")
+            for method, path, body in (("POST", "/prompt", {"prompt": "hello"}), ("GET", "/files", None)):
+                connection, response = _request(host, method, path, body=body, headers=_headers(host))
+                error = json.loads(response.read()); connection.close()
+                if response.status != 409 or error.get("error") != "open a project first":
+                    fail(f"projectless {method} {path} was not gated: {response.status}, {error!r}")
+            _, response = _request(host, "GET", "/settings", headers=_headers(host))
+            settings = json.loads(response.read())
+            if response.status != 200 or settings.get("settings", {}).get("skills") != []:
+                fail(f"projectless settings were unavailable or project-scoped: {settings!r}")
+            _, response = _request(host, "GET", "/models?provider=anthropic", headers=_headers(host))
+            if response.status != 200:
+                fail(f"projectless models returned {response.status}")
+            connection, response = _request(host, "POST", "/project/open", body={"path": str(repo)}, headers=_headers(host))
+            response.read(); connection.close()
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "now open"}, headers=_headers(host))
+            result = json.loads(response.read()); connection.close()
+            if response.status != 200 or not result.get("run_id"):
+                fail(f"prompt did not work after opening a project: {response.status}, {result!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.projects_and_directories")
+def check_projects_and_directories() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); root = base / "repo"; home = base / "home"; root.mkdir(); home.mkdir()
+        tree = base / "tree"; tree.mkdir()
+        for name in ("a", "B", ".git"): (tree / name).mkdir()
+        (tree / "file.txt").write_text("not read")
+        sessions = base / "sessions"; missing = base / "deleted-project"
+        host = HostServer(FakeModelProvider(), PermissionPolicy(repo_root=root), sessions_root=sessions, home=home)
+        host.start()
+        try:
+            recent_path = host._home / "projects.json"
+            recent_path.parent.mkdir(parents=True, exist_ok=True)
+            recent_path.write_text(json.dumps([str(root), str(missing)]))
+            _, response = _request(host, "GET", "/projects", headers=_headers(host))
+            projects = json.loads(response.read())
+            if response.status != 200 or projects.get("current", {}).get("repo_root") != str(root.resolve()) or projects.get("recent", [{}])[1].get("exists") is not False:
+                fail(f"project listing omitted current or deleted recent roots: {projects!r}")
+            _, response = _request(host, "GET", f"/directories?{urlencode({'path': str(tree)})}", headers=_headers(host))
+            listing = json.loads(response.read())
+            if response.status != 200 or [entry["name"] for entry in listing.get("entries", [])] != ["a", "B"]:
+                fail(f"directory listing included hidden paths or wrong order: {listing!r}")
+            _, response = _request(host, "GET", f"/directories?{urlencode({'path': str(tree / 'file.txt')})}", headers=_headers(host))
+            if response.status != 404:
+                fail(f"file path was not rejected as a missing directory: {response.status}")
+            _, response = _request(host, "GET", f"/directories?{urlencode({'path': '/'})}", headers=_headers(host))
+            root_reply = json.loads(response.read())
+            if response.status != 200 or root_reply.get("parent") is not None:
+                fail(f"root directory parent was not null: {root_reply!r}")
+        finally:
+            host.close()

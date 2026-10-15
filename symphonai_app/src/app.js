@@ -251,16 +251,33 @@ export async function start({ global, document, client }) {
       return roadmapResult(null, error);
     }
   };
-  let [project, initialSessions, initialRoadmap, settingsReply, healthReply, conversationReply, initialSpecRuns, initialSpecFiles] = await Promise.all([
-    boundary.project(),
-    boundary.sessions(SIDEBAR_SESSION_LIMIT),
-    readRoadmap(),
-    boundary.settings(),
-    boundary.health().catch(() => null),
-    boundary.conversationStats().catch(() => ({ conversation: null })),
-    (boundary.specRuns?.() ?? Promise.resolve([])).catch(() => []),
-    readSpecFiles(),
-  ]);
+  let project = await boundary.project();
+  const projectless = project?.repo_root == null;
+  let initialSessions = [];
+  let initialRoadmap = { roadmap: { goal: "", phases: [] }, message: "" };
+  let settingsReply;
+  let healthReply;
+  let conversationReply = { conversation: null };
+  let initialSpecRuns = [];
+  let initialSpecFiles = { paths: [] };
+  let initialProjects = { recent: [] };
+  if (projectless) {
+    [settingsReply, healthReply, initialProjects] = await Promise.all([
+      boundary.settings(),
+      boundary.health().catch(() => null),
+      (boundary.projects?.() ?? Promise.resolve({ recent: [] })).catch(() => ({ recent: [] })),
+    ]);
+  } else {
+    [initialSessions, initialRoadmap, settingsReply, healthReply, conversationReply, initialSpecRuns, initialSpecFiles] = await Promise.all([
+      boundary.sessions(SIDEBAR_SESSION_LIMIT),
+      readRoadmap(),
+      boundary.settings(),
+      boundary.health().catch(() => null),
+      boundary.conversationStats().catch(() => ({ conversation: null })),
+      (boundary.specRuns?.() ?? Promise.resolve([])).catch(() => []),
+      readSpecFiles(),
+    ]);
+  }
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
   const getSkillCommands = (reply) => {
     const builtIns = new Set(COMMANDS.flatMap((command) => [command.name, ...command.aliases].map((name) => name.toLowerCase())));
@@ -996,6 +1013,10 @@ export async function start({ global, document, client }) {
       savedScrollTop = chatRoot.scrollTop;
     }
     route = nextRoute;
+    if (projectless && projectStartScreen) {
+      replace(pageRoot, projectStartScreen);
+      return;
+    }
     for (const { page, link } of pageNavLinks) {
       if (page === route.page) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
@@ -1061,6 +1082,118 @@ export async function start({ global, document, client }) {
   listen(homeLink, "click", () => navigate({ page: "chat", section: "" }));
 
   const projectsRoot = element(document, "section", { className: "projects" });
+  let projectActionError = "";
+  let folderPicker = null;
+  let projectStartScreen = null;
+
+  async function openProjectAt(path, sessionId = null) {
+    projectActionError = "";
+    try {
+      await boundary.openProject(path);
+      if (sessionId) await boundary.openSession(sessionId);
+      global.location?.reload?.();
+      return true;
+    } catch (error) {
+      projectActionError = error instanceof Error ? error.message : String(error);
+      if (folderPicker) renderFolderPicker();
+      else if (projectless) renderProjectStart();
+      showProjects();
+      return false;
+    }
+  }
+
+  function closeFolderPicker() {
+    folderPicker = null;
+    replace(projectless ? pageRoot : pickerHost);
+    if (projectless) renderProjectStart();
+  }
+
+  function renderFolderPicker() {
+    if (!folderPicker) return;
+    const dialog = element(document, "section", { className: "folder-picker" });
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("aria-labelledby", "folder-picker-title");
+    const heading = element(document, "h2", { text: "Open a project folder" });
+    heading.id = "folder-picker-title";
+    const path = element(document, "p", { className: "folder-picker-path", text: folderPicker.listing?.path ?? "Loading folders…" });
+    const up = element(document, "button", { text: "Up" });
+    up.type = "button";
+    up.disabled = !folderPicker.listing?.parent;
+    listen(up, "click", () => folderPicker.listing?.parent && loadDirectories(folderPicker.listing.parent));
+    const entries = element(document, "div", { className: "folder-picker-entries" });
+    for (const entry of folderPicker.listing?.entries ?? []) {
+      const button = element(document, "button", { text: entry.name });
+      button.type = "button";
+      listen(button, "click", () => loadDirectories(entry.path));
+      append(entries, button);
+    }
+    const error = element(document, "p", { className: "project-action-error", text: folderPicker.error || projectActionError });
+    const open = element(document, "button", { className: "primary", text: "Open this folder" });
+    open.type = "button";
+    open.disabled = !folderPicker.listing?.path;
+    listen(open, "click", () => folderPicker.listing?.path && openProjectAt(folderPicker.listing.path));
+    const cancel = element(document, "button", { text: "Cancel" });
+    cancel.type = "button";
+    listen(cancel, "click", closeFolderPicker);
+    append(dialog, heading, path, up, entries, error, open, cancel);
+    replace(projectless ? pageRoot : pickerHost, dialog);
+    (folderPicker.listing?.entries?.[0] ? entries.children[0] : open).focus?.();
+  }
+
+  async function loadDirectories(path) {
+    if (!folderPicker) return;
+    try {
+      folderPicker.listing = await boundary.directories(path);
+      folderPicker.error = "";
+    } catch (error) {
+      folderPicker.error = error instanceof Error ? error.message : String(error);
+    }
+    renderFolderPicker();
+  }
+
+  function showFolderPicker() {
+    projectActionError = "";
+    folderPicker = { listing: null, error: "" };
+    renderFolderPicker();
+    void loadDirectories();
+  }
+
+  function renderProjectStart() {
+    if (!projectless) return;
+    projectStartScreen = element(document, "section", { className: "project-start" });
+    append(projectStartScreen, element(document, "h1", { text: "Open a project" }));
+    const recent = Array.isArray(initialProjects?.recent) ? initialProjects.recent : [];
+    const list = element(document, "div", { className: "project-start-list" });
+    for (const item of recent) {
+      const row = element(document, "div", { className: "project-start-row" });
+      const label = `${item.name || projectName(item.repo_root)}${item.exists ? "" : " · missing"}`;
+      if (item.exists) {
+        const button = element(document, "button", { text: label });
+        button.type = "button";
+        button.setAttribute("title", item.repo_root);
+        listen(button, "click", () => openProjectAt(item.repo_root));
+        append(row, button);
+      } else {
+        append(row, element(document, "span", { text: label }));
+      }
+      append(list, row);
+    }
+    const openFolder = element(document, "button", { className: "primary", text: "Open folder…" });
+    openFolder.type = "button";
+    listen(openFolder, "click", showFolderPicker);
+    append(projectStartScreen, list, openFolder,
+      element(document, "p", { className: "project-action-error", text: projectActionError }));
+    replace(pageRoot, projectStartScreen);
+  }
+
+  listen(document, "keydown", (event) => {
+    if (folderPicker && event.key === "Escape") {
+      event.preventDefault();
+      closeFolderPicker();
+    }
+  });
+
   function showTranscript() {
     const onChatPage = route.page === "chat";
     if (onChatPage) {
@@ -1138,6 +1271,10 @@ export async function start({ global, document, client }) {
   });
 
   async function openSession(runId) {
+    const targetSession = sessions.find((session) => session.run_id === runId);
+    if (targetSession?.repo_root && targetSession.repo_root !== project.repo_root) {
+      return openProjectAt(targetSession.repo_root, runId);
+    }
     const previous = transcript.snapshot();
     const previousId = currentSessionId;
     transcript.reset();
@@ -1172,18 +1309,32 @@ export async function start({ global, document, client }) {
       : [activeSearch.selectionStart, activeSearch.selectionEnd];
     let nextSearch = null;
     let nextRename = null;
+    const openFolder = element(document, "button", { className: "project-open-folder", text: "Open folder…" });
+    openFolder.type = "button";
+    listen(openFolder, "click", showFolderPicker);
+    groups.push(openFolder);
+    projectActionError && groups.push(element(document, "p", { className: "project-action-error", text: projectActionError }));
     for (const group of projectGroups(sessions, project.repo_root)) {
       const current = group.root === project.repo_root;
+      if (projectless && !group.root) continue;
       const section = element(document, "details", {
         className: `project ${current ? "openable" : "unavailable"}`,
       });
       section.open = current;
-      append(
-        section,
-        element(document, "summary", {
-          text: current ? project.name : projectName(group.root),
-        }),
-      );
+      const heading = element(document, "summary", {
+        text: current ? project.name : projectName(group.root),
+      });
+      append(section, heading);
+      if (group.root && !current) {
+        const openProject = element(document, "button", { className: "project-open-action", text: "Open project" });
+        openProject.type = "button";
+        listen(openProject, "click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          openProjectAt(group.root);
+        });
+        append(heading, openProject);
+      }
       if (current) {
         const search = element(document, "input", { className: "session-search" });
         nextSearch = search;
@@ -1206,7 +1357,7 @@ export async function start({ global, document, client }) {
         });
         append(section, search);
       }
-      if (!current) {
+      if (!current && !group.root) {
         append(section, element(document, "p", {
           className: "project-status",
           text: "Not openable from this host.",
@@ -1223,7 +1374,7 @@ export async function start({ global, document, client }) {
         const label = (session.title || session.run_id) + (
           session.parent_session_id ? ` · fork of ${parent?.title || session.parent_session_id}` : ""
         ) + (["working", "waiting"].includes(session.activity) ? ` · ${session.activity}` : "");
-        if (!current) {
+        if (!current && !group.root) {
           const unavailable = element(document, "p", {
             className: "session-link unavailable",
             text: label,
@@ -1242,9 +1393,7 @@ export async function start({ global, document, client }) {
         }
         button.setAttribute("title", label);
         button.type = "button";
-        listen(button, "click", async () => {
-          await openSession(session.run_id);
-        });
+        listen(button, "click", async () => openSession(session.run_id));
         append(row, button);
         if (editingSessionId === session.run_id) {
           const field = element(document, "input", { className: "session-rename-input" });
@@ -1395,7 +1544,14 @@ export async function start({ global, document, client }) {
     }
   }
   listen(newChat, "click", startNewChat);
-  replace(sidebar, homeLink, newChat, pageLinks, projectsRoot, settingsLink);
+  if (projectless) {
+    newChat.hidden = true;
+    pageLinks.hidden = true;
+    settingsLink.hidden = true;
+    replace(sidebar, homeLink, projectsRoot);
+  } else {
+    replace(sidebar, homeLink, newChat, pageLinks, projectsRoot, settingsLink);
+  }
 
   function setToggleLabel(button, label, folded) {
     const text = `${folded ? "Show" : "Hide"} ${label}`;
@@ -1419,7 +1575,8 @@ export async function start({ global, document, client }) {
   listen(railToggle, "click", () => toggleFold("rail-folded", railToggle, "status"));
 
   const fragment = typeof global.location?.hash === "string" ? global.location.hash : "";
-  showPage(fragment ? parseRoute(fragment) : storedRoute(global));
+  if (projectless) renderProjectStart();
+  else showPage(fragment ? parseRoute(fragment) : storedRoute(global));
   runNotice.textContent = healthReply?.state === "active"
     ? "A run started before this page was opened is still in progress."
     : "";
@@ -2851,6 +3008,9 @@ export async function start({ global, document, client }) {
     try {
       const reply = await boundary.conversationStats();
       const current = reply?.conversation;
+      conversation = current ?? null;
+      showConversationUsage();
+      showAgents();
       if (!current?.usage || !Number.isInteger(current.usage.total_tokens)) {
         answerCommand("No usage recorded in this conversation yet.");
         return;
@@ -3634,6 +3794,10 @@ export async function start({ global, document, client }) {
     await refreshSpecState().catch(() => {});
   });
 
+  const requestUsageRefresh = leadingTrailingRefresh(async () => {
+    await refreshConversation();
+  });
+
   async function refreshSpecsForEvent(frame) {
     const type = frame.kind === "event" ? frame.payload?.type : "";
     if (!["RunFinished", "RunFailed", "GoalChanged"].includes(type)) return;
@@ -3723,6 +3887,12 @@ export async function start({ global, document, client }) {
       showConversationUsage();
     }
     if (
+      event.type === "BackgroundUsageRecorded" &&
+      event.fields.session_id === currentSessionId
+    ) {
+      await requestUsageRefresh();
+    }
+    if (
       (event.type === "RunFinished" || event.type === "RunFailed") &&
       (healthReply?.runtime_run_id === null ||
         (typeof healthReply?.runtime_run_id === "string" &&
@@ -3735,10 +3905,28 @@ export async function start({ global, document, client }) {
     if (event.type === "RunFinished" || event.type === "RunFailed") {
       await refreshConversation();
       await refreshSelectedChanges();
+      const rootAgentId = conversation?.agents?.find((agent) => agent.parent_agent_id == null)?.agent_id;
+      if (typeof rootAgentId === "string" && event.fields.agent_id === rootAgentId) {
+        await requestActivityRefresh();
+      }
     }
   }
 
   const subscription = boundary.events((frame) => onFrame(frame));
+  if (subscription.ready) {
+    await subscription.ready;
+    if (currentSessionId) {
+      const leader = conversation?.agents?.find((agent) => agent.parent_agent_id == null);
+      if (leader?.state === "running") {
+        turn.submit("");
+        turn.accepted();
+        if (typeof healthReply?.runtime_run_id === "string") {
+          turn.event({ type: "RunStarted", run_id: healthReply.runtime_run_id });
+        }
+      }
+      await openSession(currentSessionId);
+    }
+  }
   showPromptError();
   return {
     approvals,

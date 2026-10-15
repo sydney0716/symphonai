@@ -88,6 +88,8 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       name: fields.tool_name,
       target: callTarget(fields),
       status: "running",
+      output: "",
+      outputTruncated: false,
     };
     entry.calls.push(call);
     if (call.name === "dispatch_subagent" && call.target) dispatchCalls.push(call);
@@ -285,19 +287,37 @@ export function createTranscript({ now = () => Date.now() } = {}) {
             model.push({ type: "user-plan", plan: toolCall.plan, outcome });
             continue;
           }
-          if (toolCall.name !== "dispatch_subagent") continue;
+          if (toolCall.name === "dispatch_subagent") {
+            appendActivity({
+              agent_id: fields.agent_id,
+              run_id: fields.run_id,
+              turn_id: fields.turn_id,
+              tool_call_id: toolCall.id,
+              tool_name: toolCall.name,
+              target: toolCall.subagent_name,
+            });
+            const record = calls.get(toolCall.id);
+            if (record) {
+              record.call.status = "settled";
+              if (typeof toolCall.task === "string") record.call.task = toolCall.task;
+              calls.delete(toolCall.id);
+            }
+            continue;
+          }
+          if (["update_plan", "ask_user", "propose_plan", "write_file", "edit_file", "multi_edit_file"].includes(toolCall.name)) continue;
           appendActivity({
             agent_id: fields.agent_id,
             run_id: fields.run_id,
             turn_id: fields.turn_id,
             tool_call_id: toolCall.id,
             tool_name: toolCall.name,
-            target: toolCall.subagent_name,
+            target: toolCall.target,
           });
           const record = calls.get(toolCall.id);
           if (record) {
-            record.call.status = "settled";
-            if (typeof toolCall.task === "string") record.call.task = toolCall.task;
+            record.call.status = toolCall.ok === false ? "failed" : "succeeded";
+            record.call.output = typeof toolCall.output === "string" ? toolCall.output : "";
+            record.call.outputTruncated = toolCall.output_truncated === true;
             calls.delete(toolCall.id);
           }
         }
@@ -378,6 +398,8 @@ export function createTranscript({ now = () => Date.now() } = {}) {
         return;
       }
       record.call.status = fields.ok ? "succeeded" : "failed";
+      record.call.output = typeof fields.output === "string" ? fields.output : "";
+      record.call.outputTruncated = fields.output_truncated === true;
       return;
     }
     if (type === "ToolCallFailed") {

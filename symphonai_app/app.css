@@ -480,6 +480,81 @@ pre:focus-within > .code-copy {
   margin: var(--space-2) 0;
 }
 
+.project-open-folder,
+.project-open-action {
+  margin: var(--space-1) 0 var(--space-1) var(--space-4);
+}
+
+.project-open-action {
+  min-height: 1.75rem;
+  font-size: 0.75rem;
+}
+
+.project-action-error {
+  margin: var(--space-2) var(--space-4);
+  color: var(--ui-danger);
+  font-size: 0.75rem;
+}
+
+.project-start {
+  box-sizing: border-box;
+  width: min(38rem, 100%);
+  margin: 10vh auto 0;
+  padding: var(--space-6);
+}
+
+.project-start-list {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-4) 0;
+}
+
+.project-start-row button {
+  width: 100%;
+  text-align: left;
+}
+
+.project-start-row span {
+  display: block;
+  padding: var(--space-2);
+  color: var(--ui-text-secondary);
+}
+
+.folder-picker {
+  display: grid;
+  gap: var(--space-2);
+  max-width: 40rem;
+  margin: 10vh auto;
+  padding: var(--space-4);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--radius-popover);
+  background: var(--ui-raised);
+  box-shadow: var(--ui-shadow);
+}
+
+.folder-picker h2,
+.folder-picker-path {
+  margin: 0;
+}
+
+.folder-picker-path {
+  overflow-wrap: anywhere;
+  color: var(--ui-text-secondary);
+  font-family: var(--font-code);
+  font-size: 0.8125rem;
+}
+
+.folder-picker-entries {
+  display: grid;
+  max-height: 45vh;
+  gap: var(--space-1);
+  overflow: auto;
+}
+
+.folder-picker-entries button {
+  text-align: left;
+}
+
 .session-search {
   display: block;
   width: calc(100% - 1rem);
@@ -569,8 +644,16 @@ pre:focus-within > .code-copy {
 }
 
 .project > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   cursor: pointer;
   font-weight: 600;
+}
+
+.project > summary .project-open-action {
+  flex: none;
+  margin: 0 0 0 var(--space-3);
 }
 
 .project-status,
@@ -1508,6 +1591,31 @@ button.session-link {
   margin: 0 0 var(--space-2);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.activity-output {
+  max-width: 100%;
+  margin-top: var(--space-2);
+}
+
+.activity-output-label,
+.activity-output-truncated {
+  margin: 0 0 var(--space-1);
+  color: var(--ui-text-secondary);
+  font-size: 0.75rem;
+}
+
+.activity-output pre {
+  box-sizing: border-box;
+  font-family: var(--font-code);
+  max-width: 100%;
+  margin: 0;
+  padding: var(--space-2);
+  overflow-x: auto;
+  color: var(--ui-text);
+  background: var(--ui-inset);
+  border-radius: var(--radius-control);
+  white-space: pre;
 }
 
 .turn-time {

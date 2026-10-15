@@ -170,7 +170,7 @@ export function createClient({
         }
         onFrame(frame);
       };
-      const done = (async () => {
+      const responseReady = (async () => {
         let response;
         try {
           response = await fetchImplementation(`${origin}/events`, {
@@ -192,6 +192,12 @@ export function createClient({
             `host event stream failed with status ${response.status}`,
           );
         }
+        return response;
+      })();
+      const ready = responseReady.then(() => undefined);
+      ready.catch(() => {});
+      const done = (async () => {
+        const response = await responseReady;
         try {
           await readEventStream(response.body, receive);
         } catch (error) {
@@ -207,6 +213,7 @@ export function createClient({
           controller.abort();
         },
         done,
+        ready,
         get droppedFrames() {
           return droppedFrames;
         },
@@ -370,6 +377,19 @@ export function createClient({
 
     project() {
       return request("GET", "/project");
+    },
+
+    openProject(path) {
+      return request("POST", "/project/open", { path }, readReply, { detailOnError: true });
+    },
+
+    projects() {
+      return request("GET", "/projects");
+    },
+
+    directories(path) {
+      const query = path === undefined ? "" : `?${new URLSearchParams({ path })}`;
+      return request("GET", `/directories${query}`, undefined, readReply, { detailOnError: true });
     },
 
     settings() {

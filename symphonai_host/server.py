@@ -12,6 +12,7 @@ import threading
 import tempfile
 from datetime import datetime, timezone
 from collections.abc import Mapping
+from collections.abc import Callable
 from http.cookies import CookieError, SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,7 @@ from symphonai_api.cost import PriceTable
 from symphonai_api.agent_memory import MemoryUnavailable
 from symphonai_api.agent_file import AgentFileError, load_agent_file
 from symphonai_api.extensions import Extensions
+from symphonai_api.events import Event
 from symphonai_api.lsp import LspManager
 from symphonai_api.model_discovery import list_models
 from symphonai_api.model_table import model_capabilities
@@ -33,7 +35,7 @@ from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHRO
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR, GeminiProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
 from symphonai_api.provider_catalog import CATALOG, build_catalog_provider, catalog_keys
-from symphonai_api.session import SessionError, TranscriptError
+from symphonai_api.session import SessionError, SessionStore, TranscriptError
 from symphonai_api.paths import symphonai_home
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
@@ -64,6 +66,7 @@ from symphonai_host.run import (
 )
 from symphonai_host.sessions import list_sessions, prompt_history
 from symphonai_host.spec_run import parse_spec
+from symphonai_host.projects import ProjectRuntime, record_recent_project, recent_projects
 
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -102,7 +105,7 @@ def _model_listing(
     provider: str,
     models: list[str] | tuple[str, ...],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    extensions = host.run.extensions
+    extensions = None if host.run is None else host.run.extensions
     configured = None if extensions is None else extensions.config.get(f"models.{provider}")
     if configured is None:
         return _models_with_efforts(provider, models), {"applied": False, "hidden": 0}
@@ -154,6 +157,64 @@ def _provider(name: str | None = None, model: str | None = None, base_url: str |
     return provider_class(**options)
 
 
+def _selection_path() -> Path:
+    return symphonai_home() / "selection.json"
+
+
+def _load_provider_selection() -> dict[str, str] | None:
+    try:
+        with _selection_path().open("r", encoding="utf-8") as source:
+            choice = json.load(source)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if (
+        not isinstance(choice, dict)
+        or set(choice) - {"name", "model", "effort", "base_url"}
+        or not isinstance(choice.get("name"), str)
+        or not choice["name"]
+        or any(
+            key in choice and choice[key] is not None
+            and (not isinstance(choice[key], str) or not choice[key].strip())
+            for key in ("model", "effort", "base_url")
+        )
+    ):
+        return None
+    return choice
+
+
+def _provider_for_start(provider_factory=_provider) -> tuple[ModelProvider | None, dict[str, str] | None]:
+    choice = _load_provider_selection()
+    if choice is None:
+        return provider_factory(), None
+    try:
+        provider = provider_factory(choice["name"], choice.get("model"), choice.get("base_url"))
+    except ProviderSelectionError:
+        return provider_factory(), None
+    return provider, choice
+
+
+def _save_provider_selection(choice: Mapping[str, str]) -> None:
+    target = _selection_path()
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent,
+            prefix=".selection-", suffix=".tmp", delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            json.dump(dict(choice), temporary)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, target)
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _app_root() -> Path:
     return Path(__file__).resolve().parent.parent / "symphonai_app"
 
@@ -164,7 +225,7 @@ class HostServer:
     def __init__(
         self,
         provider: ModelProvider | None,
-        policy: PermissionPolicy,
+        policy: PermissionPolicy | None,
         *,
         token: str | None = None,
         broker: EventBroker | None = None,
@@ -186,17 +247,29 @@ class HostServer:
         chat_token_budget: int | None = None,
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
         lsp: LspManager | None = None,
+        project_factory: Callable[[Path, EventBroker, Callable], ProjectRuntime] | None = None,
+        runtime: ProjectRuntime | None = None,
+        provider_selection: Mapping[str, str] | None = None,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
         self.token = token or secrets.token_urlsafe(32)
-        self._repo_root = policy.repo_root
+        self._current_root = (
+            runtime.root.resolve() if runtime is not None else
+            policy.repo_root.resolve() if policy is not None else None
+        )
+        self._repo_root = self._current_root
+        self._project_factory = project_factory
+        self._default_provider = provider
+        self._provider_selection = dict(provider_selection or ({
+            "name": provider.name,
+            **({"model": provider.model} if getattr(provider, "model", None) else {}),
+        } if provider is not None else {}))
         self._home = symphonai_home(home)
-        self._mcp_started = mcp_tools is not None
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
         self._model_cache_lock = threading.Lock()
         self.broker = broker or EventBroker()
-        self.run = HostRun(
+        initial_runtime = runtime or (ProjectRuntime(self._current_root, HostRun(
             provider,
             policy,
             self.broker,
@@ -218,7 +291,20 @@ class HostServer:
             chat_token_budget=chat_token_budget,
             chat_recent_turns=chat_recent_turns,
             lsp=lsp,
-        )
+        )) if policy is not None else None)
+        initial_run = None if initial_runtime is None else initial_runtime.run
+        self.run = initial_run
+        self._runtimes: dict[Path, ProjectRuntime] = {}
+        self._runtimes_lock = threading.RLock()
+        self._event_session_ids: dict[str, str] = {}
+        if initial_runtime is not None and self._current_root is not None:
+            self._runtimes[self._current_root] = initial_runtime
+        self._watch_stop = threading.Event()
+        self._event_watch: threading.Thread | None = None
+        self._event_watch_subscription: Subscription | None = None
+        if self._project_factory is not None:
+            self._event_watch = threading.Thread(target=self._watch_project_events, daemon=True)
+            self._event_watch.start()
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
         self._thread: threading.Thread | None = None
@@ -241,7 +327,11 @@ class HostServer:
         return {"port": self.port, "token": self.token}
 
     def _publish_approval(self, approval: Any) -> bool:
-        if self.broker.subscriber_count == 0:
+        watcher_count = int(
+            self._event_watch_subscription is not None
+            and not self._event_watch_subscription.closed
+        )
+        if self.broker.subscriber_count <= watcher_count:
             return False
         self.broker.publish(
             ApprovalRequested(
@@ -259,7 +349,127 @@ class HostServer:
         return True
 
     def pending_approvals(self) -> list[dict[str, str]]:
-        return [approval.__dict__ for approval in self.run.pending_approvals()]
+        with self._runtimes_lock:
+            runtimes = tuple(self._runtimes.values())
+        return [approval.__dict__ for runtime in runtimes for approval in runtime.run.pending_approvals()]
+
+    def resolve_approval(self, approval_id: str, **decision) -> bool:
+        with self._runtimes_lock:
+            runtimes = tuple(self._runtimes.values())
+        return any(runtime.run.resolve_approval(approval_id, **decision) for runtime in runtimes)
+
+    def session_activity(self) -> dict[str, str]:
+        activity = {}
+        with self._runtimes_lock:
+            runtimes = tuple(self._runtimes.values())
+        for runtime in runtimes:
+            activity.update(runtime.run.session_activity())
+        return activity
+
+    def event_session_id(self, event: Event) -> str | None:
+        session_id = getattr(event, "session_id", None)
+        if isinstance(session_id, str):
+            return session_id
+        run_id = getattr(event, "run_id", None)
+        if isinstance(run_id, str) and run_id in self._event_session_ids:
+            return self._event_session_ids[run_id]
+        with self._runtimes_lock:
+            runtimes = tuple(self._runtimes.values())
+        for runtime in runtimes:
+            session_id = runtime.run.event_session_id(event)
+            if session_id is not None:
+                if isinstance(run_id, str):
+                    self._event_session_ids[run_id] = session_id
+                    if len(self._event_session_ids) > 4096:
+                        self._event_session_ids.pop(next(iter(self._event_session_ids)))
+                return session_id
+        return None
+
+    @property
+    def run(self) -> HostRun | None:
+        with self._runtimes_lock:
+            return None if self._current_root is None else self._runtimes[self._current_root].run
+
+    @run.setter
+    def run(self, value: HostRun | None) -> None:
+        self._initial_run = value
+
+    def open_project(self, root: Path) -> tuple[ProjectRuntime | None, bool]:
+        resolved = root.resolve()
+        if self._project_factory is None:
+            raise RuntimeError("this host cannot open other projects")
+        with self._runtimes_lock:
+            runtime = self._runtimes.get(resolved)
+        if runtime is None:
+            current = self.run
+            selection = current.selection() if current is not None else {
+                "model": self._provider_selection.get("model"),
+                "effort": self._provider_selection.get("effort"),
+            }
+            provider = current._provider if current is not None else self._default_provider
+            runtime = self._project_factory(resolved, self.broker, self._publish_approval)
+            with self._runtimes_lock:
+                self._runtimes[resolved] = runtime
+            if provider is not None:
+                runtime.run.select_provider(
+                    provider, selection.get("model"), selection.get("effort"),
+                )
+            created = True
+        else:
+            created = False
+        with self._runtimes_lock:
+            previous = self._current_root
+            self._current_root = resolved
+            self._repo_root = resolved
+        if previous is not None and previous != resolved:
+            self._close_if_idle(previous)
+        record_recent_project(self._home, resolved)
+        return runtime, created
+
+    def _close_if_idle(self, root: Path) -> None:
+        with self._runtimes_lock:
+            runtime = self._runtimes.get(root)
+        if runtime is None:
+            return
+        run = runtime.run
+        if run.has_work_in_flight():
+            return
+        with self._runtimes_lock:
+            if root != self._current_root and self._runtimes.get(root) is runtime:
+                self._runtimes.pop(root, None)
+            else:
+                return
+        if root != self._current_root:
+            runtime.close()
+
+    def _session_belongs_here(self, run_id: str) -> bool:
+        try:
+            store = SessionStore.open(self.run.sessions_root, run_id)
+            try:
+                owner = store.read_meta().get("repo_root")
+            finally:
+                store.close()
+        except Exception:
+            return True
+        return owner is None or (self._current_root is not None and Path(owner).resolve() == self._current_root)
+
+    def _watch_project_events(self) -> None:
+        subscription = self.broker.subscribe()
+        self._event_watch_subscription = subscription
+        try:
+            while not self._watch_stop.is_set():
+                event = subscription.get(timeout=0.1)
+                if event is not None:
+                    self.event_session_id(event)
+                with self._runtimes_lock:
+                    roots = tuple(self._runtimes)
+                    current_root = self._current_root
+                for root in roots:
+                    if root != current_root:
+                        self._close_if_idle(root)
+        finally:
+            subscription.close()
+            self._event_watch_subscription = None
 
     def print_handshake(self) -> None:
         if not self._handshake_printed:
@@ -293,8 +503,15 @@ class HostServer:
             if self._closed:
                 return
             self._closed = True
-        self.run.close()
+        self._watch_stop.set()
+        with self._runtimes_lock:
+            runtimes = tuple(self._runtimes.values())
+            self._runtimes.clear()
+        for runtime in runtimes:
+            runtime.close()
         self.broker.close()
+        if self._event_watch is not None:
+            self._event_watch.join(timeout=1)
         if self._serving:
             self._httpd.shutdown()
         self._httpd.server_close()
@@ -717,14 +934,22 @@ class HostServer:
             def do_GET(self) -> None:
                 request_url = urlsplit(self.path)
                 request_path = request_url.path
+                if host.run is None and request_path not in (
+                    "/health", "/events", "/project", "/projects", "/directories",
+                    "/settings", "/models", "/app", "/app/",
+                ) and not request_path.startswith("/app/"):
+                    if not self._authorized():
+                        return
+                    self._json(HTTPStatus.CONFLICT, {"error": "open a project first"})
+                    return
                 if self.path == "/health":
                     self._json(
                         HTTPStatus.OK,
                         {
                             "protocol_version": PROTOCOL_VERSION,
-                            "state": "active" if host.run.active else "idle",
-                            "run_id": host.run.active_run_id,
-                            "runtime_run_id": host.run.runtime_run_id,
+                            "state": "active" if host.run is not None and host.run.active else "idle",
+                            "run_id": None if host.run is None else host.run.active_run_id,
+                            "runtime_run_id": None if host.run is None else host.run.runtime_run_id,
                         },
                     )
                     return
@@ -921,14 +1146,81 @@ class HostServer:
                 if request_path == "/project":
                     if not self._authorized():
                         return
+                    if host._current_root is None:
+                        self._json(HTTPStatus.OK, {"repo_root": None, "name": None})
+                        return
                     repo_root = host._repo_root.resolve()
                     self._json(
                         HTTPStatus.OK,
                         {"repo_root": str(repo_root), "name": repo_root.name},
                     )
                     return
+                if request_path == "/projects":
+                    if not self._authorized():
+                        return
+                    current_root = host._current_root
+                    with host._runtimes_lock:
+                        runtimes = tuple(host._runtimes.items())
+                    open_projects = [
+                        {"repo_root": str(root), "name": root.name,
+                         "activity": "working" if any(state == "working" for state in runtime.run.session_activity().values()) else "waiting" if runtime.run.pending_approvals() else "idle"}
+                        for root, runtime in runtimes
+                    ]
+                    recent = recent_projects(host._home)
+                    self._json(HTTPStatus.OK, {
+                        "current": None if current_root is None else {"repo_root": str(current_root), "name": current_root.name},
+                        "open": open_projects,
+                        "recent": [{"repo_root": path, "name": Path(path).name,
+                                    "exists": Path(path).is_dir()} for path in recent if isinstance(path, str)],
+                    })
+                    return
+                if request_path == "/directories":
+                    if not self._authorized():
+                        return
+                    paths = parse_qs(request_url.query, keep_blank_values=True).get("path", [])
+                    if len(paths) > 1:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "path must be one absolute directory"})
+                        return
+                    target = Path(paths[0]).expanduser() if paths else Path.home()
+                    if not target.is_absolute():
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "path must be absolute"})
+                        return
+                    target = target.resolve()
+                    if not target.exists() or not target.is_dir():
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "directory not found"})
+                        return
+                    try:
+                        entries = sorted(
+                            ({"name": child.name, "path": str(child)} for child in target.iterdir()
+                             if not child.name.startswith(".") and child.is_dir()),
+                            key=lambda entry: entry["name"].casefold(),
+                        )
+                    except PermissionError:
+                        self._json(HTTPStatus.FORBIDDEN, {"error": "directory is not readable"})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        "path": str(target),
+                        "parent": None if target == Path("/") else str(target.parent),
+                        "entries": entries,
+                    })
+                    return
                 if request_path == "/settings":
                     if not self._authorized():
+                        return
+                    if host.run is None:
+                        selection = host._provider_selection or None
+                        self._json(HTTPStatus.OK, {"settings": {
+                            "mode": "ask",
+                            "selection": None if selection is None else {
+                                "provider": selection.get("name"), "model": selection.get("model"), "effort": selection.get("effort")
+                            },
+                            "config": [], "ceiling": {}, "trust": [], "hooks": [],
+                            "mcp_servers": [], "agents": [], "skills": [], "plugins": [], "withheld": [],
+                            "providers": [{"name": name, "env_var": variable,
+                                           "key_present": bool(os.environ.get(variable, "").strip())}
+                                          for name, variable, _ in PROVIDERS],
+                            "search": [],
+                        }})
                         return
                     extensions = host.run.extensions
                     root = host.run.policy.repo_root.resolve()
@@ -987,7 +1279,7 @@ class HostServer:
                             for event in hook.events
                         ],
                         "mcp_servers": [] if extensions is None else [
-                            {"name": spec.name, "command": shlex.join(spec.command), "started": spec.enabled and host._mcp_started}
+                            {"name": spec.name, "command": shlex.join(spec.command), "started": spec.enabled and host.run._mcp_tools is not None}
                             for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)
                         ],
                         "agents": roster("agents"),
@@ -1038,9 +1330,7 @@ class HostServer:
                     if limit is not None and limit <= 0:
                         limit = None
                     self._json(HTTPStatus.OK, list_sessions(
-                        host.run.sessions_root, limit=limit,
-                        activity=host.run.session_activity(),
-                        query=query,
+                        host.run.sessions_root, limit=limit, activity=host.session_activity(), query=query,
                     ))
                     return
                 if request_path == "/spec/runs":
@@ -1130,13 +1420,13 @@ class HostServer:
                     return
                 if not self._authorized():
                     return
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
                 subscription = host.broker.subscribe()
                 try:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
                     self._stream_events(subscription)
                 except OSError:
                     return
@@ -1155,7 +1445,7 @@ class HostServer:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
-                    session_id = host.run.event_session_id(event)
+                    session_id = host.event_session_id(event)
                     if isinstance(event, ApprovalRequested):
                         self._sse(encode_frame("approval_requested", event.__dict__))
                     elif isinstance(event, HistoryMessage):
@@ -1175,10 +1465,36 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
+                    return
+                if host.run is None and self.path not in ("/project/open", "/credentials", "/provider"):
+                    self._json(HTTPStatus.CONFLICT, {"error": "open a project first"})
+                    return
+                if self.path == "/project/open":
+                    try:
+                        payload = self._read_object()
+                        path = payload.get("path")
+                        if set(payload) != {"path"} or not isinstance(path, str):
+                            raise ProtocolError("project/open requires an absolute path")
+                        root = Path(path)
+                        if not root.is_absolute() or not root.is_dir() or root.resolve() == Path("/"):
+                            self._json(HTTPStatus.BAD_REQUEST, {"error": "path must be an existing project directory other than /"})
+                            return
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    if host._project_factory is None:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "this host cannot open other projects"})
+                        return
+                    try:
+                        runtime, _created = host.open_project(root)
+                    except Exception as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {"repo_root": str(runtime.root), "name": runtime.root.name})
                     return
                 if self.path == "/memory/update":
                     try:
@@ -1645,6 +1961,9 @@ class HostServer:
                     if not (host.run.sessions_root / run_id).is_dir():
                         self._json(HTTPStatus.NOT_FOUND, {"error": "unknown session"})
                         return
+                    if not host._session_belongs_here(run_id):
+                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
+                        return
                     with host.run._lock:
                         opened = host.run._open_conversations.get(run_id)
                         session_store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, run_id)
@@ -1665,6 +1984,9 @@ class HostServer:
                     except ProtocolError as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
+                    if not host._session_belongs_here(payload["run_id"]):
+                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
+                        return
                     try:
                         deleted = host.run.delete_session(payload["run_id"])
                     except RunActiveError as exc:
@@ -1682,6 +2004,9 @@ class HostServer:
                             raise ProtocolError("session/fork requires run_id and record_id strings")
                     except ProtocolError as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    if not host._session_belongs_here(payload["run_id"]):
+                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
                         return
                     try:
                         reply = host.run.fork_session(
@@ -1722,16 +2047,24 @@ class HostServer:
                     except (ProtocolError, ProviderSelectionError) as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
+                    if host.run is not None:
+                        try:
+                            host.run.select_provider(
+                                provider,
+                                choice.get("model"),
+                                effort,
+                                choice,
+                            )
+                        except RunActiveError as exc:
+                            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                            return
                     try:
-                        host.run.select_provider(
-                            provider,
-                            choice.get("model"),
-                            effort,
-                            choice,
-                        )
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        _save_provider_selection(choice)
+                    except OSError:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "provider selection could not be saved"})
                         return
+                    host._default_provider = provider
+                    host._provider_selection = dict(choice)
                     self._json(HTTPStatus.OK, {"selected": True})
                     return
                 if self.path == "/mode":
@@ -1805,7 +2138,7 @@ class HostServer:
                     return
                 if kind == "approval":
                     try:
-                        resolved = host.run.resolve_approval(
+                        resolved = host.resolve_approval(
                             request.approval_id,
                             allowed=request.allowed,
                             reason=request.reason,
@@ -1821,6 +2154,9 @@ class HostServer:
                     self._json(HTTPStatus.OK, {"resolved": True})
                     return
                 if kind == "session/open":
+                    if not host._session_belongs_here(request.run_id):
+                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
+                        return
                     try:
                         reply = host.run.open_session(request.run_id)
                     except RunActiveError as exc:

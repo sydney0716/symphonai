@@ -321,7 +321,8 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
   const running = entry.calls.some((call) => call.status === "running");
   const kind = ACTIVITY_KINDS[entry.calls[0]?.name];
   const dispatches = entry.calls.filter((call) => call.name === "dispatch_subagent" && typeof call.task === "string");
-  const expandable = dispatches.length > 0;
+  const outputCalls = entry.calls.filter((call) => typeof call.output === "string" && call.output.length > 0);
+  const expandable = dispatches.length > 0 || outputCalls.length > 0;
   const line = element(document, expandable ? "div" : "p", {
     className: ["activity", kind, failed ? "failed" : ""].filter(Boolean).join(" "),
   });
@@ -382,6 +383,20 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
     className: "dispatch-task",
     text: `${call.target}: ${call.task}`,
   })));
+  taskBlock && outputCalls.forEach((call) => {
+    const label = ACTIVITY_VERBS[call.name] ?? call.name;
+    const output = element(document, "section", { className: "activity-output" });
+    append(output, element(document, "p", {
+      className: "activity-output-label",
+      text: `${label.charAt(0).toUpperCase()}${label.slice(1)}${call.target ? ` ${call.target}` : ""}`,
+    }));
+    append(output, element(document, "pre", { text: call.output }));
+    call.outputTruncated && append(output, element(document, "p", {
+        className: "activity-output-truncated",
+        text: "… output truncated",
+      }));
+    append(taskBlock, output);
+  });
   return line;
 }
 

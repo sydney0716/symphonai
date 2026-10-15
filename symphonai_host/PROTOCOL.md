@@ -37,7 +37,7 @@ fields on a known event are ignored for forward compatibility.
 | `TurnFinished` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `index: int` |
 | `AssistantTextDelta` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str` |
 | `ToolCallStarted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `target: str` |
-| `ToolCallFinished` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `ok: bool`, `result_kind: str`, `result_path: str`, `lines_added: int`, `lines_removed: int`, `diff: str`, `truncated: bool` |
+| `ToolCallFinished` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `ok: bool`, `result_kind: str`, `result_path: str`, `lines_added: int`, `lines_removed: int`, `diff: str`, `truncated: bool`, `output: str`, `output_truncated: bool` |
 | `PromptSubmitted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str`, `message_count: int`, `checkpoint_key: str | null` |
 | `ToolCallFailed` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `error: str` |
 | `PermissionRequested` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `mode: str` |
@@ -49,6 +49,7 @@ fields on a known event are ignored for forward compatibility.
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
 | `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null`, `session_id: str` |
 | `PlanChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `steps: list`, `explanation: str`, `session_id: str` |
+| `BackgroundUsageRecorded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -58,7 +59,37 @@ and it is `""` when the runtime has no safe derivation.
 never instead of it; clients that treat these events as alternatives will
 double-count some failures or miss others.
 
+Finished tool events include up to 4,000 characters of the tool result in
+`output`, with `output_truncated` set when the text was cut. File diffs and
+tools with their own transcript entries have empty output. Replayed ordinary
+tool calls include their safe `target`, `ok`, `output`, and `output_truncated`
+fields from the paired result; call arguments are not sent to the client.
+
 ## Client requests
+
+### Projects
+
+`POST /project/open` accepts `{"path": "/absolute/project/path"}` and returns
+`{"repo_root": "/resolved/path", "name": "directory-name"}`. The host keeps
+work in a project running after switching to another project. Events from
+background projects continue on the shared event stream with their
+`session_id`; `/sessions` and `/approvals` include every open project, and an
+approval can be resolved while another project is current. A project that is
+not current closes after its last turn, approval, question, goal check, or
+command ends. Session operations on a conversation from another project return
+409 with `{"error":"that conversation belongs to another project"}`; clients
+switch to its project first.
+
+The host may start with no project. In that state `GET /project` returns
+`{"repo_root":null,"name":null}` and project-dependent routes return 409 with
+`{"error":"open a project first"}`. `GET /projects` lists the current and open
+projects plus recent roots; `GET /directories?path=<absolute-path>` returns
+visible child directories for a folder picker. `/health`, `/events`, `/project`,
+`/projects`, `/directories`, `/settings`, `/models`, `/app`, `POST /project/open`,
+`/credentials`, and `/provider` remain available without a current project.
+When no explicit `--repo-root` is supplied, the host uses its current directory
+unless that is `/` or the user's home directory; then it uses the first recent
+directory that still exists, or starts without a project.
 
 Requests are validated separately from frame decoding so a transport only needs
 to pass a `kind` and object payload to the host. Required fields must have the

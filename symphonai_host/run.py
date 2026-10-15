@@ -37,7 +37,7 @@ from symphonai_api.leases import WorkspaceLeases
 from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import ContentInput, DocumentBlock, ImageBlock, Message, Role, TextBlock
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.base import ModelProvider, tool_result_text
 from symphonai_api.session import (
     SessionError,
     SessionStore,
@@ -54,6 +54,7 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import _diff_result
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
+from symphonai_api.tools.metadata import call_target
 from symphonai_api.tools.shell import shell_environment, shell_executable
 from symphonai_api.worktree import remove_worktree, worktree_diff
 from symphonai_api.worktree import create_worktree
@@ -83,6 +84,11 @@ class CommandActiveError(RuntimeError):
 
 class WorktreeApplyConflict(RuntimeError):
     """A worktree patch no longer applies to the main repository."""
+
+
+@dataclass(frozen=True)
+class BackgroundUsageRecorded(Event):
+    session_id: str = ""
 
 
 class NoConversationError(RuntimeError):
@@ -302,7 +308,7 @@ class HostRun:
         self._hooks = (
             None
             if extensions is None
-            else extensions.hook_runner(cwd=policy.repo_root)
+            else getattr(extensions, "hook_runner", lambda **_: None)(cwd=policy.repo_root)
         )
         self._mcp_tools = mcp_tools
         self._lsp = lsp
@@ -1032,6 +1038,24 @@ class HostRun:
                     replay["feedback"] = result.content.removeprefix(
                         "The person wants to keep planning: "
                     )
+        hidden_output_tools = {
+            "dispatch_subagent", "update_plan", "ask_user", "propose_plan",
+            "write_file", "edit_file", "multi_edit_file",
+        }
+        if call.name not in hidden_output_tools:
+            replay["target"] = call_target(call.name, call.arguments)
+            if result is not None:
+                output = ""
+                output_truncated = False
+                if not (isinstance(result.payload, dict) and result.payload.get("kind") == "file_diff"):
+                    text = tool_result_text(result)
+                    output = text[:4000]
+                    output_truncated = len(text) > 4000
+                replay.update({
+                    "ok": result.ok,
+                    "output": output,
+                    "output_truncated": output_truncated,
+                })
         return replay
 
     @staticmethod
@@ -1082,6 +1106,16 @@ class HostRun:
             for session_id in self._goal_checks_by_session:
                 activity[session_id] = "working"
             return activity
+
+    def has_work_in_flight(self) -> bool:
+        with self._lock:
+            return bool(
+                self._active_by_session
+                or self._goal_checks_by_session
+                or self._user_command is not None
+                or any(broker.pending() for broker in self._approvals_by_session.values())
+                or self.approvals.pending()
+            )
 
     def resolve_approval(self, approval_id: str, **decision) -> bool:
         with self._lock:
@@ -2049,6 +2083,14 @@ class HostRun:
             usage_by_agent[agent_id] = (name, updated)
             if self._conversation is not None and self._conversation[1].run_id == session_id:
                 self._usage_by_agent = dict(usage_by_agent)
+        self._publish_session(
+            BackgroundUsageRecorded(
+                agent_id=agent_id,
+                run_id=new_id("memory_usage_"),
+                session_id=session_id,
+            ),
+            session_id,
+        )
 
     def _record_result(
         self, leader: Leader, result: LeaderRunResult, session_id: str | None = None,

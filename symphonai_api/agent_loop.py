@@ -54,7 +54,7 @@ from symphonai_api.models import (
     ToolResult,
 )
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
+from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider, tool_result_text
 from symphonai_api.repair import repair_unanswered_tool_calls
 from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from symphonai_api.serialization import message_to_json
@@ -77,7 +77,22 @@ def _message_digest(message: Message) -> str:
     return hashlib.blake2b(canonical, digest_size=16).hexdigest()
 
 
-def _tool_result_event_fields(result: ToolResult) -> dict[str, str | int | bool]:
+def _tool_result_event_fields(
+    result: ToolResult, tool_name: str = "",
+) -> dict[str, str | int | bool]:
+    output = ""
+    output_truncated = False
+    hidden_output_tools = {
+        "dispatch_subagent", "update_plan", "ask_user", "propose_plan",
+        "write_file", "edit_file", "multi_edit_file",
+    }
+    if (
+        tool_name not in hidden_output_tools
+        and not (isinstance(result.payload, dict) and result.payload.get("kind") == "file_diff")
+    ):
+        text = tool_result_text(result)
+        output = text[:4000]
+        output_truncated = len(text) > 4000
     defaults: dict[str, str | int | bool] = {
         "result_kind": "",
         "result_path": "",
@@ -85,6 +100,8 @@ def _tool_result_event_fields(result: ToolResult) -> dict[str, str | int | bool]
         "lines_removed": 0,
         "diff": "",
         "truncated": False,
+        "output": output,
+        "output_truncated": output_truncated,
     }
     payload = result.payload
     if not result.ok or not isinstance(payload, dict):
@@ -646,7 +663,7 @@ class ApiAgent:
                                 tool_name=tool_call.name,
                                 tool_call_id=tool_call.id,
                                 ok=tool_result.ok,
-                                **_tool_result_event_fields(tool_result),
+                                **_tool_result_event_fields(tool_result, tool_call.name),
                             ),
                         )
                         if not tool_result.ok:
