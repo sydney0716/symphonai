@@ -22,6 +22,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "SubagentStopped",
   "CompactionApplied",
   "GoalChanged",
+  "PlanChanged",
 ]);
 
 const FRAME_KINDS = new Set([

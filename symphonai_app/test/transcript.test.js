@@ -83,6 +83,11 @@ const RECORDED_EVENTS = Object.freeze({
     reason: "",
     last_check: null,
   }),
+  PlanChanged: event("PlanChanged", {
+    steps: [{ step: "Read the spec", status: "in_progress" }],
+    explanation: "Start here.",
+    session_id: "session-1",
+  }),
 });
 
 test("assistant deltas join only while consecutive", () => {
@@ -186,6 +191,17 @@ test("history reuses live prompt and assistant text entries", () => {
   assert.deepEqual(replay.map(({ type, text }) => ({ type, text })),
     live.map(({ type, text }) => ({ type, text })));
   assert.deepEqual(replay.map(({ type }) => type), ["prompt", "text"]);
+});
+
+test("replayed user command is a command entry before the following prompt", () => {
+  const replay = applyAll([
+    history("user", "The person ran a command in the repository:\n$ ls\na\nb\n\n(exit code 3)"),
+    history("user", "what failed?", [], [], { agent_id: "agent-1" }),
+  ]).model;
+  assert.deepEqual(replay, [
+    { type: "command", command: "! ls", output: ["a\nb", "exit 3"] },
+    { type: "prompt", agentId: "agent-1", text: "what failed?", messageCount: undefined },
+  ]);
 });
 
 test("tool-call-only history adds no prose and replay keeps message order", () => {
@@ -688,6 +704,62 @@ test("goal check events become command-style transcript entries", () => {
   ]);
 });
 
+test("plan updates append in place and replay from update_plan calls", () => {
+  const steps = [
+    { step: "Read the spec", status: "completed" },
+    { step: "Implement it", status: "in_progress" },
+    { step: "Review changes", status: "pending" },
+  ];
+  const transcript = applyAll([
+    event("ToolCallStarted", { tool_name: "update_plan", tool_call_id: "plan-call" }),
+    event("PlanChanged", { steps, explanation: "Three steps." }),
+    event("PlanChanged", { steps: [{ step: "Review changes", status: "in_progress" }], explanation: "Final pass." }),
+  ]);
+  assert.deepEqual(transcript.model.map(({ type }) => type), ["plan", "plan"]);
+  assert.deepEqual(transcript.model[0], {
+    type: "plan", agentId: "agent-1", steps, explanation: "Three steps.",
+  });
+
+  const replayed = applyAll([history("assistant", "", [{
+    id: "replayed-plan", name: "update_plan", plan: steps, explanation: "Three steps.",
+  }], [], { agent_id: "agent-1" })]);
+  assert.deepEqual(replayed.model, [{
+    type: "plan", agentId: "agent-1", steps, explanation: "Three steps.",
+  }]);
+});
+
+test("replayed questions and plans include the person's decisions", () => {
+  const transcript = applyAll([history("assistant", "", [{
+    id: "replayed-question",
+    name: "ask_user",
+    question: "Which file should I update?",
+    options: ["a.py", "b.py"],
+    answer: "B",
+  }, {
+    id: "skipped-question",
+    name: "ask_user",
+    question: "Should I continue?",
+    skipped: true,
+  }, {
+    id: "approved-plan",
+    name: "propose_plan",
+    plan: "# Allow plan",
+    decision: "allow",
+  }, {
+    id: "kept-plan",
+    name: "propose_plan",
+    plan: "# Revise plan",
+    decision: "keep_planning",
+    feedback: "smaller",
+  }], [], { agent_id: "agent-1" })]);
+  assert.deepEqual(transcript.model, [
+    { type: "user-question", agentId: "agent-1", question: "Which file should I update?", answer: "B" },
+    { type: "user-question", agentId: "agent-1", question: "Should I continue?", answer: "Skipped" },
+    { type: "user-plan", plan: "# Allow plan", outcome: "Approved — allow changes" },
+    { type: "user-plan", plan: "# Revise plan", outcome: "Kept planning: smaller" },
+  ]);
+});
+
 test("orphan and post-run tool events are inert", () => {
   const transcript = applyAll([
     call("ToolCallFinished", "never-started", { ok: false }),
@@ -885,4 +957,29 @@ test("transcript ignores events tagged for another open conversation", () => {
   transcript.apply(event("AssistantTextDelta", { text: "from A", session_id: "session-a" }));
   transcript.apply(event("AssistantTextDelta", { text: "from B", session_id: "session-b" }));
   assert.deepEqual(transcript.model.map((entry) => entry.text), ["from B"]);
+});
+
+test("reset starts a new conversation with a new root and no prior turn state", () => {
+  let now = 1000;
+  const transcript = createTranscript({ now: () => now });
+  transcript.apply(event("PromptSubmitted", { agent_id: "leader-a", text: "first" }));
+  transcript.apply(event("AssistantTextDelta", { agent_id: "leader-a", run_id: "run-a", text: "answer" }));
+  const previous = transcript.snapshot();
+
+  transcript.reset();
+  transcript.setSessionId("session-b");
+  now = 2000;
+  transcript.apply(event("RunStarted", { agent_id: "leader-b", run_id: "run-b" }));
+  transcript.apply(event("PromptSubmitted", { agent_id: "worker-b", text: "subtask" }));
+  transcript.apply(event("PromptSubmitted", { agent_id: "leader-b", text: "second" }));
+  transcript.apply(event("AssistantTextDelta", { agent_id: "leader-b", run_id: "run-b", text: "reply" }));
+  transcript.apply(event("RunFinished", { agent_id: "leader-b", run_id: "run-b" }));
+
+  assert.deepEqual(transcript.model.slice(0, 2).map(({ type, agentId, text }) => ({ type, agentId, text })), [
+    { type: "prompt", agentId: "leader-b", text: "second" },
+    { type: "text", agentId: "leader-b", text: "reply" },
+  ]);
+  assert.match(transcript.model[2].text, /^Worked for 0s · /);
+  transcript.restore(previous);
+  assert.equal(transcript.model[0].text, "first");
 });

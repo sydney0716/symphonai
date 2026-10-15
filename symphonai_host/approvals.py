@@ -27,6 +27,8 @@ class PendingApproval:
     tool_call_id: str = ""
     remember: str = ""
     session_id: str | None = None
+    kind: str = "approval"
+    options: tuple[str, ...] = ()
 
 
 @dataclass
@@ -34,7 +36,12 @@ class _Pending:
     approval: PendingApproval
     event: threading.Event
     decision: PermissionDecision | None = None
-    grant_prefix: tuple[str, ...] = ()
+    grant_prefixes: tuple[tuple[str, ...], ...] = ()
+    answer: str = ""
+
+
+class InvalidApprovalAnswer(ValueError):
+    """An interactive answer does not match its pending request."""
 
 
 class ApprovalBroker:
@@ -57,27 +64,46 @@ class ApprovalBroker:
         self._lock = threading.Lock()
 
     def callback(self, request: ToolApprovalRequest) -> PermissionDecision:
-        grant_prefix = (
-            shell_grant_prefix(request.command)
-            if request.operation == "run_shell" and request.command
+        commands = request.commands
+        if commands is None:
+            commands = (request.command,) if request.command else ()
+        command_writes = request.command_writes
+        grant_prefixes = (
+            tuple(shell_grant_prefix(command) for command in commands)
+            if request.operation == "run_shell"
             else ()
         )
         with self._lock:
-            if request.operation == "run_shell" and any(
-                request.command[: len(prefix)] == prefix
-                for prefix in self._granted_shell_prefixes
+            if request.operation == "run_shell" and commands and not any(command_writes) and all(
+                any(command[:len(prefix)] == prefix for prefix in self._granted_shell_prefixes)
+                for command in commands
             ):
                 return PermissionDecision.allow()
+        distinct_prefixes = tuple(dict.fromkeys(grant_prefixes))
+        remember = (
+            ", ".join(" ".join(prefix) for prefix in distinct_prefixes)
+            if commands and grant_prefixes and all(grant_prefixes)
+            else ""
+        )
         approval = PendingApproval(
             approval_id=new_id("appr"),
             operation=request.operation,
             target=request.target,
             details=request.details,
             tool_call_id=request.tool_call_id,
-            remember=" ".join(grant_prefix),
+            remember=remember,
             session_id=self._session_id,
         )
-        pending = _Pending(approval, threading.Event(), grant_prefix=grant_prefix)
+        decision, _ = self.request_interaction(approval, grant_prefixes=grant_prefixes)
+        return decision
+
+    def request_interaction(
+        self,
+        approval: PendingApproval,
+        *,
+        grant_prefixes: tuple[tuple[str, ...], ...] = (),
+    ) -> tuple[PermissionDecision, str]:
+        pending = _Pending(approval, threading.Event(), grant_prefixes=grant_prefixes)
         with self._lock:
             self._pending[approval.approval_id] = pending
         try:
@@ -89,7 +115,7 @@ class ApprovalBroker:
                 return PermissionDecision.deny(
                     "no client is connected to answer approvals",
                     denial=DenialReason.NO_APPROVAL_CALLBACK,
-                )
+                ), ""
             if not pending.event.wait(self._timeout):
                 with self._lock:
                     if pending.decision is None:
@@ -97,14 +123,14 @@ class ApprovalBroker:
                             f"no approval decision arrived within {self._timeout:g}s",
                             denial=DenialReason.APPROVAL_FAILED,
                         )
-                return pending.decision
+                return pending.decision, pending.answer
             return pending.decision or PermissionDecision.deny(
                 "approval was resolved without a decision", denial=DenialReason.APPROVAL_FAILED
-            )
+            ), pending.answer
         except Exception:
             return PermissionDecision.deny(
                 "approval callback failed", denial=DenialReason.APPROVAL_FAILED
-            )
+            ), ""
         finally:
             with self._lock:
                 if self._pending.get(approval.approval_id) is pending:
@@ -117,11 +143,17 @@ class ApprovalBroker:
         allowed: bool,
         reason: str,
         remember: bool = False,
+        answer: str = "",
     ) -> bool:
         with self._lock:
             pending = self._pending.get(approval_id)
             if pending is None or pending.decision is not None:
                 return False
+            if allowed and pending.approval.kind in {"question", "plan"}:
+                if not isinstance(answer, str) or not answer.strip():
+                    raise InvalidApprovalAnswer("answer must be a non-blank string")
+                if pending.approval.kind == "plan" and answer not in pending.approval.options:
+                    raise InvalidApprovalAnswer("answer must be one of the offered plan modes")
             pending.decision = (
                 PermissionDecision.allow()
                 if allowed
@@ -129,10 +161,23 @@ class ApprovalBroker:
                     reason or "approval denied by user", denial=DenialReason.DENIED_BY_USER
                 )
             )
+            pending.answer = answer if allowed else ""
             if allowed and remember and pending.approval.remember:
-                self._granted_shell_prefixes.add(pending.grant_prefix)
+                self._granted_shell_prefixes.update(pending.grant_prefixes)
             pending.event.set()
             return True
+
+    def ask_user(self, question: str, options: tuple[str, ...]) -> tuple[PermissionDecision, str]:
+        approval = PendingApproval(
+            approval_id=new_id("question"),
+            operation="ask_user",
+            target=question,
+            details="",
+            session_id=self._session_id,
+            kind="question",
+            options=options,
+        )
+        return self.request_interaction(approval)
 
     def clear_grants(self) -> None:
         with self._lock:

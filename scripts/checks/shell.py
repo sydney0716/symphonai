@@ -17,6 +17,7 @@ from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
 from symphonai_api.tools.shell import RunShellTool, _terminate_process_group
+from symphonai_api.tools.shell_parse import ShellCommand, commands_for_argv, parse_command_line
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -46,6 +47,106 @@ def _sandbox_policy(root: Path, *, network: bool = False) -> PermissionPolicy:
         shell_sandbox=True,
         sandbox_network=network,
     )
+
+
+@check("shell.command_lines_parse")
+def check_command_lines_parse() -> None:
+    cases = (
+        ("git status && git diff --stat", (ShellCommand(("git", "status")), ShellCommand(("git", "diff", "--stat")))),
+        ("pytest -x | tail -n 20", (ShellCommand(("pytest", "-x")), ShellCommand(("tail", "-n", "20")))),
+        ("python3 -m unittest -v > out.txt 2>&1; echo DONE", (
+            ShellCommand(("python3", "-m", "unittest", "-v"), True),
+            ShellCommand(("echo", "DONE")),
+        )),
+        ("cmd 2>/dev/null", (ShellCommand(("cmd",)),)),
+        ("FOO=1 make test", (ShellCommand(("make", "test")),)),
+        ('echo "a | b" \'c && d\'', (ShellCommand(("echo", "a | b", "c && d")),)),
+        ("echo a#b", (ShellCommand(("echo", "a#b")),)),
+        ("ls\nrm x", (ShellCommand(("ls",)), ShellCommand(("rm", "x")))),
+        ('python3 -c "a\nb"', (ShellCommand(("python3", "-c", "a\nb")),)),
+        ('bash -lc "make && make test"', (ShellCommand(("make",)), ShellCommand(("make", "test")))),
+        ("cmd 2>&1", (ShellCommand(("cmd",)),)),
+        ("cmd > /dev/null", (ShellCommand(("cmd",)),)),
+        ("bash -o pipefail -c 'make && make test'", (ShellCommand(("make",)), ShellCommand(("make", "test")))),
+        ("timeout 5 bash -c 'pytest > out.txt'", (ShellCommand(("timeout", "5", "pytest"), True),)),
+        ("echo '$X'", (ShellCommand(("echo", "$X")),)),
+        ("command -v curl", (ShellCommand(("command", "-v", "curl")),)),
+        ("find . -name open", (ShellCommand(("find", ".", "-name", "open")),)),
+        ("find . -exec wc -l {} +", (ShellCommand(("find", ".", "-exec", "wc", "-l", "{}", "+")),)),
+        ("find . -exec rm {} ';'", (ShellCommand(("find", ".", "-exec", "rm", "{}", ";")),)),
+        ("git show stash@{0}", (ShellCommand(("git", "show", "stash@{0}")),)),
+        ("bash -l -c 'rm x'", (ShellCommand(("rm", "x")),)),
+        ("bash -o pipefail -c 'git push'", (ShellCommand(("git", "push")),)),
+        ("env sh -c 'rm x'", (ShellCommand(("env", "rm", "x")),)),
+        ("if [ -f x ]; then rm x; fi", (
+            ShellCommand(("[", "-f", "x", "]")), ShellCommand(("rm", "x")), ShellCommand((":" ,)),
+        )),
+        ("[ -f setup.py ] && echo yes", (
+            ShellCommand(("[", "-f", "setup.py", "]")), ShellCommand(("echo", "yes")),
+        )),
+        ("[[ -d build ]] || mkdir build", (
+            ShellCommand(("[[", "-d", "build", "]]")), ShellCommand(("mkdir", "build")),
+        )),
+        ("bash --version", (ShellCommand(("bash", "--version")),)),
+        ("bash -c 'rm x' --help", (ShellCommand(("rm", "x")),)),
+        ("sh -c 'git push' --version", (ShellCommand(("git", "push")),)),
+        ("timeout 5 bash -c 'curl x' --help", (ShellCommand(("timeout", "5", "curl", "x")),)),
+        ("bash --help -c 'rm x'", (ShellCommand(("bash", "--help", "-c", "rm x")),)),
+        ("env bash --version", (ShellCommand(("env", "bash", "--version")),)),
+        ("command -v bash", (ShellCommand(("command", "-v", "bash")),)),
+        ("find . -name sh", (ShellCommand(("find", ".", "-name", "sh")),)),
+        ("for f in a b; do echo $f; done", (
+            ShellCommand(("for", "f", "in", "a", "b")), ShellCommand(("echo", "$f")), ShellCommand((":" ,)),
+        )),
+    )
+    for text, expected in cases:
+        actual = parse_command_line(text)
+        if actual != expected:
+            fail(f"command line parsed incorrectly: {text!r}: {actual!r}")
+    for text in (
+        "echo $(id)", "echo `id`", "diff <(a) <(b)", "(cd x && make)",
+        "cat <<EOF", "sleep 5 &", 'echo "open', "one && && two",
+        "echo 'rm x' | bash", "bash -s < s.sh", "export X=rm; $X x",
+        "exec $X x", "eval 'rm x'", "{rm,x}",
+        "echo '$X' && /bin/r?", "{", "}",
+    ):
+        if parse_command_line(text) is not None:
+            fail(f"uncheckable command line was accepted: {text!r}")
+    for argv in (
+        ["timeout", "60", "bash", "-c", "git push"],
+        ["env", "sh", "-c", "rm x"],
+        ["bash", "-s"],
+    ):
+        parsed = commands_for_argv(argv)
+        if argv[-1] in {"git push", "rm x"} and parsed is None:
+            fail(f"wrapped shell command was not expanded: {argv!r}")
+        if argv[-1] == "-s" and parsed is not None:
+            fail(f"shell reading its script from stdin was accepted: {argv!r}")
+    if commands_for_argv(["echo", "a|b"]) != (ShellCommand(("echo", "a|b")),):
+        fail("argv words were incorrectly split on shell operators")
+
+
+@check("shell.command_argument")
+def check_command_argument() -> None:
+    tool = RunShellTool()
+    policy = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True,
+        shell_allowlist=[()],
+    )
+    result = tool.execute(ToolCall(
+        id="command-line", name="run_shell",
+        arguments={"command": "printf 'a\\nb\\n' | wc -l"},
+    ), policy)
+    if not result.ok or result.content.strip() != "2":
+        fail(f"shell command line did not execute its pipeline: {result!r}")
+    cases = (
+        ({"command": ""}, "missing or invalid required argument: command (must be a non-empty string)"),
+        ({"argv": ["echo"], "command": "echo"}, "pass either argv or command, not both"),
+        ({}, "missing required argument: command or argv"),
+    )
+    for arguments, expected in cases:
+        if tool.validate(arguments) != expected:
+            fail(f"command argument validation changed for {arguments!r}: {tool.validate(arguments)!r}")
 
 
 @check("shell.sandbox_write_confinement")
@@ -483,6 +584,58 @@ def check_shell_cancellation_bounded() -> None:
                 "cancelled run_shell blocked on an inherited pipe for "
                 f"{inherited_pipe_elapsed:.2f}s"
             )
+
+@check("shell.secrets_withheld_from_env")
+def check_shell_secrets_withheld_from_env() -> None:
+    variables = {
+        "SYMPHONAI_PROBE_API_KEY": "probe-api-key-value",
+        "symphonai_probe_token": "probe-token-value",
+        "SYMPHONAI_PROBE_SECRET_X": "probe-secret-value",
+        "SYMPHONAI_PROBE_PLAIN": "probe-plain-value",
+    }
+    policy = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True,
+        shell_allowlist=[(sys.executable,)],
+    )
+    code = (
+        "import os; "
+        "print('\\n'.join(f'{key}={os.environ.get(key, \"<missing>\")}' "
+        "for key in " + repr(list(variables)) + "))"
+    )
+    with mock.patch.dict(os.environ, variables):
+        result = RunShellTool().execute(
+            ToolCall(id="shell-env", name="run_shell", arguments={
+                "argv": [sys.executable, "-c", code],
+            }),
+            policy,
+        )
+    if not result.ok:
+        fail(f"environment probe command failed: {result!r}")
+    for key in list(variables)[:3]:
+        if variables[key] in result.content:
+            fail(f"shell child received secret environment value for {key}")
+    if variables["SYMPHONAI_PROBE_PLAIN"] not in result.content:
+        fail(f"shell child did not receive an ordinary environment variable: {result.content!r}")
+
+
+@check("shell.stdin_closed")
+def check_shell_stdin_closed() -> None:
+    code = """import sys
+from pathlib import Path
+from symphonai_api.models import ToolCall
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.tools.shell import RunShellTool
+policy = PermissionPolicy(repo_root=Path.cwd(), mode="allow", shell_enabled=True, shell_allowlist=[(sys.executable,)])
+result = RunShellTool().execute(ToolCall(id="shell-stdin", name="run_shell", arguments={"argv": [sys.executable, "-c", "import sys; print(sys.stdin.read(), end='')"]}), policy)
+sys.stdout.write(result.content)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code], input="leaked-input", text=True,
+        capture_output=True, check=False,
+    )
+    if completed.returncode != 0 or completed.stdout:
+        fail(f"shell command inherited its caller's stdin: {completed!r}")
+
 
 @check("shell.execution_paths")
 def check_shell_execution_paths() -> None:

@@ -6,7 +6,7 @@ import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths, followUpsFor } from "./roadmap.js";
 import { layoutRoadmap } from "./roadmap_graph.js";
-import { append, element, listen, renderTranscript, replace } from "./render.js";
+import { append, element, listen, renderMarkdownBlocks, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
@@ -226,6 +226,7 @@ export async function start({ global, document, client }) {
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
   let commandEntry = null;
+  let userCommandPending = false;
   const board = createAgentBoard();
   const readSpecFiles = () => typeof boundary.specFiles === "function"
     ? boundary.specFiles().catch(() => ({ paths: [] }))
@@ -261,6 +262,18 @@ export async function start({ global, document, client }) {
     readSpecFiles(),
   ]);
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
+  const getSkillCommands = (reply) => {
+    const builtIns = new Set(COMMANDS.flatMap((command) => [command.name, ...command.aliases].map((name) => name.toLowerCase())));
+    return (Array.isArray(reply?.settings?.skills) ? reply.settings.skills : [])
+      .filter((skill) => typeof skill?.name === "string" && skill.name && !builtIns.has(skill.name.toLowerCase()))
+      .map(({ name }) => ({
+        name,
+        aliases: [],
+        description: `Use the ${name} skill`,
+        argumentHint: `[<request>]`,
+      }));
+  };
+  let skillCommands = getSkillCommands(settingsReply);
   const keymap = parseKeymap(JSON.stringify(keymapDefaults));
   const platform = /mac/i.test(global.navigator?.platform ?? "") ? "darwin" : "other";
   const allModes = ["ask", "plan", "allow"];
@@ -273,8 +286,16 @@ export async function start({ global, document, client }) {
     ? configuredMode
     : (permittedModes[0] ?? "ask");
   let currentMode = conversationReply?.conversation?.mode ?? launchMode;
+  let selection = settingsReply?.settings?.selection ?? { provider: "", model: null, effort: null };
   let rememberedPlanMode = null;
   let sessions = initialSessions;
+  let sessionQuery = "";
+  let editingSessionId = null;
+  let editingSessionTitle = "";
+  let focusSessionRename = false;
+  let sessionRowError = "";
+  let confirmingSessionId = null;
+  let sessionSearchSequence = 0;
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
   let conversation = conversationReply?.conversation ?? null;
@@ -635,6 +656,7 @@ export async function start({ global, document, client }) {
             try {
               const reply = await boundary.saveAgent(currentName, currentScope, text);
               settingsReply = await boundary.settings();
+              skillCommands = getSkillCommands(settingsReply);
               renderAgentRows();
               status.textContent = reply?.message || "definition saved; it will take effect on the next run";
             } catch (error) {
@@ -1045,6 +1067,13 @@ export async function start({ global, document, client }) {
       following = chatRoot.scrollHeight - chatRoot.scrollTop - chatRoot.clientHeight <= 24;
     }
     renderTranscript(document, chatRoot, transcript.model, parseMarkdown, {
+      copyText: async (text) => {
+        const clipboard = global.navigator?.clipboard;
+        if (typeof clipboard?.writeText !== "function") {
+          throw new Error("clipboard is unavailable");
+        }
+        await clipboard.writeText(text);
+      },
       onViewChanges: () => openRailTool("Changes"),
       onUndo: async (entry, force = false) => {
         entry.undoing = true;
@@ -1109,9 +1138,9 @@ export async function start({ global, document, client }) {
   });
 
   async function openSession(runId) {
-    const previous = [...transcript.model];
+    const previous = transcript.snapshot();
     const previousId = currentSessionId;
-    transcript.model.length = 0;
+    transcript.reset();
     currentSessionId = runId;
     transcript.setSessionId(currentSessionId);
     showProjects();
@@ -1123,7 +1152,7 @@ export async function start({ global, document, client }) {
       await refreshSelectedChanges();
       navigate({ page: "chat", section: "" });
     } catch (error) {
-      transcript.model.splice(0, transcript.model.length, ...previous);
+      transcript.restore(previous);
       currentSessionId = previousId;
       transcript.setSessionId(currentSessionId);
       showProjects();
@@ -1135,6 +1164,14 @@ export async function start({ global, document, client }) {
 
   function showProjects() {
     const groups = [];
+    const activeSearch = document.activeElement?.className === "session-search"
+      ? document.activeElement
+      : null;
+    const searchSelection = activeSearch === null
+      ? null
+      : [activeSearch.selectionStart, activeSearch.selectionEnd];
+    let nextSearch = null;
+    let nextRename = null;
     for (const group of projectGroups(sessions, project.repo_root)) {
       const current = group.root === project.repo_root;
       const section = element(document, "details", {
@@ -1147,6 +1184,28 @@ export async function start({ global, document, client }) {
           text: current ? project.name : projectName(group.root),
         }),
       );
+      if (current) {
+        const search = element(document, "input", { className: "session-search" });
+        nextSearch = search;
+        search.type = "search";
+        search.setAttribute("placeholder", "Search conversations");
+        search.setAttribute("aria-label", "Search conversations");
+        search.value = sessionQuery;
+        listen(search, "input", async () => {
+          sessionQuery = search.value;
+          const sequence = ++sessionSearchSequence;
+          try {
+            const results = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+            if (sequence !== sessionSearchSequence) return;
+            sessions = results;
+            showProjects();
+          } catch (error) {
+            sessionRowError = error instanceof Error ? error.message : String(error);
+            showProjects();
+          }
+        });
+        append(section, search);
+      }
       if (!current) {
         append(section, element(document, "p", {
           className: "project-status",
@@ -1173,6 +1232,7 @@ export async function start({ global, document, client }) {
           append(section, unavailable);
           continue;
         }
+        const row = element(document, "div", { className: "session-row" });
         const button = element(document, "button", {
           className: "session-link",
           text: label,
@@ -1185,18 +1245,135 @@ export async function start({ global, document, client }) {
         listen(button, "click", async () => {
           await openSession(session.run_id);
         });
-        append(section, button);
+        append(row, button);
+        if (editingSessionId === session.run_id) {
+          const field = element(document, "input", { className: "session-rename-input" });
+          if (focusSessionRename) nextRename = field;
+          field.setAttribute("aria-label", "Conversation name");
+          field.value = editingSessionTitle;
+          listen(field, "input", () => { editingSessionTitle = field.value; });
+          listen(field, "keydown", async (event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              editingSessionId = null;
+              sessionRowError = "";
+              showProjects();
+            } else if (event.key === "Enter") {
+              event.preventDefault();
+              await saveSessionTitle(session.run_id, field.value);
+            }
+          });
+          listen(field, "blur", () => {
+            if (editingSessionId === session.run_id) void saveSessionTitle(session.run_id, field.value);
+          });
+          append(row, field);
+        } else {
+          const rename = element(document, "button", { className: "session-row-action icon-pencil" });
+          rename.type = "button";
+          rename.setAttribute("aria-label", "Rename");
+          rename.setAttribute("title", "Rename");
+          const remove = element(document, "button", { className: "session-row-action icon-trash" });
+          remove.type = "button";
+          remove.setAttribute("aria-label", "Delete");
+          remove.setAttribute("title", "Delete");
+          listen(rename, "click", () => {
+            editingSessionId = session.run_id;
+            editingSessionTitle = session.title || "";
+            focusSessionRename = true;
+            confirmingSessionId = null;
+            sessionRowError = "";
+            showProjects();
+          });
+          listen(remove, "click", () => {
+            confirmingSessionId = session.run_id;
+            editingSessionId = null;
+            sessionRowError = "";
+            showProjects();
+          });
+          append(row, rename, remove);
+          if (confirmingSessionId === session.run_id) {
+            const confirmation = element(document, "div", { className: "session-delete-confirmation" });
+            append(confirmation, element(document, "span", { text: "Delete this conversation? This cannot be undone." }));
+            const confirm = element(document, "button", { text: "Delete" });
+            confirm.type = "button";
+            const cancel = element(document, "button", { text: "Cancel" });
+            cancel.type = "button";
+            listen(confirm, "click", () => deleteSession(session.run_id));
+            listen(cancel, "click", () => {
+              confirmingSessionId = null;
+              sessionRowError = "";
+              showProjects();
+            });
+            append(confirmation, confirm, cancel);
+            append(row, confirmation);
+          }
+        }
+        if (sessionRowError && (editingSessionId === session.run_id || confirmingSessionId === session.run_id)) {
+          append(row, element(document, "p", { className: "session-row-error", text: sessionRowError }));
+        }
+        append(section, row);
       }
       groups.push(section);
     }
     replace(projectsRoot, ...groups);
+    if (nextRename) {
+      focusSessionRename = false;
+      nextRename.focus();
+      nextRename.setSelectionRange?.(0, nextRename.value.length);
+    } else if (activeSearch && nextSearch) {
+      nextSearch.focus();
+      if (searchSelection && searchSelection.every(Number.isInteger)) {
+        nextSearch.setSelectionRange?.(...searchSelection);
+      }
+    }
+  }
+  async function saveSessionTitle(runId, title) {
+    const session = sessions.find((item) => item.run_id === runId);
+    const nextTitle = title.trim();
+    if (!nextTitle || nextTitle === (session?.title || "")) {
+      editingSessionId = null;
+      sessionRowError = "";
+      showProjects();
+      return;
+    }
+    try {
+      await boundary.renameSession(runId, nextTitle);
+      editingSessionId = null;
+      sessionRowError = "";
+      sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+    } catch (error) {
+      sessionRowError = error instanceof Error ? error.message : String(error);
+    }
+    showProjects();
+  }
+  async function deleteSession(runId) {
+    try {
+      await boundary.deleteSession(runId);
+      sessions = sessions.filter((session) => session.run_id !== runId);
+      confirmingSessionId = null;
+      sessionRowError = "";
+      if (currentSessionId === runId) {
+        transcript.reset();
+        currentSessionId = null;
+        transcript.setSessionId(null);
+        clearConversationAgents();
+        currentMode = launchMode;
+        rememberedPlanMode = null;
+        await refreshConversation();
+      }
+      showProjects();
+      showTranscript();
+    } catch (error) {
+      sessionRowError = error instanceof Error ? error.message : String(error);
+      showProjects();
+    }
   }
   showProjects();
   async function startNewChat() {
     clearConversationAgents();
     try {
       await boundary.newSession();
-      transcript.model.length = 0;
+      transcript.reset();
       currentSessionId = null;
       transcript.setSessionId(null);
       showProjects();
@@ -2025,12 +2202,14 @@ export async function start({ global, document, client }) {
 
   function showConversationUsage() {
     const context = conversation?.context;
-    const provider = conversation?.provider;
-    const model = conversation?.model;
+    const provider = conversation?.provider ?? selection.provider;
+    const model = conversation?.model ?? selection.model;
     const modelText = typeof model === "string" && model ? model : "";
-    const mode = permittedModes.includes(conversation?.mode) ? conversation.mode : "";
+    const activeMode = conversation?.mode ?? currentMode;
+    const mode = permittedModes.includes(activeMode) ? activeMode : "";
     const providerText = typeof provider === "string" && provider ? provider : "";
-    const effort = typeof conversation?.effort === "string" && conversation.effort ? conversation.effort : "";
+    const activeEffort = conversation?.effort ?? selection.effort;
+    const effort = typeof activeEffort === "string" && activeEffort ? activeEffort : "";
     const identityStatus = [
       statusFields.provider && providerText,
       statusFields.model && modelText,
@@ -2149,13 +2328,25 @@ export async function start({ global, document, client }) {
     showAgents();
   }
 
+  const instructionWarningsShown = new Set();
+
+  function showInstructionWarnings(current) {
+    const sessionId = current?.session_id;
+    const warnings = current?.instruction_warnings;
+    if (!sessionId || instructionWarningsShown.has(sessionId) || !Array.isArray(warnings) || warnings.length === 0) return;
+    instructionWarningsShown.add(sessionId);
+    for (const warning of warnings) answerCommand(`Instruction warning: ${warning}`);
+  }
+
   showConversationUsage();
   showAgents();
+  showInstructionWarnings(conversation);
 
   async function refreshConversation() {
     try {
       const reply = await boundary.conversationStats();
       conversation = reply?.conversation ?? null;
+      showInstructionWarnings(conversation);
       if (permittedModes.includes(conversation?.mode)) {
         currentMode = conversation.mode;
       }
@@ -2168,8 +2359,20 @@ export async function start({ global, document, client }) {
 
   function showApprovals() {
     const children = [];
+    const recordDecisionAtCurrentPosition = (entry) => {
+      transcript.model.push(entry);
+      showTranscript();
+      return () => {
+        const index = transcript.model.indexOf(entry);
+        if (index !== -1) {
+          transcript.model.splice(index, 1);
+          showTranscript();
+        }
+      };
+    };
     for (const [id, question] of approvals.state) {
-      const row = element(document, "section", { className: `approval ${question.state}` });
+      if (question.state !== "open" && question.state !== "answering") continue;
+      const row = element(document, "section", { className: `approval ${question.state} ${question.kind ?? "approval"}` });
       if (question.session_id && question.session_id !== currentSessionId) {
         const session = sessions.find((item) => item.run_id === question.session_id);
         append(row, element(document, "p", {
@@ -2180,6 +2383,108 @@ export async function start({ global, document, client }) {
         open.type = "button";
         listen(open, "click", () => openSession(question.session_id));
         append(row, open);
+      }
+      if (question.kind === "question") {
+        append(row, element(document, "p", { text: question.target }));
+        if (question.state === "open") {
+          const recordAnswer = async (allowed, answerText = "") => {
+            const removeRecord = recordDecisionAtCurrentPosition({
+              type: "user-question",
+              question: question.target,
+              answer: allowed ? answerText : "Skipped",
+            });
+            try {
+              await approvals.answer(id, allowed, "", false, answerText);
+            } catch (error) {
+              removeRecord();
+              throw error;
+            }
+            const resolved = approvals.state.get(id);
+            if (resolved?.state !== "resolved") removeRecord();
+            showApprovals();
+          };
+          for (const option of question.options ?? []) {
+            const button = element(document, "button", { text: option });
+            button.type = "button";
+            listen(button, "click", () => recordAnswer(true, option));
+            append(row, button);
+          }
+          const answerInput = element(document, "textarea");
+          answerInput.setAttribute("aria-label", "Your answer");
+          const answerButton = element(document, "button", { text: "Answer" });
+          answerButton.type = "button";
+          listen(answerButton, "click", () => {
+            const answer = answerInput.value.trim();
+            if (answer) void recordAnswer(true, answer);
+          });
+          const answerLabel = element(document, "label", { text: "Your answer" });
+          append(answerLabel, answerInput);
+          const skip = element(document, "button", { text: "Skip" });
+          skip.type = "button";
+          listen(skip, "click", () => recordAnswer(false));
+          append(row, answerLabel, answerButton, skip);
+        }
+        children.push(row);
+        continue;
+      }
+      if (question.kind === "plan") {
+        append(row, ...renderMarkdownBlocks(document, question.target, parseMarkdown));
+        if (question.state === "open") {
+          for (const [mode, label] of [["ask", "Approve, ask before changes"], ["allow", "Approve, allow changes"]]) {
+            if (!(question.options ?? []).includes(mode)) continue;
+            const approve = element(document, "button", { text: label });
+            approve.type = "button";
+            listen(approve, "click", async () => {
+              const removeRecord = recordDecisionAtCurrentPosition({
+                type: "user-plan", plan: question.target,
+                outcome: mode === "ask" ? "Approved — ask before changes" : "Approved — allow changes",
+              });
+              try {
+                await approvals.answer(id, true, "", false, mode);
+              } catch (error) {
+                removeRecord();
+                throw error;
+              }
+              const resolved = approvals.state.get(id);
+              if (resolved?.state === "resolved") {
+                currentMode = mode;
+                if (conversation) conversation = { ...conversation, mode };
+                rememberedPlanMode = null;
+                showConversationUsage();
+                showTranscript();
+              } else {
+                removeRecord();
+              }
+              showApprovals();
+            });
+            append(row, approve);
+          }
+          const feedback = element(document, "textarea");
+          feedback.setAttribute("aria-label", "Feedback");
+          const feedbackLabel = element(document, "label", { text: "Feedback" });
+          append(feedbackLabel, feedback);
+          const keep = element(document, "button", { text: "Keep planning" });
+          keep.type = "button";
+          listen(keep, "click", async () => {
+            const reason = feedback.value.trim();
+            const removeRecord = recordDecisionAtCurrentPosition({
+              type: "user-plan", plan: question.target,
+              outcome: reason ? `Kept planning: ${reason}` : "Kept planning",
+            });
+            try {
+              await approvals.answer(id, false, reason);
+            } catch (error) {
+              removeRecord();
+              throw error;
+            }
+            const resolved = approvals.state.get(id);
+            if (resolved?.state !== "resolved") removeRecord();
+            showApprovals();
+          });
+          append(row, feedbackLabel, keep);
+        }
+        children.push(row);
+        continue;
       }
       append(
         row,
@@ -2271,7 +2576,7 @@ export async function start({ global, document, client }) {
             promptFailure = "";
             await perform(turn.accepted());
             try {
-              sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+              sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
               showProjects();
             } catch {
               // The accepted prompt remains valid if refreshing history fails.
@@ -2294,6 +2599,10 @@ export async function start({ global, document, client }) {
     global.addEventListener("keydown", async (event) => {
       if (lookup(keymap, event, { platform }) !== "stop-run") return;
       event.preventDefault();
+      if (userCommandPending) {
+        await boundary.stop("");
+        return;
+      }
       await perform(turn.stop());
     });
   }
@@ -2319,6 +2628,34 @@ export async function start({ global, document, client }) {
     const command = text.trim();
     if (command.startsWith("/")) {
       return runCommand(command);
+    }
+    if (command.startsWith("!") && command.length > 1) {
+      if (turn.state === RUNNING || turn.state === DISPATCHING) {
+        promptFailure = "Wait for the turn to finish to run a command.";
+        showPromptError();
+        return;
+      }
+      const shellCommand = command.slice(1).trim();
+      if (shellCommand) return runUserCommand(shellCommand, text);
+    }
+    if (userCommandPending) {
+      promptFailure = "Wait for the command to finish.";
+      showPromptError();
+      return;
+    }
+    if (turn.state === RUNNING && pendingFiles.length === 0 && text.trim() && command !== "!") {
+      try {
+        await boundary.steer(text);
+        input.value = "";
+        promptFailure = "";
+        rememberPrompt(text);
+        transcript.model.push({ type: "steer", text });
+        showPromptError();
+        showTranscript();
+        return;
+      } catch {
+        // A rejected steer follows the existing queued-prompt path.
+      }
     }
     if (providerRows.length > 0 && !providerRows.some((row) => row.key_present)) {
       promptFailure = "Add an API key in Settings before sending a message.";
@@ -2381,8 +2718,10 @@ export async function start({ global, document, client }) {
   }
 
   function currentModelLabel() {
-    return conversation?.model
-      ? `${conversation.provider ? `${conversation.provider} / ` : ""}${conversation.model}`
+    const provider = conversation?.provider ?? selection.provider;
+    const model = conversation?.model ?? selection.model;
+    return model
+      ? `${provider ? `${provider} / ` : ""}${model}`
       : "the current model";
   }
 
@@ -2393,7 +2732,7 @@ export async function start({ global, document, client }) {
         throw new Error("Host refused the mode change.");
       }
       currentMode = reply.mode;
-      conversation = { ...(conversation ?? {}), mode: reply.mode };
+      if (conversation) conversation = { ...conversation, mode: reply.mode };
       closePicker();
       showConversationUsage();
       answerCommand(`Mode set to ${reply.mode}.`);
@@ -2598,15 +2937,18 @@ export async function start({ global, document, client }) {
   }
 
   async function chooseModel(provider, row, efforts) {
-    const existingEffort = conversation?.effort;
+    const existingEffort = conversation?.effort ?? selection.effort;
     const choice = { name: provider, model: row.id };
     const keepEffort = Boolean(existingEffort && Array.isArray(efforts) && efforts.includes(existingEffort));
     if (keepEffort) choice.effort = existingEffort;
     try {
       await boundary.selectProvider(choice);
-      conversation = { ...(conversation ?? {}), provider, model: row.id };
-      if (keepEffort) conversation.effort = existingEffort;
-      else delete conversation.effort;
+      selection = { provider, model: row.id, effort: keepEffort ? existingEffort : null };
+      if (conversation) {
+        conversation = { ...conversation, provider, model: row.id };
+        if (keepEffort) conversation.effort = existingEffort;
+        else delete conversation.effort;
+      }
       closePicker();
       showConversationUsage();
       answerCommand(keepEffort
@@ -2622,15 +2964,18 @@ export async function start({ global, document, client }) {
   }
 
   async function chooseTypedModel(provider, model, efforts = null) {
-    const existingEffort = conversation?.effort;
+    const existingEffort = conversation?.effort ?? selection.effort;
     const choice = { name: provider, model };
     const keepEffort = Boolean(existingEffort && Array.isArray(efforts) && efforts.includes(existingEffort));
     if (keepEffort) choice.effort = existingEffort;
     try {
       await boundary.selectProvider(choice);
-      conversation = { ...(conversation ?? {}), provider, model };
-      if (keepEffort) conversation.effort = existingEffort;
-      else delete conversation.effort;
+      selection = { provider, model, effort: keepEffort ? existingEffort : null };
+      if (conversation) {
+        conversation = { ...conversation, provider, model };
+        if (keepEffort) conversation.effort = existingEffort;
+        else delete conversation.effort;
+      }
       closePicker();
       showConversationUsage();
       answerCommand(keepEffort
@@ -2647,7 +2992,8 @@ export async function start({ global, document, client }) {
   async function chooseEffort(provider, model, effort) {
     try {
       await boundary.selectProvider({ name: provider, model, effort });
-      conversation = { ...(conversation ?? {}), provider, model, effort };
+      selection = { provider, model, effort };
+      if (conversation) conversation = { ...conversation, provider, model, effort };
       closePicker();
       showConversationUsage();
       answerCommand(`Effort set to ${effort}.`);
@@ -2663,8 +3009,8 @@ export async function start({ global, document, client }) {
       answerCommand("Usage: /effort [<value>]");
       return;
     }
-    const provider = conversation?.provider;
-    const model = conversation?.model;
+    const provider = conversation?.provider ?? selection.provider;
+    const model = conversation?.model ?? selection.model;
     if (!provider || !model) {
       answerCommand("Choose a model first with /model.");
       return;
@@ -2697,7 +3043,7 @@ export async function start({ global, document, client }) {
       const rows = efforts.map((value) => ({
         id: value,
         label: value,
-        current: value === conversation.effort,
+        current: value === (conversation?.effort ?? selection.effort),
       }));
       showPicker({
         title: `Effort · ${provider} / ${model}`,
@@ -2706,7 +3052,7 @@ export async function start({ global, document, client }) {
         onChoose: (row) => chooseEffort(provider, model, row.id),
         onCancel: () => {
           closePicker();
-          answerCommand(`Kept effort as ${conversation?.effort || "default"}.`);
+          answerCommand(`Kept effort as ${conversation?.effort ?? selection.effort ?? "default"}.`);
         },
       });
       return;
@@ -2743,7 +3089,7 @@ export async function start({ global, document, client }) {
       const rows = reply.models.map((model) => ({
         id: model.id,
         label: model.id,
-        current: conversation?.provider === provider && conversation?.model === model.id,
+        current: (conversation?.provider ?? selection.provider) === provider && (conversation?.model ?? selection.model) === model.id,
       }));
       const selected = rows.findIndex((row) => row.id === requestedModel);
       const current = rows.findIndex((row) => row.current);
@@ -2768,7 +3114,7 @@ export async function start({ global, document, client }) {
     const rows = providers.map((provider) => ({
       id: provider.name,
       label: provider.name,
-      current: provider.name === conversation?.provider,
+      current: provider.name === (conversation?.provider ?? selection.provider),
     }));
     const focused = rows.findIndex((row) => row.id === focusedProvider);
     const current = rows.findIndex((row) => row.current);
@@ -2780,7 +3126,7 @@ export async function start({ global, document, client }) {
       onChoose: (row) => openModelPicker(row.id, "", true),
       onCancel: () => {
         closePicker();
-        answerCommand(conversation?.provider
+        answerCommand((conversation?.provider ?? selection.provider)
           ? `Kept model as ${currentModelLabel()}.`
           : `Kept the default provider as ${providers[0]?.name ?? "unset"}.`);
       },
@@ -2788,7 +3134,7 @@ export async function start({ global, document, client }) {
   }
 
   async function openDefaultModelPicker() {
-    const currentProvider = conversation?.provider;
+    const currentProvider = conversation?.provider ?? selection.provider;
     if (typeof currentProvider === "string" && currentProvider) {
       const otherKeyedProvider = providerRows.some((row) => row.key_present && row.name !== currentProvider);
       if (otherKeyedProvider) {
@@ -2904,7 +3250,7 @@ export async function start({ global, document, client }) {
   }
 
   function renderCommandMenu() {
-    commandMatches = matchCommands(input.value);
+    commandMatches = matchCommands(input.value, skillCommands);
     highlightedCommand = 0;
     if (commandMatches.length === 0) {
       closeCommandMenu();
@@ -3000,6 +3346,13 @@ export async function start({ global, document, client }) {
     ));
     const args = parts.slice(1);
     if (!entry) {
+      const skill = skillCommands.find((candidate) => candidate.name.toLowerCase() === typedName.slice(1).toLowerCase());
+      if (skill) {
+        const request = command.slice(typedName.length).trim();
+        const prompt = `Use the ${skill.name} skill.${request ? `\n\n${request}` : ""}`;
+        await perform(turn.submit(prompt));
+        return;
+      }
       answerCommand(`Unknown command: ${typedName}. Type / to see commands.`);
       return;
     }
@@ -3058,10 +3411,16 @@ export async function start({ global, document, client }) {
         answerCommand("Usage: /help");
         return;
       }
-      answerCommand(COMMANDS.map(({ name, aliases, description, argumentHint }) => (
+      const lines = COMMANDS.map(({ name, aliases, description, argumentHint }) => (
         `/${name}${argumentHint ? ` ${argumentHint}` : ""} — ${description}`
         + (aliases.length > 0 ? ` (also ${aliases.map((alias) => `/${alias}`).join(", ")})` : "")
-      )).join("\n"));
+      ));
+      if (skillCommands.length > 0) {
+        lines.push("Skills:", ...skillCommands.map(({ name, argumentHint, description }) => (
+          `/${name} ${argumentHint} — ${description}`
+        )));
+      }
+      answerCommand(lines.join("\n"));
       return;
     }
     if (entry.name === "new") {
@@ -3070,6 +3429,42 @@ export async function start({ global, document, client }) {
         return;
       }
       await startNewChat();
+      return;
+    }
+    if (entry.name === "rename") {
+      const title = command.slice(typedName.length).trim();
+      if (!currentSessionId || !title) {
+        answerCommand("Usage: /rename <title>");
+        return;
+      }
+      try {
+        await boundary.renameSession(currentSessionId, title);
+        sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+        showProjects();
+        answerCommand("Conversation renamed.");
+      } catch (error) {
+        answerCommand(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (entry.name === "copy") {
+      if (args.length > 0) {
+        answerCommand("Usage: /copy");
+        return;
+      }
+      const latest = [...transcript.model].reverse().find((item) => item.type === "text" && typeof item.text === "string");
+      if (!latest) {
+        answerCommand("Nothing to copy yet.");
+        return;
+      }
+      try {
+        const clipboard = global.navigator?.clipboard;
+        if (typeof clipboard?.writeText !== "function") throw new Error("clipboard is unavailable");
+        await clipboard.writeText(latest.text);
+        answerCommand("Copied the last reply.");
+      } catch (error) {
+        answerCommand(`Could not copy: ${error instanceof Error ? error.message : String(error)}`);
+      }
       return;
     }
     if (entry.name === "plan") {
@@ -3190,6 +3585,29 @@ export async function start({ global, document, client }) {
     }
   }
 
+  async function runUserCommand(command, submittedText) {
+    closeCommandMenu();
+    closeFileMenu();
+    input.value = "";
+    rememberPrompt(submittedText);
+    commandEntry = { type: "command", command: `! ${command}`, output: [] };
+    transcript.model.push(commandEntry);
+    showTranscript();
+    userCommandPending = true;
+    try {
+      const reply = await boundary.command(command);
+      if (reply.output) commandEntry.output.push(reply.output);
+      if (reply.stopped) commandEntry.output.push("stopped");
+      else if (reply.timed_out) commandEntry.output.push("timed out");
+      else if (reply.exit_code !== 0) commandEntry.output.push(`exit ${reply.exit_code}`);
+    } catch (error) {
+      commandEntry.output.push(error instanceof Error ? error.message : String(error));
+    } finally {
+      userCommandPending = false;
+    }
+    showTranscript();
+  }
+
   function leadingTrailingRefresh(refresh) {
     let lastRefresh = null;
     let trailingTimer = null;
@@ -3228,7 +3646,7 @@ export async function start({ global, document, client }) {
 
   const requestActivityRefresh = leadingTrailingRefresh(async () => {
     try {
-      sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT);
+      sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
       showProjects();
     } catch {
       // A transient listing failure does not affect the current transcript.

@@ -509,6 +509,94 @@ def check_limit_route() -> None:
             host.close()
 
 
+@check("host_sessions.rename_delete_search")
+def check_rename_delete_search() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, "first reply")),
+                ModelResponse(Message(Role.ASSISTANT, "Parser is only in this reply")),
+            ]),
+            PermissionPolicy(repo_root=root),
+            sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
+        )
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            client.send_prompt("first question")
+            _wait_idle(client)
+            first_id = client.list_sessions()[0]["run_id"]
+            _new_session(host)
+            client.send_prompt("second question")
+            _wait_idle(client)
+            second_id = client.list_sessions()[0]["run_id"]
+
+            for run_id, title in ((second_id, "Open title"), (first_id, "Closed title")):
+                connection, response = _request(host, "POST", "/session/rename", body={"run_id": run_id, "title": title}, headers=_headers(host))
+                try:
+                    body = json.loads(response.read())
+                    if response.status != 200 or body != {"renamed": True}:
+                        fail(f"session rename failed for open={run_id == second_id}: {response.status}, {body!r}")
+                finally:
+                    connection.close()
+            listed = {item["run_id"]: item["title"] for item in client.list_sessions()}
+            if listed.get(first_id) != "Closed title" or listed.get(second_id) != "Open title":
+                fail(f"renamed titles were not persisted: {listed!r}")
+
+            connection, response = _request(host, "GET", "/sessions?query=parser", headers=_headers(host))
+            try:
+                matches = json.loads(response.read())
+                if response.status != 200 or [item["run_id"] for item in matches] != [second_id]:
+                    fail(f"assistant transcript search returned the wrong sessions: {response.status}, {matches!r}")
+            finally:
+                connection.close()
+
+            connection, response = _request(host, "POST", "/session/delete", body={"run_id": first_id}, headers=_headers(host))
+            try:
+                body = json.loads(response.read())
+                if response.status != 200 or body != {"deleted": True}:
+                    fail(f"idle session delete failed: {response.status}, {body!r}")
+            finally:
+                connection.close()
+            if (root / "sessions" / first_id).exists() or first_id in {item["run_id"] for item in client.list_sessions()}:
+                fail("deleted session directory or listing entry remained")
+        finally:
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _WaitingProvider()
+        host = HostServer(
+            provider,
+            PermissionPolicy(repo_root=root),
+            sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
+        )
+        host.start()
+        try:
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host))
+            try:
+                response.read()
+            finally:
+                connection.close()
+            session_id = host.run._conversation[1].run_id
+            session_dir = root / "sessions" / session_id
+            connection, response = _request(host, "POST", "/session/delete", body={"run_id": session_id}, headers=_headers(host))
+            try:
+                response.read()
+                if response.status != 409 or not session_dir.is_dir():
+                    fail(f"active session deletion was not refused: {response.status}")
+            finally:
+                connection.close()
+            provider.release.set()
+            _wait_idle(HostClient(HostAddress(host.port, host.token)))
+        finally:
+            provider.release.set()
+            host.close()
+
+
 @check("host_sessions.open_unknown_404")
 def check_open_unknown_404() -> None:
     with tempfile.TemporaryDirectory() as directory:

@@ -21,7 +21,7 @@ from symphonai_api.providers.anthropic_provider import (
     _build_request_body as _build_anthropic_body,
     _parse_response as _parse_anthropic_response,
 )
-from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.base import ProviderError, tool_result_text
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
 from symphonai_api.providers.gemini_provider import (
     GeminiProvider,
@@ -50,6 +50,52 @@ class _FakeHttpResponse:
 
     def __exit__(self, *exc: object) -> bool:
         return False
+
+
+@check("providers.failed_tool_output_reaches_model")
+def check_failed_tool_output_reaches_model() -> None:
+    call = ToolCall("failed-call", "run_shell", {"command": "pytest"})
+    failure = ToolResult(
+        tool_call_id="failed-call", ok=False,
+        content="FAIL: test_remove\n", error="exit code 1",
+    )
+    request = ModelRequest(messages=[
+        Message(Role.ASSISTANT, tool_calls=[call]),
+        Message(Role.TOOL, tool_result=failure),
+    ])
+    expected = "exit code 1\nFAIL: test_remove\n"
+    anthropic = _build_anthropic_body(request, "claude-haiku-4-5-20251001", 100)
+    openai = _build_openai_body(request, "gpt-4.1-mini")
+    responses = _build_responses_request_body(request, "gpt-5.6-sol")
+    gemini = _build_gemini_body(request, "gemini-2.5-flash")
+    actual = (
+        anthropic["messages"][1]["content"][0]["content"],
+        openai["messages"][1]["content"],
+        next(item["output"] for item in responses["input"] if item.get("type") == "function_call_output"),
+        gemini["contents"][1]["parts"][0]["functionResponse"]["response"],
+    )
+    if actual != (expected, expected, expected, {"error": expected}):
+        fail(f"failed tool output did not reach every provider: {actual!r}")
+
+    empty = ToolResult(tool_call_id="failed-call", ok=False, error="exit code 1")
+    empty_request = ModelRequest(messages=[
+        Message(Role.ASSISTANT, tool_calls=[call]),
+        Message(Role.TOOL, tool_result=empty),
+    ])
+    empty_anthropic = _build_anthropic_body(empty_request, "claude-haiku-4-5-20251001", 100)
+    empty_openai = _build_openai_body(empty_request, "gpt-4.1-mini")
+    empty_responses = _build_responses_request_body(empty_request, "gpt-5.6-sol")
+    empty_gemini = _build_gemini_body(empty_request, "gemini-2.5-flash")
+    empty_actual = (
+        empty_anthropic["messages"][1]["content"][0]["content"],
+        empty_openai["messages"][1]["content"],
+        next(item["output"] for item in empty_responses["input"] if item.get("type") == "function_call_output"),
+        empty_gemini["contents"][1]["parts"][0]["functionResponse"]["response"],
+    )
+    if empty_actual != ("exit code 1", "exit code 1", "exit code 1", {"error": "exit code 1"}):
+        fail(f"empty failure output serialization changed: {empty_actual!r}")
+    if tool_result_text(ToolResult(tool_call_id="ok", ok=True, content="result")) != "result":
+        fail("successful tool output changed")
 
 def _openai_success(content: str) -> _FakeHttpResponse:
     payload = {

@@ -21,9 +21,12 @@ from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.events import CollectingSink, RunFinished
 from symphonai_api.identity import AgentRef, RunRef, TurnRef
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.session import SessionStore, load_run_for_resume, read_records
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from scripts.checks.harness import check, fail
 
 
@@ -776,13 +779,155 @@ def redirect_during_final_answer() -> None:
         )
         capped_result = capped_agent.run([Message(Role.USER, "task")], run=capped)
         capped_events = [event for event in capped_sink.events if isinstance(event, RunFinished)]
+        kept_redirects = [
+            message.text for message in capped_result.messages
+            if message.role is Role.USER and message.text == "also update the docs"
+        ]
         if (
             capped_result.final_response.message.text != "done at the limit"
             or capped_provider.call_count != 1
             or len(capped_events) != 1
-            or capped.take_redirects() != ("also update the docs",)
+            or kept_redirects != ["also update the docs"]
+            or capped.take_redirects()
         ):
-            fail("redirect during the only allowed turn did not stop at the limit")
+            fail("redirect during the only allowed turn was not retained in history")
+
+
+@check("run_control.redirect_after_final_check_refused")
+def redirect_after_final_check_refused() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        controlled = _new_run(root)
+        controlled.start(CancellationToken())
+        refused = []
+
+        def events(event):
+            if not isinstance(event, RunFinished):
+                return
+            try:
+                controlled.redirect("arrived after the final check")
+            except ValueError:
+                refused.append(True)
+
+        result = ApiAgent(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            {},
+            PermissionPolicy(repo_root=root),
+            events=events,
+        ).run([Message(Role.USER, "task")], run=controlled)
+        if (
+            result.stopped_reason != "final_response"
+            or refused != [True]
+            or any(message.text == "arrived after the final check" for message in result.messages)
+            or controlled.take_redirects()
+        ):
+            fail("redirect was accepted after the loop closed the run")
+
+
+@check("run_control.unread_redirect_follows_tool_results")
+def unread_redirect_follows_tool_results() -> None:
+    from symphonai_api.providers.openai_provider import _build_request_body
+
+    class RedirectThenStopTool(LocalTool):
+        def __init__(self, controlled_run: AgentRun, *, fail_tool: bool) -> None:
+            self.controlled_run = controlled_run
+            self.fail_tool = fail_tool
+
+        @property
+        def name(self) -> str:
+            return "redirect_then_stop"
+
+        @property
+        def description(self) -> str:
+            return "redirects and stops or fails the run"
+
+        @property
+        def parameters(self) -> dict:
+            return {"type": "object", "properties": {}}
+
+        def metadata(self, arguments: dict) -> ToolMetadata:
+            return ToolMetadata(ToolEffect.DESTRUCTIVE, False, ())
+
+        def _execute(self, tool_call, policy, cancel=None):
+            self.controlled_run.redirect("also check the docs")
+            if self.fail_tool:
+                raise RuntimeError("tool failed")
+            assert cancel is not None
+            cancel.cancel()
+            cancel.raise_if_cancelled()
+
+    def message_roles(messages: list[Message]) -> list[str]:
+        request = _build_request_body(ModelRequest(messages=messages), "gpt-4.1")
+        roles = [message["role"] for message in request["messages"]]
+        assistant_index = roles.index("assistant")
+        if roles[assistant_index + 1:assistant_index + 3] != ["tool", "user"]:
+            fail(f"OpenAI chat body separated tool results from their call: {roles!r}")
+        return roles
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        def run_case(*, fail_tool: bool):
+            store = SessionStore(root / ("failed" if fail_tool else "cancelled"), "run", repo_root=root)
+            controlled = _new_run(root)
+            token = CancellationToken()
+            controlled.start(token)
+            tool = RedirectThenStopTool(controlled, fail_tool=fail_tool)
+            agent = ApiAgent(
+                FakeModelProvider([
+                    ModelResponse(
+                        Message(
+                            Role.ASSISTANT,
+                            tool_calls=[ToolCall("call", tool.name, {})],
+                        )
+                    )
+                ]),
+                {tool.name: tool},
+                PermissionPolicy(repo_root=root),
+                transcript=store.writer_for("agent", is_root=True),
+            )
+            if fail_tool:
+                try:
+                    agent.run([Message(Role.USER, "task")], cancel=token, run=controlled)
+                except RuntimeError as exc:
+                    if str(exc) != "tool failed":
+                        fail(f"unexpected tool failure: {exc!r}")
+                else:
+                    fail("failing tool unexpectedly completed")
+                loaded, _diagnosis, repaired = load_run_for_resume(store)
+                if repaired:
+                    fail(f"resume repaired tool calls that should already be answered: {repaired!r}")
+                messages = loaded.messages
+            else:
+                result = agent.run([Message(Role.USER, "task")], cancel=token, run=controlled)
+                messages = result.messages
+
+            roles = [message.role.value for message in messages]
+            try:
+                assistant_index = roles.index("assistant")
+            except ValueError:
+                fail(f"run omitted its assistant tool call: {roles!r}")
+            if roles[assistant_index:assistant_index + 3] != ["assistant", "tool", "user"]:
+                fail(f"tool result and unread steer were out of order: {roles!r}")
+            if messages[assistant_index + 2].text != "also check the docs":
+                fail("unread steer text changed")
+            message_roles(messages)
+            records, _ = read_records(store.directory / "run.jsonl")
+            transcript_roles = [
+                record["data"]["role"]
+                for record in records
+                if record["type"] == "message"
+            ]
+            try:
+                transcript_assistant = transcript_roles.index("assistant")
+            except ValueError:
+                fail(f"transcript omitted its assistant tool call: {transcript_roles!r}")
+            if transcript_roles[transcript_assistant:transcript_assistant + 3] != ["assistant", "tool", "user"]:
+                fail(f"transcript recorded the steer before the tool result: {transcript_roles!r}")
+            return store
+
+        run_case(fail_tool=False)
+        run_case(fail_tool=True)
 
 
 @check("run_control.capped_turns_stop_the_run")

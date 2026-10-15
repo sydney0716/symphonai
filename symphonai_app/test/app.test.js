@@ -77,6 +77,11 @@ class FakeElement {
     document.activeElement = this;
   }
 
+  setSelectionRange(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
+
   addEventListener(type, listener) {
     const listeners = this.listeners.get(type) ?? [];
     listeners.push(listener);
@@ -301,7 +306,7 @@ export function fakeClient(
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], settings: 0, specFiles: 0, stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
   let eventCallback;
@@ -379,6 +384,14 @@ export function fakeClient(
       calls.promptAttachments.push(attachments);
       return promptReply;
     },
+    async steer(text) {
+      calls.steer.push(text);
+      throw new Error("no turn is running");
+    },
+    async command(command) {
+      calls.command.push(command);
+      throw new Error("command unavailable");
+    },
     async models(provider, baseUrl) {
       calls.models.push([provider, baseUrl]);
       return { ...modelListing, provider };
@@ -411,8 +424,12 @@ export function fakeClient(
       calls.stop.push(runId);
       return { accepted: true };
     },
-    async approve(id, allowed, reason, remember = false) {
-      calls.approve.push({ id, allowed, reason, ...(remember ? { remember: true } : {}) });
+    async approve(id, allowed, reason, remember = false, answerText = "") {
+      calls.approve.push({
+        id, allowed, reason,
+        ...(remember ? { remember: true } : {}),
+        ...(answerText ? { answer: answerText } : {}),
+      });
       return { resolved: true };
     },
     async approvals() {
@@ -466,9 +483,17 @@ export function fakeClient(
       calls.credentials.push({ name, value });
       return { stored: true, name };
     },
-    async sessions(limit) {
-      calls.sessions.push(limit);
+    async sessions(limit, query) {
+      calls.sessions.push(query === undefined ? limit : [limit, query]);
       return sessions;
+    },
+    async renameSession(runId, title) {
+      calls.renameSession.push([runId, title]);
+      return { renamed: true };
+    },
+    async deleteSession(runId) {
+      calls.deleteSession.push(runId);
+      return { deleted: true };
     },
     async openSession(runId) {
       calls.openSession.push(runId);
@@ -540,9 +565,40 @@ test("help lists commands and their aliases in table order", async () => {
     "/compact [<instructions>] — Summarize the conversation so far to free context",
     "/goal [<objective> [-- <check command>] | pause | resume | clear] — Keep working toward a goal",
     "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
+    "/rename <title> — Rename this conversation",
+    "/copy — Copy the last reply as Markdown",
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
+});
+
+test("prompt and stop actions behave while a user command is pending", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const native = fakeGlobal();
+  native.global.navigator = { platform: "MacIntel" };
+  let finishCommand;
+  client.command = (command) => {
+    client.calls.command.push(command);
+    return new Promise((resolve) => { finishCommand = resolve; });
+  };
+  await start({ global: native.global, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "! sleep 30";
+  const running = document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.command, ["sleep 30"]);
+
+  input.value = "what happened?";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(input.value, "what happened?");
+  assert.equal(document.getElementById("prompt-error").textContent, "Wait for the command to finish.");
+  assert.deepEqual(client.calls.prompt, []);
+
+  await native.dispatch("keydown", { key: ".", metaKey: true, preventDefault() {} });
+  assert.deepEqual(client.calls.stop, [""]);
+  finishCommand({ exit_code: null, output: "partial", timed_out: false, stopped: true });
+  await running;
+  assert.deepEqual(latestCommandOutput(document), ["partial", "stopped"]);
 });
 
 test("pasted images send with text, clear the chips and render in the transcript", async () => {
@@ -892,6 +948,38 @@ test("goal events render between rounds and update the status line", async () =>
   assert.match(visibleText(goalEntry), /1 failed/);
   await app.onFrame(goalEvent("clear", "", 0));
   assert.doesNotMatch(find(document.body, (node) => node.className === "conversation-usage").textContent, /Goal /);
+});
+
+test("plan events render status markers without a tool activity line", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { session_id: "session-plan", mode: "ask" },
+  });
+  const app = await start({ global: {}, document, client });
+  await client.emit(eventFrame("ToolCallStarted", {
+    tool_name: "update_plan", tool_call_id: "plan-call", target: "update_plan",
+  }));
+  await client.emit(eventFrame("PlanChanged", {
+    steps: [
+      { step: "Read the spec", status: "completed" },
+      { step: "Implement the change", status: "in_progress" },
+      { step: "Review", status: "pending" },
+    ],
+    explanation: "Three steps, **one** at a time.",
+    session_id: "session-plan",
+  }));
+  const plan = find(document.getElementById("chat"), (node) => node.className === "plan-entry");
+  assert.ok(plan);
+  assert.match(visibleText(plan).replace(/\s+/g, " "), /Three steps, one at a time\./);
+  assert.deepEqual(find(plan, (node) => node.className === "plan-steps").children.map((row) => row.className), [
+    "plan-step completed", "plan-step in_progress", "plan-step pending",
+  ]);
+  assert.equal(find(document.getElementById("chat"), (node) => node.className.includes("activity")), undefined);
+  await client.emit(eventFrame("PlanChanged", {
+    steps: [{ step: "Review", status: "in_progress" }], explanation: "Final pass.",
+    session_id: "session-plan",
+  }));
+  assert.equal(app.transcript.model.filter(({ type }) => type === "plan").length, 2);
 });
 
 test("goal update and check-less round events render in the transcript", async () => {
@@ -1265,6 +1353,8 @@ test("slash suggestions render above the composer without taking focus", async (
     "/compact  [<instructions>]  Summarize the conversation so far to free context",
     "/goal  [<objective> [-- <check command>] | pause | resume | clear]  Keep working toward a goal",
     "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
+    "/rename  <title>  Rename this conversation",
+    "/copy    Copy the last reply as Markdown",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));
@@ -2062,6 +2152,156 @@ test("sidebar groups sessions and keeps only the current project openable", asyn
   assert.deepEqual(client.calls.openSession, ["current-old"]);
 });
 
+test("sidebar manages and searches conversations without changing the session link", async () => {
+  const document = new FakeDocument();
+  const entries = [
+    { run_id: "run-1", title: "Lexer notes", repo_root: "/work/current", updated_at: "2026-01-01" },
+    { run_id: "run-2", title: "Release notes", repo_root: "/work/current", updated_at: "2026-01-02" },
+  ];
+  const client = fakeClient(fixtureRoadmap(), { sessions: entries });
+  client.sessions = async (limit, query) => {
+    client.calls.sessions.push(query === undefined ? limit : [limit, query]);
+    return query ? entries.filter((entry) => entry.title.toLowerCase().includes(query.toLowerCase())) : entries;
+  };
+  await start({ global: {}, document, client });
+  const projects = find(document.getElementById("sidebar"), (value) => value.className === "projects");
+  const currentGroup = () => projects.children[0];
+  assert.equal(find(currentGroup(), (value) => value.tagName === "BUTTON").className, "session-link");
+
+  const rename = find(currentGroup(), (value) => value.attributes.get("aria-label") === "Rename");
+  await rename.dispatch("click");
+  const title = find(currentGroup(), (value) => value.className === "session-rename-input");
+  assert.equal(document.activeElement, title);
+  assert.deepEqual([title.selectionStart, title.selectionEnd], [0, title.value.length]);
+  title.value = "New name";
+  await title.dispatch("input");
+  await title.dispatch("keydown", { key: "Enter" });
+  assert.deepEqual(client.calls.renameSession, [["run-2", "New name"]]);
+
+  await find(currentGroup(), (value) => value.attributes.get("aria-label") === "Rename").dispatch("click");
+  const escapeField = find(currentGroup(), (value) => value.className === "session-rename-input");
+  escapeField.value = "Discard this";
+  await escapeField.dispatch("input");
+  await escapeField.dispatch("keydown", { key: "Escape" });
+  await escapeField.dispatch("blur");
+  assert.deepEqual(client.calls.renameSession, [["run-2", "New name"]]);
+
+  await find(currentGroup(), (value) => value.attributes.get("aria-label") === "Rename").dispatch("click");
+  const blurField = find(currentGroup(), (value) => value.className === "session-rename-input");
+  blurField.value = "Saved on blur";
+  await blurField.dispatch("input");
+  await blurField.dispatch("blur");
+  assert.deepEqual(client.calls.renameSession.at(-1), ["run-2", "Saved on blur"]);
+
+  const remove = find(currentGroup(), (value) => value.attributes.get("aria-label") === "Delete");
+  await remove.dispatch("click");
+  const confirm = find(currentGroup(), (value) => value.tagName === "BUTTON" && value.textContent === "Cancel");
+  await confirm.dispatch("click");
+  assert.deepEqual(client.calls.deleteSession, []);
+  await find(currentGroup(), (value) => value.attributes.get("aria-label") === "Delete").dispatch("click");
+  await find(currentGroup(), (value) => value.tagName === "BUTTON" && value.textContent === "Delete").dispatch("click");
+  assert.deepEqual(client.calls.deleteSession, ["run-2"]);
+
+  const search = find(currentGroup(), (value) => value.className === "session-search");
+  search.focus();
+  for (const character of "lex") {
+    const active = document.activeElement;
+    active.value += character;
+    active.setSelectionRange(active.value.length, active.value.length);
+    await active.dispatch("input");
+    assert.equal(document.activeElement.className, "session-search");
+  }
+  const filteredSearch = find(currentGroup(), (value) => value.className === "session-search");
+  assert.equal(filteredSearch.value, "lex");
+  assert.equal(document.activeElement, filteredSearch);
+  assert.deepEqual(walk(currentGroup()).filter((value) => value.className === "session-link").map((value) => value.textContent), ["Lexer notes"]);
+  assert.deepEqual(client.calls.sessions.slice(-3), [[200, "l"], [200, "le"], [200, "lex"]]);
+});
+
+test("rename command updates the current conversation and reports usage when unavailable", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { conversation: { session_id: "run-1" } });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/rename Better title");
+  assert.deepEqual(client.calls.renameSession, [["run-1", "Better title"]]);
+  assert.match(latestCommandOutput(document)[0], /renamed/i);
+  await submitCommand(document, "/rename");
+  assert.equal(latestCommandOutput(document).at(-1), "Usage: /rename <title>");
+});
+
+test("skills appear as slash commands and submit their name with the typed request", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { skills: [
+      { name: "release", path: "/skills/release/SKILL.md" },
+      { name: "help", path: "/skills/help/SKILL.md" },
+    ] } },
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "skill-run" };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.focus();
+  input.value = "/rel";
+  await input.dispatch("input");
+  const menu = find(document.getElementById("chat-pane"), (node) => node.className === "command-menu");
+  assert.deepEqual(menu.children.map((row) => row.textContent), ["/release  [<request>]  Use the release skill"]);
+  input.value = "/hel";
+  await input.dispatch("input");
+  assert.deepEqual(
+    find(document.getElementById("chat-pane"), (node) => node.className === "command-menu").children.map((row) => row.textContent),
+    ["/help    Show the commands"],
+  );
+  await submitCommand(document, "/release cut 1.2");
+  assert.deepEqual(client.calls.prompt, ["Use the release skill.\n\ncut 1.2"]);
+  await submitCommand(document, "/help");
+  assert.deepEqual(latestCommandOutput(document)[0].trim().split("\n").slice(-2), [
+    "Skills:",
+    "/release [<request>] — Use the release skill",
+  ]);
+});
+
+test("code blocks and /copy use the clipboard without changing rendered text", async () => {
+  const document = new FakeDocument();
+  const writes = [];
+  const global = { navigator: { clipboard: { writeText: async (value) => writes.push(value) } } };
+  const client = fakeClient();
+  await start({ global, document, client });
+  const markdown = "**Done** — see `a.py`\n\n```python\nprint('hi')\n```";
+  await client.emit(eventFrame("AssistantTextDelta", { text: markdown }));
+  const assistant = find(document.getElementById("chat"), (node) => node.className === "assistant");
+  const pre = find(assistant, (node) => node.tagName === "PRE");
+  assert.deepEqual(pre.children.map((node) => node.tagName), ["CODE", "BUTTON"]);
+  assert.equal(pre.children[0].textContent, "print('hi')");
+  assert.equal(pre.children[1].attributes.get("aria-label"), "Copy code");
+  assert.equal(pre.children[1].attributes.get("title"), "Copy code");
+  await pre.children[1].dispatch("click");
+  assert.deepEqual(writes, ["print('hi')"]);
+  assert.equal(pre.children[1].attributes.get("title"), "Copied");
+
+  await submitCommand(document, "/copy");
+  assert.deepEqual(writes, ["print('hi')", markdown]);
+  assert.equal(latestCommandOutput(document)[0], "Copied the last reply.");
+});
+
+test("/copy reports an empty reply and clipboard failures", async () => {
+  const document = new FakeDocument();
+  const global = { navigator: { clipboard: { writeText: async () => { throw new Error("permission denied"); } } } };
+  const client = fakeClient();
+  await start({ global, document, client });
+  await submitCommand(document, "/copy");
+  assert.equal(latestCommandOutput(document)[0], "Nothing to copy yet.");
+  const markdown = "```text\nreply\n```";
+  await client.emit(eventFrame("AssistantTextDelta", { text: markdown }));
+  const copyButton = find(document.getElementById("chat"), (node) => node.className === "code-copy");
+  await copyButton.dispatch("click");
+  assert.equal(copyButton.attributes.get("title"), "Could not copy");
+  await submitCommand(document, "/copy");
+  assert.equal(latestCommandOutput(document)[0], "Could not copy: permission denied");
+});
+
 test("new chat clears the transcript and the next prompt adds a session link", async () => {
   const document = new FakeDocument();
   const initial = {
@@ -2102,6 +2342,13 @@ test("new chat clears the transcript and the next prompt adds a session link", a
   document.getElementById("prompt").value = "Start the next chat";
   await document.getElementById("prompt-form").dispatch("submit");
   assert.deepEqual(client.calls.prompt, ["Start the next chat"]);
+  await client.emit(eventFrame("PromptSubmitted", { agent_id: "leader-b", text: "Start the next chat" }));
+  await client.emit(eventFrame("AssistantTextDelta", { agent_id: "leader-b", run_id: "run-b", text: "Second answer" }));
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader-b", run_id: "run-b" }));
+  const nextChat = visibleText(document.getElementById("chat"));
+  assert.match(nextChat, /Start the next chat/);
+  assert.match(nextChat, /Second answer/);
+  assert.match(nextChat, /Worked for 0s/);
   assert.deepEqual(client.calls.sessions, [200, 200]);
   assert.deepEqual(sessionLinks().map((value) => value.textContent), [
     "New chat title",
@@ -2146,6 +2393,61 @@ test("status line defaults to model and effort and always shows a non-ask mode",
   await picker.dispatch("keydown", { key: "ArrowDown" });
   await picker.dispatch("keydown", { key: "Enter" });
   assert.equal(status.textContent, "gpt-5.6-terra low · plan");
+});
+
+test("fresh chat shows next-turn selection before and after model choice", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: {
+      mode: "ask",
+      selection: { provider: "anthropic", model: "m-1", effort: null },
+      providers: [{ name: "openai", key_present: true }],
+    } },
+  });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "gpt-listed", efforts: [] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+  const status = find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage"));
+  assert.equal(status.textContent, "m-1");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.match(html, /<textarea id="prompt"[^>]*placeholder="Describe a task, or type \/ for commands"/);
+
+  await submitCommand(document, "/model openai gpt-next");
+  assert.equal(status.textContent, "gpt-next");
+  assert.equal(await client.conversationStats().then((reply) => reply.conversation), null);
+});
+
+test("instruction warnings are added once for each session", async () => {
+  const document = new FakeDocument();
+  const warning = "instruction file .symphonai/INSTRUCTIONS.md is unreadable";
+  const conversation = {
+    session_id: "warning-session",
+    provider: "openai",
+    model: "gpt-current",
+    mode: "ask",
+    instruction_warnings: [warning],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { providers: [{ name: "openai", key_present: true }] } },
+    conversation,
+  });
+  client.conversationStats = async () => ({ conversation });
+  client.models = async (provider) => ({
+    provider,
+    state: "available",
+    models: [{ id: "gpt-listed", efforts: [] }],
+    detail: "",
+  });
+  await start({ global: {}, document, client });
+  const text = `Instruction warning: ${warning}`;
+  assert.equal(visibleText(document.getElementById("chat")).split(text).length - 1, 1);
+  await submitCommand(document, "/model openai gpt-next");
+  await submitCommand(document, "/model openai gpt-next");
+  assert.equal(visibleText(document.getElementById("chat")).split(text).length - 1, 1);
 });
 
 test("status line settings use a heading and provider and model toggle independently", async () => {
@@ -2439,6 +2741,7 @@ test("model picker opens before a conversation and choosing among providers open
     settings: { settings: { providers: [
       { name: "openai", key_present: true },
       { name: "anthropic", key_present: true },
+      { name: "deepseek", key_present: true },
     ] } },
     conversation: null,
     modelListing: { provider: "openai", state: "available", models: [{ id: "gpt-alpha", efforts: [] }], detail: "" },
@@ -2454,13 +2757,13 @@ test("model picker opens before a conversation and choosing among providers open
   await document.getElementById("prompt-form").dispatch("submit");
   let picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
   let rows = find(picker, (node) => node.className === "picker-list").children;
-  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["openai", "anthropic"]);
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["openai", "anthropic", "deepseek"]);
   assert.equal(latestCommandEntry(document).children[0].textContent, "/model");
   assert.deepEqual(latestCommandOutput(document), []);
-  await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "anthropic").dispatch("click");
+  await find(picker, (node) => node.className.split(" ").includes("picker-row") && node.children[0]?.textContent === "deepseek").dispatch("click");
   picker = find(document.getElementById("chat-pane"), (node) => node.className === "picker");
   rows = find(picker, (node) => node.className === "picker-list").children;
-  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["anthropic-model"]);
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["deepseek-model"]);
   assert.deepEqual(client.calls.prompt, []);
 });
 
@@ -3361,7 +3664,7 @@ test("dispatch activity expands its matched subagent task with click and Enter",
   await client.emit(eventFrame("PromptSubmitted", { agent_id: "child", run_id: "child-run", text: "find the bug" }));
   const chat = document.getElementById("chat");
   const dispatch = find(chat, (node) => node.className.includes("activity"));
-  assert.equal(find(dispatch, (node) => node.className === "activity-text").children.map((node) => node.textContent).join(""), "Dispatched explorer.");
+  assert.equal(find(dispatch, (node) => node.className === "activity-text").children.map((node) => node.textContent).join(""), "Dispatching explorer…");
   assert.equal(find(chat, (node) => node.className === "prompt" && node.textContent === "find the bug"), undefined);
   assert.equal(find(dispatch, (node) => node.className === "dispatch-tasks"), undefined);
   await dispatch.click();
@@ -3554,6 +3857,15 @@ test("opening another conversation and starting a new chat clears prior agents",
   assert.deepEqual(replayBoard, ["\nNothing is running.", "\nNothing is running."]);
   assert.deepEqual(agents.children.map(agentRowText), ["leader"]);
   assert.equal(find(agents, (row) => row.className === "agent-name" && row.textContent.includes("worker")), undefined);
+
+  await client.emit(eventFrame("PromptSubmitted", { agent_id: "leader-b", text: "Live prompt B" }));
+  await client.emit(eventFrame("AssistantTextDelta", { agent_id: "leader-b", run_id: "run-b", text: "Live answer B" }));
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader-b", run_id: "run-b" }));
+  const secondConversation = visibleText(document.getElementById("chat"));
+  assert.match(secondConversation, /History for conversation-b/);
+  assert.match(secondConversation, /Live prompt B/);
+  assert.match(secondConversation, /Live answer B/);
+  assert.match(secondConversation, /Worked for 0s/);
 
   await document.getElementById("new-chat").dispatch("click");
   assert.equal(visibleText(agents), "\nNothing is running.");
@@ -4662,6 +4974,7 @@ test("approvals stay separate and dropped frames render one model gap", async ()
   assert.ok(deny);
   await allow.dispatch("click");
   await allow.dispatch("click");
+  assert.equal(approvals.children.length, 0);
   assert.deepEqual(client.calls.approve, [
     { id: "approval-1", allowed: true, reason: "" },
   ]);
@@ -4672,6 +4985,285 @@ test("approvals stay separate and dropped frames render one model gap", async ()
   assert.equal(chat.children[0].className, "gap");
   assert.equal(chat.children[0].textContent, "2 events were dropped.");
   assert.deepEqual(app.transcript.model, [{ type: "gap", dropped: 2 }]);
+});
+
+test("question approval offers choices and records the answer once", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "question-approval",
+    operation: "ask_user",
+    target: "Which file should I update?",
+    details: "",
+    kind: "question",
+    options: ["a.py", "b.py"],
+  } });
+  const approvals = document.getElementById("approvals");
+  assert.match(visibleText(approvals), /Which file should I update\?/);
+  assert.equal(find(approvals, (node) => node.tagName === "BUTTON" && node.textContent === "Allow"), undefined);
+  assert.equal(find(approvals, (node) => node.tagName === "BUTTON" && node.textContent === "Deny"), undefined);
+  const option = find(approvals, (node) => node.tagName === "BUTTON" && node.textContent === "b.py");
+  await option.dispatch("click");
+  assert.deepEqual(client.calls.approve, [{
+    id: "question-approval", allowed: true, reason: "", answer: "b.py",
+  }]);
+  assert.deepEqual(app.transcript.model, [{
+    type: "user-question", question: "Which file should I update?", answer: "b.py",
+  }]);
+});
+
+test("plan approval renders Markdown, changes the mode, and records the decision", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(undefined, {
+    settings: { settings: { mode: "plan", ceiling: { modes: ["ask", "plan", "allow"] } } },
+  });
+  const app = await start({
+    global: { localStorage: { getItem: () => JSON.stringify({ mode: true }) } },
+    document, client,
+  });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "plan-approval",
+    operation: "propose_plan",
+    target: "# Update parser\n\n- Change the tokenizer",
+    details: "",
+    kind: "plan",
+    options: ["ask", "allow"],
+  } });
+  const approvals = document.getElementById("approvals");
+  assert.equal(find(approvals, (node) => node.tagName === "H1")?.textContent, "Update parser");
+  const approve = find(approvals, (node) => node.tagName === "BUTTON" && node.textContent === "Approve, ask before changes");
+  assert.ok(approve);
+  await approve.dispatch("click");
+  assert.deepEqual(client.calls.approve, [{
+    id: "plan-approval", allowed: true, reason: "", answer: "ask",
+  }]);
+  assert.match(find(document.getElementById("app-shell"), (node) => node.className === "conversation-usage").textContent, /ask/);
+  assert.deepEqual(app.transcript.model, [{
+    type: "user-plan",
+    plan: "# Update parser\n\n- Change the tokenizer",
+    outcome: "Approved — ask before changes",
+  }]);
+});
+
+test("answered questions and plans stay at their action-time transcript position", async () => {
+  const cases = [
+    {
+      payload: {
+        approval_id: "ordered-question", operation: "ask_user",
+        target: "Which database?", details: "", kind: "question", options: ["SQLite"],
+      },
+      button: "SQLite",
+      expected: { type: "user-question", question: "Which database?", answer: "SQLite" },
+    },
+    {
+      payload: {
+        approval_id: "ordered-plan", operation: "propose_plan",
+        target: "Plan", details: "", kind: "plan", options: ["ask", "allow"],
+      },
+      button: "Approve, ask before changes",
+      expected: { type: "user-plan", plan: "Plan", outcome: "Approved — ask before changes" },
+    },
+    {
+      payload: {
+        approval_id: "ordered-keep", operation: "propose_plan",
+        target: "Plan feedback", details: "", kind: "plan", options: ["ask", "allow"],
+      },
+      button: "Keep planning",
+      expected: { type: "user-plan", plan: "Plan feedback", outcome: "Kept planning" },
+    },
+  ];
+
+  for (const { payload, button: label, expected } of cases) {
+    const document = new FakeDocument();
+    const client = fakeClient();
+    const app = await start({ global: {}, document, client });
+    let resolveApproval;
+    client.approve = () => new Promise((resolve) => { resolveApproval = resolve; });
+    await client.emit({ kind: "approval_requested", payload });
+    const action = find(
+      document.getElementById("approvals"),
+      (node) => node.tagName === "BUTTON" && node.textContent === label,
+    );
+    assert.ok(action, `missing ${label} action`);
+    const pending = action.dispatch("click");
+    await client.emit(eventFrame("AssistantTextDelta", { text: "Reply while approval is pending" }));
+    resolveApproval({ resolved: true });
+    await pending;
+    assert.deepEqual(app.transcript.model, [
+      expected,
+      {
+        type: "text", agentId: "agent-1", runId: "run-1",
+        text: "Reply while approval is pending",
+      },
+    ]);
+  }
+});
+
+test("a failed question answer removes its pending transcript record", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.approve = async () => {
+    throw Object.assign(new Error("approval no longer exists"), { status: 404 });
+  };
+  const app = await start({ global: {}, document, client });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "failed-question", operation: "ask_user",
+    target: "Which database?", details: "", kind: "question", options: ["SQLite"],
+  } });
+  const option = find(
+    document.getElementById("approvals"),
+    (node) => node.tagName === "BUTTON" && node.textContent === "SQLite",
+  );
+  await option.dispatch("click");
+  assert.deepEqual(app.transcript.model, []);
+});
+
+test("a running turn accepts steering and queues attached messages", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  const form = document.getElementById("prompt-form");
+  document.getElementById("prompt").value = "start turn";
+  const firstPrompt = form.dispatch("submit");
+  client.resolvePrompt({ accepted: true, run_id: "steer-run" });
+  await firstPrompt;
+  client.steer = async (text) => {
+    client.calls.steer.push(text);
+    return { steered: true };
+  };
+  const input = document.getElementById("prompt");
+  input.value = "use b.py";
+  await form.dispatch("submit");
+  assert.deepEqual(client.calls.steer, ["use b.py"]);
+  assert.deepEqual(app.turn.queue, []);
+  const steer = find(document.getElementById("chat"), (node) => node.className === "prompt steer");
+  assert.ok(steer);
+  assert.match(visibleText(steer), /Sent while working/);
+  assert.match(visibleText(steer), /use b.py/);
+
+  const file = {
+    name: "shot.png", type: "image/png", size: 9,
+    async arrayBuffer() { return Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 0]).buffer; },
+  };
+  await input.dispatch("paste", { clipboardData: { items: [{ type: "image/png", getAsFile: () => file }] } });
+  input.value = "look at this";
+  await form.dispatch("submit");
+  assert.deepEqual(client.calls.steer, ["use b.py"]);
+  assert.equal(app.turn.queue[0].text, "look at this");
+  assert.equal(app.turn.queue[0].attachments.length, 1);
+});
+
+test("exclamation commands run directly, stay in the composer during a turn, and ! alone prompts", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.command = async (command) => {
+    client.calls.command.push(command);
+    return { exit_code: 3, output: "hi", timed_out: false };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "!ls";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.command, ["ls"]);
+  assert.deepEqual(client.calls.prompt, []);
+  const commandEntry = latestCommandEntry(document);
+  assert.ok(commandEntry);
+  assert.match(visibleText(commandEntry), /! ls/);
+  assert.match(visibleText(commandEntry), /hi/);
+  assert.match(visibleText(commandEntry), /exit 3/);
+
+  input.value = "start turn";
+  const firstPrompt = document.getElementById("prompt-form").dispatch("submit");
+  client.resolvePrompt({ accepted: true, run_id: "command-run" });
+  await firstPrompt;
+  input.value = "!ls";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.command, ["ls"]);
+  assert.equal(input.value, "!ls");
+  assert.equal(document.getElementById("prompt-error").textContent, "Wait for the turn to finish to run a command.");
+
+  const ordinaryDocument = new FakeDocument();
+  const ordinaryClient = fakeClient();
+  ordinaryClient.prompt = async (text) => {
+    ordinaryClient.calls.prompt.push(text);
+    return { accepted: true, run_id: "bang-prompt" };
+  };
+  await start({ global: {}, document: ordinaryDocument, client: ordinaryClient });
+  ordinaryDocument.getElementById("prompt").value = "!";
+  await ordinaryDocument.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(ordinaryClient.calls.prompt, ["!"]);
+  assert.deepEqual(ordinaryClient.calls.command, []);
+});
+
+test("a stale approval leaves the approvals area", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.approve = async () => ({ status: 404 });
+  await start({ global: {}, document, client });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "stale-approval", operation: "write_file",
+    target: "result.txt", details: "write the result",
+  } });
+  const approvals = document.getElementById("approvals");
+  const deny = find(approvals, (node) => node.tagName === "BUTTON" && node.textContent === "Deny");
+  await deny.dispatch("click");
+  assert.equal(approvals.children.length, 0);
+});
+
+test("running activity uses progressive wording until its call finishes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(toolStarted("running-shell", "run_shell", "x"));
+  let line = document.getElementById("chat").children[0];
+  assert.equal(textInDocumentOrder(line), "Running x…");
+  assert.equal(line.attributes.get("title"), "Running x…");
+  await client.emit(toolFinished("running-shell", "run_shell"));
+  line = document.getElementById("chat").children[0];
+  assert.equal(textInDocumentOrder(line), "Ran x.");
+  assert.equal(line.attributes.get("title"), "Ran x.");
+});
+
+test("activity is past tense after a run ends or from replayed history", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "root-run", agent_name: "leader" }));
+  await client.emit(eventFrame("ToolCallStarted", {
+    agent_id: "leader", run_id: "root-run", tool_call_id: "unfinished-shell",
+    tool_name: "run_shell", target: "x",
+  }));
+  await client.emit(eventFrame("RunFinished", { agent_id: "leader", run_id: "root-run" }));
+  assert.equal(textInDocumentOrder(document.getElementById("chat").children[0]), "Ran x.");
+
+  const replayDocument = new FakeDocument();
+  const replayClient = fakeClient();
+  await start({ global: {}, document: replayDocument, client: replayClient });
+  await replayClient.emit(eventFrame("HistoryMessage", {
+    role: "assistant", text: "", tool_calls: [{
+      id: "replayed-dispatch", name: "dispatch_subagent",
+      subagent_name: "explorer", task: "find the bug",
+    }],
+  }));
+  assert.equal(textInDocumentOrder(replayDocument.getElementById("chat").children[0]), "Dispatched explorer.");
+});
+
+test("approval question wording describes what the tool needs", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("ToolCallStarted", {
+    tool_call_id: "approval-call", tool_name: "run_shell", target: "pytest",
+  }));
+  await client.emit(eventFrame("PermissionRequested", {
+    tool_call_id: "approval-call", tool_name: "run_shell", mode: "ask",
+  }));
+  const question = () => find(document.getElementById("chat"), (node) => node.className.includes("question"));
+  assert.equal(question().textContent, "run_shell needs approval — waiting for an answer.");
+  await client.emit(toolFinished("approval-call", "run_shell"));
+  assert.equal(question().textContent, "run_shell needs approval — allowed.");
+  assert.doesNotMatch(question().textContent, /asks for/);
 });
 
 test("shell approvals show and answer the remember button only when offered", async () => {
@@ -5269,9 +5861,9 @@ test("transcript prose, activity, approvals, and turns use their assigned surfac
 
 test("agent turns use colored dots joined only between consecutive blocks", async () => {
   const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
-  const entryMargins = css.match(/#chat\s*>\s*:is\(\.prompt,\s*\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\s*\{([^}]*)\}/)?.[1];
-  const dotRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)::before\s*\{([^}]*)\}/)?.[1];
-  const threadRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\):has\(\+ :is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\)::after\s*\{([^}]*)\}/)?.[1];
+  const entryMargins = css.match(/#chat\s*>\s*:is\(\.prompt,\s*\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\s*\{([^}]*)\}/)?.[1];
+  const dotRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)::before\s*\{([^}]*)\}/)?.[1];
+  const threadRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\):has\(\+ :is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\)::after\s*\{([^}]*)\}/)?.[1];
   assert.match(entryMargins, /margin-top:\s*0;/);
   assert.match(entryMargins, /margin-bottom:\s*0;/);
   assert.match(css, /#chat\s*>\s*\.prompt:not\(:first-child\)\s*\{[^}]*margin-top:\s*var\(--space-6\);/s);

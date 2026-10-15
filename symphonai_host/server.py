@@ -32,12 +32,14 @@ from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR, AnthropicProvider
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR, GeminiProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
+from symphonai_api.provider_catalog import CATALOG, build_catalog_provider, catalog_keys
 from symphonai_api.session import SessionError, TranscriptError
 from symphonai_api.paths import symphonai_home
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
 from symphonai_host.broker import EventBroker, Subscription
+from symphonai_host.approvals import InvalidApprovalAnswer
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
 from symphonai_host.files import repository_files, repository_tree
 from symphonai_host.protocol import (
@@ -52,6 +54,7 @@ from symphonai_host.protocol import (
 from symphonai_host.run import (
     AgentControlError,
     ChangedOutsideError,
+    CommandActiveError,
     HostRun,
     ModeSelectionError,
     NoConversationError,
@@ -76,6 +79,9 @@ PROVIDERS = (
     ("anthropic", ANTHROPIC_KEY_ENV_VAR, AnthropicProvider),
     ("gemini", GEMINI_KEY_ENV_VAR, GeminiProvider),
     ("openai", OPENAI_KEY_ENV_VAR, OpenAIProvider),
+) + tuple(
+    (key, CATALOG[key].api_key_env_var, None)
+    for key in catalog_keys()
 )
 
 
@@ -136,6 +142,10 @@ def _provider(name: str | None = None, model: str | None = None, base_url: str |
     vendor, key, provider_class = next(row for row in PROVIDERS if row[0] == name)
     if not os.environ.get(key, "").strip():
         raise ProviderSelectionError(f"{vendor} has no API key")
+    if name in CATALOG:
+        if base_url is not None:
+            raise ProviderSelectionError(f"{name} uses its catalog base URL")
+        return build_catalog_provider(name, model)
     options = {}
     if model is not None:
         options["model"] = model
@@ -160,6 +170,8 @@ class HostServer:
         broker: EventBroker | None = None,
         keepalive_seconds: float = 15.0,
         system_prompt: str | None = None,
+        base_prompt: str = "",
+        subagent_base_prompt: str = "",
         working_dir: Path | None = None,
         max_turns: int = 20,
         model: str | None = None,
@@ -189,6 +201,8 @@ class HostServer:
             policy,
             self.broker,
             system_prompt=system_prompt,
+            base_prompt=base_prompt,
+            subagent_base_prompt=subagent_base_prompt,
             working_dir=working_dir,
             max_turns=max_turns,
             model=model,
@@ -238,6 +252,8 @@ class HostServer:
                 tool_call_id=approval.tool_call_id,
                 remember=approval.remember,
                 session_id=approval.session_id,
+                kind=approval.kind,
+                options=approval.options,
             )
         )
         return True
@@ -944,6 +960,7 @@ class HostServer:
                     configured_search = None if search_key is None else search_endpoint(search_key)
                     settings = {
                         "mode": host.run.policy.mode,
+                        "selection": host.run.selection(),
                         "config": [] if extensions is None else [
                             {
                                 "key": key,
@@ -1012,6 +1029,8 @@ class HostServer:
                     if not self._authorized():
                         return
                     values = parse_qs(request_url.query, keep_blank_values=True).get("limit", [])
+                    queries = parse_qs(request_url.query, keep_blank_values=True).get("query", [])
+                    query = queries[0] if len(queries) == 1 else None
                     try:
                         limit = int(values[0]) if len(values) == 1 else None
                     except ValueError:
@@ -1021,6 +1040,7 @@ class HostServer:
                     self._json(HTTPStatus.OK, list_sessions(
                         host.run.sessions_root, limit=limit,
                         activity=host.run.session_activity(),
+                        query=query,
                     ))
                     return
                 if request_path == "/spec/runs":
@@ -1155,7 +1175,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -1460,6 +1480,42 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, reply)
                     return
+                if self.path == "/steer":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"text"} or not isinstance(payload.get("text"), str) or not payload["text"].strip():
+                            raise ProtocolError("steer requires one non-blank text string")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        host.run.steer(payload["text"])
+                    except RunActiveError:
+                        self._json(HTTPStatus.CONFLICT, {"error": "no turn is running"})
+                        return
+                    self._json(HTTPStatus.OK, {"steered": True})
+                    return
+                if self.path == "/command":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"command"} or not isinstance(payload.get("command"), str) or not payload["command"].strip():
+                            raise ProtocolError("command requires one non-blank command string")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        reply = host.run.run_user_command(payload["command"])
+                    except CommandActiveError:
+                        self._json(HTTPStatus.CONFLICT, {"error": "a command is already running"})
+                        return
+                    except RunActiveError:
+                        self._json(HTTPStatus.CONFLICT, {"error": "wait for the turn to finish"})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
                 if self.path == "/changes/revert":
                     try:
                         payload = self._read_object()
@@ -1538,6 +1594,7 @@ class HostServer:
                         ANTHROPIC_KEY_ENV_VAR,
                         GEMINI_KEY_ENV_VAR,
                         OPENAI_KEY_ENV_VAR,
+                        *(variable for _, variable, _ in PROVIDERS[3:]),
                         *(endpoint.api_key_env_var for endpoint in search_endpoints()),
                     ):
                         self._json(HTTPStatus.BAD_REQUEST, {"error": "unknown credential name"})
@@ -1569,6 +1626,51 @@ class HostServer:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
                         return
                     self._json(HTTPStatus.OK, {"ended": True})
+                    return
+                if self.path == "/session/rename":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"run_id", "title"} or any(
+                            not isinstance(payload.get(key), str) for key in ("run_id", "title")
+                        ):
+                            raise ProtocolError("session/rename requires run_id and title strings")
+                        run_id = payload["run_id"]
+                        title = payload["title"].strip()
+                        if not run_id or run_id in (".", "..") or Path(run_id).name != run_id or not title or len(title) > 200:
+                            raise ProtocolError("title must be non-blank and at most 200 characters")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    from symphonai_api.session import SessionStore
+                    if not (host.run.sessions_root / run_id).is_dir():
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown session"})
+                        return
+                    with host.run._lock:
+                        opened = host.run._open_conversations.get(run_id)
+                        session_store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, run_id)
+                        try:
+                            meta = session_store.read_meta()
+                            meta["title"] = title
+                            session_store.write_meta(meta)
+                        finally:
+                            if opened is None:
+                                session_store.close()
+                    self._json(HTTPStatus.OK, {"renamed": True})
+                    return
+                if self.path == "/session/delete":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"run_id"} or not isinstance(payload.get("run_id"), str) or not payload["run_id"] or payload["run_id"] in (".", "..") or Path(payload["run_id"]).name != payload["run_id"]:
+                            raise ProtocolError("session/delete requires a run_id string")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        deleted = host.run.delete_session(payload["run_id"])
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND, {"deleted": deleted})
                     return
                 if self.path == "/session/fork":
                     try:
@@ -1693,18 +1795,27 @@ class HostServer:
                     except ProviderSelectionError as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
+                    except CommandActiveError:
+                        self._json(HTTPStatus.CONFLICT, {"error": "wait for the command to finish"})
+                        return
                     except RunActiveError as exc:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
                         return
                     self._json(HTTPStatus.OK, {"accepted": True, "run_id": run_id})
                     return
                 if kind == "approval":
-                    if not host.run.resolve_approval(
-                        request.approval_id,
-                        allowed=request.allowed,
-                        reason=request.reason,
-                        remember=request.remember,
-                    ):
+                    try:
+                        resolved = host.run.resolve_approval(
+                            request.approval_id,
+                            allowed=request.allowed,
+                            reason=request.reason,
+                            remember=request.remember,
+                            answer=request.answer,
+                        )
+                    except InvalidApprovalAnswer as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    if not resolved:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "unknown approval id"})
                         return
                     self._json(HTTPStatus.OK, {"resolved": True})

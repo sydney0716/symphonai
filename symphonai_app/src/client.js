@@ -272,13 +272,22 @@ export function createClient({
       return request("GET", "/spec/runs", undefined, readListReply);
     },
 
-    approve(id, allowed, reason = "", remember = false) {
+    approve(id, allowed, reason = "", remember = false, answerText = "") {
       return post("approval", {
         approval_id: id,
         allowed,
         reason,
         ...(remember ? { remember: true } : {}),
+        ...(typeof answerText === "string" && answerText.length > 0 ? { answer: answerText } : {}),
       });
+    },
+
+    steer(text) {
+      return request("POST", "/steer", { text }, readReply, { detailOnError: true });
+    },
+
+    command(command) {
+      return request("POST", "/command", { command }, readReply, { detailOnError: true });
     },
 
     openSession(runId) {
@@ -335,13 +344,28 @@ export function createClient({
       return request("GET", "/approvals");
     },
 
-    sessions(limit) {
+    sessions(limit, query) {
+      const params = new URLSearchParams();
+      if (limit !== undefined) params.set("limit", String(limit));
+      if (query !== undefined && query !== "") params.set("query", query);
       return request(
         "GET",
-        limit === undefined ? "/sessions" : `/sessions?limit=${limit}`,
+        params.size ? `/sessions?${params}` : "/sessions",
         undefined,
         readListReply,
       );
+    },
+
+    renameSession(runId, title) {
+      return request("POST", "/session/rename", { run_id: runId, title }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    deleteSession(runId) {
+      return request("POST", "/session/delete", { run_id: runId }, readReply, {
+        detailOnError: true,
+      });
     },
 
     project() {

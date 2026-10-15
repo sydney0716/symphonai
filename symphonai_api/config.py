@@ -75,6 +75,10 @@ _SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions",
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
+_PROVIDER_NAMES = {
+    "anthropic", "gemini", "openai", "deepseek", "grok", "groq", "kimi",
+    "ollama", "openrouter", "qwen", "together",
+}
 
 
 def _raise(source: Path | None, key: str, detail: str) -> None:
@@ -135,11 +139,11 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
             _boolean(source, "memory.extract", memory["extract"])
         if "provider" in memory:
             provider = _string(source, "memory.provider", memory["provider"])
-            if provider not in {"anthropic", "gemini", "openai"}:
+            if provider not in _PROVIDER_NAMES:
                 _raise(source, "memory.provider", f"unknown provider {provider!r}")
     models = _table(source, values, "models")
     if models is not None:
-        _unknown_keys(source, "models", models, {"anthropic", "gemini", "openai"})
+        _unknown_keys(source, "models", models, _PROVIDER_NAMES)
         for provider in models:
             _strings(source, f"models.{provider}", models[provider])
     search = _table(source, values, "search")

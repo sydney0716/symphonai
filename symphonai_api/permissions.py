@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import fnmatch
 import ipaddress
+import os
+import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -31,6 +33,7 @@ from symphonai_api.events import (
     emit,
 )
 from symphonai_api.web_domains import preapproved_domains
+from symphonai_api.tools.shell_parse import commands_for_argv
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     ".env",
@@ -84,6 +87,7 @@ class DenialReason(str, Enum):
     OUTSIDE_WRITE_SCOPE = "outside_write_scope"
     EMPTY_COMMAND = "empty_command"
     ALWAYS_DENY = "always_deny"
+    UNCHECKABLE_COMMAND = "uncheckable_command"
     SHELL_DISABLED = "shell_disabled"
     NOT_ALLOWLISTED = "not_allowlisted"
     NO_APPROVAL_CALLBACK = "no_approval_callback"
@@ -112,6 +116,7 @@ DENIAL_OUTCOMES: dict[DenialReason, ApprovalOutcome] = {
     DenialReason.OUTSIDE_WRITE_SCOPE: ApprovalOutcome.REJECTED,
     DenialReason.EMPTY_COMMAND: ApprovalOutcome.REJECTED,
     DenialReason.ALWAYS_DENY: ApprovalOutcome.REJECTED,
+    DenialReason.UNCHECKABLE_COMMAND: ApprovalOutcome.REJECTED,
     DenialReason.SHELL_DISABLED: ApprovalOutcome.REJECTED,
     DenialReason.NOT_ALLOWLISTED: ApprovalOutcome.REJECTED,
     DenialReason.NO_APPROVAL_CALLBACK: ApprovalOutcome.UNAVAILABLE,
@@ -160,6 +165,17 @@ _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, 
 
 def shell_grant_prefix(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     """Return the stable command prefix used for a session shell grant."""
+    if not argv:
+        return ()
+    program = os.path.basename(argv[0])
+    if program in {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}:
+        return ()
+    if re.fullmatch(r"(?:python[0-9.]*|node|ruby|perl|php|deno|bun|sh|bash|zsh|dash)", program):
+        if len(argv) >= 3 and argv[1] == "-m" and not argv[2].startswith("-"):
+            return (argv[0], "-m", argv[2])
+        if len(argv) >= 2 and not argv[1].startswith("-"):
+            return tuple(argv[:2])
+        return ()
     if len(argv) >= 2 and not argv[1].startswith("-"):
         return tuple(argv[:2])
     return tuple(argv[:1])
@@ -174,6 +190,8 @@ class ToolApprovalRequest:
     details: str = ""
     tool_call_id: str = ""
     command: tuple[str, ...] = ()
+    commands: tuple[tuple[str, ...], ...] | None = None
+    command_writes: tuple[bool, ...] = ()
 
 
 ApprovalCallback = Callable[[ToolApprovalRequest], PermissionDecision | bool]
@@ -550,13 +568,52 @@ class PermissionPolicy:
                 tool_name="run_shell",
             )
         argv_tuple = tuple(argv)
-        for denied_prefix in ALWAYS_DENY_COMMANDS:
-            if argv_tuple[: len(denied_prefix)] == denied_prefix:
-                return self._deny(
-                    f"command matches always-deny rule: {' '.join(denied_prefix)!r}",
-                    denial=DenialReason.ALWAYS_DENY,
-                    tool_name="run_shell",
-                )
+        commands = commands_for_argv(argv)
+        wrappers = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
+        if commands is not None:
+            for command in commands:
+                words = command.argv
+                if os.path.basename(words[0]) == "find":
+                    candidate_starts = (0,)
+                elif os.path.basename(words[0]) in wrappers:
+                    candidate_starts = range(1, len(words))
+                else:
+                    candidate_starts = (0,)
+                lookup_positions = {
+                    index + 2
+                    for index, word in enumerate(words[:-2])
+                    if os.path.basename(word) == "command" and words[index + 1] in {"-v", "-V"}
+                }
+                for candidate_index in candidate_starts:
+                    if candidate_index in lookup_positions:
+                        continue
+                    candidate = words[candidate_index:]
+                    program = os.path.basename(candidate[0]) if candidate else ""
+                    if program == "command" and len(candidate) > 1 and candidate[1] in {"-v", "-V"}:
+                        continue
+                    if program == "find":
+                        find_words = candidate
+                        exec_index = next(
+                            (
+                                index for index, word in enumerate(find_words)
+                                if word in {"-exec", "-execdir", "-ok", "-okdir"}
+                            ),
+                            None,
+                        )
+                        if exec_index is None:
+                            continue
+                        candidate = find_words[exec_index + 1:]
+                    for denied_prefix in ALWAYS_DENY_COMMANDS:
+                        if (
+                            candidate
+                            and os.path.basename(candidate[0]) == denied_prefix[0]
+                            and candidate[1:len(denied_prefix)] == denied_prefix[1:]
+                        ):
+                            return self._deny(
+                                f"command matches always-deny rule: {' '.join(denied_prefix)!r}",
+                                denial=DenialReason.ALWAYS_DENY,
+                                tool_name="run_shell",
+                            )
         if self.mode == "plan":
             return self._deny(
                 "plan mode allows reads only; this call would change the world",
@@ -564,11 +621,24 @@ class PermissionPolicy:
                 tool_name="run_shell",
             )
         if self.mode == "ask":
+            nested = (
+                len(argv) >= 3
+                and os.path.basename(argv[0]) in {"sh", "bash", "zsh", "dash"}
+                and re.fullmatch(r"^-[A-Za-z]*c[A-Za-z]*$", argv[1]) is not None
+            )
             return self._ask_approval(
                 operation="run_shell",
-                target=" ".join(argv),
+                target=argv[2] if nested else " ".join(argv),
                 details=f"run in repo root: {self.repo_root}",
                 command=argv_tuple,
+                commands=(
+                    () if commands is None
+                    else tuple(command.argv for command in commands)
+                ),
+                command_writes=(
+                    () if commands is None
+                    else tuple(command.writes for command in commands)
+                ),
             )
         if not self.shell_enabled:
             return self._deny(
@@ -576,9 +646,27 @@ class PermissionPolicy:
                 denial=DenialReason.SHELL_DISABLED,
                 tool_name="run_shell",
             )
-        for allowed_prefix in self.shell_allowlist:
-            if argv_tuple[: len(allowed_prefix)] == allowed_prefix:
-                return PermissionDecision.allow()
+        if commands is None:
+            return self._deny(
+                "this command uses shell syntax that cannot be checked "
+                "(command or process substitution, a subshell, a here-document, or a background job); "
+                "run it as simpler commands",
+                denial=DenialReason.UNCHECKABLE_COMMAND,
+                tool_name="run_shell",
+            )
+        if all(
+            (not command.writes and any(
+                command.argv[:len(prefix)] == prefix for prefix in self.shell_allowlist
+            )) or (command.writes and () in self.shell_allowlist)
+            for command in commands
+        ):
+            return PermissionDecision.allow()
+        if any(command.writes for command in commands):
+            return self._deny(
+                "output redirection is not allowlisted",
+                denial=DenialReason.NOT_ALLOWLISTED,
+                tool_name="run_shell",
+            )
         return self._deny(
             f"command does not match the shell allowlist: {list(argv)}",
             denial=DenialReason.NOT_ALLOWLISTED,
@@ -614,6 +702,8 @@ class PermissionPolicy:
         target: str,
         details: str = "",
         command: tuple[str, ...] = (),
+        commands: tuple[tuple[str, ...], ...] | None = None,
+        command_writes: tuple[bool, ...] = (),
     ) -> PermissionDecision:
         with self._approval_lock:
             self._permission_requested(operation)
@@ -632,6 +722,8 @@ class PermissionPolicy:
                         details=details,
                         tool_call_id=tool_call_id,
                         command=command,
+                        commands=commands,
+                        command_writes=command_writes,
                     )
                 )
             except Exception as exc:  # noqa: BLE001

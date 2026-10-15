@@ -42,6 +42,7 @@ class ApprovalReply:
     allowed: bool
     reason: str = ""
     remember: bool = False
+    answer: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,8 @@ class ApprovalRequested:
     tool_call_id: str = ""
     remember: str = ""
     session_id: str | None = None
+    kind: str = "approval"
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -240,6 +243,7 @@ def decode_request(kind: str, payload: dict) -> PromptRequest | ApprovalReply | 
             allowed=_required(payload, kind, "allowed", bool),
             reason=_optional_string(payload, kind, "reason"),
             remember=_optional_bool(payload, kind, "remember"),
+            answer=_optional_string(payload, kind, "answer"),
         )
     if kind == "stop":
         return StopRequest(reason=_optional_string(payload, kind, "reason"))

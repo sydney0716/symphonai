@@ -12,6 +12,7 @@ from unittest import mock
 from symphonai_api.agent_file import AgentFileError, load_agent_directory, load_agent_file
 from symphonai_api.agent_spec import ModelSelector
 import symphonai_api.config as config_module
+from symphonai_api import provider_catalog
 from symphonai_api.config import (
     CapabilityCeiling,
     ConfigError,
@@ -1044,20 +1045,33 @@ def search_endpoint_validation() -> None:
 
 @check("config.model_preferences")
 def model_preferences() -> None:
+    expected_providers = {"anthropic", "gemini", "openai"} | set(provider_catalog.catalog_keys())
+    if config_module._PROVIDER_NAMES != expected_providers:
+        fail(
+            "config provider names differ from the vendors plus provider catalog: "
+            f"{config_module._PROVIDER_NAMES!r} != {expected_providers!r}"
+        )
+    with mock.patch.dict(provider_catalog.CATALOG, {"symphonai-test-provider": object()}):
+        expanded_catalog = {"anthropic", "gemini", "openai"} | set(provider_catalog.catalog_keys())
+        if config_module._PROVIDER_NAMES == expanded_catalog:
+            fail("adding a provider to the catalog alone did not expose a config mismatch")
+
     with tempfile.TemporaryDirectory() as temporary:
         repo_root, home = _roots(temporary)
         source = _scope_path(Scope.PROJECT, repo_root, home)
-        _write(source, '[models]\nanthropic = ["claude-sonnet"]\nopenai = []\n')
+        _write(source, '[models]\nanthropic = ["claude-sonnet"]\nopenai = []\ndeepseek = ["deepseek-chat"]\n')
         resolved = load_config(repo_root=repo_root, home=home)
         if resolved.get("models.anthropic") != ["claude-sonnet"]:
             fail(f"provider model preferences were not flattened: {resolved.values!r}")
         if resolved.get("models.openai") != [] or resolved.scope_of("models.openai") is not Scope.PROJECT:
             fail(f"empty model preference or provenance was lost: {resolved.values!r}")
+        if resolved.get("models.deepseek") != ["deepseek-chat"]:
+            fail(f"catalog provider model preference was not accepted: {resolved.values!r}")
         if resolved.get("models.gemini") is not None:
             fail("an omitted provider unexpectedly gained a model preference")
-        _write(source, '[memory]\nmodel = "extractor-model"\nprovider = "openai"\nextract = false\n')
+        _write(source, '[memory]\nmodel = "extractor-model"\nprovider = "ollama"\nextract = false\n')
         resolved = load_config(repo_root=repo_root, home=home)
-        if resolved.get("memory.model") != "extractor-model" or resolved.get("memory.provider") != "openai":
+        if resolved.get("memory.model") != "extractor-model" or resolved.get("memory.provider") != "ollama":
             fail(f"memory extraction settings were not resolved: {resolved.values!r}")
         if resolved.get("memory.extract") is not False:
             fail(f"memory extraction switch was not resolved: {resolved.values!r}")

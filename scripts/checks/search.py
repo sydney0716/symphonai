@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import unittest.mock as mock
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.models import ToolCall
+from symphonai_api.permissions import DEFAULT_FORBIDDEN_PATTERNS, PermissionPolicy
+from symphonai_api.tools.search import GlobTool, GrepTool
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import search_tree
 
@@ -344,3 +349,56 @@ def check_search_cancellation() -> None:
                 pass
             else:
                 fail(f"{tool_name} did not observe cancellation inside its file walk")
+
+
+@check("search.gitignore_respected")
+def check_gitignore_respected() -> None:
+    if shutil.which("git") is None:
+        print("SKIP: git is unavailable")
+        return
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        (root / ".gitignore").write_text("build/\ndist/\n*.log\n", encoding="utf-8")
+        for relative in (
+            "src/a.py", "build/b.py", "build/kept.py", "dist/c.py", "notes.log",
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("needle\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore", "src/a.py"], cwd=root, check=True)
+        subprocess.run(["git", "add", "-f", "build/kept.py"], cwd=root, check=True)
+
+        policy = PermissionPolicy(
+            repo_root=root,
+            forbidden_patterns=tuple(
+                pattern for pattern in DEFAULT_FORBIDDEN_PATTERNS
+                if pattern not in ("build/", "dist/")
+            ),
+        )
+        glob = GlobTool()
+        grep = GrepTool()
+        root_glob = glob.execute(
+            ToolCall(id="gitignore-glob-root", name="glob", arguments={"pattern": "**/*.py", "head_limit": 0}),
+            policy,
+        )
+        if set(root_glob.content.splitlines()) != {"src/a.py", "build/kept.py"}:
+            fail(f"root glob did not skip ignored untracked paths and keep the tracked file: {root_glob!r}")
+        root_grep = grep.execute(
+            ToolCall(
+                id="gitignore-grep-root", name="grep",
+                arguments={"pattern": "needle", "output_mode": "content", "head_limit": 0},
+            ),
+            policy,
+        )
+        if any(path in root_grep.content for path in ("build/b.py", "dist/c.py", "notes.log")):
+            fail(f"root grep returned an ignored path: {root_grep!r}")
+        build_glob = glob.execute(
+            ToolCall(
+                id="gitignore-glob-named", name="glob",
+                arguments={"path": "build", "pattern": "*.py", "head_limit": 0},
+            ),
+            policy,
+        )
+        if set(build_glob.content.splitlines()) != {"build/b.py", "build/kept.py"}:
+            fail(f"a named ignored directory was filtered: {build_glob!r}")

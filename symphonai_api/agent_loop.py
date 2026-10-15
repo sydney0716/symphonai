@@ -259,7 +259,32 @@ class ApiAgent:
                     data=data,
                 )
 
+        def append_unread_redirects() -> None:
+            if run is None:
+                return
+            for text in run.close_redirects():
+                redirect = Message(role=Role.USER, content=text)
+                conversation.append(redirect)
+                append_record(
+                    "message",
+                    turn_id=redirect.turn_id,
+                    data=message_to_json(redirect),
+                )
+                self._persisted_digests.append(_message_digest(redirect))
+
+        def append_repaired_tool_results(
+            tool_call_ids: list[str], turn_id: str | None
+        ) -> None:
+            for repaired_message in conversation[-len(tool_call_ids):] if tool_call_ids else ():
+                append_record(
+                    "message",
+                    turn_id=turn_id,
+                    data=message_to_json(repaired_message),
+                )
+                self._persisted_digests.append(_message_digest(repaired_message))
+
         def finish_for_budget(stopped_reason: str) -> AgentRunResult:
+            append_unread_redirects()
             final_response = response or ModelResponse(
                 message=Message(role=Role.ASSISTANT), stop_reason=stopped_reason
             )
@@ -475,6 +500,7 @@ class ApiAgent:
                         )
                         if redirect_limit is None or turn < redirect_limit:
                             continue
+                    append_unread_redirects()
                     result = AgentRunResult(
                         final_response=response,
                         messages=conversation,
@@ -675,6 +701,7 @@ class ApiAgent:
                     ),
                 )
             assert response is not None and self._max_turns is not None
+            append_unread_redirects()
             result = AgentRunResult(
                 final_response=response,
                 messages=conversation,
@@ -709,17 +736,8 @@ class ApiAgent:
                 cancelled=True,
                 turn_id=repair_turn_id,
             )
-            if repaired_tool_call_ids:
-                repaired_messages = conversation[-len(repaired_tool_call_ids) :]
-                for repaired_message in repaired_messages:
-                    append_record(
-                        "message",
-                        turn_id=repair_turn_id,
-                        data=message_to_json(repaired_message),
-                    )
-                    self._persisted_digests.append(
-                        _message_digest(repaired_message)
-                    )
+            append_repaired_tool_results(repaired_tool_call_ids, repair_turn_id)
+            append_unread_redirects()
             append_record(
                 "cancellation",
                 turn_id=(
@@ -758,6 +776,17 @@ class ApiAgent:
             )
             return result
         except Exception as exc:
+            repair_turn_id = (
+                None if current_turn_ref is None else current_turn_ref.turn_id
+            )
+            repaired_tool_call_ids = repair_unanswered_tool_calls(
+                conversation,
+                error="the run failed before this tool completed",
+                cancelled=False,
+                turn_id=repair_turn_id,
+            )
+            append_repaired_tool_results(repaired_tool_call_ids, repair_turn_id)
+            append_unread_redirects()
             append_record(
                 "run_failed", turn_id=None, data={"error": str(exc)}
             )

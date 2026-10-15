@@ -26,7 +26,7 @@ from symphonai_api.memory_prompt import MEMORY_GUIDE, memory_age
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, ToolResult
 from symphonai_api.model_table import model_capabilities
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ModelProvider
+from symphonai_api.providers.base import ModelProvider, tool_result_text
 from symphonai_api.serialization import message_to_json
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tools.memory import MemoryTool
@@ -118,7 +118,7 @@ def evidence_rows(messages: Sequence[Message]) -> list[EvidenceRow]:
             result = message.tool_result
             tool_name = tool_names.get(result.tool_call_id, "tool")
             tier, label = (2, "other agent") if tool_name == "dispatch_subagent" else (3, "tool")
-            body = result.content if result.ok else (result.error or result.content)
+            body = tool_result_text(result)
             if not result.ok:
                 body = f"{tool_name} error: {body}"
             if estimate_text_tokens(body) > TOOL_OUTPUT_TOKENS:

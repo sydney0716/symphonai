@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.models import ModelRequest, ModelResponse
+from symphonai_api.models import ModelRequest, ModelResponse, ToolResult
 
 if TYPE_CHECKING:
     from symphonai_api.streaming import StreamChunk
@@ -43,6 +43,15 @@ class ContextLengthExceededError(ProviderError):
         self.actual_tokens = actual_tokens
         self.limit_tokens = limit_tokens
         self.request_tokens = request_tokens
+
+
+def tool_result_text(result: ToolResult) -> str:
+    """Return tool output and failure details in the order useful to a model."""
+    if result.ok:
+        return result.content
+    if result.error and result.content:
+        return f"{result.error}\n{result.content}"
+    return result.error or result.content
 
 
 def parse_json_object(raw: bytes, operation: str) -> dict[str, Any]:

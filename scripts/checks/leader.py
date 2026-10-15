@@ -76,6 +76,7 @@ from symphonai_api.providers.openai_provider import (
     _build_request_body as _build_openai_body,
 )
 from symphonai_api.runner import standard_tool_registry
+from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import SessionStore, load_run_for_resume, read_records
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tool_results import ToolResultStore
@@ -314,6 +315,93 @@ def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
         name="dispatch_subagent",
         arguments={"subagent_name": name, "task": task},
     )
+
+
+@check("leader.base_prompts_lead_their_agents")
+def base_prompts_lead_their_agents() -> None:
+    if (
+        "ask_user" not in LEADER_BASE_PROMPT
+        or "update_plan" not in LEADER_BASE_PROMPT
+        or "propose_plan" not in LEADER_BASE_PROMPT
+        or "ask in your reply" in LEADER_BASE_PROMPT
+    ):
+        fail("leader base prompt does not direct the model to the host tools")
+    expected_subagent_prompt = """You are a subagent in SymphonAI. The leader gave you one task. You do not see its conversation with the person, so the task message is everything you know.
+
+- Read before you change. Change existing files with edit_file or multi_edit_file, and use write_file only to create a file or replace one completely.
+- Stay inside the task. If it cannot be done as given, stop and say why instead of widening it.
+- Verify what you changed with the narrowest relevant command, and read its output.
+- Leave nothing behind. Put scratch output in a temporary directory, never in the repository.
+- Your final message is all the leader receives. End with what you did, the files you changed, what you ran and its result, and anything unresolved."""
+    if SUBAGENT_BASE_PROMPT != expected_subagent_prompt:
+        fail("subagent base prompt changed")
+    with workspace() as ws:
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("worker", "inspect")])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("explorer", "look")])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        child_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "worker done")),
+            ModelResponse(Message(Role.ASSISTANT, "explorer done")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(ws.root),
+            base_prompt="BASE",
+            subagent_base_prompt="SUB",
+            subagent_specs={
+                "leader": _spec(ws.root, "leader", prompt="DEFINED", memory=MemorySettings(enabled=False)),
+                "worker": _spec(ws.root, "worker", prompt="ROLE", memory=MemorySettings(enabled=False)),
+                "explorer": _spec(ws.root, "explorer", memory=MemorySettings(enabled=False)),
+            },
+        ))
+        leader.run("start")
+        leader_messages = leader_provider.requests[0].messages
+        system_messages = [message for message in leader_messages if message.role is Role.SYSTEM]
+        if len(system_messages) != 1 or system_messages[0].text != "BASE\n\nDEFINED":
+            fail(f"leader base prompt did not precede its definition in one system message: {leader_messages!r}")
+        child_prompts = [
+            [message.text for message in request.messages if message.role is Role.SYSTEM]
+            for request in child_provider.requests
+        ]
+        if child_prompts != [["SUB\n\nROLE"], ["SUB"]]:
+            fail(f"subagent base prompt was not joined before each role prompt: {child_prompts!r}")
+
+        no_definition_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        Leader(LeaderConfig(
+            leader_provider=no_definition_provider,
+            subagent_provider=FakeModelProvider(),
+            repo_root=str(ws.root),
+            base_prompt="BASE",
+            subagent_specs={"leader": _spec(
+                ws.root, "leader", memory=MemorySettings(enabled=False),
+            )},
+        )).run("start")
+        no_definition_system = [
+            message for message in no_definition_provider.requests[0].messages
+            if message.role is Role.SYSTEM
+        ]
+        if len(no_definition_system) != 1 or no_definition_system[0].text != "BASE":
+            fail(f"leader base prompt was missing without a defined leader prompt: {no_definition_system!r}")
+
+        plain_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        Leader(LeaderConfig(
+            leader_provider=plain_provider,
+            subagent_provider=FakeModelProvider(),
+            repo_root=str(ws.root),
+            subagent_specs={"leader": _spec(
+                ws.root, "leader", prompt="DEFINED", memory=MemorySettings(enabled=False),
+            )},
+        )).run("start")
+        plain_messages = plain_provider.requests[0].messages
+        if [message.text for message in plain_messages] != ["DEFINED", "start"]:
+            fail(f"empty base prompt changed the existing initial message list: {plain_messages!r}")
 
 
 class _ControlProvider(FakeModelProvider):
@@ -3829,6 +3917,53 @@ def check_redirects_reach_next_requests() -> None:
                 or messages[-1].text != expected
             ):
                 fail(f"redirect did not follow the preceding tool result: {messages!r}")
+
+
+@check("leader.unread_redirects_kept")
+def check_unread_redirects_kept() -> None:
+    with workspace() as ws:
+        class RedirectAtLimitProvider(FakeModelProvider):
+            def __init__(self):
+                super().__init__([
+                    ModelResponse(Message(Role.ASSISTANT, "first answer")),
+                    ModelResponse(Message(Role.ASSISTANT, "second answer")),
+                ])
+                self.leader = None
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                if self.call_count == 0:
+                    self.leader._leader_run.redirect("keep this direction")
+                return super().create_response(request, cancel=cancel)
+
+        provider = RedirectAtLimitProvider()
+        leader = Leader(LeaderConfig(
+            leader_provider=provider,
+            subagent_provider=provider,
+            repo_root=str(ws.root),
+            max_leader_turns=1,
+        ))
+        provider.leader = leader
+        first = leader.chat("first prompt")
+        second = leader.chat("second prompt")
+        messages = provider.requests[1].messages
+        redirect_index = next((
+            index for index, message in enumerate(messages)
+            if message.role is Role.USER and message.text == "keep this direction"
+        ), None)
+        prompt_index = next((
+            index for index, message in enumerate(messages)
+            if message.role is Role.USER and message.text == "second prompt"
+        ), None)
+        if (
+            first.final_answer != "first answer"
+            or second.final_answer != "second answer"
+            or redirect_index is None
+            or prompt_index is None
+            or redirect_index >= prompt_index
+        ):
+            fail(f"redirect left unread at the turn limit was lost or reordered: {messages!r}")
 
 
 @check("leader.stop_subagent_is_local")

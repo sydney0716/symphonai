@@ -18,6 +18,7 @@ from symphonai_api.mcp import McpError
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
+from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import default_sessions_root
 from symphonai_host.server import HostServer, _provider
 from symphonai_host.run import ModeSelectionError
@@ -79,6 +80,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         host = HostServer(
             _provider(),
             policy,
+            base_prompt=LEADER_BASE_PROMPT,
+            subagent_base_prompt=SUBAGENT_BASE_PROMPT,
             max_turns=arguments.max_turns,
             extensions=extensions,
             mcp_tools=mcp_tools,

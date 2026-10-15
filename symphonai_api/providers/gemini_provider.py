@@ -46,7 +46,7 @@ from symphonai_api.models import (
     has_attachments,
     reject_system_attachments,
 )
-from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
+from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object, tool_result_text
 from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_secret
 from symphonai_api.streaming import (
     StreamChunk,
@@ -138,7 +138,9 @@ def _build_contents(messages: list[Message]) -> list[dict[str, Any]]:
             if result is None:
                 continue
             payload = (
-                {"output": result.content} if result.ok else {"error": result.error or "tool failed"}
+                {"output": result.content}
+                if result.ok
+                else {"error": tool_result_text(result) or "tool failed"}
             )
             contents.append(
                 {

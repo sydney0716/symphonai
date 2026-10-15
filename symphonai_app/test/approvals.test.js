@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createApprovals } from "../src/approvals.js";
+import { createClient } from "../src/client.js";
 
 function question(id, overrides = {}) {
   return {
@@ -24,14 +25,15 @@ function client({ pending = [], approve } = {}) {
   const calls = { approve: [], approvals: 0 };
   return {
     calls,
-    async approve(id, allowed, reason, remember = false) {
+    async approve(id, allowed, reason, remember = false, answerText = "") {
       calls.approve.push({
         approval_id: id,
         allowed,
         reason,
         ...(remember ? { remember: true } : {}),
+        ...(answerText ? { answer: answerText } : {}),
       });
-      return approve ? approve(id, allowed, reason) : { resolved: true };
+      return approve ? approve(id, allowed, reason, remember, answerText) : { resolved: true };
     },
     async approvals() {
       calls.approvals += 1;
@@ -60,6 +62,43 @@ test("approval frames keep only a meaningful tool call id", async () => {
       state: "open",
     }],
   ]));
+});
+
+test("question approvals retain choices and send an answer only when present", async () => {
+  const boundary = client();
+  const approvals = createApprovals({ client: boundary });
+  await approvals.onFrame(frame("question-1", {
+    kind: "question", options: ["A", "B"],
+  }));
+  assert.deepEqual(approvals.state.get("question-1"), {
+    operation: "operation-question-1",
+    target: "target-question-1",
+    details: "details-question-1",
+    kind: "question",
+    options: ["A", "B"],
+    state: "open",
+  });
+  await approvals.answer("question-1", true, "", false, "B");
+  assert.deepEqual(boundary.calls.approve, [{
+    approval_id: "question-1", allowed: true, reason: "", answer: "B",
+  }]);
+});
+
+test("client approval request includes the answer text", async () => {
+  const requests = [];
+  const boundary = createClient({
+    port: 4312,
+    token: "approval-test-token",
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return { status: 200, async json() { return { resolved: true }; } };
+    },
+  });
+  await boundary.approve("A", true, "", false, "B");
+  assert.equal(requests[0].url, "http://127.0.0.1:4312/approval");
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    approval_id: "A", allowed: true, reason: "", answer: "B",
+  });
 });
 
 test("a repeated frame neither duplicates nor resets an answering question", async () => {

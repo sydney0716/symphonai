@@ -112,6 +112,7 @@ def prune_sessions(root: Path, *, period_days: int, now: datetime) -> int:
 
 def list_sessions(
     root: Path, *, limit: int | None = None, activity: dict[str, str] | None = None,
+    query: str | None = None,
 ) -> list[dict]:
     """List every session directory, retaining damaged entries for recovery."""
     root = Path(root)
@@ -148,6 +149,31 @@ def list_sessions(
             store = None
         sessions.append((item, store))
     sessions.sort(key=lambda entry: entry[0]["updated_at"] or "", reverse=True)
+    if query:
+        needle = query.casefold()
+        filtered = []
+        for item, store in sessions:
+            title = item["title"]
+            if isinstance(title, str) and needle in title.casefold():
+                filtered.append((item, store))
+                continue
+            if store is None:
+                continue
+            try:
+                records, _ = read_records(store.directory / "run.jsonl")
+                matched = False
+                for record in records:
+                    if record.get("type") != "message":
+                        continue
+                    message = message_from_json(record["data"])
+                    if message.role in (Role.USER, Role.ASSISTANT) and needle in message.text.casefold():
+                        matched = True
+                        break
+            except (OSError, TranscriptError, ValueError, KeyError, TypeError, UnicodeError):
+                matched = False
+            if matched:
+                filtered.append((item, store))
+        sessions = filtered
     selected = sessions if limit is None else sessions[:limit]
     for item, store in selected:
         if store is None:

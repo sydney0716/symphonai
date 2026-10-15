@@ -122,8 +122,10 @@ def check_tools_metadata_contract() -> None:
     shell_target = call_target("run_shell", {"argv": ["curl", shell_secret]})
     if shell_target != "curl" or shell_secret in shell_target:
         fail(f"shell target exposed more than the program name: {shell_target!r}")
-    if call_target("run_shell", {"command": "deploy.sh"}) != "":
-        fail("shell target accepted the undeclared command argument")
+    if call_target("run_shell", {"command": "deploy.sh"}) != "deploy.sh":
+        fail("shell target did not use the first parsed command")
+    if call_target("run_shell", {"command": "curl shell-secret | tail"}) != "curl":
+        fail("shell target did not limit its display to the first command")
     fetch_secret = "access_token=t"
     fetch_target = call_target(
         "web_fetch", {"url": f"https://user:pass@h/v1/x?{fetch_secret}"}

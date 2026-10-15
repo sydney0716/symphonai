@@ -42,10 +42,10 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   let activeTurn = null;
   let rootAgentId = null;
   let currentPrompt = null;
-  const activityTurns = new WeakMap();
-  const promptEdits = new WeakMap();
-  const promptUndone = new WeakMap();
-  const promptStarts = new WeakMap();
+  const activityTurns = new Map();
+  const promptEdits = new Map();
+  const promptUndone = new Map();
+  const promptStarts = new Map();
   const dispatchCalls = [];
 
   function appendTurnTime(prompt, endedAt, outcome) {
@@ -96,6 +96,19 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       entry,
       runId: fields.run_id ?? null,
     });
+  }
+
+  function appendPlan(fields) {
+    model.push({
+      type: "plan",
+      agentId: fields.agent_id,
+      steps: Array.isArray(fields.steps) ? fields.steps.map((step) => ({ ...step })) : [],
+      explanation: typeof fields.explanation === "string" ? fields.explanation : "",
+    });
+  }
+
+  function appendUserQuestion(question, answer = "", agentId) {
+    model.push({ type: "user-question", agentId, question, answer });
   }
 
   function liveCall(fields) {
@@ -183,6 +196,23 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     calls.delete(record.call.toolCallId);
   }
 
+  function replayedUserCommand(text) {
+    const prefix = "The person ran a command in the repository:\n$ ";
+    if (typeof text !== "string" || !text.startsWith(prefix)) return null;
+    const lines = text.slice(prefix.length).split("\n");
+    const command = lines.shift();
+    const close = lines.length - 1;
+    if (!command || close < 0 || !/^\((?:exit code \d+|timed out after 120 s|stopped)\)$/.test(lines[close])) return null;
+    const outcome = lines[close].slice(1, -1);
+    const output = lines.slice(0, close).join("\n").replace(/\n$/, "");
+    const entry = { type: "command", command: `! ${command}`, output: [] };
+    if (output) entry.output.push(output);
+    if (outcome === "stopped") entry.output.push("stopped");
+    else if (outcome === "timed out after 120 s") entry.output.push("timed out");
+    else if (outcome !== "exit code 0") entry.output.push(outcome.replace("exit code ", "exit "));
+    return entry;
+  }
+
   function applyEvent(event) {
     const { type, fields } = event;
     if (type === "HistoryMessage") {
@@ -190,28 +220,31 @@ export function createTranscript({ now = () => Date.now() } = {}) {
         return;
       }
       if (fields.role === "user") {
-        const entry = {
+        const commandEntry = replayedUserCommand(fields.text);
+        const entry = commandEntry ?? {
           type: "prompt",
           agentId: fields.agent_id,
           text: fields.text,
           messageCount: fields.message_count,
         };
-        if (typeof fields.checkpoint_key === "string") entry.checkpointKey = fields.checkpoint_key;
-        promptEdits.set(entry, (fields.edits ?? []).filter((edit) =>
-          typeof edit?.path === "string"
-          && Number.isInteger(edit.added)
-          && Number.isInteger(edit.removed)
-        ));
-        promptUndone.set(entry, fields.undone === true);
-        if (typeof fields.turn_started_at === "string") promptStarts.set(entry, fields.turn_started_at);
-        if (fields.attachments?.length) {
-          entry.attachments = fields.attachments.map(({ kind, filename }) => ({ kind, filename }));
+        if (commandEntry === null) {
+          if (typeof fields.checkpoint_key === "string") entry.checkpointKey = fields.checkpoint_key;
+          promptEdits.set(entry, (fields.edits ?? []).filter((edit) =>
+            typeof edit?.path === "string"
+            && Number.isInteger(edit.added)
+            && Number.isInteger(edit.removed)
+          ));
+          promptUndone.set(entry, fields.undone === true);
+          if (typeof fields.turn_started_at === "string") promptStarts.set(entry, fields.turn_started_at);
+          if (fields.attachments?.length) {
+            entry.attachments = fields.attachments.map(({ kind, filename }) => ({ kind, filename }));
+          }
         }
         model.push(entry);
-        if (rootAgentId === null || fields.agent_id === rootAgentId) {
+        if (commandEntry === null && (rootAgentId === null || fields.agent_id === rootAgentId)) {
           currentPrompt = entry;
         }
-        if (fields.turn_ended_at) {
+        if (commandEntry === null && fields.turn_ended_at) {
           appendEditCard(entry, promptEdits.get(entry) ?? [], {
             undone: promptUndone.get(entry) === true,
           });
@@ -226,6 +259,32 @@ export function createTranscript({ now = () => Date.now() } = {}) {
           text: fields.text,
         });
         for (const toolCall of fields.tool_calls ?? []) {
+          if (toolCall.name === "update_plan" && Array.isArray(toolCall.plan)) {
+            appendPlan({
+              agent_id: fields.agent_id,
+              steps: toolCall.plan,
+              explanation: toolCall.explanation,
+            });
+            continue;
+          }
+          if (toolCall.name === "ask_user" && typeof toolCall.question === "string") {
+            const answer = typeof toolCall.answer === "string"
+              ? toolCall.answer
+              : toolCall.skipped === true ? "Skipped" : "";
+            appendUserQuestion(toolCall.question, answer, fields.agent_id);
+            continue;
+          }
+          if (toolCall.name === "propose_plan" && typeof toolCall.plan === "string") {
+            const outcome = toolCall.decision === "ask"
+              ? "Approved — ask before changes"
+              : toolCall.decision === "allow"
+                ? "Approved — allow changes"
+                : toolCall.decision === "keep_planning"
+                  ? `Kept planning${typeof toolCall.feedback === "string" && toolCall.feedback ? `: ${toolCall.feedback}` : ""}`
+                  : "";
+            model.push({ type: "user-plan", plan: toolCall.plan, outcome });
+            continue;
+          }
           if (toolCall.name !== "dispatch_subagent") continue;
           appendActivity({
             agent_id: fields.agent_id,
@@ -236,7 +295,11 @@ export function createTranscript({ now = () => Date.now() } = {}) {
             target: toolCall.subagent_name,
           });
           const record = calls.get(toolCall.id);
-          if (record && typeof toolCall.task === "string") record.call.task = toolCall.task;
+          if (record) {
+            record.call.status = "settled";
+            if (typeof toolCall.task === "string") record.call.task = toolCall.task;
+            calls.delete(toolCall.id);
+          }
         }
         if (
           currentPrompt !== null
@@ -296,6 +359,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       return;
     }
     if (type === "ToolCallStarted") {
+      if (fields.tool_name === "update_plan" || fields.tool_name === "ask_user" || fields.tool_name === "propose_plan") return;
       if (!endedRuns.has(fields.run_id) && !calls.has(fields.tool_call_id)) {
         appendActivity(fields);
       }
@@ -391,6 +455,10 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       });
       return;
     }
+    if (type === "PlanChanged") {
+      appendPlan(fields);
+      return;
+    }
     if (type === "RunStarted") {
       rootAgentId ??= fields.agent_id;
       endedRuns.delete(fields.run_id);
@@ -411,6 +479,12 @@ export function createTranscript({ now = () => Date.now() } = {}) {
           now(),
           type === "RunFailed" ? "failed" : fields.stopped_reason === "cancelled" ? "cancelled" : "finished",
         );
+      }
+      for (const [id, record] of calls) {
+        if (record.runId === fields.run_id) {
+          if (record.call.status === "running") record.call.status = "settled";
+          calls.delete(id);
+        }
       }
       endedRuns.add(fields.run_id);
       activeTurn = null;
@@ -463,8 +537,64 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     }
   }
 
+  function reset() {
+    model.length = 0;
+    calls.clear();
+    questions.clear();
+    endedRuns.clear();
+    activityTurns.clear();
+    promptEdits.clear();
+    promptUndone.clear();
+    promptStarts.clear();
+    dispatchCalls.length = 0;
+    turnSerial = 0;
+    activeTurn = null;
+    rootAgentId = null;
+    currentPrompt = null;
+  }
+
+  function snapshot() {
+    return {
+      model: [...model],
+      calls: new Map(calls),
+      questions: new Map(questions),
+      endedRuns: new Set(endedRuns),
+      activityTurns: new Map(activityTurns),
+      promptEdits: new Map([...promptEdits].map(([entry, edits]) => [entry, [...edits]])),
+      promptUndone: new Map(promptUndone),
+      promptStarts: new Map(promptStarts),
+      dispatchCalls: [...dispatchCalls],
+      turnSerial,
+      sessionId,
+      activeTurn,
+      rootAgentId,
+      currentPrompt,
+    };
+  }
+
+  function restore(state) {
+    reset();
+    model.push(...state.model);
+    for (const [key, value] of state.calls) calls.set(key, value);
+    for (const [key, value] of state.questions) questions.set(key, value);
+    for (const value of state.endedRuns) endedRuns.add(value);
+    for (const [key, value] of state.activityTurns) activityTurns.set(key, value);
+    for (const [key, value] of state.promptEdits) promptEdits.set(key, [...value]);
+    for (const [key, value] of state.promptUndone) promptUndone.set(key, value);
+    for (const [key, value] of state.promptStarts) promptStarts.set(key, value);
+    dispatchCalls.push(...state.dispatchCalls);
+    turnSerial = state.turnSerial;
+    sessionId = state.sessionId;
+    activeTurn = state.activeTurn;
+    rootAgentId = state.rootAgentId;
+    currentPrompt = state.currentPrompt;
+  }
+
   return {
     apply,
+    reset,
+    snapshot,
+    restore,
     setSessionId(value) {
       sessionId = typeof value === "string" ? value : null;
     },

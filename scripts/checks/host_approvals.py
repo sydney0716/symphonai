@@ -228,6 +228,43 @@ def check_remembered_shell_prefix() -> None:
         fail(f"unremembered approval did not resume: {result!r}")
 
 
+@check("host_approvals.command_line_grants")
+def check_command_line_grants() -> None:
+    published: list[PendingApproval] = []
+    broker = ApprovalBroker(lambda item: published.append(item) or True, timeout=1)
+    policy = PermissionPolicy(repo_root=ROOT, mode="ask", approval_callback=broker.callback)
+    line = ["bash", "-c", "git status && pytest -x"]
+    result, thread = _start_shell_check(policy, line)
+    approval = _await_pending(broker)
+    if approval.remember != "git status, pytest":
+        fail(f"multi-command approval offered the wrong grant label: {approval!r}")
+    if not broker.resolve(approval.approval_id, allowed=True, reason="", remember=True):
+        fail("multi-command remembered approval did not resolve")
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail(f"multi-command approval did not resume: {result!r}")
+
+    if not policy.check_shell(line).allowed or len(published) != 1:
+        fail(f"remembered commands prompted again: {published!r}")
+    result, thread = _start_shell_check(policy, ["bash", "-c", "git status >> notes.txt"])
+    writing = _await_pending(broker)
+    if writing.target != "git status >> notes.txt":
+        fail(f"remembered grant auto-allowed a writing command: {writing!r}")
+    broker.resolve(writing.approval_id, allowed=True, reason="")
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail(f"writing command approval did not resume: {result!r}")
+
+    result, thread = _start_shell_check(policy, ["bash", "-c", "git status && make"])
+    other = _await_pending(broker)
+    if other.target != "git status && make" or other.remember != "git status, make":
+        fail(f"partially granted command line had the wrong approval: {other!r}")
+    broker.resolve(other.approval_id, allowed=True, reason="")
+    thread.join(1)
+    if thread.is_alive() or not result or not result[0].allowed:
+        fail(f"new command approval did not resume: {result!r}")
+
+
 @check("host_approvals.denied_shell_grant_not_remembered")
 def check_denied_shell_grant_not_remembered() -> None:
     broker = ApprovalBroker(lambda _: True, timeout=1)

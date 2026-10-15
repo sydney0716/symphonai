@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -52,12 +54,15 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import _diff_result
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
+from symphonai_api.tools.shell import shell_environment, shell_executable
 from symphonai_api.worktree import remove_worktree, worktree_diff
 from symphonai_api.worktree import create_worktree
 from symphonai_api.web_search import HttpJsonSearchBackend, search_endpoint
 from symphonai_host.broker import EventBroker
 from symphonai_host.approvals import ApprovalBroker
 from symphonai_host.goal import Goal, GoalCheck, GoalChanged, goal_tools, run_check
+from symphonai_host.plan import PlanChanged, plan_tools
+from symphonai_host.questions import plan_proposal_tools, question_tools
 from symphonai_host.protocol import HistoryMessage
 
 
@@ -70,6 +75,10 @@ class RunActiveError(RuntimeError):
             else f"run already active: {run_id}"
         )
         self.run_id = run_id
+
+
+class CommandActiveError(RuntimeError):
+    """A user command is already running in this host."""
 
 
 class WorktreeApplyConflict(RuntimeError):
@@ -195,6 +204,12 @@ class _ActiveRun:
     deferred_memory_events: list[Event] = field(default_factory=list)
 
 
+@dataclass
+class _UserCommand:
+    stop_requested: bool = False
+    process: subprocess.Popen | None = None
+
+
 class HostRun:
     """Run one prompt at a time in a persistent Leader conversation."""
 
@@ -205,6 +220,8 @@ class HostRun:
         broker: EventBroker,
         *,
         system_prompt: str | None = None,
+        base_prompt: str = "",
+        subagent_base_prompt: str = "",
         working_dir: Path | None = None,
         max_turns: int | None = None,
         model: str | None = None,
@@ -234,6 +251,8 @@ class HostRun:
         self._policy.mode = self._starting_mode
         self._broker = broker
         self._system_prompt = system_prompt
+        self._base_prompt = base_prompt
+        self._subagent_base_prompt = subagent_base_prompt
         if working_dir is None:
             current = Path.cwd().resolve()
             self._working_dir = current if current.is_relative_to(policy.repo_root) else policy.repo_root
@@ -303,8 +322,12 @@ class HostRun:
         self._chat_token_budget = chat_token_budget
         self._chat_recent_turns = chat_recent_turns
         self._active: _ActiveRun | None = None
+        self._user_command: _UserCommand | None = None
         self._active_by_session: dict[str, _ActiveRun] = {}
         self._open_conversations: dict[str, tuple[Leader, SessionStore]] = {}
+        self._instruction_warnings_by_session: dict[str, list[str]] = {}
+        self._plans_by_session: dict[str, dict] = {}
+        self._pending_user_context: list[str] = []
         self._policy_by_session: dict[str, PermissionPolicy] = {}
         self._approvals_by_session: dict[str, ApprovalBroker] = {}
         self._session_by_root_agent: dict[str, str] = {}
@@ -410,6 +433,17 @@ class HostRun:
                 self._open_conversations[conversation[1].run_id] = conversation
                 raise
 
+    def selection(self) -> dict | None:
+        """Return the model selected for the next turn."""
+        with self._lock:
+            if self._provider is None:
+                return None
+            return {
+                "provider": self._provider.name,
+                "model": self._model if self._model is not None else getattr(self._provider, "model", None),
+                "effort": self._effort,
+            }
+
     def permitted_modes(self) -> tuple[str, ...]:
         ceiling = None if self._extensions is None else getattr(self._extensions, "ceiling", None)
         modes = None if ceiling is None else ceiling.modes
@@ -425,6 +459,8 @@ class HostRun:
                 choices = ", ".join(permitted) or "none"
                 raise ModeSelectionError(f"permitted modes: {choices}")
             self._policy.mode = mode
+            if self._conversation is None:
+                self._starting_mode = mode
             return mode
 
     def _save_goal(self, session_id: str, goal: Goal | None) -> None:
@@ -464,6 +500,43 @@ class HostRun:
             last_check=None if goal is None else goal.last_check,
             session_id=session_id,
         ))
+
+    def _save_plan(self, session_id: str, plan: dict) -> None:
+        current = self._conversation
+        if current is not None and current[1].run_id == session_id:
+            store = current[1]
+            close = False
+        else:
+            store = SessionStore.open(self._sessions_root, session_id)
+            close = True
+        try:
+            metadata = store.read_meta()
+            metadata["plan"] = plan
+            store.write_meta(metadata)
+        finally:
+            if close:
+                store.close()
+
+    def _update_plan_for_session(
+        self, session_id: str, steps: list[dict], explanation: str,
+    ) -> None:
+        with self._lock:
+            plan = {"steps": [dict(step) for step in steps], "explanation": explanation}
+            self._plans_by_session[session_id] = plan
+            self._save_plan(session_id, plan)
+            leader = self._open_conversations.get(session_id, (None, None))[0]
+            active = self._active_by_session.get(session_id)
+            self._publish(
+                "" if active is None else active.run_id,
+                PlanChanged(
+                    agent_id="" if leader is None else leader.agent_ref.agent_id,
+                    run_id="" if active is None else active.run_id,
+                    steps=plan["steps"],
+                    explanation=explanation,
+                    session_id=session_id,
+                ),
+                session_id=session_id,
+            )
 
     def start_goal(self, objective: str, check: tuple[str, ...], max_rounds: int) -> str:
         with self._lock:
@@ -916,14 +989,65 @@ class HostRun:
         return result
 
     @staticmethod
-    def _replay_tool_call(call) -> dict:
+    def _replay_tool_call(call, result=None) -> dict:
         replay = {"id": call.id, "name": call.name}
         if call.name == "dispatch_subagent":
             for key in ("subagent_name", "task"):
                 value = call.arguments.get(key)
                 if isinstance(value, str):
                     replay[key] = value
+        elif call.name == "update_plan":
+            for key in ("plan", "explanation"):
+                value = call.arguments.get(key)
+                if isinstance(value, (list, str)):
+                    replay[key] = value
+        elif call.name == "ask_user":
+            question = call.arguments.get("question")
+            options = call.arguments.get("options")
+            if isinstance(question, str):
+                replay["question"] = question
+            if isinstance(options, list) and all(isinstance(option, str) for option in options):
+                replay["options"] = options
+            if result is not None and result.ok:
+                if result.content.startswith("The person answered: "):
+                    replay["answer"] = result.content.removeprefix("The person answered: ")
+                elif result.content == "The person skipped the question.":
+                    replay["skipped"] = True
+        elif call.name == "propose_plan":
+            plan = call.arguments.get("plan")
+            if isinstance(plan, str):
+                replay["plan"] = plan
+            if result is not None and result.ok:
+                for mode in ("ask", "allow"):
+                    if result.content == (
+                        "The person approved the plan. The conversation is now in "
+                        f"{mode} mode; carry out the plan."
+                    ):
+                        replay["decision"] = mode
+                        break
+                if result.content == "The person wants to keep planning.":
+                    replay["decision"] = "keep_planning"
+                elif result.content.startswith("The person wants to keep planning: "):
+                    replay["decision"] = "keep_planning"
+                    replay["feedback"] = result.content.removeprefix(
+                        "The person wants to keep planning: "
+                    )
         return replay
+
+    @staticmethod
+    def _replay_tool_calls(message: Message, results: Mapping[str, object]) -> list[dict]:
+        return [
+            HostRun._replay_tool_call(call, results.get(call.id))
+            for call in message.tool_calls
+        ]
+
+    @staticmethod
+    def _replay_tool_results(messages: list[Message]) -> dict[str, object]:
+        return {
+            message.tool_result.tool_call_id: message.tool_result
+            for message in messages
+            if message.tool_result is not None and message.tool_result.tool_call_id
+        }
 
     def _remember_event_session(self, event: Event, session_id: str) -> None:
         runtime_run_id = getattr(event, "run_id", None)
@@ -975,6 +1099,8 @@ class HostRun:
         _title: str | None = None,
     ) -> str:
         with self._lock:
+            if self._user_command is not None:
+                raise CommandActiveError("wait for the command to finish")
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
             if len(self._active_by_session) >= 4:
@@ -1028,6 +1154,7 @@ class HostRun:
                 instructions = load_instructions(instruction_policy, working_dir=self._working_dir)
                 for warning in instructions.warnings:
                     print(f"instruction warning: {warning}", file=sys.stderr)
+                self._instruction_warnings_by_session[run_id] = list(instructions.warnings)
                 rendered = instructions.render()
                 if rendered:
                     seeded.append(Message(role=Role.SYSTEM, content=rendered))
@@ -1092,6 +1219,10 @@ class HostRun:
                 if context is not None:
                     context.interrupted = "interrupted"
             is_goal_round = _goal_round or _new_goal is not None
+            if self._pending_user_context:
+                for context in self._pending_user_context:
+                    leader.add_context(context)
+                self._pending_user_context.clear()
             thread = threading.Thread(
                 target=self._run,
                 args=(run_id, leader, chat_message, cancel, is_goal_round, session_id),
@@ -1219,6 +1350,7 @@ class HostRun:
             raise ProviderSelectionError("leader cannot use lsp: no language server is configured")
         leader_provider = self._provider
         leader_model = self._model
+        conversation_approvals = self.approvals
         if defined_leader is not None:
             selector = defined_leader.model
             if selector.provider != self._provider.name:
@@ -1231,6 +1363,7 @@ class HostRun:
             elif selector.model is not None:
                 leader_model = selector.model
         child_providers: dict[tuple[str, str | None], ModelProvider | None] = {}
+        approval_broker = self.approvals
 
         def provider_for(name: str, model: str | None) -> ModelProvider | None:
             key = (name, model)
@@ -1247,6 +1380,8 @@ class HostRun:
                 leader_provider=leader_provider,
                 subagent_provider=self._provider,
                 repo_root=str(self._policy.repo_root),
+                base_prompt=self._base_prompt,
+                subagent_base_prompt=self._subagent_base_prompt,
                 max_leader_turns=self._max_turns,
                 leader_budget=self._leader_budget,
                 chat_token_budget=self._chat_token_budget,
@@ -1287,6 +1422,14 @@ class HostRun:
                     lambda status, message: self._update_goal_for_session(
                         session.run_id, status, message,
                     ),
+                ) | plan_tools(
+                    lambda plan, explanation: self._update_plan_for_session(
+                        session.run_id, plan, explanation,
+                    ),
+                ) | question_tools(approval_broker.ask_user) | plan_proposal_tools(
+                    lambda approval: conversation_approvals.request_interaction(approval),
+                    self.permitted_modes,
+                    session_id=session.run_id,
                 ),
             ),
             session=session,
@@ -1327,6 +1470,7 @@ class HostRun:
             reader = SessionStore.open(self._sessions_root, run_id)
             try:
                 loaded, diagnosis, repaired_ids = load_run_for_resume(reader)
+                tool_results = self._replay_tool_results(loaded.messages)
                 records, _ = read_records(reader.directory / "run.jsonl")
                 subagent_records = []
                 for path in sorted(reader.directory.glob("agent-*.jsonl")):
@@ -1346,6 +1490,13 @@ class HostRun:
                 choice = metadata.get("provider_choice")
                 provider_state_reset = metadata.get("provider_state_reset") is True
                 goal = Goal.from_payload(metadata.get("goal"))
+                saved_plan = metadata.get("plan")
+                if (
+                    not isinstance(saved_plan, dict)
+                    or not isinstance(saved_plan.get("steps"), list)
+                    or not isinstance(saved_plan.get("explanation", ""), str)
+                ):
+                    saved_plan = None
             finally:
                 reader.close()
             existing = self._open_conversations.get(run_id)
@@ -1361,6 +1512,9 @@ class HostRun:
                 self._goal_session_id = run_id if self._goal is not None else None
                 self._context_report = self._context_by_session.get(run_id)
                 self._usage_by_agent = dict(self._usage_by_session.get(run_id, {}))
+                self._plans_by_session.pop(run_id, None)
+                if saved_plan is not None:
+                    self._plans_by_session[run_id] = saved_plan
                 if self._goal is not None:
                     self._goals_by_session[run_id] = self._goal
                 for message, record_id in zip(loaded.messages, loaded.record_ids):
@@ -1368,7 +1522,7 @@ class HostRun:
                     self._broker.publish(ForkableHistoryMessage(
                         role=message.role.value,
                         text=message.text,
-                        tool_calls=[self._replay_tool_call(call) for call in message.tool_calls],
+                        tool_calls=self._replay_tool_calls(message, tool_results),
                         turn_id=message.turn_id, record_id=record_id,
                         attachments=[
                             {
@@ -1463,6 +1617,9 @@ class HostRun:
             self._usage_by_agent = {}
             self._context_by_session[run_id] = None
             self._usage_by_session[run_id] = {}
+            self._plans_by_session.pop(run_id, None)
+            if saved_plan is not None:
+                self._plans_by_session[run_id] = saved_plan
             if goal is not None:
                 self._goals_by_session[run_id] = goal
             goal_agent_id = leader.agent_ref.agent_id
@@ -1474,7 +1631,7 @@ class HostRun:
             self._broker.publish(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
-                tool_calls=[self._replay_tool_call(call) for call in message.tool_calls],
+                tool_calls=self._replay_tool_calls(message, tool_results),
                 turn_id=message.turn_id,
                 record_id=record_id,
                 attachments=[
@@ -1624,6 +1781,7 @@ class HostRun:
             session_id = None if conversation is None else conversation[1].run_id
             if session_id is not None and session_id in self._active_by_session:
                 self._conversation = None
+
                 self._active = None
                 self._goal = None
                 self._goal_session_id = None
@@ -1655,6 +1813,42 @@ class HostRun:
             self._policy_by_session.pop(conversation[1].run_id, None)
             self._approvals_by_session.pop(conversation[1].run_id, None)
 
+    def delete_session(self, session_id: str) -> bool:
+        """Close an idle session before removing its stored conversation."""
+        with self._lock:
+            if session_id in (".", "..") or Path(session_id).name != session_id:
+                return False
+            directory = self._sessions_root / session_id
+            if not directory.is_dir():
+                return False
+            broker = self._approvals_by_session.get(session_id)
+            if (
+                session_id in self._active_by_session
+                or session_id in self._goal_checks_by_session
+                or (broker is not None and any(item.session_id == session_id for item in broker.pending()))
+            ):
+                raise RunActiveError(session_id)
+            if self._conversation is not None and self._conversation[1].run_id == session_id:
+                self.end_conversation()
+            else:
+                conversation = self._open_conversations.pop(session_id, None)
+                if conversation is not None:
+                    conversation[1].close()
+                    conversation[0].close()
+            self._policy_by_session.pop(session_id, None)
+            self._approvals_by_session.pop(session_id, None)
+            self._goals_by_session.pop(session_id, None)
+            self._context_by_session.pop(session_id, None)
+            self._usage_by_session.pop(session_id, None)
+            for agent_id, owner in tuple(self._session_by_root_agent.items()):
+                if owner == session_id:
+                    self._session_by_root_agent.pop(agent_id, None)
+            for runtime_id, owner in tuple(self._session_by_runtime_run.items()):
+                if owner == session_id:
+                    self._session_by_runtime_run.pop(runtime_id, None)
+            shutil.rmtree(directory)
+            return True
+
     def close(self) -> None:
         self._closing = True
         with self._lock:
@@ -1684,10 +1878,18 @@ class HostRun:
     def stop(self) -> None:
         with self._lock:
             active = self._active
+            command = self._user_command
+            if command is not None:
+                command.stop_requested = True
+                process = command.process
+            else:
+                process = None
             session_id = None if self._conversation is None else self._conversation[1].run_id
             goal_check = None if session_id is None else self._goal_checks_by_session.get(session_id)
         if active is not None:
             active.cancel.cancel()
+        if process is not None:
+            self._kill_user_command(process)
         if goal_check is not None:
             goal_check.interrupted = "cancelled"
             goal_check.cancel.set()
@@ -1711,6 +1913,115 @@ class HostRun:
         except AgentControlError:
             raise
         return {"agent_id": agent_id, "state": state}
+
+    def steer(self, text: str) -> None:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("steer text must be non-blank")
+        with self._lock:
+            active = self._active
+            conversation = self._conversation
+            if active is None or conversation is None:
+                raise RunActiveError("no turn is running")
+            leader = conversation[0]
+            agent_id = active.root_agent_id
+        try:
+            leader.control_agent(agent_id, "redirect", text)
+        except AgentControlError as exc:
+            raise RunActiveError("no turn is running") from exc
+
+    def run_user_command(self, command: str) -> dict:
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be non-blank")
+        with self._lock:
+            if self._active is not None:
+                raise RunActiveError("wait for the turn to finish")
+            if self._user_command is not None:
+                raise CommandActiveError("a command is already running")
+            conversation = self._conversation
+            repo_root = self._repo_root if conversation is None else self._policy.repo_root
+            running = _UserCommand()
+            self._user_command = running
+        process = None
+        try:
+            process = subprocess.Popen(
+                [shell_executable(), "-c", command],
+                cwd=repo_root,
+                env=shell_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+            with self._lock:
+                running.process = process
+                should_stop = running.stop_requested
+            if should_stop:
+                self._kill_user_command(process)
+            deadline = time.monotonic() + 120
+            timed_out = False
+            stopped = False
+            while True:
+                with self._lock:
+                    stopped = running.stop_requested
+                if stopped:
+                    self._kill_user_command(process)
+                    try:
+                        output, _ = process.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        output = ""
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    self._kill_user_command(process)
+                    try:
+                        output, _ = process.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        output = ""
+                    break
+                try:
+                    output, _ = process.communicate(timeout=min(0.05, remaining))
+                    with self._lock:
+                        stopped = running.stop_requested
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            output = output or ""
+            exit_code = None if timed_out or stopped else process.returncode
+            limit = self._policy.shell_output_limit_chars
+            if len(output) > limit:
+                output = output[:limit] + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
+            outcome = "stopped" if stopped else "timed out after 120 s" if timed_out else f"exit code {exit_code}"
+            context = (
+                "The person ran a command in the repository:\n"
+                f"$ {command}\n{output}\n({outcome})"
+            )
+            if conversation is None:
+                with self._lock:
+                    self._pending_user_context.append(context)
+            else:
+                conversation[0].add_context(context)
+            return {
+                "exit_code": exit_code,
+                "output": output,
+                "timed_out": timed_out,
+                "stopped": stopped,
+            }
+        finally:
+            with self._lock:
+                if self._user_command is running:
+                    self._user_command = None
+
+    @staticmethod
+    def _kill_user_command(process: subprocess.Popen) -> None:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
 
     @staticmethod
     def _merge_usage(
@@ -1969,6 +2280,10 @@ class HostRun:
             "agents": agents,
             "mode": mode,
             "goal": goal_payload,
+            "plan": self._plans_by_session.get(conversation[1].run_id),
+            "instruction_warnings": self._instruction_warnings_by_session.get(
+                conversation[1].run_id, []
+            ),
             **selection,
         }
         if report is None:

@@ -403,6 +403,7 @@ class DispatchSubagentTool(LocalTool):
         *,
         max_subagents: int = DEFAULT_MAX_SUBAGENTS,
         subagent_max_turns: int | None = None,
+        subagent_base_prompt: str = "",
         subagent_tool_names: Sequence[str] | None = None,
         parent_agent_id: str | None = None,
         subagent_budget: RunBudget | None = None,
@@ -427,6 +428,7 @@ class DispatchSubagentTool(LocalTool):
         self._leader_policy = leader_policy
         self._max_subagents = max_subagents
         self._subagent_max_turns = subagent_max_turns
+        self._subagent_base_prompt = subagent_base_prompt
         self._subagent_tool_names = (
             None if subagent_tool_names is None else tuple(subagent_tool_names)
         )
@@ -592,6 +594,10 @@ class DispatchSubagentTool(LocalTool):
                 ok=False,
                 error=f"unknown subagent {subagent_name!r}; known subagents: {known}",
             )
+        if self._subagent_base_prompt:
+            spec = replace(spec, prompt="\n\n".join(
+                prompt for prompt in (self._subagent_base_prompt, spec.prompt) if prompt
+            ))
         _, input_error = validate_input(spec.io, task)
         if input_error is not None:
             return ToolResult(
@@ -1108,6 +1114,8 @@ class LeaderConfig:
     leader_provider: ModelProvider
     subagent_provider: ModelProvider
     repo_root: str
+    base_prompt: str = ""
+    subagent_base_prompt: str = ""
     max_leader_turns: int | None = None
     leader_budget: RunBudget | None = None
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
@@ -1241,7 +1249,12 @@ class Leader:
         self._leader_policy = leader_policy
         self._leases = config.leases or WorkspaceLeases(config.repo_root)
         defined_leader = None if config.subagent_specs is None else config.subagent_specs.get("leader")
-        self._leader_prompt = "" if defined_leader is None else defined_leader.prompt
+        self._leader_prompt = "\n\n".join(
+            prompt for prompt in (
+                config.base_prompt,
+                "" if defined_leader is None else defined_leader.prompt,
+            ) if prompt
+        )
         leader_provider_name = getattr(config.leader_provider, "name", None) or "unknown"
         self._leader_model_locked = bool(
             defined_leader is not None
@@ -1271,6 +1284,7 @@ class Leader:
             leader_policy=leader_policy,
             max_subagents=config.max_subagents,
             subagent_max_turns=config.subagent_max_turns,
+            subagent_base_prompt=config.subagent_base_prompt,
             subagent_tool_names=config.subagent_tool_names,
             parent_agent_id=self._agent_ref.agent_id,
             subagent_budget=config.subagent_budget,
@@ -1967,6 +1981,12 @@ class Leader:
         self._compaction_usage_by_model.clear()
         result.stopped_repairs = self._stopped_repairs()
         return result
+
+    def add_context(self, text: str) -> None:
+        """Append a user message for the next chat call without running the model."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("context text must be non-blank")
+        self._chat_messages.append(Message(role=Role.USER, content=text))
 
     def close(self) -> None:
         if self._memory_extractor is not None:

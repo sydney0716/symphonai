@@ -361,6 +361,40 @@ test("approval sends remember only when requested", async () => {
   ]);
 });
 
+test("steer posts the redirect text to the host route", async () => {
+  let record;
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      record = { url, options };
+      return response(200, { steered: true });
+    },
+  });
+  assert.deepEqual(await client.steer("use b.py"), { steered: true });
+  assert.equal(new URL(record.url).pathname, "/steer");
+  assert.equal(record.options.method, "POST");
+  assert.deepEqual(JSON.parse(record.options.body), { text: "use b.py" });
+});
+
+test("command posts the shell text to the host route", async () => {
+  let record;
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      record = { url, options };
+      return response(200, { exit_code: 0, output: "hi", timed_out: false });
+    },
+  });
+  assert.deepEqual(await client.command("printf hi"), {
+    exit_code: 0, output: "hi", timed_out: false,
+  });
+  assert.equal(new URL(record.url).pathname, "/command");
+  assert.equal(record.options.method, "POST");
+  assert.deepEqual(JSON.parse(record.options.body), { command: "printf hi" });
+});
+
 test("prompt adds attachments only when provided", async () => {
   const bodies = [];
   const client = createClient({
@@ -475,7 +509,8 @@ test("sessions accepts only an array while other routes still require objects", 
     },
   });
   assert.deepEqual(await client.sessions(200), sessions);
-  assert.deepEqual(paths, ["/sessions?limit=200"]);
+  assert.deepEqual(await client.sessions(200, "Parser"), sessions);
+  assert.deepEqual(paths, ["/sessions?limit=200", "/sessions?limit=200&query=Parser"]);
   await assert.rejects(client.health(), (error) => {
     assert.ok(error instanceof ProtocolError);
     assert.match(error.message, /must be an object/);
@@ -492,6 +527,24 @@ test("sessions accepts only an array while other routes still require objects", 
     assert.match(error.message, /must be an array/);
     return true;
   });
+});
+
+test("session rename and delete send their host route payloads", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push([new URL(url).pathname, options.method, JSON.parse(options.body)]);
+      return response(200, { ok: true });
+    },
+  });
+  await client.renameSession("run-one", "New name");
+  await client.deleteSession("run-two");
+  assert.deepEqual(records, [
+    ["/session/rename", "POST", { run_id: "run-one", title: "New name" }],
+    ["/session/delete", "POST", { run_id: "run-two" }],
+  ]);
 });
 
 test("file encodes every significant query character and returns the reply", async () => {

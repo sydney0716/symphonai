@@ -69,6 +69,23 @@ def _context(provider, messages, *, schemas=(), memory_provider=None, memory_mod
     )
 
 
+@check("memory_extract.failed_tool_output_in_evidence")
+def failed_tool_output_in_evidence() -> None:
+    messages = [
+        Message(Role.ASSISTANT, tool_calls=[
+            ToolCall("failed-call", "run_shell", {"command": "pytest"}),
+        ]),
+        Message(Role.TOOL, tool_result=ToolResult(
+            tool_call_id="failed-call", ok=False,
+            content="FAIL: test_remove\n", error="exit code 1",
+        )),
+    ]
+    rows = evidence_rows(messages)
+    expected = "run_shell error: exit code 1\nFAIL: test_remove\n"
+    if len(rows) != 2 or expected not in rows[1].text:
+        fail(f"failed tool output was missing from memory evidence: {rows!r}")
+
+
 @check("memory_extract.evidence_tiers_redaction_and_budget")
 def evidence_tiers_redaction_and_budget() -> None:
     messages = [

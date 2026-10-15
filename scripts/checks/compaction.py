@@ -532,7 +532,12 @@ def check_model_summary_receives_uncleared_dropped_messages() -> None:
             ),
             Message(
                 Role.TOOL,
-                tool_result=ToolResult(tool_call_id="call", ok=False, error="denied"),
+                tool_result=ToolResult(
+                    tool_call_id="call",
+                    ok=False,
+                    content="FAILED test_total",
+                    error="exit code 1",
+                ),
             ),
         ]
     )
@@ -541,9 +546,20 @@ def check_model_summary_receives_uncleared_dropped_messages() -> None:
         or "text" not in transcript
         or "[attachment: image/png]" not in transcript
         or 'Tool call: read_file\nArguments: {"path": "notes.txt"}' not in transcript
-        or "Tool error:\ndenied" not in transcript
+        or "Tool error:\nexit code 1\nFAILED test_total" not in transcript
     ):
         fail(f"summary transcript omitted message content: {transcript!r}")
+
+    denied_transcript = render_dropped_messages(
+        [
+            Message(
+                Role.TOOL,
+                tool_result=ToolResult(tool_call_id="call", ok=False, error="denied"),
+            )
+        ]
+    )
+    if "Tool error:\ndenied" not in denied_transcript:
+        fail(f"summary transcript changed an error without output: {denied_transcript!r}")
 
 
 @check("compaction.model_summary_falls_back_byte_for_byte")

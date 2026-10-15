@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from symphonai_api.cancellation import OperationCancelled
 from symphonai_api.identity import SCHEMA_VERSION
+from symphonai_api.tools.shell_parse import parse_command_line
 
 if TYPE_CHECKING:
     from symphonai_api.tools.base import LocalTool
@@ -68,6 +69,11 @@ def call_target(tool_name: str, arguments: dict) -> str:
     """Return a bounded display target derived safely for one known tool."""
     if not isinstance(tool_name, str) or not isinstance(arguments, dict):
         return ""
+    if tool_name == "run_shell" and "command" in arguments:
+        commands = parse_command_line(arguments["command"])
+        if commands is None or not commands[0].argv:
+            return ""
+        return commands[0].argv[0][:TARGET_LIMIT]
     target_rule = _TARGET_KEYS.get(tool_name)
     if target_rule is None:
         return ""

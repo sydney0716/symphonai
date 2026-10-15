@@ -71,15 +71,28 @@ export const COMMANDS = Object.freeze([
     description: "Have the agent write .symphonai/INSTRUCTIONS.md",
     argumentHint: "",
   }),
+  Object.freeze({
+    name: "rename",
+    aliases: Object.freeze([]),
+    description: "Rename this conversation",
+    argumentHint: "<title>",
+  }),
+  Object.freeze({
+    name: "copy",
+    aliases: Object.freeze([]),
+    description: "Copy the last reply as Markdown",
+    argumentHint: "",
+  }),
 ]);
 
-export function matchCommands(text) {
+export function matchCommands(text, extra = []) {
   if (typeof text !== "string" || !text.startsWith("/")) return [];
+  const commands = [...COMMANDS, ...extra];
   const query = text.slice(1).toLowerCase();
   if (/\s/.test(query)) return [];
-  if (query === "") return COMMANDS;
+  if (query === "") return commands;
 
-  const ranked = COMMANDS.map((command) => {
+  const ranked = commands.map((command) => {
     const names = [command.name, ...command.aliases].map((name) => name.toLowerCase());
     if (names.some((name) => name === query)) return { command, tier: 0 };
     if (names.some((name) => name.startsWith(query))) return { command, tier: 1 };

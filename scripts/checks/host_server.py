@@ -33,6 +33,8 @@ import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
 import symphonai_host.goal as goal_module
+import symphonai_host.plan as plan_module
+import symphonai_host.questions as questions_module
 from symphonai_api.agent_run import RunNode
 from symphonai_api.agent_file import load_agent_file
 from symphonai_api.agent_spec import ModelSelector
@@ -53,10 +55,12 @@ from symphonai_api.instructions import MAX_INSTRUCTION_FILE_CHARS, load_instruct
 from symphonai_api.mcp import McpServerSpec
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelResponse, Role, TextBlock, ToolCall, ToolResult, Usage
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import DenialReason, PermissionDecision, PermissionPolicy
+from symphonai_api.provider_catalog import CATALOG, catalog_keys
 from symphonai_host.files import repository_files
 from symphonai_api.providers.base import ModelProvider, ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore, load_run, load_run_for_resume
 from symphonai_api.streaming import StreamCompleted, TextDelta
@@ -69,6 +73,7 @@ from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.worktree import create_worktree, worktree_diff
 from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
+from symphonai_host.plan import PlanChanged
 from symphonai_host.protocol import decode_event, decode_frame
 from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.server import HostServer
@@ -2136,6 +2141,291 @@ def check_skills_reach_leader() -> None:
             no_skill_session.close()
 
 
+@check("host_server.steer_route")
+def check_steer_route() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        blocker = _HostControlTool()
+
+        class RecordingProvider(FakeModelProvider):
+            def __init__(self):
+                super().__init__([
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                        "wait", blocker.name, {},
+                    )])),
+                    ModelResponse(Message(Role.ASSISTANT, "done")),
+                ])
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        provider = RecordingProvider()
+        host = HostServer(
+            provider, PermissionPolicy(root), sessions_root=root / "sessions",
+            mcp_tools={blocker.name: blocker},
+        )
+        host.start()
+
+        def post(body):
+            connection, response = _request(host, "POST", "/steer", body=body, headers=_headers(host))
+            try:
+                raw = response.read()
+                return response.status, json.loads(raw) if raw else {}
+            finally:
+                connection.close()
+
+        try:
+            if post({"text": "use b.py"}) != (409, {"error": "no turn is running"}):
+                fail("steer without a running turn did not return 409")
+            if post({"text": " "})[0] != 400 or post({"text": "use b.py", "extra": True})[0] != 400:
+                fail("steer accepted blank text or an extra body field")
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "start"}, headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"steer test prompt did not start: {response.status}")
+                response.read()
+            finally:
+                connection.close()
+            if not blocker.entered.wait(3):
+                fail("leader did not reach the blocking tool")
+            status, body = post({"text": "use b.py"})
+            if status != 200 or body != {"steered": True}:
+                fail(f"steer did not accept a redirect: {status}, {body!r}")
+            blocker.release.set()
+            _wait_until(lambda: not host.run.active, "steered turn did not finish")
+            if len(provider.requests) < 2:
+                fail("steered run did not reach its next model request")
+            messages = provider.requests[1].messages
+            result_index = next((
+                index for index, item in enumerate(messages)
+                if item.tool_result is not None and item.tool_result.content == "released"
+            ), None)
+            steer_index = next((
+                index for index, item in enumerate(messages)
+                if item.role is Role.USER and item.text == "use b.py"
+            ), None)
+            if result_index is None or steer_index is None or steer_index <= result_index:
+                fail(f"steer was not delivered after the tool result: {messages!r}")
+            if post({"text": "too late"}) != (409, {"error": "no turn is running"}):
+                fail("steer after the run ended did not return 409")
+        finally:
+            blocker.release.set()
+            host.close()
+
+
+@check("host_server.user_command_route")
+def check_user_command_route() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        class RecordingProvider(FakeModelProvider):
+            def __init__(self):
+                super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        provider = RecordingProvider()
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+
+        def post(body):
+            connection, response = _request(host, "POST", "/command", body=body, headers=_headers(host))
+            try:
+                raw = response.read()
+                return response.status, json.loads(raw) if raw else {}
+            finally:
+                connection.close()
+
+        try:
+            status, reply = post({"command": "printf hi; exit 3"})
+            if status != 200 or reply != {"exit_code": 3, "output": "hi", "timed_out": False, "stopped": False}:
+                fail(f"command route returned the wrong exit and output: {status}, {reply!r}")
+            if (
+                host_run_module.shell_environment is not shell_module.shell_environment
+                or host_run_module.shell_executable is not shell_module.shell_executable
+            ):
+                fail("host command and run_shell do not share their shell helpers")
+            with mock.patch.dict(os.environ, {"FAKE_PROBE_TOKEN": "abc"}):
+                status, reply = post({"command": "printenv FAKE_PROBE_TOKEN"})
+            if status != 200 or reply.get("output") != "":
+                fail(f"command received a filtered environment value: {status}, {reply!r}")
+            if post({"command": " "})[0] != 400 or post({"command": "true", "extra": True})[0] != 400:
+                fail("command route accepted a blank command or extra field")
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "continue"}, headers=_headers(host),
+            )
+            try:
+                if response.status != 200:
+                    fail(f"command context prompt did not start: {response.status}")
+                response.read()
+            finally:
+                connection.close()
+            _wait_until(lambda: not host.run.active, "command context prompt did not finish")
+            messages = provider.requests[0].messages
+            user_messages = [message.text for message in messages if message.role is Role.USER]
+            if len(user_messages) < 3 or not all(
+                value in user_messages[0] for value in (
+                    "$ printf hi; exit 3", "hi", "(exit code 3)",
+                )
+            ) or user_messages[-1] != "continue":
+                fail(f"command result was not added before the next prompt: {user_messages!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.user_command_does_not_block")
+def check_user_command_does_not_block() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "ready"))])
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        subscription = host.broker.subscribe()
+        command_reply = []
+        command_error = []
+
+        def request_command(command):
+            try:
+                connection, response = _request(
+                    host, "POST", "/command", body={"command": command}, headers=_headers(host),
+                )
+                try:
+                    raw = response.read()
+                    command_reply.append((response.status, json.loads(raw) if raw else {}))
+                finally:
+                    connection.close()
+            except Exception as exc:  # noqa: BLE001
+                command_error.append(exc)
+
+        try:
+            host.run.start("seed conversation")
+            _wait_until(lambda: not host.run.active, "seed conversation did not finish")
+            leader = host.run._conversation[0]
+            while subscription.get(timeout=0) is not None:
+                pass
+            thread = threading.Thread(target=request_command, args=("sleep 3",), daemon=True)
+            thread.start()
+            _wait_until(lambda: host.run._user_command is not None, "user command did not start")
+
+            started = time.monotonic()
+            connection, response = _request(host, "GET", "/settings", headers=_headers(host))
+            try:
+                response.read()
+                if response.status != 200 or time.monotonic() - started >= 0.5:
+                    fail("settings waited for the user command")
+            finally:
+                connection.close()
+
+            other_event = RunStarted(
+                agent_id=leader.agent_ref.agent_id, run_id="other-conversation-run", agent_name="leader",
+            )
+            started = time.monotonic()
+            host.run._publish_active(other_event)
+            observed = subscription.get(timeout=0.5)
+            if observed != other_event or time.monotonic() - started >= 0.5:
+                fail("runtime event publication waited for the user command")
+
+            connection, response = _request(
+                host, "POST", "/command", body={"command": "true"}, headers=_headers(host),
+            )
+            try:
+                if response.status != 409 or json.loads(response.read()) != {"error": "a command is already running"}:
+                    fail("second command did not return its 409")
+            finally:
+                connection.close()
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "wait"}, headers=_headers(host),
+            )
+            try:
+                if response.status != 409 or json.loads(response.read()) != {"error": "wait for the command to finish"}:
+                    fail("prompt during a user command did not return its 409")
+            finally:
+                connection.close()
+
+            started = time.monotonic()
+            connection, response = _request(host, "POST", "/stop", body={}, headers=_headers(host))
+            try:
+                response.read()
+            finally:
+                connection.close()
+            thread.join(2)
+            if (
+                thread.is_alive()
+                or command_error
+                or time.monotonic() - started >= 2
+                or command_reply != [(200, {"exit_code": None, "output": "", "timed_out": False, "stopped": True})]
+            ):
+                fail(f"stopped command did not return promptly: {command_reply!r}, {command_error!r}")
+
+            pid_path = root / "child.pid"
+            command = f"sleep 30 & echo $! > {shlex.quote(str(pid_path))}; wait"
+            command_reply.clear()
+            thread = threading.Thread(target=request_command, args=(command,), daemon=True)
+            thread.start()
+            _wait_until(pid_path.exists, "grandchild command did not create its pid file")
+            child_pid = int(pid_path.read_text())
+            connection, response = _request(host, "POST", "/stop", body={}, headers=_headers(host))
+            try:
+                response.read()
+            finally:
+                connection.close()
+            thread.join(2)
+            if thread.is_alive() or command_reply[0][1].get("stopped") is not True:
+                fail(f"stopped descendant command did not finish: {command_reply!r}")
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                fail(f"stopped command left child process {child_pid} running")
+        finally:
+            subscription.close()
+            host.run.stop()
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        blocker = _HostControlTool()
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "wait", blocker.name, {},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(
+            provider, PermissionPolicy(root), sessions_root=root / "sessions",
+            mcp_tools={blocker.name: blocker},
+        )
+        host.start()
+        try:
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "start"}, headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            if not blocker.entered.wait(3):
+                fail("command test leader did not reach the blocking tool")
+            connection, response = _request(
+                host, "POST", "/command", body={"command": "true"}, headers=_headers(host),
+            )
+            try:
+                body = json.loads(response.read())
+                if response.status != 409 or body != {"error": "wait for the turn to finish"}:
+                    fail(f"command route did not reject an active turn: {response.status}, {body!r}")
+            finally:
+                connection.close()
+        finally:
+            blocker.release.set()
+            host.close()
+
+
 @check("host_server.agent_control_route")
 def check_agent_control_route() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -2408,9 +2698,10 @@ def check_settings_route() -> None:
                 finally:
                     connection.close()
 
+            catalog_variables = {entry.api_key_env_var: "" for entry in CATALOG.values()}
             with mock.patch.dict(
                 os.environ,
-                {"OPENAI_API_KEY": secret, "ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": " "},
+                {**catalog_variables, "OPENAI_API_KEY": secret, "ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": " "},
             ):
                 connection, response = _request(
                     host, "GET", "/settings", headers=_headers(host)
@@ -2427,7 +2718,7 @@ def check_settings_route() -> None:
             settings = payload["settings"]
             expected_fields = {
                 "config", "ceiling", "trust", "hooks", "mcp_servers",
-                "agents", "skills", "plugins", "withheld", "providers",
+                "agents", "skills", "plugins", "withheld", "providers", "selection",
             }
             if (
                 not expected_fields | {"search", "mode"} <= set(settings)
@@ -2468,11 +2759,16 @@ def check_settings_route() -> None:
             if {kind: settings[kind] for kind in empty_rosters} != empty_rosters:
                 fail("settings exposed untrusted extension names as loaded")
             providers = settings["providers"]
-            if providers != [
+            expected_providers = [
                 {"name": "anthropic", "env_var": "ANTHROPIC_API_KEY", "key_present": False},
                 {"name": "gemini", "env_var": "GEMINI_API_KEY", "key_present": False},
                 {"name": "openai", "env_var": "OPENAI_API_KEY", "key_present": True},
-            ]:
+                *[
+                    {"name": key, "env_var": CATALOG[key].api_key_env_var, "key_present": False}
+                    for key in catalog_keys()
+                ],
+            ]
+            if providers != expected_providers:
                 fail(f"settings provider presence changed: {providers!r}")
 
             protocol = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text(
@@ -2483,6 +2779,7 @@ def check_settings_route() -> None:
                 fail("settings protocol paragraph omitted a response field")
         finally:
             host.close()
+
 
         pool = McpPool(extensions.mcp_servers, cwd=root)
         try:
@@ -2513,6 +2810,137 @@ def check_settings_route() -> None:
                 started_host.close()
         finally:
             pool.close()
+
+
+@check("host_server.catalog_providers")
+def check_catalog_providers() -> None:
+    secret = "deepseek-fixture-key"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = _host(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "fallback"))]),
+            repo_root=root,
+            sessions_root=root / "sessions",
+        )
+        try:
+            with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
+                connection, response = _request(host, "POST", "/provider", body={"name": "deepseek", "model": "deepseek-chat"}, headers=_headers(host))
+                try:
+                    body = json.loads(response.read())
+                    if response.status != 400 or "deepseek has no API key" not in body.get("error", ""):
+                        fail(f"missing catalog credential was not named: {response.status}, {body!r}")
+                finally:
+                    connection.close()
+
+            requests = []
+
+            def urlopen(request, *, timeout):
+                requests.append(request)
+                return io.BytesIO(
+                    b'data: {"choices":[{"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}\n\n'
+                    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b'data: [DONE]\n\n'
+                )
+
+            with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": secret}), mock.patch(
+                "urllib.request.urlopen", side_effect=urlopen,
+            ):
+                connection, response = _request(host, "POST", "/provider", body={"name": "deepseek", "model": "deepseek-chat"}, headers=_headers(host))
+                try:
+                    if response.status != 200:
+                        fail(f"catalog provider selection failed: {response.status}, {response.read()!r}")
+                finally:
+                    connection.close()
+                connection, response = _request(host, "POST", "/prompt", body={"prompt": "use selected provider"}, headers=_headers(host))
+                try:
+                    if response.status != 200:
+                        fail(f"catalog provider prompt failed: {response.status}, {response.read()!r}")
+                    response.read()
+                finally:
+                    connection.close()
+                _wait_until(lambda: not host.run.active, "catalog provider turn did not finish")
+            if (
+                len(requests) != 1
+                or requests[0].full_url != "https://api.deepseek.com/v1/chat/completions"
+                or requests[0].get_header("Authorization") != f"Bearer {secret}"
+            ):
+                fail(f"catalog provider sent the wrong request: {[(req.full_url, req.header_items()) for req in requests]!r}")
+
+            with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), mock.patch.object(host_server_module, "store") as store:
+                connection, response = _request(host, "POST", "/credentials", body={"name": "OPENROUTER_API_KEY", "value": "x"}, headers=_headers(host))
+                try:
+                    if response.status != 200:
+                        fail(f"catalog credential was refused: {response.status}")
+                    response.read()
+                finally:
+                    connection.close()
+                store.assert_called_once_with("OPENROUTER_API_KEY", "x")
+                connection, response = _request(host, "POST", "/credentials", body={"name": "UNRELATED_KEY", "value": "x"}, headers=_headers(host))
+                try:
+                    if response.status != 400:
+                        fail("unrelated credential name was accepted")
+                    response.read()
+                finally:
+                    connection.close()
+
+            with mock.patch.dict(os.environ, {"GROQ_API_KEY": "groq-fixture"}), mock.patch.object(
+                host_server_module, "list_models", return_value=["groq-chat"],
+            ) as listed:
+                connection, response = _request(host, "GET", "/models?provider=groq", headers=_headers(host))
+                try:
+                    body = json.loads(response.read())
+                    if response.status != 200 or [item["id"] for item in body.get("models", [])] != ["groq-chat"]:
+                        fail(f"catalog model listing failed: {response.status}, {body!r}")
+                    listed.assert_called_once()
+                finally:
+                    connection.close()
+        finally:
+            host.close()
+
+
+@check("host_server.settings_selection")
+def check_settings_selection() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        host = _host(repo_root=Path(temporary))
+        class AnthropicFake(FakeModelProvider):
+            @property
+            def name(self):
+                return "anthropic"
+
+        try:
+            connection, response = _request(
+                host, "GET", "/settings", headers=_headers(host)
+            )
+            try:
+                selection = json.loads(response.read())["settings"]["selection"]
+                if response.status != 200 or selection is None or selection.get("provider") != "fake":
+                    fail(f"initial selection omitted the configured provider: {selection!r}")
+            finally:
+                connection.close()
+
+            with mock.patch.object(host_server_module, "_provider", return_value=AnthropicFake()):
+                connection, response = _request(
+                    host, "POST", "/provider", body={"name": "anthropic", "model": "m-1"},
+                    headers=_headers(host),
+                )
+                try:
+                    if response.status != 200:
+                        fail(f"provider selection returned {response.status}")
+                finally:
+                    connection.close()
+            connection, response = _request(
+                host, "GET", "/settings", headers=_headers(host)
+            )
+            try:
+                selection = json.loads(response.read())["settings"]["selection"]
+                if response.status != 200 or selection != {
+                    "provider": "anthropic", "model": "m-1", "effort": None,
+                }:
+                    fail(f"settings did not report the next-turn selection: {selection!r}")
+            finally:
+                connection.close()
+        finally:
+            host.close()
 
 
 @check("host_server.model_listing_route")
@@ -4559,6 +4987,372 @@ def check_goal_tool_reads_and_rejects_inactive_updates() -> None:
             fail(f"update_goal accepted a missing goal: {missing!r}")
 
 
+@check("host_server.plan_tool")
+def check_plan_tool() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sessions = root / "sessions"
+        plan = [
+            {"step": "Read the spec", "status": "completed"},
+            {"step": "Implement the feature", "status": "in_progress"},
+            {"step": "Review the result", "status": "pending"},
+        ]
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "plan-call", "update_plan", {"plan": plan, "explanation": "Three steps."},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        broker = EventBroker()
+        subscription = broker.subscribe()
+        run = HostRun(provider, PermissionPolicy(root), broker, sessions_root=sessions)
+        closed = False
+        try:
+            run.start("make a multi-step change")
+            _wait_until(lambda: not run.active, "plan tool run did not finish")
+            session_id = run._conversation[1].run_id
+            expected = {"steps": plan, "explanation": "Three steps."}
+            conversation = run.conversation_stats()
+            if conversation is None or conversation.get("plan") != expected:
+                fail(f"conversation stats lost the plan: {conversation!r}")
+            changed = []
+            while (event := subscription.get(timeout=0.05)) is not None:
+                if isinstance(event, PlanChanged):
+                    changed.append(event)
+            if len(changed) != 1 or changed[0].steps != plan or changed[0].session_id != session_id:
+                fail(f"plan update did not publish PlanChanged: {changed!r}")
+            run.close()
+            closed = True
+            session = SessionStore.open(sessions, session_id)
+            try:
+                if session.read_meta().get("plan") != expected:
+                    fail("plan was not saved in session metadata")
+            finally:
+                session.close()
+
+            published = []
+            tool = plan_module.plan_tools(lambda steps, explanation: published.append((steps, explanation)))["update_plan"]
+            invalid = (
+                {"plan": []},
+                {"plan": [*plan[:2], {"step": "third", "status": "in_progress"}]},
+                {"plan": [{"step": "x" * 201, "status": "pending"}]},
+                {"plan": [{"step": "one", "status": "pending", "extra": True}]},
+            )
+            for index, arguments in enumerate(invalid):
+                result = tool.execute(ToolCall(f"invalid-{index}", "update_plan", arguments), run.policy)
+                if result.ok:
+                    fail(f"invalid plan was accepted: {arguments!r}")
+            if published:
+                fail("invalid plans invoked the update callback")
+        finally:
+            subscription.close()
+            if not closed:
+                run.close()
+
+
+@check("host_server.ask_user_round_trip")
+def check_ask_user_round_trip() -> None:
+    checked = []
+    question_tool = questions_module.question_tools(
+        lambda prompt, options: checked.append((prompt, options))
+    )["ask_user"]
+    for index, arguments in enumerate((
+        {"question": ""},
+        {"question": "Pick", "options": ["same", "same"]},
+        {"question": "Pick", "options": ["only one"]},
+        {"question": "Pick", "unexpected": True},
+    )):
+        invalid = question_tool.execute(
+            ToolCall(f"invalid-question-{index}", "ask_user", arguments),
+            PermissionPolicy(REPO_ROOT),
+        )
+        if invalid.ok:
+            fail(f"invalid ask_user arguments were accepted: {arguments!r}")
+    if checked:
+        fail("invalid ask_user arguments invoked the answer callback")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+
+        def post(host, path: str, body: dict) -> tuple[int, dict]:  # noqa: ANN001
+            connection, response = _request(
+                host, "POST", path, body=body, headers=_headers(host),
+            )
+            try:
+                raw = response.read()
+                return response.status, json.loads(raw) if raw else {}
+            finally:
+                connection.close()
+
+        class RecordingProvider(FakeModelProvider):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "ask-one", "ask_user", {"question": "Choose a file", "options": ["a.py", "b.py"]},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "ask-two", "ask_user", {"question": "Continue?", "options": ["yes", "no"]},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(
+            provider, PermissionPolicy(root), sessions_root=root / "sessions",
+            approval_timeout=2,
+        )
+        host.start()
+        stream_connection = None
+        try:
+            stream_connection, stream_response = _subscribed_stream(host)
+            host.run.start("ask me before choosing")
+            first = _await_sse(
+                stream_connection, stream_response,
+                lambda item: isinstance(item, tuple)
+                and item[0] == "approval_requested" and item[1].get("kind") == "question",
+                what="first user question",
+            )[1]
+            if (
+                first.get("operation") != "ask_user"
+                or first.get("target") != "Choose a file"
+                or first.get("options") != ["a.py", "b.py"]
+            ):
+                fail(f"question request carried the wrong fields: {first!r}")
+            status, reply = post(
+                host, "/approval", {"approval_id": first["approval_id"], "allowed": True, "answer": ""},
+            )
+            if status != 400:
+                fail(f"blank allowed answer returned {status}: {reply!r}")
+            status, reply = post(
+                host, "/approval", {"approval_id": first["approval_id"], "allowed": True, "answer": "B"},
+            )
+            if status != 200 or reply != {"resolved": True}:
+                fail(f"non-blank question answer was not accepted: {status}, {reply!r}")
+
+            second = _await_sse(
+                stream_connection, stream_response,
+                lambda item: isinstance(item, tuple)
+                and item[0] == "approval_requested" and item[1].get("approval_id") != first["approval_id"],
+                what="second user question",
+            )[1]
+            status, reply = post(
+                host, "/approval", {"approval_id": second["approval_id"], "allowed": False},
+            )
+            if status != 200 or reply != {"resolved": True}:
+                fail(f"question skip was not accepted: {status}, {reply!r}")
+            _wait_until(lambda: not host.run.active, "question run did not finish")
+            tool_results = [
+                message.tool_result.content
+                for request in provider.requests
+                for message in request.messages
+                if message.tool_result is not None
+            ]
+            if (
+                "The person answered: B" not in tool_results
+                or "The person skipped the question." not in tool_results
+            ):
+                fail(f"question answers did not reach the model: {tool_results!r}")
+        finally:
+            if stream_connection is not None:
+                stream_connection.close()
+            host.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+            "ask-stop", "ask_user", {"question": "Continue?"},
+        )]))])
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host.start()
+        connection = None
+        try:
+            connection, response = _subscribed_stream(host)
+            host.run.start("wait for my answer")
+            question = _await_sse(
+                connection, response,
+                lambda item: isinstance(item, tuple)
+                and item[0] == "approval_requested" and item[1].get("kind") == "question",
+                what="question before stop",
+            )[1]
+            status, reply = post(host, "/stop", {"reason": "person stopped"})
+            if status != 200 or reply.get("accepted") is not True:
+                fail(f"stop did not accept a waiting question: {status}, {reply!r}")
+            _wait_until(lambda: not host.run.active, "stopped question run did not finish")
+            if host.run.pending_approvals():
+                fail(f"stopped question remained pending: {question!r}")
+        finally:
+            if connection is not None:
+                connection.close()
+            host.close()
+
+
+@check("host_server.plan_approval")
+def check_plan_approval() -> None:
+    plan_text = "# Change parser\n\n1. Update token handling."
+
+    def post(host, path: str, body: dict) -> tuple[int, dict]:  # noqa: ANN001
+        connection, response = _request(host, "POST", path, body=body, headers=_headers(host))
+        try:
+            raw = response.read()
+            return response.status, json.loads(raw) if raw else {}
+        finally:
+            connection.close()
+
+    def run_plan(answer: str, *, reason: str = "", modes=("ask", "plan", "allow")):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        loaded_extensions = load_extensions(repo_root=root, home=root / "home")
+        extensions = replace(loaded_extensions, ceiling=replace(loaded_extensions.ceiling, modes=modes))
+
+        class RecordingProvider(FakeModelProvider):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "propose", "propose_plan", {"plan": plan_text},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "write", "write_file", {"path": "result.txt", "content": "written"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        host = HostServer(
+            provider,
+            PermissionPolicy(root, allowed_write_scope=[root]),
+            sessions_root=root / "sessions",
+            extensions=extensions,
+            approval_timeout=2,
+            memory_extraction_enabled=False,
+        )
+        host.start()
+        connection = None
+        try:
+            host.run.select_mode("plan")
+            connection, response = _subscribed_stream(host)
+            host.run.start("make the change")
+            proposal = _await_sse(
+                connection, response,
+                lambda item: isinstance(item, tuple)
+                and item[0] == "approval_requested" and item[1].get("kind") == "plan",
+                what="plan proposal",
+            )[1]
+            expected_options = [mode for mode in ("ask", "allow") if mode in modes]
+            if proposal.get("target") != plan_text or proposal.get("options") != expected_options:
+                fail(f"plan proposal carried wrong Markdown or choices: {proposal!r}")
+            status, body = post(host, "/approval", {
+                "approval_id": proposal["approval_id"], "allowed": True, "answer": answer,
+            })
+            if answer not in expected_options:
+                if status != 400:
+                    fail(f"unoffered mode {answer!r} returned {status}: {body!r}")
+                host.run.stop()
+                _wait_until(lambda: not host.run.active, "invalid plan mode did not stop")
+                return provider, host, connection, response, temporary
+            if status != 200:
+                fail(f"plan approval failed: {status}, {body!r}")
+            if answer == "ask":
+                write_approval = _await_sse(
+                    connection, response,
+                    lambda item: isinstance(item, tuple)
+                    and item[0] == "approval_requested" and item[1].get("operation") == "write_file",
+                    what="write approval after choosing ask",
+                )[1]
+                status, body = post(host, "/approval", {
+                    "approval_id": write_approval["approval_id"], "allowed": True,
+                })
+                if status != 200:
+                    fail(f"write approval after choosing ask failed: {status}, {body!r}")
+            _wait_until(lambda: not host.run.active, "plan approval run did not finish")
+            connection2, response2 = _request(host, "GET", "/conversation", headers=_headers(host))
+            try:
+                stats = json.loads(response2.read()).get("conversation")
+            finally:
+                connection2.close()
+            if stats is None or stats.get("mode") != answer:
+                fail(f"conversation mode did not change to {answer!r}: {stats!r}")
+            if answer == "allow" and not (root / "result.txt").exists():
+                fail("write did not run after approving allow mode")
+            return provider, host, connection, response, temporary
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            host.close()
+            temporary.cleanup()
+            raise
+
+    provider, host, connection, response, temporary = run_plan("ask")
+    try:
+        results = [
+            message.tool_result.content
+            for request in provider.requests
+            for message in request.messages
+            if message.tool_result is not None
+        ]
+        if not any("The person approved the plan. The conversation is now in ask mode" in item for item in results):
+            fail(f"plan approval did not report ask mode: {results!r}")
+    finally:
+        connection.close()
+        host.close()
+        temporary.cleanup()
+
+    published = []
+    proposal_tool = questions_module.plan_proposal_tools(
+        lambda approval: published.append(approval) or (
+            PermissionDecision.deny("smaller steps", denial=DenialReason.DENIED_BY_USER), "",
+        ),
+        lambda: ("ask", "allow"),
+    )["propose_plan"]
+    policy = PermissionPolicy(Path.cwd(), mode="plan")
+    kept = proposal_tool.execute(
+        ToolCall("keep-plan", "propose_plan", {"plan": plan_text}), policy,
+    )
+    if not kept.ok or kept.content != "The person wants to keep planning: smaller steps" or policy.mode != "plan":
+        fail(f"plan feedback did not keep the conversation in plan mode: {kept!r}")
+
+    published.clear()
+    outside = proposal_tool.execute(
+        ToolCall("outside-plan", "propose_plan", {"plan": plan_text}),
+        PermissionPolicy(Path.cwd(), mode="ask"),
+    )
+    if outside.ok or outside.error != "propose_plan is for plan mode; this conversation is in ask mode" or published:
+        fail(f"propose_plan ran outside plan mode: {outside!r}, {published!r}")
+
+    provider, host, connection, response, temporary = run_plan("allow")
+    try:
+        results = [
+            message.tool_result.content
+            for request in provider.requests
+            for message in request.messages
+            if message.tool_result is not None
+        ]
+        if not any("now in allow mode" in item for item in results):
+            fail(f"plan approval did not report allow mode: {results!r}")
+    finally:
+        connection.close()
+        host.close()
+        temporary.cleanup()
+
+    provider, host, connection, response, temporary = run_plan("allow", modes=("ask", "plan"))
+    try:
+        if provider.call_count != 1:
+            fail("a disallowed plan mode reached the next model request")
+    finally:
+        connection.close()
+        host.close()
+        temporary.cleanup()
+
+
 @check("host_server.goal_stop_and_resume")
 def check_goal_stop_and_resume() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -5094,9 +5888,54 @@ def check_instruction_scope_and_warning() -> None:
             fail("case-variant user instruction include leaked forbidden content")
 
 
+@check("host_server.instruction_warnings_reported")
+def check_instruction_warnings_reported() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        instruction_file = root / ".symphonai" / "INSTRUCTIONS.md"
+        instruction_file.parent.mkdir()
+        instruction_file.write_text("x" * (MAX_INSTRUCTION_FILE_CHARS + 1), encoding="utf-8")
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-home")}):
+            host = _host(
+                provider, repo_root=root, sessions_root=root / "sessions",
+            )
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    _send_host_prompt(host, "load instruction warnings")
+                conversation = host.run.conversation_stats()
+                expected = (
+                    f"instruction file {instruction_file.resolve()} has {MAX_INSTRUCTION_FILE_CHARS + 1} "
+                    f"characters, over the {MAX_INSTRUCTION_FILE_CHARS} character reference limit; "
+                    "loaded in full"
+                )
+                if conversation is None or conversation.get("instruction_warnings") != [expected]:
+                    fail(f"conversation did not report its instruction warning: {conversation!r}")
+            finally:
+                host.close()
+
+        clean_root = root / "clean"
+        clean_root.mkdir()
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(root / "missing-home")}):
+            clean_host = _host(
+                FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+                repo_root=clean_root, sessions_root=clean_root / "sessions",
+            )
+            try:
+                _send_host_prompt(clean_host, "no instruction warnings")
+                conversation = clean_host.run.conversation_stats()
+                if conversation is None or conversation.get("instruction_warnings") != []:
+                    fail(f"clean conversation did not report an empty warning list: {conversation!r}")
+            finally:
+                clean_host.close()
+
+
 @check("host_server.provider_default_and_rejection")
 def check_provider_default_and_rejection() -> None:
-    keys = {"ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": "", "OPENAI_API_KEY": ""}
+    keys = {
+        "ANTHROPIC_API_KEY": "", "GEMINI_API_KEY": "", "OPENAI_API_KEY": "",
+        **{entry.api_key_env_var: "" for entry in CATALOG.values()},
+    }
     with mock.patch.dict(os.environ, keys), tempfile.TemporaryDirectory() as temporary:
         if host_main._provider() is not None:
             fail("a host without keys chose a default provider")
@@ -5120,7 +5959,10 @@ def check_provider_default_and_rejection() -> None:
                 fail("a refused prompt opened a conversation")
         finally:
             host.close()
-        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "fixture-key", "OPENAI_API_KEY": "fixture-key"}):
+        with mock.patch.dict(os.environ, {
+            "GEMINI_API_KEY": "fixture-key", "OPENAI_API_KEY": "fixture-key",
+            **{entry.api_key_env_var: "" for entry in CATALOG.values()},
+        }):
             if host_main._provider().name != "gemini":
                 fail("the first keyed vendor in Settings order was not the default")
     for flag in ("--provider", "--model", "--base-url"):
@@ -6264,6 +7106,39 @@ def check_second_prompt_conflicts() -> None:
         host.close()
 
 
+@check("host_server.decisions_replay")
+def check_decisions_replay() -> None:
+    calls = [
+        ToolCall("answered", "ask_user", {"question": "Pick one", "options": ["A", "B"]}),
+        ToolCall("skipped", "ask_user", {"question": "Continue?"}),
+        ToolCall("approved", "propose_plan", {"plan": "# Do it"}),
+        ToolCall("kept", "propose_plan", {"plan": "# Rework"}),
+        ToolCall("failed", "ask_user", {"question": "Unavailable?"}),
+    ]
+    messages = [
+        Message(Role.ASSISTANT, tool_calls=calls),
+        Message(Role.TOOL, tool_result=ToolResult("answered", True, "The person answered: B")),
+        Message(Role.TOOL, tool_result=ToolResult("skipped", True, "The person skipped the question.")),
+        Message(Role.TOOL, tool_result=ToolResult(
+            "approved", True,
+            "The person approved the plan. The conversation is now in allow mode; carry out the plan.",
+        )),
+        Message(Role.TOOL, tool_result=ToolResult("kept", True, "The person wants to keep planning: smaller")),
+        Message(Role.TOOL, tool_result=ToolResult("failed", False, error="question was stopped")),
+    ]
+    results = HostRun._replay_tool_results(messages)
+    replayed = HostRun._replay_tool_calls(messages[0], results)
+    expected = [
+        {"id": "answered", "name": "ask_user", "question": "Pick one", "options": ["A", "B"], "answer": "B"},
+        {"id": "skipped", "name": "ask_user", "question": "Continue?", "skipped": True},
+        {"id": "approved", "name": "propose_plan", "plan": "# Do it", "decision": "allow"},
+        {"id": "kept", "name": "propose_plan", "plan": "# Rework", "decision": "keep_planning", "feedback": "smaller"},
+        {"id": "failed", "name": "ask_user", "question": "Unavailable?"},
+    ]
+    if replayed != expected:
+        fail(f"replayed decisions were wrong or leaked tool result text: {replayed!r}")
+
+
 @check("host_server.stop_cancels")
 def check_stop_cancels() -> None:
     provider = _WaitingProvider()
@@ -7029,6 +7904,36 @@ def check_extensions_forward_and_main() -> None:
             fail(f"valid startup did not pass resolved hooks: {resolved!r}")
         fake_host.print_handshake.assert_called_once_with()
         fake_host.serve_forever.assert_called_once_with()
+        fake_host.close.assert_called_once_with()
+
+
+@check("host_server.main_passes_base_prompts")
+def main_passes_base_prompts() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        repo = root / "repo"
+        home.mkdir()
+        repo.mkdir()
+        fake_host = mock.Mock()
+        fake_pool = mock.Mock()
+        fake_pool.start.return_value = {}
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(
+            host_main, "_provider", return_value=FakeModelProvider(),
+        ), mock.patch.object(
+            host_main, "HostServer", return_value=fake_host,
+        ) as host_factory, mock.patch.object(
+            host_main, "McpPool", return_value=fake_pool,
+        ), mock.patch.object(
+            host_main, "LspManager", return_value=mock.Mock(),
+        ), mock.patch.object(
+            host_main, "prune_sessions",
+        ):
+            host_main.main(["--repo-root", str(repo)])
+        if host_factory.call_args.kwargs.get("base_prompt") != LEADER_BASE_PROMPT:
+            fail("host main did not pass the leader base prompt")
+        if host_factory.call_args.kwargs.get("subagent_base_prompt") != SUBAGENT_BASE_PROMPT:
+            fail("host main did not pass the subagent base prompt")
         fake_host.close.assert_called_once_with()
 
 
@@ -7925,6 +8830,7 @@ def check_defined_leader_provider_model_and_tools() -> None:
                 fail("leader definition prompt did not reach the provider request")
             if set(leader._agent._tools) != {
                 "dispatch_subagent", "read_file", "read_tool_result", "get_goal", "update_goal",
+                "update_plan", "ask_user", "propose_plan",
             }:
                 fail("leader definition tools did not reach the actual registry")
             if set(leader._leader_spec.tool_names or ()) != set(leader._agent._tools):

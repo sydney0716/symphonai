@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -63,12 +64,51 @@ def _matches_path(pattern: str, relative_path: str) -> bool:
     return matches(0, 0)
 
 
+def _git_ignored_paths(search_root: Path, policy: PermissionPolicy) -> set[str]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
+            cwd=policy.repo_root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+    ignored = {os.fsdecode(path).rstrip("/") for path in result.stdout.split(b"\0") if path}
+    if search_root != policy.repo_root:
+        relative_root = search_root.relative_to(policy.repo_root).as_posix()
+        try:
+            explicitly_named = subprocess.run(
+                ["git", "check-ignore", "-q", "--no-index", relative_root],
+                cwd=policy.repo_root,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ignored
+        if explicitly_named.returncode == 0:
+            return set()
+    return ignored
+
+
+def _is_git_ignored(relative_path: str, ignored: set[str]) -> bool:
+    parts = relative_path.split("/")
+    return any("/".join(parts[:index]) in ignored for index in range(1, len(parts) + 1))
+
+
 def _walk_candidates(
     search_root: Path,
     policy: PermissionPolicy,
     cancel: CancellationToken | None,
 ):
     files_seen = 0
+    ignored = _git_ignored_paths(search_root, policy)
     for directory, dirnames, filenames in os.walk(
         search_root, topdown=True, followlinks=False
     ):
@@ -77,6 +117,9 @@ def _walk_candidates(
             name
             for name in dirnames
             if not (directory_path / name).is_symlink()
+            and not _is_git_ignored(
+                (directory_path / name).relative_to(policy.repo_root).as_posix(), ignored
+            )
             and policy.check_read(directory_path / name).allowed
         ]
         for filename in filenames:
@@ -84,6 +127,8 @@ def _walk_candidates(
                 cancel.raise_if_cancelled()
             files_seen += 1
             path = directory_path / filename
+            if _is_git_ignored(path.relative_to(policy.repo_root).as_posix(), ignored):
+                continue
             if not policy.check_read(path).allowed:
                 continue
             if cancel is not None:

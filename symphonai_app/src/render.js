@@ -34,6 +34,20 @@ const ACTIVITY_VERBS = Object.freeze({
   forget: "Forgot",
 });
 
+const RUNNING_ACTIVITY_VERBS = Object.freeze({
+  read_file: "reading",
+  grep: "searching for",
+  glob: "searching for",
+  list_files: "listing",
+  edit_file: "editing",
+  multi_edit_file: "editing",
+  write_file: "writing",
+  run_shell: "running",
+  dispatch_subagent: "dispatching",
+  remember: "remembering",
+  forget: "forgetting",
+});
+
 const ACTIVITY_KINDS = Object.freeze({
   read_file: "activity-read",
   list_files: "activity-read",
@@ -57,6 +71,16 @@ function renderPrompt(document, entry) {
       : `Image${attachment.filename ? ` · ${attachment.filename}` : ""}`;
     append(prompt, element(document, "span", { className: "attachment", text: label }));
   }
+  return prompt;
+}
+
+function renderSteer(document, entry) {
+  const prompt = element(document, "div", { className: "prompt steer" });
+  append(
+    prompt,
+    element(document, "span", { className: "steer-label", text: "Sent while working" }),
+    element(document, "p", { text: entry.text }),
+  );
   return prompt;
 }
 
@@ -86,9 +110,9 @@ const INLINE_BLOCK_RENDERERS = Object.freeze({
   rich: renderRichInlineBlock,
 });
 
-function renderText(document, entry, parseMarkdown) {
+function renderText(document, entry, parseMarkdown, actions) {
   const assistant = element(document, "div", { className: "assistant" });
-  append(assistant, ...parseMarkdown(entry.text).map((block) => renderBlock(document, block)));
+  append(assistant, ...parseMarkdown(entry.text).map((block) => renderBlock(document, block, actions)));
   return assistant;
 }
 
@@ -180,11 +204,24 @@ function renderRule(document) {
   return element(document, "hr");
 }
 
-function renderCodeBlock(document, block) {
+function renderCodeBlock(document, block, actions) {
   const pre = element(document, "pre");
   const code = element(document, "code", { text: block.text });
   code.setAttribute("data-language", block.language ?? "");
-  return append(pre, code);
+  const copy = element(document, "button", { className: "code-copy" });
+  copy.type = "button";
+  copy.setAttribute("aria-label", "Copy code");
+  copy.setAttribute("title", "Copy code");
+  copy.addEventListener("click", async () => {
+    try {
+      await actions?.copyText?.(block.text);
+      copy.setAttribute("title", "Copied");
+      setTimeout(() => copy.setAttribute("title", "Copy code"), 2000);
+    } catch {
+      copy.setAttribute("title", "Could not copy");
+    }
+  });
+  return append(pre, code, copy);
 }
 
 function renderQuote(document, block) {
@@ -201,8 +238,12 @@ const BLOCK_RENDERERS = Object.freeze({
   quote: renderQuote,
 });
 
-function renderBlock(document, block) {
-  return BLOCK_RENDERERS[block.type](document, block);
+function renderBlock(document, block, actions) {
+  return BLOCK_RENDERERS[block.type](document, block, actions);
+}
+
+export function renderMarkdownBlocks(document, value, parseMarkdown) {
+  return parseMarkdown(value).map((block) => renderBlock(document, block));
 }
 
 function renderCommand(document, entry) {
@@ -231,8 +272,53 @@ function renderGoal(document, entry) {
   return command;
 }
 
+function renderPlan(document, entry, parseMarkdown) {
+  const plan = element(document, "section", { className: "plan-entry" });
+  append(plan, ...(entry.explanation ? [
+    append(
+      element(document, "div", { className: "plan-explanation" }),
+      ...parseMarkdown(entry.explanation).map((block) => renderBlock(document, block)),
+    ),
+  ] : []));
+  const list = element(document, "ol", { className: "plan-steps" });
+  for (const item of entry.steps) {
+    const step = element(document, "li", { className: `plan-step ${item.status}` });
+    const marker = item.status === "completed" ? "✓" : item.status === "in_progress" ? "●" : "○";
+    append(step,
+      element(document, "span", { className: "plan-marker", text: marker }),
+      element(document, "span", { className: "plan-step-text", text: item.step }),
+    );
+    append(list, step);
+  }
+  append(plan, list);
+  return plan;
+}
+
+function renderUserQuestion(document, entry) {
+  const question = element(document, "div", { className: "user-question" });
+  append(
+    question,
+    element(document, "p", { className: "user-question-text", text: entry.question }),
+    ...(entry.answer
+      ? [element(document, "p", { className: "user-question-answer", text: entry.answer })]
+      : []),
+  );
+  return question;
+}
+
+function renderUserPlan(document, entry, parseMarkdown) {
+  const plan = element(document, "section", { className: "user-plan" });
+  append(
+    plan,
+    ...parseMarkdown(entry.plan).map((block) => renderBlock(document, block)),
+    ...(entry.outcome ? [element(document, "p", { className: "user-plan-outcome", text: entry.outcome })] : []),
+  );
+  return plan;
+}
+
 function renderActivity(document, entry, _parseMarkdown, actions) {
   const failed = entry.calls.some((call) => call.status === "failed");
+  const running = entry.calls.some((call) => call.status === "running");
   const kind = ACTIVITY_KINDS[entry.calls[0]?.name];
   const dispatches = entry.calls.filter((call) => call.name === "dispatch_subagent" && typeof call.task === "string");
   const expandable = dispatches.length > 0;
@@ -243,11 +329,15 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
   expandable && line.setAttribute("tabindex", "0");
   expandable && line.setAttribute("aria-expanded", String(entry.expanded === true));
   const text = element(document, "span", { className: "activity-text" });
+  const endsWithQuotedMemory = entry.calls.at(-1)?.target !== null
+    && ["remember", "forget"].includes(entry.calls.at(-1)?.name);
   let sentence = "";
   append(
     text,
     ...entry.calls.flatMap((call, index, calls) => {
-      const verb = ACTIVITY_VERBS[call.name] ?? `used ${call.name}`;
+      const verb = call.status === "running"
+        ? RUNNING_ACTIVITY_VERBS[call.name] ?? `using ${call.name}`
+        : ACTIVITY_VERBS[call.name] ?? `used ${call.name}`;
       const label = index === 0 ? `${verb.charAt(0).toUpperCase()}${verb.slice(1)}` : verb;
       const separator = index === 0 ? "" : index === calls.length - 1
         ? calls.length === 2 ? " and " : ", and "
@@ -270,15 +360,12 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
         ...(failure ? [element(document, "span", { text: failure })] : []),
       ];
     }),
-    ...(entry.calls.at(-1)?.target !== null
-      && ["remember", "forget"].includes(entry.calls.at(-1)?.name)
-      ? []
-      : [element(document, "span", { text: "." })]),
+    ...(!endsWithQuotedMemory
+      ? [element(document, "span", { text: running ? "…" : "." })]
+      : []),
   );
   append(line, text);
-  const endsWithQuotedMemory = entry.calls.at(-1)?.target !== null
-    && ["remember", "forget"].includes(entry.calls.at(-1)?.name);
-  line.setAttribute("title", `${sentence}${endsWithQuotedMemory ? "" : "."}`);
+  line.setAttribute("title", `${sentence}${endsWithQuotedMemory ? "" : running ? "…" : "."}`);
   const toggle = () => {
     entry.expanded = entry.expanded !== true;
     actions?.rerender?.();
@@ -366,7 +453,7 @@ function renderQuestion(document, entry) {
     : "waiting for an answer";
   return element(document, "p", {
     className: `question ${entry.resolved ? "resolved" : "open"}`,
-    text: `${entry.toolName} asks for ${entry.mode} permission — ${state}.`,
+    text: `${entry.toolName} needs approval — ${state}.`,
   });
 }
 
@@ -393,9 +480,13 @@ function renderUnknown(document, entry) {
 
 const TRANSCRIPT_RENDERERS = Object.freeze({
   prompt: renderPrompt,
+  steer: renderSteer,
   text: renderText,
   command: renderCommand,
   goal: renderGoal,
+  plan: renderPlan,
+  "user-question": renderUserQuestion,
+  "user-plan": renderUserPlan,
   activity: renderActivity,
   edit: renderEdit,
   "edit-card": renderEditCard,

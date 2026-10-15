@@ -252,6 +252,7 @@ button.icon-pause,
 button.icon-play,
 button.icon-check,
 button.icon-trash,
+button.icon-pencil,
 button.icon-undo,
 button.icon-left-panel,
 button.icon-right-panel {
@@ -268,6 +269,7 @@ button.icon-right-panel {
 .icon-play::before,
 .icon-check::before,
 .icon-trash::before,
+.icon-pencil::before,
 .icon-undo::before,
 .icon-left-panel::before,
 .icon-right-panel::before,
@@ -362,6 +364,38 @@ code {
   line-height: 1.55;
 }
 
+pre {
+  position: relative;
+}
+
+button.code-copy {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border-color: var(--ui-border);
+  background: var(--ui-raised);
+  opacity: 0;
+}
+
+button.code-copy::before {
+  content: "";
+  display: block;
+  width: 1rem;
+  height: 1rem;
+  margin: auto;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='8' y='8' width='12' height='12' rx='1.5'/%3E%3Cpath d='M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8'/%3E%3C/svg%3E") center / 1rem 1rem no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='8' y='8' width='12' height='12' rx='1.5'/%3E%3Cpath d='M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8'/%3E%3C/svg%3E") center / 1rem 1rem no-repeat;
+}
+
+pre:hover > .code-copy,
+pre:focus-within > .code-copy {
+  opacity: 1;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 14rem minmax(0, 1fr) 18rem;
@@ -444,6 +478,94 @@ code {
 
 .project {
   margin: var(--space-2) 0;
+}
+
+.session-search {
+  display: block;
+  width: calc(100% - 1rem);
+  min-height: 2rem;
+  margin: var(--space-2) 0 0 var(--space-4);
+  padding: 0 var(--space-2);
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: var(--space-1);
+  position: relative;
+  margin-left: var(--space-4);
+}
+
+.session-row .session-link {
+  flex: 1;
+  min-width: 0;
+  margin-left: 0;
+  max-width: none;
+}
+
+.session-row:has(.session-rename-input) .session-link {
+  display: none;
+}
+
+.session-row-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  opacity: 0;
+  position: absolute;
+  top: var(--space-2);
+}
+
+.session-row-action.icon-pencil {
+  right: 2rem;
+}
+
+.session-row-action.icon-trash {
+  right: 0;
+}
+
+.session-row:hover .session-row-action,
+.session-row:focus-within .session-row-action {
+  opacity: 1;
+}
+
+.session-delete-confirmation,
+.session-row-error {
+  flex-basis: 100%;
+  margin: 0 0 var(--space-2);
+  color: var(--ui-danger);
+}
+
+.session-rename-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+
+.credential-controls > div {
+  align-items: center;
+  display: grid;
+  gap: var(--space-2);
+  grid-template-columns: minmax(0, 1fr) auto auto minmax(8rem, auto);
+  margin: var(--space-2) 0;
+}
+
+.credential-controls label {
+  align-items: center;
+  display: grid;
+  gap: var(--space-2);
+  grid-template-columns: 16rem minmax(0, 1fr);
+}
+
+.credential-controls input {
+  min-width: 0;
+  width: 100%;
 }
 
 .project > summary {
@@ -1336,6 +1458,17 @@ button.session-link {
   background: var(--ui-inset);
 }
 
+.steer-label {
+  display: block;
+  margin-bottom: var(--space-1);
+  color: var(--ui-text-secondary);
+  font-size: 0.8125rem;
+}
+
+.steer p {
+  margin: 0;
+}
+
 .activity,
 .edit,
 .question,
@@ -1408,19 +1541,19 @@ button.session-link {
   overflow-wrap: anywhere;
 }
 
-#chat > :is(.prompt, .assistant, .activity, .edit, .question, .compaction, .gap, .unknown-event) {
+#chat > :is(.prompt, .assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event) {
   margin-top: 0;
   margin-bottom: 0;
 }
 
-#chat > :is(.assistant, .activity, .edit, .question, .compaction, .gap, .unknown-event) {
+#chat > :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event) {
   --agent-dot-top: calc(0.775em - 0.25rem);
   --agent-dot-center: calc(var(--agent-dot-top) + 0.25rem);
   position: relative;
   margin-left: var(--space-6);
 }
 
-#chat > :is(.assistant, .activity, .edit, .question, .compaction, .gap, .unknown-event)::before {
+#chat > :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event)::before {
   position: absolute;
   z-index: 1;
   top: var(--agent-dot-top);
@@ -1432,7 +1565,7 @@ button.session-link {
   content: "";
 }
 
-#chat > :is(.assistant, .activity, .edit, .question, .compaction, .gap, .unknown-event):has(+ :is(.assistant, .activity, .edit, .question, .compaction, .gap, .unknown-event))::after {
+#chat > :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event):has(+ :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event))::after {
   position: absolute;
   z-index: 0;
   top: var(--agent-dot-center);
@@ -1540,12 +1673,18 @@ button.session-link {
 }
 
 .assistant pre {
-  overflow-x: auto;
+  /* overflow-x: auto belongs to the code child so the copy control stays visible. */
+  overflow: visible;
   margin: 0.5em 0;
   padding: 0.6em;
   background: var(--ui-inset);
   border-radius: var(--radius-control);
   white-space: pre;
+}
+
+.assistant pre > code {
+  display: block;
+  overflow-x: auto;
 }
 
 .assistant code {
@@ -1582,11 +1721,14 @@ button.session-link {
 
 .command-output {
   padding-left: 1.5em;
+  text-indent: -1.5em;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .command-output::before {
+  display: inline-block;
+  width: 1.5em;
   content: "⎿ ";
 }
 
@@ -1601,6 +1743,75 @@ button.session-link {
 .goal-check-output pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.plan-entry {
+  padding: var(--space-2) 0;
+}
+
+#chat > .plan-entry:not(:has(.plan-explanation)) {
+  --agent-dot-top: calc(0.775em - 0.25rem + var(--space-2) + var(--space-2));
+}
+
+.user-question {
+  margin: 0;
+}
+
+.user-plan {
+  padding: var(--space-2) 0;
+}
+
+.user-plan-outcome {
+  margin: var(--space-2) 0 0;
+  color: var(--ui-text-secondary);
+}
+
+.user-question-text,
+.user-question-answer {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.user-question-answer {
+  margin-top: var(--space-1);
+  color: var(--ui-text-secondary);
+}
+
+.plan-explanation > :first-child {
+  margin-top: 0;
+}
+
+.plan-steps {
+  display: grid;
+  gap: var(--space-1);
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+}
+
+.plan-step {
+  align-items: baseline;
+  display: flex;
+  gap: var(--space-2);
+}
+
+.plan-marker {
+  color: var(--ui-text-secondary);
+  flex: 0 0 1rem;
+  text-align: center;
+}
+
+.plan-step.in_progress .plan-marker {
+  color: var(--ui-warning);
+}
+
+.plan-step.in_progress .plan-step-text {
+  font-weight: 600;
+}
+
+.plan-step.completed .plan-step-text {
+  color: var(--ui-text-secondary);
+  text-decoration: line-through;
 }
 
 .edit summary {
@@ -1648,6 +1859,17 @@ button.session-link {
 
 .approval button {
   margin-right: var(--space-2);
+}
+
+.approval label {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-2) 0;
+}
+
+.approval textarea {
+  min-height: 4rem;
+  width: 100%;
 }
 
 #prompt-form textarea {

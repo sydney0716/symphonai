@@ -119,10 +119,112 @@ def check_shell_grant_prefix() -> None:
         (["pytest", "-x"], ("pytest",)),
         (["python3", "scripts/check.py", "--only", "app"], ("python3", "scripts/check.py")),
         (["ls"], ("ls",)),
+        (["python3", "-m", "unittest", "-v"], ("python3", "-m", "unittest")),
+        (["python3", "-c", "x"], ()),
+        (["sh", "-c", "x"], ()),
+        (["env", "X=1", "make"], ()),
     )
     for argv, expected in cases:
         if shell_grant_prefix(argv) != expected:
             fail(f"wrong remembered shell prefix for {argv!r}: {shell_grant_prefix(argv)!r}")
+
+
+@check("permissions.command_line_policy")
+def check_command_line_policy() -> None:
+    with workspace() as ws:
+        allow = PermissionPolicy(
+            ws.root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+        )
+        denied = (
+            ["sh", "-c", "ls && rm x"],
+            ["/bin/rm", "x"],
+            ["env", "FOO=1", "rm", "x"],
+            ["xargs", "rm"],
+            ["find", ".", "-exec", "rm", "{}", ";"],
+            ["bash", "-l", "-c", "rm x"],
+            ["bash", "-o", "pipefail", "-c", "git push"],
+            ["timeout", "60", "bash", "-c", "git push"],
+            ["env", "sh", "-c", "rm x"],
+            ["/bin/bash", "-c", "if [ -d build ]; then rm -rf build; fi"],
+            ["/bin/bash", "-c", "if true; then git push; fi"],
+            ["/bin/bash", "-c", "while true; do curl x; done"],
+            ["bash", "-c", "rm x", "--help"],
+            ["sh", "-c", "git push", "--version"],
+            ["timeout", "5", "bash", "-c", "curl x", "--help"],
+        )
+        for argv in denied:
+            decision = allow.check_shell(argv)
+            if decision.allowed or decision.denial is not DenialReason.ALWAYS_DENY:
+                fail(f"always-denied command was not refused: {argv!r}: {decision!r}")
+
+        for argv in (
+            ["/bin/bash", "-c", "echo 'rm x' | bash"],
+            ["/bin/bash", "-c", "bash -s < s.sh"],
+            ["/bin/bash", "-c", "export X=rm; $X x"],
+            ["/bin/bash", "-c", "exec $X x"],
+            ["/bin/bash", "-c", "eval 'rm x'"],
+            ["/bin/bash", "-c", "{rm,x}"],
+        ):
+            decision = allow.check_shell(argv)
+            if decision.allowed or decision.denial is not DenialReason.UNCHECKABLE_COMMAND:
+                fail(f"uncheckable command was not refused: {argv!r}: {decision!r}")
+
+        for argv in (
+            ["command", "-v", "curl"],
+            ["command", "-v", "bash"],
+            ["find", ".", "-name", "open"],
+            ["find", ".", "-name", "sh"],
+            ["find", ".", "-exec", "wc", "-l", "{}", "+"],
+            ["git", "show", "stash@{0}"],
+            ["/bin/bash", "-c", "[ -f setup.py ] && echo yes"],
+            ["/bin/bash", "-c", "[[ -d build ]] || mkdir build"],
+            ["bash", "--version"],
+            ["bash", "--help", "-c", "rm x"],
+            ["env", "bash", "--version"],
+            ["command", "-v", "bash"],
+            ["find", ".", "-name", "sh"],
+            ["/bin/bash", "-c", "for f in a b; do echo $f; done"],
+        ):
+            if not allow.check_shell(argv).allowed:
+                fail(f"read command was refused by the deny scan: {argv!r}")
+
+        uncheckable = allow.check_shell(["sh", "-c", "echo $(id)"])
+        expected_reason = (
+            "this command uses shell syntax that cannot be checked "
+            "(command or process substitution, a subshell, a here-document, or a background job); "
+            "run it as simpler commands"
+        )
+        if (
+            uncheckable.allowed
+            or uncheckable.denial is not DenialReason.UNCHECKABLE_COMMAND
+            or uncheckable.outcome is not ApprovalOutcome.REJECTED
+            or uncheckable.reason != expected_reason
+        ):
+            fail(f"uncheckable shell syntax was not refused clearly: {uncheckable!r}")
+
+        requests: list[ToolApprovalRequest] = []
+        ask = PermissionPolicy(
+            ws.root, mode="ask", approval_callback=lambda request: requests.append(request) or True,
+        )
+        if not ask.check_shell(["sh", "-c", "echo $(id)"]).allowed:
+            fail("ask mode did not hand uncheckable syntax to its approval callback")
+        if len(requests) != 1 or requests[0].commands != ():
+            fail(f"ask mode did not mark uncheckable commands empty: {requests!r}")
+
+        narrow_allow = PermissionPolicy(
+            ws.root, mode="allow", shell_enabled=True, shell_allowlist=[("git", "status")],
+        )
+        redirected = narrow_allow.check_shell(["bash", "-c", "git status > ../outside.txt"])
+        if (
+            redirected.allowed
+            or redirected.denial is not DenialReason.NOT_ALLOWLISTED
+            or "output redirection" not in redirected.reason
+        ):
+            fail(f"allowlist did not refuse ungranted output redirection: {redirected!r}")
+        if not narrow_allow.check_shell(["bash", "-c", "git status 2>/dev/null"]).allowed:
+            fail("stderr redirection was treated as a write")
+        if not narrow_allow.check_shell(["git", "status"]).allowed:
+            fail("allowlist refused its exact command")
 
 
 @check("permissions.always_deny_precedes_shell_approval")
@@ -1287,6 +1389,7 @@ def opaque_tool_modes() -> None:
         ("OUTSIDE_WRITE_SCOPE", "outside_write_scope"),
         ("EMPTY_COMMAND", "empty_command"),
         ("ALWAYS_DENY", "always_deny"),
+        ("UNCHECKABLE_COMMAND", "uncheckable_command"),
         ("SHELL_DISABLED", "shell_disabled"),
         ("NOT_ALLOWLISTED", "not_allowlisted"),
         ("NO_APPROVAL_CALLBACK", "no_approval_callback"),

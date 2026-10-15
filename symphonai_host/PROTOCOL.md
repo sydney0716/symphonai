@@ -48,6 +48,7 @@ fields on a known event are ignored for forward compatibility.
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
 | `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null`, `session_id: str` |
+| `PlanChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `steps: list`, `explanation: str`, `session_id: str` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -63,12 +64,12 @@ Requests are validated separately from frame decoding so a transport only needs
 to pass a `kind` and object payload to the host. Required fields must have the
 listed type; `reason` is optional and defaults to `""`.
 An approval request's optional `remember` field must be a boolean and defaults
-to `false`.
+to `false`; optional `answer` must be a string and defaults to `""`.
 
 | Request kind | Payload |
 | --- | --- |
 | `prompt` | `prompt: str`, `attachments?: [{data: str, filename?: str}]` |
-| `approval` | `approval_id: str`, `allowed: bool`, `reason: str`, `remember: bool` (optional) |
+| `approval` | `approval_id: str`, `allowed: bool`, `reason: str`, `remember: bool` (optional), `answer: str` (optional) |
 | `stop` | `reason: str` |
 
 Unknown request kinds and malformed fields are protocol errors. This document
@@ -111,13 +112,22 @@ with an empty body.
 ## Approvals
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,
-`details`, `tool_call_id`, `remember`, and `session_id`. The `tool_call_id` is `""` when the
+`details`, `tool_call_id`, `remember`, `session_id`, `kind`, and `options`.
+`kind` is `approval`, `question`, or `plan`; `options` is empty for an approval and has
+the offered choices for a question or plan. A question uses `operation: "ask_user"`,
+with its prompt in `target`. The `tool_call_id` is `""` when the
 approval belongs to no tool call. `remember` is the shell command prefix the
 client may grant for the current chat, or `""` when no grant applies. A client
 answers with the `approval` request above; `remember: true` grants that prefix
 for its conversation. An approval id is single-use; unknown or expired replies are rejected. After any
 `error` frame carrying `dropped`, a client re-reads `GET /approvals`, because a
 dropped frame may have been a question.
+For `kind: "question"`, an allowed reply includes non-blank `answer`; a denied
+reply skips the question. A blank allowed answer returns `400`.
+For `kind: "plan"`, `target` contains the proposed Markdown plan and `options`
+contains the permitted approval modes. An allowed reply must include one of
+those modes in `answer`; a denied reply sends feedback in `reason` and keeps
+the conversation in plan mode.
 
 ## Writing a client
 
@@ -201,7 +211,14 @@ Each item includes `activity`: `working` during a run or goal check, `waiting`
 while an approval is pending, and `idle` otherwise.
 An optional positive `limit` query parameter bounds the entries returned and
 classified; missing, empty, non-numeric, zero, and negative values return the
-full listing. `POST /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
+full listing. An optional `query` filters by a case-insensitive substring in
+the title or a user or assistant message, before applying `limit`.
+`POST /session/rename` takes `{"run_id": str, "title": str}` and trims a
+non-blank title of at most 200 characters; it returns `{"renamed": true}` or
+`404` for an unknown session. `POST /session/delete` takes `{"run_id": str}`;
+it returns `{"deleted": true}`, `404` when unknown, or `409` while a turn,
+approval, question, or goal check is pending. An idle open session is closed
+before its directory is removed. `POST /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
 its reply, and makes that conversation current. Each history and runtime event
 frame includes the originating `session_id`. Later prompts append to the same
 session directory and transcript, while each prompt still has a distinct run
@@ -270,27 +287,30 @@ budget, the launch limit applies when set. Limits reset for each prompt.
 `budget_cost_unpriced` when a limit ends a run;
 the conversation remains available for another prompt.
 
-Authenticated `POST /provider` takes `{"name": "anthropic" | "gemini" |
-"openai", "model": str?, "base_url": str?, "effort": str?}` and returns
+Authenticated `POST /provider` takes `{"name": str, "model": str?,
+"base_url": str?, "effort": str?}` and returns
 `{"selected": true}`. `model`, `base_url`, and `effort` are optional non-empty
 strings. The model and effort apply to the next leader request in the current
 conversation. They do not replace a dispatched agent's own settings, and a
 `leader` definition's explicit model or effort takes precedence over this choice.
-`openai` with a
-`base_url` selects an OpenAI-compatible endpoint. Unknown vendors, malformed
-options, and vendors without a configured API key return `400`. A provider
+The known providers are `anthropic`, `gemini`, `openai`, and the catalog keys
+`deepseek`, `grok`, `groq`, `kimi`, `ollama`, `openrouter`, `qwen`, and
+`together`. `openai` with a `base_url` selects an OpenAI-compatible endpoint;
+catalog providers use their preset URL and reject `base_url`. Unknown providers,
+malformed options, and providers without a configured API key return `400`. A provider
 change rebuilds the conversation's leader for the next turn while preserving
 the session and message history; provider-specific tool-call metadata from the
 previous provider is discarded. A selection while a run is active returns
 `409`. Reopening a selected conversation restores its provider choice from
 session metadata. Both Leader providers use the conversation's selected
 provider. When no selection was sent, the host uses
-the first vendor with a key in Settings order (anthropic, gemini, openai).
-If no vendor has a key, the first prompt returns `400` until a key is added or
+the first configured provider in Settings order (anthropic, gemini, openai,
+then the catalog keys listed above).
+If no provider has a key, the first prompt returns `400` until a key is added or
 a valid selection is sent. Launch flags do not select a provider.
 
 Authenticated `GET /models?provider=<name>` lists the models for a known
-provider, with optional `base_url` using the same meaning as `POST /provider`.
+provider, with optional `base_url` for vendors that permit endpoint selection.
 It returns `provider`, `state`, `models`, `detail`, and `filter`. Each model is
 `{"id": str, "efforts": [str, ...]}`. A successful lookup has `state:
 "available"`, models from live model discovery, their declared effort
@@ -352,7 +372,9 @@ entries identify an agent by opaque id and name, plus `parent_agent_id` (an
 opaque id or `null` for a root). When known, each entry also has `state`:
 `running`, `finished`, `failed`, or `stopped`; unknown state is omitted. Folded
 agents report the state of their most recent run. `mode` reports the mode
-currently in force.
+currently in force. `instruction_warnings` is a list of instruction loading
+warnings for conversations started by this host, and is empty for clean or
+reopened conversations.
 Each agent appears once; the first run in the
 timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,
@@ -361,10 +383,22 @@ this process, the payload also contains `context` (`used_tokens`, `budget_tokens
 and `cache_write_tokens`. Immediately after
 reopening a conversation, `context`, aggregate `usage`, and per-agent usage and
 `cost` are omitted until another run is accounted in this process.
+`plan` is the latest leader plan (`steps` and `explanation`), or `null` when
+none has been set.
 When every used model has a configured price, usage objects also contain
 `cost` with decimal-string `amount` and `currency`; `cost` is omitted when no
 price table exists or any used model is unpriced. The payload contains no
 repository paths, credentials, or model request content.
+
+Replayed assistant `HistoryMessage` tool calls include their `plan` and
+`explanation` arguments for `update_plan`.
+
+Replayed `ask_user` tool calls include `question` and `options`, plus
+`answer` when answered or `skipped: true` when skipped. Replayed `propose_plan`
+calls include `plan`, plus `decision` (`ask`, `allow`, or `keep_planning`) and
+optional `feedback` when the person kept planning. Calls with no result or an
+`ok: false` result have no decision fields. Tool result text is never sent to
+the client.
 
 ## Goals
 
@@ -455,7 +489,8 @@ resolved path as `repo_root` and its basename as `name`. It accepts only the
 ordinary bearer header; an app query token or app cookie does not authorize it.
 
 An authenticated `GET /settings` returns a `settings` object with the current
-permission `mode`, `config`
+permission `mode`, the next-turn `selection` (`provider`, `model`, and
+`effort`, or `null` when no provider is selected), `config`
 entries (`key`, `value`, `scope`), `ceiling`, `trust`, `hooks` (`event`, `command`),
 `mcp_servers` (`name`, `command`, `started`), sorted `agents`, `skills`, and
 `plugins` entries (`name`, `path`), `withheld` entries (`scope`, `directory`, `names`, `reason`),
@@ -488,6 +523,24 @@ idempotent. `GET /health` returns protocol version, `idle` or `active` state,
 the active host `run_id`, and the root runtime `runtime_run_id` once its
 `RunStarted` event has been seen. Both ids are `null` while idle. Other paths
 return JSON `404` responses.
+
+Authenticated `POST /steer` accepts exactly `{"text": <non-blank string>}`.
+It delivers the text to the open conversation's running leader for its next
+tool call and returns `{"steered": true}`. With no running turn, or if the
+leader has already finished, it returns `409 {"error": "no turn is running"}`.
+Malformed requests return `400`.
+
+Authenticated `POST /command` accepts exactly `{"command": <non-blank string>}`.
+It runs the command in the repository with the run_shell environment and output
+limit, a closed stdin, and a 120-second timeout. It returns
+`{"exit_code": <int or null>, "output": <str>, "timed_out": <bool>, "stopped": <bool>}`. A
+running turn returns `409 {"error": "wait for the turn to finish"}`; a running
+command returns `409 {"error": "a command is already running"}`. While a command
+runs, `POST /prompt` returns `409 {"error": "wait for the command to finish"}`.
+Malformed requests return `400`. `POST /stop` stops the command's process group;
+the reply has a null `exit_code`, `timed_out: false`, and `stopped: true`. The
+host adds the command and result to the open conversation as user context, or
+holds it for the next prompt when no conversation is open.
 
 `GET /file?path=<repository-relative path>` returns a UTF-8 text file as
 `{"path": <path as requested>, "text": <contents>}`. It serves regular files

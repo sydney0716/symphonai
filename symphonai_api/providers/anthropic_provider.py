@@ -37,7 +37,7 @@ from symphonai_api.models import (
     reject_system_attachments,
     wire_tool_call_ids,
 )
-from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
+from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object, tool_result_text
 from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_secret
 from symphonai_api.streaming import (
     StreamChunk,
@@ -113,7 +113,7 @@ def _to_anthropic_content(message: Message, id_map: dict[str, str]) -> list[dict
             {
                 "type": "tool_result",
                 "tool_use_id": id_map.get(result.tool_call_id, result.tool_call_id),
-                "content": result.content if result.ok else (result.error or ""),
+                "content": tool_result_text(result),
                 "is_error": not result.ok,
             }
         ]

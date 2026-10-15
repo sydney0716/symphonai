@@ -35,7 +35,7 @@ from symphonai_api.models import (
     reject_system_attachments,
     wire_tool_call_ids,
 )
-from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object
+from symphonai_api.providers.base import ModelProvider, ProviderError, parse_json_object, tool_result_text
 from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_secret
 from symphonai_api.streaming import (
     StreamChunk,
@@ -101,7 +101,7 @@ def _to_openai_message(message: Message, id_map: dict[str, str]) -> dict[str, An
         return {
             "role": "tool",
             "tool_call_id": id_map.get(result.tool_call_id, result.tool_call_id),
-            "content": result.content if result.ok else (result.error or ""),
+            "content": tool_result_text(result),
         }
     content = (
         message.text or None
@@ -180,7 +180,7 @@ def _build_responses_request_body(request: ModelRequest, model: str) -> dict[str
             items.append({
                 "type": "function_call_output",
                 "call_id": id_map.get(result.tool_call_id, result.tool_call_id),
-                "output": result.content if result.ok else (result.error or ""),
+                "output": tool_result_text(result),
             })
             continue
         if message.role == Role.ASSISTANT and message.tool_calls:

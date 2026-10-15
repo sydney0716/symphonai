@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
+from symphonai_api.providers.base import tool_result_text
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 16_000
 DEFAULT_CONTEXT_WINDOW = 128_000
@@ -394,7 +395,7 @@ def render_dropped_messages(messages: list[Message]) -> str:
         if message.tool_result is not None:
             result = message.tool_result
             label = "Tool result" if result.ok else "Tool error"
-            content = result.content if result.ok else (result.error or result.content)
+            content = tool_result_text(result)
             lines.append(f"{label}:\n{content}")
         for block in message.content:
             if isinstance(block, (ImageBlock, DocumentBlock)):

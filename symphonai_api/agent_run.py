@@ -44,6 +44,7 @@ class AgentRun:
         repr=False,
         compare=False,
     )
+    _redirects_closed: bool = field(default=False, init=False, repr=False, compare=False)
     _control_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -114,16 +115,26 @@ class AgentRun:
                     return
 
     def redirect(self, text: str) -> None:
-        self._require(
-            "redirect",
-            RunPhase.PENDING,
-            RunPhase.RUNNING,
-            RunPhase.PAUSED,
-        )
         if not isinstance(text, str) or not text.strip():
             raise ValueError("redirect text must not be blank")
         with self._control_lock:
+            if self._redirects_closed or self.phase not in (
+                RunPhase.PENDING, RunPhase.RUNNING, RunPhase.PAUSED,
+            ):
+                current = RunPhase.FINISHED.value if self._redirects_closed else self.phase.value
+                raise ValueError(
+                    "redirect requires pending or running or paused; "
+                    f"current phase is {current}"
+                )
             self._redirects.append(text)
+
+    def close_redirects(self) -> tuple[str, ...]:
+        """Atomically refuse new redirects and return any the loop did not read."""
+        with self._control_lock:
+            self._redirects_closed = True
+            redirects = tuple(self._redirects)
+            self._redirects.clear()
+            return redirects
 
     def take_redirects(self) -> tuple[str, ...]:
         with self._control_lock:
@@ -136,34 +147,40 @@ class AgentRun:
             return bool(self._redirects)
 
     def finish(self, result: object) -> None:
-        self._require("finish", RunPhase.RUNNING)
         try:
-            self.turns_used = result.turns_used
-            self.usage_by_model = dict(result.usage_by_model)
-            self.stopped_reason = result.stopped_reason
-            self.finished_monotonic = time.monotonic()
-            self.phase = RunPhase.FINISHED
+            with self._control_lock:
+                self._require("finish", RunPhase.RUNNING)
+                self._redirects_closed = True
+                self.turns_used = result.turns_used
+                self.usage_by_model = dict(result.usage_by_model)
+                self.stopped_reason = result.stopped_reason
+                self.finished_monotonic = time.monotonic()
+                self.phase = RunPhase.FINISHED
         finally:
             if self.token is not None:
                 self.token.close()
 
     def fail(self, error: str) -> None:
-        self._require("fail", RunPhase.RUNNING, RunPhase.PAUSED)
         try:
-            self.error = error
-            self.finished_monotonic = time.monotonic()
-            self.phase = RunPhase.FAILED
+            with self._control_lock:
+                self._require("fail", RunPhase.RUNNING, RunPhase.PAUSED)
+                self._redirects_closed = True
+                self.error = error
+                self.finished_monotonic = time.monotonic()
+                self.phase = RunPhase.FAILED
         finally:
             if self.token is not None:
                 self.token.close()
 
     def cancel(self) -> None:
-        self._require("cancel", RunPhase.PENDING, RunPhase.RUNNING, RunPhase.PAUSED)
         try:
-            if self.token is not None:
-                self.token.cancel()
-            self.finished_monotonic = time.monotonic()
-            self.phase = RunPhase.CANCELLED
+            with self._control_lock:
+                self._require("cancel", RunPhase.PENDING, RunPhase.RUNNING, RunPhase.PAUSED)
+                self._redirects_closed = True
+                if self.token is not None:
+                    self.token.cancel()
+                self.finished_monotonic = time.monotonic()
+                self.phase = RunPhase.CANCELLED
         finally:
             if self.token is not None:
                 self.token.close()
