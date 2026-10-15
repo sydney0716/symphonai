@@ -126,6 +126,15 @@ def check_tools_metadata_contract() -> None:
         fail("shell target did not use the first parsed command")
     if call_target("run_shell", {"command": "curl shell-secret | tail"}) != "curl":
         fail("shell target did not limit its display to the first command")
+    if call_target(
+        "run_shell",
+        {"command": "for i in 1 2 3; do echo tick $i; done; sleep 60"},
+    ) != "echo":
+        fail("shell target did not skip the for-loop header")
+    if call_target("run_shell", {"command": "if [ -f x ]; then make; fi"}) != "[":
+        fail("shell target did not select the first program after a shell keyword")
+    if call_target("run_shell", {"command": "git status"}) != "git":
+        fail("shell target changed the ordinary command label")
     fetch_secret = "access_token=t"
     fetch_target = call_target(
         "web_fetch", {"url": f"https://user:pass@h/v1/x?{fetch_secret}"}

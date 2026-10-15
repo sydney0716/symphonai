@@ -6,10 +6,12 @@ import json
 import os
 import secrets
 import shlex
+import shutil
 import sys
 import subprocess
 import threading
 import tempfile
+import stat
 from datetime import datetime, timezone
 from collections.abc import Mapping
 from collections.abc import Callable
@@ -78,6 +80,8 @@ APP_CONTENT_TYPES = {
 }
 APP_HANDSHAKE_MARKER = "<!-- symphonai-handshake -->"
 APP_COOKIE_NAME = "symphonai_app"
+PULL_REQUEST_TIMEOUT_SECONDS = 120
+UNTRACKED_DIFF_READ_LIMIT = 1024 * 1024
 PROVIDERS = (
     ("anthropic", ANTHROPIC_KEY_ENV_VAR, AnthropicProvider),
     ("gemini", GEMINI_KEY_ENV_VAR, GeminiProvider),
@@ -98,6 +102,332 @@ def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> 
         {"id": model, "efforts": efforts.get(model)}
         for model in models
     ]
+
+
+def _pull_request_command(args: list[str], root: Path, name: str) -> subprocess.CompletedProcess:
+    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    environment.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    try:
+        return subprocess.run(
+            args, cwd=root, stdin=subprocess.DEVNULL, env=environment,
+            capture_output=True, check=False, timeout=PULL_REQUEST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{name} timed out after 120 s") from exc
+
+
+def _git_status(root: Path, *, diff_limit: int = 200) -> dict[str, Any]:
+    top = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=root,
+        capture_output=True, check=False,
+    )
+    if top.returncode:
+        return {"repo": False}
+    root = Path(os.fsdecode(top.stdout.strip())).resolve()
+    branch_result = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=root,
+        capture_output=True, check=False,
+    )
+    branch = os.fsdecode(branch_result.stdout.strip()) if branch_result.returncode == 0 else None
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, capture_output=True, check=False,
+    )
+    if status_result.returncode:
+        return {"repo": False}
+
+    records = []
+    fields = status_result.stdout.split(b"\0")
+    index = 0
+    while index < len(fields) and fields[index]:
+        entry = fields[index]
+        index += 1
+        code = os.fsdecode(entry[:2])
+        path = os.fsdecode(entry[3:])
+        old_path = None
+        if "R" in code or "C" in code:
+            if index < len(fields):
+                old_path = os.fsdecode(fields[index])
+                index += 1
+        if code == "??":
+            status = "untracked"
+        elif "R" in code or "C" in code:
+            status = "renamed"
+        elif "D" in code:
+            status = "deleted"
+        elif "A" in code:
+            status = "added"
+        else:
+            status = "modified"
+        record = {
+            "path": path,
+            "status": status,
+            "staged": code != "??" and code[0] != " ",
+        }
+        if old_path is not None:
+            record["old_path"] = old_path
+        records.append(record)
+    records.sort(key=lambda item: item["path"])
+    for record in records[:max(0, diff_limit)]:
+        diff, truncated = _git_diff_text(root, record)
+        record["diff"] = diff[:20_000]
+        record["diff_truncated"] = truncated
+    for record in records[max(0, diff_limit):]:
+        record["diff"] = None
+        record["diff_deferred"] = True
+    return {"repo": True, "branch": branch, "files": records}
+
+
+def _git_diff_text(root: Path, record: dict[str, Any]) -> tuple[str, bool]:
+    path = record["path"]
+    if record["status"] == "untracked":
+        file_path = root / path
+        try:
+            file_stat = file_path.lstat()
+        except OSError:
+            return "Not a regular file; diff omitted.", False
+        if stat.S_ISLNK(file_stat.st_mode):
+            try:
+                target = os.readlink(file_path)
+            except OSError:
+                return "Not a regular file; diff omitted.", False
+            diff = (
+                f"diff --git a/{path} b/{path}\n"
+                "new file mode 120000\n"
+                "--- /dev/null\n"
+                f"+++ b/{path}\n"
+                "@@ -0,0 +1 @@\n"
+                f"+{target}\n"
+                "\\ No newline at end of file\n"
+            )
+            return diff, len(diff) > 20_000
+        if not stat.S_ISREG(file_stat.st_mode):
+            return "Not a regular file; diff omitted.", False
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None:
+            return "Not a regular file; diff omitted.", False
+        try:
+            descriptor = os.open(file_path, os.O_RDONLY | no_follow)
+            with os.fdopen(descriptor, "rb") as stream:
+                opened_stat = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    return "Not a regular file; diff omitted.", False
+                content = stream.read(UNTRACKED_DIFF_READ_LIMIT)
+        except OSError:
+            return "Not a regular file; diff omitted.", False
+        input_truncated = file_stat.st_size > len(content)
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return "Binary file; diff omitted.", False
+        if b"\0" in content:
+            return "Binary file; diff omitted.", False
+        lines = text.splitlines(keepends=True)
+        executable = file_stat.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        diff_lines = [
+            f"diff --git a/{path} b/{path}\n",
+            f"new file mode {'100755' if executable else '100644'}\n",
+            "--- /dev/null\n",
+            f"+++ b/{path}\n",
+        ]
+        if lines:
+            count = len(lines)
+            diff_lines.append(f"@@ -0,0 +1{f',{count}' if count != 1 else ''} @@\n")
+            for line in lines:
+                diff_lines.append(f"+{line}")
+                if not line.endswith(("\n", "\r")):
+                    diff_lines.append("\n\\ No newline at end of file\n")
+        diff = "".join(diff_lines)
+        return diff, input_truncated or len(diff) > 20_000
+    else:
+        paths = [path, *([record["old_path"]] if isinstance(record.get("old_path"), str) else [])]
+        result = subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--no-color", "HEAD", "--", *paths],
+            cwd=root, capture_output=True, check=False,
+        )
+        diff = os.fsdecode(result.stdout)
+        if b"GIT binary patch" in result.stdout or b"Binary files " in result.stdout:
+            diff = "Binary file; diff omitted."
+    return diff, len(diff) > 20_000
+
+
+def _git_diff(root: Path, path: str) -> dict[str, Any] | None:
+    top = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=root,
+        capture_output=True, check=False,
+    )
+    if top.returncode:
+        return None
+    repository = Path(os.fsdecode(top.stdout.strip())).resolve()
+    relative = Path(path)
+    if not path or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("path must be inside the repository")
+    try:
+        (repository / relative).parent.resolve(strict=False).relative_to(repository)
+    except ValueError as exc:
+        raise ValueError("path must be inside the repository") from exc
+    status = _git_status(repository, diff_limit=0)
+    if not status.get("repo"):
+        return None
+    record = next((item for item in status["files"] if item["path"] == path), None)
+    if record is None:
+        return None
+    diff, truncated = _git_diff_text(repository, record)
+    return {"path": path, "diff": diff[:20_000], "diff_truncated": truncated}
+
+
+def _git_commit(root: Path, message: str, paths: list[str]) -> dict[str, Any]:
+    top = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=root,
+        capture_output=True, check=False,
+    )
+    if top.returncode:
+        raise ValueError("not a git repository")
+    root = Path(os.fsdecode(top.stdout.strip())).resolve()
+    status = _git_status(root)
+    if not status["repo"]:
+        raise ValueError("not a git repository")
+    changed = {
+        path
+        for entry in status["files"]
+        for path in (entry["path"], entry.get("old_path"))
+        if isinstance(path, str)
+    }
+    selected = sorted(set(paths))
+    for path in selected:
+        relative = Path(path)
+        if (
+            not path or relative.is_absolute() or ".." in relative.parts
+            or path == "." or path.startswith(".git/") or path == ".git"
+        ):
+            raise ValueError(f"path is outside the repository: {path}")
+        try:
+            (root / relative).parent.resolve().relative_to(root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"path is outside the repository: {path}") from exc
+        if path not in changed:
+            raise ValueError(f"no uncommitted change for path: {path}")
+
+    descriptor, index_name = tempfile.mkstemp(prefix="symphonai-git-index-")
+    os.close(descriptor)
+    os.unlink(index_name)
+    environment = {**os.environ, "GIT_INDEX_FILE": index_name}
+    try:
+        initialized = subprocess.run(
+            ["git", "read-tree", "HEAD"], cwd=root, env=environment,
+            capture_output=True, check=False,
+        )
+        if initialized.returncode:
+            output = (initialized.stderr or initialized.stdout).decode("utf-8", errors="replace")
+            raise RuntimeError(output[-4000:] or "could not prepare a temporary Git index")
+        added = subprocess.run(
+            ["git", "add", "--", *selected], cwd=root, env=environment,
+            capture_output=True, check=False,
+        )
+        if added.returncode:
+            output = (added.stderr or added.stdout).decode("utf-8", errors="replace")
+            raise RuntimeError(output[-4000:] or "git add failed")
+        committed = subprocess.run(
+            ["git", "commit", "-m", message], cwd=root, env=environment,
+            capture_output=True, check=False,
+        )
+        if committed.returncode:
+            output = committed.stdout + committed.stderr
+            raise RuntimeError(output.decode("utf-8", errors="replace")[-4000:] or "git commit failed")
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=False,
+        )
+        if commit.returncode:
+            output = (commit.stderr or commit.stdout).decode("utf-8", errors="replace")
+            raise RuntimeError(output[-4000:] or "could not read the new commit")
+        reset = subprocess.run(
+            ["git", "reset", "--quiet", "HEAD", "--", *selected], cwd=root,
+            capture_output=True, check=False,
+        )
+        if reset.returncode:
+            output = (reset.stderr or reset.stdout).decode("utf-8", errors="replace")
+            raise RuntimeError(output[-4000:] or "could not update the selected paths in the index")
+        return {"commit": os.fsdecode(commit.stdout.strip()), "paths": selected}
+    finally:
+        try:
+            os.unlink(index_name)
+        except FileNotFoundError:
+            pass
+
+
+def _git_pull_request_info(root: Path) -> dict[str, Any]:
+    gh = shutil.which("gh")
+    if gh is None:
+        return {"branch": None, "base": None, "title": "", "ahead": 0,
+                "problem": "The GitHub CLI (gh) is not installed."}
+    auth = _pull_request_command([gh, "auth", "status"], root, "gh auth status")
+    if auth.returncode:
+        return {"branch": None, "base": None, "title": "", "ahead": 0,
+                "problem": "gh is not signed in. Run gh auth login."}
+    origin = _pull_request_command(["git", "remote", "get-url", "origin"], root, "git remote get-url")
+    if origin.returncode:
+        return {"branch": None, "base": None, "title": "", "ahead": 0,
+                "problem": "This repository has no origin remote."}
+    current = _pull_request_command(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], root, "git symbolic-ref",
+    )
+    if current.returncode:
+        return {"branch": None, "base": None, "title": "", "ahead": 0,
+                "problem": "Check out a branch first."}
+    branch = os.fsdecode(current.stdout.strip())
+    remote_head = _pull_request_command(
+        ["git", "ls-remote", "--symref", "origin", "HEAD"], root, "git ls-remote",
+    )
+    base = None
+    if remote_head.returncode == 0:
+        for line in remote_head.stdout.splitlines():
+            if line.startswith(b"ref: refs/heads/") and line.endswith(b"\tHEAD"):
+                base = os.fsdecode(line[len(b"ref: refs/heads/"):-len(b"\tHEAD")])
+                break
+    if not base:
+        return {"branch": branch, "base": None, "title": "", "ahead": 0,
+                "problem": "Could not determine origin's default branch."}
+    title_result = _pull_request_command(
+        ["git", "log", "-1", "--format=%s", "HEAD"], root, "git log",
+    )
+    title = os.fsdecode(title_result.stdout.rstrip(b"\r\n")) if title_result.returncode == 0 else ""
+    if branch == base:
+        problem = f"Create a branch first; a pull request comes from a branch other than {base}."
+        return {"branch": branch, "base": base, "title": title, "ahead": 0, "problem": problem}
+    ahead_result = _pull_request_command(
+        ["git", "rev-list", "--count", f"origin/{base}..HEAD"], root, "git rev-list",
+    )
+    if ahead_result.returncode:
+        return {"branch": branch, "base": base, "title": title, "ahead": 0,
+                "problem": f"Could not compare {branch} with {base}."}
+    ahead = int(ahead_result.stdout.strip() or b"0")
+    problem = f"{branch} has no commits that {base} does not." if ahead == 0 else None
+    return {"branch": branch, "base": base, "title": title, "ahead": ahead, "problem": problem}
+
+
+def _create_pull_request(root: Path, title: str, body: str) -> dict[str, str]:
+    info = _git_pull_request_info(root)
+    if info["problem"]:
+        raise RuntimeError(info["problem"])
+    push = _pull_request_command(
+        ["git", "push", "-u", "origin", info["branch"]], root, "git push",
+    )
+    if push.returncode:
+        output = (push.stdout + push.stderr).decode("utf-8", errors="replace")
+        raise RuntimeError(output[-4000:] or "git push failed")
+    gh = shutil.which("gh")
+    created = _pull_request_command(
+        [gh, "pr", "create", "--title", title, "--body", body,
+         "--base", info["base"], "--head", info["branch"]],
+        root, "gh pr create",
+    )
+    if created.returncode:
+        output = (created.stdout + created.stderr).decode("utf-8", errors="replace")
+        raise RuntimeError(output[-4000:] or "gh pr create failed")
+    url = os.fsdecode(created.stdout.strip()).splitlines()[-1:]
+    if not url:
+        raise RuntimeError("gh pr create did not return a pull request URL")
+    return {"url": url[0]}
 
 
 def _model_listing(
@@ -961,6 +1291,41 @@ class HostServer:
                         {"conversation": host.run.conversation_stats()},
                     )
                     return
+                if request_path == "/git/status":
+                    if not self._authorized():
+                        return
+                    self._json(HTTPStatus.OK, _git_status(host.run.policy.repo_root))
+                    return
+                if request_path == "/git/diff":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True)
+                    path = values.get("path", [""])[0]
+                    try:
+                        result = _git_diff(host.run.policy.repo_root, path)
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    if result is None:
+                        self._not_found()
+                        return
+                    self._json(HTTPStatus.OK, result)
+                    return
+                if request_path == "/jobs":
+                    if not self._authorized():
+                        return
+                    self._json(HTTPStatus.OK, {"jobs": host.run.list_jobs()})
+                    return
+                if request_path == "/git/pull-request":
+                    if not self._authorized():
+                        return
+                    try:
+                        info = _git_pull_request_info(host.run.policy.repo_root)
+                    except RuntimeError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)[-4000:]})
+                        return
+                    self._json(HTTPStatus.OK, info)
+                    return
                 if request_path == "/changes":
                     if not self._authorized():
                         return
@@ -1465,7 +1830,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -1495,6 +1860,83 @@ class HostServer:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
                     self._json(HTTPStatus.OK, {"repo_root": str(runtime.root), "name": runtime.root.name})
+                    return
+                if self.path == "/git/commit":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"message", "paths"}:
+                            raise ProtocolError("git/commit requires message and paths")
+                        message = payload.get("message")
+                        paths = payload.get("paths")
+                        if not isinstance(message, str) or not message.strip():
+                            raise ProtocolError("message must be a non-blank string")
+                        if not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in paths):
+                            raise ProtocolError("paths must be a non-empty list of repository-relative paths")
+                        if any(state == "working" for state in host.run.session_activity().values()):
+                            self._json(HTTPStatus.CONFLICT, {"error": "wait for the turn to finish"})
+                            return
+                        result = _git_commit(host.run.policy.repo_root, message, paths)
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except RuntimeError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)[-4000:]})
+                        return
+                    self._json(HTTPStatus.OK, result)
+                    return
+                if self.path == "/jobs/start":
+                    try:
+                        payload = self._read_object()
+                        command = payload.get("command")
+                        if set(payload) != {"command"} or not isinstance(command, str) or not command.strip():
+                            raise ProtocolError("jobs/start requires a non-blank command")
+                        job_id = host.run.start_job(command)
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except RuntimeError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {"id": job_id})
+                    return
+                if self.path == "/jobs/stop":
+                    try:
+                        payload = self._read_object()
+                        job_id = payload.get("id")
+                        if set(payload) != {"id"} or not isinstance(job_id, str) or not job_id:
+                            raise ProtocolError("jobs/stop requires an id")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    result = host.run.stop_job(job_id)
+                    if result is None:
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown job id"})
+                        return
+                    self._json(HTTPStatus.OK, {"status": result["status"], "exit_code": result["exit_code"]})
+                    return
+                if self.path == "/git/pull-request":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"title", "body"}:
+                            raise ProtocolError("git/pull-request requires title and body")
+                        title = payload.get("title")
+                        body = payload.get("body")
+                        if not isinstance(title, str) or not title.strip() or not isinstance(body, str):
+                            raise ProtocolError("title must be non-blank and body must be a string")
+                        if any(state == "working" for state in host.run.session_activity().values()):
+                            self._json(HTTPStatus.CONFLICT, {"error": "wait for the turn to finish"})
+                            return
+                        result = _create_pull_request(host.run.policy.repo_root, title, body)
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except RuntimeError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)[-4000:]})
+                        return
+                    self._json(HTTPStatus.OK, result)
                     return
                 if self.path == "/memory/update":
                     try:

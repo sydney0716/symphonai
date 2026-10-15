@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -23,10 +24,11 @@ from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
 from symphonai_api.config import resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
-from symphonai_api.events import Event, PromptSubmitted, RunFailed, RunFinished, RunStarted, SubagentSpawned, fan_out
+from symphonai_api.events import Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SubagentSpawned, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.environment import capture_environment
 from symphonai_api.identity import new_id
+from symphonai_api.jobs import BackgroundJob, JobManager
 from symphonai_api.instructions import load_instructions
 from symphonai_api.lsp import LspManager
 from symphonai_api.leader import (
@@ -256,6 +258,11 @@ class HostRun:
         self._starting_mode = "ask" if "ask" in permitted else permitted[0]
         self._policy.mode = self._starting_mode
         self._broker = broker
+        self._person_jobs = JobManager(
+            policy.shell_output_limit_chars,
+            owner="person",
+            on_change=lambda job: self._job_changed(job, None),
+        )
         self._system_prompt = system_prompt
         self._base_prompt = base_prompt
         self._subagent_base_prompt = subagent_base_prompt
@@ -412,7 +419,7 @@ class HostRun:
             leader, session = conversation
             try:
                 if provider_changed:
-                    replacement = self._new_leader(session)
+                    replacement = self._new_leader(session, jobs=leader.background_jobs)
                     replacement.seed_chat(
                         _without_vendor_state(leader._chat_messages),
                         persisted=True,
@@ -1109,13 +1116,71 @@ class HostRun:
 
     def has_work_in_flight(self) -> bool:
         with self._lock:
-            return bool(
+            conversational_work = bool(
                 self._active_by_session
                 or self._goal_checks_by_session
                 or self._user_command is not None
                 or any(broker.pending() for broker in self._approvals_by_session.values())
                 or self.approvals.pending()
             )
+            conversations = tuple(self._open_conversations.values())
+        return conversational_work or self._person_jobs.has_running() or any(
+            leader.background_jobs is not None and leader.background_jobs.has_running()
+            for leader, _session in conversations
+        )
+
+    def list_jobs(self) -> list[dict]:
+        with self._lock:
+            conversations = tuple(self._open_conversations.values())
+        managers = [(self._person_jobs, None)] + [
+            (leader.background_jobs, session.run_id)
+            for leader, session in conversations
+            if leader.background_jobs is not None
+        ]
+        result = []
+        for manager, session_id in managers:
+            for job in manager.list():
+                result.append({
+                    "id": job.id,
+                    "owner": job.owner,
+                    "session_id": session_id if job.owner == "agent" else None,
+                    "label": job.label,
+                    "status": job.status,
+                    "exit_code": job.exit_code,
+                    "started_at": datetime.fromtimestamp(job.started_at, timezone.utc).isoformat(),
+                    "ended_at": None if job.ended_at is None else datetime.fromtimestamp(job.ended_at, timezone.utc).isoformat(),
+                    "output_tail": job.output[-4000:],
+                    "output_dropped": job.total_chars > 4000,
+                })
+        return sorted(result, key=lambda job: job["started_at"], reverse=True)
+
+    def start_job(self, command: str) -> str:
+        return self._person_jobs.start(
+            [shell_executable(), "-c", command], str(self._policy.repo_root),
+            shell_environment(), label=command,
+        )
+
+    def stop_job(self, job_id: str) -> dict | None:
+        result = self._person_jobs.stop(job_id)
+        if result is not None:
+            return result
+        with self._lock:
+            conversations = tuple(self._open_conversations.values())
+        for leader, _session in conversations:
+            manager = leader.background_jobs
+            result = None if manager is None else manager.stop(job_id)
+            if result is not None:
+                return result
+        return None
+
+    def _job_changed(self, job: BackgroundJob, session_id: str | None) -> None:
+        self._broker.publish(JobChanged(
+            agent_id="",
+            run_id="" if session_id is None else session_id,
+            job_id=job.id,
+            status=job.status,
+            session_id=session_id,
+        ))
 
     def resolve_approval(self, approval_id: str, **decision) -> bool:
         with self._lock:
@@ -1313,6 +1378,10 @@ class HostRun:
                 session_id == current_id
                 or session_id in self._active_by_session
                 or session_id in self._goal_checks_by_session
+                or (
+                    conversation[0].background_jobs is not None
+                    and conversation[0].background_jobs.has_running()
+                )
             ):
                 continue
             conversation[1].close()
@@ -1330,7 +1399,13 @@ class HostRun:
                 if owner == session_id:
                     self._session_by_runtime_run.pop(runtime_id, None)
 
-    def _new_leader(self, session: SessionStore) -> Leader:
+    def _new_leader(self, session: SessionStore, *, jobs: JobManager | None = None) -> Leader:
+        if jobs is None:
+            jobs = JobManager(
+                self._policy.shell_output_limit_chars,
+                owner="agent",
+                on_change=lambda job: self._job_changed(job, session.run_id),
+            )
         checkpoints = CheckpointStore(
             session.directory / "checkpoints",
             self._policy.repo_root,
@@ -1346,6 +1421,7 @@ class HostRun:
             self._search_backend,
             skills=skills,
             lsp=self._lsp,
+            jobs=jobs,
         )
         if self._extensions is not None:
             roster.update(self._extensions.agents)
@@ -1451,6 +1527,7 @@ class HostRun:
                 provider_for=provider_for,
                 leases=self._leases,
                 lsp=self._lsp,
+                jobs=jobs,
                 leader_tools=goal_tools(
                     lambda: self._goal_for_session(session.run_id),
                     lambda status, message: self._update_goal_for_session(
@@ -1908,6 +1985,7 @@ class HostRun:
         for leader, session in conversations:
             leader.close()
             session.close()
+        self._person_jobs.close()
 
     def stop(self) -> None:
         with self._lock:

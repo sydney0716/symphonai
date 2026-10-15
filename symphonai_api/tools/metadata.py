@@ -73,7 +73,20 @@ def call_target(tool_name: str, arguments: dict) -> str:
         commands = parse_command_line(arguments["command"])
         if commands is None or not commands[0].argv:
             return ""
-        return commands[0].argv[0][:TARGET_LIMIT]
+        shell_keywords = {
+            "if", "then", "elif", "else", "do", "while", "until", "!",
+            "for", "case", "select",
+        }
+        first = commands[0].argv[0]
+        target = next(
+            (
+                command.argv[0]
+                for command in commands
+                if command.argv[0] not in shell_keywords and command.argv[0] != ":"
+            ),
+            first,
+        )
+        return target[:TARGET_LIMIT]
     target_rule = _TARGET_KEYS.get(tool_name)
     if target_rule is None:
         return ""

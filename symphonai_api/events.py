@@ -131,6 +131,13 @@ class SubagentStopped(Event):
 
 
 @dataclass(frozen=True)
+class JobChanged(Event):
+    job_id: str = ""
+    status: str = ""
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
 class CompactionApplied(Event):
     before_tokens: int = 0
     after_tokens: int = 0

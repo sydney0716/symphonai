@@ -17,10 +17,11 @@ import time
 from pathlib import Path
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.jobs import JobManager
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata, call_target
 from symphonai_api.tools.shell_classify import classify
 from symphonai_api.tools.shell_parse import commands_for_argv, parse_command_line
 
@@ -94,6 +95,9 @@ def _sandbox_available() -> bool:
 class RunShellTool(LocalTool):
     """Run an allowlisted command line or argv list and return its output."""
 
+    def __init__(self, jobs: JobManager | None = None) -> None:
+        self._jobs = jobs
+
     @property
     def name(self) -> str:
         return "run_shell"
@@ -128,6 +132,10 @@ class RunShellTool(LocalTool):
                     "type": "number",
                     "exclusiveMinimum": 0,
                     "description": "Optional timeout in seconds; defaults to 120 and is capped by policy.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Start the command as a background job.",
                 },
             },
         }
@@ -184,6 +192,8 @@ class RunShellTool(LocalTool):
             or not timeout_seconds > 0
         ):
             return "invalid optional argument: timeout_seconds (must be a number greater than 0)"
+        if "background" in arguments and not isinstance(arguments["background"], bool):
+            return "invalid optional argument: background (must be a boolean)"
         return None
 
     def _execute(
@@ -215,6 +225,25 @@ class RunShellTool(LocalTool):
         if policy.shell_sandbox or (policy.mode == "allow" and sandbox_available):
             command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
         env = shell_environment()
+        if tool_call.arguments.get("background") is True:
+            if self._jobs is None:
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    error="background jobs are not available here",
+                )
+            try:
+                job_id = self._jobs.start(
+                    command, str(policy.repo_root), env,
+                    label=call_target("run_shell", tool_call.arguments),
+                )
+            except RuntimeError as exc:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=True,
+                content=f"Started {job_id}. Read its output with job_output and stop it with job_stop.",
+            )
         try:
             proc = subprocess.Popen(
                 command,

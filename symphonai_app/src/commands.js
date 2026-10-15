@@ -83,6 +83,24 @@ export const COMMANDS = Object.freeze([
     description: "Copy the last reply as Markdown",
     argumentHint: "",
   }),
+  Object.freeze({
+    name: "review",
+    aliases: Object.freeze([]),
+    description: "Review the uncommitted changes",
+    argumentHint: "[<focus>]",
+  }),
+  Object.freeze({
+    name: "commit",
+    aliases: Object.freeze([]),
+    description: "Commit selected changes",
+    argumentHint: "[<message>]",
+  }),
+  Object.freeze({
+    name: "pr",
+    aliases: Object.freeze([]),
+    description: "Open a pull request",
+    argumentHint: "",
+  }),
 ]);
 
 export function matchCommands(text, extra = []) {

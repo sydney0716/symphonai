@@ -24,6 +24,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "GoalChanged",
   "PlanChanged",
   "BackgroundUsageRecorded",
+  "JobChanged",
 ]);
 
 const FRAME_KINDS = new Set([

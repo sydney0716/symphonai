@@ -176,6 +176,91 @@ test("changes requests are authenticated and retain conflict paths", async () =>
   assert.deepEqual(JSON.parse(records[1].options.body), { path: "a.py" });
 });
 
+test("job methods use the project job routes", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, records.length === 1 ? { jobs: [] } : { id: "job_123" });
+  } });
+  assert.deepEqual(await client.jobs(), { jobs: [] });
+  assert.deepEqual(await client.startJob("echo hi"), { id: "job_123" });
+  assert.deepEqual(await client.stopJob("job_123"), { id: "job_123" });
+  assert.deepEqual(records.map(({ url, options }) => [url, options.method]), [
+    ["http://127.0.0.1:4312/jobs", "GET"],
+    ["http://127.0.0.1:4312/jobs/start", "POST"],
+    ["http://127.0.0.1:4312/jobs/stop", "POST"],
+  ]);
+  assert.deepEqual(JSON.parse(records[1].options.body), { command: "echo hi" });
+  assert.deepEqual(JSON.parse(records[2].options.body), { id: "job_123" });
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+});
+
+test("git status reads the authenticated working-tree route", async () => {
+  const records = [];
+  const reply = { repo: true, branch: "main", files: [] };
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, reply);
+  } });
+  assert.deepEqual(await client.gitStatus(), reply);
+  assert.equal(records[0].url, "http://127.0.0.1:4312/git/status");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+});
+
+test("gitDiff reads one encoded repository-relative diff", async () => {
+  const records = [];
+  const reply = { path: "folder/a file.txt", diff: "+line", diff_truncated: false };
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return response(200, reply);
+  } });
+  assert.deepEqual(await client.gitDiff("folder/a file.txt"), reply);
+  assert.equal(records[0].url, "http://127.0.0.1:4312/git/diff?path=folder%2Fa%20file.txt");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+});
+
+test("commit posts the selected paths and preserves host refusal messages", async () => {
+  const records = [];
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return records.length === 1
+      ? response(200, { commit: "abc123", paths: ["a.py"] })
+      : response(409, { error: "wait for the turn to finish" });
+  } });
+  assert.deepEqual(await client.commit("Fix parser", ["a.py"]), { commit: "abc123", paths: ["a.py"] });
+  await assert.rejects(
+    client.commit("Fix parser", ["a.py"]),
+    (error) => error.status === 409 && error.message === "wait for the turn to finish",
+  );
+  assert.equal(records[0].url, "http://127.0.0.1:4312/git/commit");
+  assert.equal(records[0].options.method, "POST");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(JSON.parse(records[0].options.body), { message: "Fix parser", paths: ["a.py"] });
+});
+
+test("pull request routes fetch preflight and post the form", async () => {
+  const records = [];
+  const info = { branch: "feature", base: "main", title: "Fix parser", ahead: 1, problem: null };
+  const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {
+    records.push({ url, options });
+    return records.length === 1
+      ? response(200, info)
+      : response(200, { url: "https://github.com/example/repo/pull/1" });
+  } });
+  assert.deepEqual(await client.pullRequestInfo(), info);
+  assert.deepEqual(await client.openPullRequest("Fix parser", "Body"), {
+    url: "https://github.com/example/repo/pull/1",
+  });
+  assert.equal(records[0].url, "http://127.0.0.1:4312/git/pull-request");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.equal(records[1].url, "http://127.0.0.1:4312/git/pull-request");
+  assert.equal(records[1].options.method, "POST");
+  assert.deepEqual(JSON.parse(records[1].options.body), { title: "Fix parser", body: "Body" });
+});
+
 test("worktree actions post the name and preserve conflict messages", async () => {
   const records = [];
   const client = createClient({ port: 4312, token: TOKEN, fetch: async (url, options) => {

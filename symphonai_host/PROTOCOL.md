@@ -50,6 +50,7 @@ fields on a known event are ignored for forward compatibility.
 | `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null`, `session_id: str` |
 | `PlanChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `steps: list`, `explanation: str`, `session_id: str` |
 | `BackgroundUsageRecorded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str` |
+| `JobChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `job_id: str`, `status: str`, `session_id: str | null` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -609,6 +610,48 @@ while stop on the leader uses the ordinary host stop path. Success returns
 `{"agent_id": <id>, "state": <paused|running|stopping>}`. Invalid requests
 receive `400`, an absent active run or invalid transition receives `409`, and
 an unknown or finished agent receives `404`.
+
+Authenticated `GET /git/status` returns the current project's working-tree
+changes as `{"repo": true, "branch": str | null, "files": [...]}`. Each
+file has its repository-relative `path`, `status` (`modified`, `added`,
+`deleted`, `untracked`, or `renamed`), whether the change is staged, a diff
+against `HEAD`, and `diff_truncated`. Untracked text files are shown as added
+lines; binary diffs are omitted. Diffs are capped at 20,000 characters and
+files sort by path. A directory outside a Git repository returns
+`{"repo": false}`. This route reads Git state and does not modify the index.
+The first 200 files include diffs; later files have `diff: null` and
+`diff_deferred: true`. Authenticated `GET /git/diff?path=<repository-relative
+path>` returns one changed file's diff and truncation flag. It returns `404`
+when the path has no uncommitted change and `400` when the path leaves the
+repository.
+
+Authenticated `POST /git/commit` takes `{"message": <non-blank string>,
+"paths": [<repository-relative path>, ...]}`. It commits the current contents
+of exactly those changed paths, runs configured commit hooks, and returns
+`{"commit": <sha>, "paths": [...]}`. Unchanged or outside paths are rejected
+with `400`. A running turn or a failed commit returns `409`; commit failure
+includes Git's last 4,000 output characters and leaves the existing index
+unchanged. Unselected staged and unstaged changes are excluded from the commit.
+
+Authenticated `GET /git/pull-request` returns the current branch, `origin`'s
+default branch, latest commit subject, ahead count, and an optional `problem`
+that explains why a pull request cannot be opened. `POST /git/pull-request`
+takes `{"title": <non-blank string>, "body": <string>}`. It pushes the current
+branch to `origin`, then runs `gh pr create` with the supplied title and body,
+the default base, and the current head. Success returns `{"url": <URL>}`.
+Missing `gh`, missing authentication or remote, detached `HEAD`, a base branch
+with no commits ahead, a running turn, or a failed command returns `409` with
+the problem or command output. Working-tree changes are not pushed.
+
+Authenticated `GET /jobs` lists the current project's background jobs, newest
+first, with owner, session id, label, status, exit code, start and end times,
+the last 4,000 output characters, and whether earlier output was omitted.
+`POST /jobs/start` takes `{"command": <non-blank string>}` and starts the
+person's unsandboxed project command with closed stdin and no timeout. At most
+eight of the person's jobs may run; another start returns `409`.
+`POST /jobs/stop` takes `{"id": <job id>}` and returns its final status, or
+`404` for an unknown id. A `JobChanged` event is published when a job starts
+and ends; its `session_id` is null for a person's job.
 
 Authenticated `GET /changes` returns the current conversation's checkpointed
 file changes and durable session worktrees as `{"turns": [...], "files": [...], "worktrees": [...]}`. Each turn contains its

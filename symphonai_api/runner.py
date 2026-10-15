@@ -18,6 +18,7 @@ from symphonai_api.instructions import load_instructions
 from symphonai_api.lsp import LspManager
 from symphonai_api.identity import new_agent_ref
 from symphonai_api.models import Message, Role
+from symphonai_api.jobs import JobManager, JobOutputTool, JobStopTool
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.session import (
@@ -54,6 +55,7 @@ def standard_tool_registry(
     skills: Mapping[str, Skill] | None = None,
     checkpoints: CheckpointStore | None = None,
     lsp: LspManager | None = None,
+    jobs: JobManager | None = None,
 ) -> dict[str, LocalTool]:
     """The standard tools plus explicitly supplied optional tools.
 
@@ -70,7 +72,7 @@ def standard_tool_registry(
         ListFilesTool(),
         GlobTool(),
         GrepTool(),
-        RunShellTool(),
+        RunShellTool(jobs),
         WebFetchTool(),
     ]
     if lsp is not None and lsp.has_enabled_servers:
@@ -88,6 +90,11 @@ def standard_tool_registry(
         tools.append(LspTool(lsp))
     if result_store is not None:
         tools.append(ReadToolResultTool(result_store))
+    if jobs is not None:
+        tools.extend((
+            JobOutputTool(jobs, jobs.output_limit),
+            JobStopTool(jobs),
+        ))
     if names is not None:
         if not names:
             raise ValueError("names must not be empty; omit it for the full registry")

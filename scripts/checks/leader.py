@@ -26,6 +26,7 @@ from symphonai_api.agent_spec import (
 from symphonai_api.call_class import CallClass
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.cost import UsageTotals
+from symphonai_api.jobs import JobManager
 from symphonai_api.cancellation import (
     CancelReason,
     CancellationToken,
@@ -93,6 +94,24 @@ from symphonai_api.skills import Skill
 from scripts.checks.harness import check, fail
 from scripts.checks import memory_extract as _memory_extract_checks  # noqa: F401
 from scripts.checks.workspace import workspace
+
+
+@check("leader.background_job_registry")
+def check_background_job_registry() -> None:
+    if list(standard_tool_registry()) != [
+        "read_file", "write_file", "edit_file", "multi_edit_file", "list_files",
+        "glob", "grep", "run_shell", "web_fetch",
+    ]:
+        fail("standard registry changed when no job manager was supplied")
+    jobs = JobManager()
+    try:
+        registry = standard_tool_registry(jobs=jobs)
+        if list(registry)[-2:] != ["job_output", "job_stop"]:
+            fail(f"background job tools were not appended in order: {list(registry)!r}")
+        if any(registry[name].metadata({}).effect is not ToolEffect.READ_ONLY for name in ("job_output", "job_stop")):
+            fail("background job tools were not marked read-only")
+    finally:
+        jobs.close()
 
 
 OPENAI_COMPATIBLE_API_KEY_ENV_VAR = "SYMPHONAI_OPENAI_COMPATIBLE_SMOKE_KEY"

@@ -462,6 +462,94 @@ function renderEditCard(document, entry, _parseMarkdown, actions) {
   return card;
 }
 
+function renderCommitCard(document, entry, _parseMarkdown, actions) {
+  const card = element(document, "section", { className: "commit-card" });
+  append(card,
+    element(document, "p", { className: "command-echo", text: entry.command }),
+    element(document, "h3", { text: "Commit changes" }),
+  );
+  const files = element(document, "ul", { className: "commit-files" });
+  for (const file of entry.files) {
+    const checkbox = element(document, "input");
+    checkbox.type = "checkbox";
+    checkbox.checked = file.checked;
+    checkbox.setAttribute("aria-label", `${file.path} · ${file.status}`);
+    checkbox.addEventListener("change", () => {
+      file.checked = checkbox.checked;
+      commit.disabled = !entry.message.trim() || !entry.files.some((item) => item.checked);
+    });
+    const label = element(document, "label");
+    append(label, checkbox, element(document, "span", { text: `${file.path} · ${file.status}` }));
+    append(files, label);
+  }
+  const message = element(document, "input", { className: "commit-message" });
+  message.type = "text";
+  message.value = entry.message;
+  message.setAttribute("aria-label", "Commit message");
+  message.addEventListener("input", () => {
+    entry.message = message.value;
+    commit.disabled = !entry.message.trim() || !entry.files.some((item) => item.checked);
+  });
+  const commit = element(document, "button", { text: "Commit" });
+  commit.type = "button";
+  commit.disabled = !entry.message.trim() || !entry.files.some((item) => item.checked);
+  commit.addEventListener("click", () => actions?.onCommit?.(entry));
+  const cancel = element(document, "button", { text: "Cancel" });
+  cancel.type = "button";
+  cancel.addEventListener("click", () => actions?.onCancelCommit?.(entry));
+  append(card, files, message, commit, cancel);
+  append(card, ...(entry.error ? [element(document, "p", { className: "error", text: entry.error })] : []));
+  return card;
+}
+
+function renderPullRequestCard(document, entry, _parseMarkdown, actions) {
+  const card = element(document, "section", { className: "pull-request-card" });
+  const close = element(document, "button", { text: entry.problem ? "Close" : "Cancel" });
+  close.type = "button";
+  close.addEventListener("click", () => actions?.onClosePullRequest?.(entry));
+  const problem = entry.problem
+    ? [element(document, "p", { className: "error", text: entry.problem }), close]
+    : [];
+  const title = element(document, "input", { className: "pull-request-title" });
+  title.type = "text";
+  title.value = entry.title;
+  title.setAttribute("aria-label", "Pull request title");
+  title.addEventListener("input", () => {
+    entry.title = title.value;
+    submit.disabled = !entry.title.trim();
+  });
+  const body = element(document, "textarea", { className: "pull-request-body" });
+  body.value = entry.body;
+  body.setAttribute("aria-label", "Pull request body");
+  body.addEventListener("input", () => { entry.body = body.value; });
+  const submit = element(document, "button", { text: "Push and open pull request" });
+  submit.type = "button";
+  submit.disabled = !entry.title.trim();
+  submit.addEventListener("click", () => actions?.onOpenPullRequest?.(entry));
+  const form = entry.problem
+    ? []
+    : [
+      element(document, "p", { text: `This pushes ${entry.branch} to origin and opens a pull request into ${entry.base} on GitHub.` }),
+      title,
+      body,
+      submit,
+      close,
+      ...(entry.error ? [element(document, "p", { className: "error", text: entry.error })] : []),
+    ];
+  append(card, element(document, "p", { className: "command-echo", text: entry.command }), ...problem, ...form);
+  return card;
+}
+
+function renderPullRequestDone(document, entry) {
+  const line = element(document, "p", { className: "pull-request-result" });
+  const link = element(document, "a", { text: entry.url });
+  link.href = entry.url;
+  link.setAttribute("rel", "noopener noreferrer");
+  link.setAttribute("target", "_blank");
+  append(line, element(document, "span", { text: "Opened pull request: " }), link);
+  return line;
+}
+
 function renderQuestion(document, entry) {
   const state = entry.resolved
     ? entry.allowed ? "allowed" : `denied${entry.reason ? `: ${entry.reason}` : ""}`
@@ -505,6 +593,9 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
   activity: renderActivity,
   edit: renderEdit,
   "edit-card": renderEditCard,
+  "commit-card": renderCommitCard,
+  "pull-request-card": renderPullRequestCard,
+  "pull-request-done": renderPullRequestDone,
   question: renderQuestion,
   compaction: renderCompaction,
   gap: renderGap,

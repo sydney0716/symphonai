@@ -18,6 +18,7 @@ import { createTranscript } from "./transcript.js";
 import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
 const STATUS_LINE_KEY = "symphonai.status-line";
+const NOTIFICATIONS_KEY = "symphonai.notifications";
 const DEFAULT_STATUS_FIELDS = Object.freeze({
   provider: false, model: true, effort: true, mode: false,
   goal: false, context: false, usage: false,
@@ -54,6 +55,13 @@ Rules:
 - Keep it short: only what an agent would get wrong without it. Do not list every file or directory, and do not add generic advice such as writing tests or handling errors.
 - If README.md, CLAUDE.md, AGENTS.md, .cursorrules, .cursor/rules/ or .github/copilot-instructions.md exist, carry over the parts that matter.
 - Do not invent sections or facts the repository does not support.`;
+
+export const REVIEW_PROMPT = `Review the uncommitted changes in this repository. Do not change any file.
+
+1. Read them with \`git status\` and \`git diff HEAD\`, and read every untracked file that is not ignored.
+2. Read the code each change depends on, and run the narrowest tests that exercise it.
+3. Report findings, most severe first. For each: the file and line, what is wrong, and the input or situation that shows it. Leave out style preferences.
+4. If nothing is worth fixing, say so in one line.`;
 
 function filename(path) {
   return path.split("/").at(-1).replace(/\.md$/, "");
@@ -125,13 +133,14 @@ function clientFor(global, supplied) {
 const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
 const SIDEBAR_SESSION_LIMIT = 200;
-const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Spec", "Files"];
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs"];
 const RAIL_TOOL_ICONS = Object.freeze({
   Agents: "icon-tool-agents",
   Roadmap: "icon-tool-roadmap",
   Changes: "icon-tool-changes",
   Spec: "icon-tool-spec",
   Files: "icon-tool-files",
+  Jobs: "icon-tool-jobs",
 });
 
 function storedRail(global) {
@@ -190,9 +199,15 @@ export async function start({ global, document, client }) {
   const changesRoot = document.getElementById("changes");
   const specRoot = document.getElementById("spec");
   const filesRoot = document.getElementById("files");
+  const jobsRoot = element(document, "div", { className: "rail-pane jobs-pane" });
+  jobsRoot.setAttribute("role", "tabpanel");
+  jobsRoot.hidden = true;
   const railTabsRoot = document.getElementById("rail-tabs");
   const railToolsRoot = document.getElementById("rail-tools");
+  railToolsRoot.before(jobsRoot);
   let { open: openRailTools, selected: selectedRailTool } = storedRail(global);
+  let jobsCommandDraft = "";
+  let jobsPoll = null;
   const runNotice = document.getElementById("run-notice");
   const chatRoot = document.getElementById("chat");
   const jumpLatest = document.getElementById("jump-latest");
@@ -339,6 +354,13 @@ export async function start({ global, document, client }) {
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
   append(chatPane, conversationUsage);
   const statusFields = readStatusFields(global);
+  let notificationsEnabled = false;
+  try {
+    notificationsEnabled = global.localStorage?.getItem(NOTIFICATIONS_KEY) === "true";
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
+  }
+  let notificationMessage = "";
   let memoryReply = null;
   let memoryLoadError = null;
   let memoryLoading = false;
@@ -830,12 +852,49 @@ export async function start({ global, document, client }) {
       });
       append(statusGroup, append(element(document, "label"), checkbox, element(document, "span", { text: label })));
     }
+    const notificationGroup = element(document, "section", { className: "notification-settings" });
+    append(notificationGroup, element(document, "h3", { text: "Notifications" }));
+    const notificationCheckbox = document.createElement("input");
+    notificationCheckbox.type = "checkbox";
+    notificationCheckbox.checked = notificationsEnabled;
+    notificationCheckbox.setAttribute("aria-label", "Notifications");
+    const notificationNotice = element(document, "p", {
+      className: "notification-settings-message",
+      text: notificationMessage,
+    });
+    listen(notificationCheckbox, "change", async () => {
+      notificationMessage = "";
+      if (!notificationCheckbox.checked) {
+        notificationsEnabled = false;
+      } else {
+        try {
+          if (typeof global.Notification !== "function" || typeof global.Notification.requestPermission !== "function") {
+            throw new Error("notifications unavailable");
+          }
+          const permission = await global.Notification.requestPermission();
+          if (permission !== "granted") throw new Error("notifications unavailable");
+          notificationsEnabled = true;
+        } catch {
+          notificationsEnabled = false;
+          notificationCheckbox.checked = false;
+          notificationMessage = "Notifications are not available here.";
+        }
+      }
+      try {
+        global.localStorage?.setItem(NOTIFICATIONS_KEY, String(notificationsEnabled));
+      } catch {
+        // Storage is optional in embedded and privacy-restricted browsers.
+      }
+      notificationNotice.textContent = notificationMessage;
+    });
+    append(notificationGroup, append(element(document, "label"), notificationCheckbox, element(document, "span", { text: "Notifications" })), notificationNotice);
     replace(
       settingsContent,
       element(document, "h2", { text: "General" }),
       element(document, "h3", { text: "Appearance" }),
       themeSelect,
       statusGroup,
+      notificationGroup,
       settingsTable(["Setting", "Value", "Scope"], rows),
     );
   }
@@ -847,20 +906,12 @@ export async function start({ global, document, client }) {
       element(document, "h1", { text: "Changes" }),
       element(document, "p", { className: "changes-loading", text: "Loading changes…" }),
     );
-    let reply;
-    try {
-      reply = await boundary.changes();
-    } catch (error) {
-      replace(
-        changesRoot,
-        element(document, "h1", { text: "Changes" }),
-        element(document, "p", {
-          className: "error",
-          text: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      return;
-    }
+    const [conversationResult, gitResult] = await Promise.allSettled([
+      boundary.changes(),
+      boundary.gitStatus(),
+    ]);
+    const reply = conversationResult.status === "fulfilled" ? conversationResult.value : null;
+    const gitReply = gitResult.status === "fulfilled" ? gitResult.value : null;
 
     function showConflict(paths, payload) {
       const warning = element(document, "section", { className: "changes-conflict" });
@@ -943,7 +994,61 @@ export async function start({ global, document, client }) {
       return pre;
     }
     const children = [element(document, "h1", { text: "Changes" })];
-    if (files.length === 0 && worktrees.length === 0) {
+    const workingTree = element(document, "section", { className: "changes-working-tree" });
+    append(workingTree, element(document, "h2", { text: "Working tree" }));
+    if (gitResult.status === "rejected") {
+      append(workingTree, element(document, "p", {
+        className: "error",
+        text: gitResult.reason instanceof Error ? gitResult.reason.message : String(gitResult.reason),
+      }));
+    } else if (gitReply?.repo === false) {
+      append(workingTree, element(document, "p", { text: "Not a git repository." }));
+    } else {
+      append(workingTree, element(document, "p", {
+        className: "changes-branch",
+        text: `Branch: ${gitReply?.branch ?? "(detached HEAD)"}`,
+      }));
+      const workingFiles = Array.isArray(gitReply?.files) ? gitReply.files : [];
+      if (workingFiles.length === 0) {
+        append(workingTree, element(document, "p", { text: "No uncommitted changes." }));
+      }
+      for (const file of workingFiles) {
+        const row = element(document, "details", { className: "changes-working-file" });
+        const summary = element(document, "summary");
+        append(summary, element(document, "span", { text: `${file.path} · ${file.status}` }));
+        if (file.staged) append(summary, element(document, "span", { className: "changes-staged", text: "Staged" }));
+        let diffLoaded = file.diff_deferred !== true;
+        let diffLoading = false;
+        const diff = diffView(file.diff ?? "");
+        listen(row, "toggle", async () => {
+          if (!row.open || diffLoaded || diffLoading) return;
+          diffLoading = true;
+          diff.textContent = "Loading diff…";
+          try {
+            const result = await boundary.gitDiff(file.path);
+            diffLoaded = true;
+            row.replaceChildren(summary, diffView(result.diff ?? ""));
+          } catch (error) {
+            diff.textContent = error instanceof Error ? error.message : String(error);
+            diff.className = "diff error";
+          } finally {
+            diffLoading = false;
+          }
+        });
+        append(row, summary, diff);
+        append(workingTree, row);
+      }
+    }
+    children.push(workingTree);
+    if (conversationResult.status === "rejected") {
+      children.push(element(document, "p", {
+        className: "error",
+        text: conversationResult.reason instanceof Error
+          ? conversationResult.reason.message
+          : String(conversationResult.reason),
+      }));
+    }
+    if (conversationResult.status === "fulfilled" && files.length === 0 && worktrees.length === 0) {
       children.push(element(document, "p", { text: "No changes in this conversation." }));
     }
     if (worktrees.length > 0) {
@@ -1006,6 +1111,116 @@ export async function start({ global, document, client }) {
       }
     }
     replace(changesRoot, ...children);
+  }
+
+  function jobsPaneVisible() {
+    return selectedRailTool === "Jobs" && openRailTools.includes("Jobs") && !showRailTools;
+  }
+
+  function updateJobsPolling(jobs) {
+    const shouldPoll = jobsPaneVisible() && jobs.some((job) => job.status === "running");
+    if (shouldPoll && jobsPoll === null && typeof global.setInterval === "function") {
+      jobsPoll = global.setInterval(() => void showJobs(), 1000);
+    } else if (!shouldPoll && jobsPoll !== null) {
+      global.clearInterval?.(jobsPoll);
+      jobsPoll = null;
+    }
+  }
+
+  async function showJobs() {
+    if (!jobsPaneVisible()) {
+      updateJobsPolling([]);
+      return;
+    }
+    replace(jobsRoot, element(document, "h1", { text: "Jobs" }));
+    let jobs;
+    try {
+      const reply = await boundary.jobs();
+      jobs = Array.isArray(reply?.jobs) ? reply.jobs : [];
+    } catch (error) {
+      updateJobsPolling([]);
+      append(jobsRoot, element(document, "p", {
+        className: "error",
+        text: error instanceof Error ? error.message : String(error),
+      }));
+      return;
+    }
+
+    const command = document.createElement("input");
+    command.type = "text";
+    command.className = "jobs-command";
+    command.setAttribute("placeholder", "Command to run in the background");
+    command.value = jobsCommandDraft;
+    command.setAttribute("aria-label", "Background command");
+    const run = element(document, "button", { text: "Run in background" });
+    run.type = "button";
+    run.disabled = !command.value.trim();
+    listen(command, "input", () => {
+      jobsCommandDraft = command.value;
+      run.disabled = !command.value.trim();
+    });
+    listen(run, "click", async () => {
+      const value = command.value;
+      if (!value.trim()) return;
+      run.disabled = true;
+      try {
+        await boundary.startJob(value);
+        jobsCommandDraft = "";
+        await showJobs();
+      } catch (error) {
+        run.disabled = false;
+        append(jobsRoot, element(document, "p", {
+          className: "error",
+          text: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    });
+    append(jobsRoot, append(element(document, "div", { className: "jobs-command-form" }), command, run));
+
+    if (jobs.length === 0) {
+      append(jobsRoot, element(document, "p", { text: "No background jobs." }));
+    }
+    const now = global.Date?.now?.() ?? Date.now();
+    for (const job of jobs) {
+      const row = element(document, "details", { className: "jobs-row" });
+      const summary = element(document, "summary");
+      const startedAt = Date.parse(job.started_at);
+      const endedAt = job.ended_at ? Date.parse(job.ended_at) : now;
+      const elapsed = Number.isFinite(startedAt) && Number.isFinite(endedAt)
+        ? `${Math.max(0, Math.floor((endedAt - startedAt) / 1000))}s`
+        : "time unavailable";
+      const status = job.status === "exited" ? `exited (exit code ${job.exit_code})` : job.status;
+      append(
+        summary,
+        element(document, "span", { text: job.label }),
+        element(document, "span", { text: job.owner === "person" ? "you" : "agent" }),
+        element(document, "span", { className: "jobs-status", text: status }),
+        element(document, "span", { text: elapsed }),
+      );
+      if (job.status === "running") {
+        const stop = element(document, "button", { text: "Stop" });
+        stop.type = "button";
+        listen(stop, "click", async () => {
+          try {
+            await boundary.stopJob(job.id);
+            await showJobs();
+          } catch (error) {
+            append(row, element(document, "p", {
+              className: "error",
+              text: error instanceof Error ? error.message : String(error),
+            }));
+          }
+        });
+        append(summary, stop);
+      }
+      const output = element(document, "pre", { className: "jobs-output", text: job.output_tail ?? "" });
+      if (job.output_dropped) {
+        append(row, element(document, "p", { text: "Earlier output was dropped." }));
+      }
+      append(row, summary, output);
+      append(jobsRoot, row);
+    }
+    updateJobsPolling(jobs);
   }
 
   function showPage(nextRoute) {
@@ -1208,6 +1423,41 @@ export async function start({ global, document, client }) {
         await clipboard.writeText(text);
       },
       onViewChanges: () => openRailTool("Changes"),
+      onCommit: async (entry) => {
+        const paths = entry.files.filter((file) => file.checked)
+          .flatMap((file) => file.paths ?? [file.path]);
+        try {
+          const result = await boundary.commit(entry.message, paths);
+          entry.type = "command";
+          entry.output = [`Committed ${result.commit.slice(0, 7)}: ${entry.message.split(/\r?\n/, 1)[0]}`];
+          showTranscript();
+          await showChanges();
+        } catch (error) {
+          entry.error = error instanceof Error ? error.message : String(error);
+          showTranscript();
+        }
+      },
+      onCancelCommit: (entry) => {
+        const index = transcript.model.indexOf(entry);
+        if (index !== -1) transcript.model.splice(index, 1);
+        showTranscript();
+      },
+      onOpenPullRequest: async (entry) => {
+        try {
+          const result = await boundary.openPullRequest(entry.title, entry.body);
+          entry.type = "pull-request-done";
+          entry.url = result.url;
+          showTranscript();
+        } catch (error) {
+          entry.error = error instanceof Error ? error.message : String(error);
+          showTranscript();
+        }
+      },
+      onClosePullRequest: (entry) => {
+        const index = transcript.model.indexOf(entry);
+        if (index !== -1) transcript.model.splice(index, 1);
+        showTranscript();
+      },
       onUndo: async (entry, force = false) => {
         entry.undoing = true;
         entry.error = "";
@@ -1926,7 +2176,7 @@ export async function start({ global, document, client }) {
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
-    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Spec: specRoot, Files: filesRoot };
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Spec: specRoot, Files: filesRoot, Jobs: jobsRoot };
     if (!selectedSpec) {
       replace(specRoot, element(document, "p", {
         className: "spec-empty",
@@ -1945,11 +2195,13 @@ export async function start({ global, document, client }) {
     const changed = selectedRailTool !== name;
     selectedRailTool = name;
     showRailTools = false;
+    if (name !== "Jobs") updateJobsPolling([]);
     rememberRail(global, openRailTools, selectedRailTool);
     renderRail();
     if (!changed) return undefined;
     if (name === "Changes") return showChanges();
     if (name === "Files") return loadFileDirectory("");
+    if (name === "Jobs") return showJobs();
     return undefined;
   }
 
@@ -1963,9 +2215,11 @@ export async function start({ global, document, client }) {
     openRailTools = openRailTools.filter((tool) => tool !== name);
     if (selectedRailTool === name) selectedRailTool = openRailTools.at(-1) ?? "";
     showRailTools = openRailTools.length === 0;
+    if (selectedRailTool !== "Jobs") updateJobsPolling([]);
     rememberRail(global, openRailTools, selectedRailTool);
     renderRail();
     if (selectedRailTool === "Changes") return showChanges();
+    if (selectedRailTool === "Jobs") return showJobs();
     return undefined;
   }
 
@@ -2343,6 +2597,7 @@ export async function start({ global, document, client }) {
   renderRail();
   if (selectedRailTool === "Changes") void showChanges();
   if (selectedRailTool === "Files") void loadFileDirectory("");
+  if (selectedRailTool === "Jobs") void showJobs();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -2383,6 +2638,42 @@ export async function start({ global, document, client }) {
     ].filter(Boolean);
     conversationUsage.textContent = [primaryStatus, ...extraStatus].filter(Boolean).join(" · ");
     conversationUsage.className = `conversation-usage${mode === "plan" ? " plan" : ""}`;
+  }
+
+  function waitingForApproval() {
+    return [...approvals.state.values()].some((question) =>
+      question.state === "open" || question.state === "answering"
+    );
+  }
+
+  function updateWindowTitle() {
+    if (waitingForApproval()) {
+      document.title = "● Waiting for you · SymphonAI";
+    } else if (turn.state === RUNNING || turn.state === DISPATCHING) {
+      document.title = `Working… · ${project?.name || projectName(project?.repo_root ?? "")} · SymphonAI`;
+    } else {
+      document.title = project?.name
+        ? `${project.name} · SymphonAI`
+        : project?.repo_root ? `${projectName(project.repo_root)} · SymphonAI` : "SymphonAI";
+    }
+  }
+
+  function conversationTitle(sessionId) {
+    return sessions.find((session) => session.run_id === sessionId)?.title
+      || (sessionId === currentSessionId && conversation?.title)
+      || project?.name
+      || projectName(project?.repo_root ?? "");
+  }
+
+  function notify(title, body, sessionId) {
+    if (!notificationsEnabled || (document.hidden !== true && document.hasFocus?.() !== false)) return;
+    const Notification = global.Notification;
+    if (typeof Notification !== "function" || Notification.permission !== "granted") return;
+    const notification = new Notification(title, { body, tag: sessionId });
+    notification.onclick = () => {
+      global.focus?.();
+      void openSession(sessionId);
+    };
   }
 
   function showAgents() {
@@ -2689,6 +2980,7 @@ export async function start({ global, document, client }) {
       children.push(row);
     }
     replace(approvalsRoot, ...children);
+    updateWindowTitle();
   }
 
   async function activeRuntimeRun() {
@@ -2701,6 +2993,7 @@ export async function start({ global, document, client }) {
   }
 
   async function perform(actions) {
+    updateWindowTitle();
     for (const action of actions) {
       if (action.kind === "prompt") {
         const presentation = {
@@ -2751,6 +3044,7 @@ export async function start({ global, document, client }) {
       }
     }
     showPromptError();
+    updateWindowTitle();
   }
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
@@ -3742,6 +4036,61 @@ export async function start({ global, document, client }) {
       promptFailure = "";
       showPromptError();
       await perform(turn.submit(INIT_PROMPT));
+      return;
+    }
+    if (entry.name === "review") {
+      const focus = command.slice(typedName.length).trim();
+      promptFailure = "";
+      showPromptError();
+      await perform(turn.submit(`${REVIEW_PROMPT}${focus ? `\n\nFocus on: ${focus}` : ""}`));
+      return;
+    }
+    if (entry.name === "commit") {
+      let status;
+      try {
+        status = await boundary.gitStatus();
+      } catch (error) {
+        answerCommand(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (status?.repo === false) {
+        answerCommand("Not a git repository.");
+        return;
+      }
+      const files = Array.isArray(status?.files) ? status.files : [];
+      if (files.length === 0) {
+        answerCommand("Nothing to commit.");
+        return;
+      }
+      commandEntry.type = "commit-card";
+      commandEntry.message = command.slice(typedName.length).trim();
+      commandEntry.files = files.map((file) => ({
+        ...file,
+        checked: true,
+        paths: [...new Set([file.old_path, file.path].filter((path) => typeof path === "string"))],
+      }));
+      commandEntry.error = "";
+      showTranscript();
+      return;
+    }
+    if (entry.name === "pr") {
+      if (args.length > 0) {
+        answerCommand("Usage: /pr");
+        return;
+      }
+      try {
+        const info = await boundary.pullRequestInfo();
+        commandEntry.type = "pull-request-card";
+        commandEntry.problem = info.problem || "";
+        commandEntry.branch = info.branch || "";
+        commandEntry.base = info.base || "";
+        commandEntry.title = info.title || "";
+        commandEntry.body = "";
+        commandEntry.error = "";
+        showTranscript();
+      } catch (error) {
+        answerCommand(error instanceof Error ? error.message : String(error));
+      }
     }
   }
 
@@ -3827,11 +4176,33 @@ export async function start({ global, document, client }) {
 
   async function onFrame(frame) {
     if (frame.kind === "approval_requested") {
+      const payload = frame.payload ?? {};
+      const sessionId = payload.session_id;
+      const operation = payload.kind === "question" ? "Question"
+        : payload.kind === "plan" ? "Plan" : payload.operation;
+      if (typeof sessionId === "string" && typeof operation === "string") {
+        notify("Waiting for you", `${conversationTitle(sessionId)} · ${operation}`, sessionId);
+      }
       await approvals.onFrame(frame);
       showApprovals();
       return;
     }
+    if (frame.kind === "event" && frame.payload?.type === "JobChanged") {
+      if (jobsPaneVisible()) await showJobs();
+      return;
+    }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
+    if (frame.kind === "event" && ["RunFinished", "RunFailed"].includes(frame.payload?.type)) {
+      const payload = decodeEvent(frame.payload);
+      const rootAgentId = frameSessionId === currentSessionId
+        ? conversation?.agents?.find((agent) => agent.parent_agent_id == null)?.agent_id
+        : null;
+      const isRoot = (typeof rootAgentId === "string" && payload.fields.agent_id === rootAgentId)
+        || (!rootAgentId && payload.fields.agent_name === "leader");
+      if (isRoot && typeof frameSessionId === "string") {
+        notify(payload.type === "RunFailed" ? "Failed" : "Finished", conversationTitle(frameSessionId), frameSessionId);
+      }
+    }
     await refreshSpecsForEvent(frame);
     if (await refreshActivityForOtherSession(frameSessionId)) return;
     const previousLength = transcript.model.length;
@@ -3902,6 +4273,7 @@ export async function start({ global, document, client }) {
       runNotice.textContent = "";
     }
     await perform(turn.event({ ...event, ...event.fields }));
+    updateWindowTitle();
     if (event.type === "RunFinished" || event.type === "RunFailed") {
       await refreshConversation();
       await refreshSelectedChanges();
@@ -3927,6 +4299,7 @@ export async function start({ global, document, client }) {
       await openSession(currentSessionId);
     }
   }
+  updateWindowTitle();
   showPromptError();
   return {
     approvals,

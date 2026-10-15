@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -42,6 +43,7 @@ from symphonai_api.config import ConfigError, ResolvedConfig
 from symphonai_api.events import (
     AssistantTextDelta,
     CompactionApplied,
+    JobChanged,
     RunFailed,
     RunFinished,
     RunStarted,
@@ -67,7 +69,7 @@ from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import ReadLedger, WriteFileTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
-from symphonai_api.tools.shell import RunShellTool
+from symphonai_api.tools.shell import RunShellTool, shell_environment
 import symphonai_api.tools.shell as shell_module
 from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.worktree import create_worktree, worktree_diff
@@ -8618,10 +8620,22 @@ def check_builtin_roster_without_definitions() -> None:
                     fail(f"host could not dispatch built-ins with empty={empty_directory}: {leader.subagents!r}")
                 worker_tools = set(leader.subagents["worker"].agent._tools)
                 explorer_tools = set(leader.subagents["explorer"].agent._tools)
-                if worker_tools != set(standard_tool_registry()) | {"read_tool_result"}:
+                if worker_tools != set(standard_tool_registry()) | {"read_tool_result", "job_output", "job_stop"}:
                     fail(f"host worker lost its stored-result tool: {worker_tools!r}")
                 if explorer_tools != {"read_file", "glob", "grep", "list_files", "web_fetch", "read_tool_result"}:
                     fail(f"host explorer registry was wrong: {explorer_tools!r}")
+                roster = leader_module.builtin_subagent_specs(
+                    FakeModelProvider(), PermissionPolicy(root), jobs=leader.background_jobs,
+                )
+                for name in ("explorer", "planner"):
+                    if {"job_output", "job_stop"} & set(roster[name].tool_names or ()):
+                        fail(f"built-in {name} received job tools without run_shell")
+                for name in ("worker", "implementer", "reviewer"):
+                    tools = set(roster[name].tool_names or ())
+                    if not {"run_shell", "job_output", "job_stop"} <= tools:
+                        fail(f"built-in {name} lost job tools: {tools!r}")
+                if not {"job_output", "job_stop"} <= set(leader._agent._tools):
+                    fail("leader lost its job tools")
                 missing = leader._dispatch_tool.execute(ToolCall(
                     id="missing", name="dispatch_subagent",
                     arguments={"subagent_name": "missing", "task": "work"},
@@ -10222,6 +10236,685 @@ def check_approval_without_client_refuses() -> None:
             host.close()
 
 
+@check("host_server.git_status_route")
+def check_git_status_route() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        for name in ("a.py", "c.py", "deleted.py"):
+            (root / name).write_text(f"{name} = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.py", "c.py", "deleted.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        (root / "a.py").write_text("a.py = 2\n", encoding="utf-8")
+        (root / "deleted.py").unlink()
+        (root / "staged.py").write_text("staged = True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "staged.py"], cwd=root, check=True)
+        (root / "untracked.py").write_text("untracked = True\n", encoding="utf-8")
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            def status():
+                connection, response = _request(host, "GET", "/git/status", headers=_headers(host))
+                result = json.loads(response.read())
+                connection.close()
+                if response.status != 200:
+                    fail(f"git status route returned {response.status}: {result!r}")
+                return result
+
+            before_status = subprocess.run(
+                ["git", "status", "--porcelain", "-z"], cwd=root, capture_output=True, check=True,
+            ).stdout
+            index_path = root / ".git" / "index"
+            before_index = index_path.read_bytes()
+            result = status()
+            files = {item["path"]: item for item in result["files"]}
+            expected = {
+                "a.py": ("modified", False),
+                "deleted.py": ("deleted", False),
+                "staged.py": ("added", True),
+                "untracked.py": ("untracked", False),
+            }
+            if {path: (files[path]["status"], files[path]["staged"]) for path in expected} != expected:
+                fail(f"git status route returned incorrect file states: {files!r}")
+            if list(files) != sorted(files):
+                fail(f"git status route did not sort files by path: {list(files)!r}")
+            if "+untracked = True" not in files["untracked.py"]["diff"]:
+                fail(f"untracked diff did not show its added line: {files['untracked.py']!r}")
+            if (root / ".git" / "index").read_bytes() != before_index:
+                fail("git status route changed the index file")
+            after_status = subprocess.run(
+                ["git", "status", "--porcelain", "-z"], cwd=root, capture_output=True, check=True,
+            ).stdout
+            if after_status != before_status:
+                fail("git status route changed git status")
+
+            (root / "a.py").write_text("z" * 30_000, encoding="utf-8")
+            long_file = next(item for item in status()["files"] if item["path"] == "a.py")
+            if len(long_file["diff"]) != 20_000 or long_file["diff_truncated"] is not True:
+                fail(f"long git diff was not capped at 20,000 characters: {len(long_file['diff'])}, {long_file['diff_truncated']!r}")
+
+            entered, release = threading.Event(), threading.Event()
+            provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            original = provider.create_response
+            def slow_response(request, *, cancel=None):
+                entered.set()
+                if not release.wait(5):
+                    fail("slow provider was not released")
+                return original(request, cancel=cancel)
+            provider.create_response = slow_response
+            host.close()
+            host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "slow"}, headers=_headers(host))
+            response.read(); connection.close()
+            if not entered.wait(2):
+                fail("slow turn did not reach the provider")
+            if status().get("repo") is not True:
+                fail("git status route did not answer during an active turn")
+            release.set()
+            _wait_until(lambda: not host.run.active, "slow turn did not finish")
+        finally:
+            if "release" in locals():
+                release.set()
+            host.close()
+
+        non_repo = Path(temporary) / "not-repo"
+        non_repo.mkdir()
+        host = _host(repo_root=non_repo, sessions_root=Path(temporary) / "sessions")
+        try:
+            connection, response = _request(host, "GET", "/git/status", headers=_headers(host))
+            result = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or result != {"repo": False}:
+                fail(f"non-repository git status was not reported: {response.status}, {result!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.git_status_many_files")
+def check_git_status_many_files() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        tracked = root / "tracked.txt"
+        tracked.write_text("before\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        tracked.write_text("after\n", encoding="utf-8")
+        for index in range(2_000):
+            (root / f"u{index:04}.txt").write_text(f"value {index}\n", encoding="utf-8")
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            before_status = subprocess.run(
+                ["git", "status", "--porcelain", "-z"], cwd=root,
+                capture_output=True, check=True,
+            ).stdout
+            index_path = root / ".git" / "index"
+            before_index = index_path.read_bytes()
+            started = time.perf_counter()
+            connection, response = _request(host, "GET", "/git/status", headers=_headers(host))
+            result = json.loads(response.read())
+            connection.close()
+            elapsed = time.perf_counter() - started
+            if response.status != 200:
+                fail(f"large git status returned {response.status}: {result!r}")
+            files = result.get("files", [])
+            if len(files) != 2_001:
+                fail(f"large git status listed {len(files)} files, expected 2001")
+            diffed = [item for item in files if item.get("diff") is not None]
+            deferred = [item for item in files if item.get("diff_deferred") is True]
+            if len(diffed) != 200 or len(deferred) != 1_801:
+                fail(f"large git status diffed {len(diffed)} and deferred {len(deferred)} files")
+            if elapsed >= 3:
+                fail(f"large git status took {elapsed:.3f}s, expected under 3s")
+            if index_path.read_bytes() != before_index:
+                fail("large git status changed the index")
+            after_status = subprocess.run(
+                ["git", "status", "--porcelain", "-z"], cwd=root,
+                capture_output=True, check=True,
+            ).stdout
+            if after_status != before_status:
+                fail("large git status changed the working tree")
+
+            deferred_path = next(item["path"] for item in files if item.get("diff_deferred"))
+            connection, response = _request(
+                host, "GET", f"/git/diff?{urlencode({'path': deferred_path})}",
+                headers=_headers(host),
+            )
+            result = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or f"+value {int(deferred_path[1:5])}" not in result.get("diff", ""):
+                fail(f"deferred diff route returned an incorrect diff: {response.status}, {result!r}")
+            connection, response = _request(
+                host, "GET", f"/git/diff?{urlencode({'path': '../x'})}",
+                headers=_headers(host),
+            )
+            response.read(); connection.close()
+            if response.status != 400:
+                fail(f"outside diff path returned {response.status}, expected 400")
+            connection, response = _request(
+                host, "GET", f"/git/diff?{urlencode({'path': 'unchanged.txt'})}",
+                headers=_headers(host),
+            )
+            response.read(); connection.close()
+            if response.status != 404:
+                fail(f"unchanged diff path returned {response.status}, expected 404")
+        finally:
+            host.close()
+
+
+@check("host_server.git_status_untracked_links_and_size")
+def check_git_status_untracked_links_and_size() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / "inside.txt").write_text("inside target secret\n", encoding="utf-8")
+        subprocess.run(["git", "add", "inside.txt"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        (root / "outside-link").symlink_to("/etc/passwd")
+        (root / "inside-link").symlink_to("inside.txt")
+        large_file = root / "large.txt"
+        with large_file.open("wb") as stream:
+            block = b"x\n" * (1024 * 512)
+            for _ in range(50):
+                stream.write(block)
+        large_stat = large_file.stat()
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            original_fdopen = os.fdopen
+            bytes_read = 0
+
+            class ReadTracker:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def fileno(self):
+                    return self.stream.fileno()
+
+                def read(self, size=-1):
+                    nonlocal bytes_read
+                    content = self.stream.read(size)
+                    bytes_read += len(content)
+                    return content
+
+            def tracked_fdopen(descriptor, *args, **kwargs):
+                stream = original_fdopen(descriptor, *args, **kwargs)
+                opened_stat = os.fstat(descriptor)
+                if (opened_stat.st_dev, opened_stat.st_ino) == (large_stat.st_dev, large_stat.st_ino):
+                    return ReadTracker(stream)
+                return stream
+
+            def get(path):
+                connection, response = _request(host, "GET", path, headers=_headers(host))
+                body = json.loads(response.read())
+                connection.close()
+                if response.status != 200:
+                    fail(f"{path} returned {response.status}: {body!r}")
+                return body
+
+            with mock.patch.object(host_server_module.os, "fdopen", new=tracked_fdopen):
+                result = get("/git/status")
+            files = {item["path"]: item for item in result["files"]}
+            for name, target in (("outside-link", "/etc/passwd"), ("inside-link", "inside.txt")):
+                diff = files[name]["diff"]
+                if "new file mode 120000" not in diff or f"+{target}\n" not in diff:
+                    fail(f"untracked symlink {name} was not diffed as a link: {diff!r}")
+                if "inside target secret" in diff or "+root:" in diff:
+                    fail(f"untracked symlink {name} exposed target contents: {diff!r}")
+            expected_link_diff = (
+                "diff --git a/outside-link b/outside-link\n"
+                "new file mode 120000\n"
+                "--- /dev/null\n"
+                "+++ b/outside-link\n"
+                "@@ -0,0 +1 @@\n"
+                "+/etc/passwd\n"
+                "\\ No newline at end of file\n"
+            )
+            if files["outside-link"]["diff"] != expected_link_diff:
+                fail(f"outside symlink diff did not match git format: {files['outside-link']['diff']!r}")
+            if bytes_read > 1024 * 1024:
+                fail(f"untracked file reader consumed {bytes_read} bytes, over 1 MB")
+            if bytes_read != 1024 * 1024:
+                fail(f"untracked file reader did not track the bounded read: {bytes_read}")
+            large_diff = files["large.txt"]
+            if len(large_diff["diff"]) != 20_000 or large_diff["diff_truncated"] is not True:
+                fail(f"large untracked diff was not capped: {len(large_diff['diff'])}, {large_diff['diff_truncated']!r}")
+            if "@@ -0,0 +1,524288 @@" not in large_diff["diff"]:
+                fail(f"large untracked diff hunk did not count the lines read: {large_diff['diff'][:100]!r}")
+
+            link_diff = get(f"/git/diff?{urlencode({'path': 'outside-link'})}")
+            if link_diff.get("diff") != expected_link_diff:
+                fail(f"single-file route did not show the outside symlink itself: {link_diff!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.git_commit_route")
+def check_git_commit_route() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        for name in ("a.py", "c.py", "unchanged.py"):
+            (root / name).write_text(f"{name} = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.py", "c.py", "unchanged.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        (root / "a.py").write_text("a.py = 2\n", encoding="utf-8")
+        (root / "b.py").write_text("b.py = 2\n", encoding="utf-8")
+        (root / "c.py").write_text("c.py = staged\n", encoding="utf-8")
+        subprocess.run(["git", "add", "c.py"], cwd=root, check=True)
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+
+        def post(payload):
+            connection, response = _request(host, "POST", "/git/commit", body=payload, headers=_headers(host))
+            result = json.loads(response.read())
+            connection.close()
+            return response.status, result
+
+        try:
+            status, result = post({"message": "selected files", "paths": ["a.py", "b.py"]})
+            if status != 200 or result.get("paths") != ["a.py", "b.py"]:
+                fail(f"git commit did not commit the selected paths: {status}, {result!r}")
+            committed_paths = subprocess.run(
+                ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+                cwd=root, capture_output=True, check=True,
+            ).stdout.decode().splitlines()
+            if sorted(path for path in committed_paths if path) != ["a.py", "b.py"]:
+                fail(f"commit included paths outside its selection: {committed_paths!r}")
+            porcelain = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=root, capture_output=True, check=True,
+            ).stdout.decode()
+            if "M  c.py" not in porcelain or "a.py" in porcelain or "b.py" in porcelain:
+                fail(f"unselected staged changes did not remain staged and uncommitted: {porcelain!r}")
+
+            for path in ("unchanged.py", "../x"):
+                invalid_status, error = post({"message": "bad path", "paths": [path]})
+                if invalid_status != 400:
+                    fail(f"unchanged or outside path was accepted: {path!r}, {invalid_status}, {error!r}")
+
+            (root / "a.py").write_text("a.py = 3\n", encoding="utf-8")
+            hook = root / ".git" / "hooks" / "pre-commit"
+            hook.write_text("#!/bin/sh\necho hook refused >&2\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+            index_path = root / ".git" / "index"
+            before_index = index_path.read_bytes()
+            failed_status, error = post({"message": "hook failure", "paths": ["a.py"]})
+            if failed_status != 409 or "hook refused" not in error.get("error", ""):
+                fail(f"commit hook failure was not returned: {failed_status}, {error!r}")
+            if index_path.read_bytes() != before_index:
+                fail("failed commit changed the person's Git index")
+            hook.unlink()
+
+            entered, release = threading.Event(), threading.Event()
+            provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            original = provider.create_response
+            def slow_response(request, *, cancel=None):
+                entered.set()
+                if not release.wait(5):
+                    fail("slow provider was not released")
+                return original(request, cancel=cancel)
+            provider.create_response = slow_response
+            host.close()
+
+
+            host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+            connection, response = _request(host, "POST", "/prompt", body={"prompt": "slow"}, headers=_headers(host))
+            response.read(); connection.close()
+            if not entered.wait(2):
+                fail("slow turn did not reach the provider")
+            head_before = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True,
+            ).stdout
+            busy_status, error = post({"message": "wait", "paths": ["a.py"]})
+            if busy_status != 409 or error.get("error") != "wait for the turn to finish":
+                fail(f"commit during a running turn was not refused: {busy_status}, {error!r}")
+            head_after = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True,
+            ).stdout
+            if head_after != head_before:
+                fail("commit during a turn changed HEAD")
+            release.set()
+            _wait_until(lambda: not host.run.active, "slow turn did not finish")
+        finally:
+            if "release" in locals():
+                release.set()
+            host.close()
+
+
+@check("host_server.git_commit_from_subfolder")
+def check_git_commit_from_subfolder() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repository = Path(temporary) / "repo"
+        project = repository / "pkg"
+        project.mkdir(parents=True)
+        subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=repository, check=True)
+        changed = project / "m.py"
+        changed.write_text("before = True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "pkg/m.py"], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=repository, check=True)
+        changed.write_text("after = True\n", encoding="utf-8")
+        host = _host(repo_root=project, sessions_root=Path(temporary) / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/git/commit",
+                body={"message": "subfolder change", "paths": ["pkg/m.py"]},
+                headers=_headers(host),
+            )
+            result = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or result.get("paths") != ["pkg/m.py"]:
+                fail(f"subfolder commit failed: {response.status}, {result!r}")
+            committed = subprocess.run(
+                ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+                cwd=repository, capture_output=True, check=True,
+            ).stdout.decode().splitlines()
+            if [path for path in committed if path] != ["pkg/m.py"]:
+                fail(f"subfolder commit included incorrect paths: {committed!r}")
+        finally:
+            host.close()
+
+
+def _pull_request_repo(base: Path, *, origin: bool = True, branch: str = "feature", ahead: bool = True, detached: bool = False):
+    root = base / "repo"
+    root.mkdir()
+    bare = base / "origin.git"
+    if origin:
+        subprocess.run(["git", "init", "--bare", "--quiet", "--initial-branch=main", str(bare)], check=True)
+    subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base commit"], cwd=root, check=True)
+    if origin:
+        subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=root, check=True)
+        subprocess.run(["git", "push", "--quiet", "-u", "origin", "main"], cwd=root, check=True)
+        subprocess.run(["git", "remote", "set-head", "origin", "main"], cwd=root, check=True)
+    if branch != "main":
+        subprocess.run(["git", "checkout", "--quiet", "-b", branch], cwd=root, check=True)
+    if ahead:
+        (root / "feature.py").write_text("feature = True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "feature change"], cwd=root, check=True)
+    if detached:
+        subprocess.run(["git", "checkout", "--quiet", "--detach", "HEAD"], cwd=root, check=True)
+    return root, bare if origin else None
+
+
+def _fake_gh(bin_dir: Path) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    git_path = shutil.which("git")
+    if git_path is None:
+        fail("git executable was not found for fake PATH")
+    (bin_dir / "git").symlink_to(git_path)
+    fake = bin_dir / "gh"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = auth ]; then\n"
+        "  if [ \"${GH_SIGNED_OUT:-0}\" = 1 ]; then echo signed out >&2; exit 1; fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = pr ]; then\n"
+        "  printf '%s\\n' \"$@\" >> \"$GH_ARGS_LOG\"\n"
+        "  echo \"${GH_PR_URL:-https://github.com/example/repo/pull/1}\"\n"
+        "  exit \"${GH_CREATE_EXIT:-0}\"\n"
+        "fi\n"
+        "echo unexpected gh command >&2; exit 2\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+
+@check("host_server.pull_request_preflight")
+def check_pull_request_preflight() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        bin_dir = base / "bin"
+        _fake_gh(bin_dir)
+        path_value = str(bin_dir)
+        cases = [
+            ("gh-missing", {"origin": True, "branch": "feature", "ahead": True},
+             path_value, {}, "The GitHub CLI (gh) is not installed."),
+            ("signed-out", {"origin": True, "branch": "feature", "ahead": True},
+             path_value, {"GH_SIGNED_OUT": "1"}, "gh is not signed in. Run gh auth login."),
+            ("no-origin", {"origin": False, "branch": "feature", "ahead": True},
+             path_value, {}, "This repository has no origin remote."),
+            ("detached", {"origin": True, "branch": "feature", "ahead": True, "detached": True},
+             path_value, {}, "Check out a branch first."),
+            ("on-base", {"origin": True, "branch": "main", "ahead": False},
+             path_value, {}, "Create a branch first; a pull request comes from a branch other than main."),
+            ("no-ahead", {"origin": True, "branch": "feature", "ahead": False},
+             path_value, {}, "feature has no commits that main does not."),
+        ]
+        for name, options, route_path, extra_env, expected in cases:
+            case_root = base / name
+            case_root.mkdir()
+            root, bare = _pull_request_repo(case_root, **options)
+            if name == "gh-missing":
+                missing_bin = case_root / "git-only"
+                missing_bin.mkdir()
+                (missing_bin / "git").symlink_to(shutil.which("git"))
+                route_path = str(missing_bin)
+            env = {"PATH": route_path, "GH_SIGNED_OUT": "0", **extra_env}
+            host = _host(repo_root=root, sessions_root=case_root / "sessions")
+            try:
+                with mock.patch.dict(os.environ, env):
+                    connection, response = _request(host, "GET", "/git/pull-request", headers=_headers(host))
+                    info = json.loads(response.read())
+                    connection.close()
+                    if response.status != 200 or info.get("problem") != expected:
+                        fail(f"pull-request preflight {name} returned {response.status}, {info!r}")
+                    before = None
+                    if bare is not None:
+                        before_result = subprocess.run(
+                            ["git", "--git-dir", str(bare), "rev-parse", "--verify", "refs/heads/feature"],
+                            capture_output=True, check=False,
+                        )
+                        before = before_result.stdout if before_result.returncode == 0 else None
+                    connection, response = _request(
+                        host, "POST", "/git/pull-request",
+                        body={"title": "title", "body": "body"}, headers=_headers(host),
+                    )
+                    refused = json.loads(response.read())
+                    connection.close()
+                    if response.status != 409 or refused.get("error") != expected:
+                        fail(f"POST did not refuse preflight case {name}: {response.status}, {refused!r}")
+                    if bare is not None:
+                        after_result = subprocess.run(
+                            ["git", "--git-dir", str(bare), "rev-parse", "--verify", "refs/heads/feature"],
+                            capture_output=True, check=False,
+                        )
+                        after = after_result.stdout if after_result.returncode == 0 else None
+                        if after != before:
+                            fail(f"preflight problem {name} pushed a branch")
+            finally:
+                host.close()
+
+
+@check("host_server.pull_request_create")
+def check_pull_request_create() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, bare = _pull_request_repo(base, branch="feature", ahead=True)
+        (root / "uncommitted.txt").write_text("keep local\n", encoding="utf-8")
+        bin_dir = base / "bin"
+        _fake_gh(bin_dir)
+        args_log = base / "gh-args.log"
+        with mock.patch.dict(os.environ, {
+            "PATH": str(bin_dir), "GH_ARGS_LOG": str(args_log),
+            "GH_PR_URL": "https://github.com/example/repo/pull/42",
+        }):
+            host = _host(repo_root=root, sessions_root=base / "sessions")
+            try:
+                connection, response = _request(host, "GET", "/git/pull-request", headers=_headers(host))
+                info = json.loads(response.read()); connection.close()
+                if response.status != 200 or {
+                    key: info.get(key) for key in ("branch", "base", "title", "ahead", "problem")
+                } != {
+                    "branch": "feature", "base": "main", "title": "feature change", "ahead": 1,
+                    "problem": None,
+                }:
+                    fail(f"pull-request preflight returned wrong branch information: {info!r}")
+                connection, response = _request(
+                    host, "POST", "/git/pull-request",
+                    body={"title": "Fix parser", "body": "Fixes parsing."}, headers=_headers(host),
+                )
+                created = json.loads(response.read()); connection.close()
+                if response.status != 200 or created.get("url") != "https://github.com/example/repo/pull/42":
+                    fail(f"pull request was not created through fake gh: {response.status}, {created!r}")
+                pushed = subprocess.run(
+                    ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/feature"],
+                    capture_output=True, check=True,
+                ).stdout
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True,
+                ).stdout
+                if pushed != head:
+                    fail("current branch was not pushed to the local origin")
+                if args_log.read_text(encoding="utf-8").splitlines() != [
+                    "pr", "create", "--title", "Fix parser", "--body", "Fixes parsing.",
+                    "--base", "main", "--head", "feature",
+                ]:
+                    fail(f"gh pr create received the wrong arguments: {args_log.read_text(encoding='utf-8')!r}")
+                if not (root / "uncommitted.txt").exists():
+                    fail("PR creation changed the uncommitted working tree")
+                remote_file = subprocess.run(
+                    ["git", "--git-dir", str(bare), "show", "refs/heads/feature:uncommitted.txt"],
+                    capture_output=True, check=False,
+                )
+                if remote_file.returncode == 0:
+                    fail("uncommitted content was pushed")
+
+                entered, release = threading.Event(), threading.Event()
+                provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+                original = provider.create_response
+                def slow_response(request, *, cancel=None):
+                    entered.set()
+                    if not release.wait(5):
+                        fail("slow provider was not released")
+                    return original(request, cancel=cancel)
+                provider.create_response = slow_response
+                host.close()
+                host = _host(provider, repo_root=root, sessions_root=base / "sessions")
+                connection, response = _request(host, "POST", "/prompt", body={"prompt": "slow"}, headers=_headers(host))
+                response.read(); connection.close()
+                if not entered.wait(2):
+                    fail("slow turn did not reach the provider")
+                remote_before = subprocess.run(
+                    ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/feature"],
+                    capture_output=True, check=True,
+                ).stdout
+                connection, response = _request(
+                    host, "POST", "/git/pull-request",
+                    body={"title": "busy", "body": ""}, headers=_headers(host),
+                )
+                busy = json.loads(response.read()); connection.close()
+                if response.status != 409 or busy.get("error") != "wait for the turn to finish":
+                    fail(f"pull request during a turn was not refused: {response.status}, {busy!r}")
+                remote_after = subprocess.run(
+                    ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/feature"],
+                    capture_output=True, check=True,
+                ).stdout
+                if remote_after != remote_before:
+                    fail("pull request during a turn pushed the branch")
+                release.set()
+                _wait_until(lambda: not host.run.active, "slow turn did not finish")
+            finally:
+                if "release" in locals():
+                    release.set()
+                host.close()
+
+
+@check("host_server.pull_request_never_prompts")
+def check_pull_request_never_prompts() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, _ = _pull_request_repo(base, branch="feature", ahead=True)
+        bin_dir = base / "bin"
+        _fake_gh(bin_dir)
+        real_git = shutil.which("git")
+        if real_git is None:
+            fail("git executable was not found for non-interactive push check")
+        git = bin_dir / "git"
+        git.unlink()
+        git.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, select, sys, time\n"
+            "if sys.argv[1:2] == ['push']:\n"
+            "    ready, _, _ = select.select([sys.stdin], [], [], 1.5)\n"
+            "    stdin_closed = bool(ready) and sys.stdin.read(1) == ''\n"
+            "    with open(os.environ['PR_ENV_LOG'], 'w', encoding='utf-8') as output:\n"
+            "        json.dump({'terminal': os.environ.get('GIT_TERMINAL_PROMPT'), 'ssh': os.environ.get('GIT_SSH_COMMAND'), 'stdin_closed': stdin_closed}, output)\n"
+            "    if not stdin_closed:\n"
+            "        print('stdin was not closed', file=sys.stderr)\n"
+            "        sys.exit(2)\n"
+            "    if os.environ.get('PR_PUSH_SLEEP'):\n"
+            "        time.sleep(float(os.environ['PR_PUSH_SLEEP']))\n"
+            "    print('missing credentials', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        git.chmod(0o755)
+        environment = {
+            "PATH": str(bin_dir),
+            "GH_SIGNED_OUT": "0",
+            "PR_ENV_LOG": str(base / "push-env.json"),
+            "GIT_SSH_COMMAND": "ssh custom-batch-command",
+        }
+        host = _host(repo_root=root, sessions_root=base / "sessions")
+        try:
+            with mock.patch.dict(os.environ, environment):
+                started = time.perf_counter()
+                connection, response = _request(
+                    host, "POST", "/git/pull-request",
+                    body={"title": "title", "body": "body"}, headers=_headers(host),
+                )
+                result = json.loads(response.read())
+                connection.close()
+                elapsed = time.perf_counter() - started
+                if response.status != 409 or "missing credentials" not in result.get("error", ""):
+                    fail(f"non-interactive push did not return its error: {response.status}, {result!r}")
+                if elapsed >= 2:
+                    fail(f"push waited {elapsed:.3f}s for terminal input")
+                recorded = json.loads((base / "push-env.json").read_text(encoding="utf-8"))
+                if recorded != {
+                    "terminal": "0", "ssh": "ssh custom-batch-command", "stdin_closed": True,
+                }:
+                    fail(f"push did not receive non-interactive settings: {recorded!r}")
+
+                with mock.patch.object(host_server_module, "PULL_REQUEST_TIMEOUT_SECONDS", 0.1):
+                    with mock.patch.dict(os.environ, {**environment, "PR_PUSH_SLEEP": "1"}):
+                        connection, response = _request(
+                            host, "POST", "/git/pull-request",
+                            body={"title": "title", "body": "body"}, headers=_headers(host),
+                        )
+                        result = json.loads(response.read())
+                        connection.close()
+                if response.status != 409 or "git push timed out after 120 s" not in result.get("error", ""):
+                    fail(f"push timeout was not named in the response: {response.status}, {result!r}")
+        finally:
+            host.close()
+
+
 @check("host_server.session_belongs_to_project")
 def check_session_belongs_to_project() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -10326,5 +11019,145 @@ def check_projects_and_directories() -> None:
             root_reply = json.loads(response.read())
             if response.status != 200 or root_reply.get("parent") is not None:
                 fail(f"root directory parent was not null: {root_reply!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.jobs_live_per_conversation")
+def check_jobs_live_per_conversation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        try:
+            host.run.start("create conversation")
+            _wait_until(lambda: not host.run.active, "initial conversation did not finish")
+            leader = host.run._conversation[0]
+            manager = leader.background_jobs
+            if manager is None:
+                fail("host conversation did not receive a job manager")
+            job_id = manager.start(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                str(root), shell_environment(),
+            )
+            process = manager.get(job_id).process
+            connection, response = _request(
+                host, "POST", "/session/new", body={}, headers=_headers(host),
+            )
+            response.read(); connection.close()
+            if response.status != 200:
+                fail(f"new session did not end its conversation: {response.status}")
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                fail("ending the conversation left its background job process running")
+            result = manager.read(job_id)
+            if result is None or result["status"] != "stopped":
+                fail(f"closed conversation job did not end as stopped: {result!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.jobs_routes")
+def check_jobs_routes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = _host(repo_root=root, sessions_root=root / "sessions")
+        events = host.broker.subscribe()
+        try:
+            connection, response = _request(
+                host, "POST", "/jobs/start", body={"command": "echo hi; sleep 30"},
+                headers=_headers(host),
+            )
+            started = json.loads(response.read()); connection.close()
+            if response.status != 200 or not started.get("id", "").startswith("job_"):
+                fail(f"person job did not start: {response.status}, {started!r}")
+            start_event = events.get(timeout=1)
+            if not isinstance(start_event, JobChanged) or start_event.job_id != started["id"] or start_event.status != "running" or start_event.session_id is not None:
+                fail(f"person job start event was malformed: {start_event!r}")
+            _wait_until(
+                lambda: any(job["id"] == started["id"] and "hi" in job["output_tail"] for job in host.run.list_jobs()),
+                "person job output was not captured",
+            )
+            connection, response = _request(host, "GET", "/jobs", headers=_headers(host))
+            listing = json.loads(response.read()); connection.close()
+            person = next((job for job in listing.get("jobs", []) if job["id"] == started["id"]), None)
+            if response.status != 200 or person is None or person["owner"] != "person" or person["label"] != "echo hi; sleep 30" or person["status"] != "running" or "hi" not in person["output_tail"]:
+                fail(f"person job was not listed with its output: {listing!r}")
+
+            connection, response = _request(
+                host, "POST", "/jobs/stop", body={"id": started["id"]}, headers=_headers(host),
+            )
+            stopped = json.loads(response.read()); connection.close()
+            if response.status != 200 or stopped.get("status") != "stopped":
+                fail(f"person job did not stop: {response.status}, {stopped!r}")
+            end_event = events.get(timeout=1)
+            if not isinstance(end_event, JobChanged) or end_event.job_id != started["id"] or end_event.status != "stopped":
+                fail(f"person job end event was malformed: {end_event!r}")
+            connection, response = _request(
+                host, "POST", "/jobs/stop", body={"id": "job_unknown"}, headers=_headers(host),
+            )
+            response.read(); connection.close()
+            if response.status != 404:
+                fail(f"unknown job stop did not return 404: {response.status}")
+
+            host.run.start("open a conversation")
+            _wait_until(lambda: not host.run.active, "agent-job conversation did not finish")
+            events.close()
+            events = host.broker.subscribe()
+            leader, session = host.run._conversation
+            manager = leader.background_jobs
+            if manager is None:
+                fail("agent conversation had no background job manager")
+            agent_id = manager.start(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                str(root), shell_environment(), label="python",
+            )
+            agent_event = events.get(timeout=1)
+            if not isinstance(agent_event, JobChanged) or agent_event.job_id != agent_id or agent_event.session_id != session.run_id:
+                fail(f"agent job event omitted its session: {agent_event!r}")
+            connection, response = _request(host, "GET", "/jobs", headers=_headers(host))
+            listing = json.loads(response.read()); connection.close()
+            agent = next((job for job in listing.get("jobs", []) if job["id"] == agent_id), None)
+            if agent is None or agent["owner"] != "agent" or agent["session_id"] != session.run_id or agent["label"] != "python" or "sleep 30" in json.dumps(agent):
+                fail(f"agent job metadata leaked command or omitted label/session: {agent!r}")
+            host.run.stop_job(agent_id)
+        finally:
+            events.close()
+            host.close()
+
+
+@check("host_server.jobs_keep_a_project_open")
+def check_jobs_keep_a_project_open() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        a, b = base / "a", base / "b"
+        a.mkdir(); b.mkdir()
+        sessions = base / "sessions"
+
+        def factory(root, broker, approval):
+            return _project_runtime(root, broker, sessions, approval=approval)
+
+        host = HostServer(None, None, sessions_root=sessions, project_factory=factory)
+        runtime_a, _ = host.open_project(a)
+        assert runtime_a is not None
+        host.start()
+        try:
+            runtime_a.run.start("open conversation")
+            _wait_until(lambda: not runtime_a.run.active, "project A conversation did not finish")
+            leader = runtime_a.run._conversation[0]
+            agent_manager = leader.background_jobs
+            agent_id = agent_manager.start(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                str(a), shell_environment(), label="python",
+            )
+            person_id = runtime_a.run.start_job("sleep 30")
+            host.open_project(b)
+            if a.resolve() not in host._runtimes:
+                fail("project A closed while an agent job was running")
+            runtime_a.run.stop_job(agent_id)
+            if a.resolve() not in host._runtimes:
+                fail("project A closed while the person's job was running")
+            runtime_a.run.stop_job(person_id)
+            _wait_until(lambda: a.resolve() not in host._runtimes, "idle project A stayed open after its jobs stopped")
         finally:
             host.close()

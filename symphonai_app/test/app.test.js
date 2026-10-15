@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 
-import { INIT_PROMPT, start } from "../src/app.js";
+import { INIT_PROMPT, REVIEW_PROMPT, start } from "../src/app.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
 import { createClient } from "../src/client.js";
 import { parseMarkdown } from "../src/markdown.js";
@@ -202,7 +202,7 @@ export class FakeDocument {
   }
 }
 
-function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, storageThrows = false } = {}) {
+function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, notificationsStored = null, storageThrows = false } = {}) {
   const listeners = new Map();
   const writes = [];
   const reloads = [];
@@ -217,6 +217,7 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStor
         if (key === "symphonai.theme") return themeStored;
         if (key === "symphonai.rail-tools") return railStored;
         if (key === "symphonai.status-line") return statusStored;
+        if (key === "symphonai.notifications") return notificationsStored;
         assert.fail(`unexpected localStorage key: ${key}`);
       },
       setItem(key, value) {
@@ -318,7 +319,7 @@ export function fakeClient(
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
   let eventCallback;
@@ -361,6 +362,38 @@ export function fakeClient(
     async changes() {
       calls.changes += 1;
       return { files: [], turns: [], worktrees: [] };
+    },
+    async gitStatus() {
+      calls.gitStatus += 1;
+      return { repo: false };
+    },
+    async gitDiff(path) {
+      calls.gitDiff.push(path);
+      return { path, diff: "@@ -0,0 +1 @@\n+deferred" };
+    },
+    async commit(message, paths) {
+      calls.commits.push({ message, paths });
+      return { commit: "abc123456789", paths };
+    },
+    async pullRequestInfo() {
+      calls.pullRequestInfo += 1;
+      return { branch: "feature", base: "main", title: "Fix parser", ahead: 1, problem: null };
+    },
+    async openPullRequest(title, body) {
+      calls.pullRequests.push({ title, body });
+      return { url: "https://github.com/example/repo/pull/1" };
+    },
+    async jobs() {
+      calls.jobs += 1;
+      return { jobs: [] };
+    },
+    async startJob(command) {
+      calls.startJob.push(command);
+      return { id: "job_fake" };
+    },
+    async stopJob(id) {
+      calls.stopJob.push(id);
+      return { status: "stopped" };
     },
     async revertChanges(payload) {
       calls.revertChanges.push(payload);
@@ -593,6 +626,9 @@ test("help lists commands and their aliases in table order", async () => {
     "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
     "/rename <title> — Rename this conversation",
     "/copy — Copy the last reply as Markdown",
+    "/review [<focus>] — Review the uncommitted changes",
+    "/commit [<message>] — Commit selected changes",
+    "/pr — Open a pull request",
   ]);
   await submitCommand(document, "/help extra");
   assert.match(visibleText(document.getElementById("chat")), /Usage: \/help/);
@@ -1486,6 +1522,116 @@ test("init is refused in plan mode and rejects arguments", async () => {
   assert.deepEqual(client.calls.prompt, []);
 });
 
+test("review submits the fixed prompt with an optional focus in every mode", async () => {
+  const expected = `Review the uncommitted changes in this repository. Do not change any file.
+
+1. Read them with \`git status\` and \`git diff HEAD\`, and read every untracked file that is not ignored.
+2. Read the code each change depends on, and run the narrowest tests that exercise it.
+3. Report findings, most severe first. For each: the file and line, what is wrong, and the input or situation that shows it. Leave out style preferences.
+4. If nothing is worth fixing, say so in one line.`;
+  assert.equal(REVIEW_PROMPT, expected);
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "ask" },
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "review-run" };
+  };
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/review");
+  assert.deepEqual(client.calls.prompt, [REVIEW_PROMPT]);
+
+  const focusedDocument = new FakeDocument();
+  const focusedClient = fakeClient();
+  focusedClient.prompt = async (text) => {
+    focusedClient.calls.prompt.push(text);
+    return { accepted: true, run_id: "focused-review-run" };
+  };
+  await start({ global: {}, document: focusedDocument, client: focusedClient });
+  await submitCommand(focusedDocument, "/review error handling");
+  assert.deepEqual(focusedClient.calls.prompt, [`${REVIEW_PROMPT}\n\nFocus on: error handling`]);
+
+  const planDocument = new FakeDocument();
+  const planClient = fakeClient(fixtureRoadmap(), {
+    conversation: { provider: "openai", model: "gpt-one", mode: "plan" },
+  });
+  planClient.prompt = async (text) => {
+    planClient.calls.prompt.push(text);
+    return { accepted: true, run_id: "plan-review-run" };
+  };
+  await start({ global: {}, document: planDocument, client: planClient });
+  await submitCommand(planDocument, "/review");
+  assert.deepEqual(planClient.calls.prompt, [REVIEW_PROMPT]);
+});
+
+test("commit shows a selectable card and replaces it with the commit result", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.gitStatus = async () => {
+    client.calls.gitStatus += 1;
+    return {
+      repo: true,
+      branch: "main",
+      files: [
+        { path: "a.py", status: "modified" },
+        { path: "b.py", status: "untracked" },
+      ],
+    };
+  };
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/commit Fix the parser");
+  const card = find(document.getElementById("chat"), (node) => node.className === "commit-card");
+  assert.ok(card);
+  const checks = walk(card).filter((node) => node.tagName === "INPUT" && node.type === "checkbox");
+  assert.equal(checks.length, 2);
+  assert.deepEqual(checks.map((node) => node.checked), [true, true]);
+  const message = find(card, (node) => node.className === "commit-message");
+  assert.equal(message.value, "Fix the parser");
+  const commit = find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Commit");
+  assert.equal(commit.disabled, false);
+  checks[1].checked = false;
+  await checks[1].dispatch("change");
+  await commit.click();
+  assert.deepEqual(client.calls.commits, [{ message: "Fix the parser", paths: ["a.py"] }]);
+  assert.match(visibleText(document.getElementById("chat")), /Committed abc1234: Fix the parser/);
+  assert.equal(client.calls.gitStatus, 2);
+});
+
+test("pr shows a blocked explanation or a form and opens the returned link", async () => {
+  const blockedDocument = new FakeDocument();
+  const blockedClient = fakeClient();
+  blockedClient.pullRequestInfo = async () => ({
+    branch: "feature", base: "main", title: "Fix parser", ahead: 1,
+    problem: "gh is not signed in. Run gh auth login.",
+  });
+  await start({ global: {}, document: blockedDocument, client: blockedClient });
+  await submitCommand(blockedDocument, "/pr");
+  const blocked = find(blockedDocument.getElementById("chat"), (node) => node.className === "pull-request-card");
+  assert.ok(blocked);
+  assert.match(visibleText(blocked), /gh is not signed in/);
+  assert.equal(find(blocked, (node) => node.tagName === "INPUT" || node.tagName === "TEXTAREA"), undefined);
+  await find(blocked, (node) => node.tagName === "BUTTON" && node.textContent === "Close").click();
+  assert.equal(find(blockedDocument.getElementById("chat"), (node) => node.className === "pull-request-card"), undefined);
+
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/pr");
+  const card = find(document.getElementById("chat"), (node) => node.className === "pull-request-card");
+  assert.match(visibleText(card), /This pushes feature to origin and opens a pull request into main on GitHub\./);
+  const title = find(card, (node) => node.className === "pull-request-title");
+  const body = find(card, (node) => node.className === "pull-request-body");
+  assert.equal(title.value, "Fix parser");
+  body.value = "Fixes the parsing edge case.";
+  await body.dispatch("input");
+  await find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Push and open pull request").click();
+  assert.deepEqual(client.calls.pullRequests, [{ title: "Fix parser", body: "Fixes the parsing edge case." }]);
+  const link = find(document.getElementById("chat"), (node) => node.tagName === "A");
+  assert.equal(link.href, "https://github.com/example/repo/pull/1");
+  assert.match(visibleText(document.getElementById("chat")), /Opened pull request:/);
+});
+
 test("slash suggestions render above the composer without taking focus", async () => {
   const document = new FakeDocument();
   await start({ global: {}, document, client: fakeClient() });
@@ -1510,6 +1656,9 @@ test("slash suggestions render above the composer without taking focus", async (
     "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
     "/rename  <title>  Rename this conversation",
     "/copy    Copy the last reply as Markdown",
+    "/review  [<focus>]  Review the uncommitted changes",
+    "/commit  [<message>]  Commit selected changes",
+    "/pr    Open a pull request",
   ]);
   assert.equal(document.activeElement, input);
   assert.equal(menu.parentNode, document.getElementById("chat-pane"));
@@ -2786,6 +2935,129 @@ test("status line settings persist checked fields and storage failures use defau
   assert.equal(find(blockedDocument.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage")).textContent, "gpt-5.6-terra low");
 });
 
+test("notifications cover background approvals and root run completion only", async () => {
+  const notifications = [];
+  class FakeNotification {
+    static permission = "granted";
+    static async requestPermission() { return "granted"; }
+    constructor(title, options) {
+      this.title = title;
+      this.options = options;
+      notifications.push(this);
+    }
+  }
+  const browser = fakeGlobal({ notificationsStored: "true" });
+  browser.global.Notification = FakeNotification;
+  browser.global.focus = () => { browser.focused = true; };
+  const document = new FakeDocument();
+  document.hidden = true;
+  document.hasFocus = () => false;
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [{ run_id: "other-session", title: "Other conversation", repo_root: "/work/current" }],
+  });
+  await start({ global: browser.global, document, client });
+
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "background-approval", operation: "run_shell", target: "make test",
+    details: "run tests", session_id: "other-session",
+  } });
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, "Waiting for you");
+  assert.equal(notifications[0].options.body, "Other conversation · run_shell");
+  assert.equal(notifications[0].options.tag, "other-session");
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "background-question", kind: "question", operation: "ask_user",
+    target: "Which option?", details: "choose", session_id: "other-session",
+  } });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "background-plan", kind: "plan", operation: "propose_plan",
+    target: "Plan", details: "approve", session_id: "other-session",
+  } });
+  assert.equal(notifications[1].options.body, "Other conversation · Question");
+  assert.equal(notifications[2].options.body, "Other conversation · Plan");
+  notifications[0].onclick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(client.calls.openSession, ["other-session"]);
+  assert.equal(browser.focused, true);
+
+  await client.emit(eventFrame("RunFinished", {
+    agent_id: "root-agent", agent_name: "leader", session_id: "other-session",
+  }));
+  assert.equal(notifications.length, 4);
+  assert.equal(notifications[3].title, "Finished");
+  assert.equal(notifications[3].options.body, "Other conversation");
+  await client.emit(eventFrame("RunFinished", {
+    agent_id: "child-agent", agent_name: "worker", session_id: "other-session",
+  }));
+  assert.equal(notifications.length, 4);
+
+  document.hidden = false;
+  document.hasFocus = () => true;
+  await client.emit(eventFrame("RunFailed", {
+    agent_id: "root-agent", agent_name: "leader", session_id: "other-session",
+  }));
+  assert.equal(notifications.length, 4);
+});
+
+test("notifications require permission and the window title tracks approvals and turns", async () => {
+  const deniedBrowser = fakeGlobal({ fragment: "#/settings/general" });
+  let requests = 0;
+  class DeniedNotification {
+    static permission = "default";
+    static created = 0;
+    static async requestPermission() { requests += 1; return "denied"; }
+    constructor() { DeniedNotification.created += 1; }
+  }
+  deniedBrowser.global.Notification = DeniedNotification;
+  const deniedDocument = new FakeDocument();
+  const deniedClient = fakeClient();
+  await start({ global: deniedBrowser.global, document: deniedDocument, client: deniedClient });
+  const notifications = find(deniedDocument.getElementById("page"), (node) => node.attributes.get("aria-label") === "Notifications");
+  assert.equal(notifications.checked, false);
+  notifications.checked = true;
+  await notifications.dispatch("change");
+  assert.equal(requests, 1);
+  assert.equal(notifications.checked, false);
+  assert.equal(find(deniedDocument.getElementById("page"), (node) => node.className === "notification-settings-message").textContent, "Notifications are not available here.");
+  assert.deepEqual(deniedBrowser.writes.find(([key]) => key === "symphonai.notifications"), ["symphonai.notifications", "false"]);
+  await deniedClient.emit({ kind: "approval_requested", payload: {
+    approval_id: "disabled-approval", operation: "run_shell", target: "x", details: "run",
+    session_id: "background-session",
+  } });
+  assert.equal(DeniedNotification.created, 0);
+
+  const document = new FakeDocument();
+  const conversation = {
+    session_id: "current-session",
+    agents: [{ agent_id: "root-agent", parent_agent_id: null, state: "idle" }],
+  };
+  const client = fakeClient(fixtureRoadmap(), { conversation });
+  const app = await start({ global: {}, document, client });
+  assert.equal(document.title, "current · SymphonAI");
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "current-approval", operation: "write_file", target: "x", details: "write",
+    session_id: "current-session",
+  } });
+  assert.equal(document.title, "● Waiting for you · SymphonAI");
+  const deny = find(document.getElementById("approvals"), (node) => node.tagName === "BUTTON" && node.textContent === "Deny");
+  await deny.dispatch("click");
+  assert.equal(document.title, "current · SymphonAI");
+  app.turn.submit("background work");
+  app.turn.accepted();
+  await client.emit(eventFrame("RunStarted", {
+    agent_id: "root-agent", agent_name: "leader", session_id: "current-session",
+  }));
+  assert.equal(document.title, "Working… · current · SymphonAI");
+  await client.emit(eventFrame("RunFinished", {
+    agent_id: "root-agent", agent_name: "leader", session_id: "current-session",
+  }));
+  assert.equal(document.title, "current · SymphonAI");
+
+  const emptyDocument = new FakeDocument();
+  await start({ global: {}, document: emptyDocument, client: fakeClient(fixtureRoadmap(), { project: { repo_root: null, name: null } }) });
+  assert.equal(emptyDocument.title, "SymphonAI");
+});
+
 test("every CSS id selector targets an element in index.html", async () => {
   const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
   const index = await readFile(new URL("../index.html", import.meta.url), "utf8");
@@ -3560,7 +3832,7 @@ test("rail tabs open tools, close to the Tools list, and persist the selected la
   await find(tabs, (node) => node.attributes.get("aria-label") === "Close Agents").dispatch("click");
   await find(tabs, (node) => node.attributes.get("aria-label") === "Close Roadmap").dispatch("click");
   assert.equal(tools.hidden, false);
-  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files"]);
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs"]);
   await tools.children.find((row) => row.textContent === "Changes").dispatch("click");
   assert.equal(client.calls.changes, 1);
   assert.deepEqual(tabButtons().map((tab) => tab.textContent || tab.attributes.get("aria-label")), ["Changes"]);
@@ -3647,6 +3919,59 @@ test("Changes tool restores revert conflict and worktree actions", async () => {
   assert.deepEqual(client.calls.applyWorktree, ["w1"]);
   assert.deepEqual(client.calls.discardWorktree, ["w1"]);
   assert.equal(client.calls.changes, 5);
+});
+
+test("Changes shows the project working tree separately from conversation changes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.gitStatus = async () => ({
+    repo: true,
+    branch: "feature/status",
+    files: [
+      { path: "a.py", status: "modified", staged: false, diff: "@@ -1 +1 @@\n-old\n+new" },
+      { path: "b.py", status: "added", staged: true, diff: "+added" },
+      { path: "c.py", status: "untracked", staged: false, diff: null, diff_deferred: true },
+    ],
+  });
+  await start({ global: {}, document, client });
+  await find(document.getElementById("rail-tabs"), (node) => node.attributes.get("aria-label") === "Open a tool").dispatch("click");
+  await document.getElementById("rail-tools").children.find((row) => row.textContent === "Changes").dispatch("click");
+  const changes = document.getElementById("changes");
+  const tree = find(changes, (node) => node.className === "changes-working-tree");
+  assert.ok(tree);
+  assert.equal(visibleText(tree).includes("feature/status"), true);
+  const rows = tree.children.filter((node) => node.className === "changes-working-file");
+  assert.equal(rows.length, 3);
+  assert.match(visibleText(rows[0]), /a\.py · modified/);
+  assert.match(visibleText(rows[0]), /\+new/);
+  assert.match(visibleText(rows[1]), /b\.py · added/);
+  assert.match(visibleText(rows[1]), /Staged/);
+  let finishDeferredDiff;
+  client.gitDiff = (path) => {
+    client.calls.gitDiff.push(path);
+    return new Promise((resolve) => { finishDeferredDiff = resolve; });
+  };
+  rows[2].open = true;
+  const loading = find(rows[2], (node) => node.tagName === "PRE");
+  const opening = rows[2].dispatch("toggle");
+  assert.deepEqual(client.calls.gitDiff, ["c.py"]);
+  assert.equal(loading.textContent, "Loading diff…");
+  finishDeferredDiff({ path: "c.py", diff: "@@ -0,0 +1 @@\n+deferred" });
+  await opening;
+  assert.match(visibleText(rows[2]), /\+deferred/);
+  assert.equal(loading.parentNode, null);
+  await rows[2].dispatch("toggle");
+  assert.deepEqual(client.calls.gitDiff, ["c.py"]);
+
+  const errorDocument = new FakeDocument();
+  const partialClient = fakeClient();
+  partialClient.changes = async () => { throw new Error("conversation changes unavailable"); };
+  partialClient.gitStatus = async () => ({ repo: true, branch: "main", files: [] });
+  await start({ global: {}, document: errorDocument, client: partialClient });
+  await find(errorDocument.getElementById("rail-tabs"), (node) => node.attributes.get("aria-label") === "Open a tool").dispatch("click");
+  await errorDocument.getElementById("rail-tools").children.find((row) => row.textContent === "Changes").dispatch("click");
+  assert.match(visibleText(errorDocument.getElementById("changes")), /conversation changes unavailable/);
+  assert.match(visibleText(errorDocument.getElementById("changes")), /Branch: main/);
 });
 
 test("rail icon tabs show the selected name and move the only close button", async () => {
@@ -4024,7 +4349,8 @@ test("status rail renders the whole roadmap beside settings and live agents", as
   assert.deepEqual(rail.children, [
     document.getElementById("rail-tabs"), agents, document.getElementById("roadmap"),
     document.getElementById("changes"), document.getElementById("spec"),
-    document.getElementById("files"), document.getElementById("rail-tools"),
+    document.getElementById("files"), rail.children.find((node) => node.className === "rail-pane jobs-pane"),
+    document.getElementById("rail-tools"),
   ]);
   assert.equal(document.getElementById("page").children[0].className, "settings-pane");
   assert.equal(document.getElementById("page").children.length, 1);
@@ -6968,4 +7294,65 @@ test("general settings select applies theme even when storage is unavailable", a
   blockedSelect.value = "light";
   await blockedSelect.dispatch("change");
   assert.equal(blockedDocument.documentElement.attributes.get("data-theme"), "light");
+});
+
+test("Jobs tab lists, starts, stops, polls, and refreshes jobs on JobChanged", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  const intervals = [];
+  browser.global.setInterval = (callback, delay) => {
+    const interval = { callback, delay, cleared: false };
+    intervals.push(interval);
+    return interval;
+  };
+  browser.global.clearInterval = (interval) => { interval.cleared = true; };
+  const client = fakeClient();
+  let jobs = [{
+    id: "job-run", owner: "person", session_id: null, label: "npm run dev",
+    status: "running", exit_code: null, started_at: new Date(Date.now() - 2000).toISOString(),
+    ended_at: null, output_tail: "server ready\n", output_dropped: true,
+  }];
+  client.jobs = async () => { client.calls.jobs += 1; return { jobs }; };
+  client.stopJob = async (id) => {
+    client.calls.stopJob.push(id);
+    jobs = [{ ...jobs[0], status: "stopped", ended_at: new Date().toISOString() }];
+    return { status: "stopped" };
+  };
+  client.startJob = async (command) => {
+    client.calls.startJob.push(command);
+    jobs = [{ ...jobs[0], id: "job-new", label: command, status: "running" }];
+    return { id: "job-new" };
+  };
+  const app = await start({ global: browser.global, document, client });
+  const tools = document.getElementById("rail-tools");
+  await document.getElementById("rail-tabs").children.at(-1).dispatch("click");
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs"]);
+  await tools.children.find((row) => row.textContent === "Jobs").dispatch("click");
+  const pane = walk(document.body).find((node) => node.className === "rail-pane jobs-pane");
+  assert.equal(pane.hidden, false);
+  assert.equal(client.calls.jobs, 1);
+  assert.match(visibleText(pane), /npm run dev[\s\S]*you[\s\S]*running[\s\S]*server ready/);
+  assert.match(visibleText(pane), /Earlier output was dropped\./);
+  assert.equal(intervals[0].delay, 1000);
+  intervals[0].callback();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(client.calls.jobs, 2);
+
+  const stop = find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Stop");
+  await stop.dispatch("click");
+  assert.deepEqual(client.calls.stopJob, ["job-run"]);
+  const field = find(pane, (node) => node.className === "jobs-command");
+  assert.equal(field.attributes.get("placeholder"), "Command to run in the background");
+  assert.equal(field.attributes.get("aria-label"), "Background command");
+  field.value = "npm run watch";
+  await field.dispatch("input");
+  const run = find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Run in background");
+  await run.dispatch("click");
+  assert.deepEqual(client.calls.startJob, ["npm run watch"]);
+
+  const reads = client.calls.jobs;
+  await app.onFrame(eventFrame("JobChanged", { job_id: "job-new", status: "running", session_id: null }));
+  assert.equal(client.calls.jobs, reads + 1);
+  await document.getElementById("rail-tabs").children.at(-1).dispatch("click");
+  assert.equal(intervals[0].cleared, true);
 });

@@ -14,12 +14,134 @@ import unittest.mock as mock
 from pathlib import Path
 from symphonai_api.config import ConfigError, load_config
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.jobs import JobManager
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
-from symphonai_api.tools.shell import RunShellTool, _terminate_process_group
+from symphonai_api.tools.shell import RunShellTool, _terminate_process_group, shell_environment
 from symphonai_api.tools.shell_parse import ShellCommand, commands_for_argv, parse_command_line
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
+
+
+@check("shell.background_job_lifecycle")
+def check_background_job_lifecycle() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        manager = JobManager()
+        policy = PermissionPolicy(
+            repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+        )
+        tool = RunShellTool(manager)
+        call = lambda identifier, command: ToolCall(
+            id=identifier, name="run_shell", arguments={"command": command, "background": True},
+        )
+        try:
+            with mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False):
+                started_at = time.monotonic()
+                started = tool.execute(
+                    call("job-steps", "for i in 1 2 3; do echo $i; sleep 1; done"), policy,
+                )
+                if not started.ok or time.monotonic() - started_at >= 0.5:
+                    fail(f"background shell call did not return at once: {started!r}")
+                job_id = started.content.split()[1].rstrip(".")
+                time.sleep(0.5)
+                first = manager.read(job_id)
+                if first is None or first["status"] != "running" or "1\n" not in first["output"]:
+                    fail(f"running job output was not available incrementally: {first!r}")
+                time.sleep(3.0)
+                second = manager.read(job_id, first["since"])
+                if second is None or second["status"] != "exited" or second["exit_code"] != 0:
+                    fail(f"background command did not exit successfully: {second!r}")
+                if first["output"] + second["output"] != "1\n2\n3\n":
+                    fail(f"job output offsets lost or duplicated text: {first!r}, {second!r}")
+
+                stopped = tool.execute(call("job-sleep", "sleep 60"), policy)
+                stopped_id = stopped.content.split()[1].rstrip(".")
+                process = manager.get(stopped_id).process
+                stop_result = manager.stop(stopped_id)
+                if stop_result is None or stop_result["status"] != "stopped":
+                    fail(f"job_stop did not stop a running job: {stop_result!r}")
+                try:
+                    os.killpg(os.getpgid(process.pid), 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    fail("stopped job process group is still running")
+
+                large = tool.execute(ToolCall(
+                    id="job-large", name="run_shell",
+                    arguments={"argv": [sys.executable, "-c", "import sys; sys.stdout.write('x' * 150000)"], "background": True},
+                ), policy)
+                if not large.ok:
+                    fail(f"large background job did not start: {large!r}")
+                large_id = large.content.split()[1].rstrip(".")
+                _wait_job = lambda: manager.get(large_id).status == "exited"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not _wait_job():
+                    time.sleep(0.01)
+                large_output = manager.read(large_id, 0, 100_000)
+                job = manager.get(large_id)
+                if (
+                    job.total_chars != 150000 or len(job.output) != 100000
+                    or large_output is None or not large_output["output_dropped"]
+                    or len(large_output["output"]) != 100_000
+                ):
+                    fail(
+                        "large job output retention was incorrect: "
+                        f"total={job.total_chars}, kept={len(job.output)}, read={len(large_output['output'])}, "
+                        f"dropped={large_output['output_dropped']}"
+                    )
+
+                running = [manager.start(["sleep", "60"], str(root), shell_environment()) for _ in range(8)]
+                ninth = tool.execute(call("job-limit", "sleep 60"), policy)
+                if ninth.ok or "8" not in (ninth.error or ""):
+                    fail(f"ninth concurrent job was not refused: {ninth!r}")
+                for running_id in running:
+                    manager.stop(running_id)
+        finally:
+            manager.close()
+
+
+@check("shell.background_job_policy")
+def check_background_job_policy() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        manager = JobManager()
+        tool = RunShellTool(manager)
+        allow_policy = PermissionPolicy(
+            repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+        )
+        with mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False):
+            unavailable = RunShellTool().execute(ToolCall(
+                id="background-unavailable", name="run_shell",
+                arguments={"command": "echo no manager", "background": True},
+            ), allow_policy)
+            if unavailable.ok or unavailable.error != "background jobs are not available here":
+                fail(f"background shell without a manager was not refused clearly: {unavailable!r}")
+            refused = tool.execute(ToolCall(
+                id="background-rm", name="run_shell",
+                arguments={"command": "rm x", "background": True},
+            ), allow_policy)
+            if refused.ok or "always-deny" not in (refused.error or "") or manager.list():
+                fail(f"background rm bypassed the always-deny policy: {refused!r}")
+            if tool.metadata({"command": "echo ok"}) != tool.metadata({"command": "echo ok", "background": True}):
+                fail("background shell metadata differed from the foreground call")
+
+            approvals = []
+            def approve(request):
+                approvals.append((request, len(manager.list())))
+                return True
+            ask_policy = PermissionPolicy(
+                repo_root=root, mode="ask", shell_enabled=True,
+                approval_callback=approve,
+            )
+            asked = tool.execute(ToolCall(
+                id="background-approval", name="run_shell",
+                arguments={"command": "echo approved", "background": True},
+            ), ask_policy)
+            if not asked.ok or len(approvals) != 1 or approvals[0][1] != 0 or len(manager.list()) != 1:
+                fail(f"background command did not ask before starting: {approvals!r}, {asked!r}")
+        manager.close()
 
 
 def _sandbox_skip() -> bool:

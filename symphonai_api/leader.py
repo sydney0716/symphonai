@@ -74,6 +74,7 @@ from symphonai_api.events import (
 from symphonai_api.extensions import Extensions
 from symphonai_api.hooks import HookRunner
 from symphonai_api.identity import AgentRef, RunRef, new_agent_ref, new_id
+from symphonai_api.jobs import JobManager
 from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.lsp import LspManager
 from symphonai_api.models import ContentInput, Message, ModelRequest, Role, ToolCall, ToolResult
@@ -184,7 +185,9 @@ def builtin_subagent_specs(
     search_backend: SearchBackend | None = None,
     skills: Mapping[str, Skill] | None = None,
     lsp: LspManager | None = None,
+    jobs: JobManager | None = None,
 ) -> dict[str, AgentSpec]:
+    job_tools = ("job_output", "job_stop") if jobs is not None else ()
     selector = ModelSelector(
         provider=getattr(provider, "name", None) or "unknown",
         model=getattr(provider, "model", None),
@@ -200,7 +203,7 @@ def builtin_subagent_specs(
             call_class=CallClass.BACKGROUND,
         )
         for name, tools in (
-            ("worker", tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp))),
+            ("worker", tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp, jobs=jobs))),
             (
                 "explorer",
                 EXPLORER_TOOL_NAMES
@@ -222,14 +225,14 @@ def builtin_subagent_specs(
         "implementer": AgentSpec(
             name="implementer", prompt=IMPLEMENTER_PROMPT, model=selector,
             policy_ceiling=policy,
-            tool_names=tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp)),
+            tool_names=tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp, jobs=jobs)),
             mcp_tool_names=None,
             call_class=CallClass.BACKGROUND,
         ),
         "reviewer": AgentSpec(
             name="reviewer", prompt=REVIEWER_PROMPT, model=selector,
             policy_ceiling=policy,
-            tool_names=EXPLORER_TOOL_NAMES + ("run_shell", "write_file") + optional,
+            tool_names=EXPLORER_TOOL_NAMES + ("run_shell", "write_file") + optional + job_tools,
             mcp_tool_names=(),
             call_class=CallClass.BACKGROUND,
         ),
@@ -422,6 +425,7 @@ class DispatchSubagentTool(LocalTool):
         skills: Mapping[str, Skill] | None = None,
         checkpoints: CheckpointStore | None = None,
         lsp: LspManager | None = None,
+        jobs: JobManager | None = None,
         provider_for: Callable[[str, str | None], ModelProvider | None] | None = None,
     ) -> None:
         self._subagent_provider = subagent_provider
@@ -452,6 +456,7 @@ class DispatchSubagentTool(LocalTool):
         self._skills = skills
         self._checkpoints = checkpoints
         self._lsp = lsp
+        self._jobs = jobs
         self._provider_for = provider_for
         self._pool_lock = threading.RLock()
         self._reserved_names: set[str] = set()
@@ -813,6 +818,7 @@ class DispatchSubagentTool(LocalTool):
                     memory_tool=memory_tool,
                     skills=self._skills,
                     lsp=self._lsp,
+                    jobs=self._jobs,
                     checkpoints=(
                         None if worktree_root is not None else self._checkpoints
                     ),
@@ -1150,6 +1156,7 @@ class LeaderConfig:
     lsp: LspManager | None = None
     provider_for: Callable[[str, str | None], ModelProvider | None] | None = None
     leases: WorkspaceLeases | None = None
+    jobs: JobManager | None = None
 
 
 @dataclass
@@ -1303,6 +1310,7 @@ class Leader:
             skills=(None if config.extensions is None else config.extensions.skills),
             checkpoints=config.checkpoints,
             lsp=config.lsp,
+            jobs=config.jobs,
             provider_for=config.provider_for,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
@@ -1329,6 +1337,7 @@ class Leader:
                 skills=(None if config.extensions is None else config.extensions.skills),
                 checkpoints=config.checkpoints,
                 lsp=config.lsp,
+                jobs=config.jobs,
             ),
             config.extra_tools,
         )
@@ -1989,5 +1998,11 @@ class Leader:
         self._chat_messages.append(Message(role=Role.USER, content=text))
 
     def close(self) -> None:
+        if self._config.jobs is not None:
+            self._config.jobs.close()
         if self._memory_extractor is not None:
             self._memory_extractor.close()
+
+    @property
+    def background_jobs(self) -> JobManager | None:
+        return self._config.jobs

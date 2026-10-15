@@ -305,6 +305,42 @@ export function createClient({
       return request("GET", "/changes");
     },
 
+    gitStatus() {
+      return request("GET", "/git/status");
+    },
+
+    gitDiff(path) {
+      return request("GET", `/git/diff?path=${encodeURIComponent(path)}`);
+    },
+
+    commit(message, paths) {
+      return request("POST", "/git/commit", { message, paths }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    pullRequestInfo() {
+      return request("GET", "/git/pull-request");
+    },
+
+    openPullRequest(title, body) {
+      return request("POST", "/git/pull-request", { title, body }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    jobs() {
+      return request("GET", "/jobs");
+    },
+
+    startJob(command) {
+      return request("POST", "/jobs/start", { command }, readReply, { detailOnError: true });
+    },
+
+    stopJob(id) {
+      return request("POST", "/jobs/stop", { id }, readReply, { detailOnError: true });
+    },
+
     memory() {
       return request("GET", "/memory");
     },

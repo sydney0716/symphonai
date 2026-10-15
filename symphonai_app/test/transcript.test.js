@@ -91,6 +91,11 @@ const RECORDED_EVENTS = Object.freeze({
   BackgroundUsageRecorded: event("BackgroundUsageRecorded", {
     session_id: "session-1",
   }),
+  JobChanged: event("JobChanged", {
+    job_id: "job_123",
+    status: "running",
+    session_id: null,
+  }),
 });
 
 test("assistant deltas join only while consecutive", () => {
