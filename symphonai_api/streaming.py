@@ -13,7 +13,11 @@ from typing import Iterable, Iterator
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
 from symphonai_api.models import ModelResponse, ToolCall
-from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
+from symphonai_api.providers.base import (
+    ContextLengthExceededError,
+    ProviderError,
+    ProviderUnavailableError,
+)
 from symphonai_api.retry import (
     _context_token_counts,
     _is_context_length_error,
@@ -194,7 +198,8 @@ def open_stream_with_retry(
                     limit_tokens=limit_tokens,
                 ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            if not yielded and _is_retryable_status(exc.code) and _wait_before_retry(
+            retryable_status = _is_retryable_status(exc.code)
+            if not yielded and retryable_status and _wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -202,12 +207,14 @@ def open_stream_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(
-                f"{operation} stream returned HTTP {exc.code}: {reason}"
-            ) from None
+            message = f"{operation} stream returned HTTP {exc.code}: {reason}"
+            if not yielded and retryable_status:
+                raise ProviderUnavailableError(message, status=exc.code) from None
+            raise ProviderError(message) from None
         except urllib.error.URLError as exc:
             reason = redact_secret(str(exc.reason), api_key)
-            if not yielded and _is_retryable_url_error(exc) and _wait_before_retry(
+            retryable_network = _is_retryable_url_error(exc)
+            if not yielded and retryable_network and _wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -215,7 +222,10 @@ def open_stream_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(f"{operation} stream request failed: {reason}") from None
+            message = f"{operation} stream request failed: {reason}"
+            if not yielded and retryable_network:
+                raise ProviderUnavailableError(message, status=None) from None
+            raise ProviderError(message) from None
         except (TimeoutError, http.client.IncompleteRead, ConnectionError) as exc:
             reason = redact_secret(str(exc), api_key)
             if not yielded and _wait_before_retry(
@@ -226,7 +236,10 @@ def open_stream_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(f"{operation} stream failed: {reason}") from None
+            message = f"{operation} stream failed: {reason}"
+            if not yielded:
+                raise ProviderUnavailableError(message, status=None) from None
+            raise ProviderError(message) from None
     raise AssertionError("stream retry loop exhausted without returning or raising")
 
 

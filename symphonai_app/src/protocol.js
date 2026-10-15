@@ -9,6 +9,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "TurnStarted",
   "TurnFinished",
   "AssistantTextDelta",
+  "ModelFallback",
   "ToolCallStarted",
   "ToolCallFinished",
   "PromptSubmitted",

@@ -24,6 +24,7 @@ from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
     AssistantTextDelta,
     EventSink,
+    ModelFallback,
     PromptSubmitted,
     RunFailed,
     RunFinished,
@@ -54,7 +55,12 @@ from symphonai_api.models import (
     ToolResult,
 )
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider, tool_result_text
+from symphonai_api.providers.base import (
+    ContextLengthExceededError,
+    ModelProvider,
+    ProviderUnavailableError,
+    tool_result_text,
+)
 from symphonai_api.repair import repair_unanswered_tool_calls
 from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from symphonai_api.serialization import message_to_json
@@ -255,10 +261,9 @@ class ApiAgent:
             if self._budget is not None or run is not None
             else None
         )
-        requested_model = (
-            model
-            if model is not None
-            else getattr(self._provider, "model", None) or "unknown"
+        requested_model = model or getattr(self._provider, "model", None) or "unknown"
+        fallback_models = tuple(
+            getattr(self._provider, "_symphonai_fallback_models", ())
         )
         turn = 0
         provider_calls = 0
@@ -443,43 +448,112 @@ class ApiAgent:
                     },
                 )
                 try:
-                    if self._stream:
-                        assembler = StreamAssembler()
-                        chunks = (
-                            self._provider.create_response_stream(request)
-                            if cancel is None
-                            else self._provider.create_response_stream(
-                                request, cancel=cancel
+                    primary_model = request.model or getattr(self._provider, "model", None)
+                    fallback_chain = list(fallback_models)
+                    if primary_model in fallback_chain:
+                        fallback_chain = fallback_chain[fallback_chain.index(primary_model) + 1:]
+                    attempted_model = primary_model
+                    candidate_models = [request.model, *(
+                        candidate for candidate in fallback_chain
+                        if candidate != primary_model
+                    )]
+                    unavailable: ProviderUnavailableError | None = None
+                    used_model = primary_model or "unknown"
+                    for candidate_model in candidate_models:
+                        candidate_request = request
+                        candidate_effective_model = candidate_model or primary_model
+                        if candidate_model is not None and candidate_model != request.model:
+                            fallback_messages = [
+                                replace(
+                                    message,
+                                    tool_calls=[
+                                        replace(call, provider_metadata={}, vendor_id=None)
+                                        for call in message.tool_calls
+                                    ],
+                                ) if message.tool_calls else message
+                                for message in request.messages
+                            ]
+                            from symphonai_api.model_table import model_capabilities
+
+                            capability = next((
+                                item for item in model_capabilities()
+                                if item.wire_format == self._provider.wire_format
+                                and item.model == candidate_model
+                            ), None)
+                            effort = request.effort
+                            if capability is None or not any(
+                                option.id == effort for option in capability.efforts
+                            ):
+                                effort = None
+                            candidate_request = replace(
+                                request,
+                                model=candidate_model,
+                                messages=fallback_messages,
+                                effort=effort,
                             )
-                        )
-                        for chunk in chunks:
-                            if cancel is not None:
-                                cancel.raise_if_cancelled()
-                            if isinstance(chunk, TextDelta):
-                                emit(
-                                    event_sink,
-                                    AssistantTextDelta(
-                                        agent_id=self._agent_ref.agent_id,
-                                        run_id=run_ref.run_id,
-                                        turn_id=turn_ref.turn_id,
-                                        text=chunk.text,
-                                    ),
+                        try:
+                            if self._stream:
+                                assembler = StreamAssembler()
+                                chunks = (
+                                    self._provider.create_response_stream(candidate_request)
+                                    if cancel is None
+                                    else self._provider.create_response_stream(
+                                        candidate_request, cancel=cancel
+                                    )
                                 )
-                            assembler.add(chunk)
-                        response = assembler.finish()
-                    elif cancel is None:
-                        response = self._provider.create_response(request)
+                                for chunk in chunks:
+                                    if cancel is not None:
+                                        cancel.raise_if_cancelled()
+                                    if isinstance(chunk, TextDelta):
+                                        emit(
+                                            event_sink,
+                                            AssistantTextDelta(
+                                                agent_id=self._agent_ref.agent_id,
+                                                run_id=run_ref.run_id,
+                                                turn_id=turn_ref.turn_id,
+                                                text=chunk.text,
+                                            ),
+                                        )
+                                    assembler.add(chunk)
+                                response = assembler.finish()
+                            elif cancel is None:
+                                response = self._provider.create_response(candidate_request)
+                            else:
+                                response = self._provider.create_response(
+                                    candidate_request, cancel=cancel
+                                )
+                        except ProviderUnavailableError as exc:
+                            unavailable = exc
+                            attempted_model = candidate_effective_model
+                            continue
+                        used_model = candidate_effective_model or "unknown"
+                        if candidate_effective_model != primary_model:
+                            emit(
+                                event_sink,
+                                ModelFallback(
+                                    agent_id=self._agent_ref.agent_id,
+                                    run_id=run_ref.run_id,
+                                    turn_id=turn_ref.turn_id,
+                                    from_model=attempted_model or "unknown",
+                                    to_model=used_model,
+                                    reason=(
+                                        "network" if unavailable.status is None
+                                        else str(unavailable.status)
+                                    ),
+                                ),
+                            )
+                            model = candidate_effective_model
+                        break
                     else:
-                        response = self._provider.create_response(
-                            request, cancel=cancel
-                        )
+                        if unavailable is not None:
+                            raise unavailable
                 except ContextLengthExceededError as exc:
                     exc.request_tokens = estimate_messages_tokens(request.messages)
                     raise
                 provider_calls += 1
                 usage = UsageTotals.from_usage(response.usage)
-                usage_by_model[requested_model] = usage_by_model.get(
-                    requested_model, UsageTotals()
+                usage_by_model[used_model] = usage_by_model.get(
+                    used_model, UsageTotals()
                 ).merged(usage)
                 # Stamp once and reuse, so the message in `conversation` and
                 # `final_response` carry the same turn identity.

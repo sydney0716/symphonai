@@ -59,6 +59,13 @@ class AssistantTextDelta(Event):
 
 
 @dataclass(frozen=True)
+class ModelFallback(Event):
+    from_model: str = ""
+    to_model: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class ToolCallStarted(Event):
     tool_name: str = ""
     tool_call_id: str = ""

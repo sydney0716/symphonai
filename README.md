@@ -62,6 +62,27 @@ host serves the app from the sibling `symphonai_app/` directory. Installed
 without it, it returns `app is not installed` rather than files from your
 project.
 
+### Run without the app
+
+Run one task from a project directory, or pass `--repo-root` to choose one.
+Use `--json` for a machine-readable result. `ask` mode is the default; use
+`--mode allow` when an unattended run should apply tool actions.
+
+```bash
+symphonai run --json "Run the test suite and summarize failures"
+symphonai run --repo-root /work/project --mode allow "Fix the failing tests"
+```
+
+In a CI shell step, the command's exit code determines whether the step passes:
+
+```bash
+symphonai run --json "Run the test suite"
+```
+
+Exit codes are `0` for a final answer, `1` for a failed run, `2` for usage or
+configuration errors, `3` when a turn limit or budget stops the run, and `130`
+when interrupted.
+
 ### Desktop shell
 
 The macOS Tauri shell uses the same files as the browser app and starts the

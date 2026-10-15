@@ -22,13 +22,18 @@ from symphonai_api.model_discovery import list_models
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall
 from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_API_KEY_ENV_VAR
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
-from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
+from symphonai_api.providers.base import (
+    ContextLengthExceededError,
+    ProviderError,
+    ProviderUnavailableError,
+)
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
 from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR, OpenAIProvider
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.retry import read_with_retry
+from symphonai_api.streaming import open_stream_with_retry
 from scripts.checks.harness import check, fail
 
 
@@ -72,6 +77,69 @@ def _openai_success(content: str) -> _FakeHttpResponse:
         "usage": {},
     }
     return _FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+
+@check("retry.unavailable_is_distinguished")
+def check_unavailable_is_distinguished() -> None:
+    request = urllib.request.Request("https://mock.invalid/test")
+    unavailable = _http_error(529, "busy")
+    with mock.patch("symphonai_api.retry.time.sleep"), mock.patch(
+        "symphonai_api.retry.urllib.request.urlopen",
+        side_effect=[unavailable, _http_error(529, "busy"), _http_error(529, "busy")],
+    ):
+        try:
+            read_with_retry(
+                request, timeout=5, api_key="test-key", operation="call"
+            )
+        except ProviderUnavailableError as exc:
+            if exc.status != 529 or str(exc) != "call returned HTTP 529 after 3 attempts: busy":
+                fail(f"unavailable error lost status or message: {exc!r}")
+        else:
+            fail("exhausted HTTP 529 did not raise ProviderUnavailableError")
+    with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=_http_error(400, "bad")):
+        try:
+            read_with_retry(
+                request, timeout=5, api_key="test-key", operation="call"
+            )
+        except ProviderError as exc:
+            if type(exc) is not ProviderError or str(exc) != "call returned HTTP 400 after 1 attempt: bad":
+                fail(f"HTTP 400 changed failure type or message: {exc!r}")
+        else:
+            fail("HTTP 400 unexpectedly succeeded")
+    with mock.patch("symphonai_api.retry.time.sleep"), mock.patch(
+        "symphonai_api.streaming.urllib.request.urlopen",
+        side_effect=[_http_error(529, "busy") for _ in range(3)],
+    ):
+        try:
+            list(open_stream_with_retry(
+                request,
+                timeout=5,
+                max_attempts=3,
+                api_key="test-key",
+                operation="call",
+            ))
+        except ProviderUnavailableError as exc:
+            if exc.status != 529 or str(exc) != "call stream returned HTTP 529: busy":
+                fail(f"stream unavailable error lost status or message: {exc!r}")
+        else:
+            fail("exhausted streamed HTTP 529 did not raise ProviderUnavailableError")
+    with mock.patch(
+        "symphonai_api.streaming.urllib.request.urlopen",
+        side_effect=_http_error(400, "bad"),
+    ):
+        try:
+            list(open_stream_with_retry(
+                request,
+                timeout=5,
+                max_attempts=3,
+                api_key="test-key",
+                operation="call",
+            ))
+        except ProviderError as exc:
+            if type(exc) is not ProviderError or str(exc) != "call stream returned HTTP 400: bad":
+                fail(f"stream HTTP 400 changed failure type or message: {exc!r}")
+        else:
+            fail("streamed HTTP 400 unexpectedly succeeded")
 
 @check("retry.backoff_wakes_promptly")
 def check_retry_backoff_wakes_promptly() -> None:

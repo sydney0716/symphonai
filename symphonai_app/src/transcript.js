@@ -481,6 +481,13 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       appendPlan(fields);
       return;
     }
+    if (type === "ModelFallback") {
+      model.push({
+        type: "model-fallback",
+        text: `${fields.from_model} was unavailable (${fields.reason}); continued on ${fields.to_model}.`,
+      });
+      return;
+    }
     if (type === "RunStarted") {
       rootAgentId ??= fields.agent_id;
       endedRuns.delete(fields.run_id);

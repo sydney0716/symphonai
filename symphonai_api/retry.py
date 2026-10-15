@@ -15,7 +15,11 @@ from email.utils import parsedate_to_datetime
 
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
-from symphonai_api.providers.base import ContextLengthExceededError, ProviderError
+from symphonai_api.providers.base import (
+    ContextLengthExceededError,
+    ProviderError,
+    ProviderUnavailableError,
+)
 
 DEFAULT_MAX_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 0.5
@@ -121,7 +125,8 @@ def read_with_retry(
                     f"{operation} returned HTTP {exc.code} on {attempt_text} "
                     "and did not retry: background calls do not retry provider overload"
                 ) from None
-            if _is_retryable_status(exc.code) and _wait_before_retry(
+            retryable_status = _is_retryable_status(exc.code)
+            if retryable_status and _wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -129,13 +134,17 @@ def read_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(
+            message = (
                 f"{operation} returned HTTP {exc.code} after "
                 f"{_attempt_label(attempt)}: {detail}"
-            ) from None
+            )
+            if retryable_status:
+                raise ProviderUnavailableError(message, status=exc.code) from None
+            raise ProviderError(message) from None
         except urllib.error.URLError as exc:
             reason = redact_secret(str(exc.reason), api_key)
-            if _is_retryable_url_error(exc) and _wait_before_retry(
+            retryable_network = _is_retryable_url_error(exc)
+            if retryable_network and _wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -143,9 +152,10 @@ def read_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(
-                f"{operation} request failed after {_attempt_label(attempt)}: {reason}"
-            ) from None
+            message = f"{operation} request failed after {_attempt_label(attempt)}: {reason}"
+            if retryable_network:
+                raise ProviderUnavailableError(message, status=None) from None
+            raise ProviderError(message) from None
         except TimeoutError:
             if _wait_before_retry(
                 attempt=attempt,
@@ -155,9 +165,10 @@ def read_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(
+            raise ProviderUnavailableError(
                 f"{operation} request timed out after {_attempt_label(attempt)} "
-                f"(overall timeout {timeout}s)"
+                f"(overall timeout {timeout}s)",
+                status=None,
             ) from None
         except http.client.IncompleteRead as exc:
             reason = redact_secret(str(exc), api_key)
@@ -169,8 +180,9 @@ def read_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(
-                f"{operation} response ended early after {_attempt_label(attempt)}: {reason}"
+            raise ProviderUnavailableError(
+                f"{operation} response ended early after {_attempt_label(attempt)}: {reason}",
+                status=None,
             ) from None
         except ConnectionError as exc:
             reason = redact_secret(str(exc), api_key)
@@ -182,8 +194,9 @@ def read_with_retry(
                 cancel=cancel,
             ):
                 continue
-            raise ProviderError(
-                f"{operation} connection failed after {_attempt_label(attempt)}: {reason}"
+            raise ProviderUnavailableError(
+                f"{operation} connection failed after {_attempt_label(attempt)}: {reason}",
+                status=None,
             ) from None
 
     raise AssertionError("retry loop exhausted without returning or raising")

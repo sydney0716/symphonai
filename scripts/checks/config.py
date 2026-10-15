@@ -1075,6 +1075,21 @@ def model_preferences() -> None:
             fail(f"memory extraction settings were not resolved: {resolved.values!r}")
         if resolved.get("memory.extract") is not False:
             fail(f"memory extraction switch was not resolved: {resolved.values!r}")
+        _write(source, '[fallback]\nanthropic = ["model-a", "model-b"]\nopenai = []\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("fallback.anthropic") != ["model-a", "model-b"]:
+            fail(f"fallback model list was not resolved: {resolved.values!r}")
+        for invalid in (
+            '[fallback]\nanthropic = "x"\n',
+            '[fallback]\nunknown = ["x"]\n',
+            '[fallback]\nanthropic = ["  "]\n',
+        ):
+            _write(source, invalid)
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError:
+                continue
+            fail(f"invalid fallback settings were accepted: {invalid!r}")
         for invalid in (
             '[memory]\nmodel = " "\n',
             '[memory]\nprovider = "unknown"\n',

@@ -604,6 +604,10 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
     className: "turn-time",
     text: entry.text,
   }),
+  "model-fallback": (document, entry) => element(document, "p", {
+    className: "model-fallback",
+    text: entry.text,
+  }),
 });
 
 export function renderTranscript(document, root, model, parseMarkdown, actions) {

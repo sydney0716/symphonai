@@ -71,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "memory", "sandbox", "lsp", "worktree")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -146,6 +146,13 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
         _unknown_keys(source, "models", models, _PROVIDER_NAMES)
         for provider in models:
             _strings(source, f"models.{provider}", models[provider])
+    fallback = _table(source, values, "fallback")
+    if fallback is not None:
+        _unknown_keys(source, "fallback", fallback, _PROVIDER_NAMES)
+        for provider, configured_models in fallback.items():
+            entries = _strings(source, f"fallback.{provider}", configured_models)
+            if any(not model.strip() for model in entries):
+                _raise(source, f"fallback.{provider}", "model ids must be non-blank strings")
     search = _table(source, values, "search")
     if search is not None:
         _unknown_keys(source, "search", search, {"endpoint"})

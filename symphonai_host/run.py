@@ -1460,6 +1460,15 @@ class HostRun:
             raise ProviderSelectionError("leader cannot use lsp: no language server is configured")
         leader_provider = self._provider
         leader_model = self._model
+        def configure_fallback(provider: ModelProvider | None) -> ModelProvider | None:
+            if provider is not None:
+                provider._symphonai_fallback_models = tuple(
+                    () if self._extensions is None else
+                    self._extensions.config.get(f"fallback.{provider.name}", ())
+                )
+            return provider
+
+        configure_fallback(leader_provider)
         conversation_approvals = self.approvals
         if defined_leader is not None:
             selector = defined_leader.model
@@ -1469,6 +1478,7 @@ class HostRun:
                 leader_provider = self._provider_factory(selector.provider, selector.model, None)
                 if leader_provider is None:
                     raise ProviderSelectionError(f"leader provider {selector.provider!r} is unavailable")
+                configure_fallback(leader_provider)
                 leader_model = selector.model
             elif selector.model is not None:
                 leader_model = selector.model
@@ -1483,6 +1493,7 @@ class HostRun:
                     if self._provider_factory is None
                     else self._provider_factory(name, model, None)
                 )
+                child_providers[key] = configure_fallback(child_providers[key])
             return child_providers[key]
 
         return Leader(

@@ -20,6 +20,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -30,6 +32,7 @@ import symphonai_api.agent_loop as agent_loop
 import symphonai_api.leader as leader_module
 import symphonai_api.mcp as mcp_module
 import symphonai_host.__main__ as host_main
+import symphonai_host.headless as headless_module
 import symphonai_host.protocol as protocol_module
 import symphonai_host.run as host_run_module
 import symphonai_host.server as host_server_module
@@ -44,6 +47,7 @@ from symphonai_api.events import (
     AssistantTextDelta,
     CompactionApplied,
     JobChanged,
+    ModelFallback,
     RunFailed,
     RunFinished,
     RunStarted,
@@ -60,12 +64,13 @@ from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRespon
 from symphonai_api.permissions import DenialReason, PermissionDecision, PermissionPolicy
 from symphonai_api.provider_catalog import CATALOG, catalog_keys
 from symphonai_host.files import repository_files
-from symphonai_api.providers.base import ModelProvider, ProviderError
+from symphonai_api.providers.base import ModelProvider, ProviderError, ProviderUnavailableError
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.retry import read_with_retry
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.session import SessionStore, load_run, load_run_for_resume
-from symphonai_api.streaming import StreamCompleted, TextDelta
+from symphonai_api.streaming import StreamCompleted, TextDelta, open_stream_with_retry
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import ReadLedger, WriteFileTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
@@ -911,6 +916,272 @@ def check_roadmap_commit_marks_done_and_phase() -> None:
         phase = json.loads(path.read_text())["phases"][0]
         if phase["status"] != "done" or phase["items"][0].get("done") is not True:
             fail("commit did not mark its roadmap item and completed phase done")
+
+
+@check("host_server.model_fallback")
+def check_model_fallback() -> None:
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        def read(self) -> bytes:
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _HttpProvider(ModelProvider):
+        model = "model-a"
+
+        def __init__(self) -> None:
+            self.requests: list[str | None] = []
+
+        @property
+        def name(self) -> str:
+            return "anthropic"
+
+        @property
+        def wire_format(self) -> int:
+            return 2
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request.model)
+            request_bytes = json.dumps({"model": request.model or self.model}).encode()
+            raw = read_with_retry(
+                urllib.request.Request("https://mock.invalid/messages", data=request_bytes),
+                timeout=5,
+                api_key="test-key",
+                operation="mock provider",
+                cancel=cancel,
+            )
+            return ModelResponse(Message(Role.ASSISTANT, raw.decode("utf-8")))
+
+    def run_prompt(root, provider, *, fallback, outcomes):
+        source = root / ".symphonai" / "config.toml"
+        if fallback:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text('[fallback]\nanthropic = ["model-b"]\n', encoding="utf-8")
+        extensions = load_extensions(repo_root=root, home=root / "home")
+        broker = EventBroker()
+        subscription = broker.subscribe()
+        host = HostRun(
+            provider,
+            PermissionPolicy(repo_root=root),
+            broker,
+            sessions_root=root / "sessions",
+            extensions=extensions,
+            memory_extraction_enabled=False,
+        )
+        try:
+            host.start("first prompt")
+            events = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                event = subscription.get(timeout=0.05)
+                if event is not None:
+                    events.append(event)
+                    if isinstance(event, (RunFinished, RunFailed)):
+                        break
+            if not events or not isinstance(events[-1], outcomes):
+                fail(f"host run did not reach expected terminal event: {events!r}")
+            return host, events
+        except Exception:
+            host.close()
+            raise
+        finally:
+            subscription.close()
+
+    sent_models = []
+
+    def mocked_open(url_request, timeout):
+        body = json.loads(url_request.data.decode("utf-8"))
+        model = body["model"]
+        sent_models.append(model)
+        if model == "model-a" or always_unavailable:
+            raise urllib.error.HTTPError(
+                url_request.full_url, 529, "overloaded", {}, io.BytesIO(b"busy")
+            )
+        return _Response(b"ok")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = _HttpProvider()
+        always_unavailable = False
+        with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=mocked_open), mock.patch(
+            "symphonai_api.retry.time.sleep"
+        ):
+            host, events = run_prompt(
+                root, provider, fallback=True, outcomes=(RunFinished,)
+            )
+            fallback_events = [event for event in events if isinstance(event, ModelFallback)]
+            if len(fallback_events) != 1 or (
+                fallback_events[0].from_model,
+                fallback_events[0].to_model,
+                fallback_events[0].reason,
+            ) != ("model-a", "model-b", "529"):
+                fail(f"fallback event was missing or incorrect: {fallback_events!r}")
+            host.start("second prompt")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and host._active is not None:
+                time.sleep(0.01)
+            if sent_models != ["model-a"] * 3 + ["model-b"] + ["model-a"] * 3 + ["model-b"]:
+                fail(f"next turn did not start from model-a: {sent_models!r}")
+            if provider.requests != [None, "model-b", None, "model-b"]:
+                fail(f"primary request model was changed from None: {provider.requests!r}")
+            host.close()
+
+    for fallback, status in ((False, 529), (True, 529), (True, 400)):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provider = _HttpProvider()
+            always_unavailable = True
+            sent_models = []
+
+            def fail_open(url_request, timeout):
+                sent_models.append(json.loads(url_request.data.decode("utf-8"))["model"])
+                raise urllib.error.HTTPError(
+                    url_request.full_url, status, "provider error", {}, io.BytesIO(b"failure")
+                )
+
+            with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=fail_open), mock.patch(
+                "symphonai_api.retry.time.sleep"
+            ):
+                host, events = run_prompt(
+                    root, provider, fallback=fallback, outcomes=(RunFailed,)
+                )
+                if any(isinstance(event, ModelFallback) for event in events):
+                    fail(f"HTTP {status} emitted a fallback without a successful model")
+                if status == 400 and (provider.requests != [None] or sent_models != ["model-a"]):
+                    fail(f"HTTP 400 attempted fallback: {provider.requests!r}")
+                if status == 529 and sent_models != (
+                    ["model-a"] * 3 + (["model-b"] * 3 if fallback else [])
+                ):
+                    fail(f"fallback chain did not try the expected models: {sent_models!r}")
+                host.close()
+
+
+@check("host_server.model_fallback_streamed")
+def check_model_fallback_streamed() -> None:
+    class _StreamResponse:
+        def __iter__(self):
+            return iter([b"data: reply\n", b"\n"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _StreamProvider(ModelProvider):
+        model = "model-a"
+
+        def __init__(self) -> None:
+            self.request_models: list[str | None] = []
+            self.endpoint_models: list[str] = []
+
+        @property
+        def name(self) -> str:
+            return "anthropic"
+
+        @property
+        def wire_format(self) -> int:
+            return 2
+
+        def create_response(self, request, *, cancel=None):
+            raise AssertionError("streaming host called create_response")
+
+        def create_response_stream(self, request, *, cancel=None):
+            self.request_models.append(request.model)
+            model = request.model or self.model
+            self.endpoint_models.append(model)
+            body = json.dumps({"model": model}).encode("utf-8")
+            lines = open_stream_with_retry(
+                urllib.request.Request("https://mock.invalid/stream", data=body),
+                timeout=5,
+                max_attempts=3,
+                api_key="test-key",
+                operation="mock stream",
+                cancel=cancel,
+            )
+            for _line in lines:
+                pass
+            yield StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "streamed answer")))
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        config = root / ".symphonai" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('[fallback]\nanthropic = ["model-b"]\n', encoding="utf-8")
+        extensions = load_extensions(repo_root=root, home=root / "home")
+        provider = _StreamProvider()
+        broker = EventBroker()
+        subscription = broker.subscribe()
+        host = HostRun(
+            provider,
+            PermissionPolicy(repo_root=root),
+            broker,
+            sessions_root=root / "sessions",
+            extensions=extensions,
+            memory_extraction_enabled=False,
+        )
+
+        def open_stream(url_request, timeout):
+            model = json.loads(url_request.data.decode("utf-8"))["model"]
+            if model == "model-a":
+                raise urllib.error.HTTPError(
+                    url_request.full_url, 529, "overloaded", {}, io.BytesIO(b"busy")
+                )
+            return _StreamResponse()
+
+        def terminal_events():
+            events = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                event = subscription.get(timeout=0.05)
+                if event is not None:
+                    events.append(event)
+                    if isinstance(event, (RunFinished, RunFailed)):
+                        return events
+            fail("streamed fallback run did not reach a terminal event")
+
+        try:
+            with mock.patch("symphonai_api.streaming.urllib.request.urlopen", side_effect=open_stream), mock.patch(
+                "symphonai_api.streaming.time.sleep"
+            ):
+                host.start("first prompt")
+                first_events = terminal_events()
+                if not isinstance(first_events[-1], RunFinished):
+                    fail(f"streamed fallback failed: {first_events[-1]!r}")
+                first_fallbacks = [event for event in first_events if isinstance(event, ModelFallback)]
+                if len(first_fallbacks) != 1 or (
+                    first_fallbacks[0].from_model,
+                    first_fallbacks[0].to_model,
+                    first_fallbacks[0].reason,
+                ) != ("model-a", "model-b", "529"):
+                    fail(f"streamed fallback event was missing or incorrect: {first_fallbacks!r}")
+                if any(
+                    isinstance(event, AssistantTextDelta) for event in first_events
+                ):
+                    fail("failed primary stream emitted text before the fallback notice")
+                deadline = time.monotonic() + 5
+                while host._active is not None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                while subscription.get(timeout=0) is not None:
+                    pass
+                host.start("second prompt")
+                second_events = terminal_events()
+                if not isinstance(second_events[-1], RunFinished):
+                    fail(f"second streamed fallback failed: {second_events[-1]!r}")
+                if provider.endpoint_models != ["model-a", "model-b", "model-a", "model-b"]:
+                    fail(f"next streamed turn did not restart from model-a: {provider.endpoint_models!r}")
+                if provider.request_models != [None, "model-b", None, "model-b"]:
+                    fail(f"primary request model was changed from None: {provider.request_models!r}")
+        finally:
+            subscription.close()
+            host.close()
 _APP_HTML_RESOURCE = re.compile(r"""(?:src|href)=[\"']([^\"']+)[\"']""")
 _APP_STATIC_IMPORT = re.compile(
     r"""\b(?:import|export)\s+(?:[^;\"']*?\s+from\s*)?[\"']([^\"']+)[\"']"""
@@ -11161,3 +11432,305 @@ def check_jobs_keep_a_project_open() -> None:
             _wait_until(lambda: a.resolve() not in host._runtimes, "idle project A stayed open after its jobs stopped")
         finally:
             host.close()
+
+
+def _headless_invoke(root: Path, provider, arguments: list[str], *, stdin_text: str = ""):
+    home = root.parent / "home"
+    sessions = root.parent / "sessions"
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with mock.patch.dict(os.environ, {
+        "SYMPHONAI_HOME": str(home),
+        "SYMPHONAI_SESSIONS_DIR": str(sessions),
+    }):
+        with mock.patch.object(headless_module, "_provider", return_value=provider):
+            with mock.patch.object(headless_module.sys, "stdin", io.StringIO(stdin_text)):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = headless_module.main(arguments)
+    return code, stdout.getvalue(), stderr.getvalue(), sessions
+
+
+@check("host_server.headless_text_and_json")
+def check_headless_text_and_json() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "hello from headless"))])
+        code, output, _error, sessions = _headless_invoke(
+            root, provider,
+            ["run", "say hi", "--repo-root", str(root), "--provider", "openai"],
+        )
+        if code != 0 or output != "hello from headless\n":
+            fail(f"headless text run returned {code}, {output!r}")
+
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "json answer"))])
+        code, output, _error, sessions = _headless_invoke(
+            root, provider,
+            ["run", "--json", "say hi", "--repo-root", str(root), "--provider", "openai"],
+        )
+        lines = output.splitlines()
+        if code != 0 or len(lines) != 1:
+            fail(f"headless JSON output was not one line: {code}, {output!r}")
+        try:
+            result = json.loads(lines[0])
+        except ValueError as exc:
+            fail(f"headless JSON was invalid: {exc}")
+        expected_fields = {
+            "session_id", "status", "stopped_reason", "result", "usage",
+            "cost", "duration_ms", "files_changed", "error",
+        }
+        if (set(result) != expected_fields or result["status"] != "finished"
+                or result["result"] != "json answer" or result["error"] is not None):
+            fail(f"headless JSON result fields or values were wrong: {result!r}")
+        session = SessionStore.open(sessions, result["session_id"])
+        try:
+            if session.read_meta().get("headless") is not True:
+                fail("headless session did not record headless=true")
+        finally:
+            session.close()
+
+        for mode, filename, should_write in (("ask", "denied.txt", False), ("allow", "allowed.txt", True)):
+            provider = FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    id=f"write-{mode}", name="write_file",
+                    arguments={"path": filename, "content": "created\n"},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, f"{mode} finished")),
+            ])
+            code, output, error, _sessions = _headless_invoke(
+                root, provider,
+                ["run", "write a file", "--repo-root", str(root), "--provider", "openai", "--mode", mode],
+            )
+            exists = (root / filename).exists()
+            if code != 0 or exists != should_write or f"{mode} finished" not in output:
+                fail(f"headless {mode} mode result was wrong: {code}, {output!r}, {error!r}, exists={exists}")
+            if should_write:
+                json_provider = FakeModelProvider([
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                        id="json-write", name="write_file",
+                        arguments={"path": "json-created.txt", "content": "created\n"},
+                    )])),
+                    ModelResponse(Message(Role.ASSISTANT, "allow result")),
+                ])
+                json_code, json_output, _, _ = _headless_invoke(
+                    root, json_provider,
+                    ["run", "report file", "--json", "--repo-root", str(root), "--provider", "openai", "--mode", "allow"],
+                )
+                file_result = json.loads(json_output)
+                if json_code != 0 or file_result["files_changed"] != ["json-created.txt"]:
+                    fail(f"headless JSON omitted the changed file: {file_result!r}")
+
+        code, output, _error, _sessions = _headless_invoke(
+            root,
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "stdin answer"))]),
+            ["run", "-", "--repo-root", str(root), "--provider", "openai"],
+            stdin_text="task from stdin",
+        )
+        if code != 0 or output != "stdin answer\n":
+            fail(f"headless stdin task returned {code}, {output!r}")
+
+
+@check("host_server.headless_reports_failures_and_files")
+def check_headless_reports_failures_and_files() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+
+        class FailingProvider(FakeModelProvider):
+            def create_response(self, request, *, cancel=None):
+                raise ProviderUnavailableError(
+                    "mock provider returned HTTP 529 after 3 attempts: busy", status=529
+                )
+
+        code, output, error, _sessions = _headless_invoke(
+            root,
+            FailingProvider(),
+            ["run", "fail", "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        result = json.loads(output)
+        if code != 1 or result.get("error") != "mock provider returned HTTP 529 after 3 attempts: busy":
+            fail(f"headless JSON omitted provider failure: {code}, {result!r}")
+        if error.splitlines() != [f"symphonai: {result['error']}"] or "Exception in thread" in error:
+            fail(f"headless failure stderr was not a single diagnostic line: {error!r}")
+
+        stream_code, stream_output, stream_error, _sessions = _headless_invoke(
+            root,
+            FailingProvider(),
+            ["run", "fail", "--stream-json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        stream_records = [json.loads(line) for line in stream_output.splitlines()]
+        if (stream_code != 1 or stream_records[-1].get("type") != "result"
+                or stream_records[-1].get("error") != result["error"]
+                or stream_error.splitlines() != [f"symphonai: {result['error']}"]):
+            fail(f"headless stream JSON omitted provider failure: {stream_code}, {stream_records!r}")
+
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        tracked = root / "preexisting.txt"
+        tracked.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "preexisting.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+             "commit", "-qm", "base"],
+            check=True,
+        )
+        tracked.write_text("already changed\n", encoding="utf-8")
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "shell-write", "run_shell",
+                {"argv": ["/bin/sh", "-c", "echo hi > out.txt"]},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        code, output, error, _sessions = _headless_invoke(
+            root,
+            provider,
+            ["run", "write through shell", "--json", "--repo-root", str(root),
+             "--provider", "openai", "--mode", "allow"],
+        )
+        result = json.loads(output)
+        if code != 0 or result.get("files_changed") != ["out.txt"]:
+            fail(f"headless git status diff was wrong: {code}, {result!r}, {error!r}")
+
+
+@check("host_server.headless_exit_codes")
+def check_headless_exit_codes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+
+        class FailingProvider(FakeModelProvider):
+            def create_response(self, request, *, cancel=None):
+                raise ProviderError("provider failed")
+
+        code, _output, _error, _sessions = _headless_invoke(
+            root, FailingProvider(),
+            ["run", "fail", "--repo-root", str(root), "--provider", "openai"],
+        )
+        if code != 1:
+            fail(f"headless provider failure exited {code}, expected 1")
+
+        limited = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+            id="limited-write", name="write_file", arguments={"path": "x", "content": "x"},
+        )]))])
+        code, output, _error, _sessions = _headless_invoke(
+            root, limited,
+            ["run", "stop at limit", "--repo-root", str(root), "--provider", "openai", "--max-turns", "1"],
+        )
+        if code != 3:
+            fail(f"headless turn limit exited {code}, expected 3: {output!r}")
+
+        missing = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "should not run"))])
+        with tempfile.TemporaryDirectory() as home_dir:
+            home = Path(home_dir) / "home"
+            sessions = Path(home_dir) / "sessions"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.dict(os.environ, {
+                "SYMPHONAI_HOME": str(home), "SYMPHONAI_SESSIONS_DIR": str(sessions),
+            }):
+                with mock.patch.object(
+                    headless_module, "_provider",
+                    side_effect=headless_module.ProviderSelectionError("openai has no API key"),
+                ):
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        code = headless_module.main([
+                            "run", "no key", "--repo-root", str(root), "--provider", "openai",
+                        ])
+            if code != 2 or missing.call_count != 0 or stdout.getvalue() or len(stderr.getvalue().splitlines()) != 1:
+                fail(f"missing key did not fail before a request with one error line: {code}, {stderr.getvalue()!r}")
+
+        class InterruptBroker(EventBroker):
+            def subscribe(self):
+                subscription = super().subscribe()
+
+                class InterruptOnce:
+                    interrupted = False
+
+                    def get(self, timeout=None):
+                        if not self.interrupted:
+                            self.interrupted = True
+                            raise KeyboardInterrupt
+                        return subscription.get(timeout)
+
+                    def close(self):
+                        subscription.close()
+
+                return InterruptOnce()
+
+        class WaitingProvider(FakeModelProvider):
+            def create_response(self, request, *, cancel=None):
+                while cancel is not None:
+                    cancel.raise_if_cancelled()
+                    time.sleep(0.005)
+                return ModelResponse(Message(Role.ASSISTANT, "unexpected"))
+
+        with mock.patch.object(headless_module, "EventBroker", InterruptBroker):
+            code, _output, _error, _sessions = _headless_invoke(
+                root, WaitingProvider(),
+                ["run", "interrupt", "--repo-root", str(root), "--provider", "openai"],
+            )
+        if code != 130:
+            fail(f"headless interrupt exited {code}, expected 130")
+
+
+@check("host_server.headless_stream_json")
+def check_headless_stream_json() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "stream answer"))])
+        code, output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "stream", "--repo-root", str(root), "--provider", "openai", "--stream-json"],
+        )
+        try:
+            records = [json.loads(line) for line in output.splitlines()]
+        except ValueError as exc:
+            fail(f"headless stream JSON had an invalid line: {exc}")
+        if code != 0 or not records or records[0].get("type") not in {"PromptSubmitted", "RunStarted"}:
+            fail(f"headless stream JSON did not begin with a run event: {code}, {records!r}")
+        if (records[-1].get("type") != "result" or records[-1].get("result") != "stream answer"
+                or records[-1].get("error") is not None):
+            fail(f"headless stream JSON did not end with the result line: {records[-1]!r}")
+
+
+@check("host_server.headless_resume")
+def check_headless_resume() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "first answer"))])
+        code, output, _error, sessions = _headless_invoke(
+            root, provider,
+            ["run", "first task", "--repo-root", str(root), "--provider", "openai", "--json"],
+        )
+        if code != 0:
+            fail(f"initial headless run failed: {output!r}")
+        session_id = json.loads(output)["session_id"]
+
+        class RecordingProvider(FakeModelProvider):
+            def __init__(self):
+                super().__init__([ModelResponse(Message(Role.ASSISTANT, "second answer"))])
+                self.requests = []
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                return super().create_response(request, cancel=cancel)
+
+        resumed = RecordingProvider()
+        code, output, _error, _sessions = _headless_invoke(
+            root, resumed,
+            ["run", "second task", "--repo-root", str(root), "--provider", "openai", "--resume", session_id, "--json"],
+        )
+        if code != 0:
+            fail(f"headless resume failed: {output!r}")
+        request_texts = [
+            "\n".join(message.text for message in request.messages)
+            for request in resumed.requests
+        ]
+        if not any(
+            "first task" in text and "first answer" in text and "second task" in text
+            for text in request_texts
+        ):
+            fail(f"headless resume omitted stored history or the new task: {request_texts!r}")
+        result = json.loads(output)
+        if result["session_id"] != session_id:
+            fail(f"headless resume changed the session id: {result!r}")

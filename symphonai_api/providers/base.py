@@ -28,6 +28,14 @@ class ProviderError(Exception):
     """
 
 
+class ProviderUnavailableError(ProviderError):
+    """Raised when a retryable provider failure exhausts its retries."""
+
+    def __init__(self, message: str, *, status: int | None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class ContextLengthExceededError(ProviderError):
     """Raised when a vendor rejects a request that exceeds its context window."""
 

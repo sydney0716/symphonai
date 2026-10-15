@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 import { KNOWN_EVENT_TYPES } from "../src/protocol.js";
 import { createTranscript } from "../src/transcript.js";
+import { renderTranscript } from "../src/render.js";
 
 const BASE = Object.freeze({
   agent_id: "agent-1",
@@ -45,6 +46,11 @@ const RECORDED_EVENTS = Object.freeze({
   TurnStarted: event("TurnStarted", { index: 1 }),
   TurnFinished: event("TurnFinished", { index: 1 }),
   AssistantTextDelta: event("AssistantTextDelta", { text: "hello" }),
+  ModelFallback: event("ModelFallback", {
+    from_model: "model-a",
+    to_model: "model-b",
+    reason: "529",
+  }),
   ToolCallStarted: call("ToolCallStarted", "recorded-call", { target: "recorded.txt" }),
   ToolCallFinished: call("ToolCallFinished", "recorded-call", {
     ok: true,
@@ -676,6 +682,24 @@ test("each dropped frame inserts a positional gap", () => {
     transcript.model.filter(({ type }) => type === "gap").map(({ dropped }) => dropped),
     [4, 2],
   );
+});
+
+test("ModelFallback renders a chat line from live and replayed frames", () => {
+  class Node {
+    children = [];
+    append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = children; }
+  }
+  const document = { createElement: () => new Node() };
+  const expected = "model-a was unavailable (529); continued on model-b.";
+  for (const frame of [RECORDED_EVENTS.ModelFallback, RECORDED_EVENTS.ModelFallback]) {
+    const transcript = createTranscript();
+    transcript.apply(frame);
+    const root = new Node();
+    renderTranscript(document, root, transcript.model, () => []);
+    assert.equal(root.children[0].textContent, expected);
+    assert.equal(root.children[0].className, "model-fallback");
+  }
 });
 
 test("all documented event recordings are covered and unknown events survive", () => {
