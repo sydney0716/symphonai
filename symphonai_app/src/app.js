@@ -251,6 +251,22 @@ export async function start({ global, document, client }) {
   const approvals = createApprovals({ client: boundary });
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
+  const agentTranscript = createTranscript();
+  let agentView = null;
+  let agentViewGeneration = 0;
+  let preserveChatScroll = false;
+  const agentViewHeader = element(document, "header", { className: "agent-conversation-header" });
+  agentViewHeader.hidden = true;
+  chatRoot.before(agentViewHeader);
+  const missingKeyNotice = element(document, "p", { className: "missing-key-notice" });
+  append(
+    missingKeyNotice,
+    element(document, "span", { text: "Add an API key to start: " }),
+    modelsLink(),
+    element(document, "span", { text: "." }),
+  );
+  missingKeyNotice.hidden = true;
+  chatRoot.before(missingKeyNotice);
   let commandEntry = null;
   let userCommandPending = false;
   const board = createAgentBoard();
@@ -572,8 +588,9 @@ export async function start({ global, document, client }) {
             const providerRow = providerRows.find((item) => item.env_var === envVar);
             if (providerRow) providerRow.key_present = Boolean(value);
             notice.textContent = value ? "Key stored." : "Key removed.";
-          } catch {
-            notice.textContent = "Could not update key.";
+          } catch (error) {
+            const detail = typeof error?.message === "string" ? error.message.trim() : "";
+            notice.textContent = detail ? `Could not save the key: ${detail}` : "Could not save the key.";
           }
         }
         listen(save, "click", () => write(input.value));
@@ -1264,6 +1281,7 @@ export async function start({ global, document, client }) {
       chatRoot.scrollTop = following ? chatRoot.scrollHeight : savedScrollTop;
       jumpLatest.hidden = following;
     }
+    updateMissingKeyNotice();
   }
 
   function navigate(nextRoute, { updateFragment = true } = {}) {
@@ -1313,6 +1331,7 @@ export async function start({ global, document, client }) {
   let projectStartScreen = null;
 
   async function openProjectAt(path, sessionId = null) {
+    closeAgentView();
     projectActionError = "";
     try {
       await boundary.openProject(path);
@@ -1422,10 +1441,10 @@ export async function start({ global, document, client }) {
 
   function showTranscript() {
     const onChatPage = route.page === "chat";
-    if (onChatPage) {
+    if (onChatPage && !preserveChatScroll) {
       following = chatRoot.scrollHeight - chatRoot.scrollTop - chatRoot.clientHeight <= 24;
     }
-    renderTranscript(document, chatRoot, transcript.model, parseMarkdown, {
+    const actions = {
       promptText: promptCommand,
       copyText: async (text) => {
         const clipboard = global.navigator?.clipboard;
@@ -1492,14 +1511,120 @@ export async function start({ global, document, client }) {
         }
       },
       rerender: showTranscript,
-    });
+    };
+    if (agentView?.loading) {
+      replace(chatRoot, element(document, "p", {
+        className: "agent-history-status",
+        text: "Loading agent history…",
+      }));
+    } else if (agentView?.error) {
+      replace(chatRoot, element(document, "p", {
+        className: "agent-history-error",
+        text: `Could not load ${agentView.name}'s conversation: ${agentView.error}`,
+      }));
+    } else {
+      renderTranscript(
+        document,
+        chatRoot,
+        agentView ? agentTranscript.model : transcript.model,
+        parseMarkdown,
+        agentView ? { copyText: actions.copyText } : actions,
+      );
+    }
+    updateMissingKeyNotice();
     if (!onChatPage) return;
+    if (preserveChatScroll) return;
     if (following) {
       chatRoot.scrollTop = chatRoot.scrollHeight;
       jumpLatest.hidden = true;
     } else {
       jumpLatest.hidden = false;
     }
+  }
+
+  function renderAgentViewHeader() {
+    if (!agentView) {
+      agentViewHeader.hidden = true;
+      replace(agentViewHeader);
+      form.hidden = false;
+      return;
+    }
+    const back = element(document, "button", {
+      className: "agent-conversation-back",
+      text: "Back to conversation",
+    });
+    back.type = "button";
+    listen(back, "click", closeAgentView);
+    replace(
+      agentViewHeader,
+      element(document, "h2", { className: "agent-conversation-title", text: agentView.name }),
+      back,
+    );
+    agentViewHeader.hidden = false;
+    form.hidden = true;
+  }
+
+  async function openAgentView(rowData) {
+    if (!currentSessionId || rowData.name === "leader" || !rowData.parentAgentId) return;
+    const generation = ++agentViewGeneration;
+    agentView = {
+      agentId: rowData.agentId,
+      name: rowData.name,
+      sessionId: currentSessionId,
+      loading: true,
+      error: "",
+      returnScrollTop: chatRoot.scrollTop ?? 0,
+      returnFollowing: following,
+    };
+    agentTranscript.reset();
+    agentTranscript.setSessionId(currentSessionId);
+    renderAgentViewHeader();
+    following = true;
+    preserveChatScroll = true;
+    navigate({ page: "chat", section: "" });
+    showTranscript();
+    chatRoot.scrollTop = chatRoot.scrollHeight;
+    jumpLatest.hidden = true;
+    preserveChatScroll = false;
+    try {
+      const reply = await boundary.agentHistory(currentSessionId, rowData.agentId);
+      if (generation !== agentViewGeneration || !agentView) return;
+      if (!Array.isArray(reply?.messages)) throw new Error("host returned no agent messages");
+      for (const message of reply.messages) {
+        agentTranscript.apply({
+          kind: "event",
+          payload: {
+            ...message,
+            type: "HistoryMessage",
+            agent_id: rowData.agentId,
+            session_id: currentSessionId,
+          },
+        });
+      }
+      agentView.loading = false;
+      showTranscript();
+    } catch (error) {
+      if (generation !== agentViewGeneration || !agentView) return;
+      agentView.loading = false;
+      agentView.error = error instanceof Error ? error.message : String(error);
+      showTranscript();
+    }
+  }
+
+  function closeAgentView() {
+    if (!agentView) return;
+    const previous = agentView;
+    agentView = null;
+    agentViewGeneration += 1;
+    agentTranscript.reset();
+    agentTranscript.setSessionId(null);
+    renderAgentViewHeader();
+    following = previous.returnFollowing;
+    preserveChatScroll = true;
+    showTranscript();
+    chatRoot.scrollTop = previous.returnScrollTop;
+    jumpLatest.hidden = following;
+    preserveChatScroll = false;
   }
 
   async function reconcileEditCard(card) {
@@ -1533,6 +1658,7 @@ export async function start({ global, document, client }) {
   });
 
   async function openSession(runId) {
+    closeAgentView();
     const targetSession = sessions.find((session) => session.run_id === runId);
     if (targetSession?.repo_root && targetSession.repo_root !== project.repo_root) {
       return openProjectAt(targetSession.repo_root, runId);
@@ -1764,6 +1890,7 @@ export async function start({ global, document, client }) {
       confirmingSessionId = null;
       sessionRowError = "";
       if (currentSessionId === runId) {
+        closeAgentView();
         transcript.reset();
         currentSessionId = null;
         transcript.setSessionId(null);
@@ -1781,6 +1908,7 @@ export async function start({ global, document, client }) {
   }
   showProjects();
   async function startNewChat() {
+    closeAgentView();
     clearConversationAgents();
     try {
       await boundary.newSession();
@@ -1850,6 +1978,27 @@ export async function start({ global, document, client }) {
 
   function showPromptError() {
     promptError.textContent = promptFailure;
+    if (promptFailure === "Add an API key in Settings before sending a message.") {
+      append(promptError, element(document, "span", { text: " " }), modelsLink());
+    }
+  }
+
+  function modelsLink() {
+    const link = element(document, "a", { text: "Settings › Models" });
+    link.href = formatRoute({ page: "settings", section: "models" });
+    listen(link, "click", (event) => {
+      event.preventDefault();
+      navigate({ page: "settings", section: "models" });
+    });
+    return link;
+  }
+
+  function updateMissingKeyNotice() {
+    if (!missingKeyNotice) return;
+    missingKeyNotice.hidden = route.page !== "chat"
+      || Boolean(agentView)
+      || transcript.model.length > 0
+      || providerRows.some((row) => row.key_present);
   }
 
   function rememberPrompt(text) {
@@ -2266,6 +2415,7 @@ export async function start({ global, document, client }) {
   }
 
   async function runSpecAction(action, { newConversation = false } = {}) {
+    closeAgentView();
     specActionError = "";
     if (newConversation) clearConversationAgents();
     try {
@@ -2736,7 +2886,7 @@ export async function start({ global, document, client }) {
       return;
     }
     const byId = new Map(rows.map((row) => [row.agentId, row]));
-    const nodes = new Map(rows.map(({ agentId, name, state, tool, target }) => {
+    const nodes = new Map(rows.map(({ agentId, parentAgentId, name, state, tool, target }) => {
       const status = displayState(state);
       const activity = status === "running"
         ? (tool ? description(tool, target) : "thinking")
@@ -2744,6 +2894,21 @@ export async function start({ global, document, client }) {
           ? description(tool, target)
           : "";
       const row = element(document, "div", { className: "agent-row" });
+      if (name !== "leader" && parentAgentId) {
+        row.tabIndex = 0;
+        row.setAttribute("role", "button");
+        row.setAttribute("aria-label", `Open ${name}'s conversation`);
+        listen(row, "click", (event) => {
+          event.stopPropagation?.();
+          return openAgentView({ agentId, parentAgentId, name });
+        });
+        listen(row, "keydown", (event) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          event.stopPropagation?.();
+          return openAgentView({ agentId, parentAgentId, name });
+        });
+      }
       append(row, element(document, "span", {
         className: "agent-name",
         text: name,
@@ -3059,6 +3224,11 @@ export async function start({ global, document, client }) {
   }
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
+      if (agentView && event.key === "Escape") {
+        event.preventDefault();
+        closeAgentView();
+        return;
+      }
       if (lookup(keymap, event, { platform }) !== "stop-run") return;
       event.preventDefault();
       if (userCommandPending) {
@@ -4230,6 +4400,14 @@ export async function start({ global, document, client }) {
     if (await refreshActivityForOtherSession(frameSessionId)) return;
     const previousLength = transcript.model.length;
     transcript.apply(frame);
+    if (
+      agentView
+      && frame.kind === "event"
+      && frame.payload?.session_id === agentView.sessionId
+      && frame.payload?.agent_id === agentView.agentId
+    ) {
+      agentTranscript.apply(frame);
+    }
     const newEntries = transcript.model.slice(previousLength);
     for (const entry of newEntries) {
       if (entry.type === "edit-card") {

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
-import socket
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest.mock as mock
+import uuid
 from pathlib import Path
 from symphonai_api.config import ConfigError, load_config
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
@@ -18,6 +20,7 @@ from symphonai_api.jobs import JobManager
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
 from symphonai_api.tools.shell import RunShellTool, _terminate_process_group, shell_environment
+import symphonai_api.tools.shell as shell_module
 from symphonai_api.tools.shell_parse import ShellCommand, commands_for_argv, parse_command_line
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -248,6 +251,44 @@ def check_command_lines_parse() -> None:
         fail("argv words were incorrectly split on shell operators")
 
 
+@check("shell.cwd_carries_between_calls")
+def check_shell_cwd_carries_between_calls() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        (root / "src").mkdir()
+        policy = PermissionPolicy(root, mode="allow", shell_enabled=True, shell_allowlist=[()])
+        first = RunShellTool()
+        second = RunShellTool()
+        call = lambda identifier, arguments: ToolCall(
+            id=identifier, name="run_shell", arguments=arguments,
+        )
+        with mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False):
+            changed = first.execute(call("cwd-cd", {"command": "cd src"}), policy)
+            if not changed.ok or not changed.content.startswith("(in src)"):
+                fail(f"command result did not report its new cwd: {changed!r}")
+            current = first.execute(call("cwd-pwd", {"argv": ["pwd"]}), policy)
+            if not current.ok or not current.content.startswith("(in src)\n") or not current.content.rstrip().endswith("/src"):
+                fail(f"argv call did not run in the carried cwd: {current!r}")
+            independent = second.execute(call("cwd-independent", {"argv": ["pwd"]}), policy)
+            if not independent.ok or independent.content.strip() != str(root):
+                fail(f"separate tool registry inherited another cwd: {independent!r}")
+            reset = first.execute(call("cwd-outside", {"command": "cd /"}), policy)
+            if not reset.ok or not reset.content.endswith("Shell working directory reset to the project root."):
+                fail(f"outside cwd was not reset and reported: {reset!r}")
+            vanished = first.execute(call(
+                "cwd-vanished", {"command": "mkdir doomed; cd doomed; rmdir ../doomed"},
+            ), policy)
+            if not vanished.ok or not vanished.content.endswith("Shell working directory reset to the project root."):
+                fail(f"deleted cwd was not reset and reported: {vanished!r}")
+            first.execute(call("cwd-cd-again", {"command": "cd src"}), policy)
+            exited = first.execute(call("cwd-exit", {"command": "cd ..; exit 3"}), policy)
+            if exited.ok or exited.error != "exit code 3" or not exited.content.startswith("(in src)"):
+                fail(f"early exit changed the cwd or exit code: {exited!r}")
+            after_exit = first.execute(call("cwd-after-exit", {"argv": ["pwd"]}), policy)
+            if not after_exit.content.rstrip().endswith("/src"):
+                fail(f"early exit did not preserve the previous cwd: {after_exit!r}")
+
+
 @check("shell.command_argument")
 def check_command_argument() -> None:
     tool = RunShellTool()
@@ -337,6 +378,7 @@ def check_shell_sandbox_unavailable_fails_closed() -> None:
     policy = _sandbox_policy(Path.cwd())
     with (
         mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+        mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False),
         mock.patch("symphonai_api.tools.shell.subprocess.Popen") as popen,
     ):
         result = RunShellTool().execute(
@@ -404,6 +446,7 @@ def check_allow_mode_unavailable_sandbox_falls_back() -> None:
     )
     with (
         mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+        mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False),
         mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen,
     ):
         result = RunShellTool().execute(
@@ -419,6 +462,7 @@ def check_allow_mode_unavailable_sandbox_falls_back() -> None:
     )
     with (
         mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+        mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False),
         mock.patch("symphonai_api.tools.shell.subprocess.Popen") as strict_popen,
     ):
         refused = RunShellTool().execute(
@@ -427,6 +471,94 @@ def check_allow_mode_unavailable_sandbox_falls_back() -> None:
         )
     if refused.ok or refused.error != "sandbox requested but unavailable on this platform" or strict_popen.called:
         fail(f"explicit sandbox setting did not fail closed: {refused!r}")
+
+
+@check("shell.linux_sandbox_command")
+def check_linux_sandbox_command() -> None:
+    argv = ["echo", "linux sandbox"]
+    root = Path(tempfile.gettempdir()) / "symphonai sandbox project"
+    process = mock.Mock(returncode=0)
+    process.poll.return_value = 0
+    process.communicate.return_value = ("", "")
+    for network in (False, True):
+        policy = PermissionPolicy(
+            repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+            sandbox_network=network,
+        )
+        with (
+            mock.patch("symphonai_api.tools.shell.sys.platform", "linux"),
+            mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=True),
+            mock.patch("symphonai_api.tools.shell.subprocess.Popen", return_value=process) as popen,
+        ):
+            result = RunShellTool().execute(
+                ToolCall(id="linux-sandbox", name="run_shell", arguments={"argv": argv}), policy,
+            )
+        root_path = str(root.resolve())
+        temporary = os.path.realpath(os.environ.get("TMPDIR", tempfile.gettempdir()))
+        expected = [
+            "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+            "--bind", root_path, root_path, "--bind", temporary, temporary,
+            "--bind", "/tmp", "/tmp",
+        ]
+        if not network:
+            expected.append("--unshare-net")
+        expected.extend(("--die-with-parent", "--chdir", root_path, "--", *argv))
+        if not result.ok or popen.call_args.args[0] != expected:
+            fail(f"Linux sandbox command was wrong for network={network}: {popen.call_args!r}, {result!r}")
+        if str(Path(popen.call_args.kwargs["cwd"]).resolve()) != root_path:
+            fail(f"Linux sandbox process used the wrong cwd: {popen.call_args!r}")
+
+
+def _linux_bwrap_skip() -> bool:
+    if sys.platform != "linux":
+        print("SKIP: Linux bwrap is unavailable")
+        return True
+    if not shell_module._linux_sandbox_available():
+        print("SKIP: bwrap is unavailable or cannot sandbox commands")
+        return True
+    return False
+
+
+@check("shell.linux_sandbox_contains_writes")
+def check_linux_sandbox_contains_writes() -> None:
+    if _linux_bwrap_skip():
+        return
+    root = Path(tempfile.mkdtemp(prefix="symphonai-55d-repo-"))
+    outside = Path.home() / f".symphonai-55d-escape-{uuid.uuid4().hex}"
+    policy = PermissionPolicy(
+        repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+        shell_sandbox=True, sandbox_network=False,
+    )
+    try:
+        inside_result = RunShellTool().execute(ToolCall(
+            id="linux-sandbox-inside", name="run_shell", arguments={"argv": ["touch", str(root / "inside")]},
+        ), policy)
+        if not inside_result.ok or not (root / "inside").exists():
+            fail(f"Linux sandbox refused a repository write: {inside_result!r}")
+
+        outside_result = RunShellTool().execute(ToolCall(
+            id="linux-sandbox-outside", name="run_shell", arguments={"argv": ["touch", str(outside)]},
+        ), policy)
+        if outside_result.ok or outside.exists():
+            fail(f"Linux sandbox allowed a HOME write: {outside_result!r}")
+
+        code = (
+            "import socket\n"
+            "try:\n"
+            "    socket.create_connection(('1.1.1.1', 80), timeout=2)\n"
+            "    print('connected')\n"
+            "except OSError:\n"
+            "    print('blocked')\n"
+        )
+        network_result = RunShellTool().execute(ToolCall(
+            id="linux-sandbox-network", name="run_shell",
+            arguments={"argv": [sys.executable, "-c", code]},
+        ), policy)
+        if not network_result.ok or network_result.content.strip() != "blocked":
+            fail(f"Linux sandbox did not isolate external network access: {network_result!r}")
+    finally:
+        outside.unlink(missing_ok=True)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @check("shell.allow_mode_confinement")

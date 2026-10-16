@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from symphonai_api.extensions import load_extensions
 from symphonai_api.lsp import LspManager
 from symphonai_api.mcp_pool import McpPool
+from symphonai_api.paths import ensure_private_directory
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_host.run import HostRun
@@ -105,7 +106,7 @@ def record_recent_project(home: Path, root: Path) -> None:
     root_string = str(root.resolve())
     recent = [root_string, *(item for item in recent if item != root_string)][:20]
     try:
-        home.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(home)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with temporary.open("w", encoding="utf-8") as output:
             json.dump(recent, output)

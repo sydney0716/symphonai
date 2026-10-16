@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import unittest.mock as mock
 
 from symphonai_api import ToolEffect, ToolMetadata
@@ -11,8 +13,10 @@ from symphonai_api.events import CollectingSink, ToolCallFailed
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import run_task, standard_tool_registry
+from symphonai_api.serialization import message_from_json
 from symphonai_api.session import TranscriptWriter, read_records
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -263,3 +267,158 @@ def check_repeated_failure_is_named() -> None:
             event_errors = [event.error for event in sink.of_type(ToolCallFailed)]
             if event_errors != [error for error in expected if error is not None]:
                 fail(f"{label}: failure event errors differed: {event_errors!r}")
+
+
+@check("agent.outside_changes_are_noticed")
+def check_outside_changes_are_noticed() -> None:
+    with workspace() as ws:
+        def run_case(label, read_paths, followups, after_reads):
+            ledger = ReadLedger()
+            tools = standard_tool_registry(ledger=ledger)
+            read_tool = tools["read_file"]
+            original_execute = read_tool.execute
+            read_count = 0
+            change_lock = threading.Lock()
+            changed = False
+
+            def execute_then_change(call, policy, cancel=None):
+                nonlocal read_count, changed
+                result = original_execute(call, policy, cancel=cancel)
+                if result.ok and call.arguments.get("path") in read_paths:
+                    with change_lock:
+                        read_count += 1
+                        if read_count == len(read_paths) and not changed:
+                            after_reads()
+                            changed = True
+                return result
+
+            read_calls = [
+                ToolCall(
+                    id=f"{label}-read-{index}",
+                    name="read_file",
+                    arguments={"path": path},
+                )
+                for index, path in enumerate(read_paths)
+            ]
+            responses = [
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=read_calls)),
+                *[
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[call]))
+                    for call in followups
+                ],
+                ModelResponse(Message(Role.ASSISTANT, content="done")),
+            ]
+            provider = FakeModelProvider(responses)
+            writer = TranscriptWriter(ws.root / f"{label}.jsonl")
+            agent = ApiAgent(
+                provider,
+                tools,
+                ws.policy,
+                max_turns=len(responses),
+                transcript=writer,
+                read_ledger=ledger,
+            )
+            with mock.patch.object(read_tool, "execute", side_effect=execute_then_change), \
+                    mock.patch.object(provider, "create_response", wraps=provider.create_response) as create:
+                try:
+                    result = agent.run([Message(Role.USER, "inspect files")])
+                finally:
+                    writer.close()
+            requests = [call.args[0] for call in create.call_args_list]
+            records, dropped = read_records(ws.root / f"{label}.jsonl")
+            if dropped:
+                fail(f"{label}: transcript ended with {dropped} dropped bytes")
+            persisted_users = [
+                message_from_json(record["data"]).text for record in records
+                if record["type"] == "message" and record["data"]["role"] == "user"
+            ]
+            return result, requests, persisted_users
+
+        changed_file = ws.root / "a.py"
+        changed_file.write_text("before\n")
+
+        def rewrite_a() -> None:
+            stat = changed_file.stat()
+            changed_file.write_text("after\n")
+            os.utime(
+                changed_file,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
+
+        reread = ToolCall(
+            id="reread-a", name="read_file", arguments={"path": "a.py"}
+        )
+        result, requests, persisted = run_case("outside-rewrite", ["a.py"], [reread], rewrite_a)
+        notice = (
+            "These files changed on disk since you last read them, not through your edits: "
+            "a.py. Read them again before relying on or editing them."
+        )
+        second_users = [message.text for message in requests[1].messages if message.role == Role.USER]
+        third_users = [message.text for message in requests[2].messages if message.role == Role.USER]
+        if second_users.count(notice) != 1 or third_users.count(notice) != 1:
+            fail(f"outside rewrite was not announced exactly once: {second_users!r}, {third_users!r}")
+        if persisted.count(notice) != 1 or result.stopped_reason != "final_response":
+            fail(f"outside rewrite notice was not persisted or run did not continue: {persisted!r}")
+
+        edit_existing = ToolCall(
+            id="edit-existing",
+            name="edit_file",
+            arguments={"path": "existing.txt", "old_string": "hello", "new_string": "goodbye"},
+        )
+        edit_result, edit_requests, _ = run_case(
+            "agent-edit", ["existing.txt"], [edit_existing], lambda: None
+        )
+        if any(
+            message.text.startswith("These files changed on disk")
+            for message in edit_requests[-1].messages if message.role == Role.USER
+        ):
+            fail("the agent's own edit was reported as an outside change")
+        if not any(
+            message.role == Role.TOOL and message.tool_result.ok
+            for message in edit_result.messages
+        ):
+            fail("the same-run edit_file call did not succeed")
+
+        paths = [f"changed-{index:02}.py" for index in range(12)]
+        files = [ws.root / path for path in paths]
+        for path in files:
+            path.write_text("before\n")
+
+        def rewrite_many() -> None:
+            for path in files:
+                stat = path.stat()
+                path.write_text("after\n")
+                os.utime(
+                    path,
+                    ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+                )
+
+        many_result, many_requests, _ = run_case("outside-many", paths, [], rewrite_many)
+        many_notices = [
+            message.text for message in many_requests[1].messages
+            if message.role == Role.USER and message.text.startswith("These files changed on disk")
+        ]
+        if len(many_notices) != 1 or "and 2 more" not in many_notices[0]:
+            fail(f"twelve changed files were not summarized: {many_notices!r}")
+        if any(f"changed-{index:02}.py" not in many_notices[0] for index in range(10)):
+            fail(f"the first ten changed paths were not named: {many_notices!r}")
+        if "changed-10.py" in many_notices[0] or "changed-11.py" in many_notices[0]:
+            fail(f"more than ten changed paths were named: {many_notices!r}")
+        if many_result.stopped_reason != "final_response":
+            fail("the agent stopped after being told about changed files")
+
+        deleted_file = ws.root / "deleted.py"
+        deleted_file.write_text("before\n")
+
+        def delete_file() -> None:
+            deleted_file.unlink()
+
+        deleted_result, deleted_requests, _ = run_case("outside-deleted", ["deleted.py"], [], delete_file)
+        deleted_notices = [
+            message.text for message in deleted_requests[1].messages
+            if message.role == Role.USER and message.text.startswith("These files changed on disk")
+        ]
+        if len(deleted_notices) != 1 or "deleted.py (deleted)" not in deleted_notices[0]:
+            fail(f"deleted file was not named: {deleted_notices!r}")
+        if deleted_result.stopped_reason != "final_response":
+            fail("the agent stopped after being told a file was deleted")

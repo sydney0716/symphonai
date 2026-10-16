@@ -20,6 +20,7 @@ from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.credentials import CredentialError, apply_to_environment, load, store
+from symphonai_host.projects import record_recent_project
 from symphonai_host.protocol import encode_event, encode_frame
 from symphonai_host.server import HostServer
 from scripts.checks.harness import check, fail
@@ -121,6 +122,52 @@ def check_store_and_environment() -> None:
             _require(env == {
                 "ABSENT": "stored-a", "EMPTY": "stored-b", "EXPORTED": "exported",
             }, "environment precedence changed")
+
+
+@check("credentials.store_on_a_fresh_home")
+def check_store_on_a_fresh_home() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        home = root / "new-parent" / "nested" / ".symphonai"
+        project = root / "project"
+        project.mkdir()
+        with mock.patch.dict(os.environ, {
+            "SYMPHONAI_HOME": str(home), "SYMPHONAI_CREDENTIALS_FILE": "",
+        }):
+            record_recent_project(home, project)
+            store("OPENAI_API_KEY", "sk-test")
+            target = home / "credentials.json"
+            for folder in (root / "new-parent", root / "new-parent" / "nested", home):
+                _require(_mode(folder) == 0o700, f"fresh home component is not 0700: {folder}")
+            _require(_mode(target) == 0o600, "fresh-home credential file is not 0600")
+
+        home.chmod(0o755)
+        with mock.patch.dict(os.environ, {
+            "SYMPHONAI_HOME": str(home), "SYMPHONAI_CREDENTIALS_FILE": "",
+        }):
+            store("OPENAI_API_KEY", "sk-test")
+            _require(_mode(home) == 0o700, "owned 0755 home was not tightened to 0700")
+
+        regular_file = root / "home-file"
+        regular_file.write_text("not a directory", encoding="utf-8")
+        with mock.patch.dict(os.environ, {
+            "SYMPHONAI_HOME": str(regular_file), "SYMPHONAI_CREDENTIALS_FILE": "",
+        }):
+            try:
+                store("OPENAI_API_KEY", "sk-test")
+            except CredentialError:
+                pass
+            else:
+                fail("credentials were written beneath a regular-file home")
+
+        home.chmod(0o700)
+        with mock.patch("symphonai_host.credentials.os.getuid", return_value=os.getuid() + 1):
+            try:
+                store("OPENAI_API_KEY", "sk-test", path=home / "credentials.json")
+            except CredentialError:
+                pass
+            else:
+                fail("credentials directory owned by another uid was accepted")
 
 
 @check("credentials.route_auth_and_write")

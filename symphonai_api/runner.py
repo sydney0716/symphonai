@@ -155,10 +155,9 @@ def run_task(
 
     Automatic instructions intentionally omit directory scope.
     """
-    ledger: ReadLedger | None = None
+    ledger = ReadLedger()
     instruction_text = ""
     if include_instructions:
-        ledger = ReadLedger()
         instruction_text = load_instructions(policy, ledger=ledger).render()
 
     messages: list[Message] = []
@@ -206,6 +205,7 @@ def run_task(
         ),
         stream=stream,
         events=hook_runner,
+        read_ledger=ledger,
     )
     return agent.run(messages, model=model, cancel=cancel, hooks=hook_runner)
 
@@ -237,7 +237,8 @@ def resume_task(
         if offload_tool_results
         else None
     )
-    tools = standard_tool_registry(result_store=result_store)
+    ledger = ReadLedger()
+    tools = standard_tool_registry(ledger=ledger, result_store=result_store)
     agent_ref = new_agent_ref("agent")
     agent = ApiAgent(
         provider=provider,
@@ -248,6 +249,7 @@ def resume_task(
         result_store=result_store,
         agent_ref=agent_ref,
         transcript=new_store.writer_for(agent_ref.agent_id, is_root=True),
+        read_ledger=ledger,
     )
     return agent.run(
         messages,

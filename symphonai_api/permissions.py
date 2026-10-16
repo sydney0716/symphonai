@@ -659,7 +659,7 @@ class PermissionPolicy:
 
     # -- shell checks -------------------------------------------------------
 
-    def check_shell(self, argv: list[str]) -> PermissionDecision:
+    def check_shell(self, argv: list[str], *, cwd: Path | None = None) -> PermissionDecision:
         if not argv:
             return self._deny(
                 "empty command",
@@ -670,16 +670,16 @@ class PermissionPolicy:
         commands = commands_for_argv(argv)
         wrappers = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
         if commands is not None:
-            cwd = self.repo_root
+            current_directory = self.repo_root if cwd is None else Path(cwd).resolve()
             for command in commands:
                 words = command.argv
                 if words[0] == "cd":
                     destination = words[-1] if len(words) > 1 else ""
-                    if cwd is not None and destination and not destination.startswith("-"):
-                        directory = (cwd / destination).resolve()
-                        cwd = directory if directory.is_dir() else None
+                    if current_directory is not None and destination and not destination.startswith("-"):
+                        directory = (current_directory / destination).resolve()
+                        current_directory = directory if directory.is_dir() else None
                     else:
-                        cwd = None
+                        current_directory = None
                 if os.path.basename(words[0]) == "find":
                     candidate_starts = (0,)
                 elif os.path.basename(words[0]) in wrappers:
@@ -719,7 +719,7 @@ class PermissionPolicy:
                     )
                     discarded = None
                     for index in discard_starts:
-                        discarded = _discards_work(candidate[index:], self.repo_root, cwd, indirect=indirect)
+                        discarded = _discards_work(candidate[index:], self.repo_root, current_directory, indirect=indirect)
                         if discarded is not None:
                             break
                     if discarded is not None:

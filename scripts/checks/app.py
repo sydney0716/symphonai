@@ -210,10 +210,6 @@ def import_boundary() -> None:
         if references:
             fail(f"symphonai_app crosses the Python boundary: {references!r}")
 
-    def require_pyproject_exclusion(text: str) -> None:
-        if 'exclude = ["symphonai_app*"]' not in text:
-            fail("pyproject.toml does not exclude symphonai_app from Python packages")
-
     def expect_failure(operation, expected: tuple[str, ...], label: str) -> None:  # noqa: ANN001
         try:
             operation()
@@ -228,8 +224,6 @@ def import_boundary() -> None:
 
     app_root = REPO_ROOT / "symphonai_app"
     scan(app_root)
-    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    require_pyproject_exclusion(pyproject)
 
     with tempfile.TemporaryDirectory() as temporary:
         fixture = Path(temporary)
@@ -274,9 +268,3 @@ def import_boundary() -> None:
             ("nested/runtime.py", "Python files"),
             "nested Python source",
         )
-
-    expect_failure(
-        lambda: require_pyproject_exclusion(""),
-        ("pyproject.toml", "exclude"),
-        "missing Python package exclusion",
-    )

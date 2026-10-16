@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import shutil
 import subprocess
+import sys
 import tempfile
+import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -229,3 +233,68 @@ def check_page_tracked() -> None:
         if ignored.returncode != 1:
             detail = ignored.stderr.strip() or f"exit code {ignored.returncode}"
             fail(f"git could not inspect ignored page assets: {detail}")
+
+
+@check("packaging.wheel_includes_the_app")
+def check_wheel_includes_the_app() -> None:
+    if (
+        importlib.util.find_spec("pip") is None
+        or importlib.util.find_spec("setuptools") is None
+    ):
+        print("SKIP: pip or setuptools unavailable offline")
+        return
+
+    tracked = _run_git("ls-files", "--cached", "--")
+    if tracked.returncode != 0:
+        detail = tracked.stderr.strip() or f"exit code {tracked.returncode}"
+        fail(f"could not list tracked source for wheel build: {detail}")
+
+    app_root = ROOT / "symphonai_app"
+    expected = {
+        "symphonai_app/index.html",
+        "symphonai_app/app.css",
+        "symphonai_app/keys.default.json",
+        *(
+            path.relative_to(ROOT).as_posix()
+            for path in (app_root / "src").rglob("*")
+            if path.is_file()
+        ),
+    }
+    with tempfile.TemporaryDirectory(prefix="symphonai-wheel-") as temporary:
+        source_root = Path(temporary) / "source"
+        for relative in tracked.stdout.splitlines():
+            source = ROOT / relative
+            destination = source_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--no-build-isolation",
+                ".",
+                "-w",
+                temporary,
+            ),
+            cwd=source_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            fail(f"pip wheel failed: {result.stderr.strip() or result.stdout.strip()}")
+        wheels = list(Path(temporary).glob("*.whl"))
+        if len(wheels) != 1:
+            fail(f"pip wheel produced {len(wheels)} wheels instead of one")
+        with zipfile.ZipFile(wheels[0]) as wheel:
+            names = set(wheel.namelist())
+
+    missing = sorted(expected - names)
+    if missing:
+        fail(f"wheel omitted app files: {missing!r}")
+    test_files = sorted(name for name in names if name.startswith("symphonai_app/test/"))
+    if test_files:
+        fail(f"wheel included app tests: {test_files!r}")

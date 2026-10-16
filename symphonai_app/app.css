@@ -996,6 +996,19 @@ button.session-link {
   padding: var(--space-2) 0;
 }
 
+.agent-row[role="button"] {
+  cursor: pointer;
+}
+
+.agent-row[role="button"]:hover {
+  background: var(--ui-hover);
+}
+
+.agent-row[role="button"]:focus-visible {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 2px;
+}
+
 #agents > .agent-row + .agent-row {
   border-top: 1px solid var(--ui-border);
 }
@@ -1132,6 +1145,73 @@ button.session-link {
 
 .chat-pane:has(#run-notice:empty) {
   grid-template-rows: 1fr auto auto;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])) {
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])) > .agent-conversation-header {
+  grid-row: 1;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])) > #run-notice:not(:empty) {
+  grid-row: 2;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])) > #chat {
+  grid-row: 3;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])) > #approvals {
+  grid-row: 4;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])) > p:last-of-type {
+  grid-row: 5;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])):has(#run-notice:empty) {
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])):has(#run-notice:empty) > #chat {
+  grid-row: 2;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])):has(#run-notice:empty) > #approvals {
+  grid-row: 3;
+}
+
+.chat-pane:has(.agent-conversation-header:not([hidden])):has(#run-notice:empty) > p:last-of-type {
+  grid-row: 4;
+}
+
+.agent-conversation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 0 var(--space-3) var(--space-2);
+  border-bottom: 1px solid var(--ui-border);
+}
+
+.agent-conversation-title {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.agent-conversation-back {
+  color: var(--ui-accent);
+}
+
+.agent-history-status {
+  color: var(--ui-text-secondary);
+}
+
+.agent-history-error {
+  color: var(--ui-danger);
 }
 
 .prompt-form {

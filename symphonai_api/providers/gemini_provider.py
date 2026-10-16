@@ -66,6 +66,7 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 #
 # The leader plans and delegates, so use the pro alias by default.
 DEFAULT_MODEL = "gemini-pro-latest"
+ROUTINE_MODEL = "gemini-flash-latest"
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for Gemini functionCalls that omit one.

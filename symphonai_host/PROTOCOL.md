@@ -263,6 +263,13 @@ fifth start returns `409` with `{"error": "4 conversations are already running"}
 Busy checks concern the current conversation. `POST /stop` stops only the
 current conversation; open another one first to stop its run.
 
+`GET /session/agent?session_id=<id>&agent_id=<id>` returns
+`{"session_id": <id>, "agent_id": <id>, "messages": [...]}` for one
+subagent transcript. Each message has the `HistoryMessage` payload shape,
+including tool calls with their results. This read-only route works for open
+and closed sessions and publishes no event frames. Missing sessions, unknown
+agents, and malformed agent ids return `404`.
+
 Each replayed `HistoryMessage` also carries an opaque `record_id` for the
 message. `POST /session/fork` takes `{"run_id": str, "record_id": str}` and
 optionally `"force": true`. It copies the source conversation through that

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Callable
 
 from symphonai_api.events import EventSink, SessionEnded, SessionStarted, emit
 from symphonai_api.identity import SCHEMA_VERSION, new_id
-from symphonai_api.paths import symphonai_home
+from symphonai_api.paths import ensure_private_directory, symphonai_home
 
 if TYPE_CHECKING:
     from symphonai_api.models import Message
@@ -130,7 +130,7 @@ class TranscriptWriter:
         self._on_append = _on_append
         self._closed = False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            ensure_private_directory(self.path.parent)
             self.path.parent.chmod(0o700)
             descriptor = os.open(
                 self.path,
@@ -218,7 +218,7 @@ class SessionStore:
         self._meta_lock = threading.Lock()
         if create:
             try:
-                self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                ensure_private_directory(self._root)
                 self._root.chmod(0o700)
                 self._directory.mkdir(exist_ok=True, mode=0o700)
                 self._directory.chmod(0o700)

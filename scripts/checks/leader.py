@@ -75,6 +75,7 @@ from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
 from symphonai_api.providers.openai_provider import (
     _build_request_body as _build_openai_body,
+    OpenAIProvider,
 )
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
@@ -82,6 +83,7 @@ from symphonai_api.session import SessionStore, load_run_for_resume, read_record
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.tools.metadata import (
     InterruptBehavior,
     ResultHint,
@@ -3202,6 +3204,157 @@ def check_default_specs_match_old_behaviour() -> None:
     default_config = LeaderConfig(FakeModelProvider(), FakeModelProvider(), ".")
     if default_config.permission_mode != "allow":
         fail(f"LeaderConfig's non-interactive default changed: {default_config.permission_mode!r}")
+
+
+@check("leader.outside_changes_reach_leader_and_subagents")
+def check_outside_changes_reach_leader_and_subagents() -> None:
+    with workspace() as ws:
+        a_path = ws.root / "a.py"
+        b_path = ws.root / "b.py"
+        a_path.write_text("a = 1\n", encoding="utf-8")
+        b_path.write_text("b = 1\n", encoding="utf-8")
+
+        def change_file(path: Path, value: str) -> None:
+            path.write_text(value, encoding="utf-8")
+            stat = path.stat()
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        class LeaderProvider(_RecordingFakeProvider):
+            def create_response(self, request, *, cancel=None):
+                if len(self.requests) == 2:
+                    change_file(b_path, "b = 3\n")
+                return super().create_response(request, cancel=cancel)
+
+        leader_provider = LeaderProvider([
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[
+                ToolCall("read-a", "read_file", {"path": "a.py"}),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[
+                _dispatch("explorer", "inspect the file", "dispatch-explorer-1"),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[
+                _dispatch("explorer", "continue inspecting", "dispatch-explorer-2"),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        child_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[
+                ToolCall("read-b", "read_file", {"path": "b.py"}),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, "first inspection complete")),
+            ModelResponse(Message(Role.ASSISTANT, "second inspection complete")),
+        ])
+        original_record = ReadLedger.record
+        changed_after_read: set[Path] = set()
+
+        def record_then_change(ledger, resolved, **kwargs):
+            result = original_record(ledger, resolved, **kwargs)
+            if resolved in {a_path.resolve(), b_path.resolve()} and resolved not in changed_after_read:
+                changed_after_read.add(resolved)
+                change_file(resolved, f"{resolved.stem} = 2\n")
+            return result
+
+        specs = {
+            "leader": _spec(ws.root, "leader", memory=MemorySettings(enabled=False)),
+            "explorer": _spec(ws.root, "explorer", memory=MemorySettings(enabled=False)),
+        }
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(ws.root),
+            subagent_specs=specs,
+        ))
+        with mock.patch.object(ReadLedger, "record", autospec=True, side_effect=record_then_change):
+            leader.run("inspect the project files")
+
+        leader_texts = [
+            "\n".join(message.text for message in request.messages)
+            for request in leader_provider.requests
+        ]
+        child_texts = [
+            "\n".join(message.text for message in request.messages)
+            for request in child_provider.requests
+        ]
+        if len(leader_texts) != 4 or "These files changed on disk since you last read them, not through your edits: a.py." not in leader_texts[1]:
+            fail(f"leader did not receive its changed-file notice: {leader_texts!r}")
+        if len(child_texts) != 3 or any(
+            "These files changed on disk since you last read them, not through your edits: b.py." not in text
+            for text in (child_texts[1], child_texts[2])
+        ):
+            fail(f"explorer did not receive its own changed-file notice after reading and reuse: {child_texts!r}")
+        if any("b.py" in text for text in leader_texts):
+            fail(f"explorer's ledger leaked into the leader's requests: {leader_texts!r}")
+
+
+@check("leader.routine_roles_use_the_routine_model")
+def check_routine_roles_use_the_routine_model() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self, responses, model: str) -> None:
+            super().__init__(responses)
+            self.model = model
+            self.DEFAULT_MODEL = "gpt-6.1-sol"
+            self.ROUTINE_MODEL = "gpt-5.5"
+            self.requested_models: list[str | None] = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requested_models.append(request.model)
+            return super().create_response(request, cancel=cancel)
+
+    def dispatch_models(*, model_override=None, named_explorer_model=None):
+        calls = [
+            ToolCall(f"call-{name}", "dispatch_subagent", {
+                "subagent_name": name, "task": f"inspect {name}",
+            })
+            for name in ("explorer", "worker", "planner")
+        ]
+        leader_provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=calls)),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ], "gpt-6.1-sol")
+        child_provider = RecordingProvider(
+            [ModelResponse(Message(Role.ASSISTANT, "done"))],
+            "gpt-6.1-sol" if model_override is None else model_override,
+        )
+        policy = PermissionPolicy(Path.cwd())
+        specs = builtin_subagent_specs(
+            child_provider,
+            policy,
+            model_override=model_override,
+            use_routine_model=model_override is None,
+        )
+        if named_explorer_model is not None:
+            specs["explorer"] = specs["explorer"].with_overrides(
+                model=ModelSelector("fake", named_explorer_model),
+            )
+        leader = Leader(LeaderConfig(
+            leader_provider=leader_provider,
+            subagent_provider=child_provider,
+            repo_root=str(Path.cwd()),
+            subagent_specs=specs,
+        ))
+        leader.run("dispatch routine work")
+        return child_provider.requested_models
+
+    if dispatch_models() != ["gpt-5.5", "gpt-5.5", "gpt-6.1-sol"]:
+        fail(f"routine dispatches did not select routine/flagship models: {dispatch_models()!r}")
+    if dispatch_models(model_override="gpt-5.4-mini") != ["gpt-5.4-mini"] * 3:
+        fail("a selected model did not reach every dispatched role")
+    if dispatch_models(named_explorer_model="gpt-5.4-nano") != [
+        "gpt-5.4-nano", "gpt-5.5", "gpt-6.1-sol",
+    ]:
+        fail("a named explorer model did not override routine selection")
+    policy = PermissionPolicy(Path.cwd())
+    for provider, routine, flagship in (
+        (AnthropicProvider(), "claude-sonnet-5-5", "claude-opus-5-5"),
+        (OpenAIProvider(), "gpt-5.5", "gpt-6.1-sol"),
+        (GeminiProvider(), "gemini-flash-latest", "gemini-pro-latest"),
+    ):
+        roster = builtin_subagent_specs(provider, policy, use_routine_model=True)
+        if any(
+            roster[name].model.model != routine
+            for name in ("explorer", "worker", "implementer", "reviewer")
+        ) or roster["planner"].model.model != flagship:
+            fail(f"{provider.name} built-in roster did not select routine models")
 
 
 @check("leader.subagent_policy_is_narrowed")

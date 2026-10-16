@@ -1481,6 +1481,22 @@ class HostServer:
                         return
                     self._serve_definition()
                     return
+                if request_path == "/session/agent":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True)
+                    session_ids = values.get("session_id", [])
+                    agent_ids = values.get("agent_id", [])
+                    if len(session_ids) != 1 or len(agent_ids) != 1:
+                        self._not_found()
+                        return
+                    try:
+                        reply = host.run.agent_history(session_ids[0], agent_ids[0])
+                    except TranscriptError:
+                        self._not_found()
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
                 if request_path == "/survey":
                     if not self._authorized():
                         return

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -19,18 +20,59 @@ from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.base import ProviderError
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import SessionError, SessionStore, default_sessions_root, load_run
 from symphonai_host.broker import EventBroker
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
+from symphonai_host.__main__ import main as _host_main
 from symphonai_host.projects import build_project
 from symphonai_host.protocol import encode_event
 from symphonai_host.run import ModeSelectionError, ProviderSelectionError
-from symphonai_host.server import _provider, _provider_for_start
+from symphonai_host.server import PROVIDERS, _provider, _provider_for_start
 
 
 class _UsageError(ValueError):
     pass
+
+
+class _HeadlessKeyError(ValueError):
+    pass
+
+
+class _StatusCapturingProvider:
+    def __init__(self, provider) -> None:  # noqa: ANN001
+        self._provider = provider
+        self.key_error_status: int | None = None
+
+    def __getattr__(self, name: str):  # noqa: ANN204
+        return getattr(self._provider, name)
+
+    def create_response(self, request, *, cancel=None):  # noqa: ANN001
+        try:
+            return self._provider.create_response(request, cancel=cancel)
+        except ProviderError as exc:
+            self._capture_status(exc)
+            raise
+
+    def stream_response(self, request, *, cancel=None):  # noqa: ANN001
+        try:
+            yield from self._provider.stream_response(request, cancel=cancel)
+        except ProviderError as exc:
+            self._capture_status(exc)
+            raise
+
+    def create_response_stream(self, request, *, cancel=None):  # noqa: ANN001
+        try:
+            yield from self._provider.create_response_stream(request, cancel=cancel)
+        except ProviderError as exc:
+            self._capture_status(exc)
+            raise
+
+    def _capture_status(self, error: ProviderError) -> None:
+        status = getattr(error, "status", None)
+        if self.key_error_status is None and status in (401, 403):
+            self.key_error_status = status
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -41,6 +83,9 @@ class _ArgumentParser(argparse.ArgumentParser):
 def _parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(prog="symphonai", description="Run SymphonAI agents")
     commands = parser.add_subparsers(dest="command")
+    app = commands.add_parser("app", help="open the SymphonAI app")
+    app.add_argument("--repo-root", type=Path)
+    app.add_argument("--no-open", action="store_true")
     run = commands.add_parser("run", help="run one task without the app")
     run.add_argument("task", nargs="?")
     run.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -56,9 +101,33 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_app(arguments) -> int:  # noqa: ANN001
+    def on_started(address: str) -> None:
+        print(f"SymphonAI is running at {address}", file=sys.stderr, flush=True)
+        print("Press Ctrl+C to stop.", file=sys.stderr, flush=True)
+        if not arguments.no_open:
+            webbrowser.open(address)
+
+    host_arguments = [] if arguments.repo_root is None else ["--repo-root", str(arguments.repo_root)]
+    try:
+        _host_main(host_arguments, on_started=on_started)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def _select_provider(arguments):  # noqa: ANN001
     if arguments.provider is not None:
-        provider = _provider(arguments.provider, arguments.model)
+        try:
+            provider = _provider(arguments.provider, arguments.model)
+        except ProviderSelectionError as exc:
+            if str(exc) == f"{arguments.provider} has no API key":
+                env_var = next((variable for name, variable, _ in PROVIDERS if name == arguments.provider), None)
+                if env_var is not None:
+                    raise _HeadlessKeyError(
+                        f"no API key found; set {env_var} in the environment"
+                    ) from None
+            raise
         choice = {"name": arguments.provider}
     else:
         provider, choice = _provider_for_start(_provider)
@@ -66,7 +135,10 @@ def _select_provider(arguments):  # noqa: ANN001
             base_url = None if choice is None else choice.get("base_url")
             provider = _provider(provider.name, arguments.model, base_url)
     if provider is None:
-        raise ProviderSelectionError("no configured provider; add an API key in Settings")
+        variables = ", ".join(dict.fromkeys(variable for _, variable, _ in PROVIDERS))
+        raise _HeadlessKeyError(
+            f"no API key found; set one of {variables} in the environment"
+        )
     choice = dict(choice or {"name": provider.name})
     choice["name"] = provider.name
     model = arguments.model if arguments.model is not None else choice.get("model")
@@ -77,10 +149,20 @@ def _select_provider(arguments):  # noqa: ANN001
     effort = arguments.effort if arguments.effort is not None else choice.get("effort")
     if effort is not None:
         choice["effort"] = effort
-    return provider, model, effort, choice
+    return _StatusCapturingProvider(provider), model, effort, choice
 
 
-def _wait_for_terminal(run, subscription, stream_json: bool) -> tuple[RunFinished | RunFailed, bool, str | None]:  # noqa: ANN001
+def _rejected_key_message(provider_name: str, status: int) -> str:
+    env_var = next(
+        (variable for name, variable, _ in PROVIDERS if name == provider_name),
+        "the configured environment variable",
+    )
+    return f"{provider_name} rejected the API key in {env_var} (HTTP {status})"
+
+
+def _wait_for_terminal(
+    run, subscription, stream_json: bool, provider=None, provider_name: str | None = None,  # noqa: ANN001
+) -> tuple[RunFinished | RunFailed, bool, str | None]:
     interrupted = False
     fallback_models = {}
     while True:
@@ -94,6 +176,8 @@ def _wait_for_terminal(run, subscription, stream_json: bool) -> tuple[RunFinishe
             continue
         if stream_json:
             encoded = encode_event(event)
+            if isinstance(event, RunFailed) and provider is not None and provider.key_error_status in (401, 403):
+                encoded["error"] = _rejected_key_message(provider_name or provider.name, provider.key_error_status)
             if encoded["type"] != "SessionStarted":
                 print(json.dumps(encoded, ensure_ascii=False), flush=True)
         if isinstance(event, ModelFallback):
@@ -221,7 +305,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
         if not (arguments.json or arguments.stream_json):
             print(f"Running session {session_id}", file=sys.stderr, flush=True)
         terminal, interrupted, fallback_model = _wait_for_terminal(
-            runtime.run, subscription, arguments.stream_json,
+            runtime.run, subscription, arguments.stream_json, provider, choice.get("name", provider.name),
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         stats = runtime.run.conversation_stats() or {}
@@ -244,6 +328,11 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
                 if status_before.get(path) != status_after.get(path)
             )
         error = terminal.error if isinstance(terminal, RunFailed) else None
+        key_error_status = provider.key_error_status
+        if error is not None and key_error_status in (401, 403):
+            selected_name = choice.get("name", provider.name)
+            error = _rejected_key_message(selected_name, key_error_status)
+            status = "failed"
         selection = runtime.run.selection() or {}
         result = {
             "session_id": session_id,
@@ -268,11 +357,11 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
         elif result_text:
             print(result_text, flush=True)
         if isinstance(terminal, RunFailed):
-            print(f"symphonai: {terminal.error}", file=sys.stderr, flush=True)
+            print(f"symphonai: {error}", file=sys.stderr, flush=True)
         if interrupted:
             return 130
         if isinstance(terminal, RunFailed):
-            return 1
+            return 2 if key_error_status in (401, 403) else 1
         return 0 if status == "finished" else 3
     finally:
         if subscription is not None:
@@ -295,6 +384,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command is None:
         parser.print_help()
         return 0
+    if arguments.command == "app":
+        return _run_app(arguments)
     task = arguments.task
     try:
         if task is None or task == "-":
@@ -304,6 +395,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not task.strip():
             raise _UsageError("task must not be empty")
         return _execute(arguments, task)
+    except _HeadlessKeyError as exc:
+        message = str(exc)
+        if arguments.json:
+            print(json.dumps({"status": "failed", "error": message}, ensure_ascii=False), flush=True)
+        elif arguments.stream_json:
+            print(json.dumps({"type": "result", "status": "failed", "error": message}, ensure_ascii=False), flush=True)
+        print(f"symphonai: {message}", file=sys.stderr)
+        return 2
     except (ConfigError, CredentialError, McpError, ModeSelectionError, ProviderSelectionError,
             SessionError, OSError, ValueError) as exc:
         print(f"symphonai: {exc}", file=sys.stderr)

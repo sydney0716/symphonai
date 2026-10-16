@@ -1567,3 +1567,20 @@ def check_discarding_work_is_refused() -> None:
                         "git restore -Sq src/a.py", "git checkout release/1.2", "cd src && git checkout main"):
             if not policy.check_shell(["bash", "-c", command]).allowed:
                 fail(f"non-discarding command was refused: {command!r}")
+
+
+@check("permissions.paths_resolve_from_the_shell_cwd")
+def check_shell_paths_resolve_from_cwd() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        src = root / "src"
+        src.mkdir()
+        (src / "a.py").touch()
+        policy = PermissionPolicy(root, mode="allow", shell_enabled=True, shell_allowlist=[()])
+        decision = policy.check_shell(["git", "checkout", "a.py"], cwd=src)
+        expected = "this would discard uncommitted work (checkout); change the files with edits instead, or ask the person"
+        if decision.allowed or decision.reason != expected:
+            fail(f"relative checkout in src was not refused: {decision!r}")
+        root_decision = policy.check_shell(["git", "checkout", "a.py"])
+        if not root_decision.allowed:
+            fail(f"root checkout with no root a.py was refused: {root_decision!r}")

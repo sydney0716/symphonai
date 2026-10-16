@@ -319,7 +319,7 @@ export function fakeClient(
     specFilesFailure = false,
   } = {},
 ) {
-  const calls = { agent: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
   let eventCallback;
@@ -557,6 +557,14 @@ export function fakeClient(
       calls.openSession.push(runId);
       calls.projectActions.push(["openSession", runId]);
       return { run_id: runId };
+    },
+    async agentHistory(sessionId, agentId) {
+      calls.agentHistory.push([sessionId, agentId]);
+      return {
+        session_id: sessionId,
+        agent_id: agentId,
+        messages: [],
+      };
     },
     async forkSession(runId, recordId, force = false) {
       calls.forkSession.push([runId, recordId, ...(force ? [true] : [])]);
@@ -2358,6 +2366,102 @@ test("conversation context and per-agent usage render and refresh after compacti
   await client.emit(eventFrame("RunFinished", { agent_id: "leader-id" }));
   assert.equal(usage.textContent, "");
   assert.equal(client.calls.conversationStats, 2);
+});
+
+test("Agents rows open a read-only subagent transcript and keep live events scoped", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient("", { conversation: {
+    session_id: "run-agent-view",
+    agents: [
+      { agent_id: "leader-view", name: "leader", parent_agent_id: null, state: "running" },
+      { agent_id: "explorer-view", name: "explorer", parent_agent_id: "leader-view", state: "running" },
+    ],
+  } });
+  client.agentHistory = async (sessionId, agentId) => {
+    client.calls.agentHistory.push([sessionId, agentId]);
+    return {
+      session_id: sessionId,
+      agent_id: agentId,
+      messages: [
+        { role: "user", text: "explore the code", tool_calls: [], turn_id: "turn-explorer" },
+        { role: "assistant", text: "Explorer read the files.", tool_calls: [], turn_id: "turn-explorer" },
+      ],
+    };
+  };
+  const native = fakeGlobal();
+  const app = await start({ global: native.global, document, client });
+  await client.emit(eventFrame("RunStarted", {
+    agent_id: "leader-view", session_id: "run-agent-view", agent_name: "leader",
+  }));
+  await client.emit(eventFrame("AssistantTextDelta", {
+    agent_id: "leader-view", session_id: "run-agent-view", text: "Leader transcript stays here.",
+  }));
+  const leaderRow = find(document.getElementById("agents"), (row) =>
+    row.className === "agent-row" && agentRowText(row).startsWith("leader"));
+  const explorerRow = find(document.getElementById("agents"), (row) =>
+    row.className === "agent-row" && agentRowText(row).startsWith("explorer"));
+  assert.ok(leaderRow);
+  assert.ok(explorerRow);
+  assert.equal(leaderRow.attributes.get("role"), undefined);
+  assert.equal(leaderRow.tabIndex, undefined);
+  const leaderModel = JSON.stringify(app.transcript.model);
+  const chat = document.getElementById("chat");
+  chat.scrollTop = 25;
+  chat.scrollHeight = 100;
+  chat.clientHeight = 50;
+
+  await explorerRow.dispatch("click", { stopPropagation() {} });
+  assert.deepEqual(client.calls.agentHistory, [["run-agent-view", "explorer-view"]]);
+  assert.equal(document.getElementById("prompt-form").hidden, true);
+  assert.match(visibleText(document.getElementById("chat-pane")), /explore the code/);
+  assert.match(visibleText(document.getElementById("chat-pane")), /Explorer read the files\./);
+  assert.doesNotMatch(visibleText(document.getElementById("chat-pane")), /Leader transcript stays here/);
+  assert.equal(JSON.stringify(app.transcript.model), leaderModel);
+
+  await client.emit(eventFrame("AssistantTextDelta", {
+    agent_id: "explorer-view", session_id: "run-agent-view", text: "live explorer detail",
+  }));
+  await client.emit(eventFrame("AssistantTextDelta", {
+    agent_id: "leader-view", session_id: "run-agent-view", text: "live leader detail",
+  }));
+  assert.match(visibleText(chat), /live explorer detail/);
+  assert.doesNotMatch(visibleText(chat), /live leader detail/);
+
+  const back = find(document.getElementById("chat-pane"), (node) =>
+    node.tagName === "BUTTON" && node.textContent === "Back to conversation");
+  await back.dispatch("click");
+  assert.equal(document.getElementById("prompt-form").hidden, false);
+  assert.equal(chat.scrollTop, 25);
+  assert.match(visibleText(chat), /Leader transcript stays here/);
+
+  await explorerRow.dispatch("keydown", {
+    key: "Enter", preventDefault() {}, stopPropagation() {},
+  });
+  assert.equal(client.calls.agentHistory.length, 2);
+  await native.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(document.getElementById("prompt-form").hidden, false);
+
+  await leaderRow.dispatch("click", { stopPropagation() {} });
+  assert.equal(client.calls.agentHistory.length, 2);
+});
+
+test("failed agent history loads stay in the view with a return action", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient("", { conversation: {
+    session_id: "run-agent-error",
+    agents: [
+      { agent_id: "leader-error", name: "leader", parent_agent_id: null },
+      { agent_id: "worker-error", name: "worker", parent_agent_id: "leader-error" },
+    ],
+  } });
+  client.agentHistory = async () => { throw new Error("history unavailable"); };
+  await start({ global: {}, document, client });
+  const worker = find(document.getElementById("agents"), (row) =>
+    row.className === "agent-row" && agentRowText(row).startsWith("worker"));
+  await worker.dispatch("click", { stopPropagation() {} });
+  assert.match(visibleText(document.getElementById("chat")), /Could not load worker's conversation: history unavailable/);
+  assert.ok(find(document.getElementById("chat-pane"), (node) =>
+    node.tagName === "BUTTON" && node.textContent === "Back to conversation"));
 });
 
 test("context command shows the measured source breakdown and model window", async () => {
@@ -4815,6 +4919,71 @@ test("model settings save and remove a key without displaying its value", async 
   assert.deepEqual(client.calls.credentials.at(-1), { name: "OPENAI_API_KEY", value: "" });
   assert.equal(status.textContent, "absent");
   assert.equal(walk(document.getElementById("prompt-form")).some((node) => node.tagName === "SELECT"), false);
+});
+
+test("empty chat links to Models when no provider key is configured", async () => {
+  const settings = { settings: { providers: [
+    { name: "openai", env_var: "OPENAI_API_KEY", key_present: false },
+  ] } };
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  await start({ global: browser.global, document, client: fakeClient(fixtureRoadmap(), { settings }) });
+
+  const notice = find(document.getElementById("chat-pane"), (value) => value.className === "missing-key-notice");
+  assert.match(visibleText(notice), /Add an API key to start:\s+Settings › Models\s+\./);
+  await find(notice, (value) => value.tagName === "A").dispatch("click");
+  assert.equal(browser.global.location.hash, "#/settings/models");
+  assert.equal(find(document.getElementById("page"), (value) => value.tagName === "H2").textContent, "Models");
+
+  const keyedDocument = new FakeDocument();
+  await start({
+    global: fakeGlobal().global,
+    document: keyedDocument,
+    client: fakeClient(fixtureRoadmap(), {
+      settings: { settings: { providers: [
+        { name: "openai", env_var: "OPENAI_API_KEY", key_present: true },
+      ] } },
+    }),
+  });
+  assert.equal(find(keyedDocument.getElementById("chat-pane"), (value) => value.className === "missing-key-notice").hidden, true);
+});
+
+test("sending without a provider key adds a link to Models", async () => {
+  const document = new FakeDocument();
+  await start({
+    global: fakeGlobal().global,
+    document,
+    client: fakeClient(fixtureRoadmap(), {
+      settings: { settings: { providers: [
+        { name: "openai", env_var: "OPENAI_API_KEY", key_present: false },
+      ] } },
+    }),
+  });
+  document.getElementById("prompt").value = "hello";
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  const error = document.getElementById("prompt-error");
+  assert.equal(error.textContent, "Add an API key in Settings before sending a message.");
+  const link = find(error, (value) => value.tagName === "A");
+  assert.equal(link.textContent, "Settings › Models");
+});
+
+test("failed key saves show the host error", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { providers: [
+      { name: "openai", env_var: "OPENAI_API_KEY", key_present: false },
+    ] } },
+  });
+  client.storeCredential = async () => {
+    throw new Error("credential store unavailable for OPENAI_API_KEY");
+  };
+  await start({ global: fakeGlobal({ fragment: "#/settings/models" }).global, document, client });
+  const controls = find(document.getElementById("page"), (value) => value.className === "credential-controls");
+  find(controls, (value) => value.tagName === "INPUT").value = "fixture-key";
+  await find(controls, (value) => value.tagName === "BUTTON" && value.textContent === "Save").dispatch("click");
+  assert.equal(find(controls, (value) => value.tagName === "SPAN").textContent,
+    "Could not save the key: credential store unavailable for OPENAI_API_KEY");
 });
 
 test("credential client sends the value only in an authenticated POST body", async () => {

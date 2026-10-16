@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -1424,6 +1425,8 @@ class HostRun:
             skills=skills,
             lsp=self._lsp,
             jobs=jobs,
+            model_override=self._model,
+            use_routine_model=self._model is None,
         )
         if self._extensions is not None:
             roster.update(self._extensions.agents)
@@ -1780,6 +1783,50 @@ class HostRun:
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
         }
+
+    def agent_history(self, session_id: str, agent_id: str) -> dict:
+        """Return one subagent's display-safe transcript without publishing it."""
+        if re.fullmatch(r"run_[0-9a-f]{32}", session_id) is None:
+            raise SessionError("session not found")
+        if re.fullmatch(r"agent_[0-9a-f]{32}", agent_id) is None:
+            raise SessionError("agent not found")
+        reader = SessionStore.open(self._sessions_root, session_id)
+        try:
+            loaded = load_run(reader, agent_id=agent_id)
+            if loaded.agent_id != agent_id:
+                raise SessionError("agent not found")
+            records, _ = read_records(reader.directory / f"agent-{agent_id}.jsonl")
+            tool_results = self._replay_tool_results(loaded.messages)
+            replay_turns = self._turn_replay_data(records)
+            messages = []
+            for message, record_id in zip(loaded.messages, loaded.record_ids):
+                turn = replay_turns.get(record_id, {})
+                messages.append(HistoryMessage(
+                    role=message.role.value,
+                    text=message.text,
+                    tool_calls=self._replay_tool_calls(message, tool_results),
+                    turn_id=message.turn_id,
+                    attachments=[
+                        {
+                            "kind": "image" if isinstance(block, ImageBlock) else "document",
+                            "media_type": block.media_type,
+                            "filename": block.filename if isinstance(block, DocumentBlock) else None,
+                        }
+                        for block in message.content
+                        if isinstance(block, (ImageBlock, DocumentBlock))
+                    ],
+                    session_id=session_id,
+                    turn_started_at=turn.get("turn_started_at"),
+                    turn_ended_at=turn.get("turn_ended_at"),
+                    turn_outcome=turn.get("turn_outcome"),
+                ).payload())
+            return {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "messages": messages,
+            }
+        finally:
+            reader.close()
 
     def fork_session(self, run_id: str, record_id: str, *, force: bool = False) -> dict:
         """Restore the file state at a message prefix, then reopen its fork."""

@@ -9,11 +9,13 @@ A denied command returns `ToolResult(ok=False, ...)` without ever touching
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
@@ -29,6 +31,7 @@ from symphonai_api.tools.shell_parse import commands_for_argv, parse_command_lin
 CANCEL_POLL_SECONDS = 0.05
 CLEANUP_TIMEOUT_SECONDS = 1.0
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+BWRAP_EXEC = "bwrap"
 
 
 def shell_executable() -> str:
@@ -88,7 +91,29 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+@lru_cache(maxsize=1)
+def _linux_sandbox_available() -> bool:
+    if shutil.which(BWRAP_EXEC) is None:
+        return False
+    try:
+        probe = subprocess.run(
+            [
+                BWRAP_EXEC, "--ro-bind", "/", "/", "--dev", "/dev",
+                "--proc", "/proc", "/bin/true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
 def _sandbox_available() -> bool:
+    if sys.platform == "linux":
+        return _linux_sandbox_available()
     if sys.platform != "darwin" or not os.path.isfile(SANDBOX_EXEC):
         return False
     try:
@@ -104,11 +129,32 @@ def _sandbox_available() -> bool:
     return probe.returncode == 0
 
 
+def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None = None) -> list[str]:
+    root = str(policy.repo_root.resolve())
+    working_directory = root if cwd is None else str(cwd.resolve())
+    temporary = os.path.realpath(os.environ.get("TMPDIR", tempfile.gettempdir()))
+    command = [
+        BWRAP_EXEC,
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--bind", root, root,
+        "--bind", temporary, temporary,
+        "--bind", "/tmp", "/tmp",
+    ]
+    if not policy.sandbox_network:
+        # Each call gets its own loopback; only server and client in one command can connect.
+        command.append("--unshare-net")
+    command.extend(("--die-with-parent", "--chdir", working_directory, "--", *argv))
+    return command
+
+
 class RunShellTool(LocalTool):
     """Run an allowlisted command line or argv list and return its output."""
 
     def __init__(self, jobs: JobManager | None = None) -> None:
         self._jobs = jobs
+        self._cwd: Path | None = None
 
     @property
     def name(self) -> str:
@@ -214,6 +260,13 @@ class RunShellTool(LocalTool):
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
+        root = policy.repo_root.resolve()
+        cwd = self._cwd or root
+        reset_message = ""
+        if not cwd.is_dir() or not cwd.is_relative_to(root):
+            cwd = root
+            reset_message = "Shell working directory reset to the project root."
+        self._cwd = cwd
         command_line = tool_call.arguments.get("command")
         if isinstance(command_line, str):
             argv = [shell_executable(), "-c", command_line]
@@ -223,10 +276,17 @@ class RunShellTool(LocalTool):
             tool_call.arguments.get("timeout_seconds") or 120,
             policy.shell_timeout_seconds,
         )
-        decision = policy.check_shell(argv)
+        decision = policy.check_shell(argv, cwd=cwd)
         if not decision.allowed:
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
+            error = decision.reason + (f"\n{reset_message}" if reset_message else "")
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=error)
         command = argv
+        cwd_marker = f"\036SYMPHONAI_CWD_{os.urandom(12).hex()}_"
+        if isinstance(command_line, str) and tool_call.arguments.get("background") is not True:
+            command = [
+                shell_executable(), "-c",
+                f"{command_line}\n__symphonai_status=$?; printf '{cwd_marker}%s\\037' \"$PWD\"; exit \"$__symphonai_status\"",
+            ]
         sandbox_available = _sandbox_available()
         if policy.shell_sandbox and not sandbox_available:
             return ToolResult(
@@ -235,7 +295,10 @@ class RunShellTool(LocalTool):
                 error="sandbox requested but unavailable on this platform",
             )
         if policy.shell_sandbox or (policy.mode == "allow" and sandbox_available):
-            command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
+            if sys.platform == "linux":
+                command = _bwrap_command(policy, command, cwd)
+            else:
+                command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *command]
         env = shell_environment(policy.repo_root)
         if tool_call.arguments.get("background") is True:
             if self._jobs is None:
@@ -246,7 +309,7 @@ class RunShellTool(LocalTool):
                 )
             try:
                 job_id = self._jobs.start(
-                    command, str(policy.repo_root), env,
+                    command, str(cwd), env,
                     label=call_target("run_shell", tool_call.arguments),
                 )
             except RuntimeError as exc:
@@ -260,7 +323,7 @@ class RunShellTool(LocalTool):
             proc = subprocess.Popen(
                 command,
                 shell=False,
-                cwd=policy.repo_root,
+                cwd=cwd,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -296,13 +359,32 @@ class RunShellTool(LocalTool):
                     continue
         except (OSError, subprocess.TimeoutExpired) as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=f"error running command: {exc}")
-        output = (stdout or "") + (stderr or "")
+        stdout = stdout or ""
+        if isinstance(command_line, str):
+            marker_at = stdout.rfind(cwd_marker)
+            if marker_at >= 0 and stdout.endswith("\x1f"):
+                captured = stdout[marker_at + len(cwd_marker):-1]
+                stdout = stdout[:marker_at]
+                ended = Path(captured).resolve()
+                if ended.is_dir() and ended.is_relative_to(root):
+                    self._cwd = ended
+                else:
+                    self._cwd = root
+                    reset_message = "Shell working directory reset to the project root."
+        if not self._cwd.is_dir() or not self._cwd.is_relative_to(root):
+            self._cwd = root
+            reset_message = "Shell working directory reset to the project root."
+        output = stdout + (stderr or "")
+        if self._cwd != root:
+            output = f"(in {self._cwd.relative_to(root)})\n" + output
         limit = policy.shell_output_limit_chars
         if len(output) > limit:
             output = (
                 output[:limit]
                 + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
             )
+        if reset_message:
+            output = (output + "\n" if output else "") + reset_message
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=proc.returncode == 0,

@@ -10,7 +10,7 @@ import threading
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
-from symphonai_api.paths import symphonai_home
+from symphonai_api.paths import ensure_private_directory, symphonai_home
 
 
 class CredentialError(ValueError):
@@ -63,13 +63,15 @@ def store(name: str, value: str, path: Path | None = None) -> None:
     target = _path(path)
     with _write_lock:
         try:
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            ensure_private_directory(target.parent)
             parent_metadata = target.parent.lstat()
             if not stat.S_ISDIR(parent_metadata.st_mode):
                 raise CredentialError("credentials directory is not a directory")
+            if parent_metadata.st_uid != os.getuid():
+                raise CredentialError("credentials directory is not owned by the current user")
             parent_mode = stat.S_IMODE(parent_metadata.st_mode)
             if parent_mode & ~0o700:
-                raise CredentialError(f"credentials directory mode {parent_mode:04o} is wider than 0700")
+                target.parent.chmod(0o700)
             keys = load(target)
             if value:
                 keys[name] = value

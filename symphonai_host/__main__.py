@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import signal
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,7 +37,11 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    on_started: Callable[[str], None] | None = None,
+) -> None:
     arguments = _arguments(argv)
     try:
         apply_to_environment(os.environ, load())
@@ -122,7 +128,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
-        host.print_handshake()
+        if on_started is None:
+            host.print_handshake()
+        else:
+            with contextlib.redirect_stderr(io.StringIO()):
+                host.print_handshake()
+        if on_started is not None:
+            handshake = host.handshake()
+            address = f"http://127.0.0.1:{handshake['port']}/app/?token={handshake['token']}"
+            on_started(address)
         host.serve_forever()
     except ModeSelectionError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

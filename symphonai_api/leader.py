@@ -81,6 +81,21 @@ from symphonai_api.models import ContentInput, Message, ModelRequest, Role, Tool
 from symphonai_api.memory_extract import MemoryExtractor
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
+from symphonai_api.providers.anthropic_provider import (
+    DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL,
+    AnthropicProvider,
+    ROUTINE_MODEL as ANTHROPIC_ROUTINE_MODEL,
+)
+from symphonai_api.providers.gemini_provider import (
+    DEFAULT_MODEL as GEMINI_DEFAULT_MODEL,
+    GeminiProvider,
+    ROUTINE_MODEL as GEMINI_ROUTINE_MODEL,
+)
+from symphonai_api.providers.openai_provider import (
+    DEFAULT_MODEL as OPENAI_DEFAULT_MODEL,
+    OpenAIProvider,
+    ROUTINE_MODEL as OPENAI_ROUTINE_MODEL,
+)
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.roles import IMPLEMENTER_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT
 from symphonai_api.session import SessionStore, TranscriptError, load_run, read_records
@@ -92,6 +107,7 @@ from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
 
@@ -186,17 +202,29 @@ def builtin_subagent_specs(
     skills: Mapping[str, Skill] | None = None,
     lsp: LspManager | None = None,
     jobs: JobManager | None = None,
+    *,
+    model_override: str | None = None,
+    use_routine_model: bool = False,
 ) -> dict[str, AgentSpec]:
     job_tools = ("job_output", "job_stop") if jobs is not None else ()
-    selector = ModelSelector(
-        provider=getattr(provider, "name", None) or "unknown",
-        model=getattr(provider, "model", None),
-    )
+    provider_name = getattr(provider, "name", None) or "unknown"
+
+    def selector(name: str) -> ModelSelector:
+        model = model_override or getattr(provider, "model", None)
+        if model_override is None and use_routine_model and name in {
+            "worker", "explorer", "implementer", "reviewer",
+        }:
+            routine_model = getattr(provider, "ROUTINE_MODEL", None)
+            if routine_model is None:
+                routine_model = _provider_routine_model(provider)
+            model = routine_model or model
+        return ModelSelector(provider=provider_name, model=model)
+
     specs = {
         name: AgentSpec(
             name=name,
             prompt="",
-            model=selector,
+            model=selector(name),
             policy_ceiling=policy,
             tool_names=tools,
             mcp_tool_names=None if name == "worker" else (),
@@ -216,21 +244,21 @@ def builtin_subagent_specs(
     optional = (("web_search",) if search_backend is not None else ()) + (("use_skill",) if skills else ())
     specs.update({
         "planner": AgentSpec(
-            name="planner", prompt=PLANNER_PROMPT, model=selector,
+            name="planner", prompt=PLANNER_PROMPT, model=selector("planner"),
             policy_ceiling=policy,
             tool_names=EXPLORER_TOOL_NAMES + ("write_file", "edit_file") + optional,
             mcp_tool_names=(),
             call_class=CallClass.BACKGROUND,
         ),
         "implementer": AgentSpec(
-            name="implementer", prompt=IMPLEMENTER_PROMPT, model=selector,
+            name="implementer", prompt=IMPLEMENTER_PROMPT, model=selector("implementer"),
             policy_ceiling=policy,
             tool_names=tuple(standard_tool_registry(search_backend=search_backend, skills=skills, lsp=lsp, jobs=jobs)),
             mcp_tool_names=None,
             call_class=CallClass.BACKGROUND,
         ),
         "reviewer": AgentSpec(
-            name="reviewer", prompt=REVIEWER_PROMPT, model=selector,
+            name="reviewer", prompt=REVIEWER_PROMPT, model=selector("reviewer"),
             policy_ceiling=policy,
             tool_names=EXPLORER_TOOL_NAMES + ("run_shell", "write_file") + optional + job_tools,
             mcp_tool_names=(),
@@ -238,6 +266,26 @@ def builtin_subagent_specs(
         ),
     })
     return specs
+
+
+def _provider_routine_model(provider: ModelProvider) -> str | None:
+    if isinstance(provider, AnthropicProvider):
+        return ANTHROPIC_ROUTINE_MODEL
+    if isinstance(provider, OpenAIProvider):
+        return OPENAI_ROUTINE_MODEL
+    if isinstance(provider, GeminiProvider):
+        return GEMINI_ROUTINE_MODEL
+    return None
+
+
+def _provider_default_model(provider: ModelProvider) -> str | None:
+    if isinstance(provider, AnthropicProvider):
+        return ANTHROPIC_DEFAULT_MODEL
+    if isinstance(provider, OpenAIProvider):
+        return OPENAI_DEFAULT_MODEL
+    if isinstance(provider, GeminiProvider):
+        return GEMINI_DEFAULT_MODEL
+    return getattr(provider, "DEFAULT_MODEL", None)
 
 class _LeaderEventSink:
     """Fan out events and preserve parent identity for subagent spawning."""
@@ -558,12 +606,22 @@ class DispatchSubagentTool(LocalTool):
         if self._subagent_specs is not None:
             return self._subagent_specs.get(subagent_name)
         provider_name = getattr(self._subagent_provider, "name", None) or "unknown"
+        model = getattr(self._subagent_provider, "model", None)
+        if (
+            subagent_name in {"worker", "explorer", "implementer", "reviewer"}
+            and model == _provider_default_model(self._subagent_provider)
+        ):
+            model = (
+                getattr(self._subagent_provider, "ROUTINE_MODEL", None)
+                or _provider_routine_model(self._subagent_provider)
+                or model
+            )
         return AgentSpec(
             name=subagent_name,
             prompt="",
             model=ModelSelector(
                 provider=provider_name,
-                model=getattr(self._subagent_provider, "model", None),
+                model=model,
             ),
             policy_ceiling=self._leader_policy,
             tool_names=self._subagent_tool_names,
@@ -813,9 +871,11 @@ class DispatchSubagentTool(LocalTool):
                 if spec.memory.enabled and self._memory is not None
                 else None
             )
+            read_ledger = ReadLedger()
             standard_tools = (
                 standard_tool_registry(
                     tool_names,
+                    ledger=read_ledger,
                     result_store=self._result_store,
                     search_backend=self._search_backend,
                     memory_tool=memory_tool,
@@ -851,6 +911,7 @@ class DispatchSubagentTool(LocalTool):
                     events=self._events,
                     stream=self._stream,
                     result_store=self._result_store,
+                    read_ledger=read_ledger,
                     budget=spec.budget,
                     call_class=spec.call_class,
                     transcript=(
@@ -1331,9 +1392,11 @@ class Leader:
             and (defined_leader is None or defined_leader.memory.enabled)
             else None
         )
+        read_ledger = ReadLedger()
         standard_tools = merge_tool_registry(
             standard_tool_registry(
                 tool_names,
+                ledger=read_ledger,
                 result_store=config.result_store,
                 search_backend=config.search_backend,
                 memory_tool=leader_memory_tool,
@@ -1394,6 +1457,7 @@ class Leader:
             events=self._event_sink,
             stream=config.stream,
             result_store=config.result_store,
+            read_ledger=read_ledger,
             call_class=CallClass.FOREGROUND,
             transcript=(
                 self._transcript

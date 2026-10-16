@@ -49,6 +49,7 @@ from symphonai_api.streaming import (
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-6.1-sol"
+ROUTINE_MODEL = "gpt-5.5"
 
 _ROLE_TO_OPENAI = {
     Role.SYSTEM: "system",

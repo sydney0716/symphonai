@@ -44,23 +44,23 @@ an item puts the spec next to the report that came back.
 ## Running it
 
 Python 3.11 or later and Node 18 or later. Node's built-in test runner checks
-the JavaScript app, so there is no npm install. API keys are read from the
-environment, never from a file in the repository.
+the JavaScript app, so there is no npm install. Install from a checkout with
+`pip install .` (or `pip install -e .` for development). API keys come from the
+environment or Settings › Models, never from a file in the repository.
 
 ```bash
 python3 scripts/check.py                 # the check suite (--only selects a subset)
+pip install .                            # install from this checkout
+pip install -e .                         # editable install for development
 pip install -e ".[tui]"                  # optional Textual UI
 python3 scripts/tui.py                   # run it
-python3 -m symphonai_host --provider openai   # the host, for the browser app
+symphonai app                            # open the app for the current project
+symphonai app --repo-root /work/project --no-open  # print its address without opening a browser
+python3 -m symphonai_host                # development entry point for the host
 ```
 
-The host prints a JSON handshake with `port` and `token` on its first line. Open
-`http://127.0.0.1:<port>/app?token=<token>` with those values. The query token
-works only for that first navigation. Later page requests use a session cookie
-scoped to `/app/`, and data and control requests authenticate by header. The
-host serves the app from the sibling `symphonai_app/` directory. Installed
-without it, it returns `app is not installed` rather than files from your
-project.
+For development and desktop-shell integration, `python3 -m symphonai_host`
+keeps its stdout JSON handshake as the contract used by the shell and scripts.
 
 ### Run without the app
 
@@ -141,16 +141,20 @@ the spec                     the report
 
 ## 실행 방법
 
-Python 3.11 이상 및 Node 18 이상 환경이 필요합니다. JavaScript 앱은 Node의 내장 테스트 러너로 검증하므로 별도의 `npm install` 과정이 필요하지 않습니다. API 키는 저장소 파일이 아닌 환경 변수에서 읽어옵니다.
+Python 3.11 이상 및 Node 18 이상 환경이 필요합니다. JavaScript 앱은 Node의 내장 테스트 러너로 검증하므로 별도의 `npm install` 과정이 필요하지 않습니다. 체크아웃에서 `pip install .`로 설치하고, 개발 중에는 `pip install -e .`를 사용합니다. API 키는 환경 변수 또는 설정 › 모델에서 관리하며 저장소 파일에서는 읽지 않습니다.
 
 ```bash
 python3 scripts/check.py                 # 전체 검사 스위트 실행 (--only 옵션으로 일부 선택 가능)
+pip install .                            # 현재 체크아웃에서 설치
+pip install -e .                         # 개발용 editable 설치
 pip install -e ".[tui]"                  # 선택 사항: Textual UI 설치
 python3 scripts/tui.py                   # TUI 실행
-python3 -m symphonai_host --provider openai   # 브라우저 앱용 호스트 실행
+symphonai app                            # 현재 프로젝트의 앱을 브라우저에서 열기
+symphonai app --repo-root /work/project --no-open  # 브라우저를 열지 않고 주소 출력
+python3 -m symphonai_host                # 개발용 호스트 진입점
 ```
 
-호스트를 실행하면 첫 줄에 `port`와 `token`이 포함된 JSON 핸드셰이크가 출력됩니다. 해당 값을 확인한 뒤 `http://127.0.0.1:<port>/app?token=<token>` 주소로 접속합니다. 쿼리 파라미터의 토큰은 최초 접속 시에만 사용되며, 이후의 페이지 요청은 `/app/` 범위로 제한된 세션 쿠키를 사용하고 데이터 및 제어 요청은 헤더 인증을 거칩니다. 호스트는 동일 경로상의 `symphonai_app/` 디렉터리에서 웹 앱을 서빙합니다. 해당 디렉터리 없이 설치된 환경에서는 프로젝트 내부 파일을 노출하는 대신 `app is not installed` 오류를 반환합니다.
+개발 및 데스크톱 셸 연동에서는 `python3 -m symphonai_host`를 사용하며 stdout의 JSON 핸드셰이크는 셸과 스크립트가 사용하는 계약입니다.
 
 ### 데스크톱 셸
 

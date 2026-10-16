@@ -713,6 +713,160 @@ def check_spec_plan_binds_one_new_spec() -> None:
             host.close()
 
 
+@check("host_server.spec_roles_use_the_routine_model")
+def check_spec_roles_use_the_routine_model() -> None:
+    class RecordingProvider(FakeModelProvider):
+        model = "claude-opus-5-5"
+        DEFAULT_MODEL = "claude-opus-5-5"
+        ROUTINE_MODEL = "claude-sonnet-5-5"
+
+        def __init__(self) -> None:
+            super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            self.requested_models: list[str | None] = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requested_models.append(request.model)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = RecordingProvider()
+        run = HostRun(
+            provider, PermissionPolicy(root), EventBroker(),
+            sessions_root=root / "sessions", memory_extraction_enabled=False,
+        )
+        try:
+            for role, expected in (
+                ("implementer", "claude-sonnet-5-5"),
+                ("reviewer", "claude-sonnet-5-5"),
+                ("planner", "claude-opus-5-5"),
+            ):
+                session = SessionStore(
+                    root / "sessions", f"role-{role}", repo_root=root,
+                )
+                meta = session.read_meta()
+                meta["spec_run"] = {"role": role}
+                session.write_meta(meta)
+                try:
+                    leader = run._new_leader(session)
+                    leader.run(f"run {role}")
+                finally:
+                    session.close()
+                if provider.requested_models[-1] != expected:
+                    fail(
+                        f"spec {role} used {provider.requested_models[-1]!r}; "
+                        f"expected {expected!r}"
+                    )
+        finally:
+            run.close()
+
+
+@check("host_server.agent_history_route")
+def check_agent_history_route() -> None:
+    class BlockingProvider(FakeModelProvider):
+        def __init__(self) -> None:
+            super().__init__([
+                ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                    "dispatch", "dispatch_subagent", {
+                        "subagent_name": "explorer",
+                        "task": "inspect live explorer history",
+                    },
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                    "files", "list_files", {"path": "."},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "explorer finished")),
+                ModelResponse(Message(Role.ASSISTANT, "leader finished")),
+            ])
+            self.explorer_started = threading.Event()
+            self.release_explorer = threading.Event()
+
+        def create_response(self, request, *, cancel=None):
+            latest_user = next(
+                (message.text for message in reversed(request.messages) if message.role is Role.USER),
+                "",
+            )
+            if latest_user == "inspect live explorer history" and not self.explorer_started.is_set():
+                self.explorer_started.set()
+                if not self.release_explorer.wait(5):
+                    raise RuntimeError("explorer test gate timed out")
+            return super().create_response(request, cancel=cancel)
+
+    provider = BlockingProvider()
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = _host(provider, repo_root=root, sessions_root=root / "sessions")
+        try:
+            connection, response = _request(
+                host, "POST", "/prompt", body={"prompt": "dispatch explorer now"},
+                headers=_headers(host),
+            )
+            response.read()
+            connection.close()
+            if not provider.explorer_started.wait(3):
+                fail("explorer did not enter its blocked model request")
+            conversation = host.run.conversation_stats()
+            if conversation is None:
+                fail("running conversation disappeared")
+            explorer = next(
+                (agent for agent in conversation["agents"] if agent["name"] == "explorer"),
+                None,
+            )
+            if explorer is None:
+                fail(f"running explorer was not listed: {conversation!r}")
+            session_id = conversation["session_id"]
+            agent_id = explorer["agent_id"]
+            subscription = host.broker.subscribe()
+            try:
+                path = "/session/agent?" + urlencode({
+                    "session_id": session_id, "agent_id": agent_id,
+                })
+                connection, response = _request(host, "GET", path, headers=_headers(host))
+                partial = json.loads(response.read())
+                connection.close()
+                if response.status != 200 or not partial["messages"] or (
+                    partial["messages"][0]["role"], partial["messages"][0]["text"]
+                ) != ("user", "inspect live explorer history"):
+                    fail(f"running history did not return the explorer task: {partial!r}")
+                if subscription.get(timeout=0.02) is not None:
+                    fail("agent history GET published an event")
+            finally:
+                subscription.close()
+                provider.release_explorer.set()
+            _wait_until(lambda: not host.run.active, "explorer conversation did not finish")
+            path = "/session/agent?" + urlencode({
+                "session_id": session_id, "agent_id": agent_id,
+            })
+            connection, response = _request(host, "GET", path, headers=_headers(host))
+            history = json.loads(response.read())
+            connection.close()
+            messages = history.get("messages", [])
+            if response.status != 200 or not messages or messages[0]["text"] != "inspect live explorer history":
+                fail(f"closed history did not start with the explorer task: {history!r}")
+            tool_calls = [call for message in messages for call in message["tool_calls"]]
+            if not any(call["name"] == "list_files" and call.get("output") for call in tool_calls):
+                fail(f"explorer tool call/result was not replayed: {history!r}")
+            if not any(message["text"] == "explorer finished" for message in messages):
+                fail(f"explorer final answer was not replayed: {history!r}")
+            if any(message["text"] == "leader finished" for message in messages):
+                fail("leader transcript leaked into the explorer history")
+            for query in (
+                {"session_id": session_id, "agent_id": "../run"},
+                {"session_id": session_id, "agent_id": "agent_00000000000000000000000000000000"},
+                {"session_id": "run_00000000000000000000000000000000", "agent_id": agent_id},
+            ):
+                connection, response = _request(
+                    host, "GET", "/session/agent?" + urlencode(query), headers=_headers(host),
+                )
+                response.read()
+                connection.close()
+                if response.status != 404:
+                    fail(f"invalid/unknown agent history query was not 404: {query!r}")
+        finally:
+            provider.release_explorer.set()
+            host.close()
+
+
 @check("host_server.spec_plan_records_zero_and_multiple_specs_without_binding")
 def check_spec_plan_records_zero_and_multiple_specs_without_binding() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -5091,7 +5245,10 @@ def check_goal_rounds_until_check_passes() -> None:
             check_events = []
             goal_events = []
             while len(check_events) < 3:
-                kind, payload = _next_sse(connection, response, timeout=5)
+                frame = _next_sse(connection, response, timeout=5)
+                if frame == "keepalive":
+                    continue
+                kind, payload = frame
                 if kind != "event":
                     continue
                 seen.append(payload.get("type"))
@@ -11544,6 +11701,148 @@ def _headless_invoke(root: Path, provider, arguments: list[str], *, stdin_text: 
                 with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     code = headless_module.main(arguments)
     return code, stdout.getvalue(), stderr.getvalue(), sessions
+
+
+@check("host_server.headless_key_errors")
+def check_headless_key_errors() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        home = root.parent / "home"
+        sessions = root.parent / "sessions"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {
+            "SYMPHONAI_HOME": str(home), "SYMPHONAI_SESSIONS_DIR": str(sessions),
+        }):
+            with mock.patch.object(headless_module, "_provider_for_start", return_value=(None, None)):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = headless_module.main([
+                        "run", "no key", "--json", "--repo-root", str(root),
+                    ])
+        message = "no API key found; set one of " + ", ".join(
+            dict.fromkeys(variable for _, variable, _ in headless_module.PROVIDERS)
+        ) + " in the environment"
+        if (code != 2 or json.loads(stdout.getvalue()) != {"status": "failed", "error": message}
+                or stderr.getvalue().splitlines() != [f"symphonai: {message}"]):
+            fail(f"headless missing-key JSON result was wrong: {code}, {stdout.getvalue()!r}, {stderr.getvalue()!r}")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {
+            "SYMPHONAI_HOME": str(home), "SYMPHONAI_SESSIONS_DIR": str(sessions),
+        }):
+            with mock.patch.object(headless_module, "_provider_for_start", return_value=(None, None)):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = headless_module.main([
+                        "run", "no key", "--stream-json", "--repo-root", str(root),
+                    ])
+        stream_missing = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        if (code != 2 or stream_missing != [{"type": "result", "status": "failed", "error": message}]
+                or stderr.getvalue().splitlines() != [f"symphonai: {message}"]):
+            fail(f"headless missing-key stream JSON result was wrong: {code}, {stream_missing!r}, {stderr.getvalue()!r}")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {
+            "SYMPHONAI_HOME": str(home), "SYMPHONAI_SESSIONS_DIR": str(sessions),
+        }):
+            with mock.patch.object(
+                headless_module, "_provider",
+                side_effect=headless_module.ProviderSelectionError("openai has no API key"),
+            ):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = headless_module.main([
+                        "run", "no key", "--json", "--repo-root", str(root), "--provider", "openai",
+                    ])
+        explicit_message = "no API key found; set OPENAI_API_KEY in the environment"
+        if (code != 2 or json.loads(stdout.getvalue()).get("error") != explicit_message
+                or stderr.getvalue().splitlines() != [f"symphonai: {explicit_message}"]):
+            fail(f"headless provider-specific missing-key message was wrong: {code}, {stdout.getvalue()!r}, {stderr.getvalue()!r}")
+
+        class RejectedProvider(FakeModelProvider):
+            @property
+            def name(self):
+                return "openai"
+
+            @property
+            def wire_format(self):
+                return 1
+
+            def create_response(self, request, *, cancel=None):
+                raise ProviderUnavailableError("HTTP 401: raw vendor response body", status=401)
+
+        code, output, error, _sessions = _headless_invoke(
+            root, RejectedProvider(),
+            ["run", "reject key", "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        result = json.loads(output)
+        rejected_message = "openai rejected the API key in OPENAI_API_KEY (HTTP 401)"
+        if (code != 2 or result.get("status") != "failed" or result.get("error") != rejected_message
+                or "raw vendor response body" in output + error
+                or error.splitlines() != [f"symphonai: {rejected_message}"]):
+            fail(f"headless rejected-key JSON result was wrong: {code}, {output!r}, {error!r}")
+
+        stream_code, stream_output, stream_error, _sessions = _headless_invoke(
+            root, RejectedProvider(),
+            ["run", "reject key", "--stream-json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        records = [json.loads(line) for line in stream_output.splitlines()]
+        if (stream_code != 2 or records[-1].get("type") != "result"
+                or records[-1].get("error") != rejected_message
+                or any("raw vendor response body" in line for line in stream_output.splitlines())
+                or stream_error.splitlines() != [f"symphonai: {rejected_message}"]):
+            fail(f"headless rejected-key stream JSON result was wrong: {stream_code}, {records!r}, {stream_error!r}")
+
+
+@check("host_server.symphonai_app_command")
+def check_symphonai_app_command() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        served_hosts = []
+
+        def serve_then_interrupt(host):  # noqa: ANN001
+            served_hosts.append(host)
+            server_thread = threading.Thread(target=host._httpd.serve_forever, daemon=True)
+            server_thread.start()
+            connection, response = _request(
+                host, "GET", f"/app/?token={host.token}",
+            )
+            body = response.read().decode("utf-8")
+            connection.close()
+            if response.status != 200 or "SymphonAI" not in body:
+                fail(f"symphonai app did not serve the app: {response.status}, {body[:200]!r}")
+            raise KeyboardInterrupt
+
+        for no_open, browser_result in ((True, False), (False, True), (False, False)):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            browser = mock.Mock(return_value=browser_result)
+            args = ["app", "--repo-root", str(root)] + (["--no-open"] if no_open else [])
+            with mock.patch.dict(os.environ, {
+                "SYMPHONAI_HOME": str(root / ".symphonai"),
+                "SYMPHONAI_SESSIONS_DIR": str(root / "sessions"),
+            }):
+                with mock.patch.object(HostServer, "serve_forever", serve_then_interrupt):
+                    with mock.patch.object(headless_module.webbrowser, "open", browser):
+                        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            code = headless_module.main(args)
+            if code != 0 or not served_hosts[-1]._closed:
+                fail(f"symphonai app did not stop cleanly after Ctrl+C: {code}, closed={served_hosts[-1]._closed}")
+            handshake = json.loads(stdout.getvalue().splitlines()[0])
+            address = f"http://127.0.0.1:{handshake['port']}/app/?token={handshake['token']}"
+            lines = stderr.getvalue().splitlines()
+            if f"SymphonAI is running at {address}" not in lines or "Press Ctrl+C to stop." not in lines:
+                fail(f"symphonai app status was missing: {lines!r}")
+            if len(lines) != 2 or stderr.getvalue().count(address) != 1:
+                fail(f"symphonai app printed an unexpected browser diagnostic: {lines!r}")
+            if no_open and browser.called:
+                fail("symphonai app opened a browser with --no-open")
+            if not no_open and browser.call_args_list != [mock.call(address)]:
+                fail(f"symphonai app did not open the app address once: {browser.call_args_list!r}")
+
+        help_output, help_error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(help_output), contextlib.redirect_stderr(help_error):
+            code = headless_module.main(["--help"])
+        if code != 0 or "app" not in help_output.getvalue() or "run" not in help_output.getvalue():
+            fail(f"symphonai help omitted a subcommand: {code}, {help_output.getvalue()!r}")
 
 
 @check("host_server.headless_text_and_json")

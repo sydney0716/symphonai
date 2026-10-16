@@ -125,3 +125,17 @@ class ReadLedger:
                 self._enforce_bounds()
                 return None
             return "file has changed since it was read; read it again before editing it"
+
+    def changed_files(self) -> tuple[tuple[Path, int | None], ...]:
+        """Return recorded paths that are newer on disk or have been deleted."""
+        changed: list[tuple[Path, int | None]] = []
+        with self._lock:
+            for resolved, record in self._records.items():
+                try:
+                    current_mtime_ns = resolved.stat().st_mtime_ns
+                except FileNotFoundError:
+                    changed.append((resolved, None))
+                    continue
+                if current_mtime_ns > record.mtime_ns:
+                    changed.append((resolved, current_mtime_ns))
+        return tuple(changed)

@@ -15,6 +15,7 @@ import json
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from symphonai_api.budgets import BudgetState, RunBudget
 from symphonai_api.call_class import CallClass
@@ -69,6 +70,7 @@ from symphonai_api.streaming import StreamAssembler, TextDelta
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import call_target
+from symphonai_api.tools.read_ledger import ReadLedger
 
 _CUT_TOOL_CALL_ERROR = (
     "not run: the reply reached its output limit before this call was complete. "
@@ -165,6 +167,7 @@ class ApiAgent:
         call_class: CallClass = CallClass.FOREGROUND,
         transcript: TranscriptWriter | None = None,
         stream: bool = False,
+        read_ledger: ReadLedger | None = None,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns is not None and effective_max_turns < 1:
@@ -180,6 +183,7 @@ class ApiAgent:
         self._events = events
         self._transcript = transcript
         self._stream = stream
+        self._read_ledger = read_ledger
         self._persisted_digests: list[str] = []
         # Schemas actually sent to the model so it knows these tools exist.
         # `tools` above is only the *execution* registry, keyed by name --
@@ -268,6 +272,7 @@ class ApiAgent:
         turn = 0
         provider_calls = 0
         current_turn_ref: TurnRef | None = None
+        reported_changes: dict[Path, int | None] = {}
         last_failure: tuple[str, str | None] | None = None
         repeated_failures = 0
 
@@ -295,6 +300,38 @@ class ApiAgent:
                     data=message_to_json(redirect),
                 )
                 self._persisted_digests.append(_message_digest(redirect))
+
+        def append_outside_change_notice() -> None:
+            if self._read_ledger is None:
+                return
+            changed = [
+                (path, version)
+                for path, version in self._read_ledger.changed_files()
+                if path not in reported_changes or reported_changes[path] != version
+            ]
+            if not changed:
+                return
+            changed.sort(key=lambda item: item[0].relative_to(self._policy.repo_root).as_posix())
+            paths = [
+                path.relative_to(self._policy.repo_root).as_posix()
+                + (" (deleted)" if version is None else "")
+                for path, version in changed
+            ]
+            shown = paths[:10]
+            if len(paths) > 10:
+                shown.append(f"and {len(paths) - 10} more")
+            notice = (
+                "These files changed on disk since you last read them, not through "
+                "your edits: " + ", ".join(shown)
+                + ". Read them again before relying on or editing them."
+            )
+            message = Message(role=Role.USER, content=notice)
+            conversation.append(message)
+            append_record(
+                "message", turn_id=message.turn_id, data=message_to_json(message)
+            )
+            self._persisted_digests.append(_message_digest(message))
+            reported_changes.update(changed)
 
         def append_repaired_tool_results(
             tool_call_ids: list[str], turn_id: str | None
@@ -433,6 +470,8 @@ class ApiAgent:
                 budget_reason = exceeded_budget(boundary_budget)
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)
+                if provider_calls > 0:
+                    append_outside_change_notice()
                 request = ModelRequest(
                     messages=list(conversation),
                     model=model,

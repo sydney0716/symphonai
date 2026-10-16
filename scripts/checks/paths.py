@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -13,8 +14,9 @@ from symphonai_api.discovery import discover
 from symphonai_api.instructions import InstructionScope, load_instructions
 from symphonai_api.paths import symphonai_home
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.session import default_sessions_root
+from symphonai_api.session import SessionStore, default_sessions_root
 from symphonai_host.credentials import _path as credential_path
+from symphonai_host.projects import record_recent_project
 from scripts.checks.harness import check, fail
 
 
@@ -89,3 +91,26 @@ def call_sites() -> None:
                 (InstructionScope.USER, user_instructions.resolve())
             ]:
                 fail("user instructions did not use SYMPHONAI_HOME")
+
+
+@check("paths.home_is_private")
+def home_is_private() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "new-parent" / "home"
+        project = root / "project"
+        project.mkdir()
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(home)}):
+            record_recent_project(symphonai_home(), project)
+            sessions = default_sessions_root()
+            store = SessionStore(sessions, "private-run", repo_root=project)
+            try:
+                for directory in (
+                    root / "new-parent", home, sessions,
+                    sessions / "private-run", sessions / "private-run" / "tool-results",
+                ):
+                    mode = stat.S_IMODE(directory.stat().st_mode)
+                    if mode != 0o700:
+                        fail(f"home/session directory was not 0700: {directory}: {mode:04o}")
+            finally:
+                store.close()
