@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import unittest.mock as mock
+
 from symphonai_api import ToolEffect, ToolMetadata
+from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.events import CollectingSink, ToolCallFailed
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import run_task, standard_tool_registry
+from symphonai_api.session import TranscriptWriter, read_records
 from symphonai_api.tools.base import LocalTool
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
@@ -185,3 +190,76 @@ def check_agent_base_validation() -> None:
             pass
         else:
             fail("LocalTool validated invalid arguments before checking cancellation")
+
+
+@check("agent.repeated_failure_is_named")
+def check_repeated_failure_is_named() -> None:
+    error = "scripted validation failure"
+    warning = (
+        " This has now failed {count} times in a row with the same error. "
+        "Do not send it again; change approach, or tell the person what is blocking you."
+    )
+    cases = [
+        ("repeated", [("first", error)] * 4,
+         [error, error, error + warning.format(count=3), error + warning.format(count=4)]),
+        ("success resets", [("first", error)] * 2 + [("first", None), ("first", error)],
+         [error, error, None, error]),
+        ("different error resets", [("first", error), ("first", "other error"), ("first", error)],
+         [error, "other error", error]),
+        ("alternating tools", [("first", error), ("second", error)] * 3,
+         [error] * 6),
+    ]
+    with workspace() as ws:
+        for case_index, (label, outcomes, expected) in enumerate(cases):
+            calls = [
+                ToolCall(id=f"call-{index}", name=name, arguments={"attempt": index})
+                for index, (name, _) in enumerate(outcomes)
+            ]
+            provider = FakeModelProvider([
+                *[
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[call]))
+                    for call in calls
+                ],
+                ModelResponse(Message(Role.ASSISTANT, content="done")),
+            ])
+            sink = CollectingSink()
+            path = ws.root / f"repeated-failure-{case_index}.jsonl"
+            writer = TranscriptWriter(path)
+            tool = _ValidationStageTool()
+            agent = ApiAgent(
+                provider, {"first": tool, "second": tool}, ws.policy,
+                max_turns=len(calls) + 1, events=sink, transcript=writer,
+            )
+            with mock.patch.object(tool, "validate", side_effect=[error for _, error in outcomes]), \
+                    mock.patch.object(provider, "create_response", wraps=provider.create_response) as create:
+                try:
+                    result = agent.run([Message(Role.USER, "exercise failures")])
+                finally:
+                    writer.close()
+            tool_results = [
+                message.tool_result for message in result.messages if message.role == Role.TOOL
+            ]
+            actual = [item.error for item in tool_results]
+            if actual != expected:
+                fail(f"{label}: expected errors {expected!r}, got {actual!r}")
+            if [item.ok for item in tool_results] != [error is None for _, error in outcomes]:
+                fail(f"{label}: failure annotation changed tool status")
+            if result.stopped_reason != "final_response" or provider.call_count != len(calls) + 1:
+                fail(f"{label}: repeated failures stopped the run")
+            for index, request_call in enumerate(create.call_args_list[1:]):
+                received = [
+                    message.tool_result.error
+                    for message in request_call.args[0].messages if message.role == Role.TOOL
+                ]
+                if received != expected[:index + 1]:
+                    fail(f"{label}: model received different errors: {received!r}")
+            records, dropped = read_records(path)
+            persisted = [
+                record["data"]["tool_result"]["error"] for record in records
+                if record["type"] == "message" and record["data"]["role"] == "tool"
+            ]
+            if dropped or persisted != expected:
+                fail(f"{label}: persisted errors differed: {persisted!r}")
+            event_errors = [event.error for event in sink.of_type(ToolCallFailed)]
+            if event_errors != [error for error in expected if error is not None]:
+                fail(f"{label}: failure event errors differed: {event_errors!r}")

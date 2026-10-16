@@ -10,6 +10,9 @@ from pathlib import Path
 from symphonai_api.config import load_config
 
 
+_PROJECT_ROOT_METADATA = "symphonai-project-root"
+
+
 class WorktreeError(RuntimeError):
     """A git worktree could not be created, inspected, or removed."""
 
@@ -66,7 +69,13 @@ def create_worktree(repo_root: Path, path: Path) -> Path:
                 pass
         raise
     worktree_root = path / relative_root
-    configured = load_config(repo_root=repo_root).get("worktree.symlink", [])
+    git_dir = Path(os.fsdecode(_git(path, "rev-parse", "--git-dir").stdout.strip()))
+    if not git_dir.is_absolute():
+        git_dir = (path / git_dir).resolve()
+    (git_dir / _PROJECT_ROOT_METADATA).write_text(relative_root.as_posix(), encoding="utf-8")
+    configured = load_config(repo_root=repo_root).get(
+        "worktree.symlink", ["node_modules", ".venv", "venv"],
+    )
     for entry in configured if isinstance(configured, list) else ():
         source = repo_root / entry
         target = worktree_root / entry
@@ -76,10 +85,40 @@ def create_worktree(repo_root: Path, path: Path) -> Path:
     return worktree_root
 
 
+def _linked_paths(path: Path) -> tuple[str, ...]:
+    worktree_top = _top_level(path)
+    common_dir = Path(os.fsdecode(_git(path, "rev-parse", "--git-common-dir").stdout.strip()))
+    if not common_dir.is_absolute():
+        common_dir = (path / common_dir).resolve()
+    project_relative = path.relative_to(worktree_top)
+    if not project_relative.parts:
+        git_dir = Path(os.fsdecode(_git(path, "rev-parse", "--git-dir").stdout.strip()))
+        if not git_dir.is_absolute():
+            git_dir = (path / git_dir).resolve()
+        metadata = git_dir / _PROJECT_ROOT_METADATA
+        if metadata.is_file():
+            project_relative = Path(metadata.read_text(encoding="utf-8"))
+    project_root = worktree_top / project_relative
+    repo_root = common_dir.parent / project_relative
+    configured = load_config(repo_root=repo_root).get(
+        "worktree.symlink", ["node_modules", ".venv", "venv"],
+    )
+    entries = configured if isinstance(configured, list) else ()
+    return tuple(
+        (project_root / entry).relative_to(path).as_posix()
+        for entry in entries
+        if (project_root / entry).is_symlink()
+        and os.readlink(project_root / entry) == os.fspath(repo_root / entry)
+    )
+
+
 def worktree_diff(path: Path) -> WorktreeDiff:
     """Stage worktree changes in its own index and return paths plus patch."""
     path = Path(path).resolve()
     _git(path, "add", "-A")
+    linked = _linked_paths(path)
+    if linked:
+        _git(path, "reset", "--quiet", "HEAD", "--", *linked)
     files = _git(
         path,
         "diff",

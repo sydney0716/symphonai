@@ -6358,6 +6358,43 @@ def check_provider_default_and_rejection() -> None:
         }):
             if host_main._provider().name != "gemini":
                 fail("the first keyed vendor in Settings order was not the default")
+        for name, key, expected_model in (
+            ("anthropic", "ANTHROPIC_API_KEY", "claude-opus-5-5"),
+            ("openai", "OPENAI_API_KEY", "gpt-6.1-sol"),
+            ("gemini", "GEMINI_API_KEY", "gemini-pro-latest"),
+        ):
+            root = Path(temporary) / name
+            root.mkdir()
+            host = HostServer(
+                None, PermissionPolicy(root), sessions_root=root / "sessions",
+                memory_extraction_enabled=False,
+            )
+            host.start()
+            try:
+                with mock.patch.dict(os.environ, {key: "fixture-key"}):
+                    connection, response = _request(
+                        host, "POST", "/provider", body={"name": name}, headers=_headers(host),
+                    )
+                    try:
+                        reply = json.loads(response.read())
+                        if response.status != 200 or reply != {"selected": True}:
+                            fail(f"default {name} selection failed: {response.status}, {reply!r}")
+                    finally:
+                        connection.close()
+                    with mock.patch.object(
+                        host.run._provider, "create_response_stream",
+                        return_value=iter([StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "done")))]),
+                    ) as respond:
+                        _send_host_prompt(host, "use the default model")
+                    if respond.call_count != 1:
+                        fail(f"default {name} conversation did not call its selected provider")
+                    conversation = host.run.conversation_stats()
+                    if conversation is None or (
+                        conversation.get("provider"), conversation.get("model")
+                    ) != (name, expected_model):
+                        fail(f"default {name} conversation used the wrong model: {conversation!r}")
+            finally:
+                host.close()
     for flag in ("--provider", "--model", "--base-url"):
         with contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -11523,9 +11560,10 @@ def check_headless_text_and_json() -> None:
             fail(f"headless text run returned {code}, {output!r}")
 
         provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "json answer"))])
+        provider.model = "fake-default"
         code, output, _error, sessions = _headless_invoke(
             root, provider,
-            ["run", "--json", "say hi", "--repo-root", str(root), "--provider", "openai"],
+            ["run", "--json", "say hi", "--repo-root", str(root), "--provider", "openai", "--model", "m-1"],
         )
         lines = output.splitlines()
         if code != 0 or len(lines) != 1:
@@ -11536,11 +11574,53 @@ def check_headless_text_and_json() -> None:
             fail(f"headless JSON was invalid: {exc}")
         expected_fields = {
             "session_id", "status", "stopped_reason", "result", "usage",
-            "cost", "duration_ms", "files_changed", "error",
+            "cost", "duration_ms", "files_changed", "error", "provider", "model",
         }
         if (set(result) != expected_fields or result["status"] != "finished"
-                or result["result"] != "json answer" or result["error"] is not None):
+                or result["result"] != "json answer" or result["error"] is not None
+                or result["provider"] != "fake" or result["model"] != "m-1"):
+
             fail(f"headless JSON result fields or values were wrong: {result!r}")
+        default_provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "default model answer"))])
+        default_provider.model = "fake-default"
+        default_code, default_output, _default_error, _default_sessions = _headless_invoke(
+            root, default_provider,
+            ["run", "--json", "say hi", "--repo-root", str(root), "--provider", "openai"],
+        )
+        default_result = json.loads(default_output)
+        if (default_code != 0 or default_result.get("provider") != "fake"
+                or default_result.get("model") != "fake-default"):
+            fail(f"headless JSON omitted provider default model: {default_code}, {default_result!r}")
+
+        class FallbackProvider(FakeModelProvider):
+            @property
+            def name(self):
+                return "openai"
+
+            @property
+            def wire_format(self):
+                return 1
+
+            def create_response(self, request, *, cancel=None):
+                if request.model == "m-1":
+                    raise ProviderUnavailableError("primary unavailable", status=529)
+                return super().create_response(request, cancel=cancel)
+
+        fallback_provider = FallbackProvider([ModelResponse(Message(Role.ASSISTANT, "fallback answer"))])
+        fallback_provider.model = "m-1"
+        config_dir = root / ".symphonai"
+        config_dir.mkdir(exist_ok=True)
+        (config_dir / "config.toml").write_text('[fallback]\nopenai = ["m-2"]\n', encoding="utf-8")
+        fallback_code, fallback_output, _fallback_error, _fallback_sessions = _headless_invoke(
+            root, fallback_provider,
+            ["run", "say hi", "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        if fallback_code != 0:
+            fail(f"headless fallback run failed: {fallback_code}, {fallback_output!r}, {_fallback_error!r}")
+        fallback_result = json.loads(fallback_output)
+        if (fallback_result.get("provider") != "openai" or fallback_result.get("model") != "m-2"):
+            fail(f"headless JSON omitted fallback model: {fallback_result!r}")
+
         session = SessionStore.open(sessions, result["session_id"])
         try:
             if session.read_meta().get("headless") is not True:
@@ -11737,9 +11817,10 @@ def check_headless_stream_json() -> None:
         root = Path(temporary) / "project"
         root.mkdir()
         provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "stream answer"))])
+        provider.model = "fake-default"
         code, output, _error, _sessions = _headless_invoke(
             root, provider,
-            ["run", "stream", "--repo-root", str(root), "--provider", "openai", "--stream-json"],
+            ["run", "stream", "--repo-root", str(root), "--provider", "openai", "--model", "m-1", "--stream-json"],
         )
         try:
             records = [json.loads(line) for line in output.splitlines()]
@@ -11748,8 +11829,21 @@ def check_headless_stream_json() -> None:
         if code != 0 or not records or records[0].get("type") not in {"PromptSubmitted", "RunStarted"}:
             fail(f"headless stream JSON did not begin with a run event: {code}, {records!r}")
         if (records[-1].get("type") != "result" or records[-1].get("result") != "stream answer"
-                or records[-1].get("error") is not None):
+                or records[-1].get("error") is not None or records[-1].get("provider") != "fake"
+                or records[-1].get("model") != "m-1"):
+
             fail(f"headless stream JSON did not end with the result line: {records[-1]!r}")
+
+        default_provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "default stream answer"))])
+        default_provider.model = "fake-default"
+        default_code, default_output, _default_error, _default_sessions = _headless_invoke(
+            root, default_provider,
+            ["run", "stream", "--repo-root", str(root), "--provider", "openai", "--stream-json"],
+        )
+        default_records = [json.loads(line) for line in default_output.splitlines()]
+        if (default_code != 0 or default_records[-1].get("model") != "fake-default"
+                or default_records[-1].get("provider") != "fake"):
+            fail(f"headless stream JSON omitted provider default model: {default_code}, {default_records[-1]!r}")
 
 
 @check("host_server.headless_resume")

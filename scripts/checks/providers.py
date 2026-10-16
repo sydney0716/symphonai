@@ -7,6 +7,7 @@ import os
 import unittest.mock as mock
 import symphonai_api.model_table as model_table_module
 from symphonai_api.compaction import budget_for_model
+from symphonai_api.leader import dispatch_subagent_tool_schema
 from symphonai_api.model_table import (
     ModelCapability,
     ModelEffort,
@@ -35,6 +36,9 @@ from symphonai_api.providers.openai_provider import (
     _build_responses_request_body,
     _parse_response as _parse_openai_response,
 )
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.tool_schema import tool_registry_schemas
+from symphonai_host.questions import question_tools
 from scripts.checks.harness import check, fail
 
 
@@ -800,6 +804,7 @@ def check_openai_responses_request_and_compatible_chat() -> None:
             "name": "weather",
             "description": "Get weather",
             "parameters": {"type": "object", "properties": {}},
+            "strict": False,
         }],
         "reasoning": {"effort": "high"},
     }:
@@ -814,6 +819,32 @@ def check_openai_responses_request_and_compatible_chat() -> None:
         }
     ):
         fail(f"OpenAI-compatible Chat wire request changed: {captured!r}")
+
+
+@check("providers.responses_tools_are_not_strict")
+def check_responses_tools_are_not_strict() -> None:
+    tools = tool_registry_schemas(
+        standard_tool_registry() | question_tools(lambda question, options, tool_call_id: (None, "")),
+        1,
+    ) + [dispatch_subagent_tool_schema(1)]
+    request = ModelRequest(messages=[Message(Role.USER, "Run pwd.")], tools=tools)
+    body = _build_responses_request_body(request, "gpt-5.4-mini")
+    names = {tool["name"] for tool in body["tools"]}
+    if not {"run_shell", "ask_user", "dispatch_subagent"} <= names:
+        fail(f"Responses strictness fixture omitted required tools: {names!r}")
+    if len(body["tools"]) != len(tools):
+        fail("Responses translation dropped tools")
+    for tool in body["tools"]:
+        if tool.get("strict") is not False:
+            fail(f"Responses tool did not disable strict mode: {tool!r}")
+
+    for strict in (True, False):
+        explicit = {"type": "function", "function": {**tools[0]["function"], "strict": strict}}
+        body = _build_responses_request_body(
+            ModelRequest(messages=request.messages, tools=[explicit]), "gpt-5.4-mini",
+        )
+        if body["tools"][0].get("strict") is not strict:
+            fail(f"Responses translation changed explicit strict={strict!r}: {body!r}")
 
 
 @check("providers.openai_responses_effort")

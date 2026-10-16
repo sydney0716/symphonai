@@ -31,7 +31,16 @@ const ACTIVITY_VERBS = Object.freeze({
   run_shell: "ran",
   dispatch_subagent: "dispatched",
   remember: "remembered",
-  forget: "Forgot",
+  forget: "forgot",
+  read_tool_result: "read an earlier result",
+  job_output: "checked a job",
+  job_stop: "stopped a job",
+  web_fetch: "fetched",
+  web_search: "searched the web for",
+  use_skill: "used skill",
+  lsp: "looked up code",
+  get_goal: "checked the goal",
+  update_goal: "updated the goal",
 });
 
 const RUNNING_ACTIVITY_VERBS = Object.freeze({
@@ -46,6 +55,15 @@ const RUNNING_ACTIVITY_VERBS = Object.freeze({
   dispatch_subagent: "dispatching",
   remember: "remembering",
   forget: "forgetting",
+  read_tool_result: "reading an earlier result",
+  job_output: "checking a job",
+  job_stop: "stopping a job",
+  web_fetch: "fetching",
+  web_search: "searching the web for",
+  use_skill: "using skill",
+  lsp: "looking up code",
+  get_goal: "checking the goal",
+  update_goal: "updating the goal",
 });
 
 const ACTIVITY_KINDS = Object.freeze({

@@ -104,7 +104,7 @@ class GetGoalTool(LocalTool):
 
     @property
     def description(self) -> str:
-        return "Read the current goal and its status."
+        return "Read the goal the person set with /goal, and its status. Most conversations have none."
 
     @property
     def parameters(self) -> dict:
@@ -140,7 +140,7 @@ class UpdateGoalTool(LocalTool):
 
     @property
     def description(self) -> str:
-        return "Report that the current goal is blocked or complete."
+        return "Only when the person set a goal with /goal: report that it is blocked or complete. Never call this without one."
 
     @property
     def parameters(self) -> dict:

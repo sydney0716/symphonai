@@ -48,7 +48,7 @@ from symphonai_api.streaming import (
 
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-6.1-sol"
 
 _ROLE_TO_OPENAI = {
     Role.SYSTEM: "system",
@@ -162,7 +162,7 @@ def _responses_content(message: Message) -> list[dict[str, Any]]:
 
 def _responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
     function = tool.get("function", {})
-    translated = {"type": "function"}
+    translated = {"type": "function", "strict": False}
     for key in ("name", "description", "parameters", "strict"):
         if key in function:
             translated[key] = function[key]

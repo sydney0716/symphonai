@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from symphonai_api.config import ConfigError
-from symphonai_api.events import RunFailed, RunFinished
+from symphonai_api.events import ModelFallback, RunFailed, RunFinished
 from symphonai_api.extensions import load_extensions
 from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
@@ -80,8 +80,9 @@ def _select_provider(arguments):  # noqa: ANN001
     return provider, model, effort, choice
 
 
-def _wait_for_terminal(run, subscription, stream_json: bool) -> tuple[RunFinished | RunFailed, bool]:  # noqa: ANN001
+def _wait_for_terminal(run, subscription, stream_json: bool) -> tuple[RunFinished | RunFailed, bool, str | None]:  # noqa: ANN001
     interrupted = False
+    fallback_models = {}
     while True:
         try:
             event = subscription.get(timeout=0.1)
@@ -95,10 +96,12 @@ def _wait_for_terminal(run, subscription, stream_json: bool) -> tuple[RunFinishe
             encoded = encode_event(event)
             if encoded["type"] != "SessionStarted":
                 print(json.dumps(encoded, ensure_ascii=False), flush=True)
+        if isinstance(event, ModelFallback):
+            fallback_models[event.agent_id] = event.to_model
         if isinstance(event, RunFailed) and event.agent_name == "leader":
-            return event, interrupted
+            return event, interrupted, fallback_models.get(event.agent_id)
         if isinstance(event, RunFinished) and event.agent_name == "leader":
-            return event, interrupted
+            return event, interrupted, fallback_models.get(event.agent_id)
 
 
 def _saved_result(runtime, session_id: str, before_message_count: int) -> str:  # noqa: ANN001
@@ -217,7 +220,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
         session_id = arguments.resume or host_run_id
         if not (arguments.json or arguments.stream_json):
             print(f"Running session {session_id}", file=sys.stderr, flush=True)
-        terminal, interrupted = _wait_for_terminal(
+        terminal, interrupted, fallback_model = _wait_for_terminal(
             runtime.run, subscription, arguments.stream_json,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
@@ -241,6 +244,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
                 if status_before.get(path) != status_after.get(path)
             )
         error = terminal.error if isinstance(terminal, RunFailed) else None
+        selection = runtime.run.selection() or {}
         result = {
             "session_id": session_id,
             "status": status,
@@ -250,6 +254,8 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             ),
             "result": result_text,
             "error": error,
+            "provider": selection.get("provider"),
+            "model": fallback_model or selection.get("model"),
             "usage": usage,
             "cost": cost,
             "duration_ms": duration_ms,

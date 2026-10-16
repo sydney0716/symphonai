@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 from symphonai_api.agent_spec import AgentSpec, ModelSelector
 from symphonai_api.config import ConfigError, load_config
@@ -13,7 +14,7 @@ from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, Too
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.session import SessionStore
-from symphonai_api.leader import DispatchSubagentTool
+from symphonai_api.leader import DispatchSubagentTool, dispatch_subagent_tool_schema
 
 from scripts.checks.harness import check, fail
 
@@ -42,12 +43,12 @@ def _git(root: Path, *arguments: str, input: bytes | None = None) -> bytes:
     return result.stdout
 
 
-def _repository(root: Path, *, subdirectory: bool = False) -> Path:
+def _repository(root: Path, *, subdirectory: str | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     _git(root, "init", "--quiet")
     _git(root, "config", "user.email", "worktree-check@example.test")
     _git(root, "config", "user.name", "Worktree Check")
-    repo_root = root / "nested" if subdirectory else root
+    repo_root = root / subdirectory if subdirectory else root
     repo_root.mkdir(parents=True, exist_ok=True)
     (repo_root / "a.py").write_text("value = 1\n", encoding="utf-8")
     _git(root, "add", "-A")
@@ -99,6 +100,144 @@ def _dispatch_tool(
 
 def _session(root: Path, repo_root: Path) -> SessionStore:
     return SessionStore(root / "sessions", "session", repo_root=repo_root)
+
+
+@check("worktree.dependencies_are_linked_by_default")
+def check_dependencies_are_linked_by_default() -> None:
+    from symphonai_api.worktree import create_worktree, remove_worktree
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        repo = _repository(base / "repo")
+        home = base / "home"
+        dependencies = {
+            "node_modules": "node_modules/p",
+            ".venv": ".venv/p",
+            "venv": "venv/p",
+        }
+        for directory, probe in dependencies.items():
+            target = repo / probe
+            target.parent.mkdir(parents=True)
+            target.write_text(directory, encoding="utf-8")
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(home)}):
+            default_path = base / "sessions" / "default"
+            default = create_worktree(repo, default_path)
+            try:
+                for directory, probe in dependencies.items():
+                    linked = default / probe
+                    if not linked.is_file() or linked.read_text(encoding="utf-8") != directory:
+                        fail(f"default dependency {directory} was not linked into the worktree")
+                    if not (default / directory).is_symlink():
+                        fail(f"default dependency {directory} is not a symlink")
+            finally:
+                remove_worktree(repo, default_path)
+
+            project_config = repo / ".symphonai" / "config.toml"
+            project_config.parent.mkdir(parents=True)
+            project_config.write_text("[worktree]\nsymlink = []\n", encoding="utf-8")
+            empty_path = base / "sessions" / "empty"
+            empty = create_worktree(repo, empty_path)
+            try:
+                if any((empty / name).is_symlink() for name in dependencies):
+                    fail("empty worktree.symlink configuration created dependency links")
+            finally:
+                remove_worktree(repo, empty_path)
+
+    schema = dispatch_subagent_tool_schema(1)["function"]
+    description = schema["description"]
+    isolation = schema["parameters"]["properties"]["isolation"]["description"]
+    expected_description = (
+        "Set isolation to worktree only for a task that should start from the last commit and stay apart from the person's tree. "
+        "Such a subagent does not see uncommitted changes, including yours, and its diff comes back in the result for you to apply. "
+        "Explorers, and follow-ups on uncommitted work, share the tree."
+    )
+    if expected_description not in description or isolation != (
+        "Run the subagent in its own git worktree, from the last commit."
+    ):
+        fail(f"dispatch description did not explain worktree isolation: {description!r}, {isolation!r}")
+
+
+@check("worktree.linked_paths_stay_out_of_the_diff")
+def check_linked_paths_stay_out_of_the_diff() -> None:
+    from symphonai_api.worktree import create_worktree, remove_worktree, worktree_diff
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        repo = _repository(base / "repo")
+        (repo / "a.txt").write_text("original\n", encoding="utf-8")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "--quiet", "-m", "add source file")
+        (repo / "tracked-link").symlink_to("a.txt")
+        _git(repo, "add", "tracked-link")
+        _git(repo, "commit", "--quiet", "-m", "add tracked symlink")
+        (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "--quiet", "-m", "ignore dependencies")
+        (repo / "node_modules").mkdir()
+        (repo / "node_modules" / "p").write_text("package", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(base / "home")}):
+            worktree_path = base / "sessions" / "worktree"
+            worktree = create_worktree(repo, worktree_path)
+            try:
+                (worktree / "a.txt").write_text("edited\n", encoding="utf-8")
+                (worktree / "new-link").symlink_to("b.txt")
+                (worktree / "tracked-link").unlink()
+                (worktree / "tracked-link").symlink_to("b.txt")
+                diff = worktree_diff(worktree)
+                if diff.files != ("a.txt", "new-link", "tracked-link"):
+                    fail(f"worker symlink changes were omitted or dependency link leaked: {diff!r}")
+                if any(
+                    marker not in diff.patch
+                    for marker in (
+                        "diff --git a/new-link b/new-link",
+                        "diff --git a/tracked-link b/tracked-link",
+                        "-a.txt",
+                        "+b.txt",
+                    )
+                ) or "node_modules" in diff.patch:
+                    fail(f"worktree patch lost symlink changes or included dependency link: {diff.patch!r}")
+            finally:
+                remove_worktree(repo, worktree_path)
+
+        real_repo = _repository(base / "real-repo")
+        (real_repo / "node_modules").mkdir()
+        (real_repo / "node_modules" / "p").write_text("package", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(base / "home")}):
+            real_path = base / "sessions" / "real-directory"
+            real_worktree = create_worktree(real_repo, real_path)
+            try:
+                (real_worktree / "node_modules").unlink()
+                (real_worktree / "node_modules").mkdir()
+                (real_worktree / "node_modules" / "p").write_text("worker package", encoding="utf-8")
+                diff = worktree_diff(real_worktree)
+                if diff.files != ("node_modules/p",) or "worker package" not in diff.patch:
+                    fail(f"worker-owned dependency directory was omitted from its diff: {diff!r}")
+            finally:
+                remove_worktree(real_repo, real_path)
+
+        top = base / "monorepo"
+        package = _repository(top, subdirectory="pkg")
+        (top / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        _git(top, "add", ".gitignore")
+        _git(top, "commit", "--quiet", "-m", "ignore dependencies")
+        (package / "a.txt").write_text("original\n", encoding="utf-8")
+        _git(top, "add", "pkg/a.txt")
+        _git(top, "commit", "--quiet", "-m", "add package source")
+        (package / "node_modules").mkdir()
+        (package / "node_modules" / "p").write_text("package", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(base / "home")}):
+            package_worktree_path = base / "sessions" / "monorepo-worktree"
+            package_root = create_worktree(package, package_worktree_path)
+            try:
+                (package_root / "a.txt").write_text("edited\n", encoding="utf-8")
+                package_diff = worktree_diff(package_root)
+                top_diff = worktree_diff(package_worktree_path)
+                if package_diff.files != ("a.txt",) or "node_modules" in package_diff.patch:
+                    fail(f"project-root diff included a linked dependency: {package_diff!r}")
+                if top_diff.files != ("pkg/a.txt",) or "node_modules" in top_diff.patch:
+                    fail(f"worktree-top diff included a linked dependency: {top_diff!r}")
+            finally:
+                remove_worktree(package, package_worktree_path)
 
 
 @check("worktree.diff_isolated_and_applyable")
@@ -249,7 +388,7 @@ def check_subdirectory_root() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         base = Path(temporary)
         top = base / "repo"
-        repo = _repository(top, subdirectory=True)
+        repo = _repository(top, subdirectory="nested")
         session = _session(base, repo)
         provider = _RecordingProvider([
             _response("", ToolCall("pwd", "run_shell", {"argv": ["pwd"]})),

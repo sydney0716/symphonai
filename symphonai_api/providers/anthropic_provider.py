@@ -50,7 +50,7 @@ from symphonai_api.streaming import (
 
 API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_MODEL = "claude-opus-5-5"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_STREAM_MAX_TOKENS = 32000

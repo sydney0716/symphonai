@@ -268,6 +268,8 @@ class ApiAgent:
         turn = 0
         provider_calls = 0
         current_turn_ref: TurnRef | None = None
+        last_failure: tuple[str, str | None] | None = None
+        repeated_failures = 0
 
         def append_record(
             record_type: str, *, turn_id: str | None, data: dict
@@ -710,6 +712,25 @@ class ApiAgent:
                         tool_result = results.get(index)
                         if tool_result is None:
                             continue
+                        if tool_result.ok:
+                            last_failure = None
+                            repeated_failures = 0
+                        else:
+                            failure = (tool_call.name, tool_result.error)
+                            repeated_failures = (
+                                repeated_failures + 1 if failure == last_failure else 1
+                            )
+                            last_failure = failure
+                            if repeated_failures >= 3:
+                                tool_result = replace(
+                                    tool_result,
+                                    error=(
+                                        f"{tool_result.error or ''} This has now failed "
+                                        f"{repeated_failures} times in a row with the same error. "
+                                        "Do not send it again; change approach, or tell the "
+                                        "person what is blocking you."
+                                    ),
+                                )
                         if self._result_store is not None:
                             tool_result = offload_tool_result(
                                 tool_result,

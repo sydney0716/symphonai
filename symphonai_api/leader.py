@@ -271,8 +271,11 @@ _DISPATCH_DESCRIPTION = (
     "used yet in this run, a new subagent is created. If it has, the same "
     "subagent continues its existing conversation with this new task "
     "instead of starting over -- use the same name to follow up with the "
-    "same subagent. Set isolation to worktree to run from the last commit "
-    "without uncommitted changes; its diff comes back in the result."
+    "same subagent. Set isolation to worktree only for a task that should "
+    "start from the last commit and stay apart from the person's tree. Such "
+    "a subagent does not see uncommitted changes, including yours, and its "
+    "diff comes back in the result for you to apply. Explorers, and "
+    "follow-ups on uncommitted work, share the tree."
 )
 _BUILTIN_PURPOSES = {
     "worker": "implements coding tasks",
@@ -318,7 +321,7 @@ _DISPATCH_PROPERTIES = {
     "isolation": {
         "type": "string",
         "enum": ["worktree"],
-        "description": "Run the subagent in its own git worktree.",
+        "description": "Run the subagent in its own git worktree, from the last commit.",
     },
 }
 _DISPATCH_REQUIRED = ["subagent_name", "task"]

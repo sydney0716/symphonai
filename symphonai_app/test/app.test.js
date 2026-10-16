@@ -5482,6 +5482,42 @@ test("two tool calls in one turn render as one activity", async () => {
   assert.doesNotMatch(textInDocumentOrder(activity), /`/);
 });
 
+test("tool activities use sentence verbs while running and after finishing", async () => {
+  const cases = [
+    ["read_tool_result", null, "Reading an earlier result…", "Read an earlier result."],
+    ["job_output", null, "Checking a job…", "Checked a job."],
+    ["job_stop", null, "Stopping a job…", "Stopped a job."],
+    ["web_fetch", "https://example.com", "Fetching https://example.com…", "Fetched https://example.com."],
+    ["web_search", "tool verbs", "Searching the web for tool verbs…", "Searched the web for tool verbs."],
+    ["use_skill", "review", "Using skill review…", "Used skill review."],
+    ["lsp", null, "Looking up code…", "Looked up code."],
+    ["get_goal", null, "Checking the goal…", "Checked the goal."],
+    ["update_goal", null, "Updating the goal…", "Updated the goal."],
+  ];
+  for (const [name, target, running, finished] of cases) {
+    const document = new FakeDocument();
+    const client = fakeClient();
+    await start({ global: {}, document, client });
+    await client.emit(toolStarted("verb-call", name, target));
+    assert.equal(textInDocumentOrder(document.getElementById("chat").children[0]), running, name);
+    await client.emit(toolFinished("verb-call", name));
+    assert.equal(textInDocumentOrder(document.getElementById("chat").children[0]), finished, name);
+  }
+});
+
+test("remember then forget keeps the second verb lowercase", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("remember-1", "remember", "Run checks"));
+  await client.emit(toolFinished("remember-1", "remember"));
+  await client.emit(toolStarted("forget-1", "forget", "Old preference"));
+  await client.emit(toolFinished("forget-1", "forget"));
+  assert.equal(textInDocumentOrder(document.getElementById("chat").children[0]),
+    'Remembered "Run checks" and forgot "Old preference"');
+});
+
 test("late extractor memory activity follows the finished turn as quoted prose", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
