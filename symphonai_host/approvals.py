@@ -167,12 +167,15 @@ class ApprovalBroker:
             pending.event.set()
             return True
 
-    def ask_user(self, question: str, options: tuple[str, ...]) -> tuple[PermissionDecision, str]:
+    def ask_user(
+        self, question: str, options: tuple[str, ...], tool_call_id: str = "",
+    ) -> tuple[PermissionDecision, str]:
         approval = PendingApproval(
             approval_id=new_id("question"),
             operation="ask_user",
             target=question,
             details="",
+            tool_call_id=tool_call_id,
             session_id=self._session_id,
             kind="question",
             options=options,

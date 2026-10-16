@@ -372,6 +372,10 @@ class HostRun:
         return self._policy
 
     @property
+    def starting_mode(self) -> str:
+        return self._starting_mode
+
+    @property
     def extensions(self) -> Extensions | None:
         return self._extensions
 
@@ -472,8 +476,6 @@ class HostRun:
                 choices = ", ".join(permitted) or "none"
                 raise ModeSelectionError(f"permitted modes: {choices}")
             self._policy.mode = mode
-            if self._conversation is None:
-                self._starting_mode = mode
             return mode
 
     def _save_goal(self, session_id: str, goal: Goal | None) -> None:
@@ -1157,7 +1159,7 @@ class HostRun:
     def start_job(self, command: str) -> str:
         return self._person_jobs.start(
             [shell_executable(), "-c", command], str(self._policy.repo_root),
-            shell_environment(), label=command,
+            shell_environment(self._policy.repo_root), label=command,
         )
 
     def stop_job(self, job_id: str) -> dict | None:
@@ -2069,7 +2071,7 @@ class HostRun:
             process = subprocess.Popen(
                 [shell_executable(), "-c", command],
                 cwd=repo_root,
-                env=shell_environment(),
+                env=shell_environment(repo_root),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

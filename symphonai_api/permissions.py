@@ -75,6 +75,105 @@ ALWAYS_DENY_COMMANDS: tuple[tuple[str, ...], ...] = (
 )
 
 
+def _loopback_download(argv: tuple[str, ...]) -> bool:
+    urls = []
+    arguments = iter(argv[1:])
+    for argument in arguments:
+        if argument == "--":
+            urls.extend(arguments)
+            break
+        if argument.startswith("--"):
+            option, separator, value = argument.partition("=")
+            if option in {
+                "--upload-file", "--form", "--form-string", "--config", "--post-file",
+                "--proxy", "--resolve", "--connect-to", "--next",
+            }:
+                return False
+            if option.startswith("--data") or option in {
+                "--url", "--output", "--header", "--user-agent", "--request", "--user",
+                "--max-time", "--connect-timeout",
+                "--write-out", "--cookie", "--cookie-jar", "--referer", "--range",
+                "--retry", "--json",
+            }:
+                value = value if separator else next(arguments, None)
+                if value is None:
+                    return False
+                if (option.startswith("--data") or option == "--json") and (value.startswith("@") or option == "--data-urlencode" and "@" in value):
+                    return False
+                if option == "--url":
+                    urls.append(value)
+            elif separator and "://" in value:
+                urls.append(value)
+        elif argument.startswith("-"):
+            flags = argument[1:]
+            for index, flag in enumerate(flags):
+                if flag in "TFKx:":
+                    return False
+                if flag in "doHAXumwbcer":
+                    value = flags[index + 1:] or next(arguments, None)
+                    if value is None or flag == "d" and value.startswith("@"):
+                        return False
+                    break
+        else:
+            urls.append(argument)
+    for url in urls:
+        try:
+            parsed = urlsplit(url if "://" in url else "http://" + url)
+            if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+                return False
+            parsed.port
+        except ValueError:
+            return False
+    return bool(urls)
+
+
+def _discards_work(
+    argv: tuple[str, ...], root: Path, cwd: Path | None, *, indirect: bool = False,
+) -> str | None:
+    if len(argv) < 2 or os.path.basename(argv[0]) != "git":
+        return None
+    subcommand, *arguments = argv[1:]
+    if subcommand in {"checkout", "restore"} and (
+        indirect or any(
+            argument.startswith(":") or any(char in argument for char in "*?[")
+            or argument.split("=", 1)[0] == "--pathspec-from-file"
+            for argument in arguments
+        )
+    ):
+        return subcommand
+    short_flags = "".join(arg[1:] for arg in arguments if arg.startswith("-") and not arg.startswith("--"))
+    refused = False
+    if subcommand == "reset":
+        refused = "--hard" in arguments
+    elif subcommand == "clean":
+        refused = "--force" in arguments or "f" in short_flags
+    elif subcommand == "checkout":
+        refused = cwd is None or bool({"--force", "--", ".", "--patch"}.intersection(arguments)) or any(flag in short_flags for flag in "fp")
+        skip_branch = False
+        for argument in arguments:
+            if skip_branch:
+                skip_branch = False
+                continue
+            if argument in {"-b", "-B"}:
+                skip_branch = True
+                continue
+            if argument.startswith("-"):
+                continue
+            for directory in (root, cwd):
+                if directory is None:
+                    continue
+                path = (directory / argument).resolve()
+                if path.is_relative_to(root.resolve()) and path.exists():
+                    refused = True
+    elif subcommand == "restore":
+        refused = ("--staged" not in arguments and "S" not in short_flags) or "--worktree" in arguments or "W" in short_flags
+    elif subcommand == "stash":
+        refused = bool(arguments) and arguments[0] in {"drop", "clear"}
+    elif subcommand == "switch":
+        refused = bool({"--discard-changes", "--force"}.intersection(arguments)) or "f" in short_flags
+    return subcommand if refused else None
+
+
 class DenialReason(str, Enum):
     """Why a check said no, as a value a caller can branch on.
 
@@ -571,8 +670,16 @@ class PermissionPolicy:
         commands = commands_for_argv(argv)
         wrappers = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
         if commands is not None:
+            cwd = self.repo_root
             for command in commands:
                 words = command.argv
+                if words[0] == "cd":
+                    destination = words[-1] if len(words) > 1 else ""
+                    if cwd is not None and destination and not destination.startswith("-"):
+                        directory = (cwd / destination).resolve()
+                        cwd = directory if directory.is_dir() else None
+                    else:
+                        cwd = None
                 if os.path.basename(words[0]) == "find":
                     candidate_starts = (0,)
                 elif os.path.basename(words[0]) in wrappers:
@@ -588,6 +695,7 @@ class PermissionPolicy:
                     if candidate_index in lookup_positions:
                         continue
                     candidate = words[candidate_index:]
+                    indirect = any(os.path.basename(word) == "xargs" for word in words[:candidate_index])
                     program = os.path.basename(candidate[0]) if candidate else ""
                     if program == "command" and len(candidate) > 1 and candidate[1] in {"-v", "-V"}:
                         continue
@@ -603,12 +711,31 @@ class PermissionPolicy:
                         if exec_index is None:
                             continue
                         candidate = find_words[exec_index + 1:]
+                        indirect = True
+                    discard_starts = (
+                        range(1, len(candidate))
+                        if indirect and candidate and os.path.basename(candidate[0]) in wrappers
+                        else (0,)
+                    )
+                    discarded = None
+                    for index in discard_starts:
+                        discarded = _discards_work(candidate[index:], self.repo_root, cwd, indirect=indirect)
+                        if discarded is not None:
+                            break
+                    if discarded is not None:
+                        return self._deny(
+                            f"this would discard uncommitted work ({discarded}); change the files with edits instead, or ask the person",
+                            denial=DenialReason.ALWAYS_DENY,
+                            tool_name="run_shell",
+                        )
                     for denied_prefix in ALWAYS_DENY_COMMANDS:
                         if (
                             candidate
                             and os.path.basename(candidate[0]) == denied_prefix[0]
                             and candidate[1:len(denied_prefix)] == denied_prefix[1:]
                         ):
+                            if denied_prefix[0] in {"curl", "wget"} and _loopback_download(candidate):
+                                continue
                             return self._deny(
                                 f"command matches always-deny rule: {' '.join(denied_prefix)!r}",
                                 denial=DenialReason.ALWAYS_DENY,

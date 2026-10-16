@@ -63,8 +63,8 @@ const ACTIVITY_KINDS = Object.freeze({
   forget: "activity-memory",
 });
 
-function renderPrompt(document, entry) {
-  const prompt = element(document, "p", { className: "prompt", text: entry.text });
+function renderPrompt(document, entry, _parseMarkdown, actions) {
+  const prompt = element(document, "p", { className: "prompt", text: actions?.promptText?.(entry.text) ?? entry.text });
   for (const attachment of entry.attachments ?? []) {
     const label = attachment.kind === "document"
       ? `PDF · ${attachment.filename || "document"}`
@@ -339,7 +339,8 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
       const verb = call.status === "running"
         ? RUNNING_ACTIVITY_VERBS[call.name] ?? `using ${call.name}`
         : ACTIVITY_VERBS[call.name] ?? `used ${call.name}`;
-      const label = index === 0 ? `${verb.charAt(0).toUpperCase()}${verb.slice(1)}` : verb;
+      const description = call.name === "run_shell" && !call.target ? `${verb} a command` : verb;
+      const label = index === 0 ? `${description.charAt(0).toUpperCase()}${description.slice(1)}` : description;
       const separator = index === 0 ? "" : index === calls.length - 1
         ? calls.length === 2 ? " and " : ", and "
         : ", ";

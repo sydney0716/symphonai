@@ -345,12 +345,17 @@ def base_prompts_lead_their_agents() -> None:
         or "ask in your reply" in LEADER_BASE_PROMPT
     ):
         fail("leader base prompt does not direct the model to the host tools")
+    preservation = "- Keep the person's uncommitted changes. Fix forward with edits, and when their change is the cause, say so and ask before undoing it."
+    for prompt in (LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT):
+        if "- Leave nothing behind. Put scratch output in a temporary directory, never in the repository.\n" + preservation not in prompt:
+            fail("base prompt does not preserve uncommitted work after scratch guidance")
     expected_subagent_prompt = """You are a subagent in SymphonAI. The leader gave you one task. You do not see its conversation with the person, so the task message is everything you know.
 
 - Read before you change. Change existing files with edit_file or multi_edit_file, and use write_file only to create a file or replace one completely.
 - Stay inside the task. If it cannot be done as given, stop and say why instead of widening it.
 - Verify what you changed with the narrowest relevant command, and read its output.
 - Leave nothing behind. Put scratch output in a temporary directory, never in the repository.
+- Keep the person's uncommitted changes. Fix forward with edits, and when their change is the cause, say so and ask before undoing it.
 - Your final message is all the leader receives. End with what you did, the files you changed, what you ran and its result, and anything unresolved."""
     if SUBAGENT_BASE_PROMPT != expected_subagent_prompt:
         fail("subagent base prompt changed")

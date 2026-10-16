@@ -316,7 +316,7 @@ def check_shell_sandbox_network_policy() -> None:
         port = listener.getsockname()[1]
         code = f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
         try:
-            for network, allowed in ((False, False), (True, True)):
+            for network, allowed in ((False, True), (True, True)):
                 result = RunShellTool().execute(
                     ToolCall(id="sandbox-network", name="run_shell", arguments={
                         "argv": [sys.executable, "-c", code],
@@ -914,3 +914,108 @@ def check_shell_timeout_seconds() -> None:
             error = tool.validate({"argv": argv, "timeout_seconds": value})
             if not error or "timeout_seconds" not in error:
                 fail(f"run_shell accepted invalid timeout_seconds {value!r}")
+
+
+@check("shell.sandbox_allows_loopback")
+def check_sandbox_allows_loopback() -> None:
+    if _sandbox_skip():
+        return
+    code = """
+import http.server, threading, urllib.request, socket
+server = http.server.HTTPServer(('127.0.0.1', 0), http.server.BaseHTTPRequestHandler)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+server.RequestHandlerClass = Handler
+threading.Thread(target=server.serve_forever, daemon=True).start()
+fetch = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+for host in ('127.0.0.1', 'localhost'):
+    with fetch(f'http://{host}:{server.server_port}/', timeout=2) as response:
+        assert response.status == 200
+# Use a documentation address to avoid DNS or contacting a real public service.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *args, **kwargs: resolve('203.0.113.1' if host == 'example.com' else host, *args, **kwargs)
+try:
+    fetch('http://example.com/', timeout=2)
+except urllib.error.URLError as exc:
+    assert isinstance(exc.reason, PermissionError), repr(exc)
+else:
+    raise AssertionError('external network was allowed')
+server.shutdown()
+print('loopback only')
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        result = RunShellTool().execute(ToolCall(
+            id="loopback", name="run_shell", arguments={"argv": [sys.executable, "-c", code]},
+        ), _sandbox_policy(Path(directory)))
+    if not result.ok or result.content.strip() != "loopback only":
+        fail(f"loopback sandbox failed: {result!r}")
+
+
+@check("shell.project_venv_on_path")
+def check_project_venv_on_path() -> None:
+    from symphonai_host.broker import EventBroker
+    from symphonai_host.run import HostRun
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        baseline = root / "baseline"
+        baseline.mkdir()
+        stub = baseline / "python"
+        stub.write_text("#!/bin/sh\necho baseline python\n")
+        stub.chmod(0o755)
+        variables = {"PATH": str(baseline) + os.pathsep + os.defpath, "PYTHONHOME": "original",
+                     "PROBE_KEY": "hidden", "PROBE_SECRET": "hidden", "PROBE_TOKEN": "hidden"}
+        manager = JobManager()
+        host = HostRun(None, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        policy = PermissionPolicy(root, mode="allow", shell_enabled=True, shell_allowlist=[()])
+        tool = RunShellTool(manager)
+        try:
+            with mock.patch.dict(os.environ, variables), mock.patch(
+                "symphonai_api.tools.shell._sandbox_available", return_value=False,
+            ):
+                original = shell_environment()
+                if shell_environment(root) != original:
+                    fail("no-venv environment changed")
+                plain = tool.execute(ToolCall(id="plain-python", name="run_shell", arguments={"command": "python"}), policy)
+                if not plain.ok or plain.content != "baseline python\n":
+                    fail(f"no-venv python changed: {plain!r}")
+                for name in ("venv", ".venv"):
+                    venv = root / name
+                    (venv / "bin").mkdir(parents=True)
+                    (venv / "bin/python").write_text("#!/bin/sh\necho venv python\n")
+                    (venv / "bin/python").chmod(0o755)
+                    expected = original if name == "venv" else previous
+                    if shell_environment(root) != expected:
+                        fail("incomplete virtualenv was activated")
+                    (venv / "pyvenv.cfg").touch()
+                    environment = shell_environment(root)
+                    if (environment["PATH"].split(os.pathsep)[0] != str(venv / "bin")
+                        or environment.get("VIRTUAL_ENV") != str(venv) or "PYTHONHOME" in environment
+                        or any(key in environment for key in ("PROBE_KEY", "PROBE_SECRET", "PROBE_TOKEN"))):
+                        fail("virtualenv environment or secret filtering differed")
+                    previous = environment
+                result = tool.execute(ToolCall(id="venv-python", name="run_shell", arguments={"command": "python"}), policy)
+                if not result.ok or result.content != "venv python\n":
+                    fail(f"agent did not use virtualenv: {result!r}")
+                background = tool.execute(ToolCall(id="venv-job", name="run_shell", arguments={"command": "python", "background": True}), policy)
+                if not background.ok:
+                    fail(f"virtualenv background job failed: {background!r}")
+                agent_id = background.content.split()[1].rstrip(".")
+                person_id = host.start_job("python")
+                for jobs, job_id in ((manager, agent_id), (host._person_jobs, person_id)):
+                    deadline = time.monotonic() + 5
+                    while jobs.get(job_id).status == "running" and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    job = jobs.read(job_id)
+                    if job["exit_code"] != 0 or job["output"] != "venv python\n":
+                        fail(f"background job did not use virtualenv: {job!r}")
+                reply = host.run_user_command("python")
+                if reply["exit_code"] != 0 or reply["output"] != "venv python\n":
+                    fail(f"person command did not use virtualenv: {reply!r}")
+        finally:
+            manager.close()
+            host.close()

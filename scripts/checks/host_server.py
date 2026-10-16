@@ -5387,7 +5387,7 @@ def check_plan_tool() -> None:
 def check_ask_user_round_trip() -> None:
     checked = []
     question_tool = questions_module.question_tools(
-        lambda prompt, options: checked.append((prompt, options))
+        lambda prompt, options, tool_call_id: checked.append((prompt, options, tool_call_id))
     )["ask_user"]
     for index, arguments in enumerate((
         {"question": ""},
@@ -5522,6 +5522,66 @@ def check_ask_user_round_trip() -> None:
             if connection is not None:
                 connection.close()
             host.close()
+
+
+@check("host_server.questions_carry_their_tool_call")
+def check_questions_carry_their_tool_call() -> None:
+    for call, mode, kind, answer in (
+        (ToolCall("q-1", "ask_user", {"question": "Continue?"}), "ask", "question", "yes"),
+        (ToolCall("p-1", "propose_plan", {"plan": "# Make the change"}), "plan", "plan", "ask"),
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provider = FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[call])),
+                ModelResponse(Message(Role.ASSISTANT, "done")),
+            ])
+            host = HostServer(
+                provider, PermissionPolicy(root), sessions_root=root / "sessions",
+                memory_extraction_enabled=False,
+            )
+            host.start()
+            stream_connection = None
+            try:
+                host.run.select_mode(mode)
+                stream_connection, stream_response = _subscribed_stream(host)
+                host.run.start("ask for my decision")
+                frame = _await_sse(
+                    stream_connection, stream_response,
+                    lambda item: isinstance(item, tuple)
+                    and item[0] == "approval_requested" and item[1].get("kind") == kind,
+                    what=f"{kind} with its tool call id",
+                )[1]
+                if frame.get("tool_call_id") != call.id:
+                    fail(f"{call.name} event lost its tool call id: {frame!r}")
+                connection, response = _request(host, "GET", "/approvals", headers=_headers(host))
+                try:
+                    pending = json.loads(response.read())
+                    if response.status != 200:
+                        fail(f"pending {kind} request failed: {response.status}, {pending!r}")
+                finally:
+                    connection.close()
+                approvals = pending.get("pending", [])
+                if (
+                    len(approvals) != 1
+                    or approvals[0].get("approval_id") != frame["approval_id"]
+                    or approvals[0].get("tool_call_id") != call.id
+                ):
+                    fail(f"{call.name} pending approval lost its tool call id: {pending!r}")
+                connection, response = _request(host, "POST", "/approval", headers=_headers(host), body={
+                    "approval_id": frame["approval_id"], "allowed": True, "answer": answer,
+                })
+                try:
+                    resolved = json.loads(response.read())
+                    if response.status != 200 or resolved != {"resolved": True}:
+                        fail(f"{kind} answer failed: {response.status}, {resolved!r}")
+                finally:
+                    connection.close()
+                _wait_until(lambda: not host.run.active, f"{kind} run did not finish")
+            finally:
+                if stream_connection is not None:
+                    stream_connection.close()
+                host.close()
 
 
 @check("host_server.plan_approval")
@@ -11734,3 +11794,106 @@ def check_headless_resume() -> None:
         result = json.loads(output)
         if result["session_id"] != session_id:
             fail(f"headless resume changed the session id: {result!r}")
+
+
+@check("host_server.environment_names_the_venv")
+def check_environment_names_the_venv() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        for name in ("venv", ".venv"):
+            venv = root / name
+            (venv / "bin").mkdir(parents=True)
+            (venv / "pyvenv.cfg").touch()
+            (venv / "bin/python").touch()
+            provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            host = HostServer(provider, PermissionPolicy(root), sessions_root=root / f"sessions-{name}", memory_extraction_enabled=False)
+            host.start()
+            try:
+                with mock.patch.object(provider, "create_response", wraps=provider.create_response) as spy:
+                    _send_host_prompt(host, "inspect environment")
+                systems = [message.text for message in spy.call_args.args[0].messages if message.role is Role.SYSTEM]
+                expected = f"- Repository root: {root}\n- Python virtual environment: {name} (on PATH for shell commands)\n- Platform:"
+                if not any(expected in text for text in systems):
+                    fail(f"project virtualenv missing from environment: {systems!r}")
+            finally:
+                host.close()
+
+
+@check("host_server.empty_chat_mode_is_one_chat")
+def check_empty_chat_mode_is_one_chat() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")) for _ in range(3)
+        ])
+        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions",
+                          memory_extraction_enabled=False)
+        host.start()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def request(method, path, body=None):
+            connection, response = _request(host, method, path, body=body, headers=_headers(host))
+            try:
+                reply = json.loads(response.read())
+                if response.status != 200:
+                    fail(f"mode fixture request failed: {method} {path}: {response.status}, {reply!r}")
+                return reply
+            finally:
+                connection.close()
+
+        def configured_mode():
+            if request("GET", "/settings").get("settings", {}).get("mode") != "ask":
+                fail("temporary conversation mode leaked into settings")
+
+        def conversation_mode(expected):
+            _, reply = _conversation_reply(host)
+            if reply.get("conversation", {}).get("mode") != expected:
+                fail(f"expected conversation mode {expected!r}: {reply!r}")
+            configured_mode()
+
+        try:
+            configured_mode()
+            request("POST", "/mode", {"mode": "plan"})
+            configured_mode()
+            _send_host_prompt(host, "plan this chat")
+            conversation_mode("plan")
+            first_session = host.run._conversation[1].run_id
+            request("POST", "/session/new", {})
+            configured_mode()
+
+            respond = provider.create_response
+
+            def blocked_response(model_request, *, cancel=None):
+                entered.set()
+                if not release.wait(5):
+                    fail("mode fixture did not release the active turn")
+                return respond(model_request, cancel=cancel)
+
+            with mock.patch.object(provider, "create_response", side_effect=blocked_response):
+                request("POST", "/prompt", {"prompt": "ordinary new chat"})
+                if not entered.wait(2):
+                    fail("new chat did not reach its model request")
+                conversation_mode("ask")
+                request("POST", "/mode", {"mode": "plan"})
+                conversation_mode("plan")
+                release.set()
+                _wait_until(lambda: not host.run.active, "mode fixture turn did not finish")
+
+            request("POST", "/session/new", {})
+            _send_host_prompt(host, "another ordinary chat")
+            conversation_mode("ask")
+            request("POST", "/session/new", {})
+            request("POST", "/mode", {"mode": "plan"})
+            request("POST", "/session/new", {})
+            if host.run.policy.mode != "ask":
+                fail("new chat retained an unused temporary mode")
+            request("POST", "/mode", {"mode": "plan"})
+            request("POST", "/session/open", {"run_id": first_session})
+            request("POST", "/session/new", {})
+            if host.run.policy.mode != "ask":
+                fail("switching conversations retained a temporary mode")
+            configured_mode()
+        finally:
+            release.set()
+            host.close()

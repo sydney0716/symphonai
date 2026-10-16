@@ -1616,7 +1616,7 @@ class HostServer:
                     search_key = None if extensions is None else extensions.config.get("search.endpoint")
                     configured_search = None if search_key is None else search_endpoint(search_key)
                     settings = {
-                        "mode": host.run.policy.mode,
+                        "mode": host.run.starting_mode,
                         "selection": host.run.selection(),
                         "config": [] if extensions is None else [
                             {

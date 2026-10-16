@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.environment import project_virtualenv
 from symphonai_api.jobs import JobManager
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
@@ -34,11 +35,17 @@ def shell_executable() -> str:
     return "/bin/bash" if os.path.isfile("/bin/bash") else "/bin/sh"
 
 
-def shell_environment() -> dict[str, str]:
-    return {
+def shell_environment(repo_root: str | Path | None = None) -> dict[str, str]:
+    environment = {
         key: value for key, value in os.environ.items()
         if not any(part in key.upper() for part in ("KEY", "SECRET", "TOKEN"))
     }
+    virtualenv = None if repo_root is None else project_virtualenv(repo_root)
+    if virtualenv is not None:
+        environment["PATH"] = str(virtualenv / "bin") + os.pathsep + environment.get("PATH", os.defpath)
+        environment["VIRTUAL_ENV"] = str(virtualenv)
+        environment.pop("PYTHONHOME", None)
+    return environment
 
 
 def _seatbelt_profile(policy: PermissionPolicy) -> str:
@@ -58,7 +65,12 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
     )
     rules.extend(("(allow file-write* (literal \"/dev/null\"))", "(allow file-write* (literal \"/dev/tty\"))"))
     if not policy.sandbox_network:
-        rules.extend(("(deny network*)", "(allow network* (local unix))"))
+        rules.extend((
+            "(deny network*)", "(allow network* (local unix))",
+            '(allow network-bind (local ip "localhost:*"))',
+            '(allow network-inbound (local ip "localhost:*"))',
+            '(allow network-outbound (remote ip "localhost:*"))',
+        ))
     return "\n".join(rules)
 
 
@@ -224,7 +236,7 @@ class RunShellTool(LocalTool):
             )
         if policy.shell_sandbox or (policy.mode == "allow" and sandbox_available):
             command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
-        env = shell_environment()
+        env = shell_environment(policy.repo_root)
         if tool_call.arguments.get("background") is True:
             if self._jobs is None:
                 return ToolResult(

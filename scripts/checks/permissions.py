@@ -1462,3 +1462,108 @@ def opaque_tool_modes() -> None:
                     fail(f"opaque request named the wrong tool: {requested[0]!r}")
                 if requested and denied and sink.events != [requested[0], denied[0]]:
                     fail(f"opaque permission event order differed: {sink.events!r}")
+
+
+@check("permissions.curl_to_loopback")
+def check_curl_to_loopback() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        policy = PermissionPolicy(Path(directory), mode="allow", shell_enabled=True, shell_allowlist=[()])
+        allowed = [
+            ["curl", "-s", "http://localhost:8000/"],
+            ["curl", "http://127.0.0.1:5173/api"],
+            ["wget", "https://[::1]:8443/path"],
+            ["curl", "--url=http://localhost:80/"],
+            ["curl", "-d", "hello", "http://localhost/"],
+            ["curl", "-sdTEXT", "http://localhost/"],
+            ["curl", "-o", "result.txt", "http://localhost/"],
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8000/"],
+            ["curl", "localhost:8000"],
+            ["curl", "127.0.0.1:5173/api"],
+            ["curl", "--json", "{}", "http://localhost/"],
+            ["curl", "-b", "c.txt", "http://localhost/"],
+            ["curl", "-sw%{http_code}", "http://localhost/"],
+            ["curl", "--write-out=%{http_code}", "--cookie=c.txt", "--cookie-jar=out.txt",
+             "--referer=http://example.com/", "--range=0-10", "--retry=2", "http://localhost/"],
+            ["curl", "-c", "out.txt", "-e", "http://example.com/", "-r", "0-10", "localhost"],
+        ]
+        denied = [
+            ["curl", "https://example.com"], ["curl", "http://localhost.evil.com/"],
+            ["curl", "-T", "f", "http://localhost:8000/"], ["wget", "http://10.0.0.1/"],
+            ["curl"], ["curl", "http://localhost/", "https://example.com"],
+            ["curl", "--url=https://example.com", "http://localhost/"],
+            ["curl", "example.com"],
+            ["curl", "--json", "@f", "http://localhost/"],
+            ["curl", "--json=@f", "http://localhost/"],
+            ["curl", "-x", "http://127.0.0.1:1", "http://localhost/"],
+            ["curl", "-sxhttp://127.0.0.1:1", "http://localhost/"],
+            ["curl", "--proxy=http://localhost:1", "http://localhost/"],
+            ["curl", "--resolve", "localhost:80:127.0.0.1", "http://localhost/"],
+            ["curl", "--resolve=localhost:80:127.0.0.1", "http://localhost/"],
+            ["curl", "--connect-to=localhost:80:localhost:8000", "http://localhost/"],
+            ["curl", "http://localhost/", "-:", "https://example.com"],
+            ["curl", "http://localhost/", "--next", "http://localhost/"],
+        ]
+        for option in (["--upload-file=f"], ["-Ffield=@f"], ["--form", "a=b"],
+                       ["-d@f"], ["-sd@f"], ["--data-urlencode", "field@f"], ["--data-binary=@f"], ["--config=f"], ["-Kf"], ["--post-file=f"]):
+            denied.append(["curl", *option, "http://localhost/"])
+        for argv in allowed:
+            if not policy.check_shell(argv).allowed:
+                fail(f"local download denied: {argv!r}")
+        for argv in denied:
+            decision = policy.check_shell(argv)
+            if decision.allowed or decision.denial is not DenialReason.ALWAYS_DENY:
+                fail(f"unsafe download escaped deny list: {argv!r}: {decision!r}")
+        requests = []
+        policy.mode = "ask"
+        policy.approval_callback = lambda request: requests.append(request) or True
+        for argv in allowed:
+            if not policy.check_shell(argv).allowed:
+                fail(f"local download did not get approval in ask mode: {argv!r}")
+        if len(requests) != len(allowed):
+            fail("loopback download bypassed ask mode")
+
+
+@check("permissions.discarding_work_is_refused")
+def check_discarding_work_is_refused() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "src").mkdir()
+        (root / "src/a.py").touch()
+        denied = [
+            "git checkout src/a.py", "git checkout -- .", "git checkout -p",
+            "git restore src/a.py", "git reset --hard HEAD", "git clean -fd",
+            "git stash drop", "git switch -f main",
+            "bash -c 'git status && git checkout src/a.py'",
+            "git checkout src", "git checkout --force main", "git checkout --patch",
+            "git clean -xdf", "git clean --force", "git stash clear",
+            "git switch --discard-changes main", "git switch --force main",
+            "git restore --staged --worktree src/a.py", "git restore --staged -W src/a.py",
+            "git checkout '*.py'", "git checkout :/", "cd src && git checkout a.py",
+            "cd src; git checkout src/a.py", "cd missing; git checkout src/a.py",
+            "git checkout --pathspec-from-file=f", "git checkout --pathspec-from-file f",
+            "xargs git checkout < f", "find . -name a.py -exec git checkout {} \\;",
+            "find . -name a.py -execdir git checkout {} \\;",
+            "find . -name a.py -exec env git checkout {} \\;",
+            "git restore -SW src/a.py", "git restore --staged '*.py'",
+            "git restore -S --pathspec-from-file=f", "xargs git restore -S < f",
+            "find . -exec git restore -S {} \\;",
+            "find . -execdir env git restore -S {} \\;",
+        ]
+        requests = []
+        for mode in ("allow", "ask", "plan"):
+            policy = PermissionPolicy(root, mode=mode, shell_enabled=True, shell_allowlist=[()],
+                                      approval_callback=lambda request: requests.append(request) or True)
+            for command in denied:
+                decision = policy.check_shell(["bash", "-c", command])
+                subcommand = "checkout" if "checkout" in command else "restore" if "restore" in command else command.split()[1]
+                expected = f"this would discard uncommitted work ({subcommand}); change the files with edits instead, or ask the person"
+                if decision.allowed or decision.denial is not DenialReason.ALWAYS_DENY or decision.reason != expected:
+                    fail(f"discarding command was not refused in {mode}: {command!r}: {decision!r}")
+        if requests:
+            fail("discarding work asked for approval")
+        policy.mode = "allow"
+        for command in ("git checkout feature", "git checkout -b fix", "git restore --staged src/a.py",
+                        "git stash", "git stash pop", "git reset HEAD~1", "git restore -S src/a.py",
+                        "git restore -Sq src/a.py", "git checkout release/1.2", "cd src && git checkout main"):
+            if not policy.check_shell(["bash", "-c", command]).allowed:
+                fail(f"non-discarding command was refused: {command!r}")

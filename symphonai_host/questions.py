@@ -18,7 +18,7 @@ PLAN_LIMIT = 20_000
 
 
 class AskUserTool(LocalTool):
-    def __init__(self, ask: Callable[[str, tuple[str, ...]], tuple[object, str]]) -> None:
+    def __init__(self, ask: Callable[[str, tuple[str, ...], str], tuple[object, str]]) -> None:
         self._ask = ask
 
     @property
@@ -80,6 +80,7 @@ class AskUserTool(LocalTool):
     ) -> ToolResult:
         decision, answer = self._ask(
             tool_call.arguments["question"], tuple(tool_call.arguments.get("options", ())),
+            tool_call.id,
         )
         if decision.allowed:
             return ToolResult(
@@ -102,7 +103,7 @@ class AskUserTool(LocalTool):
 
 
 def question_tools(
-    ask: Callable[[str, tuple[str, ...]], tuple[object, str]],
+    ask: Callable[[str, tuple[str, ...], str], tuple[object, str]],
 ) -> dict[str, LocalTool]:
     return {"ask_user": AskUserTool(ask)}
 
@@ -158,6 +159,7 @@ class ProposePlanTool(LocalTool):
             operation="propose_plan",
             target=tool_call.arguments["plan"],
             details="",
+            tool_call_id=tool_call.id,
             session_id=self._session_id,
             kind="plan",
             options=options,

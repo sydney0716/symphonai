@@ -1050,3 +1050,30 @@ test("reset starts a new conversation with a new root and no prior turn state", 
   transcript.restore(previous);
   assert.equal(transcript.model[0].text, "first");
 });
+
+
+test("background usage stays out of live and replayed transcripts", () => {
+  const transcript = createTranscript();
+  transcript.apply(event("BackgroundUsageRecorded", { session_id: "session-1" }));
+  assert.deepEqual(transcript.model, []);
+  transcript.apply(history("user", "hello", [], [], { session_id: "session-1" }));
+  const before = [...transcript.model];
+  transcript.apply(RECORDED_EVENTS.BackgroundUsageRecorded);
+  assert.deepEqual(transcript.model, before);
+});
+
+test("restored decision matching uses call ids across snapshot restore and rolls back failures", () => {
+  const transcript = applyAll([history("assistant", "", [
+    { id: "earlier-call", name: "ask_user", question: "Which database?", answer: "SQLite" },
+    { id: "pending-call", name: "ask_user", question: "Which database?" },
+  ])]);
+  const state = transcript.snapshot();
+  transcript.reset();
+  transcript.restore(state);
+  const undo = transcript.recordDecision({ type: "user-question", question: "Which database?", answer: "Postgres" }, "pending-call");
+  assert.deepEqual(transcript.model.map((entry) => entry.answer), ["SQLite", "Postgres"]);
+  undo();
+  assert.deepEqual(transcript.model.map((entry) => entry.answer), ["SQLite", ""]);
+  transcript.recordDecision({ type: "user-question", question: "Which database?", answer: "Skipped" }, "pending-call");
+  assert.deepEqual(transcript.model.map((entry) => entry.answer), ["SQLite", "Skipped"]);
+});

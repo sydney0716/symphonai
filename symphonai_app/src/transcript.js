@@ -36,6 +36,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   const model = [];
   const calls = new Map();
   const questions = new Map();
+  const pendingDecisions = new Map();
   const endedRuns = new Set();
   let turnSerial = 0;
   let sessionId = null;
@@ -110,7 +111,27 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   }
 
   function appendUserQuestion(question, answer = "", agentId) {
-    model.push({ type: "user-question", agentId, question, answer });
+    const entry = { type: "user-question", agentId, question, answer };
+    model.push(entry);
+    return entry;
+  }
+
+  function recordDecision(entry, toolCallId) {
+    const previous = pendingDecisions.get(toolCallId);
+    const index = model.indexOf(previous);
+    const decision = index === -1 ? entry : { ...previous, ...entry };
+    if (index === -1) model.push(decision);
+    else model.splice(index, 1, decision);
+    pendingDecisions.delete(toolCallId);
+    return () => {
+      const current = model.indexOf(decision);
+      if (current === -1) return;
+      if (index === -1) model.splice(current, 1);
+      else {
+        model.splice(current, 1, previous);
+        pendingDecisions.set(toolCallId, previous);
+      }
+    };
   }
 
   function liveCall(fields) {
@@ -273,7 +294,10 @@ export function createTranscript({ now = () => Date.now() } = {}) {
             const answer = typeof toolCall.answer === "string"
               ? toolCall.answer
               : toolCall.skipped === true ? "Skipped" : "";
-            appendUserQuestion(toolCall.question, answer, fields.agent_id);
+            const entry = appendUserQuestion(toolCall.question, answer, fields.agent_id);
+            if (typeof toolCall.id === "string" && typeof toolCall.answer !== "string" && toolCall.skipped !== true) {
+              pendingDecisions.set(toolCall.id, entry);
+            }
             continue;
           }
           if (toolCall.name === "propose_plan" && typeof toolCall.plan === "string") {
@@ -284,7 +308,9 @@ export function createTranscript({ now = () => Date.now() } = {}) {
                 : toolCall.decision === "keep_planning"
                   ? `Kept planning${typeof toolCall.feedback === "string" && toolCall.feedback ? `: ${toolCall.feedback}` : ""}`
                   : "";
-            model.push({ type: "user-plan", plan: toolCall.plan, outcome });
+            const entry = { type: "user-plan", plan: toolCall.plan, outcome };
+            model.push(entry);
+            if (typeof toolCall.id === "string" && !outcome) pendingDecisions.set(toolCall.id, entry);
             continue;
           }
           if (toolCall.name === "dispatch_subagent") {
@@ -533,6 +559,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       type === "SessionStarted"
       || type === "SessionEnded"
       || type === "SubagentStopped"
+      || type === "BackgroundUsageRecorded"
     ) {
       return;
     }
@@ -570,6 +597,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     model.length = 0;
     calls.clear();
     questions.clear();
+    pendingDecisions.clear();
     endedRuns.clear();
     activityTurns.clear();
     promptEdits.clear();
@@ -587,6 +615,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       model: [...model],
       calls: new Map(calls),
       questions: new Map(questions),
+      pendingDecisions: new Map(pendingDecisions),
       endedRuns: new Set(endedRuns),
       activityTurns: new Map(activityTurns),
       promptEdits: new Map([...promptEdits].map(([entry, edits]) => [entry, [...edits]])),
@@ -606,6 +635,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     model.push(...state.model);
     for (const [key, value] of state.calls) calls.set(key, value);
     for (const [key, value] of state.questions) questions.set(key, value);
+    for (const [key, value] of state.pendingDecisions) pendingDecisions.set(key, value);
     for (const value of state.endedRuns) endedRuns.add(value);
     for (const [key, value] of state.activityTurns) activityTurns.set(key, value);
     for (const [key, value] of state.promptEdits) promptEdits.set(key, [...value]);
@@ -621,6 +651,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
 
   return {
     apply,
+    recordDecision,
     reset,
     snapshot,
     restore,

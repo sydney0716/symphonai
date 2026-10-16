@@ -1501,6 +1501,7 @@ test("init queues behind a running turn and sends when that turn finishes", asyn
   await document.getElementById("prompt-form").dispatch("submit");
   assert.deepEqual(client.calls.prompt, ["first request"]);
   assert.deepEqual(app.turn.queue.map(({ text }) => text), [INIT_PROMPT]);
+  assert.equal(app.transcript.model.some((entry) => entry.type === "command" && entry.command === "/init"), false);
   assert.equal(input.value, "");
 
   await client.emit(eventFrame("RunFinished", { run_id: "run-active" }));
@@ -1515,9 +1516,11 @@ test("init is refused in plan mode and rejects arguments", async () => {
   });
   await start({ global: {}, document, client });
   await submitCommand(document, "/init");
+  assert.equal(latestCommandEntry(document).children[0].textContent, "/init");
   assert.deepEqual(latestCommandOutput(document), ["Plan mode cannot write files. Switch with /plan, then run /init."]);
   assert.deepEqual(client.calls.prompt, []);
   await submitCommand(document, "/init now");
+  assert.equal(latestCommandEntry(document).children[0].textContent, "/init now");
   assert.deepEqual(latestCommandOutput(document), ["Usage: /init"]);
   assert.deepEqual(client.calls.prompt, []);
 });
@@ -5544,7 +5547,7 @@ test("activity targets render as code while failures and missing targets keep th
   await untargetedClient.emit(toolStarted("untargeted-call", "run_shell", null));
   await untargetedClient.emit(toolFinished("untargeted-call", "run_shell"));
   const untargetedLine = untargetedDocument.getElementById("chat").children[0];
-  assert.equal(textInDocumentOrder(untargetedLine), "Ran.");
+  assert.equal(textInDocumentOrder(untargetedLine), "Ran a command.");
   assert.deepEqual(walk(untargetedLine).filter((node) => node.tagName === "CODE"), []);
 });
 
@@ -7355,4 +7358,221 @@ test("Jobs tab lists, starts, stops, polls, and refreshes jobs on JobChanged", a
   assert.equal(client.calls.jobs, reads + 1);
   await document.getElementById("rail-tabs").children.at(-1).dispatch("click");
   assert.equal(intervals[0].cleared, true);
+});
+
+
+test("startup restores answerable questions and approvals without duplicating streamed cards", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const pending = [
+    { approval_id: "restored-question", operation: "ask_user", target: "Which file?", details: "",
+      kind: "question", options: ["a.py", "b.py"] },
+    { approval_id: "restored-approval", operation: "write_file", target: "a.py", details: "write file" },
+  ];
+  const events = client.events;
+  let resolveReady;
+  let subscribed;
+  const listening = new Promise((resolve) => { subscribed = resolve; });
+  const ready = new Promise((resolve) => { resolveReady = resolve; });
+  let reads = 0;
+  client.events = (callback) => {
+    const subscription = events(callback);
+    subscribed();
+    return { ...subscription, ready };
+  };
+  client.approvals = async () => {
+    reads += 1;
+    await client.emit({ kind: "approval_requested", payload: pending[0] });
+    return { pending };
+  };
+  const opening = start({ global: {}, document, client });
+  await listening;
+  assert.equal(reads, 0);
+  resolveReady();
+  const app = await opening;
+  const cards = document.getElementById("approvals");
+  assert.equal(reads, 1);
+  assert.equal(cards.children.length, 2);
+  assert.equal(app.approvals.state.size, 2);
+  await find(cards, (node) => node.tagName === "BUTTON" && node.textContent === "b.py").dispatch("click");
+  await find(cards, (node) => node.tagName === "BUTTON" && node.textContent === "Allow").dispatch("click");
+  assert.deepEqual(client.calls.approve, [
+    { id: "restored-question", allowed: true, reason: "", answer: "b.py" },
+    { id: "restored-approval", allowed: true, reason: "" },
+  ]);
+});
+
+test("startup finishes when pending approvals cannot be refreshed", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const events = client.events;
+  client.events = (callback) => ({ ...events(callback), ready: Promise.resolve() });
+  let reads = 0;
+  client.approvals = async () => { reads += 1; throw new Error("offline"); };
+  const app = await start({ global: {}, document, client });
+  assert.ok(app);
+  assert.equal(reads, 1);
+  assert.equal(document.getElementById("approvals").children.length, 0);
+});
+
+
+test("slash expansions render as commands live and on replay while retaining model text", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  const cases = [
+    [INIT_PROMPT, "/init"], [REVIEW_PROMPT, "/review"],
+    [REVIEW_PROMPT + "\n\nFocus on: errors", "/review errors"],
+    ["Use the release skill.", "/release"],
+    ["Use the release skill.\n\ncut 1.2", "/release cut 1.2"],
+    [INIT_PROMPT + " extra", INIT_PROMPT + " extra"], ["ordinary prompt", "ordinary prompt"],
+  ];
+  for (const type of ["PromptSubmitted", "HistoryMessage"]) {
+    for (const [text, expected] of cases) {
+      await client.emit(eventFrame(type, { role: "user", text, message_count: 1 }));
+      const prompts = document.getElementById("chat").children.filter((node) => node.className === "prompt");
+      assert.equal(prompts.at(-1).textContent, expected);
+      assert.equal(app.transcript.model.at(-1).text, text);
+    }
+  }
+});
+
+test("listed typed models select immediately without opening a picker", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.models = async (provider) => ({ provider, state: "available", models: [{ id: "claude-sonnet-5-5", efforts: [] }] });
+  await start({ global: {}, document, client });
+  document.getElementById("prompt").value = "/model anthropic claude-sonnet-5-5";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.selectProvider, [{ name: "anthropic", model: "claude-sonnet-5-5" }]);
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "picker"), undefined);
+  assert.match(visibleText(document.getElementById("chat")), /Model set to anthropic \/ claude-sonnet-5-5\./);
+});
+
+test("shell calls without a target have readable running and finished activity", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(toolStarted("empty-shell", "run_shell", ""));
+  assert.equal(find(document.getElementById("chat"), (node) => node.className.includes("activity-shell")).attributes.get("title"), "Running a command…");
+  await client.emit(toolFinished("empty-shell", "run_shell"));
+  assert.equal(find(document.getElementById("chat"), (node) => node.className.includes("activity-shell")).attributes.get("title"), "Ran a command.");
+});
+
+test("background usage refreshes statistics without a transcript line", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), { conversation: { session_id: "usage-session" } });
+  const app = await start({ global: {}, document, client });
+  const before = client.calls.conversationStats;
+  await client.emit(eventFrame("BackgroundUsageRecorded", { session_id: "usage-session" }));
+  assert.ok(client.calls.conversationStats > before);
+  assert.deepEqual(app.transcript.model, []);
+  assert.doesNotMatch(visibleText(document.getElementById("chat")), /BackgroundUsageRecorded/);
+});
+
+test("answering restored questions and plans updates their replayed entry once", async () => {
+  const cases = [
+    { name: "ask_user", question: "Which database?", kind: "question", options: ["Postgres"],
+      target: "Which database?", button: "Postgres", type: "user-question", field: "answer", expected: "Postgres" },
+    { name: "ask_user", question: "Which database?", kind: "question", options: ["Postgres"],
+      target: "Which database?", button: "Skip", type: "user-question", field: "answer", expected: "Skipped" },
+    { name: "propose_plan", plan: "Database plan", kind: "plan", options: ["ask", "allow"],
+      target: "Database plan", button: "Approve, ask before changes", type: "user-plan", field: "outcome", expected: "Approved — ask before changes" },
+    { name: "propose_plan", plan: "Database plan", kind: "plan", options: ["ask", "allow"],
+      target: "Database plan", button: "Keep planning", type: "user-plan", field: "outcome", expected: "Kept planning" },
+  ];
+  for (const fixture of cases) {
+    for (const replay of [false, true]) {
+      const document = new FakeDocument();
+      const client = fakeClient();
+      const app = await start({ global: {}, document, client });
+      if (replay) {
+        await client.emit(eventFrame("HistoryMessage", { role: "assistant", text: "", tool_calls: [
+          { id: "restored-call", name: fixture.name, question: fixture.question, plan: fixture.plan },
+        ] }));
+      }
+      await client.emit({ kind: "approval_requested", payload: {
+        approval_id: "restored-decision", tool_call_id: "restored-call", operation: fixture.name,
+        target: fixture.target, details: "", kind: fixture.kind, options: fixture.options,
+      } });
+      await find(document.getElementById("approvals"), (node) => (
+        node.tagName === "BUTTON" && node.textContent === fixture.button
+      )).dispatch("click");
+      const entries = app.transcript.model.filter((entry) => entry.type === fixture.type);
+      assert.equal(entries.length, 1, `${fixture.button}, replay=${replay}`);
+      assert.equal(entries[0][fixture.field], fixture.expected);
+    }
+  }
+});
+
+test("a stale restored answer preserves the unanswered replay entry", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  await client.emit(eventFrame("HistoryMessage", { role: "assistant", text: "", tool_calls: [
+    { id: "stale-call", name: "ask_user", question: "Which database?" },
+  ] }));
+  const original = [...app.transcript.model];
+  client.approve = async () => ({ status: 404 });
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "stale-restored", tool_call_id: "stale-call", operation: "ask_user",
+    target: "Which database?", details: "", kind: "question", options: ["Postgres"],
+  } });
+  await find(document.getElementById("approvals"), (node) => (
+    node.tagName === "BUTTON" && node.textContent === "Postgres"
+  )).dispatch("click");
+  assert.deepEqual(app.transcript.model, original);
+});
+
+test("answering a restored ordinary approval adds no duplicate activity", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const app = await start({ global: {}, document, client });
+  await client.emit(eventFrame("HistoryMessage", { role: "assistant", text: "", tool_calls: [
+    { id: "permission-call", name: "run_shell", target: "pytest" },
+  ] }));
+  const original = [...app.transcript.model];
+  await client.emit({ kind: "approval_requested", payload: {
+    approval_id: "restored-permission", tool_call_id: "permission-call", operation: "run_shell",
+    target: "pytest", details: "run tests",
+  } });
+  await find(document.getElementById("approvals"), (node) => (
+    node.tagName === "BUTTON" && node.textContent === "Allow"
+  )).dispatch("click");
+  assert.deepEqual(app.transcript.model, original);
+  assert.deepEqual(client.calls.approve, [{ id: "restored-permission", allowed: true, reason: "" }]);
+});
+
+test("prompt slash commands show one prompt live and after replay", async () => {
+  const cases = [
+    { command: "/review errors", expansion: REVIEW_PROMPT + "\n\nFocus on: errors" },
+    { command: "/init", expansion: INIT_PROMPT },
+    { command: "/release cut 1.2", expansion: "Use the release skill.\n\ncut 1.2" },
+  ];
+  for (const { command, expansion } of cases) {
+    const document = new FakeDocument();
+    const client = fakeClient(fixtureRoadmap(), { settings: { settings: { skills: [
+      { name: "release", description: "Release the project" },
+    ] } } });
+    client.prompt = async (text) => {
+      client.calls.prompt.push(text);
+      await client.emit(eventFrame("PromptSubmitted", { text, message_count: 1 }));
+      return { accepted: true, run_id: "slash-run" };
+    };
+    const app = await start({ global: {}, document, client });
+    await submitCommand(document, command);
+    assert.deepEqual(client.calls.prompt, [expansion]);
+    assert.equal(app.transcript.model.filter((entry) => entry.type === "command").length, 0);
+    assert.equal(app.transcript.model.filter((entry) => entry.type === "prompt").length, 1);
+    const prompts = document.getElementById("chat").children.filter((node) => node.className === "prompt");
+    assert.deepEqual(prompts.map((node) => node.textContent), [command]);
+    assert.equal(document.getElementById("chat").children.length, 1);
+
+    const replayDocument = new FakeDocument();
+    const replayClient = fakeClient();
+    const replay = await start({ global: {}, document: replayDocument, client: replayClient });
+    await replayClient.emit(eventFrame("HistoryMessage", { role: "user", text: expansion }));
+    assert.deepEqual(replay.transcript.model.map((entry) => entry.type), ["prompt"]);
+    assert.equal(replayDocument.getElementById("chat").children[0].textContent, command);
+  }
 });

@@ -63,6 +63,17 @@ export const REVIEW_PROMPT = `Review the uncommitted changes in this repository.
 3. Report findings, most severe first. For each: the file and line, what is wrong, and the input or situation that shows it. Leave out style preferences.
 4. If nothing is worth fixing, say so in one line.`;
 
+function promptCommand(text) {
+  if (text === INIT_PROMPT) return "/init";
+  if (text === REVIEW_PROMPT) return "/review";
+  const focusPrefix = `${REVIEW_PROMPT}\n\nFocus on: `;
+  if (typeof text === "string" && text.startsWith(focusPrefix)) {
+    return `/review ${text.slice(focusPrefix.length)}`;
+  }
+  const skill = typeof text === "string" && /^Use the (\S+) skill\.(?:\n\n([\s\S]*))?$/.exec(text);
+  return skill ? `/${skill[1]}${skill[2] ? ` ${skill[2]}` : ""}` : text;
+}
+
 function filename(path) {
   return path.split("/").at(-1).replace(/\.md$/, "");
 }
@@ -1415,6 +1426,7 @@ export async function start({ global, document, client }) {
       following = chatRoot.scrollHeight - chatRoot.scrollTop - chatRoot.clientHeight <= 24;
     }
     renderTranscript(document, chatRoot, transcript.model, parseMarkdown, {
+      promptText: promptCommand,
       copyText: async (text) => {
         const clipboard = global.navigator?.clipboard;
         if (typeof clipboard?.writeText !== "function") {
@@ -2807,15 +2819,14 @@ export async function start({ global, document, client }) {
 
   function showApprovals() {
     const children = [];
-    const recordDecisionAtCurrentPosition = (entry) => {
-      transcript.model.push(entry);
+    const recordDecisionAtCurrentPosition = (entry, question) => {
+      const toolCallId = !question.session_id || question.session_id === currentSessionId
+        ? question.tool_call_id : undefined;
+      const removeRecord = transcript.recordDecision(entry, toolCallId);
       showTranscript();
       return () => {
-        const index = transcript.model.indexOf(entry);
-        if (index !== -1) {
-          transcript.model.splice(index, 1);
-          showTranscript();
-        }
+        removeRecord();
+        showTranscript();
       };
     };
     for (const [id, question] of approvals.state) {
@@ -2840,7 +2851,7 @@ export async function start({ global, document, client }) {
               type: "user-question",
               question: question.target,
               answer: allowed ? answerText : "Skipped",
-            });
+            }, question);
             try {
               await approvals.answer(id, allowed, "", false, answerText);
             } catch (error) {
@@ -2886,7 +2897,7 @@ export async function start({ global, document, client }) {
               const removeRecord = recordDecisionAtCurrentPosition({
                 type: "user-plan", plan: question.target,
                 outcome: mode === "ask" ? "Approved — ask before changes" : "Approved — allow changes",
-              });
+              }, question);
               try {
                 await approvals.answer(id, true, "", false, mode);
               } catch (error) {
@@ -2918,7 +2929,7 @@ export async function start({ global, document, client }) {
             const removeRecord = recordDecisionAtCurrentPosition({
               type: "user-plan", plan: question.target,
               outcome: reason ? `Kept planning: ${reason}` : "Kept planning",
-            });
+            }, question);
             try {
               await approvals.answer(id, false, reason);
             } catch (error) {
@@ -3786,6 +3797,14 @@ export async function start({ global, document, client }) {
     }
   }
 
+  async function submitCommandPrompt(prompt) {
+    const index = transcript.model.indexOf(commandEntry);
+    if (index !== -1) transcript.model.splice(index, 1);
+    commandEntry = null;
+    showTranscript();
+    await perform(turn.submit(prompt));
+  }
+
   async function runCommand(command) {
     closeCommandMenu();
     closeFileMenu();
@@ -3804,7 +3823,7 @@ export async function start({ global, document, client }) {
       if (skill) {
         const request = command.slice(typedName.length).trim();
         const prompt = `Use the ${skill.name} skill.${request ? `\n\n${request}` : ""}`;
-        await perform(turn.submit(prompt));
+        await submitCommandPrompt(prompt);
         return;
       }
       answerCommand(`Unknown command: ${typedName}. Type / to see commands.`);
@@ -3850,7 +3869,11 @@ export async function start({ global, document, client }) {
           await chooseTypedModel(provider, model);
           return;
         }
-        await openModelPicker(provider, model);
+        if (listing?.state === "available" && Array.isArray(listing.models)) {
+          await chooseTypedModel(provider, model, listing.models.find((row) => row.id === model)?.efforts);
+        } else {
+          await openModelPicker(provider, model);
+        }
         return;
       }
       answerCommand("Usage: /model [<provider> [<id>]]");
@@ -4035,14 +4058,14 @@ export async function start({ global, document, client }) {
       }
       promptFailure = "";
       showPromptError();
-      await perform(turn.submit(INIT_PROMPT));
+      await submitCommandPrompt(INIT_PROMPT);
       return;
     }
     if (entry.name === "review") {
       const focus = command.slice(typedName.length).trim();
       promptFailure = "";
       showPromptError();
-      await perform(turn.submit(`${REVIEW_PROMPT}${focus ? `\n\nFocus on: ${focus}` : ""}`));
+      await submitCommandPrompt(`${REVIEW_PROMPT}${focus ? `\n\nFocus on: ${focus}` : ""}`);
       return;
     }
     if (entry.name === "commit") {
@@ -4297,6 +4320,12 @@ export async function start({ global, document, client }) {
         }
       }
       await openSession(currentSessionId);
+    }
+    try {
+      await approvals.resync();
+      showApprovals();
+    } catch {
+      // A failed refresh must not prevent the conversation from opening.
     }
   }
   updateWindowTitle();

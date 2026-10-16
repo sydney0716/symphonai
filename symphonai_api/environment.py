@@ -20,6 +20,15 @@ class GitSnapshot:
     recent_commits: str
 
 
+def project_virtualenv(repo_root: str | Path) -> Path | None:
+    root = Path(repo_root).resolve()
+    for name in (".venv", "venv"):
+        candidate = root / name
+        if (candidate / "pyvenv.cfg").is_file() and (candidate / "bin/python").is_file():
+            return candidate
+    return None
+
+
 def render_environment(
     *,
     working_dir: str | Path,
@@ -41,6 +50,9 @@ def render_environment(
         f"- Date: {date_text}",
         model_line,
     ]
+    virtualenv = project_virtualenv(repo_root)
+    if virtualenv is not None:
+        lines.insert(3, f"- Python virtual environment: {virtualenv.name} (on PATH for shell commands)")
     rendered = "\n".join(lines)
     if git_snapshot is None:
         return rendered
