@@ -7,7 +7,7 @@ import difflib
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.models import ToolCall, ToolResult
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import PermissionPolicy, approval_diff
 from symphonai_api.tools import filesystem as filesystem_tools
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
@@ -168,7 +168,10 @@ class EditFileTool(LocalTool):
         old_string = tool_call.arguments["old_string"]
         new_string = tool_call.arguments["new_string"]
         replace_all = tool_call.arguments.get("replace_all", False)
-        decision = policy.check_write(path)
+        if policy.mode == "ask":
+            decision = policy.check_read(path)
+        else:
+            decision = policy.check_write(path)
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         resolved = policy._resolve_within_root(path)
@@ -201,6 +204,15 @@ class EditFileTool(LocalTool):
         updated = content.replace(old_string, new_string) if replace_all else content.replace(
             old_string, new_string, 1
         )
+        if policy.mode == "ask":
+            decision = policy.check_write(
+                path, diff=approval_diff(content, updated, str(path))
+            )
+            if not decision.allowed:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
+            stale_error = self._ledger.check(resolved)
+            if stale_error is not None:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
         try:
             if self._checkpoints is not None:
                 self._checkpoints.before_write(resolved)
@@ -277,7 +289,11 @@ class MultiEditFileTool(EditFileTool):
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
         path = tool_call.arguments["path"]
-        decision = policy.check_write(path)
+        decision = (
+            policy.check_read(path)
+            if policy.mode == "ask"
+            else policy.check_write(path)
+        )
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         resolved = policy._resolve_within_root(path)
@@ -316,6 +332,15 @@ class MultiEditFileTool(EditFileTool):
                 if edit.get("replace_all", False)
                 else updated.replace(old_string, edit["new_string"], 1)
             )
+        if policy.mode == "ask":
+            decision = policy.check_write(
+                path, diff=approval_diff(original, updated, str(path))
+            )
+            if not decision.allowed:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
+            stale_error = self._ledger.check(resolved)
+            if stale_error is not None:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
         try:
             if self._checkpoints is not None:
                 self._checkpoints.before_write(resolved)

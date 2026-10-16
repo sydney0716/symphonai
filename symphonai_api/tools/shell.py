@@ -38,7 +38,9 @@ def shell_executable() -> str:
     return "/bin/bash" if os.path.isfile("/bin/bash") else "/bin/sh"
 
 
-def shell_environment(repo_root: str | Path | None = None) -> dict[str, str]:
+def shell_environment(
+    repo_root: str | Path | None = None, *, for_agent: bool = False,
+) -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items()
         if not any(part in key.upper() for part in ("KEY", "SECRET", "TOKEN"))
@@ -48,6 +50,16 @@ def shell_environment(repo_root: str | Path | None = None) -> dict[str, str]:
         environment["PATH"] = str(virtualenv / "bin") + os.pathsep + environment.get("PATH", os.defpath)
         environment["VIRTUAL_ENV"] = str(virtualenv)
         environment.pop("PYTHONHOME", None)
+    if for_agent:
+        environment.update({
+            "PAGER": "cat",
+            "GIT_PAGER": "cat",
+            "GIT_EDITOR": "true",
+            "EDITOR": "true",
+            "VISUAL": "true",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+        })
     return environment
 
 
@@ -299,7 +311,7 @@ class RunShellTool(LocalTool):
                 command = _bwrap_command(policy, command, cwd)
             else:
                 command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *command]
-        env = shell_environment(policy.repo_root)
+        env = shell_environment(policy.repo_root, for_agent=True)
         if tool_call.arguments.get("background") is True:
             if self._jobs is None:
                 return ToolResult(

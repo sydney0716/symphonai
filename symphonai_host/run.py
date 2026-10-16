@@ -41,6 +41,7 @@ from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import ContentInput, DocumentBlock, ImageBlock, Message, Role, TextBlock
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, tool_result_text
+from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import (
     SessionError,
     SessionStore,
@@ -132,6 +133,14 @@ def _checkpoint_file_bytes(checkpoints: CheckpointStore, path: str) -> bytes | N
 
 
 PERMISSION_MODES = ("ask", "plan", "allow")
+_sleep_keeper_lock = threading.Lock()
+_sleep_keeper_holders: set[int] = set()
+_sleep_keeper_process: subprocess.Popen | None = None
+
+
+def _schema_tool_name(schema: dict) -> str | None:
+    function = schema.get("function")
+    return function.get("name") if isinstance(function, dict) else schema.get("name")
 
 
 @dataclass(frozen=True)
@@ -320,6 +329,7 @@ class HostRun:
         )
         self._mcp_tools = mcp_tools
         self._lsp = lsp
+        self._restricted_tool_names: frozenset[str] | None = None
         self._price_table = price_table
         self._leader_budget = None
         self._subagent_budget = None
@@ -358,6 +368,7 @@ class HostRun:
         self._context_by_session: dict[str, ContextReport | None] = {}
         self._usage_by_session: dict[str, dict[str, tuple[str, dict[str, UsageTotals]]]] = {}
         self._closing = False
+        self._sleep_keeper_released = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
         self._memory_root = default_memory_root() if memory_root is None else Path(memory_root)
         self._memory: AgentMemory | None = None
@@ -792,6 +803,7 @@ class HostRun:
             context = GoalCheck(goal, session_id, threading.Event(), leader.agent_ref.agent_id)
             self._goal_check = context
             self._goal_checks_by_session[session_id] = context
+            self._refresh_sleep_prevention()
             thread = threading.Thread(
                 target=self._perform_goal_check,
                 args=(context, ""),
@@ -804,6 +816,47 @@ class HostRun:
 
     def _root_agent_id(self) -> str:
         return "" if self._conversation is None else self._conversation[0].agent_ref.agent_id
+
+    def _refresh_sleep_prevention(self) -> None:
+        global _sleep_keeper_process
+        active = (
+            not self._sleep_keeper_released
+            and bool(self._active_by_session or self._goal_checks_by_session)
+        )
+        supported = sys.platform == "darwin" and os.path.isfile("/usr/bin/caffeinate")
+        with _sleep_keeper_lock:
+            if active and supported:
+                _sleep_keeper_holders.add(id(self))
+            else:
+                _sleep_keeper_holders.discard(id(self))
+            if not supported:
+                return
+            if _sleep_keeper_holders:
+                if _sleep_keeper_process is None or _sleep_keeper_process.poll() is not None:
+                    try:
+                        _sleep_keeper_process = subprocess.Popen(
+                            ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except OSError:
+                        _sleep_keeper_process = None
+            elif _sleep_keeper_process is not None:
+                process = _sleep_keeper_process
+                _sleep_keeper_process = None
+                try:
+                    process.terminate()
+                    process.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+
+    def _release_sleep_prevention(self) -> None:
+        self._sleep_keeper_released = True
+        self._refresh_sleep_prevention()
 
     def _start_for_session(self, session_id: str, prompt: str) -> str:
         with self._lock:
@@ -1335,11 +1388,13 @@ class HostRun:
                 run_id, cancel, thread, leader.agent_ref.agent_id, goal_round=is_goal_round,
             )
             self._active_by_session[session_id] = self._active
+            self._refresh_sleep_prevention()
             try:
                 thread.start()
             except Exception:
                 self._active = None
                 self._active_by_session.pop(session_id, None)
+                self._refresh_sleep_prevention()
                 if _new_goal is not None:
                     self._save_goal(session_id, None)
                     self._goals_by_session.pop(session_id, None)
@@ -1417,6 +1472,11 @@ class HostRun:
             directory=session.tool_results_directory,
             fallback_directories=tool_result_search_path(session),
         )
+        if (
+            self._restricted_tool_names is not None
+            and "read_tool_result" not in self._restricted_tool_names
+        ):
+            result_store = None
         skills = None if self._extensions is None else self._extensions.skills
         roster = builtin_subagent_specs(
             self._provider,
@@ -1430,6 +1490,41 @@ class HostRun:
         )
         if self._extensions is not None:
             roster.update(self._extensions.agents)
+        if self._restricted_tool_names is not None:
+            available_extra = set(self._mcp_tools or {})
+            restricted_roster = {}
+            for name, spec in roster.items():
+                if name == "leader":
+                    restricted_roster[name] = spec
+                    continue
+                tool_names = (
+                    tuple(
+                        tool for tool in standard_tool_registry(
+                            result_store=(result_store if "read_tool_result" in self._restricted_tool_names else None),
+                            search_backend=self._search_backend,
+                            skills=skills,
+                            lsp=self._lsp,
+                            jobs=jobs,
+                        )
+                        if tool in self._restricted_tool_names
+                    ) if spec.tool_names is None
+                    else tuple(tool for tool in spec.tool_names if tool in self._restricted_tool_names)
+                )
+                mcp_names = (
+                    tuple(tool for tool in available_extra if tool in self._restricted_tool_names)
+                    if spec.mcp_tool_names is None
+                    else tuple(tool for tool in spec.mcp_tool_names if tool in self._restricted_tool_names)
+                )
+                if tool_names == () and not mcp_names:
+                    continue
+                memory = spec.memory
+                if not {"remember", "forget_memory"}.issubset(self._restricted_tool_names):
+                    memory = replace(memory, enabled=False)
+                restricted_roster[name] = replace(
+                    spec, tool_names=tool_names, mcp_tool_names=mcp_names,
+                    denied_mcp_tool_names=(), memory=memory,
+                )
+            roster = restricted_roster
         if self._subagent_budget is not None:
             roster = {
                 name: spec if name == "leader" else spec.with_overrides(
@@ -1501,7 +1596,7 @@ class HostRun:
                 child_providers[key] = configure_fallback(child_providers[key])
             return child_providers[key]
 
-        return Leader(
+        leader = Leader(
             LeaderConfig(
                 leader_provider=leader_provider,
                 subagent_provider=self._provider,
@@ -1561,6 +1656,38 @@ class HostRun:
             ),
             session=session,
         )
+        if self._restricted_tool_names is not None:
+            selected = set(self._restricted_tool_names)
+            leader._agent._tools = {
+                name: tool for name, tool in leader._agent._tools.items()
+                if name in selected
+            }
+            leader._agent._tool_schemas = [
+                schema for schema in leader._agent._tool_schemas
+                if _schema_tool_name(schema) in selected
+            ]
+            leader._leader_spec = replace(
+                leader._leader_spec,
+                tool_names=tuple(name for name in leader._leader_spec.tool_names if name in selected),
+            )
+        return leader
+
+    def available_tool_names(self) -> set[str]:
+        names = set(standard_tool_registry())
+        names.update({
+            "web_search", "use_skill", "lsp", "read_tool_result", "job_output",
+            "job_stop", "remember", "forget_memory", "dispatch_subagent",
+            "get_goal", "update_goal", "update_plan", "ask_user", "propose_plan",
+        })
+        names.update(self._mcp_tools or {})
+        if self._extensions is not None:
+            for spec in self._extensions.agents.values():
+                names.update(spec.tool_names or ())
+                names.update(spec.mcp_tool_names or ())
+        return names
+
+    def restrict_tool_names(self, names: set[str]) -> None:
+        self._restricted_tool_names = frozenset(names)
 
     def _publish_active(self, event: Event) -> None:
         with self._lock:
@@ -2022,6 +2149,7 @@ class HostRun:
 
     def close(self) -> None:
         self._closing = True
+        self._release_sleep_prevention()
         with self._lock:
             active_runs = tuple(self._active_by_session.values())
             approval_brokers = tuple(dict.fromkeys(self._approvals_by_session.values()))
@@ -2875,6 +3003,7 @@ class HostRun:
                     self._goal_check = None
                     self._goal_check_thread = None
                 self._goal_checks_by_session.pop(context.session_id, None)
+                self._refresh_sleep_prevention()
                 self._close_idle_conversations_locked()
                 return
             goal.last_check = result
@@ -2911,6 +3040,7 @@ class HostRun:
                 self._goal_check = None
                 self._goal_check_thread = None
             self._goal_checks_by_session.pop(context.session_id, None)
+            self._refresh_sleep_prevention()
             self._goal_event("check", goal, run_id, context.agent_id)
             if goal.phase in ("complete", "blocked", "paused"):
                 self._finish_spec_run(context.session_id, goal.phase)
@@ -3099,6 +3229,7 @@ class HostRun:
                     and self._active_by_session.get(session_id) is active_to_finish
                 ):
                     self._active_by_session.pop(session_id, None)
+                    self._refresh_sleep_prevention()
                     if self._conversation is not None and self._conversation[1].run_id == session_id:
                         self._active = None
                     if terminal_event is not None:
@@ -3133,6 +3264,7 @@ class HostRun:
                         self._goal_check = context
                         self._goal_check_thread = threading.current_thread()
                     self._goal_checks_by_session[session_id] = context
+                    self._refresh_sleep_prevention()
                     run_check_now = True
                 elif goal.rounds < goal.max_rounds:
                     next_prompt = _unchecked_goal_prompt(goal)

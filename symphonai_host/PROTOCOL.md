@@ -145,7 +145,8 @@ with an empty body.
 ## Approvals
 
 An `approval_requested` frame carries `approval_id`, `operation`, `target`,
-`details`, `tool_call_id`, `remember`, `session_id`, `kind`, and `options`.
+`details`, `tool_call_id`, `remember`, `session_id`, `kind`, `options`, and
+`diff`. `diff` is an empty string when the request has no proposed file change.
 `kind` is `approval`, `question`, or `plan`; `options` is empty for an approval and has
 the offered choices for a question or plan. A question uses `operation: "ask_user"`,
 with its prompt in `target`. The `tool_call_id` is `""` when the

@@ -21,8 +21,87 @@ from symphonai_api.permissions import (
     ToolApprovalRequest,
     shell_grant_prefix,
 )
+from symphonai_api.tools.edit import EditFileTool
+from symphonai_api.tools.filesystem import ReadFileTool, WriteFileTool
+from symphonai_api.tools.read_ledger import ReadLedger
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
+
+
+@check("permissions.edit_approval_carries_its_diff")
+def check_edit_approval_carries_its_diff() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        target = root / "note.txt"
+        target.write_text("a\n", encoding="utf-8")
+        ledger = ReadLedger()
+        ReadFileTool(ledger).execute(
+            ToolCall("read", "read_file", {"path": "note.txt"}),
+            PermissionPolicy(repo_root=root),
+        )
+        requests = []
+        policy = PermissionPolicy(
+            repo_root=root, mode="ask",
+            approval_callback=lambda request: requests.append(request) or True,
+        )
+        edit = EditFileTool(ledger)
+        result = edit.execute(
+            ToolCall("edit", "edit_file", {
+                "path": "note.txt", "old_string": "a", "new_string": "b",
+            }),
+            policy,
+        )
+        if not result.ok or target.read_text(encoding="utf-8") != "b\n":
+            fail(f"approved edit did not write its proposed content: {result!r}")
+        if len(requests) != 1 or "-a" not in requests[0].diff or "+b" not in requests[0].diff:
+            fail(f"edit approval omitted its unified diff: {requests!r}")
+
+        new_requests = []
+        new_policy = PermissionPolicy(
+            repo_root=root, mode="ask",
+            approval_callback=lambda request: new_requests.append(request) or True,
+        )
+        write = WriteFileTool(ReadLedger())
+        created = write.execute(
+            ToolCall("write", "write_file", {"path": "new.txt", "content": "created\n"}),
+            new_policy,
+        )
+        if not created.ok or len(new_requests) != 1:
+            fail(f"new file write did not complete through approval: {created!r}")
+        if not new_requests[0].diff.startswith("--- /dev/null\n"):
+            fail(f"new file approval did not diff from /dev/null: {new_requests[0].diff!r}")
+
+        failed_requests = []
+        failed_policy = PermissionPolicy(
+            repo_root=root, mode="ask",
+            approval_callback=lambda request: failed_requests.append(request) or True,
+        )
+        ReadFileTool(ledger).execute(
+            ToolCall("read-again", "read_file", {"path": "note.txt"}),
+            PermissionPolicy(repo_root=root),
+        )
+        failed = edit.execute(
+            ToolCall("bad-edit", "edit_file", {
+                "path": "note.txt", "old_string": "missing", "new_string": "x",
+            }),
+            failed_policy,
+        )
+        if failed.ok or failed_requests:
+            fail(f"invalid edit asked for approval: {failed!r}, {failed_requests!r}")
+
+        large_requests = []
+        large_policy = PermissionPolicy(
+            repo_root=root, mode="ask",
+            approval_callback=lambda request: large_requests.append(request) or True,
+        )
+        large = "".join(f"line {index}\n" for index in range(1000))
+        large_result = WriteFileTool(ReadLedger()).execute(
+            ToolCall("large", "write_file", {"path": "large.txt", "content": large}),
+            large_policy,
+        )
+        marker = "… 600 more lines"
+        if not large_result.ok or len(large_requests) != 1 or not large_requests[0].diff.endswith(marker):
+            fail(f"large diff was not capped at 400 lines: {large_requests!r}")
 
 
 @check("permissions.ceiling_bounds_write_and_shell")

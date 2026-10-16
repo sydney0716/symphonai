@@ -9,10 +9,12 @@ import unittest.mock as mock
 from symphonai_api import ToolEffect, ToolMetadata
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
-from symphonai_api.events import CollectingSink, ToolCallFailed
+from symphonai_api.events import CollectingSink, ToolCallFailed, ToolCallFinished
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import run_task, standard_tool_registry
+from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.serialization import message_from_json
 from symphonai_api.session import TranscriptWriter, read_records
 from symphonai_api.tools.base import LocalTool
@@ -33,6 +35,102 @@ class _ToolContractStub(LocalTool):
     @property
     def parameters(self) -> dict:
         return {"type": "object", "properties": {}, "required": []}
+
+
+class _SecretOutputTool(_ToolContractStub):
+    @property
+    def name(self) -> str:
+        return "secret_output"
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=True, paths=())
+
+    def _execute(self, tool_call, policy, cancel=None):  # noqa: ANN001
+        if tool_call.name == "fail_secret":
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"scripted failure: {os.environ['OPENAI_API_KEY']}",
+            )
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            ok=True,
+            content=(os.environ["OPENAI_API_KEY"] + " ") * 600,
+        )
+
+
+@check("agent.secrets_are_masked")
+def check_secrets_are_masked() -> None:
+    secret = "sk-test-1234567890"
+    short_secret = "sixsix"
+    path_value = "path-visible-123"
+    with workspace() as ws, mock.patch.dict(os.environ, {
+        "OPENAI_API_KEY": secret,
+        "SHORT_TOKEN": short_secret,
+        "PATH": path_value,
+    }, clear=True):
+        secret_file = ws.root / "secret.txt"
+        secret_file.write_text(f"{secret}\n{short_secret}\n{path_value}\n", encoding="utf-8")
+        scripted = _SecretOutputTool()
+        tools = standard_tool_registry()
+        tools.update({"fail_secret": scripted, "large_secret": scripted})
+        calls = [
+            ToolCall(id="secret-read", name="read_file", arguments={"path": "secret.txt"}),
+            ToolCall(id="secret-failure", name="fail_secret"),
+            ToolCall(id="secret-large", name="large_secret"),
+        ]
+        provider = FakeModelProvider([
+            *[ModelResponse(Message(Role.ASSISTANT, tool_calls=[call])) for call in calls],
+            ModelResponse(Message(Role.ASSISTANT, content="done")),
+        ])
+        sink = CollectingSink()
+        writer = TranscriptWriter(ws.root / "secret-results.jsonl")
+        store = ToolResultStore()
+        agent = ApiAgent(
+            provider, tools, ws.policy, max_turns=4, events=sink,
+            transcript=writer, result_store=store,
+        )
+        try:
+            with mock.patch.object(provider, "create_response", wraps=provider.create_response) as create:
+                result = agent.run([Message(Role.USER, "read and report")])
+        finally:
+            writer.close()
+
+        tool_messages = [message for message in result.messages if message.role == Role.TOOL]
+        if len(tool_messages) != 3:
+            fail(f"expected three recorded tool results: {tool_messages!r}")
+        read_text = tool_messages[0].tool_result.content
+        if f"[redacted OPENAI_API_KEY]" not in read_text or secret in read_text:
+            fail(f"read_file secret was not masked in the model conversation: {read_text!r}")
+        if short_secret not in read_text or path_value not in read_text:
+            fail(f"ineligible short/PATH values were changed: {read_text!r}")
+
+        requests = [call.args[0] for call in create.call_args_list]
+        request_tool_text = "\n".join(
+            message.tool_result.content + (message.tool_result.error or "")
+            for request in requests for message in request.messages
+            if message.role == Role.TOOL and message.tool_result is not None
+        )
+        if secret in request_tool_text or "[redacted OPENAI_API_KEY]" not in request_tool_text:
+            fail(f"model's next request received an unmasked result: {request_tool_text[:500]!r}")
+
+        records, dropped = read_records(ws.root / "secret-results.jsonl")
+        transcript_text = str(records)
+        if dropped or secret in transcript_text or "[redacted OPENAI_API_KEY]" not in transcript_text:
+            fail("persisted transcript contains a raw secret or lacks the redacted value")
+        finished = sink.of_type(ToolCallFinished)
+        failed = sink.of_type(ToolCallFailed)
+        if not finished or secret in "\n".join(event.output for event in finished):
+            fail(f"ToolCallFinished exposed the raw key: {finished!r}")
+        if not any("[redacted OPENAI_API_KEY]" in event.output for event in finished):
+            fail(f"ToolCallFinished omitted the redacted key: {finished!r}")
+        if len(failed) != 1 or secret in failed[0].error or "[redacted OPENAI_API_KEY]" not in failed[0].error:
+            fail(f"failing tool error was not masked in ToolCallFailed: {failed!r}")
+
+        large_result = tool_messages[2].tool_result
+        stored = store.get(large_result.offloaded.id) if large_result.offloaded is not None else None
+        if stored is None or secret in stored.content or "[redacted OPENAI_API_KEY]" not in stored.content:
+            fail(f"offloaded result store contains an unmasked value: {stored!r}")
 
 class _ValidationStageTool(_ToolContractStub):
     def __init__(self) -> None:

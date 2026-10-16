@@ -674,6 +674,7 @@ class HostServer:
                 session_id=approval.session_id,
                 kind=approval.kind,
                 options=approval.options,
+                diff=approval.diff,
             )
         )
         return True

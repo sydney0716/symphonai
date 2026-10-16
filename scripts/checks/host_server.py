@@ -11703,6 +11703,354 @@ def _headless_invoke(root: Path, provider, arguments: list[str], *, stdin_text: 
     return code, stdout.getvalue(), stderr.getvalue(), sessions
 
 
+@check("host_server.headless_review")
+def check_headless_review() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self) -> None:
+            super().__init__([ModelResponse(Message(Role.ASSISTANT, "No findings."))])
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    def app_review_prompt(source: str) -> str | None:
+        prefix = "export const REVIEW_PROMPT = `"
+        suffix = "`;\n\nfunction promptCommand"
+        if prefix not in source or suffix not in source:
+            return None
+        prompt = source.split(prefix, 1)[1].split(suffix, 1)[0]
+        return prompt.replace("\\`", "`")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        modes = []
+        original_select_mode = HostRun.select_mode
+
+        def record_mode(run, mode):
+            modes.append(mode)
+            return original_select_mode(run, mode)
+
+        provider = RecordingProvider()
+        with mock.patch.object(HostRun, "select_mode", record_mode):
+            code, output, _error, _sessions = _headless_invoke(
+                root, provider,
+                ["review", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
+        result = json.loads(output)
+        user_messages = [
+            message.text
+            for message in provider.requests[0].messages
+            if message.role is Role.USER
+        ]
+        if (code != 0 or result.get("status") != "finished"
+                or result.get("result") != "No findings."
+                or user_messages != [headless_module.REVIEW_PROMPT] or modes != ["plan"]):
+            fail(f"headless review did not use the app prompt and plan mode: {code}, {result!r}, {user_messages!r}, {modes!r}")
+
+        provider = RecordingProvider()
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["review", "--repo-root", str(root), "--provider", "openai",
+             "--base", "origin/main", "--focus", "errors"],
+        )
+        messages = [
+            message.text
+            for message in provider.requests[0].messages
+            if message.role is Role.USER
+        ]
+        based_prompt = messages[0] if messages else ""
+        if (code != 0 or not based_prompt.startswith(
+                "Review the changes between origin/main and the working tree (git diff origin/main)."
+        ) or not based_prompt.endswith("Focus on: errors")):
+            fail(f"headless review did not apply --base and --focus: {code}, {based_prompt!r}")
+
+        app_source = (REPO_ROOT / "symphonai_app" / "src" / "app.js").read_text(encoding="utf-8")
+        if app_review_prompt(app_source) != headless_module.REVIEW_PROMPT:
+            fail("headless review prompt drifted from REVIEW_PROMPT in app.js")
+        with tempfile.TemporaryDirectory() as temporary_copy:
+            edited_source = app_source.replace(
+                "Report findings, most severe first.",
+                "Report issues, most severe first.",
+                1,
+            )
+            edited_path = Path(temporary_copy) / "app.js"
+            edited_path.write_text(edited_source, encoding="utf-8")
+            if app_review_prompt(edited_path.read_text(encoding="utf-8")) == headless_module.REVIEW_PROMPT:
+                fail("the review prompt drift check accepted an edited app.js prompt")
+
+
+@check("host_server.headless_output_schema")
+def check_headless_output_schema() -> None:
+    schema = {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        schema_path = root / "schema.json"
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, '{"ok": true}'))])
+        code, output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "return json", "--repo-root", str(root), "--provider", "openai",
+             "--output-schema", str(schema_path), "--json"],
+        )
+        result = json.loads(output)
+        if code != 0 or result.get("output") != {"ok": True} or result.get("status") != "finished":
+            fail(f"valid output schema was not returned: {code}, {result!r}")
+
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "hello"))])
+        code, output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "return json", "--repo-root", str(root), "--provider", "openai",
+             "--output-schema", str(schema_path), "--json"],
+        )
+        result = json.loads(output)
+        if (code != 1 or result.get("status") != "failed"
+                or not result.get("error", "").startswith("final answer did not match the output schema:")):
+            fail(f"invalid output schema result was accepted: {code}, {result!r}")
+
+        schema_path.write_text("[]", encoding="utf-8")
+        code, _output, error, _sessions = _headless_invoke(
+            root, FakeModelProvider([]),
+            ["run", "task", "--repo-root", str(root), "--provider", "openai",
+             "--output-schema", str(schema_path)],
+        )
+        if code != 2 or "invalid output schema" not in error:
+            fail(f"non-object output schema did not exit 2: {code}, {error!r}")
+
+
+@check("host_server.headless_tool_lists")
+def check_headless_tool_lists() -> None:
+    class RecordingProvider(FakeModelProvider):
+        def __init__(self, responses) -> None:
+            super().__init__(responses)
+            self.requests = []
+
+        def create_response(self, request, *, cancel=None):
+            self.requests.append(request)
+            return super().create_response(request, cancel=cancel)
+
+    def request_tool_names(request) -> set[str]:
+        return {
+            schema.get("function", {}).get("name", schema.get("name"))
+            for schema in request.tools
+        }
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        provider = RecordingProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "task", "--repo-root", str(root), "--provider", "openai", "--json",
+             "--allowed-tools", "read_file,grep"],
+        )
+        if code != 0 or request_tool_names(provider.requests[0]) != {"read_file", "grep"}:
+            fail(f"--allowed-tools did not constrain the leader schemas: {code}, {provider.requests!r}")
+
+        provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "blocked-shell", "run_shell", {"argv": ["echo", "unsafe"]},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "task", "--repo-root", str(root), "--provider", "openai", "--json",
+             "--allowed-tools", "read_file,grep"],
+        )
+        tool_results = [
+            message.tool_result.error or message.tool_result.content
+            for message in provider.requests[1].messages
+            if message.tool_result is not None
+        ]
+        if code != 0 or any("unknown tool" not in str(value) for value in tool_results):
+            fail(f"a removed tool call was not refused: {code}, {tool_results!r}")
+
+        provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "worker done")),
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+        ])
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "task", "--repo-root", str(root), "--provider", "openai", "--json",
+             "--disallowed-tools", "run_shell"],
+        )
+        if (code != 0 or len(provider.requests) < 2
+                or "run_shell" in request_tool_names(provider.requests[0])
+                or "run_shell" in request_tool_names(provider.requests[1])):
+            fail(f"--disallowed-tools did not constrain the leader and worker: {code}, {provider.requests!r}")
+
+        code, _output, error, _sessions = _headless_invoke(
+            root, FakeModelProvider([]),
+            ["run", "task", "--repo-root", str(root), "--provider", "openai", "--allowed-tools", "nope"],
+        )
+        if code != 2 or "nope" not in error or "read_file" not in error:
+            fail(f"unknown tool did not report the valid tools: {code}, {error!r}")
+
+
+@check("host_server.doctor")
+def check_doctor() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "project"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+        home = base / ".symphonai"
+        home.mkdir(mode=0o700)
+        home.chmod(0o700)
+        env_name = headless_module.PROVIDERS[0][1]
+        secret = "doctor-secret-must-not-appear"
+        isolated_env = {"PATH": os.environ.get("PATH", ""), "SYMPHONAI_HOME": str(home), env_name: secret}
+        output, error = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, isolated_env, clear=True), \
+                mock.patch.object(headless_module, "_sandbox_available", return_value=True), \
+                mock.patch.object(headless_module, "_app_root", return_value=root), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            code = headless_module.main(["doctor", "--repo-root", str(root)])
+        if code != 0 or secret in output.getvalue() or "ok API keys" not in output.getvalue():
+            fail(f"doctor did not pass safely with a configured key: {code}, {output.getvalue()!r}")
+
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "SYMPHONAI_HOME": str(home)}, clear=True), \
+                mock.patch.object(headless_module, "_sandbox_available", return_value=False), \
+                mock.patch.object(headless_module, "_app_root", return_value=root), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            code = headless_module.main(["doctor", "--repo-root", str(root), "--json"])
+        result = json.loads(output.getvalue())
+        key_check = next(item for item in result["checks"] if item["name"] == "API keys")
+        if code != 1 or key_check["status"] != "fail" or set(result) != {"checks"}:
+            fail(f"doctor did not report missing keys in the documented JSON shape: {code}, {result!r}")
+
+
+@check("host_server.no_sleep_while_running")
+def check_no_sleep_while_running() -> None:
+    class KeeperProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.terminated = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.terminate()
+
+    class BlockingProvider(FakeModelProvider):
+        def __init__(self) -> None:
+            super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+            self.calls_lock = threading.Lock()
+
+        def create_response(self, request, *, cancel=None):
+            with self.calls_lock:
+                self.calls += 1
+                calls = self.calls
+            if calls >= 2:
+                self.entered.set()
+            self.release.wait(timeout=5)
+            return super().create_response(request, cancel=cancel)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        def make_run(provider, sessions, repo_root=root):
+            return HostRun(
+                provider, PermissionPolicy(repo_root=repo_root), EventBroker(),
+                sessions_root=sessions, memory_extraction_enabled=False,
+            )
+
+        provider = BlockingProvider()
+        host = make_run(provider, root / "sessions")
+        second_root = root / "second-project"
+        second_root.mkdir()
+        second_host = make_run(provider, root / "second-sessions", second_root)
+        keeper_processes = []
+
+        def start_keeper(*args, **kwargs):
+            if args[0][0] != "/usr/bin/caffeinate":
+                return real_popen(*args, **kwargs)
+            process = KeeperProcess()
+            keeper_processes.append(process)
+            return process
+
+        real_isfile = os.path.isfile
+        real_popen = subprocess.Popen
+        with mock.patch.object(host_run_module.sys, "platform", "darwin"), \
+                mock.patch.object(host_run_module.os.path, "isfile", side_effect=lambda path: path == "/usr/bin/caffeinate" or real_isfile(path)), \
+                mock.patch.object(host_run_module.subprocess, "Popen", side_effect=start_keeper):
+            host.start("first")
+            _wait_until(lambda: provider.calls >= 1, "first run did not reach the provider")
+            second_host.start("second")
+            if not provider.entered.wait(timeout=2):
+                fail("second concurrent run did not reach the provider")
+            if len(keeper_processes) != 1 or keeper_processes[0].terminated:
+                fail(f"concurrent runs did not share one active keeper: {len(keeper_processes)}")
+            provider.release.set()
+            _wait_until(
+                lambda: not host._active_by_session and not second_host._active_by_session,
+                "concurrent runs did not finish",
+            )
+            if not keeper_processes[0].terminated:
+                fail("keeper remained after the last conversation ended")
+        host.close()
+        second_host.close()
+
+        linux_provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        linux_host = make_run(linux_provider, root / "linux-sessions")
+        linux_starts = []
+        def record_linux_keeper(*args, **kwargs):
+            if args[0][0] == "/usr/bin/caffeinate":
+                linux_starts.append(args)
+                return KeeperProcess()
+            return real_popen(*args, **kwargs)
+        with mock.patch.object(host_run_module.sys, "platform", "linux"), \
+                mock.patch.object(host_run_module.os.path, "isfile", return_value=True), \
+                mock.patch.object(host_run_module.subprocess, "Popen", side_effect=record_linux_keeper):
+            linux_host.start("linux run")
+            _wait_until(lambda: not linux_host._active_by_session, "Linux run did not finish")
+        linux_host.close()
+        if linux_starts:
+            fail(f"Linux started a sleep keeper: {linux_starts!r}")
+
+        shutdown_provider = BlockingProvider()
+        shutdown_host = make_run(shutdown_provider, root / "shutdown-sessions")
+        shutdown_keeper = []
+        def start_shutdown_keeper(*args, **kwargs):
+            if args[0][0] != "/usr/bin/caffeinate":
+                return real_popen(*args, **kwargs)
+            shutdown_keeper.append(KeeperProcess())
+            return shutdown_keeper[-1]
+        with mock.patch.object(host_run_module.sys, "platform", "darwin"), \
+                mock.patch.object(host_run_module.os.path, "isfile", side_effect=lambda path: path == "/usr/bin/caffeinate" or real_isfile(path)), \
+                mock.patch.object(host_run_module.subprocess, "Popen", side_effect=start_shutdown_keeper):
+            shutdown_host.start("shutdown during run")
+            _wait_until(lambda: shutdown_provider.calls >= 1, "shutdown run did not reach the provider")
+            closer = threading.Thread(target=shutdown_host.close)
+            closer.start()
+            _wait_until(lambda: bool(shutdown_keeper) and shutdown_keeper[0].terminated, "host shutdown left the keeper running")
+            shutdown_provider.release.set()
+            closer.join(timeout=3)
+            if closer.is_alive():
+                fail("host shutdown did not finish after the active run was released")
+
+
 @check("host_server.headless_key_errors")
 def check_headless_key_errors() -> None:
     with tempfile.TemporaryDirectory() as temporary:

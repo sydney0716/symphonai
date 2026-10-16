@@ -14,6 +14,7 @@ caller (see `symphonai_api.tools`) is allowed to.
 from __future__ import annotations
 
 import fnmatch
+import difflib
 import ipaddress
 import os
 import re
@@ -258,6 +259,21 @@ class PermissionDecision:
 
 PermissionMode = Literal["ask", "plan", "allow"]
 
+
+def approval_diff(current: str | None, updated: str, path: str) -> str:
+    """Build a bounded unified diff for an interactive write approval."""
+    lines = list(difflib.unified_diff(
+        (current or "").splitlines(),
+        updated.splitlines(),
+        fromfile=path if current is not None else "/dev/null",
+        tofile=path,
+        lineterm="",
+    ))
+    if len(lines) > 3 and len(lines) - 3 > 400:
+        remaining = len(lines) - 403
+        lines = [*lines[:403], f"… {remaining} more lines"]
+    return "\n".join(lines)
+
 _MODE_ORDER = {"plan": 0, "ask": 1, "allow": 2}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 
@@ -291,6 +307,7 @@ class ToolApprovalRequest:
     command: tuple[str, ...] = ()
     commands: tuple[tuple[str, ...], ...] | None = None
     command_writes: tuple[bool, ...] = ()
+    diff: str = ""
 
 
 ApprovalCallback = Callable[[ToolApprovalRequest], PermissionDecision | bool]
@@ -568,7 +585,7 @@ class PermissionPolicy:
     # list_files follows exactly the same rule as read_file.
     check_list = check_read
 
-    def check_write(self, path: str | Path) -> PermissionDecision:
+    def check_write(self, path: str | Path, *, diff: str = "") -> PermissionDecision:
         read_decision = self.check_read(path)
         if not read_decision.allowed:
             return read_decision
@@ -585,6 +602,7 @@ class PermissionPolicy:
                 operation="write_file",
                 target=str(path),
                 details=f"write inside repo root: {resolved}",
+                diff=diff,
             )
         for allowed_root in self.allowed_write_scope:
             if resolved == allowed_root or allowed_root in resolved.parents:
@@ -831,6 +849,7 @@ class PermissionPolicy:
         command: tuple[str, ...] = (),
         commands: tuple[tuple[str, ...], ...] | None = None,
         command_writes: tuple[bool, ...] = (),
+        diff: str = "",
     ) -> PermissionDecision:
         with self._approval_lock:
             self._permission_requested(operation)
@@ -851,6 +870,7 @@ class PermissionPolicy:
                         command=command,
                         commands=commands,
                         command_writes=command_writes,
+                        diff=diff,
                     )
                 )
             except Exception as exc:  # noqa: BLE001

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -13,6 +15,7 @@ import webbrowser
 from collections.abc import Sequence
 from pathlib import Path
 
+from symphonai_api.agent_spec import IOContract, validate_output
 from symphonai_api.config import ConfigError
 from symphonai_api.events import ModelFallback, RunFailed, RunFinished
 from symphonai_api.extensions import load_extensions
@@ -20,6 +23,7 @@ from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.paths import symphonai_home
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import SessionError, SessionStore, default_sessions_root, load_run
@@ -29,11 +33,20 @@ from symphonai_host.__main__ import main as _host_main
 from symphonai_host.projects import build_project
 from symphonai_host.protocol import encode_event
 from symphonai_host.run import ModeSelectionError, ProviderSelectionError
-from symphonai_host.server import PROVIDERS, _provider, _provider_for_start
+from symphonai_host.server import PROVIDERS, _app_root, _provider, _provider_for_start
+from symphonai_api.tools.shell import _sandbox_available
 
 
 class _UsageError(ValueError):
     pass
+
+
+REVIEW_PROMPT = """Review the uncommitted changes in this repository. Do not change any file.
+
+1. Read them with `git status` and `git diff HEAD`, and read every untracked file that is not ignored.
+2. Read the code each change depends on, and run the narrowest tests that exercise it.
+3. Report findings, most severe first. For each: the file and line, what is wrong, and the input or situation that shows it. Leave out style preferences.
+4. If nothing is worth fixing, say so in one line."""
 
 
 class _HeadlessKeyError(ValueError):
@@ -86,6 +99,9 @@ def _parser() -> argparse.ArgumentParser:
     app = commands.add_parser("app", help="open the SymphonAI app")
     app.add_argument("--repo-root", type=Path)
     app.add_argument("--no-open", action="store_true")
+    doctor = commands.add_parser("doctor", help="check whether this machine is ready")
+    doctor.add_argument("--repo-root", type=Path, default=Path.cwd())
+    doctor.add_argument("--json", action="store_true")
     run = commands.add_parser("run", help="run one task without the app")
     run.add_argument("task", nargs="?")
     run.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -95,9 +111,29 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--mode", choices=("ask", "plan", "allow"), default="ask")
     run.add_argument("--max-turns", type=int)
     run.add_argument("--resume")
+    run.add_argument("--output-schema", type=Path)
+    run.add_argument("--allowed-tools")
+    run.add_argument("--disallowed-tools")
     output = run.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true")
     output.add_argument("--stream-json", action="store_true")
+
+    review = commands.add_parser("review", help="review changes without editing files")
+    review.add_argument("--repo-root", type=Path, default=Path.cwd())
+    review.add_argument("--provider")
+    review.add_argument("--model")
+    review.add_argument("--effort")
+    review.add_argument("--max-turns", type=int)
+    review.add_argument("--resume")
+    review.add_argument("--output-schema", type=Path)
+    review.add_argument("--allowed-tools")
+    review.add_argument("--disallowed-tools")
+    review.add_argument("--base")
+    review.add_argument("--focus")
+    review_output = review.add_mutually_exclusive_group()
+    review_output.add_argument("--json", action="store_true")
+    review_output.add_argument("--stream-json", action="store_true")
+    review.set_defaults(mode="plan")
     return parser
 
 
@@ -114,6 +150,131 @@ def _run_app(arguments) -> int:  # noqa: ANN001
     except KeyboardInterrupt:
         return 0
     return 0
+
+
+def _run_doctor(arguments) -> int:  # noqa: ANN001
+    checks = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    add(
+        "Python",
+        "ok" if sys.version_info >= (3, 11) else "fail",
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    )
+    git = shutil.which("git")
+    add("git", "ok" if git else "fail", "on PATH" if git else "not found on PATH")
+
+    home = symphonai_home()
+    credentials_path = home / "credentials.json"
+    provider_keys = {variable for _, variable, _ in PROVIDERS}
+    present_keys = {name for name in provider_keys if os.environ.get(name)}
+    try:
+        home_info = home.lstat()
+    except FileNotFoundError:
+        add("Home folder", "warn", f"{home} does not exist yet")
+    except OSError:
+        add("Home folder", "fail", f"{home} cannot be inspected")
+    else:
+        if not stat.S_ISDIR(home_info.st_mode):
+            add("Home folder", "fail", f"{home} is not a directory")
+        else:
+            mode = stat.S_IMODE(home_info.st_mode)
+            home_status = "warn" if mode & ~0o700 else "ok"
+            home_details = [f"directory mode {mode:04o}"]
+            if mode & ~0o700:
+                home_details.append("directory mode is fixed on the next key save")
+            try:
+                credentials_info = credentials_path.lstat()
+                if stat.S_ISREG(credentials_info.st_mode):
+                    credentials_mode = stat.S_IMODE(credentials_info.st_mode)
+                    if credentials_mode & ~0o600:
+                        home_status = "warn"
+                        home_details.append(
+                            f"credentials file mode {credentials_mode:04o}; fixed on the next key save"
+                        )
+                    else:
+                        home_details.append(f"credentials file mode {credentials_mode:04o}")
+                    try:
+                        stored = json.loads(credentials_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, ValueError):
+                        stored = {}
+                    keys = stored.get("keys", {}) if isinstance(stored, dict) else {}
+                    if isinstance(keys, dict):
+                        present_keys.update(
+                            key for key, value in keys.items()
+                            if key in provider_keys and isinstance(value, str) and value
+                        )
+                else:
+                    home_status = "warn"
+                    home_details.append("credentials path is not a regular file")
+            except FileNotFoundError:
+                pass
+            except OSError:
+                home_status = "warn"
+                home_details.append("credentials file cannot be inspected")
+            add("Home folder", home_status, "; ".join(home_details))
+    add(
+        "API keys",
+        "ok" if present_keys else "fail",
+        "available: " + ", ".join(sorted(present_keys)) if present_keys else "none found",
+    )
+    sandbox = _sandbox_available()
+    add("Sandbox", "ok" if sandbox else "warn", "available" if sandbox else "unavailable (allow mode runs unsandboxed)")
+    app_root = _app_root()
+    add("App", "ok" if app_root.is_dir() else "fail", "installed" if app_root.is_dir() else f"missing: {app_root}")
+    root = arguments.repo_root.expanduser()
+    if not root.is_dir():
+        add("Project", "warn", f"path does not exist: {root}")
+    elif not git:
+        add("Project", "warn", "cannot check repository because git is missing")
+    else:
+        result = subprocess.run(
+            [git, "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        add("Project", "ok" if result.returncode == 0 else "warn", "git repository" if result.returncode == 0 else "not a git repository")
+
+    if arguments.json:
+        print(json.dumps({"checks": checks}, ensure_ascii=False))
+    else:
+        for check in checks:
+            print(f"{check['status']} {check['name']}: {check['detail']}")
+    return 1 if any(check["status"] == "fail" for check in checks) else 0
+
+
+def _review_task(arguments) -> str:  # noqa: ANN001
+    prompt = REVIEW_PROMPT
+    if arguments.base is not None:
+        prompt = prompt.replace(
+            "Review the uncommitted changes in this repository.",
+            f"Review the changes between {arguments.base} and the working tree (git diff {arguments.base}).",
+            1,
+        )
+    if arguments.focus is not None:
+        prompt += f"\n\nFocus on: {arguments.focus}"
+    return prompt
+
+
+def _load_output_schema(path: Path | None) -> dict | None:
+    if path is None:
+        return None
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        IOContract(output_schema=schema)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _UsageError(f"invalid output schema {path}: {exc}") from None
+    return schema
+
+
+def _tool_list(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    names = tuple(dict.fromkeys(name.strip() for name in value.split(",")))
+    if not names or any(not name for name in names):
+        raise _UsageError("tool lists must contain comma-separated names")
+    return names
 
 
 def _select_provider(arguments):  # noqa: ANN001
@@ -245,7 +406,13 @@ def _git_status(root: Path) -> dict[str, str] | None:
 
 def _execute(arguments, task: str) -> int:  # noqa: ANN001
     apply_to_environment(os.environ, load())
-    provider, model, effort, choice = _select_provider(arguments)
+    output_schema = _load_output_schema(arguments.output_schema)
+    allowed_tools = _tool_list(arguments.allowed_tools)
+    disallowed_tools = _tool_list(arguments.disallowed_tools) or ()
+    if output_schema is not None:
+        task += "\n\nReply with only a JSON value matching this schema:\n" + json.dumps(
+            output_schema, ensure_ascii=False,
+        )
     root = arguments.repo_root.expanduser().resolve()
     if not root.is_dir():
         raise _UsageError(f"project directory does not exist: {root}")
@@ -263,7 +430,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
         runtime = build_project(
             root,
             broker,
-            provider,
+            None,
             publish_approval=lambda _approval: False,
             base_prompt=LEADER_BASE_PROMPT,
             subagent_base_prompt=SUBAGENT_BASE_PROMPT,
@@ -277,6 +444,19 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             lsp_factory=LspManager,
             policy_factory=PermissionPolicy,
         )
+        valid_tools = runtime.run.available_tool_names()
+        requested_tools = set(allowed_tools or ()) | set(disallowed_tools)
+        unknown_tools = sorted(requested_tools - valid_tools)
+        if unknown_tools:
+            raise _UsageError(
+                f"unknown tool name(s): {', '.join(unknown_tools)}; valid tools: "
+                + ", ".join(sorted(valid_tools))
+            )
+        if allowed_tools is not None or disallowed_tools:
+            selected_tools = (set(allowed_tools) if allowed_tools is not None else valid_tools)
+            selected_tools.difference_update(disallowed_tools)
+            runtime.run.restrict_tool_names(selected_tools)
+        provider, model, effort, choice = _select_provider(arguments)
         previous_keys: set[str] = set()
         before_message_count = 0
         if arguments.resume:
@@ -328,6 +508,14 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
                 if status_before.get(path) != status_after.get(path)
             )
         error = terminal.error if isinstance(terminal, RunFailed) else None
+        output_value = None
+        if output_schema is not None and status == "finished":
+            output_value, output_error = validate_output(
+                IOContract(output_schema=output_schema), result_text,
+            )
+            if output_error is not None:
+                status = "failed"
+                error = f"final answer did not match the output schema: {output_error}"
         key_error_status = provider.key_error_status
         if error is not None and key_error_status in (401, 403):
             selected_name = choice.get("name", provider.name)
@@ -350,6 +538,8 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             "duration_ms": duration_ms,
             "files_changed": sorted(changed_paths),
         }
+        if output_schema is not None and error is None:
+            result["output"] = output_value
         if arguments.stream_json:
             print(json.dumps({"type": "result", **result}, ensure_ascii=False), flush=True)
         elif arguments.json:
@@ -362,6 +552,8 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             return 130
         if isinstance(terminal, RunFailed):
             return 2 if key_error_status in (401, 403) else 1
+        if status == "failed":
+            return 1
         return 0 if status == "finished" else 3
     finally:
         if subscription is not None:
@@ -384,15 +576,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command is None:
         parser.print_help()
         return 0
+    if arguments.command == "doctor":
+        return _run_doctor(arguments)
     if arguments.command == "app":
         return _run_app(arguments)
-    task = arguments.task
+    review = arguments.command == "review"
+    task = _review_task(arguments) if review else arguments.task
     try:
-        if task is None or task == "-":
+        if not review and (task is None or task == "-"):
             if task is None and sys.stdin.isatty():
                 raise _UsageError("a task is required when stdin is a terminal")
             task = sys.stdin.read()
-        if not task.strip():
+        if not review and not task.strip():
             raise _UsageError("task must not be empty")
         return _execute(arguments, task)
     except _HeadlessKeyError as exc:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import signal
@@ -1151,3 +1153,138 @@ def check_project_venv_on_path() -> None:
         finally:
             manager.close()
             host.close()
+
+
+@check("shell.non_interactive_environment")
+def check_non_interactive_environment() -> None:
+    from symphonai_host.broker import EventBroker
+    from symphonai_host.run import HostRun
+
+    unattended = {
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "GIT_EDITOR": "true",
+        "EDITOR": "true",
+        "VISUAL": "true",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+    }
+    inherited = {name: f"host-{name.lower()}" for name in unattended}
+    inherited.update({"PROBE_KEY": "hidden", "PROBE_SECRET": "hidden", "PROBE_TOKEN": "hidden"})
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "Shell Test"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "shell-test@example.invalid"], check=True)
+        policy = PermissionPolicy(root, mode="allow", shell_enabled=True, shell_allowlist=[()])
+        manager = JobManager()
+        host = HostRun(None, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        tool = RunShellTool(manager)
+        call = lambda identifier, arguments: ToolCall(
+            id=identifier, name="run_shell", arguments=arguments,
+        )
+
+        def variables_in(output: str) -> dict[str, str]:
+            values = {}
+            for line in output.splitlines():
+                name, separator, value = line.partition("=")
+                if separator:
+                    values[name] = value
+            return values
+
+        try:
+            with mock.patch.dict(os.environ, inherited), mock.patch(
+                "symphonai_api.tools.shell._sandbox_available", return_value=False,
+            ):
+                started = time.monotonic()
+                commit = tool.execute(call(
+                    "noninteractive-commit",
+                    {"command": "git commit --allow-empty", "timeout_seconds": 3},
+                ), policy)
+                elapsed = time.monotonic() - started
+                if elapsed >= 5 or "timed out" in (commit.error or "").lower():
+                    fail(f"git commit waited for an editor: {elapsed:.2f}s, {commit!r}")
+
+                result = tool.execute(call("agent-env", {"command": "env"}), policy)
+                agent_env = variables_in(result.content)
+                if not result.ok or any(agent_env.get(name) != value for name, value in unattended.items()):
+                    fail(f"agent environment did not override interactive settings: {result!r}")
+                if any(name in agent_env for name in ("PROBE_KEY", "PROBE_SECRET", "PROBE_TOKEN")):
+                    fail("agent environment exposed a key, secret, or token variable")
+
+                background = tool.execute(call(
+                    "agent-env-background", {"command": "env", "background": True},
+                ), policy)
+                if not background.ok:
+                    fail(f"agent background job could not start: {background!r}")
+                job_id = background.content.split()[1].rstrip(".")
+                deadline = time.monotonic() + 5
+                while manager.get(job_id).status == "running" and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                job = manager.read(job_id)
+                job_env = variables_in(job["output"])
+                if job["exit_code"] != 0 or any(job_env.get(name) != value for name, value in unattended.items()):
+                    fail(f"agent background environment lacked non-interactive settings: {job!r}")
+
+                person = host.run_user_command("env")
+                person_env = variables_in(person["output"])
+                if person["exit_code"] != 0 or any(person_env.get(name) != value for name, value in inherited.items() if name in unattended):
+                    fail(f"person command environment was changed: {person!r}")
+                if any(name in person_env for name in ("PROBE_KEY", "PROBE_SECRET", "PROBE_TOKEN")):
+                    fail("person command environment exposed a key, secret, or token variable")
+        finally:
+            manager.close()
+            host.close()
+
+
+@check("shell.login_shell_path")
+def check_login_shell_path() -> None:
+    import symphonai_host.__main__ as host_main
+
+    with mock.patch.dict(os.environ, {"SHELL": "/stub/login-shell", "PATH": "/usr/bin:/bin"}, clear=True):
+        with mock.patch.object(host_main.sys, "frozen", True, create=True):
+            def login_shell(*args, **kwargs):  # noqa: ANN002, ANN003
+                command = args[0][-1]
+                marker = "SYMPHONAI_PATH_" + command.split("SYMPHONAI_PATH_", 1)[1].split(" ", 1)[0]
+                return subprocess.CompletedProcess(
+                    args[0], 0, f"startup noise\n{marker}\n/opt/x/bin:/usr/bin\n", "",
+                )
+
+            with mock.patch.object(host_main.subprocess, "run", side_effect=login_shell) as run:
+                host_main._load_login_shell_path()
+            if os.environ["PATH"] != "/opt/x/bin:/usr/bin:/bin":
+                fail(f"login-shell PATH was not merged with inherited PATH: {os.environ['PATH']!r}")
+            if run.call_args.args[0][0] != "/stub/login-shell" or run.call_args.kwargs.get("timeout") != 5:
+                fail(f"login shell was not launched with the required executable and timeout: {run.call_args!r}")
+            if run.call_args.kwargs.get("stdin") != subprocess.DEVNULL:
+                fail(f"login shell stdin was not closed: {run.call_args!r}")
+
+    stderr = io.StringIO()
+    with tempfile.TemporaryDirectory() as temporary:
+        sleeper = Path(temporary) / "login-shell-sleeper"
+        sleeper.write_text(f"#!{sys.executable}\nimport time; time.sleep(10)\n", encoding="utf-8")
+        sleeper.chmod(0o755)
+        with mock.patch.dict(os.environ, {"SHELL": str(sleeper), "PATH": "/usr/bin:/bin"}, clear=True):
+            with mock.patch.object(host_main.sys, "frozen", True, create=True):
+                started = time.monotonic()
+                with contextlib.redirect_stderr(stderr):
+                    host_main._load_login_shell_path()
+                elapsed = time.monotonic() - started
+            if (
+                os.environ["PATH"] != "/usr/bin:/bin"
+                or len(stderr.getvalue().splitlines()) != 1
+                or not 4.5 <= elapsed < 7.5
+            ):
+                fail(
+                    "login-shell sleeper did not time out near five seconds with PATH preserved "
+                    f"and one stderr line: elapsed={elapsed:.2f}s, PATH={os.environ['PATH']!r}, "
+                    f"stderr={stderr.getvalue()!r}"
+                )
+
+    with mock.patch.dict(os.environ, {"SHELL": "/stub/unused", "PATH": "/usr/bin:/bin"}, clear=True):
+        with mock.patch.object(host_main.sys, "frozen", False, create=True):
+            with mock.patch.object(host_main.subprocess, "run") as run:
+                host_main._load_login_shell_path()
+        if run.called or os.environ["PATH"] != "/usr/bin:/bin":
+            fail("non-frozen host ran the login shell or changed PATH")

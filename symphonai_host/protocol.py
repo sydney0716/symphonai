@@ -56,6 +56,7 @@ class ApprovalRequested:
     session_id: str | None = None
     kind: str = "approval"
     options: tuple[str, ...] = ()
+    diff: str = ""
 
 
 @dataclass(frozen=True)

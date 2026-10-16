@@ -7,8 +7,10 @@ import contextlib
 import io
 import os
 import signal
+import subprocess
 import sys
 import threading
+import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,37 @@ from symphonai_host.projects import build_project, choose_start_root, record_rec
 from symphonai_host.broker import EventBroker
 
 
+def _load_login_shell_path() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    inherited_path = os.environ.get("PATH", "")
+    marker = f"SYMPHONAI_PATH_{uuid.uuid4().hex}"
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    command = f'printf "\\n%s\\n%s\\n" {marker} "$PATH"'
+    try:
+        result = subprocess.run(
+            [shell, "-l", "-i", "-c", command],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0 or marker not in result.stdout:
+            raise ValueError("login shell did not print PATH")
+        login_path = result.stdout.split(marker, 1)[1].lstrip("\r\n").splitlines()[0]
+        if not login_path:
+            raise ValueError("login shell printed an empty PATH")
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        print("could not read login-shell PATH; keeping inherited PATH", file=sys.stderr)
+        return
+
+    entries = login_path.split(os.pathsep)
+    entries.extend(entry for entry in inherited_path.split(os.pathsep) if entry not in entries)
+    os.environ["PATH"] = os.pathsep.join(entries)
+
+
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path)
@@ -43,6 +76,7 @@ def main(
     on_started: Callable[[str], None] | None = None,
 ) -> None:
     arguments = _arguments(argv)
+    _load_login_shell_path()
     try:
         apply_to_environment(os.environ, load())
     except CredentialError as exc:

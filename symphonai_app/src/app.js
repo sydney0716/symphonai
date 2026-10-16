@@ -19,6 +19,7 @@ import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
 const STATUS_LINE_KEY = "symphonai.status-line";
 const NOTIFICATIONS_KEY = "symphonai.notifications";
+const PROMPT_DRAFTS_KEY = "symphonai.drafts";
 const DEFAULT_STATUS_FIELDS = Object.freeze({
   provider: false, model: true, effort: true, mode: false,
   goal: false, context: false, usage: false,
@@ -248,7 +249,25 @@ export async function start({ global, document, client }) {
   let historyIndex = -1;
   let historyDraft = "";
   let recalledPrompt = null;
-  const approvals = createApprovals({ client: boundary });
+  const approvalDiffs = new Map();
+  const approvalClient = new Proxy(boundary, {
+    get(target, property, receiver) {
+      if (property === "approvals") {
+        return async (...args) => {
+          const reply = await boundary.approvals(...args);
+          for (const approval of reply?.pending ?? []) {
+            if (typeof approval.approval_id === "string" && typeof approval.diff === "string") {
+              approvalDiffs.set(approval.approval_id, approval.diff);
+            }
+          }
+          return reply;
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const approvals = createApprovals({ client: approvalClient });
+  const approvalDenyNotes = new Map();
   const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
   const agentTranscript = createTranscript();
@@ -358,6 +377,89 @@ export async function start({ global, document, client }) {
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
   let conversation = conversationReply?.conversation ?? null;
+  let draftSaveTimer = null;
+
+  function draftKey() {
+    return JSON.stringify([project?.repo_root ?? "", currentSessionId ?? "new"]);
+  }
+
+  function readDrafts() {
+    try {
+      const stored = global.localStorage?.getItem(PROMPT_DRAFTS_KEY);
+      const drafts = JSON.parse(stored ?? "[]");
+      return Array.isArray(drafts)
+        ? drafts.filter((draft) => (
+          typeof draft?.key === "string"
+          && typeof draft?.text === "string"
+          && Number.isFinite(draft?.savedAt)
+        ))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function stopDraftTimer() {
+    if (draftSaveTimer === null) return;
+    try {
+      (global.clearTimeout ?? clearTimeout)(draftSaveTimer);
+    } catch {
+      // A timer host may be unavailable alongside storage.
+    }
+    draftSaveTimer = null;
+  }
+
+  function saveDraft() {
+    stopDraftTimer();
+    try {
+      const key = draftKey();
+      const drafts = readDrafts().filter((draft) => draft.key !== key);
+      if (input.value) {
+        drafts.push({ key, text: input.value, savedAt: Date.now() });
+        drafts.sort((left, right) => left.savedAt - right.savedAt);
+        if (drafts.length > 50) drafts.splice(0, drafts.length - 50);
+      }
+      global.localStorage?.setItem(PROMPT_DRAFTS_KEY, JSON.stringify(drafts));
+    } catch {
+      // Drafts are optional when storage is unavailable.
+    }
+  }
+
+  function restoreDraft() {
+    const key = draftKey();
+    input.value = readDrafts().find((draft) => draft.key === key)?.text ?? "";
+  }
+
+  function clearDraft() {
+    stopDraftTimer();
+    try {
+      const key = draftKey();
+      const drafts = readDrafts();
+      const remaining = drafts.filter((draft) => draft.key !== key);
+      if (remaining.length !== drafts.length) {
+        global.localStorage?.setItem(PROMPT_DRAFTS_KEY, JSON.stringify(remaining));
+      }
+    } catch {
+      // Drafts are optional when storage is unavailable.
+    }
+  }
+
+  function queueDraftSave() {
+    stopDraftTimer();
+    try {
+      const schedule = typeof global.setTimeout === "function"
+        ? global.setTimeout.bind(global)
+        : setTimeout;
+      draftSaveTimer = schedule(() => {
+        draftSaveTimer = null;
+        saveDraft();
+      }, 300);
+    } catch {
+      // The composer remains usable when timers are unavailable.
+    }
+  }
+
+  restoreDraft();
   let roadmap = initialRoadmap.roadmap;
   let roadmapMessage = initialRoadmap.message;
   let specRuns = initialSpecRuns;
@@ -1331,6 +1433,7 @@ export async function start({ global, document, client }) {
   let projectStartScreen = null;
 
   async function openProjectAt(path, sessionId = null) {
+    saveDraft();
     closeAgentView();
     projectActionError = "";
     try {
@@ -1663,11 +1766,13 @@ export async function start({ global, document, client }) {
     if (targetSession?.repo_root && targetSession.repo_root !== project.repo_root) {
       return openProjectAt(targetSession.repo_root, runId);
     }
+    saveDraft();
     const previous = transcript.snapshot();
     const previousId = currentSessionId;
     transcript.reset();
     currentSessionId = runId;
     transcript.setSessionId(currentSessionId);
+    restoreDraft();
     showProjects();
     showTranscript();
     clearConversationAgents();
@@ -1680,6 +1785,7 @@ export async function start({ global, document, client }) {
       transcript.restore(previous);
       currentSessionId = previousId;
       transcript.setSessionId(currentSessionId);
+      restoreDraft();
       showProjects();
       showTranscript();
       await refreshConversation();
@@ -1908,6 +2014,7 @@ export async function start({ global, document, client }) {
   }
   showProjects();
   async function startNewChat() {
+    saveDraft();
     closeAgentView();
     clearConversationAgents();
     try {
@@ -1915,6 +2022,7 @@ export async function start({ global, document, client }) {
       transcript.reset();
       currentSessionId = null;
       transcript.setSessionId(null);
+      restoreDraft();
       showProjects();
       showTranscript();
       conversation = null;
@@ -1926,7 +2034,6 @@ export async function start({ global, document, client }) {
       promptFailure = "";
       showPromptError();
       navigate({ page: "chat", section: "" });
-      input.value = "";
     } catch {
       await refreshConversation();
       promptFailure = "Could not start a new chat.";
@@ -2984,6 +3091,12 @@ export async function start({ global, document, client }) {
 
   function showApprovals() {
     const children = [];
+    for (const id of approvalDenyNotes.keys()) {
+      if (approvals.state.get(id)?.state !== "open") approvalDenyNotes.delete(id);
+    }
+    for (const id of approvalDiffs.keys()) {
+      if (approvals.state.get(id)?.state !== "open") approvalDiffs.delete(id);
+    }
     const recordDecisionAtCurrentPosition = (entry, question) => {
       const toolCallId = !question.session_id || question.session_id === currentSessionId
         ? question.tool_call_id : undefined;
@@ -3116,6 +3229,34 @@ export async function start({ global, document, client }) {
           text: `${question.operation}: ${question.target} — ${question.details}`,
         }),
       );
+      const approvalDiff = question.diff ?? approvalDiffs.get(id) ?? "";
+      if (approvalDiff) {
+        const lines = approvalDiff.split("\n");
+        const diffRoot = element(document, "div", { className: "approval-diff" });
+        const renderDiff = (visibleLines) => {
+          const pre = element(document, "pre", { className: "diff" });
+          for (const line of visibleLines) {
+            const span = element(document, "span", { text: `${line}\n` });
+            if (line.startsWith("+") && !line.startsWith("+++")) {
+              span.className = "diff-add";
+            } else if (line.startsWith("-") && !line.startsWith("---")) {
+              span.className = "diff-remove";
+            } else if (line.startsWith("@@")) {
+              span.className = "diff-hunk";
+            }
+            append(pre, span);
+          }
+          return pre;
+        };
+        append(diffRoot, renderDiff(lines.slice(0, 20)));
+        if (lines.length > 20) {
+          const expand = element(document, "button", { text: `Show all ${lines.length} lines` });
+          expand.type = "button";
+          listen(expand, "click", () => replace(diffRoot, renderDiff(lines)));
+          append(diffRoot, expand);
+        }
+        append(row, diffRoot);
+      }
       if (question.state === "open") {
         const allow = listen(
           element(document, "button", { text: "Allow" }),
@@ -3142,16 +3283,37 @@ export async function start({ global, document, client }) {
         } else {
           append(row, allow);
         }
+        const denyNote = element(document, "input");
+        denyNote.type = "text";
+        denyNote.placeholder = "Tell the agent why (optional)";
+        denyNote.setAttribute("aria-label", "Tell the agent why (optional)");
+        denyNote.value = approvalDenyNotes.get(id) ?? "";
+        listen(denyNote, "input", () => {
+          approvalDenyNotes.set(id, denyNote.value);
+        });
+        const denyWithNote = async () => {
+          const note = denyNote.value.trim();
+          approvalDenyNotes.delete(id);
+          await approvals.answer(
+            id,
+            false,
+            note ? `Denied by the person: ${note}` : "",
+          );
+          showApprovals();
+        };
+        listen(denyNote, "keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            void denyWithNote();
+          }
+        });
         const deny = listen(
           element(document, "button", { text: "Deny" }),
           "click",
-          async () => {
-            await approvals.answer(id, false, "");
-            showApprovals();
-          },
+          denyWithNote,
         );
         deny.type = "button";
-        append(row, deny);
+        append(row, denyNote, deny);
       }
       children.push(row);
     }
@@ -3259,6 +3421,7 @@ export async function start({ global, document, client }) {
     const text = input.value;
     const command = text.trim();
     if (command.startsWith("/")) {
+      clearDraft();
       return runCommand(command);
     }
     if (command.startsWith("!") && command.length > 1) {
@@ -3268,7 +3431,10 @@ export async function start({ global, document, client }) {
         return;
       }
       const shellCommand = command.slice(1).trim();
-      if (shellCommand) return runUserCommand(shellCommand, text);
+      if (shellCommand) {
+        clearDraft();
+        return runUserCommand(shellCommand, text);
+      }
     }
     if (userCommandPending) {
       promptFailure = "Wait for the command to finish.";
@@ -3279,6 +3445,7 @@ export async function start({ global, document, client }) {
       try {
         await boundary.steer(text);
         input.value = "";
+        clearDraft();
         promptFailure = "";
         rememberPrompt(text);
         transcript.model.push({ type: "steer", text });
@@ -3306,6 +3473,7 @@ export async function start({ global, document, client }) {
       }
     }
     input.value = "";
+    clearDraft();
     pendingFiles.length = 0;
     showPendingAttachments();
     promptFailure = "";
@@ -3316,6 +3484,7 @@ export async function start({ global, document, client }) {
   });
 
   listen(input, "input", () => {
+    queueDraftSave();
     if (historyIndex >= 0) {
       historyIndex = -1;
       recalledPrompt = null;
@@ -4370,6 +4539,9 @@ export async function start({ global, document, client }) {
   async function onFrame(frame) {
     if (frame.kind === "approval_requested") {
       const payload = frame.payload ?? {};
+      if (typeof payload.approval_id === "string" && typeof payload.diff === "string") {
+        approvalDiffs.set(payload.approval_id, payload.diff);
+      }
       const sessionId = payload.session_id;
       const operation = payload.kind === "question" ? "Question"
         : payload.kind === "plan" ? "Plan" : payload.operation;

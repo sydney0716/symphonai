@@ -29,6 +29,7 @@ class PendingApproval:
     session_id: str | None = None
     kind: str = "approval"
     options: tuple[str, ...] = ()
+    diff: str = ""
 
 
 @dataclass
@@ -90,6 +91,7 @@ class ApprovalBroker:
             operation=request.operation,
             target=request.target,
             details=request.details,
+            diff=request.diff,
             tool_call_id=request.tool_call_id,
             remember=remember,
             session_id=self._session_id,

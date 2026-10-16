@@ -424,6 +424,7 @@ def check_transport_tool_call_id() -> None:
         target="transport.txt",
         details="transport identity",
         tool_call_id="call-over-wire",
+        diff="--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-old\n+new",
     )
     result = []
     stream_connection = None
@@ -479,7 +480,14 @@ def check_transport_tool_call_id() -> None:
     pending = listing.get("pending", [])
     frame_id = frame_payload.get("tool_call_id")
     pending_id = pending[0].get("tool_call_id") if len(pending) == 1 else None
-    if frame_id != request.tool_call_id or pending_id != request.tool_call_id:
+    frame_diff = frame_payload.get("diff")
+    pending_diff = pending[0].get("diff") if len(pending) == 1 else None
+    if (
+        frame_id != request.tool_call_id
+        or pending_id != request.tool_call_id
+        or frame_diff != request.diff
+        or pending_diff != request.diff
+    ):
         fail(
             "approval transport lost tool-call identity: "
             f"frame={frame_payload!r}, listing={listing!r}"

@@ -202,10 +202,11 @@ export class FakeDocument {
   }
 }
 
-function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, notificationsStored = null, storageThrows = false } = {}) {
+function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, notificationsStored = null, draftsStored = null, storageThrows = false } = {}) {
   const listeners = new Map();
   const writes = [];
   const reloads = [];
+  let drafts = draftsStored;
   const global = {
     location: { hash: fragment, reload() { reloads.push(true); } },
     localStorage: {
@@ -218,6 +219,7 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStor
         if (key === "symphonai.rail-tools") return railStored;
         if (key === "symphonai.status-line") return statusStored;
         if (key === "symphonai.notifications") return notificationsStored;
+        if (key === "symphonai.drafts") return drafts;
         assert.fail(`unexpected localStorage key: ${key}`);
       },
       setItem(key, value) {
@@ -225,6 +227,7 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStor
           throw new Error("storage write failed");
         }
         writes.push([key, value]);
+        if (key === "symphonai.drafts") drafts = value;
       },
     },
     addEventListener(type, listener) {
@@ -255,6 +258,28 @@ function textInDocumentOrder(root) {
 
 function find(root, predicate) {
   return walk(root).find(predicate);
+}
+
+async function appWithApproval(id = "note-approval") {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const frame = {
+    kind: "approval_requested",
+    payload: {
+      approval_id: id,
+      operation: "write_file",
+      target: "result.txt",
+      details: "write the result",
+    },
+  };
+  await client.emit(frame);
+  return { document, client, frame };
+}
+
+function approvalNote(document) {
+  return find(document.getElementById("approvals"), (node) =>
+    node.tagName === "INPUT" && node.placeholder === "Tell the agent why (optional)");
 }
 
 function agentRowText(row) {
@@ -2593,6 +2618,81 @@ test("opening another project's conversation switches, opens it, then reloads", 
     ["openSession", "other-run"],
   ]);
   assert.deepEqual(browser.reloads, [true]);
+});
+
+test("composer drafts follow their conversation and project", async () => {
+  const browser = fakeGlobal();
+  const projectA = { repo_root: "/work/current", name: "current" };
+  const projectB = { repo_root: "/work/other", name: "other" };
+  const sessions = [
+    { run_id: "draft-a", title: "A", repo_root: projectA.repo_root },
+    { run_id: "draft-b", title: "B", repo_root: projectB.repo_root },
+  ];
+  const firstDocument = new FakeDocument();
+  await start({ global: browser.global, document: firstDocument, client: fakeClient(fixtureRoadmap(), {
+    project: projectA, sessions, conversation: { session_id: "draft-a" },
+  }) });
+  const firstInput = firstDocument.getElementById("prompt");
+  firstInput.value = "draft for project A";
+  await firstInput.dispatch("input");
+  await find(firstDocument.getElementById("sidebar"), (node) => (
+    node.className.includes("session-link") && node.textContent === "B"
+  )).click();
+
+  const secondDocument = new FakeDocument();
+  const secondClient = fakeClient(fixtureRoadmap(), {
+    project: projectB, sessions, conversation: { session_id: "draft-b" },
+  });
+  await start({ global: browser.global, document: secondDocument, client: secondClient });
+  const secondInput = secondDocument.getElementById("prompt");
+  assert.equal(secondInput.value, "");
+  secondInput.value = "draft for project B";
+  await secondInput.dispatch("input");
+  await find(secondDocument.getElementById("sidebar"), (node) => (
+    node.className.includes("session-link") && node.textContent === "A"
+  )).click();
+
+  const returnedDocument = new FakeDocument();
+  await start({ global: browser.global, document: returnedDocument, client: fakeClient(fixtureRoadmap(), {
+    project: projectA, sessions, conversation: { session_id: "draft-a" },
+  }) });
+  assert.equal(returnedDocument.getElementById("prompt").value, "draft for project A");
+});
+
+test("composer drafts autosave, restore after reload, and clear when sent", async () => {
+  const browser = fakeGlobal();
+  const options = { conversation: { session_id: "draft-reload" } };
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), options);
+  await start({ global: browser.global, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "a long task description";
+  await input.dispatch("input");
+  await new Promise((resolve) => setTimeout(resolve, 320));
+
+  const reloadedDocument = new FakeDocument();
+  const reloadedClient = fakeClient(fixtureRoadmap(), options);
+  await start({ global: browser.global, document: reloadedDocument, client: reloadedClient });
+  const reloadedInput = reloadedDocument.getElementById("prompt");
+  assert.equal(reloadedInput.value, "a long task description");
+  const submitting = reloadedDocument.getElementById("prompt-form").dispatch("submit");
+  reloadedClient.resolvePrompt({ accepted: true, run_id: "draft-reload" });
+  await submitting;
+
+  const finalDocument = new FakeDocument();
+  await start({ global: browser.global, document: finalDocument, client: fakeClient(fixtureRoadmap(), options) });
+  assert.equal(finalDocument.getElementById("prompt").value, "");
+});
+
+test("composer remains usable when draft storage throws", async () => {
+  const browser = fakeGlobal({ storageThrows: true });
+  const document = new FakeDocument();
+  await start({ global: browser.global, document, client: fakeClient() });
+  const input = document.getElementById("prompt");
+  input.value = "still editable";
+  await assert.doesNotReject(input.dispatch("input"));
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  assert.equal(input.value, "still editable");
 });
 
 test("projectless startup shows recent projects without chat or composer", async () => {
@@ -5827,6 +5927,85 @@ test("approvals stay separate and dropped frames render one model gap", async ()
   assert.deepEqual(app.transcript.model, [{ type: "gap", dropped: 2 }]);
 });
 
+test("denying an approval sends the note to the agent", async () => {
+  const { document, client } = await appWithApproval();
+  const note = approvalNote(document);
+  assert.equal(note.type, "text");
+  note.value = "use config.example.toml";
+  await note.dispatch("input");
+  await find(document.getElementById("approvals"), (node) =>
+    node.tagName === "BUTTON" && node.textContent === "Deny").dispatch("click");
+
+  assert.deepEqual(client.calls.approve, [{
+    id: "note-approval",
+    allowed: false,
+    reason: "Denied by the person: use config.example.toml",
+  }]);
+});
+
+test("denying an approval with a blank note sends an empty reason", async () => {
+  const { document, client } = await appWithApproval();
+  await find(document.getElementById("approvals"), (node) =>
+    node.tagName === "BUTTON" && node.textContent === "Deny").dispatch("click");
+
+  assert.deepEqual(client.calls.approve, [{
+    id: "note-approval",
+    allowed: false,
+    reason: "",
+  }]);
+});
+
+test("Enter in the approval note denies with the note", async () => {
+  const { document, client } = await appWithApproval();
+  const note = approvalNote(document);
+  note.value = "use config.example.toml";
+  await note.dispatch("input");
+  let prevented = false;
+  await note.dispatch("keydown", {
+    key: "Enter",
+    preventDefault() { prevented = true; },
+  });
+
+  assert.equal(prevented, true);
+  assert.deepEqual(client.calls.approve, [{
+    id: "note-approval",
+    allowed: false,
+    reason: "Denied by the person: use config.example.toml",
+  }]);
+});
+
+test("approval note survives a card redraw", async () => {
+  const { document, client, frame } = await appWithApproval();
+  const note = approvalNote(document);
+  note.value = "use config.example.toml";
+  await note.dispatch("input");
+  await client.emit(frame);
+  assert.equal(approvalNote(document).value, "use config.example.toml");
+  await find(document.getElementById("approvals"), (node) =>
+    node.tagName === "BUTTON" && node.textContent === "Deny").dispatch("click");
+
+  assert.deepEqual(client.calls.approve, [{
+    id: "note-approval",
+    allowed: false,
+    reason: "Denied by the person: use config.example.toml",
+  }]);
+});
+
+test("allow ignores a note entered in the approval card", async () => {
+  const { document, client } = await appWithApproval();
+  const note = approvalNote(document);
+  note.value = "use config.example.toml";
+  await note.dispatch("input");
+  await find(document.getElementById("approvals"), (node) =>
+    node.tagName === "BUTTON" && node.textContent === "Allow").dispatch("click");
+
+  assert.deepEqual(client.calls.approve, [{
+    id: "note-approval",
+    allowed: true,
+    reason: "",
+  }]);
+});
+
 test("question approval offers choices and records the answer once", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -6148,6 +6327,30 @@ test("shell approvals show and answer the remember button only when offered", as
   const ordinaryButtons = walk(document.getElementById("approvals"))
     .filter((node) => node.tagName === "BUTTON");
   assert.deepEqual(ordinaryButtons.slice(-2).map((button) => button.textContent), ["Allow", "Deny"]);
+});
+
+test("approval diffs start collapsed and expand to all lines", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const diff = Array.from({ length: 30 }, (_, index) => `+line ${index + 1}`).join("\n");
+  await client.emit({
+    kind: "approval_requested",
+    payload: {
+      approval_id: "diff-approval", operation: "write_file", target: "note.txt",
+      details: "write note", diff,
+    },
+  });
+  const card = find(document.getElementById("approvals"), (node) => (
+    node.className.includes("approval") && node.className !== "approvals"
+  ));
+  const pre = find(card, (node) => node.tagName === "PRE" && node.className === "diff");
+  assert.equal(pre.children.length, 20);
+  const expand = find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Show all 30 lines");
+  assert.ok(expand);
+  await expand.dispatch("click");
+  const expanded = find(card, (node) => node.tagName === "PRE" && node.className === "diff");
+  assert.equal(expanded.children.length, 30);
 });
 
 test("assistant runs split around tool activity", async () => {

@@ -13,7 +13,7 @@ from symphonai_api.cancellation import CancellationToken
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.compaction import estimate_text_tokens
 from symphonai_api.models import ToolCall, ToolResult
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import PermissionPolicy, approval_diff
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
 from symphonai_api.tools.read_ledger import DEFAULT_READ_LIMIT, ReadLedger
@@ -324,15 +324,33 @@ class WriteFileTool(LocalTool):
     ) -> ToolResult:
         path = tool_call.arguments.get("path")
         content = tool_call.arguments.get("content")
-        decision = policy.check_write(path)
-        if not decision.allowed:
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
+        current = None
+        if policy.mode == "ask":
+            read_decision = policy.check_read(path)
+            if not read_decision.allowed:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=read_decision.reason)
+        else:
+            decision = policy.check_write(path)
+            if not decision.allowed:
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         resolved = policy._resolve_within_root(path)
         try:
             if resolved.exists():
+                if policy.mode == "ask":
+                    current = resolved.read_text(encoding="utf-8")
                 stale_error = self._ledger.check(resolved)
                 if stale_error is not None:
                     return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
+            if policy.mode == "ask":
+                decision = policy.check_write(
+                    path, diff=approval_diff(current, content, str(path))
+                )
+                if not decision.allowed:
+                    return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
+                if resolved.exists():
+                    stale_error = self._ledger.check(resolved)
+                    if stale_error is not None:
+                        return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
             resolved.parent.mkdir(parents=True, exist_ok=True)
             if self._checkpoints is not None:
                 self._checkpoints.before_write(resolved)
@@ -340,6 +358,8 @@ class WriteFileTool(LocalTool):
             if self._checkpoints is not None:
                 self._checkpoints.after_write(resolved)
             self._ledger.record(resolved, full=True, content=content)
+        except UnicodeDecodeError:
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
         except OSError as exc:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
         return ToolResult(

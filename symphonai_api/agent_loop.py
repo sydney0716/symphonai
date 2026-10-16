@@ -64,6 +64,7 @@ from symphonai_api.providers.base import (
 )
 from symphonai_api.repair import repair_unanswered_tool_calls
 from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
+from symphonai_api.secrets import mask_tool_result
 from symphonai_api.serialization import message_to_json
 from symphonai_api.session import TranscriptWriter
 from symphonai_api.streaming import StreamAssembler, TextDelta
@@ -770,6 +771,7 @@ class ApiAgent:
                                         "person what is blocking you."
                                     ),
                                 )
+                        tool_result = mask_tool_result(tool_result)
                         if self._result_store is not None:
                             tool_result = offload_tool_result(
                                 tool_result,
