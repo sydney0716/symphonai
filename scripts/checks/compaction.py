@@ -308,7 +308,7 @@ def check_microcompaction_preserves_handles() -> None:
             error="retained diagnostic",
             payload=payload,
         ),
-        tool_name="read_file",
+        tool_name="grep",
         store=ToolResultStore(),
     )
     if offloaded.offloaded is None:
@@ -322,7 +322,7 @@ def check_microcompaction_preserves_handles() -> None:
         Message(role=Role.USER, content="first goal"),
         Message(
             role=Role.ASSISTANT,
-            tool_calls=[ToolCall(id="stored-read", name="read_file")],
+            tool_calls=[ToolCall(id="stored-read", name="grep")],
         ),
         tool_message,
         Message(role=Role.USER, content="latest request"),

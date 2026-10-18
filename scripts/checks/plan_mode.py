@@ -68,14 +68,22 @@ def check_plan_command_decisions() -> None:
         ls_metadata = classify(["ls"])
         if ls_metadata is None or not ls_metadata.concurrency_safe:
             fail(f"test precondition changed for ls classification: {ls_metadata!r}")
-        plan_denied = policy.check_shell(["ls"])
+        plan_allowed = policy.check_shell(["ls"])
+        if (
+            not plan_allowed.allowed
+            or plan_allowed.denial is not None
+            or plan_allowed.outcome is not ApprovalOutcome.ALLOWED
+        ):
+            fail(f"plan mode refused a read-only shell command: {plan_allowed!r}")
+
+        plan_denied = policy.check_shell(["touch", "x"])
         if (
             plan_denied.allowed
             or plan_denied.reason != PLAN_MODE_REASON
             or plan_denied.denial is not DenialReason.PLAN_MODE
             or plan_denied.outcome is not ApprovalOutcome.REJECTED
         ):
-            fail(f"safe-classified shell escaped plan mode: {plan_denied!r}")
+            fail(f"non-read-only shell command escaped plan mode: {plan_denied!r}")
 
 
 @check("plan.real_tools")

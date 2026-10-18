@@ -899,6 +899,57 @@ test("root turns append duration and local finish time for completed, stopped, a
   assert.match(lines[2], /^Failed after 1m 3s · /);
 });
 
+test("root run failures append a rendered, bounded error after the failed time line", () => {
+  const message = "Anthropic API stream failed: The read operation timed out";
+  const transcript = applyAll([
+    event("RunStarted", { agent_id: "root", run_id: "run-failure" }),
+    event("PromptSubmitted", { agent_id: "root", run_id: "run-failure", text: "work" }),
+    event("RunFailed", { agent_id: "root", run_id: "run-failure", error: message }),
+  ]);
+  assert.deepEqual(transcript.model.map(({ type }) => type), ["prompt", "turn-time", "turn-error"]);
+  assert.match(transcript.model[1].text, /^Failed after /);
+  assert.equal(transcript.model[2].text, message);
+
+  class Node {
+    children = [];
+    append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = children; }
+  }
+  const document = { createElement: () => new Node() };
+  const root = new Node();
+  renderTranscript(document, root, transcript.model, () => []);
+  assert.match(root.children[1].textContent, /^Failed after /);
+  assert.equal(root.children[2].textContent, message);
+  assert.equal(root.children[2].className, "turn-error");
+
+  const longError = "x".repeat(1000);
+  const longTranscript = applyAll([
+    event("RunStarted", { agent_id: "root", run_id: "run-long-failure" }),
+    event("PromptSubmitted", { agent_id: "root", run_id: "run-long-failure", text: "work" }),
+    event("RunFailed", { agent_id: "root", run_id: "run-long-failure", error: longError }),
+  ]);
+  assert.equal(longTranscript.model[2].text, `${"x".repeat(300)}…`);
+  assert.equal(longTranscript.model[2].text.length, 301);
+});
+
+test("subagent failures do not add a root turn error; replay uses supplied error text", () => {
+  const live = applyAll([
+    event("RunStarted", { agent_id: "root" }),
+    event("PromptSubmitted", { agent_id: "root", text: "work" }),
+    event("RunFailed", { agent_id: "worker", error: "worker failed" }),
+  ]);
+  assert.deepEqual(live.model.map(({ type }) => type), ["prompt"]);
+
+  const replay = applyAll([history("user", "failed work", [], [], {
+    turn_started_at: "2026-10-12T17:21:00.000Z",
+    turn_ended_at: "2026-10-12T17:21:12.000Z",
+    turn_outcome: "failed",
+    error: "replayed provider failure",
+  })]);
+  assert.deepEqual(replay.model.map(({ type }) => type), ["prompt", "turn-time", "turn-error"]);
+  assert.equal(replay.model[2].text, "replayed provider failure");
+});
+
 test("replayed turns restore dispatch task and the end-time line", () => {
   const transcript = applyAll([
     history("user", "investigate", [], [], {

@@ -368,7 +368,7 @@ def check_retry_overall_deadline() -> None:
                     side_effect=lambda: next(deadline_clock, 129.75),
                 ):
                     try:
-                        OpenAIProvider().create_response(basic_request)
+                        OpenAIProvider(timeout_seconds=30).create_response(basic_request)
                     except ProviderError as exc:
                         deadline_message = str(exc)
                     else:

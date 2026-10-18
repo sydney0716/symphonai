@@ -55,7 +55,7 @@ class OpenAICompatibleProvider(ModelProvider):
     base_url: str
     model: str = DEFAULT_MODEL
     provider_label: str = "openai-compatible"
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 600.0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     stream_usage: bool = True
 

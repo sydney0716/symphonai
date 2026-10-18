@@ -1756,6 +1756,12 @@ button.session-link {
   font-size: 0.75rem;
 }
 
+.turn-error {
+  margin: 0 0 0 var(--space-6);
+  color: var(--ui-danger);
+  font-size: 0.75rem;
+}
+
 .activity code,
 .edit code,
 .question code,

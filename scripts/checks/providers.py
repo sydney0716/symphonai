@@ -55,6 +55,9 @@ class _FakeHttpResponse:
     def __exit__(self, *exc: object) -> bool:
         return False
 
+    def __iter__(self):
+        return iter(())
+
 
 @check("providers.failed_tool_output_reaches_model")
 def check_failed_tool_output_reaches_model() -> None:
@@ -556,6 +559,74 @@ def check_cache_usage_accounting() -> None:
         gemini = GeminiProvider().create_response(request)
     if gemini.usage != Usage(1000, 0, 600, 0):
         fail(f"Gemini cache usage was wrong: {gemini.usage!r}")
+
+
+@check("providers.slow_models_are_waited_for")
+def check_slow_models_are_waited_for() -> None:
+    request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
+    compatible_env = "SYMPHONAI_SLOW_COMPATIBLE_KEY"
+    providers = (
+        ("anthropic", AnthropicProvider(), AnthropicProvider(timeout_seconds=30), ANTHROPIC_API_KEY_ENV_VAR),
+        ("openai", OpenAIProvider(), OpenAIProvider(timeout_seconds=30), API_KEY_ENV_VAR),
+        ("gemini", GeminiProvider(), GeminiProvider(timeout_seconds=30), GEMINI_API_KEY_ENV_VAR),
+        (
+            "compatible",
+            OpenAICompatibleProvider(compatible_env, "https://compatible.invalid/v1"),
+            OpenAICompatibleProvider(
+                compatible_env, "https://compatible.invalid/v1", timeout_seconds=30
+            ),
+            compatible_env,
+        ),
+    )
+    payloads = {
+        "anthropic": {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {},
+            "stop_reason": "end_turn",
+        },
+        "openai": _responses_success("ok").read(),
+        "gemini": {
+            "candidates": [
+                {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {},
+        },
+        "compatible": _openai_success("ok").read(),
+    }
+    calls: list[tuple[str, float | None]] = []
+
+    def urlopen(http_request, timeout=None):  # noqa: ANN001
+        url = http_request.full_url
+        name = "compatible" if "compatible.invalid" in url else (
+            "anthropic" if "anthropic" in url else "gemini" if "generativelanguage" in url else "openai"
+        )
+        calls.append((name, timeout))
+        payload = payloads[name]
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        return _FakeHttpResponse(body)
+
+    env = {
+        ANTHROPIC_API_KEY_ENV_VAR: "anthropic-test-key",
+        API_KEY_ENV_VAR: "openai-test-key",
+        GEMINI_API_KEY_ENV_VAR: "gemini-test-key",
+        compatible_env: "compatible-test-key",
+    }
+    with mock.patch.dict(os.environ, env), mock.patch(
+        "urllib.request.urlopen", side_effect=urlopen
+    ), mock.patch("symphonai_api.streaming.time.monotonic", return_value=0.0):
+        for name, default_provider, custom_provider, _ in providers:
+            list(default_provider.create_response_stream(request))
+            default_provider.create_response(request)
+            list(custom_provider.create_response_stream(request))
+            custom_provider.create_response(request)
+
+    expected = [
+        (name, timeout)
+        for name, _, _, _ in providers
+        for timeout in (600.0, 600.0, 30, 30)
+    ]
+    if calls != expected:
+        fail(f"provider transport timeouts were {calls!r}, expected {expected!r}")
 
 
 @check("providers.unlisted_effort_passthrough")

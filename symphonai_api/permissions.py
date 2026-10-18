@@ -35,6 +35,7 @@ from symphonai_api.events import (
 )
 from symphonai_api.web_domains import preapproved_domains
 from symphonai_api.tools.shell_parse import commands_for_argv
+from symphonai_api.tools.shell_classify import classify
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     ".env",
@@ -173,6 +174,51 @@ def _discards_work(
     elif subcommand == "switch":
         refused = bool({"--discard-changes", "--force"}.intersection(arguments)) or "f" in short_flags
     return subcommand if refused else None
+
+
+def _plan_read_only_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
+    normalized = list(argv)
+    program = os.path.basename(argv[0]) if argv else ""
+    git_subcommand = os.path.basename(argv[1]) if program == "git" and len(argv) > 1 else ""
+    if not ((program == "git" and git_subcommand == "log") or program in {"head", "tail"}):
+        return argv
+    for index, word in enumerate(normalized):
+        if re.fullmatch(r"-[0-9]+", word):
+            normalized[index:index + 1] = ["-n", word[1:]]
+            break
+    return tuple(normalized)
+
+
+def _plan_path_arguments(argv: tuple[str, ...]) -> tuple[str, ...]:
+    if not argv:
+        return ()
+    program = os.path.basename(argv[0])
+    command_start = 2 if program == "git" and len(argv) > 1 else 1
+    option_command = (
+        ("git", os.path.basename(argv[1])) if program == "git" and len(argv) > 1
+        else (program,)
+    )
+    takes_value = {
+        ("git", "log"): {"-n", "--max-count", "--format", "--pretty"},
+        ("git", "show"): {"--format", "--pretty"},
+        ("head",): {"-n", "-c"},
+        ("tail",): {"-n", "-c"},
+    }.get(option_command, set())
+    paths = []
+    index = command_start
+    while index < len(argv):
+        word = argv[index]
+        if word == "--":
+            paths.extend(argv[index + 1:])
+            break
+        if word.startswith("-"):
+            if word.split("=", 1)[0] in takes_value and "=" not in word:
+                index += 2
+                continue
+        else:
+            paths.append(word)
+        index += 1
+    return tuple(paths)
 
 
 class DenialReason(str, Enum):
@@ -760,6 +806,37 @@ class PermissionPolicy:
                                 tool_name="run_shell",
                             )
         if self.mode == "plan":
+            if commands is None:
+                return self._deny(
+                    "this command uses shell syntax that cannot be checked "
+                    "(command or process substitution, a subshell, a here-document, or a background job); "
+                    "run it as simpler commands",
+                    denial=DenialReason.UNCHECKABLE_COMMAND,
+                    tool_name="run_shell",
+                )
+            current_directory = self.repo_root if cwd is None else Path(cwd).resolve()
+            for command in commands:
+                if command.writes or classify(_plan_read_only_argv(command.argv)) is None:
+                    break
+                unsafe_path = False
+                for argument in _plan_path_arguments(command.argv):
+                    if "$" in argument or any(char in argument for char in "*?["):
+                        unsafe_path = True
+                        break
+                    try:
+                        candidate = Path(argument).expanduser()
+                    except (OSError, RuntimeError):
+                        unsafe_path = True
+                        break
+                    if not candidate.is_absolute():
+                        candidate = current_directory / candidate
+                    if not self.check_read(candidate).allowed:
+                        unsafe_path = True
+                        break
+                if unsafe_path:
+                    break
+            else:
+                return PermissionDecision.allow()
             return self._deny(
                 "plan mode allows reads only; this call would change the world",
                 denial=DenialReason.PLAN_MODE,

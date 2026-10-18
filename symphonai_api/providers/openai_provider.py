@@ -486,7 +486,7 @@ class OpenAIProvider(ModelProvider):
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 600.0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
     @property

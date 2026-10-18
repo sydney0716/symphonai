@@ -1648,6 +1648,71 @@ def check_discarding_work_is_refused() -> None:
                 fail(f"non-discarding command was refused: {command!r}")
 
 
+@check("permissions.plan_mode_runs_read_only_commands")
+def check_plan_mode_runs_read_only_commands() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("pass\n", encoding="utf-8")
+        plan = PermissionPolicy(root, mode="plan")
+        for argv in (
+            ["git", "diff", "HEAD"],
+            ["git", "log", "--oneline", "-5"],
+            ["git", "status"],
+            ["ls", "src"],
+            ["bash", "-c", "git diff HEAD | head -50"],
+        ):
+            decision = plan.check_shell(argv)
+            if not decision.allowed:
+                fail(f"plan mode refused a classified read-only command {argv!r}: {decision!r}")
+
+        for argv in (
+            ["touch", "a"],
+            ["bash", "-c", "echo x > a.txt"],
+            ["cat", "~/.ssh/id_rsa"],
+            ["cat", ".env"],
+        ):
+            decision = plan.check_shell(argv)
+            if decision.allowed or decision.denial is not DenialReason.PLAN_MODE:
+                fail(f"plan mode did not refuse a write or out-of-root read: {argv!r}: {decision!r}")
+
+        uncheckable = plan.check_shell(["bash", "-c", "echo $(id)"])
+        if uncheckable.allowed or uncheckable.denial is not DenialReason.UNCHECKABLE_COMMAND:
+            fail(f"plan mode did not preserve the uncheckable-syntax denial: {uncheckable!r}")
+
+        for argv in (["git", "commit", "-m", "x"], ["rm", "a"]):
+            decision = plan.check_shell(argv)
+            if decision.allowed or decision.denial is not DenialReason.ALWAYS_DENY:
+                fail(f"always-deny precedence changed in plan mode: {argv!r}: {decision!r}")
+
+        checkout = plan.check_shell(["git", "checkout", "src/a.py"])
+        expected_checkout = (
+            "this would discard uncommitted work (checkout); change the files with edits instead, or ask the person"
+        )
+        if checkout.allowed or checkout.denial is not DenialReason.ALWAYS_DENY or checkout.reason != expected_checkout:
+            fail(f"plan mode bypassed the checkout discard guard: {checkout!r}")
+
+        requests = []
+        ask = PermissionPolicy(
+            root, mode="ask", shell_enabled=True, shell_allowlist=[()],
+            approval_callback=lambda request: requests.append(request) or True,
+        )
+        allow = PermissionPolicy(root, mode="allow", shell_enabled=True, shell_allowlist=[()])
+        unchanged_modes = (
+            ["git", "status"], ["touch", "a"],
+            ["bash", "-c", "echo x > a.txt"], ["cat", "~/.ssh/id_rsa"],
+            ["git", "commit", "-m", "x"], ["rm", "a"],
+        )
+        for argv in unchanged_modes:
+            expected_allowed = not (argv[:2] == ["git", "commit"] or argv[0] == "rm")
+            ask_decision = ask.check_shell(argv)
+            allow_decision = allow.check_shell(argv)
+            if ask_decision.allowed != expected_allowed or allow_decision.allowed != expected_allowed:
+                fail(f"plan-mode change altered ask/allow decisions for {argv!r}")
+        if len(requests) != 4:
+            fail(f"ask mode did not preserve its approval requests: {requests!r}")
+
+
 @check("permissions.paths_resolve_from_the_shell_cwd")
 def check_shell_paths_resolve_from_cwd() -> None:
     with tempfile.TemporaryDirectory() as temporary:

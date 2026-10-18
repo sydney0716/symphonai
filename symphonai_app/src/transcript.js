@@ -49,7 +49,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   const promptStarts = new Map();
   const dispatchCalls = [];
 
-  function appendTurnTime(prompt, endedAt, outcome) {
+  function appendTurnTime(prompt, endedAt, outcome, error = "") {
     const startValue = promptStarts.get(prompt);
     const started = typeof startValue === "number" ? startValue : Date.parse(startValue);
     const ended = typeof endedAt === "number" ? endedAt : Date.parse(endedAt);
@@ -64,6 +64,12 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     const time = new Date(ended).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
     const entry = { type: "turn-time", text: `${label} ${duration} · ${time}` };
     model.push(entry);
+    if (outcome === "failed" && typeof error === "string" && error.length > 0) {
+      model.push({
+        type: "turn-error",
+        text: error.length > 300 ? `${error.slice(0, 300)}…` : error,
+      });
+    }
     return entry;
   }
 
@@ -271,7 +277,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
           appendEditCard(entry, promptEdits.get(entry) ?? [], {
             undone: promptUndone.get(entry) === true,
           });
-          appendTurnTime(entry, fields.turn_ended_at, fields.turn_outcome);
+          appendTurnTime(entry, fields.turn_ended_at, fields.turn_outcome, fields.error);
           if (currentPrompt === entry) currentPrompt = null;
         }
       } else if (fields.role === "assistant") {
@@ -355,7 +361,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
             undone: promptUndone.get(currentPrompt) === true,
           });
           if (fields.turn_ended_at) {
-            appendTurnTime(currentPrompt, fields.turn_ended_at, fields.turn_outcome);
+            appendTurnTime(currentPrompt, fields.turn_ended_at, fields.turn_outcome, fields.error);
           }
           currentPrompt = null;
         }
@@ -533,6 +539,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
           currentPrompt,
           now(),
           type === "RunFailed" ? "failed" : fields.stopped_reason === "cancelled" ? "cancelled" : "finished",
+          type === "RunFailed" ? fields.error : "",
         );
       }
       for (const [id, record] of calls) {

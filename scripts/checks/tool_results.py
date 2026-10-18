@@ -89,13 +89,13 @@ def check_threshold_and_preview() -> None:
         ok=True,
         content="x" * OFFLOAD_THRESHOLD_CHARS,
     )
-    unchanged = offload_tool_result(threshold_result, tool_name="read_file", store=store)
+    unchanged = offload_tool_result(threshold_result, tool_name="grep", store=store)
     if unchanged is not threshold_result or len(store) != 0:
         fail(f"threshold-sized result was offloaded: {unchanged!r}")
 
     newline_content = "line\n" * 1_001
     original = ToolResult(tool_call_id="newline", ok=True, content=newline_content)
-    offloaded = offload_tool_result(original, tool_name="read_file", store=store)
+    offloaded = offload_tool_result(original, tool_name="grep", store=store)
     if offloaded.offloaded is None:
         fail("large newline result was not offloaded")
     expected_preview = newline_content[:PREVIEW_CHARS]
@@ -115,7 +115,7 @@ def check_threshold_and_preview() -> None:
     if (
         record.characters != len(newline_content)
         or record.preview_characters != len(expected_preview)
-        or record.tool_name != "read_file"
+        or record.tool_name != "grep"
     ):
         fail(f"offload metadata was wrong: {record!r}")
     stored = store.get(record.id)
@@ -136,7 +136,7 @@ def check_threshold_and_preview() -> None:
     early_newline_content = "\n" + "q" * 100_000
     early = offload_tool_result(
         ToolResult(tool_call_id="early", ok=True, content=early_newline_content),
-        tool_name="read_file",
+        tool_name="grep",
         store=store,
     )
     if early.offloaded is None or early.offloaded.preview_characters != PREVIEW_CHARS:
@@ -144,11 +144,27 @@ def check_threshold_and_preview() -> None:
     boundary_content = "b" * MIN_PREVIEW_CHARS + "\n" + "b" * 100_000
     boundary = offload_tool_result(
         ToolResult(tool_call_id="boundary", ok=True, content=boundary_content),
-        tool_name="read_file",
+        tool_name="grep",
         store=store,
     )
     if boundary.offloaded is None or boundary.offloaded.preview_characters != MIN_PREVIEW_CHARS:
         fail(f"a newline at the preview floor was not used as the cut: {boundary!r}")
+
+
+@check("tool_results.read_file_is_not_offloaded")
+def check_read_file_is_not_offloaded() -> None:
+    content = "r" * 30_000
+    read_result = ToolResult(tool_call_id="read", ok=True, content=content)
+    read_store = ToolResultStore()
+    unchanged = offload_tool_result(read_result, tool_name="read_file", store=read_store)
+    if unchanged is not read_result or unchanged.content != content or len(read_store) != 0:
+        fail(f"large read_file result was changed or stored: {unchanged!r}")
+
+    shell_result = ToolResult(tool_call_id="shell", ok=True, content="s" * 30_000)
+    shell_store = ToolResultStore()
+    offloaded = offload_tool_result(shell_result, tool_name="run_shell", store=shell_store)
+    if offloaded.offloaded is None or len(shell_store) != 1:
+        fail(f"large run_shell result was not offloaded: {offloaded!r}")
 
 
 @check("results.preserves_other_fields")
@@ -703,8 +719,13 @@ def check_resume_fallback_directory() -> None:
                             tool_calls=[
                                 ToolCall(
                                     id="read-large",
-                                    name="read_file",
-                                    arguments={"path": "large.txt"},
+                                    name="grep",
+                                    arguments={
+                                        "pattern": "persistent line",
+                                        "path": ".",
+                                        "glob": "large.txt",
+                                        "output_mode": "content",
+                                    },
                                 )
                             ],
                         )
@@ -782,8 +803,13 @@ def check_resume_chain_resolves_ancestor_handle() -> None:
                             tool_calls=[
                                 ToolCall(
                                     id="read-ancestor",
-                                    name="read_file",
-                                    arguments={"path": "large.txt"},
+                                    name="grep",
+                                    arguments={
+                                        "pattern": "ancestor line",
+                                        "path": ".",
+                                        "glob": "large.txt",
+                                        "output_mode": "content",
+                                    },
                                 )
                             ],
                         )

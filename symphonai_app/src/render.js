@@ -623,6 +623,10 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
     className: "turn-time",
     text: entry.text,
   }),
+  "turn-error": (document, entry) => element(document, "p", {
+    className: "turn-error",
+    text: entry.text,
+  }),
   "model-fallback": (document, entry) => element(document, "p", {
     className: "model-fallback",
     text: entry.text,
