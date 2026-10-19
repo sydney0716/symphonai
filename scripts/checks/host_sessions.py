@@ -442,6 +442,24 @@ def check_damaged_session_listed() -> None:
             fail(f"damaged session was omitted or misclassified: {result!r}")
 
 
+@check("host_sessions.loops_folder_is_not_listed")
+def check_loops_folder_is_not_listed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        sessions_root = root / "sessions"
+        real_session = SessionStore(sessions_root, "run_real", repo_root=root)
+        real_session.close()
+        (sessions_root / "loops" / "loop_000000000000" / "integration").mkdir(parents=True)
+        (sessions_root / "run_broken").mkdir()
+
+        sessions = list_sessions(sessions_root)
+        by_id = {session["run_id"]: session for session in sessions}
+        if set(by_id) != {"run_real", "run_broken"}:
+            fail(f"loops folder was listed or another directory was omitted: {sessions!r}")
+        if by_id["run_broken"]["state"] != "unreadable":
+            fail(f"damaged session was not retained as unreadable: {sessions!r}")
+
+
 @check("host_sessions.empty_root")
 def check_empty_root() -> None:
     with tempfile.TemporaryDirectory() as directory:

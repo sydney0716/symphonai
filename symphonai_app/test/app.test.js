@@ -342,9 +342,15 @@ export function fakeClient(
     roadmapFailure = null,
     specFilesReply = { paths: [] },
     specFilesFailure = false,
+    loopList = { loops: [] },
+    loopReplies = {},
+    loopCardReplies = {},
+    loopCommitReplies = {},
+    startLoopReply = { loop: { id: "loop_fake", goal: "fake goal", state: "planning", lanes: [], cards: [] } },
+    startLoopFailure = null,
   } = {},
 ) {
-  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
   let eventCallback;
@@ -419,6 +425,39 @@ export function fakeClient(
     async stopJob(id) {
       calls.stopJob.push(id);
       return { status: "stopped" };
+    },
+    async startLoop(goal) {
+      calls.startLoop.push(goal);
+      if (startLoopFailure) throw startLoopFailure;
+      return typeof startLoopReply === "function" ? startLoopReply(goal) : startLoopReply;
+    },
+    async loops() {
+      calls.loops += 1;
+      return loopList;
+    },
+    async loop(id) {
+      calls.loop.push(id);
+      return loopReplies[id] ?? { loop: null };
+    },
+    async loopPlan(loopId, action, options = {}) {
+      calls.loopPlan.push({ loopId, action, ...options });
+      return loopReplies[loopId] ?? { loop: null };
+    },
+    async loopCancel(loopId) {
+      calls.loopCancel.push(loopId);
+      return loopReplies[loopId] ?? { loop: null };
+    },
+    async loopResume(loopId) {
+      calls.loopResume.push(loopId);
+      return loopReplies[loopId] ?? { loop: null };
+    },
+    async loopCard(loopId, cardId) {
+      calls.loopCard.push([loopId, cardId]);
+      return loopCardReplies[`${loopId}:${cardId}`] ?? {};
+    },
+    async loopCommit(loopId, action) {
+      calls.loopCommit.push({ loopId, action });
+      return loopCommitReplies[`${loopId}:${action}`] ?? { loop: null };
     },
     async revertChanges(payload) {
       calls.revertChanges.push(payload);
@@ -651,6 +690,7 @@ test("help lists commands and their aliases in table order", async () => {
     "/help — Show the commands",
     "/new — Start a new chat (also /clear)",
     "/plan — Switch plan mode on or off",
+    "/spec — Switch spec mode on or off",
     "/resume [<search>] — Reopen a past conversation in this project (also /continue)",
     "/cost — Show what this conversation has used",
     "/context — Show what fills the context window",
@@ -1250,6 +1290,490 @@ test("plan toggles back to the mode that was active before plan", async () => {
   assert.deepEqual(allowClient.calls.selectMode, ["plan", "allow"]);
 });
 
+test("spec mode toggles independently from permission mode and validates arguments", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { mode: "ask" } },
+    conversation: { mode: "ask" },
+  });
+  await start({ global: {}, document, client });
+  const status = () => find(document.getElementById("chat-pane"), (node) => node.className.includes("conversation-usage"));
+  assert.doesNotMatch(status().textContent, /Spec mode/);
+
+  await submitCommand(document, "/spec");
+  assert.match(visibleText(document.getElementById("chat")), /Spec mode on: each message starts a spec loop\./);
+  assert.match(status().textContent, /Spec mode/);
+  assert.match(status().className, /spec-mode/);
+  assert.equal(client.calls.selectMode.length, 0);
+
+  await submitCommand(document, "/spec");
+  assert.match(visibleText(document.getElementById("chat")), /Spec mode off\./);
+  assert.doesNotMatch(status().textContent, /Spec mode/);
+  await submitCommand(document, "/spec x");
+  assert.match(visibleText(document.getElementById("chat")), /Usage: \/spec/);
+  assert.doesNotMatch(status().textContent, /Spec mode/);
+  assert.equal(client.calls.selectMode.length, 0);
+});
+
+test("spec mode starts a loop instead of sending a prompt and opens it in the Loop tab", async () => {
+  const document = new FakeDocument();
+  const loop = {
+    id: "loop_012345abcdef",
+    goal: "add compound durations",
+    state: "planning",
+    reason: "",
+    lanes: [{ id: 1, cards: ["a"] }],
+    cards: [{ id: "a", title: "Parse durations", state: "planned", lane: 1 }],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id: loop.id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19T12:00:00Z" }] },
+    loopReplies: { [loop.id]: { loop } },
+    startLoopReply: { loop },
+  });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/spec");
+  const input = document.getElementById("prompt");
+  input.value = "add compound durations";
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.deepEqual(client.calls.startLoop, ["add compound durations"]);
+  assert.deepEqual(client.calls.prompt, []);
+  assert.equal(input.value, "");
+  assert.match(latestCommandOutput(document).join("\n"), /Started a spec loop: add compound durations/);
+  assert.equal(find(document.getElementById("chat"), (node) => (
+    node.className === "command-echo" && node.textContent === ""
+  )), undefined);
+  assert.ok(find(document.getElementById("chat"), (node) => (
+    node.className === "command-echo" && node.textContent === "/spec"
+  )));
+  const loopTab = find(document.getElementById("rail-tabs"), (node) => (
+    node.attributes.get("role") === "tab" && node.attributes.get("aria-label") === "Loop"
+  ));
+  assert.equal(loopTab.attributes.get("aria-selected"), "true");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  assert.match(visibleText(pane), /add compound durations/);
+  assert.match(visibleText(pane), /Parse durations/);
+});
+
+test("Loop tab renders lanes and refreshes the shown loop after LoopChanged", async () => {
+  const document = new FakeDocument();
+  const id = "loop_012345abcdef";
+  const loop = {
+    id,
+    goal: "add compound durations",
+    state: "running",
+    reason: "",
+    lanes: [{ id: 1, cards: ["a", "b"] }, { id: 2, cards: ["c"] }],
+    cards: [
+      { id: "a", title: "Parse values", state: "planned", lane: 1 },
+      { id: "b", title: "Old approach", state: "dropped", lane: 1 },
+      { id: "c", title: "Add tests", state: "planned", lane: 2 },
+    ],
+  };
+  const loopReplies = { [id]: { loop } };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19T12:00:00Z" }] },
+    loopReplies,
+  });
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  const lanes = walk(pane).filter((node) => node.className === "loop-lane");
+  assert.equal(lanes.length, 2);
+  const dropped = walk(pane).find((node) => node.className === "loop-card loop-card-dimmed");
+  assert.match(find(dropped, (node) => node.className === "loop-card-open").textContent, /b · Old approach · dropped/);
+  assert.match(visibleText(pane), /State: running/);
+
+  loopReplies[id] = { loop: {
+    ...loop,
+    cards: loop.cards.map((card) => card.id === "a" ? { ...card, state: "running" } : card),
+  } };
+  const readsBefore = client.calls.loop.length;
+  await client.emit(eventFrame("LoopChanged", {
+    loop_id: id, state: "running", change: "card", card_id: "a", reason: "",
+  }));
+  assert.equal(client.calls.loop.length, readsBefore + 1);
+  assert.match(find(pane, (node) => node.className === "loop-card-open" && node.textContent.startsWith("a ·")).textContent, /running/);
+});
+
+test("LoopChanged updates the list state for a loop that is not selected", async () => {
+  const loops = [
+    { id: "loop_first", goal: "First", state: "planning", updated_at: "2026-10-19T12:00:00Z" },
+    { id: "loop_second", goal: "Second", state: "awaiting_plan", updated_at: "2026-10-19T11:00:00Z" },
+  ];
+  const client = fakeClient(fixtureRoadmap(), { loopList: { loops } });
+  const document = new FakeDocument();
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  await client.emit(eventFrame("LoopChanged", {
+    loop_id: "loop_second", state: "running", change: "state",
+  }));
+
+  const second = walk(pane).find((node) => node.className === "loop-list-item" && node.textContent.startsWith("Second"));
+  assert.match(second.textContent, /Second · running$/);
+});
+
+test("a rejected spec loop start shows the host error and keeps the composer text", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    startLoopFailure: new Error("planner is unavailable"),
+  });
+  await start({ global: {}, document, client });
+  await submitCommand(document, "/spec");
+  const input = document.getElementById("prompt");
+  input.value = "add compound durations";
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.equal(input.value, "add compound durations");
+  assert.match(visibleText(document.getElementById("chat")), /planner is unavailable/);
+  assert.deepEqual(client.calls.prompt, []);
+});
+
+test("awaiting-plan cards can be approved or dropped and the board uses each reply", async () => {
+  const id = "loop_111111111111";
+  const makePlan = () => ({
+    id,
+    goal: "build a parser",
+    state: "awaiting_plan",
+    reason: "",
+    lanes: [{ id: 1, cards: ["a", "b"] }],
+    cards: [
+      { id: "a", title: "Parse input", state: "planned", lane: 1 },
+      { id: "b", title: "Add output", state: "planned", lane: 1 },
+    ],
+  });
+
+  const approveDocument = new FakeDocument();
+  const approveClient = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: "build a parser", state: "awaiting_plan", updated_at: "2026-10-19" }] },
+  });
+  let approvedLoop = makePlan();
+  approveClient.loop = async (loopId) => {
+    approveClient.calls.loop.push(loopId);
+    return { loop: approvedLoop };
+  };
+  approveClient.loopPlan = async (loopId, action, options = {}) => {
+    approveClient.calls.loopPlan.push({ loopId, action, ...options });
+    approvedLoop = { ...approvedLoop, state: "running" };
+    return { loop: approvedLoop };
+  };
+  const approveApp = await start({ global: {}, document: approveDocument, client: approveClient });
+  await approveApp.openTool("Loop");
+  const approvePane = find(approveDocument.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  await find(approvePane, (node) => node.tagName === "BUTTON" && node.textContent === "Approve plan").dispatch("click");
+  assert.deepEqual(approveClient.calls.loopPlan, [{ loopId: id, action: "approve" }]);
+  assert.match(visibleText(approvePane), /State: running/);
+
+  const dropDocument = new FakeDocument();
+  const dropClient = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: "build a parser", state: "awaiting_plan", updated_at: "2026-10-19" }] },
+  });
+  let droppedLoop = makePlan();
+  dropClient.loop = async (loopId) => {
+    dropClient.calls.loop.push(loopId);
+    return { loop: droppedLoop };
+  };
+  dropClient.loopPlan = async (loopId, action, options = {}) => {
+    dropClient.calls.loopPlan.push({ loopId, action, ...options });
+    droppedLoop = {
+      ...droppedLoop,
+      cards: droppedLoop.cards.map((card) => card.id === "b" ? { ...card, state: "dropped" } : card),
+    };
+    return { loop: droppedLoop };
+  };
+  const dropApp = await start({ global: {}, document: dropDocument, client: dropClient });
+  await dropApp.openTool("Loop");
+  const dropPane = find(dropDocument.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  const cardB = walk(dropPane).find((node) => node.className === "loop-card-open" && node.textContent.startsWith("b ·"));
+  await find(cardB.parentNode, (node) => node.tagName === "BUTTON" && node.textContent === "Drop").dispatch("click");
+  assert.deepEqual(dropClient.calls.loopPlan, [{ loopId: id, action: "drop", cards: ["b"] }]);
+  const droppedCard = walk(dropPane).find((node) => node.className === "loop-card loop-card-dimmed");
+  assert.match(find(droppedCard, (node) => node.className === "loop-card-open").textContent, /b ·/);
+  assert.equal(find(droppedCard, (node) => node.tagName === "BUTTON" && node.textContent === "Drop"), undefined);
+});
+
+test("a rejected dependent-card drop shows the host error without dropping the card", async () => {
+  const document = new FakeDocument();
+  const id = "loop_222222222222";
+  const loop = {
+    id, goal: "build a parser", state: "awaiting_plan", reason: "",
+    lanes: [{ id: 1, cards: ["a", "b"] }],
+    cards: [
+      { id: "a", title: "Use output", state: "planned", lane: 1, after: ["b"] },
+      { id: "b", title: "Build output", state: "planned", lane: 1 },
+    ],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopPlan = async (loopId, action, options = {}) => {
+    client.calls.loopPlan.push({ loopId, action, ...options });
+    throw new Error("cannot drop b because kept card a depends on it");
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  const card = walk(pane).find((node) => node.className === "loop-card-open" && node.textContent.startsWith("b ·"));
+  await find(card.parentNode, (node) => node.tagName === "BUTTON" && node.textContent === "Drop").dispatch("click");
+  assert.match(visibleText(pane), /cannot drop b because kept card a depends on it/);
+  assert.ok(walk(pane).some((node) => node.className === "loop-card" && walk(node).some((child) => child.textContent === "Drop")));
+});
+
+test("revise sends its note and renders the planning loop returned by the host", async () => {
+  const document = new FakeDocument();
+  const id = "loop_333333333333";
+  let loop = {
+    id, goal: "build a parser", state: "awaiting_plan", reason: "",
+    lanes: [{ id: 1, cards: ["b"] }],
+    cards: [{ id: "b", title: "Build parser", state: "planned", lane: 1 }],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopPlan = async (loopId, action, options = {}) => {
+    client.calls.loopPlan.push({ loopId, action, ...options });
+    loop = { ...loop, state: "planning" };
+    return { loop };
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  const note = find(pane, (node) => node.className === "loop-revise-note");
+  note.value = "split b into two";
+  await note.dispatch("input");
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Revise…").dispatch("click");
+
+  assert.deepEqual(client.calls.loopPlan, [{ loopId: id, action: "revise", note: "split b into two" }]);
+  assert.match(visibleText(pane), /State: planning/);
+  assert.equal(find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Approve plan"), undefined);
+});
+
+test("cancel asks inline and Keep running makes no request", async () => {
+  const document = new FakeDocument();
+  const id = "loop_444444444444";
+  let loop = {
+    id, goal: "build a parser", state: "running", reason: "",
+    lanes: [], cards: [],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopCancel = async (loopId) => {
+    client.calls.loopCancel.push(loopId);
+    loop = { ...loop, state: "cancelled" };
+    return { loop };
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Cancel loop").dispatch("click");
+  assert.match(visibleText(pane), /Cancel this loop\? Its branch and work will be removed\./);
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Keep running").dispatch("click");
+  assert.deepEqual(client.calls.loopCancel, []);
+
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Cancel loop").dispatch("click");
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Cancel loop").dispatch("click");
+  assert.deepEqual(client.calls.loopCancel, [id]);
+  assert.match(visibleText(pane), /State: cancelled/);
+});
+
+test("needs-attention loop shows its reason and resumes", async () => {
+  const document = new FakeDocument();
+  const id = "loop_555555555555";
+  let loop = {
+    id, goal: "build a parser", state: "needs_attention", reason: "merge conflict",
+    lanes: [], cards: [],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopResume = async (loopId) => {
+    client.calls.loopResume.push(loopId);
+    loop = { ...loop, state: "running", reason: "" };
+    return { loop };
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  assert.match(visibleText(pane), /merge conflict/);
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Resume").dispatch("click");
+  assert.deepEqual(client.calls.loopResume, [id]);
+  assert.match(visibleText(pane), /State: running/);
+});
+
+test("card details render markdown, diff, review and conversation with Back and Escape", async () => {
+  const document = new FakeDocument();
+  const id = "loop_666666666666";
+  const loop = {
+    id, goal: "build a parser", state: "running", reason: "",
+    lanes: [{ id: 1, cards: ["a"] }],
+    cards: [{ id: "a", title: "Parse input", state: "review", lane: 1 }],
+  };
+  const cardDetails = {
+    a: {
+      card: loop.cards[0],
+      spec: "# Spec\n\nBuild the parser.",
+      report: "# Report\n\n**All checks passed.**",
+      diff: "@@ -0,0 +1 @@\n+const value = 1;\n-old value",
+      diff_truncated: true,
+      review: { verdict: "passed", text: "Looks good.", follow_ups: [] },
+      session_id: "agent-session",
+    },
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    sessions: [{ run_id: "agent-session", title: "Agent conversation", repo_root: "/work/current" }],
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async (loopId) => {
+    client.calls.loop.push(loopId);
+    return { loop };
+  };
+  client.loopCard = async (loopId, cardId) => {
+    client.calls.loopCard.push([loopId, cardId]);
+    return cardDetails[cardId];
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  await find(pane, (node) => node.className === "loop-card-open" && node.textContent.startsWith("a ·")).dispatch("click");
+
+  assert.deepEqual(client.calls.loopCard, [[id, "a"]]);
+  assert.match(visibleText(pane), /Spec/);
+  assert.match(visibleText(pane), /Build the parser\./);
+  assert.match(visibleText(pane), /All checks passed\./);
+  assert.match(visibleText(pane), /passed/);
+  assert.match(visibleText(pane), /Looks good\./);
+  assert.match(visibleText(pane), /Diff truncated\./);
+  assert.ok(walk(pane).some((node) => node.className === "diff-add"));
+  assert.ok(walk(pane).some((node) => node.className === "diff-remove"));
+
+  cardDetails.a = { ...cardDetails.a, spec: "# Spec\n\nUpdated after review." };
+  await client.emit(eventFrame("LoopChanged", {
+    loop_id: id, state: "running", change: "card", card_id: "a", reason: "",
+  }));
+  assert.deepEqual(client.calls.loopCard, [[id, "a"], [id, "a"]]);
+  assert.match(visibleText(pane), /Updated after review\./);
+
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Back to the board").dispatch("click");
+  assert.ok(find(pane, (node) => node.className === "loop-card-open"));
+  await find(pane, (node) => node.className === "loop-card-open").dispatch("click");
+  await document.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.ok(find(pane, (node) => node.className === "loop-card-open"));
+
+  await find(pane, (node) => node.className === "loop-card-open").dispatch("click");
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Open conversation").dispatch("click");
+  assert.deepEqual(client.calls.openSession, ["agent-session"]);
+});
+
+test("card review follow-up links open the follow-up card", async () => {
+  const document = new FakeDocument();
+  const id = "loop_777777777777";
+  const loop = {
+    id, goal: "build a parser", state: "running", reason: "",
+    lanes: [{ id: 1, cards: ["a", "aF"] }],
+    cards: [
+      { id: "a", title: "Build parser", state: "review", lane: 1 },
+      { id: "aF", title: "Fix review finding", state: "planned", lane: 1, follow_up_of: "a" },
+    ],
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopCard = async (loopId, cardId) => {
+    client.calls.loopCard.push([loopId, cardId]);
+    return {
+      card: loop.cards.find((card) => card.id === cardId),
+      spec: `Spec for ${cardId}`,
+      report: "",
+      diff: "",
+      diff_truncated: false,
+      review: cardId === "a" ? { verdict: "changes requested", text: "Fix one item.", follow_ups: ["aF"] } : { verdict: "pending", text: "", follow_ups: [] },
+      session_id: null,
+    };
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  await find(pane, (node) => node.className === "loop-card-open" && node.textContent.startsWith("a ·")).dispatch("click");
+  await find(pane, (node) => node.className === "loop-follow-up" && node.textContent === "aF").dispatch("click");
+
+  assert.deepEqual(client.calls.loopCard, [[id, "a"], [id, "aF"]]);
+  assert.match(visibleText(pane), /aF · Fix review finding · planned/);
+  assert.match(visibleText(pane), /Spec for aF/);
+});
+
+test("awaiting-commit board shows commits, files, folded validation and keeps the branch", async () => {
+  const document = new FakeDocument();
+  const id = "loop_888888888888";
+  let loop = {
+    id, goal: "build a parser", state: "awaiting_commit", branch: "symphonai/build-a-parser", reason: "",
+    lanes: [], cards: [],
+    summary: {
+      commits: [{ card: "a", commit: "0123456789abcdef", title: "Build parser" }],
+      files: ["src/parser.js", "test/parser.test.js"],
+      validation: [{ command: "python3 scripts/check.py", exit: 0, output: "all checks passed" }],
+    },
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopCommit = async (loopId, action) => {
+    client.calls.loopCommit.push({ loopId, action });
+    loop = { ...loop, state: "done" };
+    return { loop };
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  assert.match(visibleText(pane), /a · 01234567 · Build parser/);
+  assert.match(visibleText(pane), /src\/parser\.js/);
+  assert.match(visibleText(pane), /exit 0/);
+  const validation = find(pane, (node) => node.className === "loop-validation");
+  assert.equal(validation.open, false);
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Keep the branch").dispatch("click");
+
+  assert.deepEqual(client.calls.loopCommit, [{ loopId: id, action: "approve" }]);
+  assert.match(visibleText(pane), /Kept on branch symphonai\/build-a-parser/);
+  assert.match(visibleText(pane), /Merge this branch with git\./);
+});
+
+test("discard asks inline, then declines; Keep leaves the branch untouched", async () => {
+  const document = new FakeDocument();
+  const id = "loop_999999999999";
+  let loop = {
+    id, goal: "build a parser", state: "awaiting_commit", branch: "symphonai/build-a-parser", reason: "",
+    lanes: [], cards: [], summary: { commits: [], files: [], validation: [] },
+  };
+  const client = fakeClient(fixtureRoadmap(), {
+    loopList: { loops: [{ id, goal: loop.goal, state: loop.state, updated_at: "2026-10-19" }] },
+  });
+  client.loop = async () => ({ loop });
+  client.loopCommit = async (loopId, action) => {
+    client.calls.loopCommit.push({ loopId, action });
+    loop = { ...loop, state: "cancelled" };
+    return { loop };
+  };
+  const app = await start({ global: {}, document, client });
+  await app.openTool("Loop");
+  const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Discard").dispatch("click");
+  assert.match(visibleText(pane), /Discard this work and delete symphonai\/build-a-parser\?/);
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Keep").dispatch("click");
+  assert.deepEqual(client.calls.loopCommit, []);
+
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Discard").dispatch("click");
+  await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Discard").dispatch("click");
+  assert.deepEqual(client.calls.loopCommit, [{ loopId: id, action: "decline" }]);
+  assert.match(visibleText(pane), /State: cancelled/);
+});
+
 test("plan mode rejects disallowed settings and accepts no arguments", async () => {
   const document = new FakeDocument();
   const client = fakeClient(fixtureRoadmap(), {
@@ -1684,6 +2208,7 @@ test("slash suggestions render above the composer without taking focus", async (
     "/help    Show the commands",
     "/new    Start a new chat",
     "/plan    Switch plan mode on or off",
+    "/spec    Switch spec mode on or off",
     "/resume  [<search>]  Reopen a past conversation in this project",
     "/cost    Show what this conversation has used",
     "/context    Show what fills the context window",
@@ -4039,7 +4564,7 @@ test("rail tabs open tools, close to the Tools list, and persist the selected la
   await find(tabs, (node) => node.attributes.get("aria-label") === "Close Agents").dispatch("click");
   await find(tabs, (node) => node.attributes.get("aria-label") === "Close Roadmap").dispatch("click");
   assert.equal(tools.hidden, false);
-  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs"]);
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs", "Loop"]);
   await tools.children.find((row) => row.textContent === "Changes").dispatch("click");
   assert.equal(client.calls.changes, 1);
   assert.deepEqual(tabButtons().map((tab) => tab.textContent || tab.attributes.get("aria-label")), ["Changes"]);
@@ -4557,6 +5082,7 @@ test("status rail renders the whole roadmap beside settings and live agents", as
     document.getElementById("rail-tabs"), agents, document.getElementById("roadmap"),
     document.getElementById("changes"), document.getElementById("spec"),
     document.getElementById("files"), rail.children.find((node) => node.className === "rail-pane jobs-pane"),
+    rail.children.find((node) => node.className === "rail-pane loop-pane"),
     document.getElementById("rail-tools"),
   ]);
   assert.equal(document.getElementById("page").children[0].className, "settings-pane");
@@ -5106,6 +5632,58 @@ test("credential client sends the value only in an authenticated POST body", asy
     name: "OPENAI_API_KEY", value: "recognisable-client-fixture",
   });
   assert.ok(!request.url.includes("recognisable-client-fixture"));
+});
+
+test("loop client uses the loop routes and posts the goal as JSON", async () => {
+  const requests = [];
+  const replies = [
+    { loop: { id: "loop_012345abcdef" }, session_id: "session-1" },
+    { loops: [{ id: "loop_012345abcdef" }] },
+    { loop: { id: "loop_012345abcdef" } },
+    { loop: { id: "loop_012345abcdef" } },
+    { loop: { id: "loop_012345abcdef" } },
+    { card: { id: "a" }, spec: "spec", report: "report" },
+    { loop: { id: "loop_012345abcdef", state: "done" } },
+    { loop: { id: "loop_012345abcdef" } },
+  ];
+  const client = createClient({
+    port: 4312,
+    token: "fixture-token",
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return { status: 200, json: async () => replies.shift() };
+    },
+  });
+
+  await client.startLoop("add compound durations");
+  await client.loops();
+  await client.loop("loop_012345abcdef");
+  await client.loopPlan("loop_012345abcdef", "drop", { cards: ["b"] });
+  await client.loopCancel("loop_012345abcdef");
+  await client.loopResume("loop_012345abcdef");
+  await client.loopCard("loop_012345abcdef", "a");
+  await client.loopCommit("loop_012345abcdef", "approve");
+
+  assert.deepEqual(requests.map(({ url, options }) => [url, options.method]), [
+    ["http://127.0.0.1:4312/loop/start", "POST"],
+    ["http://127.0.0.1:4312/loops", "GET"],
+    ["http://127.0.0.1:4312/loop?id=loop_012345abcdef", "GET"],
+    ["http://127.0.0.1:4312/loop/plan", "POST"],
+    ["http://127.0.0.1:4312/loop/cancel", "POST"],
+    ["http://127.0.0.1:4312/loop/resume", "POST"],
+    ["http://127.0.0.1:4312/loop/card?loop=loop_012345abcdef&card=a", "GET"],
+    ["http://127.0.0.1:4312/loop/commit", "POST"],
+  ]);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { goal: "add compound durations" });
+  assert.deepEqual(JSON.parse(requests[3].options.body), {
+    loop_id: "loop_012345abcdef", action: "drop", cards: ["b"],
+  });
+  assert.deepEqual(JSON.parse(requests[4].options.body), { loop_id: "loop_012345abcdef" });
+  assert.deepEqual(JSON.parse(requests[5].options.body), { loop_id: "loop_012345abcdef" });
+  assert.deepEqual(JSON.parse(requests[7].options.body), {
+    loop_id: "loop_012345abcdef", action: "approve",
+  });
+  assert.ok(requests.every(({ options }) => options.headers.Authorization === "Bearer fixture-token"));
 });
 
 test("extension settings routes show startup state, complete commands, and withheld reasons", async () => {
@@ -7737,7 +8315,7 @@ test("Jobs tab lists, starts, stops, polls, and refreshes jobs on JobChanged", a
   const app = await start({ global: browser.global, document, client });
   const tools = document.getElementById("rail-tools");
   await document.getElementById("rail-tabs").children.at(-1).dispatch("click");
-  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs"]);
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs", "Loop"]);
   await tools.children.find((row) => row.textContent === "Jobs").dispatch("click");
   const pane = walk(document.body).find((node) => node.className === "rail-pane jobs-pane");
   assert.equal(pane.hidden, false);

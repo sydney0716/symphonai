@@ -46,7 +46,7 @@ def _top_level(repo_root: Path) -> Path:
     return Path(os.fsdecode(result.stdout.strip())).resolve()
 
 
-def create_worktree(repo_root: Path, path: Path) -> Path:
+def create_worktree(repo_root: Path, path: Path, start: str = "HEAD") -> Path:
     """Create a detached checkout and return the matching repository root."""
     repo_root = Path(repo_root).resolve()
     top_level = _top_level(repo_root)
@@ -56,7 +56,7 @@ def create_worktree(repo_root: Path, path: Path) -> Path:
         raise WorktreeError(f"worktree path already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        _git(top_level, "worktree", "add", "--detach", str(path), "HEAD")
+        _git(top_level, "worktree", "add", "--detach", str(path), start)
     except WorktreeError:
         if path.exists():
             try:

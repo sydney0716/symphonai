@@ -122,6 +122,8 @@ def list_sessions(
     for directory in root.iterdir():
         if not directory.is_dir():
             continue
+        if directory.name == "loops":
+            continue
         item = {
             "run_id": directory.name,
             "title": None,

@@ -221,6 +221,10 @@ button:disabled {
   --icon-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3.5' y='5' width='17' height='14' rx='1.5'/%3E%3Cpath d='m7 9 3 3-3 3m6 0h4'/%3E%3C/svg%3E");
 }
 
+.icon-tool-loop {
+  --icon-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='6' cy='6' r='2'/%3E%3Ccircle cx='18' cy='6' r='2'/%3E%3Ccircle cx='12' cy='18' r='2'/%3E%3Cpath d='M8 6h3a3 3 0 0 1 3 3v3m2 2-2 2-2-2M14 6h2'/%3E%3C/svg%3E");
+}
+
 .icon-page,
 .activity-read {
   --icon-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 3.75h8l4 4V20.25H6z'/%3E%3Cpath d='M14 3.75v4h4M9 12h6m-6 3h6'/%3E%3C/svg%3E");
@@ -1278,6 +1282,11 @@ button.session-link {
   font-weight: 600;
 }
 
+.conversation-usage.spec-mode {
+  color: var(--ui-warning);
+  font-weight: 600;
+}
+
 .conversation-usage:empty {
   display: none;
 }
@@ -2226,6 +2235,206 @@ button.session-link {
   .app-shell.rail-folded #status-rail {
     display: none;
   }
+}
+
+.loop-list {
+  display: grid;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+}
+
+.loop-pane {
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+.loop-list-item {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loop-list-item[aria-selected="true"] {
+  border-color: var(--ui-accent);
+  background: var(--ui-selected);
+  font-weight: 600;
+}
+
+.loop-detail h3 {
+  margin: 0 0 var(--space-1);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.loop-state {
+  color: var(--ui-text-secondary);
+  font-size: 0.75rem;
+}
+
+.loop-lanes {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  overflow-x: auto;
+  padding-bottom: var(--space-2);
+}
+
+.loop-lane {
+  flex: 0 0 10rem;
+  min-width: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--ui-border);
+}
+
+.loop-lane h4 {
+  margin: 0 0 var(--space-2);
+  font-size: 0.8125rem;
+}
+
+.loop-card {
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--ui-border);
+  background: var(--ui-panel);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.loop-card-open {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.loop-card-dimmed {
+  color: var(--ui-text-secondary);
+  background: var(--ui-inset);
+}
+
+.loop-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  margin-top: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.loop-actions > button {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.loop-revise {
+  display: flex;
+  gap: var(--space-1);
+  width: 100%;
+}
+
+.loop-revise-note {
+  flex: 1;
+  min-width: 0;
+}
+
+.loop-cancel-prompt {
+  color: var(--ui-warning);
+}
+
+.loop-action-error {
+  margin: 0;
+}
+
+.loop-card-details,
+.loop-checkpoint {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.loop-card-details h3,
+.loop-checkpoint h3,
+.loop-card-section h4,
+.loop-checkpoint h4 {
+  margin: 0;
+}
+
+.loop-card-section {
+  min-width: 0;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--ui-border);
+}
+
+.loop-card-section .diff {
+  max-height: 18rem;
+  overflow: auto;
+}
+
+.loop-diff-truncated,
+.loop-review-verdict {
+  color: var(--ui-text-secondary);
+  font-size: 0.75rem;
+}
+
+.loop-follow-ups,
+.loop-commits,
+.loop-files {
+  margin: var(--space-1) 0 0;
+  padding-left: 1.25rem;
+}
+
+.loop-commits,
+.loop-files {
+  overflow-wrap: anywhere;
+}
+
+.loop-follow-up {
+  min-height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ui-accent);
+  text-decoration: underline;
+}
+
+.loop-validation {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.loop-validation summary {
+  overflow-wrap: anywhere;
+}
+
+.loop-validation pre {
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--space-2) 0;
+  padding: var(--space-2);
+  background: var(--ui-inset);
+  font-family: var(--font-code);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.loop-discard-prompt {
+  color: var(--ui-warning);
+}
+
+.loop-commit-message {
+  color: var(--ui-success);
+}
+
+.loop-commit-error {
+  margin: 0;
 }
 .spec-workflow {
   border-bottom: 1px solid var(--ui-border);

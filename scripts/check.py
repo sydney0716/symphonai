@@ -75,6 +75,7 @@ from scripts.checks import scheduler  # noqa: E402, F401
 from scripts.checks import plan_mode  # noqa: E402, F401
 from scripts.checks import worktree  # noqa: E402, F401
 from scripts.checks import lsp  # noqa: E402, F401
+from scripts.checks import loops  # noqa: E402, F401
 from scripts.checks.harness import names, run  # noqa: E402
 
 

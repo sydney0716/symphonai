@@ -8,21 +8,11 @@ import json
 from pathlib import Path
 
 
-def parse_spec(path: Path, repo_root: Path) -> dict:
-    path = Path(path).resolve()
-    root = Path(repo_root).resolve()
-    try:
-        relative = path.relative_to(root).as_posix()
-    except ValueError:
-        raise ValueError("spec path must be inside specs/") from None
-    if not relative.startswith("specs/") or path.suffix != ".md" or not path.is_file():
-        raise ValueError("spec path must name an existing Markdown file under specs/")
-    source = path.read_text(encoding="utf-8")
-    title = next((line[2:].strip() for line in source.splitlines() if line.startswith("# ")), path.stem)
+def spec_validation(text: str) -> list[str]:
     validation = []
     in_section = False
     in_fence = False
-    for line in source.splitlines():
+    for line in text.splitlines():
         if line.startswith("## "):
             if in_section and in_fence:
                 break
@@ -37,6 +27,21 @@ def parse_spec(path: Path, repo_root: Path) -> dict:
             continue
         if in_fence and line.strip():
             validation.append(line)
+    return validation
+
+
+def parse_spec(path: Path, repo_root: Path) -> dict:
+    path = Path(path).resolve()
+    root = Path(repo_root).resolve()
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        raise ValueError("spec path must be inside specs/") from None
+    if not relative.startswith("specs/") or path.suffix != ".md" or not path.is_file():
+        raise ValueError("spec path must name an existing Markdown file under specs/")
+    source = path.read_text(encoding="utf-8")
+    title = next((line[2:].strip() for line in source.splitlines() if line.startswith("# ")), path.stem)
+    validation = spec_validation(source)
     report_match = re.search(r"`([^`]+)`", source[source.find("## Report"):] if "## Report" in source else "")
     report = report_match.group(1) if report_match else f"specs/report/{path.parent.name}/{path.stem}-report.md"
     report_path = Path(report)

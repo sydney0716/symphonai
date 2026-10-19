@@ -36,6 +36,12 @@ export const COMMANDS = Object.freeze([
     argumentHint: "",
   }),
   Object.freeze({
+    name: "spec",
+    aliases: Object.freeze([]),
+    description: "Switch spec mode on or off",
+    argumentHint: "",
+  }),
+  Object.freeze({
     name: "resume",
     aliases: Object.freeze(["continue"]),
     description: "Reopen a past conversation in this project",

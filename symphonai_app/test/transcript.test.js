@@ -102,6 +102,13 @@ const RECORDED_EVENTS = Object.freeze({
     status: "running",
     session_id: null,
   }),
+  LoopChanged: event("LoopChanged", {
+    loop_id: "loop_0123456789ab",
+    state: "awaiting_plan",
+    change: "planned",
+    card_id: "",
+    reason: "",
+  }),
 });
 
 test("assistant deltas join only while consecutive", () => {
@@ -720,6 +727,11 @@ test("all documented event recordings are covered and unknown events survive", (
     agentId: "agent-1",
     event: payload,
   }]);
+});
+
+test("loop changes do not enter the chat transcript", () => {
+  const transcript = applyAll([RECORDED_EVENTS.LoopChanged]);
+  assert.deepEqual(transcript.model, []);
 });
 
 test("attachment-only history stays visible with safe metadata", () => {

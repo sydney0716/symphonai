@@ -6,7 +6,7 @@ import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { renderRoadmap, parseRoadmap, specPaths, followUpsFor } from "./roadmap.js";
 import { layoutRoadmap } from "./roadmap_graph.js";
-import { append, element, listen, renderMarkdownBlocks, renderTranscript, replace } from "./render.js";
+import { append, element, listen, renderDiff, renderMarkdownBlocks, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
@@ -145,7 +145,7 @@ function clientFor(global, supplied) {
 const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
 const SIDEBAR_SESSION_LIMIT = 200;
-const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs"];
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs", "Loop"];
 const RAIL_TOOL_ICONS = Object.freeze({
   Agents: "icon-tool-agents",
   Roadmap: "icon-tool-roadmap",
@@ -153,6 +153,7 @@ const RAIL_TOOL_ICONS = Object.freeze({
   Spec: "icon-tool-spec",
   Files: "icon-tool-files",
   Jobs: "icon-tool-jobs",
+  Loop: "icon-tool-loop",
 });
 
 function storedRail(global) {
@@ -214,10 +215,29 @@ export async function start({ global, document, client }) {
   const jobsRoot = element(document, "div", { className: "rail-pane jobs-pane" });
   jobsRoot.setAttribute("role", "tabpanel");
   jobsRoot.hidden = true;
+  const loopsRoot = element(document, "div", { className: "rail-pane loop-pane" });
+  loopsRoot.setAttribute("role", "tabpanel");
+  loopsRoot.hidden = true;
   const railTabsRoot = document.getElementById("rail-tabs");
   const railToolsRoot = document.getElementById("rail-tools");
-  railToolsRoot.before(jobsRoot);
+  railToolsRoot.before(jobsRoot, loopsRoot);
   let { open: openRailTools, selected: selectedRailTool } = storedRail(global);
+  let loops = [];
+  let selectedLoopId = "";
+  let selectedLoop = null;
+  let loopError = "";
+  let loopActionError = "";
+  let loopActionPending = false;
+  let loopCancelConfirm = false;
+  let loopReviseNote = "";
+  let selectedCardId = "";
+  let cardDetail = null;
+  let cardDetailLoading = false;
+  let cardDetailError = "";
+  let loopCommitError = "";
+  let loopCommitPending = false;
+  let loopDiscardConfirm = false;
+  let loopCommitMessage = "";
   let jobsCommandDraft = "";
   let jobsPoll = null;
   const runNotice = document.getElementById("run-notice");
@@ -364,6 +384,7 @@ export async function start({ global, document, client }) {
     ? configuredMode
     : (permittedModes[0] ?? "ask");
   let currentMode = conversationReply?.conversation?.mode ?? launchMode;
+  let specMode = false;
   let selection = settingsReply?.settings?.selection ?? { provider: "", model: null, effort: null };
   let rememberedPlanMode = null;
   let sessions = initialSessions;
@@ -1108,20 +1129,7 @@ export async function start({ global, document, client }) {
     const turns = Array.isArray(reply?.turns) ? reply.turns : [];
     const worktrees = Array.isArray(reply?.worktrees) ? reply.worktrees : [];
     function diffView(diff) {
-      const pre = element(document, "pre", { className: "diff" });
-      if (!diff) return pre;
-      for (const line of diff.split("\n")) {
-        const span = element(document, "span", { text: line });
-        if (line.startsWith("+") && !line.startsWith("+++")) {
-          span.className = "diff-add";
-        } else if (line.startsWith("-") && !line.startsWith("---")) {
-          span.className = "diff-remove";
-        } else if (line.startsWith("@@")) {
-          span.className = "diff-hunk";
-        }
-        append(pre, span);
-      }
-      return pre;
+      return renderDiff(document, diff);
     }
     const children = [element(document, "h1", { text: "Changes" })];
     const workingTree = element(document, "section", { className: "changes-working-tree" });
@@ -1539,6 +1547,10 @@ export async function start({ global, document, client }) {
     if (folderPicker && event.key === "Escape") {
       event.preventDefault();
       closeFolderPicker();
+    } else if (selectedCardId && selectedRailTool === "Loop" && event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation?.();
+      returnToLoopBoard();
     }
   });
 
@@ -2402,6 +2414,412 @@ export async function start({ global, document, client }) {
     }
   }
 
+  function renderLoopCardDetails() {
+    const details = element(document, "section", { className: "loop-card-details" });
+    const back = element(document, "button", { text: "Back to the board" });
+    back.type = "button";
+    listen(back, "click", returnToLoopBoard);
+    append(details, back);
+    if (cardDetailLoading) {
+      append(details, element(document, "p", { text: "Loading card…" }));
+      return details;
+    }
+    if (cardDetailError) {
+      append(details, element(document, "p", { className: "error", text: cardDetailError }));
+      return details;
+    }
+    if (!cardDetail) return details;
+
+    const card = cardDetail.card ?? selectedLoop.cards?.find((item) => item.id === selectedCardId) ?? {};
+    append(details, element(document, "h3", {
+      text: `${card.id ?? selectedCardId} · ${card.title ?? ""} · ${card.state ?? "unknown"}`,
+    }));
+    const markdownSection = (title, source) => {
+      const section = element(document, "section", { className: "loop-card-section" });
+      append(section, element(document, "h4", { text: title }));
+      append(section, ...renderMarkdownBlocks(document, typeof source === "string" ? source : "", parseMarkdown));
+      return section;
+    };
+    append(details, markdownSection("Spec", cardDetail.spec));
+    append(details, markdownSection("Report", cardDetail.report));
+
+    const change = element(document, "section", { className: "loop-card-section" });
+    append(change, element(document, "h4", { text: "Change" }));
+    if (cardDetail.diff_truncated) {
+      append(change, element(document, "p", { className: "loop-diff-truncated", text: "Diff truncated." }));
+    }
+    append(change, renderDiff(document, cardDetail.diff ?? ""));
+    append(details, change);
+
+    const review = cardDetail.review ?? {};
+    const reviewSection = element(document, "section", { className: "loop-card-section" });
+    append(reviewSection, element(document, "h4", { text: "Review" }));
+    append(reviewSection, element(document, "p", {
+      className: "loop-review-verdict",
+      text: review.verdict ?? "No review verdict",
+    }));
+    append(reviewSection, ...renderMarkdownBlocks(document, typeof review.text === "string" ? review.text : "", parseMarkdown));
+    const followUps = Array.isArray(review.follow_ups) ? review.follow_ups : [];
+    if (followUps.length > 0) {
+      const list = element(document, "ul", { className: "loop-follow-ups" });
+      for (const followUp of followUps) {
+        const id = typeof followUp === "string" ? followUp : followUp?.id;
+        if (typeof id !== "string") continue;
+        const button = element(document, "button", { className: "loop-follow-up", text: id });
+        button.type = "button";
+        listen(button, "click", () => loadLoopCard(id));
+        const item = element(document, "li");
+        append(item, button);
+        append(list, item);
+      }
+      append(reviewSection, list);
+    }
+    append(details, reviewSection);
+
+    if (typeof cardDetail.session_id === "string" && cardDetail.session_id) {
+      const open = element(document, "button", { text: "Open conversation" });
+      open.type = "button";
+      listen(open, "click", () => openSession(cardDetail.session_id));
+      append(details, open);
+    }
+    return details;
+  }
+
+  function renderLoopCheckpoint() {
+    const section = element(document, "section", { className: "loop-checkpoint" });
+    const summary = selectedLoop.summary ?? {};
+    if (["awaiting_commit", "done"].includes(selectedLoop.state)) {
+      append(section, element(document, "h3", { text: "Commit checkpoint" }));
+      const commits = Array.isArray(summary.commits) ? summary.commits : [];
+      if (commits.length > 0) {
+        append(section, element(document, "h4", { text: "Commits" }));
+        const list = element(document, "ul", { className: "loop-commits" });
+        for (const item of commits) {
+          const shortId = typeof item.commit === "string" ? item.commit.slice(0, 8) : "";
+          append(list, element(document, "li", { text: `${item.card} · ${shortId} · ${item.title}` }));
+        }
+        append(section, list);
+      }
+      if (Array.isArray(summary.files)) {
+        append(section, element(document, "h4", { text: "Changed files" }));
+        const list = element(document, "ul", { className: "loop-files" });
+        for (const file of summary.files) {
+          append(list, element(document, "li", { text: typeof file === "string" ? file : file.path ?? "" }));
+        }
+        append(section, list);
+      }
+      if (Array.isArray(summary.validation)) {
+        append(section, element(document, "h4", { text: "Validation" }));
+        for (const result of summary.validation) {
+          const output = element(document, "details", { className: "loop-validation" });
+          append(
+            output,
+            element(document, "summary", { text: `${result.command} · exit ${result.exit}` }),
+            element(document, "pre", { text: result.output ?? "" }),
+          );
+          append(section, output);
+        }
+      }
+    }
+    if (loopCommitMessage) {
+      append(section, element(document, "p", { className: "loop-commit-message", text: loopCommitMessage }));
+    }
+    if (selectedLoop.state === "done") {
+      append(section, element(document, "p", { text: `Branch: ${selectedLoop.branch ?? ""}` }));
+      append(section, element(document, "p", { text: "Merge this branch with git." }));
+    }
+    if (selectedLoop.state === "awaiting_commit") {
+      const keep = element(document, "button", { className: "primary", text: "Keep the branch" });
+      keep.type = "button";
+      keep.disabled = loopCommitPending;
+      listen(keep, "click", () => runLoopCommit("approve"));
+      append(section, keep);
+      if (loopDiscardConfirm) {
+        append(section, element(document, "p", {
+          className: "loop-discard-prompt",
+          text: `Discard this work and delete ${selectedLoop.branch ?? ""}?`,
+        }));
+        const discard = element(document, "button", { text: "Discard" });
+        discard.type = "button";
+        discard.disabled = loopCommitPending;
+        listen(discard, "click", () => runLoopCommit("decline"));
+        const keep = element(document, "button", { text: "Keep" });
+        keep.type = "button";
+        keep.disabled = loopCommitPending;
+        listen(keep, "click", () => {
+          loopDiscardConfirm = false;
+          renderLoops();
+        });
+        append(section, discard, keep);
+      } else {
+        const discard = element(document, "button", { text: "Discard" });
+        discard.type = "button";
+        discard.disabled = loopCommitPending;
+        listen(discard, "click", () => {
+          loopDiscardConfirm = true;
+          renderLoops();
+        });
+        append(section, discard);
+      }
+    }
+    if (loopCommitError) {
+      append(section, element(document, "p", { className: "error loop-commit-error", text: loopCommitError }));
+    }
+    return section;
+  }
+
+  function returnToLoopBoard() {
+    selectedCardId = "";
+    cardDetail = null;
+    cardDetailLoading = false;
+    cardDetailError = "";
+    renderLoops();
+  }
+
+  async function loadLoopCard(cardId) {
+    selectedCardId = cardId;
+    cardDetail = null;
+    cardDetailLoading = true;
+    cardDetailError = "";
+    renderLoops();
+    try {
+      cardDetail = await boundary.loopCard(selectedLoopId, cardId);
+    } catch (error) {
+      cardDetailError = error instanceof Error ? error.message : String(error);
+    } finally {
+      cardDetailLoading = false;
+      renderLoops();
+    }
+  }
+
+  async function runLoopCommit(action) {
+    if (loopCommitPending) return;
+    loopCommitPending = true;
+    loopCommitError = "";
+    renderLoops();
+    try {
+      const reply = await boundary.loopCommit(selectedLoopId, action);
+      selectedLoop = reply?.loop ?? reply;
+      loopDiscardConfirm = false;
+      loopCommitMessage = action === "approve"
+        ? `Kept on branch ${reply?.branch ?? selectedLoop.branch ?? ""}`
+        : "";
+    } catch (error) {
+      loopCommitError = error instanceof Error ? error.message : String(error);
+    } finally {
+      loopCommitPending = false;
+      renderLoops();
+    }
+  }
+
+  function renderLoops() {
+    const list = element(document, "nav", { className: "loop-list" });
+    list.setAttribute("aria-label", "Spec loops");
+    const children = [element(document, "h2", { text: "Loop" }), list];
+    if (loopError) {
+      children.push(element(document, "p", { className: "error", text: loopError }));
+    }
+    const ordered = [...loops].sort((left, right) => (
+      String(right.updated_at ?? "").localeCompare(String(left.updated_at ?? ""))
+    ));
+    if (ordered.length === 0 && !loopError) {
+      children.push(element(document, "p", { text: "No spec loops yet." }));
+    }
+    for (const loop of ordered) {
+      const button = element(document, "button", {
+        className: "loop-list-item",
+        text: `${loop.goal ?? loop.id} · ${loop.state ?? "unknown"}`,
+      });
+      button.type = "button";
+      button.setAttribute("aria-selected", String(loop.id === selectedLoopId));
+      listen(button, "click", () => loadLoop(loop.id));
+      append(list, button);
+    }
+    if (selectedLoop) {
+      if (selectedCardId) {
+        children.push(renderLoopCardDetails());
+      } else {
+      const detail = element(document, "section", { className: "loop-detail" });
+      append(detail, element(document, "h3", { text: selectedLoop.goal ?? "" }));
+      append(detail, element(document, "p", {
+        className: "loop-state",
+        text: `State: ${selectedLoop.state ?? "unknown"}${selectedLoop.reason ? ` · ${selectedLoop.reason}` : ""}`,
+      }));
+      const lanes = element(document, "div", { className: "loop-lanes" });
+      const cardsById = new Map((selectedLoop.cards ?? []).map((card) => [card.id, card]));
+      for (const lane of selectedLoop.lanes ?? []) {
+        const column = element(document, "section", { className: "loop-lane" });
+        append(column, element(document, "h4", { text: `Lane ${lane.id}` }));
+        const cards = (lane.cards ?? []).map((id) => cardsById.get(id)).filter(Boolean);
+        for (const card of cards) {
+          const cardElement = element(document, "article", {
+            className: `loop-card${card.state === "dropped" ? " loop-card-dimmed" : ""}`,
+          });
+          const open = element(document, "button", {
+            className: "loop-card-open",
+            text: `${card.id} · ${card.title ?? ""} · ${card.state ?? "unknown"}`,
+          });
+          open.type = "button";
+          listen(open, "click", () => loadLoopCard(card.id));
+          append(cardElement, open);
+          if (selectedLoop.state === "awaiting_plan" && card.state !== "dropped") {
+            const drop = element(document, "button", { text: "Drop" });
+            drop.type = "button";
+            drop.disabled = loopActionPending;
+            listen(drop, "click", () => runLoopAction(() => boundary.loopPlan(
+              selectedLoopId,
+              "drop",
+              { cards: [card.id] },
+            )));
+            append(cardElement, drop);
+          }
+          append(column, cardElement);
+        }
+        append(lanes, column);
+      }
+      append(detail, lanes);
+      const actions = element(document, "div", { className: "loop-actions" });
+      if (selectedLoop.state === "awaiting_plan") {
+        const approve = element(document, "button", { text: "Approve plan" });
+        approve.type = "button";
+        approve.disabled = loopActionPending;
+        listen(approve, "click", () => runLoopAction(() => boundary.loopPlan(selectedLoopId, "approve")));
+        append(actions, approve);
+
+        const revise = element(document, "div", { className: "loop-revise" });
+        const note = element(document, "input", { className: "loop-revise-note" });
+        note.type = "text";
+        note.value = loopReviseNote;
+        note.setAttribute("aria-label", "Revision note");
+        note.setAttribute("placeholder", "Note for the planner");
+        note.disabled = loopActionPending;
+        listen(note, "input", () => { loopReviseNote = note.value; });
+        const reviseButton = element(document, "button", { text: "Revise…" });
+        reviseButton.type = "button";
+        reviseButton.disabled = loopActionPending;
+        listen(reviseButton, "click", () => runLoopAction(() => boundary.loopPlan(
+          selectedLoopId,
+          "revise",
+          { note: loopReviseNote },
+        )));
+        append(revise, note, reviseButton);
+        append(actions, revise);
+      }
+      if (["planning", "awaiting_plan", "running", "validating", "needs_attention"].includes(selectedLoop.state)) {
+        if (loopCancelConfirm) {
+          append(actions, element(document, "p", {
+            className: "loop-cancel-prompt",
+            text: "Cancel this loop? Its branch and work will be removed.",
+          }));
+          const confirm = element(document, "button", { text: "Cancel loop" });
+          confirm.type = "button";
+          confirm.disabled = loopActionPending;
+          listen(confirm, "click", () => runLoopAction(() => boundary.loopCancel(selectedLoopId)));
+          const keep = element(document, "button", { text: "Keep running" });
+          keep.type = "button";
+          keep.disabled = loopActionPending;
+          listen(keep, "click", () => {
+            loopCancelConfirm = false;
+            renderLoops();
+          });
+          append(actions, confirm, keep);
+        } else {
+          const cancel = element(document, "button", { text: "Cancel loop" });
+          cancel.type = "button";
+          cancel.disabled = loopActionPending;
+          listen(cancel, "click", () => {
+            loopCancelConfirm = true;
+            renderLoops();
+          });
+          append(actions, cancel);
+        }
+      }
+      if (selectedLoop.state === "needs_attention") {
+        const resume = element(document, "button", { text: "Resume" });
+        resume.type = "button";
+        resume.disabled = loopActionPending;
+        listen(resume, "click", () => runLoopAction(() => boundary.loopResume(selectedLoopId)));
+        append(actions, resume);
+      }
+      if (loopActionError) {
+        append(actions, element(document, "p", { className: "error loop-action-error", text: loopActionError }));
+      }
+      append(detail, actions);
+      children.push(detail);
+      children.push(renderLoopCheckpoint());
+      }
+    } else if (selectedLoopId && !loopError) {
+      children.push(element(document, "p", { text: "Loading loop…" }));
+    }
+    replace(loopsRoot, ...children);
+  }
+
+  async function loadLoop(id) {
+    if (typeof id !== "string" || !id) return;
+    if (selectedLoopId !== id) {
+      loopActionError = "";
+      loopReviseNote = "";
+      loopCancelConfirm = false;
+      selectedCardId = "";
+      cardDetail = null;
+      cardDetailError = "";
+      cardDetailLoading = false;
+      loopCommitError = "";
+      loopCommitMessage = "";
+      loopDiscardConfirm = false;
+    }
+    selectedLoopId = id;
+    selectedLoop = null;
+    loopError = "";
+    loopCancelConfirm = false;
+    renderLoops();
+    try {
+      const reply = await boundary.loop(id);
+      selectedLoop = reply.loop;
+    } catch (error) {
+      loopError = error instanceof Error ? error.message : String(error);
+    }
+    renderLoops();
+  }
+
+  async function runLoopAction(action) {
+    if (loopActionPending) return;
+    loopActionPending = true;
+    loopActionError = "";
+    renderLoops();
+    try {
+      const reply = await action();
+      selectedLoop = reply?.loop ?? reply;
+      loopCancelConfirm = false;
+      loopReviseNote = "";
+    } catch (error) {
+      loopActionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      loopActionPending = false;
+      renderLoops();
+    }
+  }
+
+  async function loadLoops() {
+    loopError = "";
+    try {
+      const reply = await boundary.loops();
+      loops = Array.isArray(reply?.loops) ? reply.loops : [];
+      if (!loops.some((loop) => loop.id === selectedLoopId)) {
+        selectedLoopId = loops[0]?.id ?? "";
+      }
+      renderLoops();
+      if (selectedLoopId) await loadLoop(selectedLoopId);
+      else {
+        selectedLoop = null;
+        renderLoops();
+      }
+    } catch (error) {
+      loopError = error instanceof Error ? error.message : String(error);
+      renderLoops();
+    }
+  }
+
   function renderRail() {
     const tabs = openRailTools.map((name) => {
       const selected = name === selectedRailTool;
@@ -2444,7 +2862,7 @@ export async function start({ global, document, client }) {
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
-    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Spec: specRoot, Files: filesRoot, Jobs: jobsRoot };
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Spec: specRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot };
     if (!selectedSpec) {
       replace(specRoot, element(document, "p", {
         className: "spec-empty",
@@ -2454,6 +2872,7 @@ export async function start({ global, document, client }) {
     for (const [name, pane] of Object.entries(panes)) {
       pane.hidden = showRailTools || name !== selectedRailTool;
     }
+    renderLoops();
     renderFiles();
     railToolsRoot.hidden = !showRailTools && openRailTools.length > 0;
   }
@@ -2466,6 +2885,7 @@ export async function start({ global, document, client }) {
     if (name !== "Jobs") updateJobsPolling([]);
     rememberRail(global, openRailTools, selectedRailTool);
     renderRail();
+    if (name === "Loop") return loadLoops();
     if (!changed) return undefined;
     if (name === "Changes") return showChanges();
     if (name === "Files") return loadFileDirectory("");
@@ -2899,6 +3319,7 @@ export async function start({ global, document, client }) {
     const extraStatus = [
       mode && mode !== "ask" && (statusFields.mode ? `Mode ${mode}` : mode),
       mode === "ask" && statusFields.mode && `Mode ${mode}`,
+      specMode && "Spec mode",
       statusFields.goal && conversation?.goal && `Goal ${conversation.goal.phase} ${conversation.goal.rounds}/${conversation.goal.max_rounds}`,
       statusFields.context && Number.isInteger(context?.used_tokens) && Number.isInteger(context?.budget_tokens)
         ? `Context ${context.used_tokens} / ${context.budget_tokens} tokens`
@@ -2906,7 +3327,7 @@ export async function start({ global, document, client }) {
       statusFields.usage && usageText(conversation?.usage),
     ].filter(Boolean);
     conversationUsage.textContent = [primaryStatus, ...extraStatus].filter(Boolean).join(" · ");
-    conversationUsage.className = `conversation-usage${mode === "plan" ? " plan" : ""}`;
+    conversationUsage.className = `conversation-usage${mode === "plan" ? " plan" : ""}${specMode ? " spec-mode" : ""}`;
   }
 
   function waitingForApproval() {
@@ -3441,6 +3862,11 @@ export async function start({ global, document, client }) {
       showPromptError();
       return;
     }
+    if (specMode && text.trim()) {
+      promptFailure = "";
+      showPromptError();
+      return startSpecLoop(text);
+    }
     if (turn.state === RUNNING && pendingFiles.length === 0 && text.trim() && command !== "!") {
       try {
         await boundary.steer(text);
@@ -3500,6 +3926,31 @@ export async function start({ global, document, client }) {
     }
     commandEntry.output.push(text);
     showTranscript();
+  }
+
+  async function startSpecLoop(goal) {
+    try {
+      const reply = await boundary.startLoop(goal);
+      input.value = "";
+      clearDraft();
+      commandEntry = null;
+      transcript.model.push({
+        type: "command",
+        command: "",
+        output: [`Started a spec loop: ${goal}`],
+      });
+      showTranscript();
+      selectedLoopId = reply.loop?.id ?? "";
+      await openRailTool("Loop");
+    } catch (error) {
+      commandEntry = null;
+      transcript.model.push({
+        type: "command",
+        command: "",
+        output: [error instanceof Error ? error.message : String(error)],
+      });
+      showTranscript();
+    }
   }
 
   function showPicker(options) {
@@ -4291,6 +4742,18 @@ export async function start({ global, document, client }) {
       await togglePlanMode();
       return;
     }
+    if (entry.name === "spec") {
+      if (args.length > 0) {
+        answerCommand("Usage: /spec");
+        return;
+      }
+      specMode = !specMode;
+      showConversationUsage();
+      answerCommand(specMode
+        ? "Spec mode on: each message starts a spec loop."
+        : "Spec mode off.");
+      return;
+    }
     if (entry.name === "resume") {
       await resumeConversation(args);
       return;
@@ -4554,6 +5017,26 @@ export async function start({ global, document, client }) {
     }
     if (frame.kind === "event" && frame.payload?.type === "JobChanged") {
       if (jobsPaneVisible()) await showJobs();
+      return;
+    }
+    if (frame.kind === "event" && frame.payload?.type === "LoopChanged") {
+      const loopId = frame.payload.loop_id;
+      if (typeof loopId === "string" && !loops.some((loop) => loop.id === loopId)) {
+        await loadLoops();
+      } else if (typeof loopId === "string") {
+        if (typeof frame.payload.state === "string") {
+          loops = loops.map((loop) => loop.id === loopId
+            ? { ...loop, state: frame.payload.state }
+            : loop);
+          renderLoops();
+        }
+        if (loopId === selectedLoopId && selectedRailTool === "Loop" && !loopsRoot.hidden) {
+          await loadLoop(loopId);
+          if (selectedCardId && frame.payload.card_id === selectedCardId) {
+            await loadLoopCard(selectedCardId);
+          }
+        }
+      }
       return;
     }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;

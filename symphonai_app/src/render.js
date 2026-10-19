@@ -264,11 +264,23 @@ export function renderMarkdownBlocks(document, value, parseMarkdown) {
   return parseMarkdown(value).map((block) => renderBlock(document, block));
 }
 
+export function renderDiff(document, value) {
+  const pre = element(document, "pre", { className: "diff" });
+  for (const line of String(value ?? "").split("\n")) {
+    const span = element(document, "span", { text: line });
+    span.className = line.startsWith("+") && !line.startsWith("+++") ? "diff-add"
+      : line.startsWith("-") && !line.startsWith("---") ? "diff-remove"
+        : line.startsWith("@@") ? "diff-hunk" : "";
+    append(pre, span);
+  }
+  return pre;
+}
+
 function renderCommand(document, entry) {
   const command = element(document, "div", { className: "command" });
   append(
     command,
-    element(document, "p", { className: "command-echo", text: entry.command }),
+    ...(entry.command ? [element(document, "p", { className: "command-echo", text: entry.command })] : []),
     ...entry.output.map((text) => element(document, "p", { className: "command-output", text })),
   );
   return command;

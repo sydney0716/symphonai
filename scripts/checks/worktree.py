@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -381,6 +383,57 @@ def check_starts_from_head() -> None:
                 fail(f"new worktree inherited main-tree uncommitted edits: {read_result!r}")
         finally:
             session.close()
+
+
+@check("worktree.starts_from_a_ref")
+def check_starts_from_a_ref() -> None:
+    from symphonai_api.worktree import create_worktree, remove_worktree
+    from symphonai_host.broker import EventBroker
+    from symphonai_host.run import HostRun
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        repo = _repository(base / "repo")
+        old_ref = os.fsdecode(_git(repo, "rev-parse", "HEAD").strip())
+        (repo / "a.py").write_text("value = 2\n", encoding="utf-8")
+        _git(repo, "add", "a.py")
+        _git(repo, "commit", "--quiet", "-m", "newer")
+        worktree_path = base / "sessions" / "older"
+        worktree = create_worktree(repo, worktree_path, start=old_ref)
+        try:
+            actual = os.fsdecode(_git(worktree, "rev-parse", "HEAD").strip())
+            contents = (worktree / "a.py").read_text(encoding="utf-8")
+            if actual != old_ref or contents != "value = 1\n":
+                fail(f"worktree did not start at the supplied ref: {actual}, {contents!r}")
+        finally:
+            remove_worktree(repo, worktree_path)
+
+        sessions = base / "host-sessions"
+        run = HostRun(
+            FakeModelProvider([_response("done")]),
+            PermissionPolicy(repo, allowed_write_scope=[repo]), EventBroker(),
+            sessions_root=sessions,
+        )
+        admin_path = None
+        try:
+            run.start("implement from old ref", _session_meta={"spec_run": {
+                "kind": "implement", "start_ref": old_ref,
+            }})
+            session_id = run._conversation[1].run_id
+            admin_path = sessions / session_id / "worktree"
+            deadline = time.monotonic() + 5
+            while run.active and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if run.active:
+                fail("spec run from start_ref did not finish")
+            worktree_root = admin_path
+            actual = os.fsdecode(_git(worktree_root, "rev-parse", "HEAD").strip())
+            if actual != old_ref or (worktree_root / "a.py").read_text(encoding="utf-8") != "value = 1\n":
+                fail("HostRun ignored spec_run.start_ref when creating its worktree")
+        finally:
+            run.close()
+            if admin_path is not None and admin_path.exists():
+                remove_worktree(repo, admin_path)
 
 
 @check("worktree.subdirectory_root")

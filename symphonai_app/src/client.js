@@ -346,6 +346,47 @@ export function createClient({
       return request("POST", "/jobs/stop", { id }, readReply, { detailOnError: true });
     },
 
+    startLoop(goal) {
+      return request("POST", "/loop/start", { goal }, readReply, { detailOnError: true });
+    },
+
+    loops() {
+      return request("GET", "/loops");
+    },
+
+    loop(id) {
+      return request("GET", `/loop?${new URLSearchParams({ id })}`);
+    },
+
+    loopPlan(loopId, action, options = {}) {
+      return request("POST", "/loop/plan", { loop_id: loopId, action, ...options }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    loopCancel(loopId) {
+      return request("POST", "/loop/cancel", { loop_id: loopId }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    loopResume(loopId) {
+      return request("POST", "/loop/resume", { loop_id: loopId }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    loopCard(loopId, cardId) {
+      const query = new URLSearchParams({ loop: loopId, card: cardId });
+      return request("GET", `/loop/card?${query}`);
+    },
+
+    loopCommit(loopId, action) {
+      return request("POST", "/loop/commit", { loop_id: loopId, action }, readReply, {
+        detailOnError: true,
+      });
+    },
+
     memory() {
       return request("GET", "/memory");
     },

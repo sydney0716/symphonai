@@ -52,6 +52,7 @@ fields on a known event are ignored for forward compatibility.
 | `PlanChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `steps: list`, `explanation: str`, `session_id: str` |
 | `BackgroundUsageRecorded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str` |
 | `JobChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `job_id: str`, `status: str`, `session_id: str | null` |
+| `LoopChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `loop_id: str`, `state: str`, `change: str`, `card_id: str`, `reason: str` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -210,6 +211,44 @@ Review data on an implementation run records its verdict and the review run's
 `stopped_reason`, or `error` if the review run failed.
 After a successful spec commit, every roadmap item bound to the spec is marked
 done, and the phase is marked `done` only when every item is done.
+
+### Spec loops
+
+Authenticated `POST /loop/start` accepts `{"goal": str}` and returns the new
+loop plus its planner `session_id`. `GET /loops` lists loop summaries newest
+first; `GET /loop?id=<loop_id>` returns a loop record. `POST /loop/plan`
+accepts `approve`, `drop` (with `cards`), or `revise` (with a `note`) while the
+loop is `awaiting_plan`. Approval moves it to `running`; dropping marks the
+selected cards `dropped`; revision starts a new planner on the same loop.
+`POST /loop/cancel` accepts a `loop_id` and cancels a non-terminal loop. These
+routes publish `LoopChanged` events when loop state or cards change. Invalid
+loop ids return `404`, plan actions in another state return `409`, and invalid
+drop requests or approval of an empty plan return `400`.
+
+After plan approval, the host runs ready cards in lane order, with one active
+card per lane and at most four active conversations. A finished implementation
+is reviewed before it is integrated into the loop branch. Review follow-ups
+become cards in the same lane, with no more than two rounds; failed runs,
+review findings beyond that limit, and integration conflicts move the loop to
+`needs_attention`. When every non-dropped card is done, the loop moves to
+`validating`. `LoopChanged` announces each card transition with `change: "card"`
+and its `card_id`.
+
+Authenticated `POST /loop/commit` accepts `{"loop_id": str, "action":
+"approve" | "decline"}` only while the loop is `awaiting_commit`. Approval
+keeps the loop branch and finishes the loop; decline deletes the branch and
+moves the loop to `cancelled`. The reply includes the loop, branch, and
+committed cards. `POST /loop/resume` accepts `{"loop_id": str}` only while the
+loop is `needs_attention`; it retries failed cards or combined validation and
+returns the updated loop. A project runtime resumes interrupted loops when it
+starts: running cards without live conversations are reset to `planned`, and
+loops in `validating` rerun combined validation.
+
+Authenticated `GET /loop/card?loop=<loop_id>&card=<card_id>` returns the card,
+its spec and report text, the card commit diff (or its current running-worktree
+diff), review verdict and answer, follow-up card ids, and implementer session
+id. Invalid loop or card ids return `404`; text and diffs are bounded by the
+host's `MAX_READ_BYTES` limit.
 
 Authenticated `GET /files?query=<text>&limit=<n>` searches readable regular
 files under the repository root and returns `{"files": [...], "truncated":

@@ -567,6 +567,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       || type === "SessionEnded"
       || type === "SubagentStopped"
       || type === "BackgroundUsageRecorded"
+      || type === "LoopChanged"
     ) {
       return;
     }

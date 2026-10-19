@@ -69,6 +69,7 @@ from symphonai_host.run import (
 from symphonai_host.sessions import list_sessions, prompt_history
 from symphonai_host.spec_run import parse_spec
 from symphonai_host.projects import ProjectRuntime, record_recent_project, recent_projects
+from symphonai_host.loops import LoopStore
 
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -644,6 +645,8 @@ class HostServer:
         handler = self._handler_type()
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self._httpd.daemon_threads = True
+        if initial_run is not None:
+            initial_run.recover_loops()
 
     @property
     def port(self) -> int:
@@ -745,6 +748,7 @@ class HostServer:
                 runtime.run.select_provider(
                     provider, selection.get("model"), selection.get("effort"),
                 )
+            runtime.run.recover_loops()
             created = True
         else:
             created = False
@@ -1778,6 +1782,44 @@ class HostServer:
                     runs.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
                     self._json(HTTPStatus.OK, runs)
                     return
+                if request_path == "/loops":
+                    if not self._authorized():
+                        return
+                    loops = LoopStore(host._repo_root).list()
+                    self._json(HTTPStatus.OK, {"loops": [
+                        {key: loop[key] for key in ("id", "goal", "state", "updated_at")}
+                        for loop in loops
+                    ]})
+                    return
+                if request_path == "/loop":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True).get("id", [])
+                    if len(values) != 1:
+                        self._not_found()
+                        return
+                    try:
+                        loop = LoopStore(host._repo_root).load(values[0])
+                    except (KeyError, ValueError):
+                        self._not_found()
+                        return
+                    self._json(HTTPStatus.OK, {"loop": loop})
+                    return
+                if request_path == "/loop/card":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True)
+                    loop_ids, card_ids = values.get("loop", []), values.get("card", [])
+                    if len(loop_ids) != 1 or len(card_ids) != 1:
+                        self._not_found()
+                        return
+                    try:
+                        detail = host.run.loop_card_details(loop_ids[0], card_ids[0])
+                    except (KeyError, ValueError):
+                        self._not_found()
+                        return
+                    self._json(HTTPStatus.OK, detail)
+                    return
                 if request_path == "/history":
                     if not self._authorized():
                         return
@@ -1847,7 +1889,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -2056,6 +2098,121 @@ class HostServer:
                         self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
                         return
                     self._json(HTTPStatus.OK, {"session_id": session_id, "run_id": run_id})
+                    return
+                if self.path == "/loop/start":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"goal"} or not isinstance(payload.get("goal"), str):
+                            raise ProtocolError("loop/start requires goal")
+                        loop = host.run.start_loop(payload["goal"])
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        "loop": loop, "session_id": loop["planner_session_id"],
+                    })
+                    return
+                if self.path == "/loop/plan":
+                    try:
+                        payload = self._read_object()
+                        loop_id, action = payload.get("loop_id"), payload.get("action")
+                        if not isinstance(loop_id, str) or not isinstance(action, str):
+                            raise ProtocolError("loop/plan requires loop_id and action")
+                        if action == "approve" and set(payload) == {"loop_id", "action"}:
+                            loop = host.run.approve_loop_plan(loop_id)
+                            reply = {"loop": loop}
+                        elif action == "drop" and set(payload) == {"loop_id", "action", "cards"}:
+                            cards = payload["cards"]
+                            if not isinstance(cards, list) or not all(isinstance(card, str) for card in cards):
+                                raise ProtocolError("loop/plan drop requires cards as string ids")
+                            loop = host.run.drop_loop_cards(loop_id, cards)
+                            reply = {"loop": loop}
+                        elif action == "revise" and set(payload) == {"loop_id", "action", "note"} and isinstance(payload.get("note"), str):
+                            loop = host.run.revise_loop_plan(loop_id, payload["note"])
+                            reply = {"loop": loop, "session_id": loop["planner_session_id"]}
+                        else:
+                            raise ProtocolError("loop/plan has an invalid action or body")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except KeyError:
+                        self._not_found()
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
+                if self.path == "/loop/cancel":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"loop_id"} or not isinstance(payload.get("loop_id"), str):
+                            raise ProtocolError("loop/cancel requires loop_id")
+                        loop = host.run.cancel_loop(payload["loop_id"])
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except KeyError:
+                        self._not_found()
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    self._json(HTTPStatus.OK, {"loop": loop})
+                    return
+                if self.path == "/loop/commit":
+                    try:
+                        payload = self._read_object()
+                        if (set(payload) != {"loop_id", "action"}
+                                or not isinstance(payload.get("loop_id"), str)
+                                or not isinstance(payload.get("action"), str)):
+                            raise ProtocolError("loop/commit requires loop_id and action")
+                        loop = host.run.commit_loop(payload["loop_id"], payload["action"])
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except KeyError:
+                        self._not_found()
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        "loop": loop, "branch": loop.get("branch"),
+                        "commits": loop.get("summary", {}).get("commits", []),
+                    })
+                    return
+                if self.path == "/loop/resume":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"loop_id"} or not isinstance(payload.get("loop_id"), str):
+                            raise ProtocolError("loop/resume requires loop_id")
+                        loop = host.run.resume_loop(payload["loop_id"])
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except KeyError:
+                        self._not_found()
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {"loop": loop})
                     return
                 if self.path == "/spec/review":
                     try:
