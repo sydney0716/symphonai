@@ -15,6 +15,9 @@ import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.models import ToolCall, ToolResult
@@ -29,11 +32,14 @@ if TYPE_CHECKING:
 
 _CLEANUP_TIMEOUT_SECONDS = 0.2
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+_MCP_HTTP_PROTOCOL_VERSION = "2025-06-18"
 # Both OpenAI and Anthropic require this function-name shape.
 _TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SERVER_KEYS = {
     "name",
     "command",
+    "url",
+    "bearer_token_env_var",
     "enabled",
     "startup_timeout_seconds",
     "call_timeout_seconds",
@@ -53,6 +59,8 @@ class McpServerSpec:
     startup_timeout_seconds: float = 10.0
     call_timeout_seconds: float = 30.0
     source: Path | None = None
+    url: str | None = None
+    bearer_token_env_var: str | None = None
 
 
 def _config_error(source: Path | None, key: str, detail: str) -> ConfigError:
@@ -116,7 +124,10 @@ def mcp_servers_from_config(
         first_index[name] = index
 
         command = entry.get("command")
-        if (
+        url = entry.get("url")
+        if (command is None) == (url is None):
+            raise _config_error(source, key, "exactly one of command or url is required")
+        if command is not None and (
             not isinstance(command, list)
             or not command
             or not all(isinstance(part, str) and part for part in command)
@@ -126,6 +137,25 @@ def mcp_servers_from_config(
                 f"{key}.command",
                 "must be a non-empty array of non-empty strings",
             )
+        if url is not None:
+            if not isinstance(url, str) or not url:
+                raise _config_error(source, f"{key}.url", "must be a non-empty HTTP or HTTPS URL")
+            try:
+                parsed_url = urlsplit(url)
+                hostname = parsed_url.hostname
+                parsed_url.port
+            except ValueError:
+                raise _config_error(source, f"{key}.url", "must be a valid HTTP or HTTPS URL") from None
+            if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc or hostname is None:
+                raise _config_error(source, f"{key}.url", "must be a valid HTTP or HTTPS URL")
+            if parsed_url.scheme == "http" and hostname.lower() not in ("localhost", "127.0.0.1", "::1"):
+                raise _config_error(source, f"{key}.url", "HTTP is allowed only for localhost")
+        bearer_token_env_var = entry.get("bearer_token_env_var")
+        if bearer_token_env_var is not None:
+            if url is None:
+                raise _config_error(source, f"{key}.bearer_token_env_var", "is only valid with url")
+            if not isinstance(bearer_token_env_var, str) or not bearer_token_env_var:
+                raise _config_error(source, f"{key}.bearer_token_env_var", "must be a non-empty environment variable name")
         enabled = entry.get("enabled", McpServerSpec.enabled)
         if type(enabled) is not bool:
             raise _config_error(source, f"{key}.enabled", "must be a boolean")
@@ -160,11 +190,13 @@ def mcp_servers_from_config(
         specs.append(
             McpServerSpec(
                 name=name,
-                command=tuple(command),
+                command=() if command is None else tuple(command),
                 enabled=enabled,
                 startup_timeout_seconds=startup_timeout,
                 call_timeout_seconds=call_timeout,
                 source=source,
+                url=url,
+                bearer_token_env_var=bearer_token_env_var,
             )
         )
     return tuple(specs)
@@ -217,12 +249,24 @@ class McpClient:
         self._frames: queue.Queue[object] = queue.Queue()
         self._request_lock = threading.Lock()
         self._next_id = 1
+        self._http_session_id: str | None = None
+        self._http_protocol_version: str | None = None
+        self._http_token: str | None = None
+        self._http_ready = False
+        self.instructions: str | None = None
 
     def start(self) -> None:
         if not self.spec.enabled:
             raise McpError(f"MCP server {self.spec.name!r} is disabled")
+        if self.spec.url is not None:
+            if self._http_ready:
+                return
+            self.instructions = None
+            self._start_http()
+            return
         if self._process is not None and self._process.poll() is None:
             return
+        self.instructions = None
         try:
             proc = subprocess.Popen(
                 self.spec.command,
@@ -266,10 +310,224 @@ class McpClient:
                 raise McpError(
                     f"MCP server {self.spec.name!r} returned an invalid initialize result"
                 )
+            self._keep_instructions(result)
             self._notify("notifications/initialized", {})
         except McpError:
             self.close()
             raise
+
+    def _start_http(self) -> None:
+        if self.spec.bearer_token_env_var is not None:
+            token = os.environ.get(self.spec.bearer_token_env_var)
+            if not token:
+                raise McpError(
+                    f"MCP server {self.spec.name!r} requires environment variable "
+                    f"{self.spec.bearer_token_env_var!r}"
+                )
+            self._http_token = token
+        try:
+            result = self._request(
+                "initialize",
+                {
+                    "protocolVersion": _MCP_HTTP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "symphonai", "version": "1"},
+                },
+                timeout=self.spec.startup_timeout_seconds,
+                phase="startup",
+            )
+            if not isinstance(result, Mapping):
+                raise McpError(
+                    f"MCP server {self.spec.name!r} returned an invalid initialize result"
+                )
+            self._keep_instructions(result)
+            version = result.get("protocolVersion")
+            if not isinstance(version, str) or not version:
+                raise McpError(
+                    f"MCP server {self.spec.name!r} returned an invalid protocol version"
+                )
+            self._http_protocol_version = version
+            self._notify("notifications/initialized", {})
+            self._http_ready = True
+        except McpError:
+            self.close()
+            raise
+
+    def _keep_instructions(self, result: Mapping) -> None:
+        instructions = result.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            self.instructions = instructions[:4000] + (
+                "…" if len(instructions) > 4000 else ""
+            )
+
+    def _http_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        }
+        if self._http_token is not None:
+            headers["Authorization"] = f"Bearer {self._http_token}"
+        if self._http_session_id is not None:
+            headers["Mcp-Session-Id"] = self._http_session_id
+        if self._http_protocol_version is not None:
+            headers["MCP-Protocol-Version"] = self._http_protocol_version
+        return headers
+
+    def _http_request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+        *,
+        timeout: float,
+        phase: str,
+    ) -> object:
+        if self.spec.url is None:
+            raise McpError(f"MCP server {self.spec.name!r} has no HTTP URL")
+        if method != "initialize" and not self._http_ready:
+            raise McpError(f"MCP server {self.spec.name!r} is not running")
+        with self._request_lock:
+            request_id = self._next_id
+            self._next_id += 1
+            message = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": dict(params),
+            }
+            request = Request(
+                self.spec.url,
+                data=json.dumps(message, separators=(",", ":")).encode("utf-8"),
+                headers=self._http_headers(),
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    status = response.status
+                    content_type = response.headers.get_content_type()
+                    body = response.read()
+                    if method == "initialize":
+                        session_id = response.headers.get("Mcp-Session-Id")
+                        if session_id:
+                            self._http_session_id = session_id
+            except HTTPError as exc:
+                self.close()
+                raise McpError(
+                    f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {phase}"
+                ) from None
+            except (TimeoutError, URLError, OSError) as exc:
+                self.close()
+                detail = "timed out" if isinstance(exc, TimeoutError) else "connection failed"
+                if isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError):
+                    detail = "timed out"
+                raise McpError(
+                    f"MCP server {self.spec.name!r} HTTP status unavailable during "
+                    f"{phase}: {detail}"
+                ) from None
+
+            try:
+                return self._decode_http_response(
+                    body,
+                    content_type=content_type,
+                    request_id=request_id,
+                    status=status,
+                    phase=phase,
+                )
+            except McpError:
+                self.close()
+                raise
+
+    def _decode_http_response(
+        self,
+        body: bytes,
+        *,
+        content_type: str,
+        request_id: int,
+        status: int,
+        phase: str,
+    ) -> object:
+        if not 200 <= status < 300:
+            raise McpError(
+                f"MCP server {self.spec.name!r} returned HTTP {status} during {phase}"
+            )
+        try:
+            text = body.decode("utf-8")
+        except UnicodeError:
+            raise McpError(
+                f"MCP server {self.spec.name!r} returned malformed HTTP {status} during {phase}"
+            ) from None
+
+        candidates: list[object] = []
+        if content_type == "text/event-stream":
+            data_lines: list[str] = []
+            for line in (*text.splitlines(), ""):
+                if not line:
+                    if data_lines:
+                        candidates.append("\n".join(data_lines))
+                        data_lines = []
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+        else:
+            candidates.append(text)
+
+        for candidate in candidates:
+            try:
+                message = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(message, Mapping) or message.get("jsonrpc") != "2.0":
+                continue
+            if message.get("id") != request_id:
+                if content_type == "text/event-stream":
+                    continue
+                break
+            if "error" in message:
+                raise McpError(
+                    f"MCP server {self.spec.name!r} returned a JSON-RPC error "
+                    f"with HTTP {status} during {phase}"
+                )
+            if "result" not in message:
+                break
+            return message["result"]
+        raise McpError(
+            f"MCP server {self.spec.name!r} returned a malformed response "
+            f"with HTTP {status} during {phase}"
+        )
+
+    def _http_notification(self, method: str, params: Mapping[str, object]) -> None:
+        if self.spec.url is None:
+            raise McpError(f"MCP server {self.spec.name!r} has no HTTP URL")
+        request = Request(
+            self.spec.url,
+            data=json.dumps(
+                {"jsonrpc": "2.0", "method": method, "params": dict(params)},
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            headers=self._http_headers(),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.spec.startup_timeout_seconds) as response:
+                status = response.status
+        except HTTPError as exc:
+            self.close()
+            raise McpError(
+                f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {method}"
+            ) from None
+        except (TimeoutError, URLError, OSError) as exc:
+            self.close()
+            detail = "timed out" if isinstance(exc, TimeoutError) else "connection failed"
+            if isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError):
+                detail = "timed out"
+            raise McpError(
+                f"MCP server {self.spec.name!r} HTTP status unavailable during "
+                f"{method}: {detail}"
+            ) from None
+        if status != 202:
+            self.close()
+            raise McpError(
+                f"MCP server {self.spec.name!r} expected HTTP 202 during {method}, "
+                f"received HTTP {status}"
+            )
 
     def _read_frames(self) -> None:
         proc = self._process
@@ -307,6 +565,9 @@ class McpClient:
             ) from None
 
     def _notify(self, method: str, params: Mapping[str, object]) -> None:
+        if self.spec.url is not None:
+            self._http_notification(method, params)
+            return
         self._write_message(
             {"jsonrpc": "2.0", "method": method, "params": dict(params)}
         )
@@ -319,6 +580,8 @@ class McpClient:
         timeout: float,
         phase: str,
     ) -> object:
+        if self.spec.url is not None:
+            return self._http_request(method, params, timeout=timeout, phase=phase)
         with self._request_lock:
             request_id = self._next_id
             self._next_id += 1
@@ -471,6 +734,24 @@ class McpClient:
         return _render_content(result.get("content"))
 
     def close(self) -> None:
+        if self.spec.url is not None:
+            session_id = self._http_session_id
+            if session_id is not None:
+                try:
+                    request = Request(
+                        self.spec.url,
+                        headers=self._http_headers(),
+                        method="DELETE",
+                    )
+                    with urlopen(request, timeout=_CLEANUP_TIMEOUT_SECONDS):
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
+            self._http_session_id = None
+            self._http_protocol_version = None
+            self._http_token = None
+            self._http_ready = False
+            return
         proc = self._process
         pgid = self._process_group
         if proc is None or pgid is None:

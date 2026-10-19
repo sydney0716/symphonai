@@ -251,6 +251,7 @@ class HostRun:
         memory_extraction_enabled: bool | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
+        mcp_instructions: tuple[tuple[str, str], ...] = (),
         price_table: PriceTable | None = None,
         chat_token_budget: int | None = None,
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
@@ -328,6 +329,7 @@ class HostRun:
             else getattr(extensions, "hook_runner", lambda **_: None)(cwd=policy.repo_root)
         )
         self._mcp_tools = mcp_tools
+        self._mcp_instructions = tuple(mcp_instructions)
         self._lsp = lsp
         self._restricted_tool_names: frozenset[str] | None = None
         self._price_table = price_table
@@ -1326,6 +1328,15 @@ class HostRun:
                         "Read it with read_file before relying on its contents."
                     ),
                 ))
+                if self._mcp_instructions:
+                    sections = "\n\n".join(
+                        f"## {name}\n{instructions}"
+                        for name, instructions in self._mcp_instructions
+                    )
+                    seeded.append(Message(
+                        role=Role.SYSTEM,
+                        content=f"MCP servers' instructions:\n\n{sections}",
+                    ))
                 leader.seed_chat(seeded)
                 meta = session.read_meta()
                 attachment_title = (

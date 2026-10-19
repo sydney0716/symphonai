@@ -283,6 +283,7 @@ def standard_registry_collision() -> None:
         def __init__(self, spec, *, cwd, reserved_names=()):  # noqa: ANN001
             self.spec = spec
             self.reserved = set(reserved_names)
+            self.instructions = None
             seen_reserved.append(self.reserved)
 
         def start(self) -> None:

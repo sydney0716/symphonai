@@ -179,6 +179,16 @@
     {
       "provider": "gemini",
       "wire_format": 3,
+      "id": "gemini-pro-latest",
+      "context_window": 1048576,
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
       "id": "gemini-3.1-pro",
       "context_window": 1048576,
       "efforts": [
@@ -262,6 +272,17 @@
       "provider": "gemini",
       "wire_format": 3,
       "id": "gemini-3.8-flash",
+      "context_window": 1048576,
+      "efforts": [
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"}
+      ]
+    },
+    {
+      "provider": "gemini",
+      "wire_format": 3,
+      "id": "gemini-flash-latest",
       "context_window": 1048576,
       "efforts": [
         {"id": "low", "value": "low"},

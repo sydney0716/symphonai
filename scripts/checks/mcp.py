@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
 import signal
@@ -24,6 +25,7 @@ from symphonai_api.mcp import (
     McpTool,
     mcp_servers_from_config,
 )
+from symphonai_api.mcp_pool import McpPool
 from symphonai_api.models import ToolCall
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
@@ -76,11 +78,20 @@ for line in sys.stdin:
         continue
     request_id = message["id"]
     if method == "initialize":
-        send(request_id, {
+        result = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "fake", "version": "1"},
-        })
+        }
+        if mode == "instructions":
+            result["instructions"] = "Call search first."
+        elif mode == "blank_instructions":
+            result["instructions"] = "  \n"
+        elif mode == "nonstring_instructions":
+            result["instructions"] = 42
+        elif mode == "long_instructions":
+            result["instructions"] = "x" * 5000
+        send(request_id, result)
     elif method == "tools/list":
         send(request_id, {"tools": [{
             "name": tool_name,
@@ -145,6 +156,37 @@ def _spec(
         call_timeout_seconds=call_timeout,
         source=script,
     )
+
+
+def _http_spec(
+    url: str,
+    *,
+    name: str = "docs",
+    bearer_token_env_var: str | None = None,
+    startup_timeout: float = 1.0,
+    call_timeout: float = 1.0,
+) -> McpServerSpec:
+    server = {"name": name, "url": url, "enabled": True}
+    if bearer_token_env_var is not None:
+        server["bearer_token_env_var"] = bearer_token_env_var
+    if startup_timeout != 1.0:
+        server["startup_timeout_seconds"] = startup_timeout
+    if call_timeout != 1.0:
+        server["call_timeout_seconds"] = call_timeout
+    config = load_config(
+        repo_root=Path("/tmp/mcp-http-repo"),
+        home=Path("/tmp/mcp-http-home"),
+        session={"mcp": {"servers": [server]}},
+    )
+    return mcp_servers_from_config(config)[0]
+
+
+def _start_http_server(handler: type[BaseHTTPRequestHandler]) -> tuple[ThreadingHTTPServer, threading.Thread]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
 
 
 def _write(path: Path, content: str) -> None:
@@ -372,6 +414,29 @@ def handshake_tools_and_namespaces() -> None:
         finally:
             for client in clients:
                 client.close()
+
+
+@check("mcp.server_instructions_are_kept")
+def server_instructions_are_kept() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        script = _write_fake(directory)
+        pool = McpPool(
+            (
+                _spec(script, name="first", mode="instructions"),
+                _spec(script, name="blank", mode="blank_instructions"),
+                _spec(script, name="second", mode="long_instructions"),
+                _spec(script, name="nonstring", mode="nonstring_instructions"),
+            ),
+            cwd=directory,
+        )
+        try:
+            pool.start()
+            expected = (("first", "Call search first."), ("second", "x" * 4000 + "…"))
+            if pool.instructions != expected:
+                fail(f"MCP pool returned unexpected server instructions: {pool.instructions!r}")
+        finally:
+            pool.close()
 
 
 @check("mcp.reserved_names_are_injected")
@@ -815,3 +880,259 @@ def trust_grants_a_repository() -> None:
         )
         if actual != expected:
             fail(f"trusted project MCP server parsed incorrectly: {actual!r}")
+
+
+@check("mcp.http_config_parsing")
+def http_config_parsing() -> None:
+    def parse(entries):  # noqa: ANN001
+        config = load_config(
+            repo_root=Path("/tmp/mcp-http-config-repo"),
+            home=Path("/tmp/mcp-http-config-home"),
+            session={"mcp": {"servers": entries}},
+        )
+        return mcp_servers_from_config(config)
+
+    rejected = (
+        {"name": "both", "command": ["fake"], "url": "http://127.0.0.1/mcp"},
+        {"name": "ftp", "url": "ftp://example.com/mcp"},
+        {"name": "remote_http", "url": "http://example.com/mcp"},
+    )
+    for server in rejected:
+        try:
+            parse([server])
+        except ConfigError:
+            pass
+        else:
+            fail(f"invalid HTTP MCP config was accepted: {server!r}")
+
+    parsed = parse([
+        {"name": "local", "url": "http://127.0.0.1:9/mcp"},
+        {"name": "remote", "url": "https://example.com/mcp", "bearer_token_env_var": "MCP_DOCS_TOKEN"},
+    ])
+    if (
+        [spec.url for spec in parsed] != ["http://127.0.0.1:9/mcp", "https://example.com/mcp"]
+        or parsed[0].command != ()
+        or parsed[1].bearer_token_env_var != "MCP_DOCS_TOKEN"
+    ):
+        fail(f"valid HTTP MCP configs parsed incorrectly: {parsed!r}")
+
+
+@check("mcp.http_handshake_tools_and_calls")
+def http_handshake_tools_and_calls() -> None:
+    requests = []
+    deleted = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: ANN001
+            return
+
+        def _body(self, status: int, content_type: str, body: bytes = b"", *, session: bool = False) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if session:
+                self.send_header("Mcp-Session-Id", "session-123")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append((request, dict(self.headers)))
+            method = request["method"]
+            if method == "notifications/initialized":
+                self._body(202, "application/json")
+            elif method == "initialize":
+                result = {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fake-http", "version": "1"},
+                }
+                body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}).encode()
+                self._body(200, "application/json", body, session=True)
+            elif method == "tools/list":
+                tools = [
+                    {"name": name, "description": name, "inputSchema": {"type": "object", "properties": {}}}
+                    for name in ("search", "fetch")
+                ]
+                body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": tools}}).encode()
+                self._body(200, "application/json", body)
+            elif request["params"]["name"] == "search":
+                body = json.dumps({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": {"content": [{"type": "text", "text": "json result"}]},
+                }).encode()
+                self._body(200, "application/json", body)
+            else:
+                wrong = json.dumps({
+                    "jsonrpc": "2.0", "id": request["id"] + 1,
+                    "result": {"content": [{"type": "text", "text": "ignore"}]},
+                })
+                right = json.dumps({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": {"content": [{"type": "text", "text": "sse result"}]},
+                })
+                self._body(200, "text/event-stream", f"data: {wrong}\n\ndata: {right}\n\n".encode())
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            deleted.append(dict(self.headers))
+            self._body(200, "application/json")
+
+    server, thread = _start_http_server(Handler)
+    token = "test-bearer-value-never-in-errors"
+    try:
+        with mock.patch.dict(os.environ, {"MCP_DOCS_TOKEN": token}):
+            spec = _http_spec(
+                f"http://127.0.0.1:{server.server_port}/mcp",
+                bearer_token_env_var="MCP_DOCS_TOKEN",
+            )
+            pool = McpPool((spec,), cwd=Path.cwd())
+            tools = pool.start()
+            if set(tools) != {"mcp__docs__search", "mcp__docs__fetch"}:
+                fail(f"HTTP MCP tool names were not namespaced like stdio tools: {sorted(tools)!r}")
+            search_client = tools["mcp__docs__search"]._client
+            fetch_client = tools["mcp__docs__fetch"]._client
+            if search_client.call("search", {"query": "cats"}) != "json result":
+                fail("HTTP MCP JSON tool call returned the wrong result")
+            if fetch_client.call("fetch", {"query": "cats"}) != "sse result":
+                fail("HTTP MCP SSE tool call did not select the matching response id")
+            if requests[0][0]["params"].get("protocolVersion") != "2025-06-18":
+                fail(f"HTTP initialize request used the wrong protocol version: {requests[0]!r}")
+            if requests[0][1].get("Authorization") != f"Bearer {token}":
+                fail("HTTP initialize request did not carry the configured bearer token")
+            for _, headers in requests[1:]:
+                if (
+                    headers.get("Mcp-Session-Id") != "session-123"
+                    or headers.get("Mcp-Protocol-Version") != "2025-06-18"
+                    or headers.get("Authorization") != f"Bearer {token}"
+                ):
+                    fail(f"later HTTP MCP request omitted negotiated headers: {headers!r}")
+            pool.close()
+            pool.close()
+        if len(deleted) != 1 or deleted[0].get("Mcp-Session-Id") != "session-123":
+            fail(f"HTTP session was not deleted exactly once: {deleted!r}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+@check("mcp.http_failures_are_bounded")
+def http_failures_are_bounded() -> None:
+    token = "sensitive-bearer-value"
+    query = "query-secret-marker"
+
+    class Handler(BaseHTTPRequestHandler):
+        mode = ""
+
+        def log_message(self, format, *args):  # noqa: ANN001
+            return
+
+        def _reply(self, status: int, body: bytes = b"", content_type: str = "application/json", session: bool = False) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if session:
+                self.send_header("Mcp-Session-Id", "failure-session")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if request["method"] == "notifications/initialized":
+                self._reply(202)
+            elif request["method"] == "initialize":
+                result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {}}
+                body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}).encode()
+                self._reply(200, body, session=True)
+            elif self.mode == "status":
+                self._reply(500, b"server error")
+            elif self.mode == "malformed":
+                self._reply(200, b"not-json", "application/json")
+            else:
+                time.sleep(0.3)
+                body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": []}}).encode()
+                try:
+                    self._reply(200, body)
+                except OSError:
+                    pass
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._reply(200)
+
+    for mode in ("status", "malformed", "timeout"):
+        Handler.mode = mode
+        server, thread = _start_http_server(Handler)
+        client = McpClient(
+            _http_spec(
+                f"http://127.0.0.1:{server.server_port}/mcp?key={query}",
+                bearer_token_env_var="MCP_HTTP_TOKEN",
+                startup_timeout=0.5,
+                call_timeout=0.05,
+            ),
+            cwd=Path.cwd(),
+        )
+        try:
+            with mock.patch.dict(os.environ, {"MCP_HTTP_TOKEN": token}):
+                client.start()
+                started = time.monotonic()
+                try:
+                    client.list_tools()
+                except McpError as exc:
+                    message = str(exc)
+                else:
+                    fail(f"HTTP {mode} MCP response was accepted")
+                elapsed = time.monotonic() - started
+                if "docs" not in message or token in message or query in message:
+                    fail(f"HTTP {mode} MCP error leaked a credential or omitted its server: {message!r}")
+                if mode == "status" and "HTTP 500" not in message:
+                    fail(f"HTTP status missing from error: {message!r}")
+                if mode == "malformed" and "HTTP 200" not in message:
+                    fail(f"malformed response status missing from error: {message!r}")
+                if mode == "timeout" and (elapsed > 0.5 or "HTTP status unavailable" not in message):
+                    fail(f"HTTP timeout was not bounded or safely reported: {elapsed:.2f}s, {message!r}")
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    server, thread = _start_http_server(Handler)
+    port = server.server_port
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=1)
+    refused = McpClient(
+        _http_spec(
+            f"http://127.0.0.1:{port}/mcp?key={query}",
+            bearer_token_env_var="MCP_HTTP_TOKEN",
+            startup_timeout=0.2,
+        ),
+        cwd=Path.cwd(),
+    )
+    with mock.patch.dict(os.environ, {"MCP_HTTP_TOKEN": token}):
+        try:
+            refused.start()
+        except McpError as exc:
+            message = str(exc)
+            if "HTTP status unavailable" not in message or token in message or query in message:
+                fail(f"connection failure was not safely reported: {message!r}")
+        else:
+            fail("connection-refused MCP server started")
+
+    for value in (None, ""):
+        missing = McpClient(
+            _http_spec("http://127.0.0.1:9/mcp", bearer_token_env_var="MISSING_MCP_TOKEN"),
+            cwd=Path.cwd(),
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            if value is not None:
+                os.environ["MISSING_MCP_TOKEN"] = value
+            try:
+                missing.start()
+            except McpError as exc:
+                if "MISSING_MCP_TOKEN" not in str(exc) or token in str(exc):
+                    fail(f"missing/empty bearer variable was not named safely: {exc!r}")
+            else:
+                fail("HTTP MCP server started without its configured bearer token")

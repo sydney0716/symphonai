@@ -24,6 +24,7 @@ class McpPool:
         self._reserved_names = frozenset(reserved_names)
         self._clients: list[McpClient] = []
         self._tools: dict[str, LocalTool] = {}
+        self._instructions: tuple[tuple[str, str], ...] = ()
         self._started = False
 
     def start(self) -> dict[str, LocalTool]:
@@ -32,6 +33,7 @@ class McpPool:
             return self.tools
 
         tools: dict[str, LocalTool] = {}
+        instructions: list[tuple[str, str]] = []
         owners: dict[str, tuple[str, int]] = {}
         reserved = set(self._reserved_names)
         try:
@@ -45,6 +47,8 @@ class McpPool:
                 )
                 self._clients.append(client)
                 client.start()
+                if client.instructions is not None:
+                    instructions.append((spec.name, client.instructions))
                 try:
                     listed = client.list_tools()
                 except McpError as exc:
@@ -85,6 +89,7 @@ class McpPool:
             raise
 
         self._tools = tools
+        self._instructions = tuple(instructions)
         self._started = True
         return self.tools
 
@@ -93,6 +98,7 @@ class McpPool:
         clients = self._clients
         self._clients = []
         self._tools = {}
+        self._instructions = ()
         self._started = False
         first_error: Exception | None = None
         for client in reversed(clients):
@@ -114,3 +120,7 @@ class McpPool:
     @property
     def tools(self) -> dict[str, LocalTool]:
         return self._tools.copy()
+
+    @property
+    def instructions(self) -> tuple[tuple[str, str], ...]:
+        return self._instructions

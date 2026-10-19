@@ -86,6 +86,7 @@ def build_project(
             memory_root=memory_root,
             extensions=extensions,
             mcp_tools=mcp_tools,
+            mcp_instructions=pool.instructions,
             lsp=lsp,
         )
         return ProjectRuntime(root, run, pool, lsp)

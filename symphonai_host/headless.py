@@ -409,6 +409,9 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
     output_schema = _load_output_schema(arguments.output_schema)
     allowed_tools = _tool_list(arguments.allowed_tools)
     disallowed_tools = _tool_list(arguments.disallowed_tools) or ()
+    if (arguments.command == "review"
+            and (allowed_tools is None or "dispatch_subagent" not in allowed_tools)):
+        disallowed_tools = (*disallowed_tools, "dispatch_subagent")
     if output_schema is not None:
         task += "\n\nReply with only a JSON value matching this schema:\n" + json.dumps(
             output_schema, ensure_ascii=False,

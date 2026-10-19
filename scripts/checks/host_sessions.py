@@ -1015,6 +1015,7 @@ def check_prune_startup() -> None:
             host.serve_forever.side_effect = lambda: events.append("serve")
             pool = mock.Mock()
             pool.start.return_value = {}
+            pool.instructions = ()
 
             def prune(root: Path, *, period_days: int, now: datetime) -> int:
                 events.append("prune")

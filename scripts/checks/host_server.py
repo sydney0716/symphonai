@@ -8505,6 +8505,7 @@ def main_passes_base_prompts() -> None:
         fake_host = mock.Mock()
         fake_pool = mock.Mock()
         fake_pool.start.return_value = {}
+        fake_pool.instructions = ()
         with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(
             host_main, "_provider", return_value=FakeModelProvider(),
         ), mock.patch.object(
@@ -8563,6 +8564,7 @@ def selection_is_remembered() -> None:
             fake_host = mock.Mock()
             fake_pool = mock.Mock()
             fake_pool.start.return_value = {}
+            fake_pool.instructions = ()
             with mock.patch.dict(os.environ, {
                 "HOME": str(test_home), "PATH": os.defpath,
                 "SYMPHONAI_HOME": "", **environment,
@@ -8829,6 +8831,93 @@ def check_mcp_start_and_schema() -> None:
             fail("disabled configured server contributed a tool")
 
 
+@check("host_server.mcp_instructions_seed_the_conversation")
+def check_mcp_instructions_seed_the_conversation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        server = root / "mcp.py"
+        server.write_text(
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            " message = json.loads(line)\n"
+            " if 'id' not in message: continue\n"
+            " result = {'protocolVersion':'2024-11-05','capabilities':{},"
+            "'serverInfo':{'name':'test','version':'1'},"
+            "'instructions':'Call search before fetch.'}\n"
+            " if message.get('method') == 'initialize':\n"
+            "  print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)\n"
+            " elif message.get('method') == 'tools/list':\n"
+            "  print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':{'tools':[]}}), flush=True)\n",
+            encoding="utf-8",
+        )
+        pool = McpPool((McpServerSpec(
+            name="docs",
+            command=(sys.executable, str(server)),
+            enabled=True,
+        ),), cwd=root)
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        run = HostRun(
+            provider,
+            PermissionPolicy(root),
+            EventBroker(),
+            system_prompt="host baseline",
+            sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
+            mcp_tools=pool.start(),
+            mcp_instructions=pool.instructions,
+        )
+        host = HostServer(provider, PermissionPolicy(root), runtime=ProjectRuntime(root, run, pool))
+        environment = "fixed environment"
+        try:
+            host.start()
+            with (
+                mock.patch.object(host_run_module, "capture_environment", return_value=environment),
+                mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy,
+            ):
+                _send_host_prompt(host, "hello")
+                actual = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
+                actual = [item for item in actual if "Memory persists across conversations" not in (item[1] or "")]
+                expected = [
+                    ("system", "host baseline"),
+                    ("system", environment + "\n\nIn the person's messages, @<path> names a file in this repository. "
+                     "Read it with read_file before relying on its contents."),
+                    ("system", "MCP servers' instructions:\n\n## docs\nCall search before fetch."),
+                    ("user", "hello"),
+                ]
+                if actual != expected:
+                    fail(f"MCP instructions were not seeded after the environment block: {actual!r}")
+        finally:
+            host.close()
+
+        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        host = HostServer(
+            provider,
+            PermissionPolicy(root),
+            system_prompt="host baseline",
+            sessions_root=root / "no-mcp-sessions",
+            memory_extraction_enabled=False,
+        )
+        try:
+            host.start()
+            with (
+                mock.patch.object(host_run_module, "capture_environment", return_value=environment),
+                mock.patch.object(provider, "create_response", wraps=provider.create_response) as response_spy,
+            ):
+                _send_host_prompt(host, "hello")
+                actual = [(message.role.value, message.text) for message in response_spy.call_args.args[0].messages]
+                actual = [item for item in actual if "Memory persists across conversations" not in (item[1] or "")]
+                expected = [
+                    ("system", "host baseline"),
+                    ("system", environment + "\n\nIn the person's messages, @<path> names a file in this repository. "
+                     "Read it with read_file before relying on its contents."),
+                    ("user", "hello"),
+                ]
+                if actual != expected:
+                    fail(f"opening messages changed without MCP instructions: {actual!r}")
+        finally:
+            host.close()
+
+
 @check("host_server.mcp_start_failures")
 def check_mcp_start_failures() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -8958,6 +9047,7 @@ def check_mcp_close_order() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         events: list[str] = []
         pool = mock.Mock()
+        pool.instructions = ()
         pool.close.side_effect = lambda: events.append("pool.close")
         lsp = mock.Mock()
         lsp.close.side_effect = lambda: events.append("lsp.close")
@@ -11706,8 +11796,8 @@ def _headless_invoke(root: Path, provider, arguments: list[str], *, stdin_text: 
 @check("host_server.headless_review")
 def check_headless_review() -> None:
     class RecordingProvider(FakeModelProvider):
-        def __init__(self) -> None:
-            super().__init__([ModelResponse(Message(Role.ASSISTANT, "No findings."))])
+        def __init__(self, responses=None) -> None:
+            super().__init__(responses or [ModelResponse(Message(Role.ASSISTANT, "No findings."))])
             self.requests = []
 
         def create_response(self, request, *, cancel=None):
@@ -11721,6 +11811,12 @@ def check_headless_review() -> None:
             return None
         prompt = source.split(prefix, 1)[1].split(suffix, 1)[0]
         return prompt.replace("\\`", "`")
+
+    def request_tool_names(request) -> set[str]:
+        return {
+            schema.get("function", {}).get("name", schema.get("name"))
+            for schema in request.tools
+        }
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "project"
@@ -11746,8 +11842,45 @@ def check_headless_review() -> None:
         ]
         if (code != 0 or result.get("status") != "finished"
                 or result.get("result") != "No findings."
-                or user_messages != [headless_module.REVIEW_PROMPT] or modes != ["plan"]):
+                or user_messages != [headless_module.REVIEW_PROMPT] or modes != ["plan"]
+                or "dispatch_subagent" in request_tool_names(provider.requests[0])):
             fail(f"headless review did not use the app prompt and plan mode: {code}, {result!r}, {user_messages!r}, {modes!r}")
+
+        provider = RecordingProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "dispatch", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "No findings.")),
+        ])
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["review", "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        tool_results = [
+            message.tool_result.error or message.tool_result.content
+            for message in provider.requests[1].messages
+            if message.tool_result is not None
+        ]
+        if (code != 0 or "dispatch_subagent" in request_tool_names(provider.requests[0])
+                or not tool_results or any("unknown tool" not in str(value) for value in tool_results)):
+            fail(f"headless review did not refuse delegation by default: {code}, {tool_results!r}")
+
+        provider = RecordingProvider()
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["review", "--json", "--repo-root", str(root), "--provider", "openai",
+             "--allowed-tools", "read_file,dispatch_subagent"],
+        )
+        if code != 0 or request_tool_names(provider.requests[0]) != {"read_file", "dispatch_subagent"}:
+            fail(f"review --allowed-tools did not preserve the explicit delegation allow: {code}, {provider.requests!r}")
+
+        provider = RecordingProvider()
+        code, _output, _error, _sessions = _headless_invoke(
+            root, provider,
+            ["run", "task", "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        if code != 0 or "dispatch_subagent" not in request_tool_names(provider.requests[0]):
+            fail(f"headless run unexpectedly lost dispatch_subagent: {code}, {provider.requests!r}")
 
         provider = RecordingProvider()
         code, _output, _error, _sessions = _headless_invoke(

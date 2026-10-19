@@ -13,6 +13,7 @@ from symphonai_api.model_table import (
     ModelEffort,
     _models_from_json,
     model_capabilities,
+    context_window_for_model,
     resolve_effort,
 )
 from symphonai_api.models import Message, ModelRequest, Role, ToolCall, ToolResult, Usage
@@ -172,19 +173,43 @@ def check_model_table_schema() -> None:
         (2, "claude-haiku-4-5"),
         (2, "claude-sonnet-5"),
         (3, "gemini-3-pro"),
+        (3, "gemini-pro-latest"),
         (3, "gemini-3.5-flash"),
+        (3, "gemini-flash-latest"),
     }
     if not required.issubset(indexed):
         fail(f"model effort table omitted required entries: {indexed!r}")
     gemini_efforts = {
         model: tuple(option.id for option in indexed[(3, model)].efforts)
-        for model in ("gemini-3-pro", "gemini-3.5-flash")
+        for model in (
+            "gemini-3-pro",
+            "gemini-pro-latest",
+            "gemini-3.5-flash",
+            "gemini-flash-latest",
+        )
     }
     if gemini_efforts != {
         "gemini-3-pro": ("low", "high"),
+        "gemini-pro-latest": ("low", "high"),
         "gemini-3.5-flash": ("minimal", "low", "medium", "high"),
+        "gemini-flash-latest": ("low", "medium", "high"),
     }:
         fail(f"Gemini model efforts were flattened across models: {gemini_efforts!r}")
+    for model in ("gemini-pro-latest", "gemini-flash-latest"):
+        if context_window_for_model(3, model) != 1048576:
+            fail(f"Gemini default {model!r} has the wrong context window")
+    pro_high = next(
+        option.value for option in indexed[(3, "gemini-3-pro")].efforts
+        if option.id == "high"
+    )
+    if resolve_effort(3, "gemini-pro-latest", "high") != pro_high:
+        fail("Gemini Pro default did not resolve high effort")
+    try:
+        resolve_effort(3, "gemini-pro-latest", "medium")
+    except ValueError:
+        pass
+    else:
+        fail("Gemini Pro default accepted unsupported medium effort")
     if _models_from_json({"schema_version": 2, "notes": "bad", "models": []}) != ():
         fail("a mismatched model table schema did not fail closed")
     integer_capabilities = _models_from_json({
