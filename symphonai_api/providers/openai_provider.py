@@ -40,9 +40,11 @@ from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_se
 from symphonai_api.streaming import (
     StreamChunk,
     StreamCompleted,
+    StreamEventError,
     TextDelta,
     ToolCallDelta,
     open_stream_with_retry,
+    retry_stream_chunks,
     sse_events,
 )
 
@@ -369,7 +371,7 @@ def _responses_stream_chunks(
                 failed_response = data.get("response")
                 error = failed_response.get("error", {}) if isinstance(failed_response, dict) else {}
             message = error.get("message") if isinstance(error, dict) else None
-            raise ProviderError(redact_secret(str(message or f"{operation} stream failed"), api_key))
+            raise StreamEventError(redact_secret(str(message or f"{operation} stream failed"), api_key), error.get("code") if isinstance(error, dict) else None)
         if event == "response.output_text.delta":
             delta = data.get("delta")
             if isinstance(delta, str):
@@ -428,7 +430,7 @@ def _openai_stream_chunks(
         error = data.get("error")
         if isinstance(error, dict):
             message = error.get("message") or f"{operation} stream returned an error"
-            raise ProviderError(redact_secret(str(message), api_key))
+            raise StreamEventError(redact_secret(str(message), api_key), error.get("code"))
 
         usage_raw = data.get("usage")
         if isinstance(usage_raw, dict):
@@ -552,14 +554,9 @@ class OpenAIProvider(ModelProvider):
                 "content-type": "application/json",
             },
         )
-        lines = open_stream_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation="OpenAI API",
-            cancel=cancel,
-        )
-        yield from _responses_stream_chunks(
-            lines, operation="OpenAI API", api_key=api_key
-        )
+        def attempt(remaining):
+            lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
+                api_key=api_key, operation="OpenAI API", cancel=cancel)
+            return _responses_stream_chunks(lines, operation="OpenAI API", api_key=api_key)
+        yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
+                                       max_attempts=self.max_attempts, cancel=cancel)

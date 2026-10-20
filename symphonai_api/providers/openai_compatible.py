@@ -35,7 +35,7 @@ from symphonai_api.providers.openai_provider import (
     _parse_response,
 )
 from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry
-from symphonai_api.streaming import StreamChunk, open_stream_with_retry
+from symphonai_api.streaming import StreamChunk, open_stream_with_retry, retry_stream_chunks
 
 DEFAULT_MODEL = "openai-compatible-placeholder"
 
@@ -124,12 +124,9 @@ class OpenAICompatibleProvider(ModelProvider):
             },
         )
         operation = f"{self.provider_label} API"
-        lines = open_stream_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation=operation,
-            cancel=cancel,
-        )
-        yield from _openai_stream_chunks(lines, operation=operation, api_key=api_key)
+        def attempt(remaining):
+            lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
+                api_key=api_key, operation=operation, cancel=cancel)
+            return _openai_stream_chunks(lines, operation=operation, api_key=api_key)
+        yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
+                                       max_attempts=self.max_attempts, cancel=cancel)

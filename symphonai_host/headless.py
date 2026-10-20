@@ -30,9 +30,10 @@ from symphonai_api.session import SessionError, SessionStore, default_sessions_r
 from symphonai_host.broker import EventBroker
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.__main__ import main as _host_main
+from symphonai_host.loops import LoopStore
 from symphonai_host.projects import build_project
 from symphonai_host.protocol import encode_event
-from symphonai_host.run import ModeSelectionError, ProviderSelectionError
+from symphonai_host.run import LoopChanged, ModeSelectionError, ProviderSelectionError, RunActiveError
 from symphonai_host.server import PROVIDERS, _app_root, _provider, _provider_for_start
 from symphonai_api.tools.shell import _sandbox_available
 
@@ -117,6 +118,14 @@ def _parser() -> argparse.ArgumentParser:
     output = run.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true")
     output.add_argument("--stream-json", action="store_true")
+
+    loop = commands.add_parser("loop", help="run a spec loop without the app")
+    loop.add_argument("goal", nargs="?")
+    loop.add_argument("--repo-root", type=Path, default=Path.cwd())
+    loop.add_argument("--provider")
+    loop.add_argument("--model")
+    loop.add_argument("--effort")
+    loop.add_argument("--json", action="store_true")
 
     review = commands.add_parser("review", help="review changes without editing files")
     review.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -567,6 +576,141 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
         broker.close()
 
 
+def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None) -> None:
+    result = {
+        "loop_id": loop["id"],
+        "state": loop.get("state", "unknown"),
+        "reason": loop.get("reason", "") if reason is None else reason,
+        "branch": loop.get("branch"),
+        "cards": [
+            {
+                "id": card.get("id"),
+                "title": card.get("title", ""),
+                "state": card.get("state", "unknown"),
+                "commit": card.get("commit"),
+            }
+            for card in loop.get("cards", [])
+        ],
+        "summary": loop.get("summary", {}),
+    }
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return
+    print(f"Branch: {result['branch'] or ''}")
+    for card in result["cards"]:
+        print(f"{card['id']} · {card['state']} · {card['commit'] or ''}")
+    for validation in result["summary"].get("validation", []):
+        print(f"{validation.get('command', '')} · {validation.get('exit')}")
+    if result["reason"]:
+        print(f"Reason: {result['reason']}")
+
+
+def _run_loop(arguments, goal: str) -> int:  # noqa: ANN001
+    apply_to_environment(os.environ, load())
+    root = arguments.repo_root.expanduser().resolve()
+    if not root.is_dir():
+        raise _UsageError(f"project directory does not exist: {root}")
+
+    broker = EventBroker()
+    runtime = None
+    subscription = None
+    original_threading_excepthook = threading.excepthook
+    threading.excepthook = lambda _args: None
+    loop = None
+    approval_error = None
+    try:
+        runtime = build_project(
+            root,
+            broker,
+            None,
+            publish_approval=lambda _approval: False,
+            base_prompt=LEADER_BASE_PROMPT,
+            subagent_base_prompt=SUBAGENT_BASE_PROMPT,
+            sessions_root=default_sessions_root(),
+            provider_factory=lambda name, selected_model, base_url: _provider(
+                name, selected_model, base_url
+            ),
+            extensions_loader=load_extensions,
+            pool_factory=McpPool,
+            lsp_factory=LspManager,
+            policy_factory=PermissionPolicy,
+        )
+        provider, model, effort, choice = _select_provider(arguments)
+        runtime.run.select_provider(provider, model, effort, choice)
+        subscription = broker.subscribe()
+        loop = runtime.run.start_loop(goal, runner_pid=os.getpid())
+        store = LoopStore(root)
+        approved = False
+        last_reported_state = None
+        terminal_states = ("awaiting_commit", "needs_attention", "cancelled", "done")
+        while True:
+            try:
+                event = subscription.get(timeout=0.1)
+            except KeyboardInterrupt:
+                runtime.run.cancel_loop(loop["id"])
+                print(f"loop {loop['id']} cancelled", file=sys.stderr, flush=True)
+                return 130
+            if isinstance(event, LoopChanged) and event.loop_id == loop["id"]:
+                current = store.load(loop["id"])
+                if event.change == "card":
+                    card = next(
+                        (item for item in current.get("cards", []) if item.get("id") == event.card_id),
+                        None,
+                    )
+                    if card is not None:
+                        print(f"card {event.card_id} {card.get('state', 'unknown')}", file=sys.stderr, flush=True)
+                elif event.state != last_reported_state:
+                    print(f"loop {loop['id']} {event.state}", file=sys.stderr, flush=True)
+                    last_reported_state = event.state
+                if current.get("state") == "awaiting_plan" and not approved:
+                    approved = True
+                    try:
+                        runtime.run.approve_loop_plan(loop["id"])
+                    except (RunActiveError, ValueError) as exc:
+                        approval_error = str(exc)
+                        break
+                elif (
+                    current.get("state") in terminal_states
+                    and event.state == current.get("state")
+                ):
+                    loop = current
+                    break
+            elif event is None:
+                current = store.load(loop["id"])
+                if current.get("state") != last_reported_state:
+                    print(f"loop {loop['id']} {current.get('state', 'unknown')}", file=sys.stderr, flush=True)
+                    last_reported_state = current.get("state")
+                if current.get("state") == "awaiting_plan" and not approved:
+                    approved = True
+                    try:
+                        runtime.run.approve_loop_plan(loop["id"])
+                    except (RunActiveError, ValueError) as exc:
+                        approval_error = str(exc)
+                        loop = current
+                        break
+                elif current.get("state") in terminal_states:
+                    loop = current
+                    break
+        loop = store.load(loop["id"])
+        _print_loop_result(loop, arguments.json, approval_error)
+        return 1 if approval_error or loop.get("state") in ("needs_attention", "cancelled") else 0
+    except KeyboardInterrupt:
+        if runtime is not None and loop is not None:
+            try:
+                runtime.run.cancel_loop(loop["id"])
+            except (KeyError, OSError, RunActiveError, ValueError):
+                pass
+            print(f"loop {loop['id']} cancelled", file=sys.stderr, flush=True)
+        return 130
+    finally:
+        if subscription is not None:
+            subscription.close()
+        if runtime is not None:
+            runtime.close()
+        threading.excepthook = original_threading_excepthook
+        broker.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     try:
@@ -583,6 +727,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_doctor(arguments)
     if arguments.command == "app":
         return _run_app(arguments)
+    if arguments.command == "loop":
+        try:
+            goal = arguments.goal
+            if goal is None or goal == "-":
+                if goal is None and sys.stdin.isatty():
+                    raise _UsageError("a goal is required when stdin is a terminal")
+                goal = sys.stdin.read()
+            if not goal.strip():
+                raise _UsageError("goal must not be empty")
+            return _run_loop(arguments, goal)
+        except _HeadlessKeyError as exc:
+            print(f"symphonai: {exc}", file=sys.stderr, flush=True)
+            return 2
+        except (ConfigError, CredentialError, McpError, ModeSelectionError,
+                ProviderSelectionError, SessionError, OSError, ValueError) as exc:
+            print(f"symphonai: {exc}", file=sys.stderr, flush=True)
+            return 2
     review = arguments.command == "review"
     task = _review_task(arguments) if review else arguments.task
     try:

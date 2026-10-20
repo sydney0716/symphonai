@@ -801,6 +801,42 @@ def lanes_run_in_order_and_in_parallel() -> None:
             run.close()
 
 
+@check("loops.review_reason")
+def review_reason() -> None:
+    cases = (
+        ({"verdict": "tree-changed", "error": "An error occurred while processing the request."},
+         "card a review failed: An error occurred while processing the request."),
+        ({"verdict": "no-verdict"}, "card a review gave no verdict"),
+        ({"verdict": "tree-changed"}, "card a review changed files other than its follow-up specs"),
+    )
+    for index, (review, expected) in enumerate(cases):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root, sessions = base / "project", base / "sessions"
+            run, store, loop = _lane_loop(
+                root, sessions, [{"id": "a", "title": "A", "lane": 1, "state": "review"}],
+            )
+            try:
+                loop = store.load(loop["id"])
+                loop["state"] = "running"
+                store.save(loop)
+                session_id = f"review-{index}"
+                _loop_session(sessions, root, session_id, {"kind": "implement", "loop_id": loop["id"], "card_id": "a"})
+                source = SessionStore.open(sessions, session_id)
+                try:
+                    meta = source.read_meta()
+                    meta["review"] = review
+                    source.write_meta(meta)
+                finally:
+                    source.close()
+                run._finish_loop_card_review({"loop_id": loop["id"], "card_id": "a", "of": session_id})
+                result = store.load(loop["id"])
+                if result.get("reason") != expected:
+                    fail(f"review result {review!r} had reason {result.get('reason')!r}, expected {expected!r}")
+            finally:
+                run.close()
+
+
 @check("loops.review_pass_integrates")
 def review_pass_integrates() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -1072,6 +1108,81 @@ def failed_card_needs_attention() -> None:
             run.close()
 
 
+@check("loops.card_run_reason")
+def card_run_reason() -> None:
+    failure = "scripted implementer failure"
+
+    class _FailingProvider(FakeModelProvider):
+        def create_response(self, request, *, cancel=None):
+            raise ProviderError(failure)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, sessions = base / "project", base / "sessions"
+        run, store, loop = _lane_loop(
+            root, sessions, [{"id": "a", "title": "A", "lane": 1}],
+        )
+        run._provider = _FailingProvider()
+        original_hook = threading.excepthook
+        threading.excepthook = lambda _args: None
+        try:
+            loop = run.approve_loop_plan(loop["id"])
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                result = store.load(loop["id"])
+                if result["state"] == "needs_attention":
+                    break
+                time.sleep(0.01)
+            if result.get("reason") != f"card a could not finish: {failure}":
+                fail(f"failed implementation reported the wrong cause: {result!r}")
+            session_id = result["cards"][0].get("session_id")
+            source = SessionStore.open(sessions, session_id)
+            try:
+                goal = source.read_meta().get("goal", {})
+            finally:
+                source.close()
+            if goal.get("reason") != "failed":
+                fail(f"card goal reason changed while reporting the error: {goal!r}")
+        finally:
+            run.close()
+            threading.excepthook = original_hook
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, sessions = base / "project", base / "sessions"
+        run, store, loop = _lane_loop(
+            root, sessions,
+            [{"id": "a", "title": "A", "lane": 1, "state": "running"}],
+        )
+        try:
+            loop["state"] = "running"
+            store.save(loop)
+            session_id = "blocked-card"
+            _loop_session(sessions, root, session_id, {
+                "kind": "implement", "loop_id": loop["id"], "card_id": "a",
+            })
+            source = SessionStore.open(sessions, session_id)
+            try:
+                meta = source.read_meta()
+                meta["goal"] = {"reason": "rounds exhausted"}
+                source.write_meta(meta)
+            finally:
+                source.close()
+            run._finish_spec_run(session_id, "blocked")
+            result = store.load(loop["id"])
+            if result.get("reason") != "card a could not finish: rounds exhausted":
+                fail(f"blocked implementation reported the wrong cause: {result!r}")
+            source = SessionStore.open(sessions, session_id)
+            try:
+                goal = source.read_meta()["goal"]
+            finally:
+                source.close()
+            if goal.get("reason") != "rounds exhausted":
+                fail(f"blocked goal reason changed while reporting the card: {goal!r}")
+        finally:
+            run.close()
+
+
 def _validation_loop(root: Path, sessions: Path, commands: list[str]) -> tuple[HostRun, LoopStore, dict]:
     card = {"id": "a", "title": "A", "lane": 1, "state": "running", "commit": None}
     run, store, loop = _lane_loop(root, sessions, [card])
@@ -1292,6 +1403,8 @@ def card_details() -> None:
             {"id": "a", "title": "A", "lane": 1, "state": "done", "session_id": "done-session"},
             {"id": "b", "title": "B", "lane": 1, "state": "running", "session_id": "running-session"},
             {"id": "c", "title": "C", "lane": 1, "state": "planned", "session_id": None},
+            {"id": "d", "title": "D", "lane": 1, "state": "failed", "session_id": "failed-session"},
+            {"id": "e", "title": "E", "lane": 1, "state": "review", "session_id": "review-card-session"},
             {"id": "aF", "title": "Follow-up", "lane": 1, "state": "done", "follow_up_of": "a", "after": ["a"]},
         ]
         run, store, loop = _lane_loop(root, sessions, cards)
@@ -1313,6 +1426,10 @@ def card_details() -> None:
             report.write_text("Implementation passed.\n", encoding="utf-8")
             card_worktree = create_worktree(root, sessions / "running-session" / "worktree", start=branch)
             (card_worktree / "working.py").write_text("current change\n", encoding="utf-8")
+            failed_worktree = create_worktree(root, sessions / "failed-session" / "worktree", start=branch)
+            (failed_worktree / "failed.py").write_text("failed change\n", encoding="utf-8")
+            review_worktree = create_worktree(root, sessions / "review-card-session" / "worktree", start=branch)
+            (review_worktree / "review.py").write_text("review change\n", encoding="utf-8")
             _loop_session(sessions, root, "done-session", {
                 "kind": "implement", "loop_id": loop["id"], "card_id": "a",
                 "spec": f".symphonai/loops/{loop['id']}/specs/a.md",
@@ -1359,6 +1476,12 @@ def card_details() -> None:
             status, running = _http(host, "GET", f"/loop/card?loop={loop['id']}&card=b")
             if status != 200 or "+current change" not in running.get("diff", "") or running.get("report") or running.get("review", {}).get("text"):
                 fail(f"running card detail did not return only its current patch: {status}, {running!r}")
+            status, reviewing = _http(host, "GET", f"/loop/card?loop={loop['id']}&card=e")
+            if status != 200 or "+review change" not in reviewing.get("diff", ""):
+                fail(f"review card detail omitted its worktree patch: {status}, {reviewing!r}")
+            status, failed = _http(host, "GET", f"/loop/card?loop={loop['id']}&card=d")
+            if status != 200 or "+failed change" not in failed.get("diff", ""):
+                fail(f"failed card detail omitted its worktree patch: {status}, {failed!r}")
             status, planned = _http(host, "GET", f"/loop/card?loop={loop['id']}&card=c")
             if status != 200 or planned.get("diff") or planned.get("report") or planned.get("review", {}).get("text"):
                 fail(f"planned card detail was not empty: {status}, {planned!r}")
@@ -1498,6 +1621,69 @@ def integrate_commits_a_card() -> None:
                 fail("empty card worktree created an integration commit")
         finally:
             for path in (card_a_admin, stale_admin, second_admin, integration_admin):
+                if path.exists():
+                    try:
+                        remove_worktree(root, path)
+                    except Exception:
+                        pass
+            run.close()
+
+
+@check("loops.integrate_ignores_dependency_links")
+def integrate_ignores_dependency_links() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, sessions = base / "project", base / "sessions"
+        _git_repo(root)
+        (root / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        (root / "node_modules").mkdir()
+        (root / "node_modules" / "package.json").write_text("{}\n", encoding="utf-8")
+        _git(root, "add", ".gitignore")
+        _git(root, "commit", "--quiet", "-m", "ignore node_modules")
+        store = LoopStore(root)
+        loop = store.create("Integrate through linked dependencies")
+        loop.update(
+            state="awaiting_plan",
+            cards=[{
+                "id": "a", "title": "Add a file", "lane": 1, "after": [], "state": "review",
+            }],
+        )
+        store.save(loop)
+        run = HostRun(
+            FakeModelProvider(), PermissionPolicy(root, allowed_write_scope=[root]), EventBroker(),
+            sessions_root=sessions,
+        )
+        card_admin, second_admin = sessions / "cards" / "a", sessions / "cards" / "b"
+        integration_admin = sessions / "loops" / loop["id"] / "integration"
+        try:
+            loop = run.approve_loop_plan(loop["id"])
+            integration = run._loop_integration_root(loop["id"])
+            if not (integration / "node_modules").is_symlink():
+                fail("integration worktree did not link the project node_modules folder")
+            card_worktree = create_worktree(root, card_admin, start=loop["branch"])
+            (card_worktree / "new.py").write_text("value = 2\n", encoding="utf-8")
+            commit = run.integrate(loop, loop["cards"][0], card_worktree)
+            changed = _git(integration, "diff-tree", "--no-commit-id", "--name-only", "-r", commit).decode().splitlines()
+            if changed != ["new.py"] or (integration / "new.py").read_text(encoding="utf-8") != "value = 2\n":
+                fail(f"integration commit contained unexpected paths: {changed!r}")
+            if _git(integration, "ls-tree", "-r", "--name-only", commit).decode().splitlines().count("node_modules"):
+                fail("integration commit tracked the linked node_modules folder")
+
+            second = create_worktree(root, second_admin, start=loop["branch"])
+            (second / "other.py").write_text("value = 3\n", encoding="utf-8")
+            (integration / "unrelated.txt").write_text("uncommitted\n", encoding="utf-8")
+            before_head = _git(integration, "rev-parse", "HEAD")
+            try:
+                run.integrate(loop, {"id": "b", "title": "Add another file"}, second)
+            except RuntimeError as exc:
+                if str(exc) != "integration worktree has uncommitted changes":
+                    raise
+            else:
+                fail("an unrelated untracked integration file did not stop the card")
+            if _git(integration, "rev-parse", "HEAD") != before_head or (integration / "other.py").exists():
+                fail("rejected integration changed the branch")
+        finally:
+            for path in (card_admin, second_admin, integration_admin):
                 if path.exists():
                     try:
                         remove_worktree(root, path)

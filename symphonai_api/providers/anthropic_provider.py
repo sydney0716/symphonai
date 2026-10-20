@@ -42,9 +42,11 @@ from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_se
 from symphonai_api.streaming import (
     StreamChunk,
     StreamCompleted,
+    StreamEventError,
     TextDelta,
     ToolCallDelta,
     open_stream_with_retry,
+    retry_stream_chunks,
     sse_events,
 )
 
@@ -262,7 +264,7 @@ def _anthropic_stream_chunks(
         if event == "error":
             error = data.get("error", {})
             message = error.get("message", "Anthropic API stream returned an error") if isinstance(error, dict) else "Anthropic API stream returned an error"
-            raise ProviderError(redact_secret(str(message), api_key))
+            raise StreamEventError(redact_secret(str(message), api_key), error.get("type") or error.get("code"), "anthropic")
         if event == "message_start":
             message = data.get("message", {})
             usage = message.get("usage", {}) if isinstance(message, dict) else {}
@@ -460,12 +462,9 @@ class AnthropicProvider(ModelProvider):
                 "content-type": "application/json",
             },
         )
-        lines = open_stream_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation="Anthropic API",
-            cancel=cancel,
-        )
-        yield from _anthropic_stream_chunks(lines, api_key=api_key)
+        def attempt(remaining):
+            lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
+                api_key=api_key, operation="Anthropic API", cancel=cancel)
+            return _anthropic_stream_chunks(lines, api_key=api_key)
+        yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
+                                       max_attempts=self.max_attempts, cancel=cancel)

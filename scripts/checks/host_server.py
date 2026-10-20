@@ -80,6 +80,7 @@ from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.worktree import create_worktree, worktree_diff
 from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
+from symphonai_host.loops import LoopStore
 from symphonai_host.plan import PlanChanged
 from symphonai_host.protocol import ApprovalRequested, decode_event, decode_frame
 from symphonai_host.run import HostRun, RunActiveError
@@ -2707,6 +2708,17 @@ def check_user_command_route() -> None:
                 fail(f"command result was not added before the next prompt: {user_messages!r}")
         finally:
             host.close()
+
+
+@check("host_server.user_command_output_that_is_not_utf8")
+def check_user_command_output_that_is_not_utf8() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        run = HostRun(None, PermissionPolicy(root), EventBroker(), sessions_root=root / "sessions")
+        result = run.run_user_command("printf 'ok \\247 done'")
+    output = result["output"]
+    if "ok" not in output or "\ufffd" not in output or "done" not in output:
+        fail(f"user command did not replace invalid UTF-8 output bytes: {result!r}")
 
 
 @check("host_server.user_command_does_not_block")
@@ -12771,3 +12783,272 @@ def check_empty_chat_mode_is_one_chat() -> None:
         finally:
             release.set()
             host.close()
+
+
+def _headless_loop_provider(validation_command: str = "true") -> FakeModelProvider:
+    loop_id = "loop_000000000000"
+    spec_path = f".symphonai/loops/{loop_id}/specs/a-change.md"
+    report_path = f".symphonai/loops/{loop_id}/reports/a-change-a-report.md"
+    spec = (
+        "# Change a\n\n## Validation\n\n```sh\n"
+        f"{validation_command}\n```\n\n## Report\n\n`{report_path}`\n"
+    )
+    plan = {"cards": [{
+        "id": "a", "title": "Change a", "spec": "specs/a-change.md",
+        "lane": 1, "after": [],
+    }]}
+    return FakeModelProvider([
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "plan-spec", "write_file", {"path": spec_path, "content": spec},
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "plan", "write_file", {
+                "path": f".symphonai/loops/{loop_id}/plan.json",
+                "content": json.dumps(plan),
+            },
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "Plan complete.")),
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "new-file", "write_file", {"path": "new.py", "content": "value = 2\n"},
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "report", "write_file", {"path": report_path, "content": "Implementation passed.\n"},
+        )])),
+        ModelResponse(Message(Role.ASSISTANT, "Implemented the change.")),
+        ModelResponse(Message(Role.ASSISTANT, "Verdict: pass")),
+    ])
+
+
+@check("host_server.headless_loop")
+def check_headless_loop() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "headless-loop@example.test"),
+            ("config", "user.name", "Headless Loop Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+
+        provider = _headless_loop_provider()
+        with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+            code, output, error, sessions = _headless_invoke(
+                root,
+                provider,
+                ["loop", "Add new.py", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
+        try:
+            result = json.loads(output)
+        except ValueError as exc:
+            fail(f"headless loop did not emit JSON: {code}, {output!r}, {error!r}: {exc}")
+        loop = LoopStore(root).load(result.get("loop_id", ""))
+        if (code != 0 or result.get("state") != "awaiting_commit"
+                or loop.get("state") != "awaiting_commit" or not loop.get("branch")
+                or result.get("branch") != loop.get("branch")
+                or not result.get("cards") or not result["cards"][0].get("commit")
+                or loop["cards"][0].get("state") != "done"
+                or loop["cards"][0].get("commit") != result["cards"][0].get("commit")
+                or not result.get("summary", {}).get("commits")
+                or result["summary"]["commits"][0].get("card") != "a"
+                or not result.get("summary", {}).get("validation")
+                or result["summary"]["validation"][0].get("command") != "true"
+                or result["summary"]["validation"][0].get("exit") != 0
+                or not (sessions / "loops" / loop["id"] / "integration").is_dir()):
+            fail(f"headless loop did not stop at a committed checkpoint: {code}, {result!r}, {loop!r}, {error!r}")
+        branch_ref = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{loop['branch']}"],
+            cwd=root, check=False,
+        )
+        if branch_ref.returncode != 0:
+            fail(f"headless loop branch was missing at checkpoint: {loop['branch']!r}")
+        integration = sessions / "loops" / loop["id"] / "integration"
+        if not (integration / "new.py").is_file() or "card a" not in error:
+            fail(f"headless loop did not run its card or report card changes: {error!r}")
+        committer = HostRun(
+            FakeModelProvider(), PermissionPolicy(root, allowed_write_scope=[root]),
+            EventBroker(), sessions_root=sessions,
+        )
+        try:
+            committer.commit_loop(loop["id"], "approve")
+        finally:
+            committer.close()
+        if LoopStore(root).load(loop["id"])["state"] != "done":
+            fail("later checkpoint approval did not finish the headless loop")
+
+    class TerminalInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(headless_module.sys, "stdin", TerminalInput()):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = headless_module.main([
+                    "loop", "--repo-root", str(root), "--provider", "openai",
+                ])
+        if code != 2 or "goal is required when stdin is a terminal" not in stderr.getvalue():
+            fail(f"headless loop without a terminal goal did not return usage: {code}, {stderr.getvalue()!r}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "headless-loop@example.test"),
+            ("config", "user.name", "Headless Loop Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+        code, output, error, _sessions = _headless_invoke(
+            root, _headless_loop_provider("false"),
+            ["loop", "Add blocked.py", "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        result = json.loads(output)
+        if (code != 1 or result.get("state") != "needs_attention"
+                or not result.get("reason") or result["reason"] not in output
+                or "loop " not in error):
+            fail(f"blocked loop did not report needs_attention: {code}, {result!r}, {error!r}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "headless-loop@example.test"),
+            ("config", "user.name", "Headless Loop Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+
+        class BlockingProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__(_headless_loop_provider()._responses)
+                self.card_started = threading.Event()
+                self.card_cancelled = threading.Event()
+                self.release_card = threading.Event()
+
+            def create_response(self, request, *, cancel=None):
+                if self.call_count == 3:
+                    self.card_started.set()
+                    deadline = time.monotonic() + 10
+                    while not self.release_card.wait(0.01) and time.monotonic() < deadline:
+                        if cancel is not None and cancel.cancelled:
+                            self.card_cancelled.set()
+                            break
+                    if cancel is not None and cancel.cancelled:
+                        self.card_cancelled.set()
+                return super().create_response(request, cancel=cancel)
+
+        provider = BlockingProvider()
+        command_result = []
+        command_errors = []
+
+        def invoke_loop() -> None:
+            try:
+                command_result.append(_headless_invoke(
+                    root, provider,
+                    ["loop", "Add new.py", "--json", "--repo-root", str(root), "--provider", "openai"],
+                ))
+            except BaseException as exc:
+                command_errors.append(exc)
+
+        store = LoopStore(root)
+        with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+            command_thread = threading.Thread(target=invoke_loop, daemon=True)
+            command_thread.start()
+            deadline = time.monotonic() + 5
+            loop = None
+            while time.monotonic() < deadline:
+                try:
+                    loop = store.list()[0]
+                except IndexError:
+                    time.sleep(0.01)
+                    continue
+                if loop.get("state") == "running" and provider.card_started.is_set():
+                    break
+                time.sleep(0.01)
+            if loop is None or loop.get("state") != "running" or not provider.card_started.is_set():
+                provider.release_card.set()
+                command_thread.join(timeout=3)
+                fail(f"headless loop did not block in its card: {loop!r}")
+
+            canceller = HostRun(
+                FakeModelProvider(), PermissionPolicy(root, allowed_write_scope=[root]),
+                EventBroker(), sessions_root=root.parent / "sessions",
+            )
+            try:
+                canceller.cancel_loop(loop["id"])
+            finally:
+                canceller.close()
+            command_thread.join(timeout=3)
+            if command_thread.is_alive():
+                provider.release_card.set()
+                cancelled = store.load(loop["id"])
+                cancelled.update(state="needs_attention", reason="test cleanup")
+                store.save(cancelled)
+                command_thread.join(timeout=3)
+                fail("headless command did not exit after another HostRun cancelled its loop")
+            if command_errors:
+                fail(f"headless cancellation command raised: {command_errors[0]!r}")
+            code, output, _error, _sessions = command_result[0]
+            result = json.loads(output)
+            if code != 1 or result.get("state") != "cancelled":
+                fail(f"headless cancellation returned the wrong result: {code}, {result!r}")
+            if not provider.card_cancelled.is_set():
+                fail("headless cancellation did not stop the active card conversation")
+
+
+@check("host_server.headless_loop_is_not_recovered_while_running")
+def check_headless_loop_is_not_recovered_while_running() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        sessions = Path(temporary) / "sessions"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "loop-recovery@example.test"),
+            ("config", "user.name", "Loop Recovery Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        store = LoopStore(root)
+        loop = store.create("Recover a running card")
+        loop.update(
+            state="running",
+            runner_pid=os.getpid(),
+            cards=[{"id": "a", "title": "A", "state": "running", "session_id": "run_card"}],
+            lanes=[{"id": 1, "cards": ["a"]}],
+        )
+        store.save(loop)
+
+        with mock.patch.object(HostRun, "_advance_loop", lambda _self, _loop_id: None):
+            live_host = HostServer(
+                FakeModelProvider(), PermissionPolicy(root), sessions_root=sessions,
+            )
+            try:
+                live_loop = store.load(loop["id"])
+                if live_loop["cards"][0]["state"] != "running":
+                    fail(f"host recovered a card while its headless runner was alive: {live_loop!r}")
+            finally:
+                live_host.close()
+
+            stale = store.load(loop["id"])
+            stale["runner_pid"] = os.getpid() + 10_000_000
+            store.save(stale)
+            recovered_host = HostServer(
+                FakeModelProvider(), PermissionPolicy(root), sessions_root=sessions,
+            )
+            try:
+                recovered = store.load(loop["id"])
+                if recovered["cards"][0]["state"] != "planned":
+                    fail(f"host did not recover the card after its runner exited: {recovered!r}")
+            finally:
+                recovered_host.close()

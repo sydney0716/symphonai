@@ -11,7 +11,7 @@ import urllib.request
 from unittest import mock
 
 from symphonai_api.agent_loop import ApiAgent
-from symphonai_api.cancellation import CancellationToken
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.compaction import estimate_messages_tokens
 from symphonai_api.events import (
     AssistantTextDelta,
@@ -34,6 +34,7 @@ from symphonai_api.providers.base import (
     ContextLengthExceededError,
     ModelProvider,
     ProviderError,
+    ProviderUnavailableError,
 )
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.providers.gemini_provider import GeminiProvider, _build_request_body
@@ -1683,6 +1684,204 @@ def check_openai_error_event() -> None:
                     fail(f"OpenAI error did not retain/redact the vendor message: {exc}")
             else:
                 fail("OpenAI SSE error payload did not raise ProviderError")
+
+
+@check("streaming.error_event_before_output_is_retried")
+def check_error_event_before_output_is_retried() -> None:
+    key = "stream-retry-key"
+    failed = [b'event: response.created\n', b'event: error\n',
+              b'data: {"error":{"code":"server_error","message":"temporary vendor failure"}}\n\n']
+    success = [b'event: response.output_text.delta\n', b'data: {"delta":"second answer"}\n\n',
+               b'event: response.completed\n', b'data: {"response":{"status":"completed","output":[]}}\n\n']
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=[_LinesResponse(failed), _LinesResponse(success)]) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", return_value=True):
+        provider = OpenAIProvider(max_attempts=2)
+        chunks = list(provider.create_response_stream(_request()))
+    if opener.call_count != 2 or _assemble(chunks).message.text != "second answer":
+        fail(f"Responses transient stream error was not retried: calls={opener.call_count}, chunks={chunks!r}")
+
+    failed_request = [b'event: error\n', b'data: {"error":{"code":"context_length_exceeded","message":"too long"}}\n\n']
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", return_value=_LinesResponse(failed_request)) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", return_value=True):
+        try:
+            list(OpenAIProvider(max_attempts=3).create_response_stream(_request()))
+        except ProviderError as exc:
+            if isinstance(exc, ProviderUnavailableError):
+                fail("context length stream error was classified as transient")
+        else:
+            fail("context length stream error was accepted")
+    if opener.call_count != 1:
+        fail(f"non-retryable stream error opened {opener.call_count} requests")
+
+    chat_failure = [b'data: {"error":{"code":"server_error","message":"temporary chat failure"}}\n\n']
+    chat_success = [b'data: {"choices":[{"delta":{"content":"chat answer"}}]}\n\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', b'data: [DONE]\n\n']
+    with mock.patch.dict(os.environ, {"STREAM_RETRY_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=[_LinesResponse(chat_failure), _LinesResponse(chat_success)]) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", return_value=True):
+        provider = OpenAICompatibleProvider("STREAM_RETRY_KEY", "https://compatible.invalid/v1", max_attempts=2)
+        chunks = list(provider.create_response_stream(_request()))
+    if opener.call_count != 2 or _assemble(chunks).message.text != "chat answer":
+        fail(f"chat-completions transient stream error was not retried: calls={opener.call_count}, chunks={chunks!r}")
+
+    anthropic_failure = [b'event: error\n', b'data: {"type":"error","error":{"type":"overloaded_error","message":"temporary Anthropic failure"}}\n\n']
+    anthropic_success = [b'event: message_start\n', b'data: {"message":{"usage":{}}}\n\n',
+                         b'event: content_block_start\n', b'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+                         b'event: content_block_delta\n', b'data: {"index":0,"delta":{"type":"text_delta","text":"Anthropic answer"}}\n\n',
+                         b'event: message_stop\n', b'data: {}\n\n']
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=[_LinesResponse(anthropic_failure), _LinesResponse(anthropic_success)]) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", return_value=True):
+        chunks = list(AnthropicProvider(max_attempts=2).create_response_stream(_request()))
+    if opener.call_count != 2 or _assemble(chunks).message.text != "Anthropic answer":
+        fail(f"Anthropic overload stream error was not retried: calls={opener.call_count}, chunks={chunks!r}")
+
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", return_value=_LinesResponse(failed)) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", side_effect=lambda **kwargs: kwargs["attempt"] < kwargs["max_attempts"]):
+        try:
+            list(OpenAIProvider(max_attempts=2).create_response_stream(_request()))
+        except ProviderUnavailableError as exc:
+            if "temporary vendor failure" not in str(exc):
+                fail(f"exhausted stream error lost the vendor message: {exc}")
+        else:
+            fail("exhausted transient stream errors did not raise ProviderUnavailableError")
+    if opener.call_count != 2:
+        fail(f"exhausted transient stream error made {opener.call_count} requests")
+
+    anthropic_tool_failure = [
+        b'event: content_block_start\n', b'data: {"index":0,"content_block":{"type":"tool_use","id":"bad","name":"write_file","input":{}}}\n\n',
+        b'event: content_block_delta\n', b'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\": \\"a"}}\n\n',
+        b'event: error\n', b'data: {"error":{"type":"overloaded_error","message":"retry tool"}}\n\n',
+    ]
+    anthropic_tool_success = [
+        b'event: content_block_start\n', b'data: {"index":0,"content_block":{"type":"tool_use","id":"good","name":"write_file","input":{}}}\n\n',
+        b'event: content_block_delta\n', b'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\": \\"b.py\\"}"}}\n\n',
+        b'event: message_stop\n', b'data: {}\n\n',
+    ]
+    with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=[_LinesResponse(anthropic_tool_failure), _LinesResponse(anthropic_tool_success)]) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", return_value=True):
+        chunks = list(AnthropicProvider(max_attempts=2).create_response_stream(_request()))
+    calls = _assemble(chunks).message.tool_calls
+    if opener.call_count != 2 or len(calls) != 1 or calls[0].arguments != {"path": "b.py"}:
+        fail(f"Anthropic retry leaked failed tool fragments: calls={opener.call_count}, result={calls!r}")
+
+    chat_tool_failure = [b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"bad","function":{"name":"write_file","arguments":"{\\"path\\": \\"a"}}]}}]}\n\n',
+                         b'data: {"error":{"code":"server_error","message":"retry tool"}}\n\n']
+    chat_tool_success = [b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"good","function":{"name":"write_file","arguments":"{\\"path\\": \\"b.py\\"}"}}]}}]}\n\n',
+                         b'data: [DONE]\n\n']
+    with mock.patch.dict(os.environ, {"STREAM_RETRY_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=[_LinesResponse(chat_tool_failure), _LinesResponse(chat_tool_success)]) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", return_value=True):
+        provider = OpenAICompatibleProvider("STREAM_RETRY_KEY", "https://compatible.invalid/v1", max_attempts=2)
+        chunks = list(provider.create_response_stream(_request()))
+    calls = _assemble(chunks).message.tool_calls
+    if opener.call_count != 2 or len(calls) != 1 or calls[0].arguments != {"path": "b.py"}:
+        fail(f"chat retry leaked failed tool fragments: calls={opener.call_count}, result={calls!r}")
+
+    request = urllib.request.Request("https://api.openai.com/v1/responses")
+    retry_after_error = urllib.error.HTTPError(request.full_url, 503, "busy", {"Retry-After": "7"}, io.BytesIO(b"busy"))
+    slept: list[float] = []
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=[retry_after_error, _LinesResponse(success)]) as opener, \
+         mock.patch("symphonai_api.retry.time.sleep", side_effect=lambda delay: slept.append(delay)):
+        chunks = list(OpenAIProvider(max_attempts=2).create_response_stream(_request()))
+    if opener.call_count != 2 or slept != [7.0]:
+        fail(f"stream HTTP retry ignored Retry-After: calls={opener.call_count}, sleeps={slept!r}")
+
+    errors = [urllib.error.HTTPError(request.full_url, 503, "busy", {"Retry-After": "0"}, io.BytesIO(b"busy")) for _ in range(3)]
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=errors) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", side_effect=lambda **kwargs: kwargs["attempt"] < kwargs["max_attempts"]):
+        try:
+            list(OpenAIProvider(max_attempts=3).create_response_stream(_request()))
+        except ProviderUnavailableError as exc:
+            if exc.status != 503:
+                fail(f"exhausted HTTP stream retry lost status 503: {exc.status}")
+        else:
+            fail("exhausted HTTP stream retry did not raise ProviderUnavailableError")
+    if opener.call_count != 3:
+        fail(f"exhausted HTTP stream retry made {opener.call_count} requests")
+
+    mixed = [urllib.error.HTTPError(request.full_url, 503, "busy", {"Retry-After": "0"}, io.BytesIO(b"busy")),
+             _LinesResponse([b'event: error\n', b'data: {"error":{"code":"server_error","message":"transient"}}\n\n']),
+             _LinesResponse([b'event: error\n', b'data: {"error":{"code":"server_error","message":"transient"}}\n\n'])]
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", side_effect=mixed) as opener, \
+         mock.patch("symphonai_api.streaming._wait_before_retry", side_effect=lambda **kwargs: kwargs["attempt"] < kwargs["max_attempts"]):
+        try:
+            list(OpenAIProvider(max_attempts=3).create_response_stream(_request()))
+        except ProviderUnavailableError:
+            pass
+        else:
+            fail("mixed HTTP and event failures unexpectedly succeeded")
+    if opener.call_count != 3:
+        fail(f"HTTP and event retries multiplied the attempt budget: {opener.call_count} requests")
+
+    cancel = CancellationToken()
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}), \
+         mock.patch("urllib.request.urlopen", return_value=_LinesResponse(failed)), \
+         mock.patch.object(cancel, "wait", side_effect=lambda delay: (cancel.cancel() or True)):
+        try:
+            list(OpenAIProvider(max_attempts=3).create_response_stream(_request(), cancel=cancel))
+        except OperationCancelled:
+            pass
+        else:
+            fail("cancellation during stream retry backoff was not raised")
+
+
+@check("streaming.text_streams_before_the_response_ends")
+def check_text_streams_before_the_response_ends() -> None:
+    class _TrackingResponse(_LinesResponse):
+        def __init__(self, lines):
+            super().__init__(lines)
+            self.read_count = 0
+
+        def __iter__(self):
+            for chunk in self._lines:
+                for line in chunk.splitlines(keepends=True):
+                    self.read_count += 1
+                    yield line
+
+    responses = [
+        (
+            OpenAIProvider(),
+            "OPENAI_API_KEY",
+            [
+                b"event: response.output_text.delta\n", b'data: {"delta":"first"}\n\n',
+                b"event: response.created\n", b"data: {}\n\n",
+                b"event: response.created\n", b"data: {}\n\n",
+                b"event: response.completed\n", b'data: {"response":{"status":"completed","output":[]}}\n\n',
+            ],
+        ),
+        (
+            AnthropicProvider(),
+            "ANTHROPIC_API_KEY",
+            [
+                b"event: message_start\n", b'data: {"message":{"usage":{}}}\n\n',
+                b"event: content_block_start\n", b'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+                b"event: content_block_delta\n", b'data: {"index":0,"delta":{"type":"text_delta","text":"first"}}\n\n',
+                b"event: message_delta\n", b'data: {"delta":{},"usage":{}}\n\n',
+                b"event: message_stop\n", b"data: {}\n\n",
+            ],
+        ),
+    ]
+    for provider, key_name, transcript in responses:
+        response = _TrackingResponse(transcript)
+        with mock.patch.dict(os.environ, {key_name: "stream-test-key"}), \
+             mock.patch("urllib.request.urlopen", return_value=response):
+            chunks = provider.create_response_stream(_request())
+            try:
+                first_text = next(chunk for chunk in chunks if isinstance(chunk, TextDelta))
+                if first_text.text != "first":
+                    fail(f"unexpected first streamed text: {first_text!r}")
+                if response.read_count >= sum(len(part.splitlines(keepends=True)) for part in transcript):
+                    fail(f"{provider.name} held text until the response ended")
+            finally:
+                chunks.close()
 
 
 def _gemini_transcript(*, signature: bool = True, two_calls: bool = False) -> list[bytes]:

@@ -62,7 +62,7 @@ from symphonai_api.tools.edit import _diff_result
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.metadata import call_target
 from symphonai_api.tools.shell import shell_environment, shell_executable
-from symphonai_api.worktree import WorktreeDiff, WorktreeError, remove_worktree, worktree_diff
+from symphonai_api.worktree import WorktreeDiff, WorktreeError, _linked_paths, remove_worktree, worktree_diff
 from symphonai_api.worktree import create_worktree
 from symphonai_api.web_search import HttpJsonSearchBackend, search_endpoint
 from symphonai_host.broker import EventBroker
@@ -745,9 +745,12 @@ class HostRun:
                 self._conversation, self._policy, self._active = previous
                 raise
 
-    def start_loop(self, goal: str) -> dict:
+    def start_loop(self, goal: str, *, runner_pid: int | None = None) -> dict:
         store = LoopStore(self._repo_root)
         loop = store.create(goal)
+        if runner_pid is not None:
+            loop["runner_pid"] = runner_pid
+            store.save(loop)
         return self._start_loop_planner(loop, "created")
 
     def _start_loop_planner(
@@ -765,7 +768,9 @@ class HostRun:
             )
         prompt = (
             f"Plan this goal: {loop['goal']}\n\n"
-            f"Write one Markdown spec per card at {folder / 'specs'}/<id>-<slug>.md using ids a through h in order. "
+            f"Write one Markdown spec per card at {folder / 'specs'}/<id>-<slug>.md. Use as few cards as the goal needs: "
+            "one card is right for a small change. Split only where a card can be implemented and reviewed on its own. "
+            "Use ids starting at a in order, with at most 8 cards. "
             f"Follow {self._repo_root / 'specs' / 'TEMPLATE.md'} if it exists; otherwise use the sections "
             "Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report. "
             "The Validation section must hold one fenced `sh` block with one shell command per line, "
@@ -774,6 +779,8 @@ class HostRun:
             "on each other into the same lane, with at most 3 lanes. Write plan.json last at "
             f"{folder / 'plan.json'} as {{\"cards\":[{{\"id\":\"a\",\"title\":\"Short title\","
             "\"spec\":\"specs/a-short-title.md\",\"lane\":1,\"after\":[]}]}}. "
+            "A card whose work documents, tests, or builds on another card's change lists that card in `after`, "
+            "whether or not they share a lane. A card starts from the work of the cards before it and sees nothing else. "
             "For this loop, that plan.json path is the only permitted exception to the planner instruction "
             "to write under specs/." + revision
         )
@@ -1013,7 +1020,12 @@ class HostRun:
         diff = self._loop_card_diff(loop_id, Path(worktree))
         if not diff.patch:
             return ""
-        if _loop_git(integration_root, "status", "--porcelain").stdout:
+        linked = _linked_paths(integration_root.resolve())
+        status = _loop_git(
+            integration_root, "status", "--porcelain", "--untracked-files=all", "--", ".",
+            *(f":(exclude){path}" for path in linked),
+        ).stdout
+        if status:
             raise RuntimeError("integration worktree has uncommitted changes")
         patch = diff.patch.encode("utf-8", errors="surrogateescape")
         checked = subprocess.run(
@@ -1030,7 +1042,7 @@ class HostRun:
         if applied.returncode:
             message = applied.stderr.decode("utf-8", errors="replace").strip()
             raise WorktreeApplyConflict(message or "git apply failed")
-        _loop_git(integration_root, "add", "-A")
+        worktree_diff(integration_root)
         _loop_git(integration_root, "commit", "-m", f"{card['id']}: {card['title']}")
         return os.fsdecode(_loop_git(integration_root, "rev-parse", "HEAD").stdout.strip())
 
@@ -1157,7 +1169,9 @@ class HostRun:
                 self._loop_changed(loop, "state")
                 self._start_loop_validation(loop_id)
 
-    def _finish_loop_card_run(self, session_id: str, state: str) -> None:
+    def _finish_loop_card_run(
+        self, session_id: str, state: str, *, error: str = "", goal_reason: str = "",
+    ) -> None:
         info = {}
         try:
             source = SessionStore.open(self._sessions_root, session_id)
@@ -1179,7 +1193,8 @@ class HostRun:
                     self._loop_card_changed(loop, card)
                     self._advance_loop(loop_id)
                     return
-                self._loop_attention(loop, f"card {card_id} could not finish: {state}", card)
+                cause = error or goal_reason or state
+                self._loop_attention(loop, f"card {card_id} could not finish: {cause}", card)
         except (OSError, KeyError, ValueError, SessionError) as exc:
             if isinstance(info, dict) and info.get("loop_id"):
                 with self._lock:
@@ -1203,7 +1218,16 @@ class HostRun:
                 source.close()
             verdict = result.get("verdict")
             if verdict not in ("passed", "follow-ups"):
-                self._loop_attention(loop, f"card {card_id} review did not pass", card)
+                error = result.get("error")
+                if error:
+                    reason = f"card {card_id} review failed: {error}"
+                elif verdict == "tree-changed":
+                    reason = f"card {card_id} review changed files other than its follow-up specs"
+                elif verdict == "no-verdict":
+                    reason = f"card {card_id} review gave no verdict"
+                else:
+                    reason = f"card {card_id} review did not pass"
+                self._loop_attention(loop, reason, card)
                 return
             try:
                 card_worktree = self._sessions_root / review_info["of"] / "worktree"
@@ -1497,7 +1521,7 @@ class HostRun:
                 diff_bytes = _loop_git(
                     self._repo_root, "show", "--format=", "--binary", commit,
                 ).stdout
-        elif card.get("state") == "running" and isinstance(card.get("session_id"), str):
+        elif isinstance(card.get("session_id"), str):
             worktree = self._sessions_root / card["session_id"] / "worktree"
             if worktree.is_dir():
                 try:
@@ -1559,6 +1583,16 @@ class HostRun:
                     continue
                 if loop.get("state") != "running":
                     continue
+                runner_pid = loop.get("runner_pid")
+                if type(runner_pid) is int and runner_pid > 0:
+                    try:
+                        os.kill(runner_pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    except OSError:
+                        continue
+                    else:
+                        continue
                 changed = False
                 changed_cards = []
                 for card in loop.get("cards", []):
@@ -3291,6 +3325,7 @@ class HostRun:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                errors="replace",
                 start_new_session=True,
             )
             with self._lock:
@@ -4095,7 +4130,8 @@ class HostRun:
         with self._lock:
             self._close_idle_conversations_locked()
 
-    def _finish_spec_run(self, session_id: str, phase: str) -> None:
+    def _finish_spec_run(self, session_id: str, phase: str, *, error: str = "") -> None:
+        goal_reason = ""
         try:
             store = SessionStore.open(self._sessions_root, session_id)
             try:
@@ -4103,6 +4139,9 @@ class HostRun:
                 info = meta.get("spec_run")
                 if not isinstance(info, dict) or info.get("kind") != "implement":
                     return
+                goal = meta.get("goal")
+                if isinstance(goal, dict) and isinstance(goal.get("reason"), str):
+                    goal_reason = goal["reason"]
                 root = self._sessions_root / session_id / "worktree"
                 report = info.get("report")
                 copied = False
@@ -4128,7 +4167,9 @@ class HostRun:
         except (OSError, SessionError, ValueError):
             return
         self._finish_loop_card_run(
-            session_id, {"complete": "finished", "blocked": "blocked", "paused": "stopped"}.get(phase, "stopped"),
+            session_id,
+            {"complete": "finished", "blocked": "blocked", "paused": "stopped"}.get(phase, "stopped"),
+            error=error, goal_reason=goal_reason,
         )
 
     def _finish_spec_review(self, session_id: str, leader: Leader, terminal_event: RunFinished | RunFailed | None) -> None:
@@ -4336,7 +4377,10 @@ class HostRun:
                 goal.phase = "paused"
                 goal.reason = reason
                 self._save_goal(session_id, goal)
-                self._finish_spec_run(session_id, "paused")
+                self._finish_spec_run(
+                    session_id, "paused",
+                    error=terminal_event.error if isinstance(terminal_event, RunFailed) else "",
+                )
                 self._goal_event("pause", goal, run_id, leader.agent_ref.agent_id)
                 run_check_now = False
         if run_check_now:

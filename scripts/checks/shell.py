@@ -314,6 +314,20 @@ def check_command_argument() -> None:
             fail(f"command argument validation changed for {arguments!r}: {tool.validate(arguments)!r}")
 
 
+@check("shell.output_that_is_not_utf8")
+def check_output_that_is_not_utf8() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        policy = PermissionPolicy(repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()])
+        with mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False):
+            result = RunShellTool().execute(
+                ToolCall("invalid-utf8", "run_shell", {"argv": ["printf", "ok \\247 done"]}),
+                policy,
+            )
+    if not result.ok or "ok" not in result.content or "\ufffd" not in result.content or "done" not in result.content:
+        fail(f"run_shell did not replace invalid UTF-8 output bytes: {result!r}")
+
+
 @check("shell.sandbox_write_confinement")
 def check_shell_sandbox_write_confinement() -> None:
     if _sandbox_skip():

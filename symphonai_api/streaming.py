@@ -49,7 +49,82 @@ class StreamCompleted:
     response: ModelResponse
 
 
+class StreamEventError(ProviderError):
+    """A vendor error event, retaining its code for retry classification."""
+
+    def __init__(self, message: str, code: str | None = None, vendor: str = "openai") -> None:
+        super().__init__(message)
+        self.code = code
+        self.vendor = vendor
+
+
+class _StreamUnavailableError(ProviderUnavailableError):
+    def __init__(self, message: str, *, status: int | None, retry_after: str | None = None) -> None:
+        super().__init__(message, status=status)
+        self.retry_after = retry_after
+
+
 StreamChunk = TextDelta | ToolCallDelta | StreamCompleted
+
+
+def retry_stream_chunks(
+    factory, *, timeout: float, max_attempts: int,
+    cancel: CancellationToken | None = None,
+):
+    """Retry transient stream failures until answer text has been yielded."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    deadline = time.monotonic() + timeout
+    for attempt in range(1, max_attempts + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderError(f"stream exceeded its {timeout}s overall timeout")
+        chunks: list[StreamChunk] = []
+        text_yielded = False
+        try:
+            for chunk in factory(remaining):
+                if isinstance(chunk, TextDelta):
+                    if not text_yielded:
+                        yield from chunks
+                        chunks.clear()
+                        text_yielded = True
+                    yield chunk
+                elif text_yielded:
+                    yield chunk
+                else:
+                    chunks.append(chunk)
+            if not text_yielded:
+                yield from chunks
+            return
+        except StreamEventError as exc:
+            if text_yielded:
+                yield from chunks
+            permanent_codes = (
+                {"invalid_request_error", "context_length_exceeded", "invalid_prompt"}
+                if exc.vendor == "openai"
+                else {"invalid_request_error", "authentication_error", "permission_error",
+                      "not_found_error", "request_too_large"}
+            )
+            permanent = exc.code in permanent_codes
+            if text_yielded or permanent:
+                raise ProviderError(str(exc)) from None
+            if _wait_before_retry(attempt=attempt, max_attempts=max_attempts,
+                                  deadline=deadline, retry_after=None, cancel=cancel):
+                continue
+            raise ProviderUnavailableError(str(exc), status=None) from None
+        except ProviderUnavailableError as exc:
+            if text_yielded:
+                yield from chunks
+                raise ProviderError(str(exc)) from None
+            retry_after = getattr(exc, "retry_after", None)
+            if _wait_before_retry(attempt=attempt, max_attempts=max_attempts,
+                                  deadline=deadline, retry_after=retry_after, cancel=cancel):
+                continue
+            raise ProviderUnavailableError(str(exc), status=exc.status) from None
+        except ProviderError:
+            yield from chunks
+            raise
+    raise AssertionError("stream retry loop exhausted without returning or raising")
 
 
 @dataclass
@@ -209,7 +284,7 @@ def open_stream_with_retry(
                 continue
             message = f"{operation} stream returned HTTP {exc.code}: {reason}"
             if not yielded and retryable_status:
-                raise ProviderUnavailableError(message, status=exc.code) from None
+                raise _StreamUnavailableError(message, status=exc.code, retry_after=retry_after) from None
             raise ProviderError(message) from None
         except urllib.error.URLError as exc:
             reason = redact_secret(str(exc.reason), api_key)

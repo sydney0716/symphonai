@@ -341,6 +341,7 @@ class RunShellTool(LocalTool):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                errors="replace",
                 start_new_session=True,
             )
             deadline = time.monotonic() + timeout_seconds
