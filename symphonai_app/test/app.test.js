@@ -1352,16 +1352,32 @@ test("Roadmap adds, reorders, starts goals, and opens the returned loop", async 
   assert.match(visibleText(loopsPane), /Second goal/);
 });
 
+test("Roadmap state labels stay readable without changing which goals can start", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(undefined, { roadmapGoals: [
+    { id: "g1", goal: "New goal", loop_id: null, done: false, state: "not_started" },
+    { id: "g2", goal: "Restart goal", loop_id: "l2", done: false, state: "cancelled" },
+  ] });
+  await start({ global: {}, document, client });
+  const pane = document.getElementById("roadmap");
+  const rows = find(pane, (node) => node.className === "roadmap-goals").children;
+  assert.match(visibleText(rows[0]), /Not started/);
+  assert.match(visibleText(rows[1]), /Cancelled/);
+  for (const row of rows) {
+    assert.ok(find(row, (node) => node.tagName === "BUTTON" && node.textContent === "Start"));
+  }
+});
+
 test("LoopChanged refreshes the Roadmap goal state", async () => {
   const document = new FakeDocument();
   const client = fakeClient(undefined, { roadmapGoals: [
     { id: "g1", goal: "Build the feature", loop_id: "l1", done: false, state: "running" },
   ] });
   await start({ global: {}, document, client });
-  await client.emit(eventFrame("LoopChanged", { loop_id: "l1", state: "validating" }));
+  await client.emit(eventFrame("LoopChanged", { loop_id: "l1", state: "needs_attention" }));
   const row = find(document.getElementById("roadmap"), (node) => node.className === "roadmap-goal");
   assert.match(visibleText(row), /Build the feature/);
-  assert.match(visibleText(row), /validating/);
+  assert.match(visibleText(row), /Needs attention/);
   assert.ok(client.calls.roadmap >= 2);
 });
 
@@ -1475,8 +1491,8 @@ test("Loop tab renders lanes and refreshes the shown loop after LoopChanged", as
   const lanes = walk(pane).filter((node) => node.className === "loop-lane");
   assert.equal(lanes.length, 2);
   const dropped = walk(pane).find((node) => node.className === "loop-card loop-card-dimmed");
-  assert.match(find(dropped, (node) => node.className === "loop-card-open").textContent, /b · Old approach · dropped/);
-  assert.match(visibleText(pane), /State: running/);
+  assert.match(find(dropped, (node) => node.className === "loop-card-open").textContent, /b · Old approach · Dropped/);
+  assert.match(visibleText(pane), /State: Running/);
 
   loopReplies[id] = { loop: {
     ...loop,
@@ -1487,7 +1503,7 @@ test("Loop tab renders lanes and refreshes the shown loop after LoopChanged", as
     loop_id: id, state: "running", change: "card", card_id: "a", reason: "",
   }));
   assert.equal(client.calls.loop.length, readsBefore + 1);
-  assert.match(find(pane, (node) => node.className === "loop-card-open" && node.textContent.startsWith("a ·")).textContent, /running/);
+  assert.match(find(pane, (node) => node.className === "loop-card-open" && node.textContent.startsWith("a ·")).textContent, /Running/);
 });
 
 test("LoopChanged updates the list state for a loop that is not selected", async () => {
@@ -1505,7 +1521,7 @@ test("LoopChanged updates the list state for a loop that is not selected", async
   }));
 
   const second = walk(pane).find((node) => node.className === "loop-list-item" && node.textContent.startsWith("Second"));
-  assert.match(second.textContent, /Second · running$/);
+  assert.match(second.textContent, /Second · Running$/);
 });
 
 test("a rejected spec loop start shows the host error and keeps the composer text", async () => {
@@ -1557,7 +1573,7 @@ test("awaiting-plan cards can be approved or dropped and the board uses each rep
   const approvePane = find(approveDocument.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
   await find(approvePane, (node) => node.tagName === "BUTTON" && node.textContent === "Approve plan").dispatch("click");
   assert.deepEqual(approveClient.calls.loopPlan, [{ loopId: id, action: "approve" }]);
-  assert.match(visibleText(approvePane), /State: running/);
+  assert.match(visibleText(approvePane), /State: Running/);
 
   const dropDocument = new FakeDocument();
   const dropClient = fakeClient(fixtureRoadmap(), {
@@ -1641,7 +1657,7 @@ test("revise sends its note and renders the planning loop returned by the host",
   await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Revise…").dispatch("click");
 
   assert.deepEqual(client.calls.loopPlan, [{ loopId: id, action: "revise", note: "split b into two" }]);
-  assert.match(visibleText(pane), /State: planning/);
+  assert.match(visibleText(pane), /State: Planning/);
   assert.equal(find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Approve plan"), undefined);
 });
 
@@ -1672,7 +1688,7 @@ test("cancel asks inline and Keep running makes no request", async () => {
   await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Cancel loop").dispatch("click");
   await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Cancel loop").dispatch("click");
   assert.deepEqual(client.calls.loopCancel, [id]);
-  assert.match(visibleText(pane), /State: cancelled/);
+  assert.match(visibleText(pane), /State: Cancelled/);
 });
 
 test("needs-attention loop shows its reason and resumes", async () => {
@@ -1695,9 +1711,10 @@ test("needs-attention loop shows its reason and resumes", async () => {
   await app.openTool("Loop");
   const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
   assert.match(visibleText(pane), /merge conflict/);
+  assert.match(visibleText(pane), /State: Needs attention/);
   await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Resume").dispatch("click");
   assert.deepEqual(client.calls.loopResume, [id]);
-  assert.match(visibleText(pane), /State: running/);
+  assert.match(visibleText(pane), /State: Running/);
 });
 
 test("card details render markdown, diff, review and conversation with Back and Escape", async () => {
@@ -1798,7 +1815,7 @@ test("card review follow-up links open the follow-up card", async () => {
   await find(pane, (node) => node.className === "loop-follow-up" && node.textContent === "aF").dispatch("click");
 
   assert.deepEqual(client.calls.loopCard, [[id, "a"], [id, "aF"]]);
-  assert.match(visibleText(pane), /aF · Fix review finding · planned/);
+  assert.match(visibleText(pane), /aF · Fix review finding · Planned/);
   assert.match(visibleText(pane), /Spec for aF/);
 });
 
@@ -1826,6 +1843,7 @@ test("awaiting-commit board shows commits, files, folded validation and keeps th
   const app = await start({ global: {}, document, client });
   await app.openTool("Loop");
   const pane = find(document.getElementById("status-rail"), (node) => node.className === "rail-pane loop-pane");
+  assert.match(visibleText(pane), /State: Awaiting commit/);
   assert.match(visibleText(pane), /a · 01234567 · Build parser/);
   assert.match(visibleText(pane), /src\/parser\.js/);
   assert.match(visibleText(pane), /exit 0/);
@@ -1865,7 +1883,7 @@ test("discard asks inline, then declines; Keep leaves the branch untouched", asy
   await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Discard").dispatch("click");
   await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === "Discard").dispatch("click");
   assert.deepEqual(client.calls.loopCommit, [{ loopId: id, action: "decline" }]);
-  assert.match(visibleText(pane), /State: cancelled/);
+  assert.match(visibleText(pane), /State: Cancelled/);
 });
 
 test("plan mode rejects disallowed settings and accepts no arguments", async () => {

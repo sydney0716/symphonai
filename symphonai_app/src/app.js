@@ -22,6 +22,12 @@ const DEFAULT_STATUS_FIELDS = Object.freeze({
   goal: false, context: false, usage: false,
 });
 
+function stateLabel(state) {
+  const value = typeof state === "string" && state ? state : "unknown";
+  const label = value.replaceAll("_", " ");
+  return label[0].toUpperCase() + label.slice(1);
+}
+
 function readStatusFields(global) {
   try {
     const stored = JSON.parse(global.localStorage?.getItem(STATUS_LINE_KEY) ?? "null");
@@ -2272,7 +2278,7 @@ export async function start({ global, document, client }) {
       } else {
         append(detail, element(document, "span", { className: "roadmap-goal-text", text: goal.goal }));
       }
-      append(detail, element(document, "span", { className: "roadmap-goal-state", text: goal.state }));
+      append(detail, element(document, "span", { className: "roadmap-goal-state", text: stateLabel(goal.state) }));
       const actions = element(document, "div", { className: "roadmap-goal-actions" });
       for (const [label, delta] of [["Move up", -1], ["Move down", 1]]) {
         const button = element(document, "button", { text: label });
@@ -2467,7 +2473,7 @@ export async function start({ global, document, client }) {
 
     const card = cardDetail.card ?? selectedLoop.cards?.find((item) => item.id === selectedCardId) ?? {};
     append(details, element(document, "h3", {
-      text: `${card.id ?? selectedCardId} · ${card.title ?? ""} · ${card.state ?? "unknown"}`,
+      text: `${card.id ?? selectedCardId} · ${card.title ?? ""} · ${stateLabel(card.state)}`,
     }));
     const markdownSection = (title, source) => {
       const section = element(document, "section", { className: "loop-card-section" });
@@ -2663,7 +2669,7 @@ export async function start({ global, document, client }) {
     for (const loop of ordered) {
       const button = element(document, "button", {
         className: "loop-list-item",
-        text: `${loop.goal ?? loop.id} · ${loop.state ?? "unknown"}`,
+        text: `${loop.goal ?? loop.id} · ${stateLabel(loop.state)}`,
       });
       button.type = "button";
       button.setAttribute("aria-selected", String(loop.id === selectedLoopId));
@@ -2678,7 +2684,7 @@ export async function start({ global, document, client }) {
       append(detail, element(document, "h3", { text: selectedLoop.goal ?? "" }));
       append(detail, element(document, "p", {
         className: "loop-state",
-        text: `State: ${selectedLoop.state ?? "unknown"}${selectedLoop.reason ? ` · ${selectedLoop.reason}` : ""}`,
+        text: `State: ${stateLabel(selectedLoop.state)}${selectedLoop.reason ? ` · ${selectedLoop.reason}` : ""}`,
       }));
       const lanes = element(document, "div", { className: "loop-lanes" });
       const cardsById = new Map((selectedLoop.cards ?? []).map((card) => [card.id, card]));
@@ -2692,7 +2698,7 @@ export async function start({ global, document, client }) {
           });
           const open = element(document, "button", {
             className: "loop-card-open",
-            text: `${card.id} · ${card.title ?? ""} · ${card.state ?? "unknown"}`,
+            text: `${card.id} · ${card.title ?? ""} · ${stateLabel(card.state)}`,
           });
           open.type = "button";
           listen(open, "click", () => loadLoopCard(card.id));
