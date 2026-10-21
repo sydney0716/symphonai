@@ -544,18 +544,6 @@ def check_duplicate_store_skips_write() -> None:
             fail("duplicate content changed the stored entry or its mtime")
 
 
-@check("tool_results.cold_store_reads_disk")
-def check_cold_store_reads_disk() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        directory = Path(temporary)
-        stored = ToolResultStore(directory=directory).store(
-            tool_name="grep", tool_call_id="warm", content="cold content"
-        )
-        resolved = ToolResultStore(directory=directory).get(stored.id)
-        if resolved is None or resolved.content != "cold content":
-            fail(f"fresh store did not read persisted content: {resolved!r}")
-
-
 @check("tool_results.cold_read_preserves_newlines")
 def check_cold_read_preserves_newlines() -> None:
     with tempfile.TemporaryDirectory() as temporary:

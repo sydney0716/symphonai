@@ -72,6 +72,7 @@ from symphonai_host.plan import PlanChanged, plan_tools
 from symphonai_host.questions import plan_proposal_tools, question_tools
 from symphonai_host.protocol import HistoryMessage
 from symphonai_host.loops import LoopStore
+from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
 
 
 class RunActiveError(RuntimeError):
@@ -636,7 +637,7 @@ class HostRun:
                 raise
 
     def start_spec_review(self, session_id: str) -> tuple[str, str]:
-        from symphonai_host.spec_run import parse_spec, patch_digest
+        from symphonai_host.spec_run import patch_digest
 
         with self._lock:
             source = SessionStore.open(self._sessions_root, session_id)
@@ -645,7 +646,11 @@ class HostRun:
             finally:
                 source.close()
             info = source_meta.get("spec_run")
-            if not isinstance(info, dict) or info.get("kind") != "implement":
+            if (
+                not isinstance(info, dict)
+                or info.get("kind") != "implement"
+                or not isinstance(info.get("loop_id"), str)
+            ):
                 raise KeyError(session_id)
             if info.get("state") not in ("finished", "blocked", "stopped"):
                 raise RunActiveError("spec run has not finished")
@@ -663,11 +668,11 @@ class HostRun:
                     hashlib.sha256(file_path.read_bytes()).hexdigest()
                     if file_path.is_file() else None
                 )
-            if info.get("loop_id"):
-                spec_path = LoopStore(self._repo_root).path(info["loop_id"], Path(info["spec"]).relative_to(f".symphonai/loops/{info['loop_id']}").as_posix())
-                spec = {"text": spec_path.read_text(encoding="utf-8")}
-            else:
-                spec = parse_spec(self._repo_root / info["spec"], self._repo_root)
+            spec_path = LoopStore(self._repo_root).path(
+                info["loop_id"],
+                Path(info["spec"]).relative_to(f".symphonai/loops/{info['loop_id']}").as_posix(),
+            )
+            spec = {"text": spec_path.read_text(encoding="utf-8")}
             report_path = self._repo_root / info["report"]
             if not report_path.is_file():
                 report_path = worktree / info["report"]
@@ -684,9 +689,7 @@ class HostRun:
             self._conversation = None
             self._active = None
             self._policy = replace(self._base_policy, repo_root=worktree)
-            review_scope = worktree / "specs"
-            if info.get("loop_id"):
-                review_scope = worktree / Path(info["spec"]).parent
+            review_scope = worktree / Path(info["spec"]).parent
             self._policy.allowed_write_scope = [review_scope]
             self._policy.mode = "allow"
             meta = {
@@ -715,36 +718,6 @@ class HostRun:
                 self._conversation, self._policy, self._active = previous
                 raise
 
-    def start_spec_plan(
-        self, phase: str, item: int, title: str, phase_name: str,
-        phase_plan: str, prompt: str, baseline: list[str],
-    ) -> tuple[str, str]:
-        with self._lock:
-            if len(self._active_by_session) >= 4:
-                raise RunActiveError("4 conversations are already running")
-            previous = (self._conversation, self._policy, self._active)
-            self._conversation = None
-            self._active = None
-            self._policy = replace(self._base_policy, repo_root=self._repo_root)
-            self._policy.allowed_write_scope = [self._repo_root / "specs"]
-            self._policy.shell_enabled = False
-            self._policy.mode = "allow"
-            full_prompt = (
-                f"Roadmap phase: {phase_name}\nItem: {title}\n\n"
-                f"Phase plan:\n{phase_plan or 'No phase plan is present.'}\n\n"
-                f"{prompt}\n\nWrite exactly one spec under specs/{phase}/."
-            )
-            meta = {"spec_run": {
-                "kind": "plan", "phase": phase, "item": item,
-                "baseline_specs": baseline, "role": "planner",
-            }}
-            try:
-                run_id = self.start(full_prompt, _session_meta=meta, _title=f"Plan {title}")
-                return self._conversation[1].run_id, run_id
-            except Exception:
-                self._conversation, self._policy, self._active = previous
-                raise
-
     def start_loop(self, goal: str, *, runner_pid: int | None = None) -> dict:
         store = LoopStore(self._repo_root)
         loop = store.create(goal)
@@ -752,6 +725,27 @@ class HostRun:
             loop["runner_pid"] = runner_pid
             store.save(loop)
         return self._start_loop_planner(loop, "created")
+
+    def start_roadmap_goal(self, goal_id: str) -> tuple[dict, dict]:
+        with self._lock:
+            roadmap_store = RoadmapStore(self._repo_root)
+            roadmap = roadmap_store.load()
+            goal = roadmap_store.find(roadmap, goal_id)
+            if goal is None:
+                raise KeyError(goal_id)
+            loops = LoopStore(self._repo_root)
+            if goal["loop_id"] is not None:
+                try:
+                    existing = loops.load(goal["loop_id"])
+                except (KeyError, ValueError):
+                    raise RunActiveError("roadmap goal already has a loop") from None
+                if existing.get("state") != "cancelled":
+                    raise RunActiveError("roadmap goal already has a loop")
+            loop = self.start_loop(goal["goal"])
+            goal["loop_id"] = loop["id"]
+            goal["done"] = False
+            roadmap_store.save(roadmap)
+            return roadmap_store.reply(roadmap), loop
 
     def _start_loop_planner(
         self, loop: dict, change: str, *, note: str | None = None,
@@ -771,8 +765,7 @@ class HostRun:
             f"Write one Markdown spec per card at {folder / 'specs'}/<id>-<slug>.md. Use as few cards as the goal needs: "
             "one card is right for a small change. Split only where a card can be implemented and reviewed on its own. "
             "Use ids starting at a in order, with at most 8 cards. "
-            f"Follow {self._repo_root / 'specs' / 'TEMPLATE.md'} if it exists; otherwise use the sections "
-            "Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report. "
+            "Each spec must have Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report sections. "
             "The Validation section must hold one fenced `sh` block with one shell command per line, "
             "run from the project root; nothing else in that section is run. "
             "Inspect the project before making claims. Group specs whose Scope paths overlap or that depend "
@@ -781,8 +774,7 @@ class HostRun:
             "\"spec\":\"specs/a-short-title.md\",\"lane\":1,\"after\":[]}]}}. "
             "A card whose work documents, tests, or builds on another card's change lists that card in `after`, "
             "whether or not they share a lane. A card starts from the work of the cards before it and sees nothing else. "
-            "For this loop, that plan.json path is the only permitted exception to the planner instruction "
-            "to write under specs/." + revision
+            "Write plan.json last." + revision
         )
         with self._lock:
             if len(self._active_by_session) >= 4:
@@ -1375,30 +1367,13 @@ class HostRun:
             ]
             if cancelled.is_set():
                 return
-            history = _loop_git(integration, "log", "--format=%H%x09%s").stdout.decode(errors="replace").splitlines()
-            commit_by_subject = {}
-            for line in history:
-                commit_id, separator, subject = line.partition("\t")
-                if separator:
-                    commit_by_subject[subject] = commit_id
             done_cards = [card for card in loop.get("cards", []) if card.get("state") == "done"]
-            commits = []
-            for card in done_cards:
-                commit_id = card.get("commit") or commit_by_subject.get(f"{card['id']}: {card['title']}")
-                if commit_id:
-                    commits.append({"card": card["id"], "commit": commit_id, "title": card["title"]})
-            base_commit = loop.get("base_commit")
-            if not isinstance(base_commit, str) or not base_commit:
-                history_positions = {entry.partition("\t")[0]: index for index, entry in enumerate(history)}
-                oldest = max(
-                    (entry["commit"] for entry in commits),
-                    key=lambda commit_id: history_positions.get(commit_id, -1),
-                    default=None,
-                )
-                if oldest:
-                    base_commit = os.fsdecode(_loop_git(integration, "rev-parse", f"{oldest}^").stdout.strip())
-                else:
-                    base_commit = os.fsdecode(_loop_git(integration, "rev-parse", "HEAD").stdout.strip())
+            commits = [
+                {"card": card["id"], "commit": card["commit"], "title": card["title"]}
+                for card in done_cards
+                if card.get("commit")
+            ]
+            base_commit = loop["base_commit"]
             head = os.fsdecode(_loop_git(integration, "rev-parse", "HEAD").stdout.strip())
             files = _loop_git(integration, "diff", "--name-only", f"{base_commit}..{head}").stdout
             summary = {
@@ -1455,17 +1430,24 @@ class HostRun:
                 raise ValueError(str(exc)) from exc
             if action == "approve":
                 store.set_state(loop, "done")
+                try:
+                    RoadmapStore(self._repo_root).mark_loop_done(loop_id)
+                except InvalidRoadmap:
+                    pass
             else:
                 store.set_state(loop, "cancelled", "declined")
             self._loop_changed(loop, "state")
             return loop
 
-    def resume_loop(self, loop_id: str) -> dict:
+    def resume_loop(self, loop_id: str, *, runner_pid: int | None = None) -> dict:
         with self._lock:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop.get("state") != "needs_attention":
                 raise RunActiveError(loop.get("state", "unknown"))
+            if runner_pid is not None:
+                loop["runner_pid"] = runner_pid
+                store.save(loop)
             for card in loop.get("cards", []):
                 if card.get("state") != "failed":
                     continue
@@ -3853,94 +3835,6 @@ class HostRun:
                 leader.forget_subagent(name)
             return {"applied": list(diff.files)}
 
-    def commit_spec(self, session_id: str, message: str) -> dict:
-        if not message.strip():
-            raise ValueError("commit message must not be blank")
-        source = SessionStore.open(self._sessions_root, session_id)
-        try:
-            meta = source.read_meta()
-            info = meta.get("spec_run")
-            review = meta.get("review")
-        finally:
-            source.close()
-        if not isinstance(info, dict) or info.get("kind") != "implement":
-            raise KeyError(session_id)
-        if not isinstance(review, dict) or review.get("verdict") not in ("passed", "follow-ups"):
-            raise RunActiveError("spec run has no passing review")
-        staged = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"], cwd=self._repo_root,
-            capture_output=True, check=False,
-        )
-        if staged.returncode != 0:
-            raise WorktreeApplyConflict("the main tree has staged changes")
-        worktree = self._sessions_root / session_id / "worktree"
-        diff = worktree_diff(worktree)
-        if not diff.files:
-            return {"commit": "", "paths": []}
-        dirty = []
-        for path in diff.files:
-            unstaged = subprocess.run(
-                ["git", "diff", "--quiet", "--", path], cwd=self._repo_root,
-                capture_output=True, check=False,
-            )
-            main_status = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=all", "--", path],
-                cwd=self._repo_root, capture_output=True, check=False,
-            )
-            worktree_status = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=all", "--", path],
-                cwd=worktree, capture_output=True, check=False,
-            )
-            main_untracked = main_status.stdout.decode("utf-8", errors="replace").splitlines()
-            worktree_untracked = worktree_status.stdout.decode("utf-8", errors="replace").splitlines()
-            adds_path = any(line.startswith(("?? ", "A ", " A")) for line in worktree_untracked)
-            conflicts_with_untracked = adds_path and any(line.startswith("?? ") for line in main_untracked)
-            if unstaged.returncode != 0 or conflicts_with_untracked:
-                dirty.append(path)
-        if dirty:
-            raise WorktreeApplyConflict(f"uncommitted changes in: {', '.join(dirty)}")
-        checkpoints = CheckpointStore(
-            self._sessions_root / str(review.get("session_id")) / "checkpoints",
-            self._repo_root,
-        )
-        applied = self.apply_worktree(
-            f"spec {session_id}", directory=worktree,
-            checkpoints_override=checkpoints,
-        )
-        paths = applied["applied"]
-        added = subprocess.run(
-            ["git", "add", "--", *paths], cwd=self._repo_root,
-            capture_output=True, check=False,
-        )
-        if added.returncode:
-            raise WorktreeApplyConflict(added.stderr.decode("utf-8", errors="replace").strip())
-        committed = subprocess.run(
-            ["git", "commit", "-m", message], cwd=self._repo_root,
-            capture_output=True, check=False,
-        )
-        if committed.returncode:
-            subprocess.run(["git", "reset", "--", *paths], cwd=self._repo_root, capture_output=True, check=False)
-            detail = (committed.stderr or committed.stdout).decode("utf-8", errors="replace").strip()
-            raise WorktreeApplyConflict(detail or "git commit failed")
-        sha_result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=self._repo_root,
-            capture_output=True, check=True,
-        )
-        sha = os.fsdecode(sha_result.stdout.strip())
-        source = SessionStore.open(self._sessions_root, session_id)
-        try:
-            meta = source.read_meta()
-            meta["committed"] = {"sha": sha, "message": message}
-            source.write_meta(meta)
-        finally:
-            source.close()
-        try:
-            from symphonai_host.spec_run import mark_roadmap_spec_done
-            mark_roadmap_spec_done(self._repo_root, str(info["spec"]))
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-        return {"commit": sha, "paths": paths}
-
     def discard_worktree(self, name: str) -> dict:
         with self._lock:
             if self._active is not None:
@@ -4142,6 +4036,23 @@ class HostRun:
                 goal = meta.get("goal")
                 if isinstance(goal, dict) and isinstance(goal.get("reason"), str):
                     goal_reason = goal["reason"]
+                    check = goal.get("check")
+                    rounds = goal.get("rounds")
+                    last_check = goal.get("last_check")
+                    if (
+                        goal_reason == "rounds exhausted"
+                        and isinstance(check, list) and len(check) >= 3
+                        and isinstance(check[2], str)
+                        and type(rounds) is int
+                        and isinstance(last_check, dict) and "exit" in last_check
+                    ):
+                        commands = "; ".join(
+                            line for line in check[2].splitlines() if line != "set -e"
+                        )
+                        goal_reason = (
+                            f"validation still failing after {rounds} rounds "
+                            f"(exit {last_check['exit']}): {commands}"
+                        )
                 root = self._sessions_root / session_id / "worktree"
                 report = info.get("report")
                 copied = False
@@ -4249,48 +4160,6 @@ class HostRun:
         if isinstance(review_info, dict):
             self._finish_loop_card_review(review_info)
 
-    def _finish_spec_plan(self, session_id: str, terminal_event: RunFinished | RunFailed | None) -> None:
-        from symphonai_host.spec_run import bind_roadmap_item
-
-        store = SessionStore.open(self._sessions_root, session_id)
-        try:
-            meta = store.read_meta()
-            info = meta.get("spec_run")
-            if not isinstance(info, dict) or info.get("kind") != "plan":
-                return
-            phase = str(info.get("phase", ""))
-            baseline = set(info.get("baseline_specs", []))
-            phase_root = self._repo_root / "specs" / phase
-            created = sorted(
-                path.relative_to(self._repo_root).as_posix()
-                for path in phase_root.rglob("*.md")
-                if path.is_file()
-                and path.relative_to(self._repo_root).as_posix() not in baseline
-                and not path.name.endswith("-PLAN.md")
-                and "specs/report/" not in path.relative_to(self._repo_root).as_posix()
-            ) if phase_root.is_dir() else []
-            bound = created if len(created) == 1 else []
-            if bound:
-                try:
-                    bind_roadmap_item(self._repo_root, phase, int(info["item"]), bound[0])
-                except (OSError, ValueError, KeyError, TypeError):
-                    bound = []
-            info.update({"created": created, "bound": bound[0] if bound else None})
-            if isinstance(terminal_event, RunFinished) and terminal_event.stopped_reason == "final_response":
-                info["state"] = "finished"
-                info["stopped_reason"] = terminal_event.stopped_reason
-            elif isinstance(terminal_event, RunFailed):
-                info["state"] = "failed"
-                info["error"] = terminal_event.error
-            else:
-                info["state"] = "stopped"
-                if isinstance(terminal_event, RunFinished):
-                    info["stopped_reason"] = terminal_event.stopped_reason
-            meta["spec_run"] = info
-            store.write_meta(meta)
-        finally:
-            store.close()
-
     def _run(
         self,
         run_id: str,
@@ -4335,7 +4204,6 @@ class HostRun:
                     self._active = None
         if not goal_round:
             self._finish_spec_review(session_id, leader, terminal_event)
-            self._finish_spec_plan(session_id, terminal_event)
             self._finish_loop_plan(session_id, terminal_event)
             with self._lock:
                 self._close_idle_conversations_locked()

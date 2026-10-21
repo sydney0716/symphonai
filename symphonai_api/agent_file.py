@@ -453,14 +453,6 @@ def load_agent_file(
     return spec
 
 
-def memory_settings(path: Path) -> MemorySettings:
-    """Read the opt-in memory settings from one agent TOML file."""
-    source = Path(path)
-    data = _read_toml(source)
-    _unknown_keys(source, "file", data)
-    return _memory_settings(source, _table(source, data, "memory"))
-
-
 def load_agent_directory(
     path: Path,
     *,

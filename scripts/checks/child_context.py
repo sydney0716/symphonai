@@ -306,6 +306,14 @@ def never_orphans_a_tool_result() -> None:
     occurrence_witness_seen = False
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
+        specs = [
+            _spec(root),
+            _spec(root, inherit=ContextInheritance.ALL),
+            *[
+                _spec(root, inherit=ContextInheritance.TAIL, inherit_tail=turns)
+                for turns in range(1, 5)
+            ],
+        ]
         for parent in chain(REGRESSION_CONVERSATIONS, _enumerated_conversations()):
             if parent == occurrence_witness:
                 occurrence_witness_seen = True
@@ -323,14 +331,6 @@ def never_orphans_a_tool_result() -> None:
             parent_systems = [message for message in parent if message.role is Role.SYSTEM]
             parent_orphan_ids = _orphan_tool_result_ids(parent)
             parent_orphan_count = _orphan_tool_result_count(parent)
-            specs = [
-                _spec(root),
-                _spec(root, inherit=ContextInheritance.ALL),
-                *[
-                    _spec(root, inherit=ContextInheritance.TAIL, inherit_tail=turns)
-                    for turns in range(1, 5)
-                ],
-            ]
             for spec in specs:
                 seeded = seed_messages(spec, "task", parent_messages=parent)
                 explicit_empty = seed_messages(
@@ -435,6 +435,25 @@ def seeds_memory() -> None:
         ):
             fail(f"memory framing or entry order changed: {prompted[1]!r}")
 
+        specs = [
+            _spec(root, prompt="child system", memory_enabled=True),
+            _spec(
+                root,
+                prompt="child system",
+                inherit=ContextInheritance.ALL,
+                memory_enabled=True,
+            ),
+            *[
+                _spec(
+                    root,
+                    prompt="child system",
+                    inherit=ContextInheritance.TAIL,
+                    inherit_tail=turns,
+                    memory_enabled=True,
+                )
+                for turns in range(1, 5)
+            ],
+        ]
         for parent_messages in chain(
             REGRESSION_CONVERSATIONS,
             _enumerated_conversations(),
@@ -443,25 +462,6 @@ def seeds_memory() -> None:
                 message
                 for message in parent_messages
                 if message.role is Role.SYSTEM
-            ]
-            specs = [
-                _spec(root, prompt="child system", memory_enabled=True),
-                _spec(
-                    root,
-                    prompt="child system",
-                    inherit=ContextInheritance.ALL,
-                    memory_enabled=True,
-                ),
-                *[
-                    _spec(
-                        root,
-                        prompt="child system",
-                        inherit=ContextInheritance.TAIL,
-                        inherit_tail=turns,
-                        memory_enabled=True,
-                    )
-                    for turns in range(1, 5)
-                ],
             ]
             for spec in specs:
                 without_memory = seed_messages(

@@ -8,7 +8,7 @@ import unittest.mock as mock
 from pathlib import Path
 import symphonai_api.content as content
 from symphonai_api.compaction import _message_excerpts, estimate_message_tokens
-from symphonai_api.content import content_block_from_bytes, content_block_from_path, detect_media_type
+from symphonai_api.content import content_block_from_bytes, detect_media_type
 from symphonai_api.cost import UsageTotals
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, TextBlock, ToolCall, ToolResult, Usage, has_attachments, reject_system_attachments
 from symphonai_api.providers.anthropic_provider import _build_request_body as _build_anthropic_body
@@ -94,23 +94,6 @@ def check_content_attachment_construction() -> None:
             fail(f"unsupported attachment error changed: {exc!r}")
     else:
         fail("unsupported attachment bytes were accepted")
-
-    with tempfile.TemporaryDirectory() as attachment_tmp:
-        attachment_root = Path(attachment_tmp)
-        pdf_path = attachment_root / "report.pdf"
-        png_path = attachment_root / "renamed.bin"
-        pdf_path.write_bytes(pdf_raw)
-        png_path.write_bytes(png_raw)
-        path_pdf = content_block_from_path(pdf_path)
-        path_png = content_block_from_path(png_path)
-    if (
-        not isinstance(path_pdf, DocumentBlock)
-        or path_pdf.filename != "report.pdf"
-        or path_pdf.media_type != "application/pdf"
-        or not isinstance(path_png, ImageBlock)
-        or path_png.media_type != "image/png"
-    ):
-        fail(f"path attachment construction changed: pdf={path_pdf!r}, png={path_png!r}")
 
 @check("content.system_attachments_refused")
 def check_content_system_attachments_refused() -> None:

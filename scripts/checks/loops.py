@@ -7,6 +7,7 @@ import http.client
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,7 @@ from symphonai_api.session import SessionStore
 from symphonai_host.broker import EventBroker
 from scripts.checks.harness import check, fail
 from symphonai_host.loops import LoopStore
+from symphonai_host.roadmap import RoadmapStore
 from symphonai_host.projects import ProjectRuntime
 from symphonai_host.run import HostRun, LoopChanged, WorktreeApplyConflict
 from symphonai_host.server import HostServer
@@ -211,6 +213,156 @@ def slug_is_never_empty() -> None:
             fail(f"ASCII goal slug changed unexpectedly: {loop['slug']!r}")
 
 
+@check("loops.roadmap_goals_round_trip")
+def roadmap_goals_round_trip() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        host = _start_host(root, FakeModelProvider([]))
+        try:
+            status, first = _http(host, "POST", "/roadmap/add", {"goal": "  First goal  "})
+            if status != 200 or first["goals"][0]["goal"] != "First goal":
+                fail(f"roadmap/add did not trim and append the goal: {status}, {first!r}")
+            first_id = first["goals"][0]["id"]
+            _, second = _http(host, "POST", "/roadmap/add", {"goal": "Second goal"})
+            second_id = second["goals"][1]["id"]
+            _, third = _http(host, "POST", "/roadmap/add", {"goal": "Third goal"})
+            third_id = third["goals"][2]["id"]
+            status, moved = _http(host, "POST", "/roadmap/move", {"id": third_id, "index": 0})
+            if status != 200 or [goal["id"] for goal in moved["goals"]] != [third_id, first_id, second_id]:
+                fail(f"roadmap/move returned the wrong order: {status}, {moved!r}")
+            status, removed = _http(host, "POST", "/roadmap/remove", {"id": second_id})
+            if status != 200 or [goal["id"] for goal in removed["goals"]] != [third_id, first_id]:
+                fail(f"roadmap/remove returned the wrong goals: {status}, {removed!r}")
+            _, appended = _http(host, "POST", "/roadmap/add", {"goal": "Fourth goal"})
+            fourth_id = appended["goals"][-1]["id"]
+            status, reloaded = _http(host, "GET", "/roadmap")
+            expected_goals = [
+                {"id": third_id, "goal": "Third goal", "loop_id": None, "done": False, "state": "not_started"},
+                {"id": first_id, "goal": "First goal", "loop_id": None, "done": False, "state": "not_started"},
+                {"id": fourth_id, "goal": "Fourth goal", "loop_id": None, "done": False, "state": "not_started"},
+            ]
+            if status != 200 or reloaded.get("goals") != expected_goals:
+                fail(f"GET /roadmap did not preserve file order: {status}, {reloaded!r}")
+            raw = json.loads(RoadmapStore(root).path.read_text(encoding="utf-8"))
+            expected_records = [{key: item[key] for key in ("id", "goal", "loop_id", "done")} for item in expected_goals]
+            if raw != {"schema_version": 1, "goals": expected_records}:
+                fail(f"roadmap file has the wrong persisted shape or order: {raw!r}")
+
+            loop = LoopStore(root).create("Third goal")
+            store = LoopStore(root)
+            for state in ("awaiting_plan", "running", "validating", "awaiting_commit"):
+                store.set_state(loop, state)
+            roadmap_store = RoadmapStore(root)
+            roadmap = roadmap_store.load()
+            roadmap_store.find(roadmap, third_id)["loop_id"] = loop["id"]
+            roadmap_store.save(roadmap)
+            host.run.commit_loop(loop["id"], "approve")
+            status, committed = _http(host, "GET", "/roadmap")
+            goal = next(item for item in committed["goals"] if item["id"] == third_id)
+            if status != 200 or not goal["done"]:
+                fail(f"approving the loop did not mark its roadmap goal done: {status}, {goal!r}")
+            shutil.rmtree(store._folder(loop["id"]))
+            status, missing_loop = _http(host, "GET", "/roadmap")
+            goal = next(item for item in missing_loop["goals"] if item["id"] == third_id)
+            if status != 200 or goal["state"] != "done":
+                fail(f"a done goal lost its state after its loop folder was removed: {status}, {goal!r}")
+        finally:
+            host.close()
+
+
+@check("loops.roadmap_start_links_one_loop")
+def roadmap_start_links_one_loop() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        host = _start_host(root, FakeModelProvider([]))
+        try:
+            status, added = _http(host, "POST", "/roadmap/add", {"goal": "Concurrent start"})
+            if status != 200:
+                fail(f"could not add roadmap goal: {status}, {added!r}")
+            goal_id = added["goals"][0]["id"]
+            def start_planner(loop: dict, _change: str) -> dict:
+                loop["planner_session_id"] = "session_fake"
+                return loop
+
+            host.run._start_loop_planner = start_planner
+            barrier = threading.Barrier(2)
+            results = []
+            failures = []
+
+            def start() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results.append(_http(host, "POST", "/roadmap/start", {"id": goal_id}))
+                except Exception as exc:
+                    failures.append(exc)
+
+            threads = [threading.Thread(target=start) for _ in range(2)]
+            with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+            if failures or any(thread.is_alive() for thread in threads):
+                fail(f"concurrent roadmap starts did not finish: {failures!r}")
+            statuses = sorted(status for status, _ in results)
+            loop_folders = list((root / ".symphonai" / "loops").glob("loop_*"))
+            if statuses != [200, 409] or len(loop_folders) != 1:
+                fail(f"concurrent start created multiple loops or returned wrong statuses: {results!r}, {loop_folders!r}")
+            status, reply = _http(host, "GET", "/roadmap")
+            if status != 200 or reply["goals"][0]["loop_id"] != "loop_000000000000":
+                fail(f"the winning roadmap start did not link its loop: {status}, {reply!r}")
+        finally:
+            host.close()
+
+
+@check("loops.roadmap_file_is_not_overwritten")
+def roadmap_file_is_not_overwritten() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        host = _start_host(root, FakeModelProvider([]))
+        try:
+            path = RoadmapStore(root).path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            original = b'{"goals": "x"}\n'
+            path.write_bytes(original)
+            status, reply = _http(host, "POST", "/roadmap/add", {"goal": "Keep malformed bytes"})
+            if status != 409 or not reply.get("error", "").startswith("invalid roadmap: "):
+                fail(f"malformed roadmap add did not return 409: {status}, {reply!r}")
+            if path.read_bytes() != original:
+                fail("malformed roadmap was changed by the rejected add")
+        finally:
+            host.close()
+
+
+@check("loops.approve_with_an_invalid_roadmap")
+def approve_with_an_invalid_roadmap() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        host = _start_host(root, FakeModelProvider([]))
+        subscription = host.broker.subscribe()
+        try:
+            loop = LoopStore(root).create("Approve with malformed roadmap")
+            loop["state"] = "awaiting_commit"
+            LoopStore(root).save(loop)
+            path = RoadmapStore(root).path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            original = b'{"goals": "x"}\n'
+            path.write_bytes(original)
+            status, reply = _http(host, "POST", "/loop/commit", {
+                "loop_id": loop["id"], "action": "approve",
+            })
+            if status != 200 or reply.get("loop", {}).get("state") != "done":
+                fail(f"approval failed with an invalid roadmap: {status}, {reply!r}")
+            if path.read_bytes() != original:
+                fail("approval changed the malformed roadmap file")
+            event = subscription.get(timeout=1)
+            if not isinstance(event, LoopChanged) or event.loop_id != loop["id"] or event.state != "done":
+                fail(f"approval did not publish the done event: {event!r}")
+        finally:
+            subscription.close()
+            host.close()
+
+
 @check("loops.round_trip")
 def round_trip() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -305,6 +457,9 @@ def ids_and_paths_are_safe() -> None:
 def planner_writes_a_plan() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "project"
+        template = root / "specs" / "TEMPLATE.md"
+        template.parent.mkdir(parents=True)
+        template.write_text("Repository-specific template that SymphonAI must ignore.\n", encoding="utf-8")
         spec_a = "# a — Read files\n\n## Validation\n\n```sh\ntrue\n```\n"
         spec_b = "# b — Review errors\n\n## Validation\n\n```sh\ntrue\n```\n"
         plan = {"cards": [
@@ -364,6 +519,8 @@ def planner_writes_a_plan() -> None:
             for message in provider.requests[0].messages
         ):
             fail("planner task omitted the plan instructions")
+        if any("TEMPLATE.md" in message.text for message in provider.requests[0].messages):
+            fail("planner request named the project's TEMPLATE.md")
         if not any(
             message.role is Role.USER and "one fenced `sh` block" in message.text
             and "nothing else in that section is run" in message.text
@@ -1110,6 +1267,8 @@ def failed_card_needs_attention() -> None:
 
 @check("loops.card_run_reason")
 def card_run_reason() -> None:
+    from symphonai_host.goal import Goal, GoalCheck
+
     failure = "scripted implementer failure"
 
     class _FailingProvider(FakeModelProvider):
@@ -1179,6 +1338,40 @@ def card_run_reason() -> None:
                 source.close()
             if goal.get("reason") != "rounds exhausted":
                 fail(f"blocked goal reason changed while reporting the card: {goal!r}")
+        finally:
+            run.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, sessions = base / "project", base / "sessions"
+        run, store, loop = _lane_loop(
+            root, sessions,
+            [{"id": "a", "title": "A", "lane": 1, "state": "running"}],
+        )
+        try:
+            loop["state"] = "running"
+            session_id = "checked-card"
+            loop["cards"][0]["session_id"] = session_id
+            store.save(loop)
+            _loop_session(sessions, root, session_id, {
+                "kind": "implement", "loop_id": loop["id"], "card_id": "a",
+            })
+            goal = Goal(
+                "finish implementation", ("/bin/sh", "-c", "set -e\ntrue\nfalse"),
+                rounds=5, max_rounds=5,
+            )
+            run._save_goal(session_id, goal)
+            run._goals_by_session[session_id] = goal
+            run._policy_by_session[session_id] = PermissionPolicy(root, allowed_write_scope=[root])
+            run._perform_goal_check(
+                GoalCheck(goal, session_id, threading.Event(), "check-agent"), "check-run",
+            )
+            result = store.load(loop["id"])
+            expected = "card a could not finish: validation still failing after 5 rounds (exit 1): true; false"
+            if result.get("reason") != expected:
+                fail(f"exhausted validation did not name its failing checks: {result!r}")
+            if goal.reason != "rounds exhausted" or goal.last_check != {"exit": 1, "ok": False, "output": ""}:
+                fail(f"goal state was changed or the failing check was not run: {goal!r}")
         finally:
             run.close()
 
@@ -1386,7 +1579,9 @@ def resume_after_restart() -> None:
             result["cards"][0]["state"] = "done"
             store.save(result)
             run._advance_loop(loop["id"])
-            _wait_state(store, loop["id"], "awaiting_commit")
+            finished = _wait_state(store, loop["id"], "awaiting_commit")
+            if finished.get("summary", {}).get("commits") != []:
+                fail(f"a done card without a commit was included in the summary: {finished.get('summary')!r}")
         finally:
             if host is None:
                 run.close()

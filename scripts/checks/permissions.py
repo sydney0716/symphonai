@@ -419,20 +419,6 @@ def check_permissions_traversal_denied() -> None:
         if r.ok:
             fail("read_file should deny a .. path-traversal attempt")
 
-@check("permissions.shell_disabled")
-def check_permissions_shell_disabled() -> None:
-    with workspace() as ws:
-        root = ws.root
-        outside_tmp = str(ws.outside)
-        policy = ws.policy
-        tools = ws.tools
-        # -- deny path: run_shell disabled by default --
-        r = tools["run_shell"].execute(
-            ToolCall(id="d4", name="run_shell", arguments={"argv": ["echo", "hi"]}), policy
-        )
-        if r.ok:
-            fail("run_shell should be denied by default")
-
 @check("permissions.shell_always_denied")
 def check_permissions_shell_always_denied() -> None:
     with workspace() as ws:

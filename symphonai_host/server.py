@@ -67,9 +67,9 @@ from symphonai_host.run import (
     WorktreeApplyConflict,
 )
 from symphonai_host.sessions import list_sessions, prompt_history
-from symphonai_host.spec_run import parse_spec
 from symphonai_host.projects import ProjectRuntime, record_recent_project, recent_projects
 from symphonai_host.loops import LoopStore
+from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
 
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -996,47 +996,6 @@ class HostServer:
                     return
                 self._bytes(HTTPStatus.OK, body, content_type)
 
-            def _serve_file(self) -> None:
-                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-                paths = values.get("path", [])
-                if len(paths) != 1:
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                requested = paths[0]
-                candidate = Path(requested)
-                if candidate.is_absolute():
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                try:
-                    resolved = (host._repo_root / candidate).resolve()
-                except (OSError, RuntimeError):
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                allowed_roots = (
-                    host._repo_root / "specs",
-                    host._repo_root / "docs",
-                )
-                if not _contains_path(host._repo_root, resolved) or not any(
-                    _contains_path(root, resolved) for root in allowed_roots
-                ):
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                try:
-                    with resolved.open("rb") as source:
-                        data = source.read(MAX_FILE_BYTES + 1)
-                except (OSError, ValueError):
-                    self._not_found()
-                    return
-                if len(data) > MAX_FILE_BYTES:
-                    self._empty(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                    return
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-                    return
-                self._json(HTTPStatus.OK, {"path": requested, "text": text})
-
             def _serve_tree(self) -> None:
                 values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                 paths = values.get("path", [])
@@ -1100,22 +1059,6 @@ class HostServer:
                     self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
                     return
                 self._json(HTTPStatus.OK, {"path": requested, "text": text})
-
-            def _serve_spec_files(self) -> None:
-                specs_root = host._repo_root / "specs"
-                paths = []
-                for path in specs_root.rglob("*.md"):
-                    relative = path.relative_to(host._repo_root)
-                    if (
-                        len(relative.parts) < 3
-                        or relative.parts[1] == "report"
-                        or path.name.endswith("-PLAN.md")
-                        or not path.is_file()
-                        or not host.run.policy.check_read(path).allowed
-                    ):
-                        continue
-                    paths.append(relative.as_posix())
-                self._json(HTTPStatus.OK, {"paths": sorted(paths)})
 
             def _definition_target(
                 self,
@@ -1358,6 +1301,17 @@ class HostServer:
                         )
                     self._json(HTTPStatus.OK, reply)
                     return
+                if request_path == "/roadmap":
+                    if not self._authorized():
+                        return
+                    try:
+                        roadmap = RoadmapStore(host.run._repo_root).load()
+                        reply = RoadmapStore(host.run._repo_root).reply(roadmap)
+                    except InvalidRoadmap as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": f"invalid roadmap: {exc}"})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
                 if request_path == "/models":
                     if not self._authorized():
                         return
@@ -1441,11 +1395,6 @@ class HostServer:
                         return
                     self._serve_app_asset(request_path.removeprefix("/app/"))
                     return
-                if request_path == "/file":
-                    if not self._authorized():
-                        return
-                    self._serve_file()
-                    return
                 if request_path == "/tree":
                     if not self._authorized():
                         return
@@ -1455,11 +1404,6 @@ class HostServer:
                     if not self._authorized():
                         return
                     self._serve_source()
-                    return
-                if request_path == "/spec/files":
-                    if not self._authorized():
-                        return
-                    self._serve_spec_files()
                     return
                 if request_path == "/files":
                     if not self._authorized():
@@ -1719,69 +1663,6 @@ class HostServer:
                         host.run.sessions_root, limit=limit, activity=host.session_activity(), query=query,
                     ))
                     return
-                if request_path == "/spec/runs":
-                    if not self._authorized():
-                        return
-                    from symphonai_api.session import SessionStore
-                    runs = []
-                    for directory in host.run.sessions_root.iterdir() if host.run.sessions_root.is_dir() else ():
-                        try:
-                            store = SessionStore.open(host.run.sessions_root, directory.name)
-                            meta = store.read_meta()
-                            store.close()
-                        except Exception:
-                            continue
-                        info = meta.get("spec_run")
-                        if not isinstance(info, dict):
-                            continue
-                        if info.get("kind") == "plan":
-                            runs.append({
-                                "session_id": directory.name, "kind": "plan",
-                                "phase": info.get("phase"), "item": info.get("item"),
-                                "bound": info.get("bound"),
-                                "state": "running" if host.run.session_activity().get(directory.name) in ("working", "waiting") and info.get("state") is None else info.get("state", "running"),
-                                "updated_at": meta.get("updated_at"),
-                            })
-                            continue
-                        if info.get("kind") != "implement" or not isinstance(info.get("spec"), str):
-                            continue
-                        worktree = host.run.sessions_root / directory.name / str(info.get("worktree", "worktree"))
-                        active = host.run.session_activity().get(directory.name) in ("working", "waiting")
-                        files = []
-                        if worktree.is_dir():
-                            changed = subprocess.run(
-                                ["git", "diff", "--name-only", "-z", "HEAD"],
-                                cwd=worktree, capture_output=True, check=False,
-                            )
-                            untracked = subprocess.run(
-                                ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-                                cwd=worktree, capture_output=True, check=False,
-                            )
-                            if changed.returncode == 0 and untracked.returncode == 0:
-                                files = sorted({
-                                    os.fsdecode(value)
-                                    for output in (changed.stdout, untracked.stdout)
-                                    for value in output.split(b"\0") if value
-                                })
-                        state = "running" if active and info.get("state") not in ("finished", "blocked", "stopped") else info.get("state", "running")
-                        title = ""
-                        try:
-                            title = parse_spec(host._repo_root / info["spec"], host._repo_root)["title"]
-                        except (ValueError, OSError):
-                            pass
-                        spec_id = Path(info["spec"]).stem.split("-", 1)[0]
-                        after_dash = title.split("—", 1)[1].strip() if "—" in title else title
-                        runs.append({
-                            "session_id": directory.name, "spec": info["spec"],
-                            "kind": info.get("kind", "implement"), "state": state,
-                            "report_copied": bool(info.get("report_copied", False)),
-                            "files": files, "updated_at": meta.get("updated_at"),
-                            "review": meta.get("review"), "committed": meta.get("committed"),
-                            "commit_message": f"{spec_id}: {after_dash}".strip(),
-                        })
-                    runs.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
-                    self._json(HTTPStatus.OK, runs)
-                    return
                 if request_path == "/loops":
                     if not self._authorized():
                         return
@@ -1889,7 +1770,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/spec/run", "/spec/review", "/spec/commit", "/spec/plan", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -2052,53 +1933,6 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, {"deleted": payload["id"]})
                     return
-                if self.path == "/spec/plan":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"phase", "item"} or not isinstance(payload.get("phase"), str) or type(payload.get("item")) is not int:
-                            raise ProtocolError("spec/plan requires phase and item")
-                        roadmap_path = host._repo_root / "docs" / "roadmap.json"
-                        roadmap = json.loads(roadmap_path.read_text(encoding="utf-8"))
-                        phase_id, index = payload["phase"], payload["item"]
-                        phase = next((entry for entry in roadmap.get("phases", []) if entry.get("id") == phase_id), None)
-                        if phase is None or not isinstance(phase.get("items"), list) or not 0 <= index < len(phase["items"]):
-                            self._json(HTTPStatus.NOT_FOUND, {"error": "unknown roadmap item"})
-                            return
-                        item_value = phase["items"][index]
-                        title = item_value if isinstance(item_value, str) else item_value.get("title", "")
-                        if (item_value.get("spec") if isinstance(item_value, dict) else None):
-                            self._json(HTTPStatus.CONFLICT, {"error": "roadmap item already has a spec"})
-                            return
-                        if not phase_id or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in phase_id):
-                            self._json(HTTPStatus.NOT_FOUND, {"error": "unknown roadmap phase"})
-                            return
-                        from symphonai_api.session import SessionStore
-                        for directory in host.run.sessions_root.iterdir() if host.run.sessions_root.is_dir() else ():
-                            try:
-                                session_store = SessionStore.open(host.run.sessions_root, directory.name)
-                                info = session_store.read_meta().get("spec_run")
-                                session_store.close()
-                            except Exception:
-                                continue
-                            if isinstance(info, dict) and info.get("kind") == "plan" and info.get("phase") == phase_id and info.get("item") == index and host.run.session_activity().get(directory.name) in ("working", "waiting"):
-                                self._json(HTTPStatus.CONFLICT, {"error": "a plan for this item is already running"})
-                                return
-                        phase_root = host._repo_root / "specs" / phase_id
-                        baseline = [path.relative_to(host._repo_root).as_posix() for path in phase_root.rglob("*.md")] if phase_root.is_dir() else []
-                        phase_plan = phase_root / f"{phase_id}-PLAN.md"
-                        plan_text = phase_plan.read_text(encoding="utf-8") if phase_plan.is_file() else ""
-                        session_id, run_id = host.run.start_spec_plan(
-                            phase_id, index, str(title), str(phase.get("name", "")),
-                            plan_text, f"Plan roadmap item: {title}", baseline,
-                        )
-                    except (ProtocolError, OSError, ValueError, json.JSONDecodeError) as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    self._json(HTTPStatus.OK, {"session_id": session_id, "run_id": run_id})
-                    return
                 if self.path == "/loop/start":
                     try:
                         payload = self._read_object()
@@ -2116,6 +1950,70 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, {
                         "loop": loop, "session_id": loop["planner_session_id"],
+                    })
+                    return
+                if self.path in ("/roadmap/add", "/roadmap/remove", "/roadmap/move"):
+                    try:
+                        payload = self._read_object()
+                        with host.run._lock:
+                            roadmap_store = RoadmapStore(host.run._repo_root)
+                            roadmap = roadmap_store.load()
+                            if self.path == "/roadmap/add":
+                                if set(payload) != {"goal"} or not isinstance(payload.get("goal"), str):
+                                    raise ProtocolError("roadmap/add requires goal")
+                                goal_text = payload["goal"].strip()
+                                if not goal_text:
+                                    raise ProtocolError("goal must not be blank")
+                                roadmap_store.add(roadmap, goal_text)
+                            else:
+                                expected = {"id"} if self.path == "/roadmap/remove" else {"id", "index"}
+                                if set(payload) != expected or not isinstance(payload.get("id"), str):
+                                    raise ProtocolError("invalid roadmap request")
+                                item = roadmap_store.find(roadmap, payload["id"])
+                                if item is None:
+                                    self._not_found()
+                                    return
+                                if self.path == "/roadmap/remove":
+                                    roadmap["goals"].remove(item)
+                                else:
+                                    index = payload.get("index")
+                                    if type(index) is not int or not 0 <= index < len(roadmap["goals"]):
+                                        raise ProtocolError("index must be between 0 and the last goal index")
+                                    roadmap["goals"].remove(item)
+                                    roadmap["goals"].insert(index, item)
+                            roadmap_store.save(roadmap)
+                            reply = roadmap_store.reply(roadmap)
+                    except InvalidRoadmap as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": f"invalid roadmap: {exc}"})
+                        return
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, reply)
+                    return
+                if self.path == "/roadmap/start":
+                    try:
+                        payload = self._read_object()
+                        if set(payload) != {"id"} or not isinstance(payload.get("id"), str):
+                            raise ProtocolError("roadmap/start requires id")
+                        roadmap_reply, loop = host.run.start_roadmap_goal(payload["id"])
+                    except InvalidRoadmap as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": f"invalid roadmap: {exc}"})
+                        return
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except KeyError:
+                        self._not_found()
+                        return
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
+                        return
+                    except ValueError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        **roadmap_reply, "loop": loop, "session_id": loop["planner_session_id"],
                     })
                     return
                 if self.path == "/loop/plan":
@@ -2213,84 +2111,6 @@ class HostServer:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
                     self._json(HTTPStatus.OK, {"loop": loop})
-                    return
-                if self.path == "/spec/review":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"session_id"} or not isinstance(payload.get("session_id"), str):
-                            raise ProtocolError("spec/review requires session_id")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        session_id, run_id = host.run.start_spec_review(payload["session_id"])
-                    except KeyError:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "not a spec run"})
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    except (OSError, ValueError, RuntimeError) as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"session_id": session_id, "run_id": run_id})
-                    return
-                if self.path == "/spec/commit":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"session_id", "message"} or not all(isinstance(payload.get(key), str) for key in ("session_id", "message")):
-                            raise ProtocolError("spec/commit requires session_id and message")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        reply = host.run.commit_spec(payload["session_id"], payload["message"])
-                    except KeyError:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "not a spec run"})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except WorktreeApplyConflict as exc:
-                        status = HTTPStatus.CONFLICT
-                        self._json(status, {"error": str(exc)})
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path == "/spec/run":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"path"} or not isinstance(payload.get("path"), str):
-                            raise ProtocolError("spec/run requires a path")
-                        if Path(payload["path"]).is_absolute():
-                            raise ProtocolError("spec/run path must be repository-relative")
-                        spec = parse_spec(host._repo_root / payload["path"], host._repo_root)
-                    except (ProtocolError, ValueError, OSError) as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    from symphonai_api.session import SessionStore
-                    for directory in host.run.sessions_root.iterdir() if host.run.sessions_root.is_dir() else ():
-                        try:
-                            session_store = SessionStore.open(host.run.sessions_root, directory.name)
-                            info = session_store.read_meta().get("spec_run")
-                            session_store.close()
-                        except Exception:
-                            continue
-                        if isinstance(info, dict) and info.get("spec") == spec["path"] and host.run.session_activity().get(directory.name) in ("working", "waiting"):
-                            self._json(HTTPStatus.CONFLICT, {"error": "this spec is already running"})
-                            return
-                    try:
-                        session_id, run_id = host.run.start_spec_run(spec)
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except (ProviderSelectionError, OSError, RuntimeError) as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"session_id": session_id, "run_id": run_id})
                     return
                 if self.path == "/goal":
                     try:

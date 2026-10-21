@@ -340,8 +340,8 @@ export function fakeClient(
     modelListing = { provider: "", state: "unknown", models: [], detail: "Model listing unavailable." },
     fileOverrides = {},
     roadmapFailure = null,
-    specFilesReply = { paths: [] },
-    specFilesFailure = false,
+    roadmapGoals = [],
+    roadmapAddFailure = null,
     loopList = { loops: [] },
     loopReplies = {},
     loopCardReplies = {},
@@ -350,16 +350,17 @@ export function fakeClient(
     startLoopFailure = null,
   } = {},
 ) {
-  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, specFiles: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], roadmap: 0, roadmapActions: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
+  let currentGoals = roadmapGoals.map((goal) => ({ ...goal }));
+  let currentLoops = [...(loopList.loops ?? [])];
   let eventCallback;
   let resolvePrompt;
   const promptReply = new Promise((resolve) => {
     resolvePrompt = resolve;
   });
   const files = new Map([
-    ["docs/roadmap.json", { path: "docs/roadmap.json", text: roadmapText }],
     [BASE, { path: BASE, text: "base spec text" }],
     [REPORT, { path: REPORT, text: "base report text" }],
     [OPEN_BASE, { path: OPEN_BASE, text: "open spec text" }],
@@ -369,10 +370,47 @@ export function fakeClient(
   return {
     calls,
     emit(frame) {
+      if (frame.payload?.type === "LoopChanged") {
+        currentGoals = currentGoals.map((goal) => goal.loop_id === frame.payload.loop_id
+          ? { ...goal, state: frame.payload.state }
+          : goal);
+      }
       return eventCallback(frame);
     },
     setRoadmapFailure(failure) {
       currentRoadmapFailure = failure;
+    },
+    async roadmap() {
+      calls.roadmap += 1;
+      if (currentRoadmapFailure) throw currentRoadmapFailure;
+      return { goals: currentGoals.map((goal) => ({ ...goal })) };
+    },
+    async addRoadmapGoal(goal) {
+      calls.roadmapActions.push(["add", goal]);
+      if (roadmapAddFailure) throw roadmapAddFailure;
+      const added = { id: `goal-${currentGoals.length + 1}`, goal, loop_id: null, done: false, state: "not_started" };
+      currentGoals.push(added);
+      return { goals: currentGoals.map((entry) => ({ ...entry })) };
+    },
+    async removeRoadmapGoal(id) {
+      calls.roadmapActions.push(["remove", id]);
+      currentGoals = currentGoals.filter((goal) => goal.id !== id);
+      return { goals: currentGoals.map((goal) => ({ ...goal })) };
+    },
+    async moveRoadmapGoal(id, index) {
+      calls.roadmapActions.push(["move", id, index]);
+      const current = currentGoals.findIndex((goal) => goal.id === id);
+      if (current >= 0) currentGoals.splice(index, 0, currentGoals.splice(current, 1)[0]);
+      return { goals: currentGoals.map((goal) => ({ ...goal })) };
+    },
+    async startRoadmapGoal(id) {
+      calls.roadmapActions.push(["start", id]);
+      const loop = { id: `loop-${id}`, goal: currentGoals.find((goal) => goal.id === id)?.goal, state: "planning", lanes: [], cards: [] };
+      currentLoops = [loop, ...currentLoops];
+      currentGoals = currentGoals.map((goal) => goal.id === id
+        ? { ...goal, loop_id: loop.id, state: "planning" }
+        : goal);
+      return { goals: currentGoals.map((entry) => ({ ...entry })), loop, session_id: "session-started" };
     },
     resolvePrompt,
     async file(path) {
@@ -433,11 +471,11 @@ export function fakeClient(
     },
     async loops() {
       calls.loops += 1;
-      return loopList;
+      return { loops: currentLoops };
     },
     async loop(id) {
       calls.loop.push(id);
-      return loopReplies[id] ?? { loop: null };
+      return loopReplies[id] ?? { loop: currentLoops.find((loop) => loop.id === id) ?? null };
     },
     async loopPlan(loopId, action, options = {}) {
       calls.loopPlan.push({ loopId, action, ...options });
@@ -474,11 +512,6 @@ export function fakeClient(
     async files(query, limit = 20) {
       calls.files.push([query, limit]);
       return { files: [] };
-    },
-    async specFiles() {
-      calls.specFiles += 1;
-      if (specFilesFailure) throw new Error("spec listing unavailable");
-      return specFilesReply;
     },
     async history(limit = 100) {
       calls.history.push(limit);
@@ -1288,6 +1321,67 @@ test("plan toggles back to the mode that was active before plan", async () => {
   await submitCommand(allowDocument, "/plan");
   await submitCommand(allowDocument, "/plan");
   assert.deepEqual(allowClient.calls.selectMode, ["plan", "allow"]);
+});
+
+test("Roadmap adds, reorders, starts goals, and opens the returned loop", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  const pane = document.getElementById("roadmap");
+  const submitGoal = async (goal) => {
+    const field = find(pane, (node) => node.className === "roadmap-add-input");
+    field.value = goal;
+    await field.dispatch("input");
+    await find(pane, (node) => node.className === "roadmap-add-form").dispatch("submit");
+  };
+  await submitGoal("First goal");
+  await submitGoal("Second goal");
+  let rows = find(pane, (node) => node.className === "roadmap-goals").children;
+  await rows[1].children[1].children.find((button) => button.textContent === "Move up").dispatch("click");
+  rows = find(pane, (node) => node.className === "roadmap-goals").children;
+  await rows[0].children[1].children.find((button) => button.textContent === "Start").dispatch("click");
+
+  assert.deepEqual(client.calls.roadmapActions, [
+    ["add", "First goal"],
+    ["add", "Second goal"],
+    ["move", "goal-2", 0],
+    ["start", "goal-2"],
+  ]);
+  const loopsPane = find(document.body, (node) => node.className === "rail-pane loop-pane");
+  assert.equal(loopsPane.hidden, false);
+  assert.match(visibleText(loopsPane), /Second goal/);
+});
+
+test("LoopChanged refreshes the Roadmap goal state", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(undefined, { roadmapGoals: [
+    { id: "g1", goal: "Build the feature", loop_id: "l1", done: false, state: "running" },
+  ] });
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("LoopChanged", { loop_id: "l1", state: "validating" }));
+  const row = find(document.getElementById("roadmap"), (node) => node.className === "roadmap-goal");
+  assert.match(visibleText(row), /Build the feature/);
+  assert.match(visibleText(row), /validating/);
+  assert.ok(client.calls.roadmap >= 2);
+});
+
+test("Roadmap add errors stay in place and keep the existing list", async () => {
+  const document = new FakeDocument();
+  const conflict = new Error("roadmap file is invalid");
+  conflict.status = 409;
+  const client = fakeClient(undefined, {
+    roadmapGoals: [{ id: "g1", goal: "Keep this goal", loop_id: null, done: false, state: "not_started" }],
+    roadmapAddFailure: conflict,
+  });
+  await start({ global: {}, document, client });
+  const pane = document.getElementById("roadmap");
+  const field = find(pane, (node) => node.className === "roadmap-add-input");
+  field.value = "A rejected goal";
+  await field.dispatch("input");
+  await find(pane, (node) => node.className === "roadmap-add-form").dispatch("submit");
+  assert.match(visibleText(pane), /roadmap file is invalid/);
+  assert.match(visibleText(pane), /Keep this goal/);
+  assert.doesNotMatch(visibleText(pane), /A rejected goal/);
 });
 
 test("spec mode toggles independently from permission mode and validates arguments", async () => {
@@ -2561,317 +2655,6 @@ test("live edit cards have no Undo when changes has no matching checkpoint", asy
   const card = find(document.getElementById("chat"), (node) => node.className === "edit-card");
   assert.ok(card);
   assert.equal(find(card, (node) => node.tagName === "BUTTON" && node.textContent === "Undo"), undefined);
-});
-
-test("start renders the chat page and prepares the whole roadmap graph in the rail", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  const app = await start({ global: {}, document, client });
-  const roadmap = document.getElementById("roadmap");
-  const page = document.getElementById("page");
-
-  assert.deepEqual(page.children, [document.getElementById("chat-pane")]);
-  assert.equal(app.route().page, "chat");
-  assert.ok(find(roadmap, (node) => node.className === "roadmap-overview"));
-  assert.equal(find(roadmap, (node) => node.className === "roadmap-graph-error"), undefined);
-  assert.deepEqual(
-    walk(roadmap).filter((node) => node.className.startsWith("roadmap-phase-box"))
-      .map((node) => node.attributes.get("data-phase-id")),
-    ["17", "18", "20"],
-  );
-  assert.equal(find(roadmap, (node) => node.className === "roadmap-open"), undefined);
-  assert.ok(document.getElementById("chat"));
-  assert.equal(document.getElementById("turn-state"), null);
-  assert.equal(document.getElementById("prompt-error").textContent, "");
-  assert.equal(app.client, client);
-  assert.ok(app.transcript);
-  assert.deepEqual(app.transcript.model, []);
-  assert.equal(find(document.body, (value) => value.className === "conversation-usage").textContent, "");
-});
-
-test("missing roadmap does not stop the chat app from starting", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient(fixtureRoadmap(), {
-    roadmapFailure: { status: 404, message: "host file request failed with status 404" },
-  });
-  await start({ global: {}, document, client });
-
-  assert.ok(document.getElementById("prompt-form"));
-  assert.equal(
-    find(document.getElementById("roadmap"), (node) => node.className === "roadmap-message").textContent,
-    "No roadmap in this repository.",
-  );
-});
-
-test("invalid roadmap does not stop startup and reports the parse error", async () => {
-  const document = new FakeDocument();
-  await start({ global: {}, document, client: fakeClient("not json") });
-
-  assert.ok(document.getElementById("prompt-form"));
-  assert.equal(
-    find(document.getElementById("roadmap"), (node) => node.className === "roadmap-message").textContent,
-    "The roadmap couldn't be read: roadmap is not valid JSON",
-  );
-});
-
-test("a missing roadmap during refresh updates the tool without replacing the page", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  client.specRuns = async () => [{ session_id: "spec-session", kind: "implement", state: "running", spec: "specs/18/example.md" }];
-  const app = await start({ global: {}, document, client });
-  const chatPane = document.getElementById("page").children[0];
-  const composer = document.getElementById("prompt-form");
-
-  client.setRoadmapFailure({ status: 404, message: "host file request failed with status 404" });
-  await client.emit(eventFrame("RunFinished", { session_id: "spec-session" }));
-
-  assert.equal(document.getElementById("page").children[0], chatPane);
-  assert.equal(document.getElementById("prompt-form"), composer);
-  assert.equal(
-    find(document.getElementById("roadmap"), (node) => node.className === "roadmap-message").textContent,
-    "No roadmap in this repository.",
-  );
-});
-
-test("opening phase 18 loads each primary spec and follow-up once", async () => {
-  const roadmap = {
-    goal: "Shared specs",
-    phases: [{
-      id: "18", name: "Client", status: "done",
-      items: [
-        { title: "First", spec: BASE },
-        { title: "Same spec", spec: BASE },
-        { title: "Second", spec: OPEN_BASE },
-        { title: "Same second spec", spec: OPEN_BASE },
-      ],
-    }],
-  };
-  const client = fakeClient(JSON.stringify(roadmap), {
-    specFilesReply: { paths: [BASE, OPEN_BASE, FOLLOW_UP] },
-    fileOverrides: { [FOLLOW_UP]: "# 18aF — Follow-up\nbody" },
-  });
-  const document = new FakeDocument();
-  await start({ global: {}, document, client });
-  assert.equal(client.calls.file.includes(BASE), false);
-  const rail = document.getElementById("roadmap");
-  await find(rail, (node) => node.className === "roadmap-phase-header").dispatch("click");
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  for (const path of [BASE, OPEN_BASE, FOLLOW_UP]) {
-    assert.equal(client.calls.file.filter((value) => value === path).length, 1, path);
-  }
-  assert.equal(walk(rail).filter((node) => node.className.startsWith("roadmap-task ")).length, 2);
-});
-
-test("phase waves load full spec titles and open tasks and follow-ups", async () => {
-  const roadmap = JSON.parse(fixtureRoadmap());
-  roadmap.phases[0].status = "in_progress";
-  delete roadmap.phases[0].items[0].done;
-  roadmap.phases[0].items[0].after = [];
-  roadmap.phases[0].items.push({ title: "Second spec", spec: OPEN_BASE, after: ["18a"] });
-  const client = fakeClient(JSON.stringify(roadmap), {
-    fileOverrides: {
-      [BASE]: "# 18a — A beautifully long title\nbody",
-      [FOLLOW_UP]: "# 18aF — Fix the goal\nbody",
-    },
-  });
-  const originalFile = client.file.bind(client);
-  let releaseFiles;
-  const filesReady = new Promise((resolve) => { releaseFiles = resolve; });
-  client.file = async (path) => {
-    if ([BASE, FOLLOW_UP].includes(path)) await filesReady;
-    return originalFile(path);
-  };
-  const document = new FakeDocument();
-  await start({ global: {}, document, client });
-  const roadmapRail = document.getElementById("roadmap");
-  const phase = find(roadmapRail, (node) => node.attributes.get("data-phase-id") === "17");
-  const initialWaves = find(phase, (node) => node.className === "roadmap-waves");
-  assert.equal(find(initialWaves, (node) => node.className.startsWith("roadmap-task ")).textContent, "18a  Boundary");
-  releaseFiles();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  const refreshedPhase = find(roadmapRail, (node) => node.attributes.get("data-phase-id") === "17");
-  const waves = find(refreshedPhase, (node) => node.className === "roadmap-waves");
-  assert.ok(waves);
-  assert.equal(walk(waves).filter((node) => node.className.startsWith("roadmap-task ")).length, 2);
-  assert.equal(find(waves, (node) => node.className.startsWith("roadmap-task ")).textContent, "18a  A beautifully long title");
-  assert.equal(find(waves, (node) => node.className.startsWith("roadmap-task ")).attributes.get("title"), "A beautifully long title");
-  assert.equal(walk(waves).some((node) => node.className.startsWith("roadmap-edge")), false);
-  assert.equal(find(waves, (node) => node.className === "roadmap-follow-up").textContent, "18aF  Fix the goal");
-
-  await find(waves, (node) => node.className.startsWith("roadmap-task ")).dispatch("click");
-  assert.ok(client.calls.file.includes(BASE));
-  await find(waves, (node) => node.className === "roadmap-follow-up").dispatch("click");
-  assert.ok(client.calls.file.includes(FOLLOW_UP));
-  assert.ok(!find(roadmapRail, (node) => node.tagName === "SVG"));
-});
-
-test("phase 43 renders task waves with full titles and clickable follow-ups", async () => {
-  const followUpPath = "specs/43/43iF-forks-and-merges-inside-a-phase.md";
-  const phase = {
-    id: "43",
-    name: "Waves",
-    status: "in_progress",
-    progress: { done: 0, total: 10 },
-    after: [],
-    items: [
-      { title: "Root", spec: "specs/43/43a-root.md", after: [] },
-      { title: "Controls: plain and primary buttons", spec: "specs/43/43b-buttons.md", after: ["43a"] },
-      { title: "The sidebar shows where you are", spec: "specs/43/43c-sidebar.md", after: ["43b"] },
-      { title: "Make the primary button clearer", spec: "specs/43/43d-primary.md", after: ["43b"] },
-      { title: "The transcript is flat", spec: "specs/43/43e-transcript.md", after: ["43a"] },
-      { title: "Each column scrolls on its own", spec: "specs/43/43g-columns.md", after: ["43a"] },
-      { title: "Roadmap arrows connect", spec: "specs/43/43i-arrows.md", after: ["43a"] },
-      { title: "A task finishes", spec: "specs/43/43h-finish.md", after: ["43e"] },
-      { title: "One task per line", spec: "specs/43/43j-wave.md", after: ["43i"] },
-      { title: "Roadmap waves", spec: "specs/43/43f-waves.md", after: ["43c", "43d", "43e"] },
-    ],
-  };
-  const roadmap = JSON.stringify({ goal: "Phase 43 graph", phases: [phase] });
-  const client = fakeClient(roadmap, {
-    specFilesReply: { paths: [followUpPath] },
-    fileOverrides: { [followUpPath]: "# 43iF — Forks and merges inside a phase\nbody" },
-  });
-  const document = new FakeDocument();
-  await start({ global: {}, document, client });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  const phaseNode = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "43");
-  const waves = find(phaseNode, (node) => node.className === "roadmap-waves");
-  const waveNodes = waves.children.filter((node) => node.className === "roadmap-wave");
-  assert.equal(waveNodes.length, 4);
-  const secondWaveTasks = walk(waveNodes[1]).filter((node) => node.className.startsWith("roadmap-task "));
-  assert.deepEqual(secondWaveTasks.map((task) => task.textContent), [
-    "43b  Controls: plain and primary buttons", "43e  The transcript is flat",
-    "43g  Each column scrolls on its own", "43i  Roadmap arrows connect",
-  ]);
-  assert.deepEqual(secondWaveTasks.map((task) => task.attributes.get("title")), secondWaveTasks.map((task) => task.textContent.slice(5)));
-  const followUp = find(waveNodes[1], (node) => node.className === "roadmap-follow-up");
-  assert.equal(followUp.textContent, "43iF  Forks and merges inside a phase");
-  assert.equal(walk(phaseNode).some((node) => node.className.startsWith("roadmap-edge")), false);
-  await followUp.dispatch("click");
-  assert.ok(client.calls.file.includes(followUpPath));
-});
-
-test("two-column phase tasks keep their titles in the buttons", async () => {
-  const roadmap = JSON.stringify({
-    goal: "Two columns",
-    phases: [{
-      id: "43", name: "Two tasks", status: "in_progress", after: [], progress: { done: 0, total: 2 },
-      items: [
-        { title: "Root", spec: "specs/43/43a-root.md", after: [] },
-        { title: "Task B", spec: "specs/43/43b-task.md", after: ["43a"] },
-        { title: "Task C", spec: "specs/43/43c-task.md", after: ["43a"] },
-      ],
-    }],
-  });
-  const document = new FakeDocument();
-  await start({ global: {}, document, client: fakeClient(roadmap) });
-  const phaseNode = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "43");
-  const graph = find(phaseNode, (node) => node.className === "roadmap-waves");
-  const buttons = walk(graph).filter((node) => node.className.startsWith("roadmap-task "));
-  assert.deepEqual(buttons.slice(1).map((button) => button.textContent), ["43b  Task B", "43c  Task C"]);
-});
-
-test("roadmap phases use waves and the overview arrow stays a CSS shape", async () => {
-  const roadmap = JSON.stringify({ goal: "Waves", phases: [
-    { id: "43", name: "Current", status: "in_progress", after: [], items: [
-      { title: "Root", spec: "specs/43/43a-root.md", after: [] },
-      { title: "Parallel", spec: "specs/43/43b-parallel.md", after: ["43a"] },
-    ] },
-    { id: "44", name: "Next", status: "next", items: [] },
-  ] });
-  const document = new FakeDocument();
-  await start({ global: {}, document, client: fakeClient(roadmap) });
-  const rail = document.getElementById("roadmap");
-  const phase = find(rail, (node) => node.attributes.get("data-phase-id") === "43");
-  const waves = find(phase, (node) => node.className === "roadmap-waves");
-  assert.ok(waves);
-  assert.equal(walk(phase).some((node) => node.className.startsWith("roadmap-edge")), false);
-  assert.equal(walk(rail).filter((node) => node.className === "roadmap-edge").length, 1);
-
-  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
-  const rule = (selector) => css.match(
-    new RegExp(`(?:^|\\n)${selector}\\s*\\{([^}]*)\\}`),
-  )?.[1] ?? "";
-  const edge = rule("\\.roadmap-edge");
-  const edgeStem = rule("\\.roadmap-edge::before");
-  const edgeHead = rule("\\.roadmap-edge::after");
-  assert.match(edgeStem, /left:\s*50%;/);
-  assert.match(edgeStem, /border-left:\s*1px solid var\(--ui-text-secondary\);/);
-  assert.match(edgeHead, /border-top:\s*0\.3rem solid var\(--ui-text-secondary\);/);
-  assert.match(edge, /position:\s*relative;/);
-  assert.doesNotMatch(edgeStem + edgeHead, /content:\s*["'][^"']+["']/);
-  assert.doesNotMatch(css, /--edge-bend|roadmap-edge-through|roadmap-graph-compact|\.roadmap-box\b/);
-});
-
-test("independent phases stack in a parallel rail group and task clicks open the spec", async () => {
-  const roadmap = {
-    goal: "Parallel roadmap",
-    phases: [
-      { id: "37", name: "Independent A", status: "in_progress", after: [], items: [{ title: "Task A", spec: "specs/37/37a-task-a.md", after: [] }] },
-      { id: "38", name: "Independent B", status: "in_progress", after: [], items: [{ title: "Task B", spec: "specs/38/38a-task-b.md", after: [] }] },
-    ],
-  };
-  const document = new FakeDocument();
-  await start({ global: {}, document, client: fakeClient(JSON.stringify(roadmap)) });
-
-  const rail = document.getElementById("roadmap");
-  const group = find(rail, (node) => node.className === "roadmap-phase-group");
-  assert.deepEqual(group.children.map((node) => node.attributes.get("data-phase-id")), ["37", "38"]);
-  const phase37 = find(rail, (node) => node.attributes.get("data-phase-id") === "37");
-  const task = find(phase37, (node) => node.className.startsWith("roadmap-task "));
-  await task.dispatch("click");
-  assert.match(visibleText(document.getElementById("spec")), /37a-task-a\.md/);
-});
-
-test("spec file listing connects cross-phase follow-ups to the graph and viewer", async () => {
-  const followUpPath = "specs/37/37eF-fix-the-goal.md";
-  const roadmap = {
-    goal: "Show follow-ups",
-    phases: [
-      { id: "37", name: "Sandbox", status: "in_progress", items: [{ title: "Sandbox", spec: "specs/37/37e-test.md", after: [] }] },
-      { id: "39", name: "Workflow", status: "next", items: [{ title: "Run", spec: "specs/39/39b-run.md", after: ["37eF"] }] },
-    ],
-  };
-  const client = fakeClient(JSON.stringify(roadmap), {
-    specFilesReply: { paths: [followUpPath] },
-    fileOverrides: {
-      "specs/37/37e-test.md": "# 37e — Shell sandbox\nbody",
-      [followUpPath]: "# 37eF — Fix the goal\nbody",
-      "specs/39/39b-run.md": "# 39b — Run a spec\nbody",
-    },
-  });
-  const document = new FakeDocument();
-  await start({ global: {}, document, client });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  const rail = document.getElementById("roadmap");
-  const priorPhase = find(rail, (node) => node.attributes.get("data-phase-id") === "37");
-  const priorGraph = find(priorPhase, (node) => node.className === "roadmap-waves");
-  assert.equal(find(priorGraph, (node) => node.className === "roadmap-follow-up").textContent, "37eF  Fix the goal");
-  const currentPhase = find(rail, (node) => node.attributes.get("data-phase-id") === "39");
-  assert.ok(find(currentPhase, (node) => node.className === "roadmap-waves"));
-  assert.ok(!find(currentPhase, (node) => node.className === "roadmap-graph-error"));
-
-  await find(priorGraph, (node) => node.className.startsWith("roadmap-task ")).dispatch("click");
-  assert.match(visibleText(document.getElementById("spec")), /37eF-fix-the-goal/);
-  assert.equal(client.calls.specFiles, 1);
-});
-
-test("spec file listing failure keeps the bound roadmap paths", async () => {
-  const roadmap = {
-    goal: "Keep the roadmap available",
-    phases: [{ id: "18", name: "Client", status: "in_progress", items: [{ title: "Open boundary", spec: BASE, after: [] }] }],
-  };
-  const client = fakeClient(JSON.stringify(roadmap), { specFilesFailure: true });
-  const document = new FakeDocument();
-  await start({ global: {}, document, client });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  const phase = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "18");
-  assert.ok(find(phase, (node) => node.className === "roadmap-waves"));
-  assert.equal(find(phase, (node) => node.className.startsWith("roadmap-task ")).textContent, "18a  Open boundary");
 });
 
 test("conversation context and per-agent usage render and refresh after compaction", async () => {
@@ -4290,25 +4073,6 @@ test("page navigation preserves the rendered transcript and stores the route", a
   assert.equal(document.getElementById("chat").children[0].textContent, "still here");
 });
 
-test("the removed roadmap route falls back to chat unless a URL fragment wins", async () => {
-  const storedDocument = new FakeDocument();
-  const stored = fakeGlobal({ stored: "#/roadmap" });
-  const storedApp = await start({ global: stored.global, document: storedDocument, client: fakeClient() });
-  assert.equal(storedDocument.getElementById("page").children[0].className, "chat-pane");
-  assert.equal(storedApp.route().page, "chat");
-
-  const fragmentDocument = new FakeDocument();
-  const fragment = fakeGlobal({ fragment: "#/settings/mcp", stored: "#/roadmap" });
-  const app = await start({
-    global: fragment.global,
-    document: fragmentDocument,
-    client: fakeClient(),
-  });
-  assert.equal(app.route().page, "settings");
-  assert.equal(app.route().section, "mcp");
-  assert.equal(fragmentDocument.getElementById("page").children[0].className, "settings-pane");
-});
-
 test("sidebar places Settings after the scrolling conversation list", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal({ fragment: "#/settings/general" });
@@ -4346,7 +4110,7 @@ test("sidebar places Settings after the scrolling conversation list", async () =
   await document.getElementById("home-link").dispatch("click");
   assert.equal(browser.global.location.hash, "#/chat");
   assert.deepEqual(document.getElementById("page").children, [document.getElementById("chat-pane")]);
-  assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-overview"));
+  assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-goals"));
 });
 
 test("sidebar tracks the active page and Settings section", async () => {
@@ -4393,7 +4157,7 @@ test("session buttons keep the centred navigation row styles", async () => {
   const buttonRule = css.match(/button\.session-link\s*\{([^}]*)\}/)?.[1] ?? "";
   const sessionType = [...css.matchAll(/\.session-link\s*\{([^}]*)\}/g)]
     .find((match) => /font-size:/.test(match[1]))?.[1] ?? "";
-  const metadataSelectors = css.match(/(?:^|\n)(\.conversation-usage,[\s\S]*?\.roadmap-task)\s*\{/)?.[1] ?? "";
+  const metadataSelectors = css.match(/(?:^|\n)(\.roadmap-goal-state)\s*\{/)?.[1] ?? "";
 
   assert.match(buttonRule, /width:\s*calc\(100% - 1rem\);/);
   assert.match(buttonRule, /text-align:\s*left;/);
@@ -4555,7 +4319,7 @@ test("rail tabs open tools, close to the Tools list, and persist the selected la
   assert.equal(agents.hidden, false);
   assert.equal(roadmap.hidden, true);
   assert.equal(changes.hidden, true);
-  assert.equal(document.getElementById("spec").hidden, true);
+  assert.equal(tabButtons().some((tab) => tab.textContent === "Spec"), false);
   assert.equal(document.getElementById("files").hidden, true);
   assert.equal(tools.hidden, true);
 
@@ -4564,7 +4328,7 @@ test("rail tabs open tools, close to the Tools list, and persist the selected la
   await find(tabs, (node) => node.attributes.get("aria-label") === "Close Agents").dispatch("click");
   await find(tabs, (node) => node.attributes.get("aria-label") === "Close Roadmap").dispatch("click");
   assert.equal(tools.hidden, false);
-  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs", "Loop"]);
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop"]);
   await tools.children.find((row) => row.textContent === "Changes").dispatch("click");
   assert.equal(client.calls.changes, 1);
   assert.deepEqual(tabButtons().map((tab) => tab.textContent || tab.attributes.get("aria-label")), ["Changes"]);
@@ -4589,28 +4353,18 @@ test("rail tabs open tools, close to the Tools list, and persist the selected la
   await start({ global: fakeGlobal({ storageThrows: true }).global, document: throwingDocument, client: fakeClient() });
   assert.deepEqual(throwingDocument.getElementById("rail-tabs").children.slice(0, -1).map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap"]);
   assert.equal(throwingDocument.getElementById("agents").hidden, false);
-});
 
-test("roadmap task clicks open and reuse the Spec tool tab", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  await start({ global: {}, document, client });
-  const tasks = () => walk(document.getElementById("roadmap"))
-    .filter((node) => node.className.startsWith("roadmap-task "));
-  const firstTask = tasks()[0];
-  assert.ok(firstTask);
-  await firstTask.dispatch("click");
-  assert.equal(document.getElementById("spec").hidden, false);
-  assert.deepEqual(
-    document.getElementById("rail-tabs").children.slice(0, -1).map((row) => row.children[0].attributes.get("aria-label")),
-    ["Agents", "Roadmap", "Spec"],
-  );
-  assert.equal(document.getElementById("rail-tabs").children[2].children[0].attributes.get("aria-selected"), "true");
-  await tasks()[1].dispatch("click");
-  assert.equal(
-    document.getElementById("rail-tabs").children.filter((row) => row.children[0]?.attributes.get("aria-label") === "Spec").length,
-    1,
-  );
+  const legacyDocument = new FakeDocument();
+  await start({
+    global: fakeGlobal({
+      railStored: JSON.stringify({ open: ["Spec", "Roadmap"], selected: "Spec" }),
+    }).global,
+    document: legacyDocument,
+    client: fakeClient(),
+  });
+  const legacyTabs = legacyDocument.getElementById("rail-tabs").children.slice(0, -1);
+  assert.deepEqual(legacyTabs.map((row) => row.children[0].attributes.get("aria-label")), ["Roadmap"]);
+  assert.equal(legacyTabs[0].children[0].attributes.get("aria-selected"), "true");
 });
 
 test("Changes tool restores revert conflict and worktree actions", async () => {
@@ -4716,15 +4470,15 @@ test("rail icon tabs show the selected name and move the only close button", asy
       .find((row) => row.textContent === name).dispatch("click");
   };
   await openFromTools("Changes");
-  await openFromTools("Spec");
+  await openFromTools("Files");
   const rows = tabs.children.slice(0, -1);
-  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["", "", "", "Spec"]);
-  assert.deepEqual(rows.map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap", "Changes", "Spec"]);
-  assert.deepEqual(rows.map((row) => row.children[0].attributes.get("title")), ["Agents", "Roadmap", "Changes", "Spec"]);
+  assert.deepEqual(rows.map((row) => row.children[0].textContent), ["", "", "", "Files"]);
+  assert.deepEqual(rows.map((row) => row.children[0].attributes.get("aria-label")), ["Agents", "Roadmap", "Changes", "Files"]);
+  assert.deepEqual(rows.map((row) => row.children[0].attributes.get("title")), ["Agents", "Roadmap", "Changes", "Files"]);
   assert.equal(rows[3].attributes.get("aria-selected"), "true");
   assert.deepEqual(rows.map((row) => row.children.length), [1, 1, 1, 2]);
   assert.equal(walk(tabs).filter((node) => node.className === "rail-tab-close").length, 1);
-  assert.match(visibleText(document.getElementById("spec")), /Choose a task in Roadmap to open its spec\./);
+  assert.doesNotMatch(rows.map((row) => row.children[0].attributes.get("aria-label")).join(" "), /Spec/);
 
   const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
   const rule = (selector) => css.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
@@ -4734,7 +4488,7 @@ test("rail icon tabs show the selected name and move the only close button", asy
   assert.match(railTabs, /width:\s*calc\(100% - var\(--space-8\) - var\(--space-3\)\);/);
   assert.match(railTab, /width:\s*1\.5rem;/);
   assert.doesNotMatch(railTab, /text-overflow:\s*ellipsis/);
-  for (const icon of ["agents", "roadmap", "changes", "spec", "files"]) {
+  for (const icon of ["agents", "roadmap", "changes", "files"]) {
     assert.match(css, new RegExp(`\\.icon-tool-${icon}\\s*\\{[^}]*--icon-image:\\s*url\\("data:image/svg\\+xml,`, "s"));
   }
 
@@ -5068,57 +4822,6 @@ test("reopened history renders its collapsed dispatch task and turn time", async
   assert.match(visibleText(chat), /Worked for 6m 34s ·/);
   await dispatch.dispatch("keydown", { key: "Enter", preventDefault() {} });
   assert.match(visibleText(chat), /explorer: find the bug/);
-});
-
-test("status rail renders the whole roadmap beside settings and live agents", async () => {
-  const document = new FakeDocument();
-  const browser = fakeGlobal({ fragment: "#/settings/general" });
-  const client = fakeClient();
-  await start({ global: browser.global, document, client });
-  const rail = document.getElementById("status-rail");
-  const agents = document.getElementById("agents");
-
-  assert.deepEqual(rail.children, [
-    document.getElementById("rail-tabs"), agents, document.getElementById("roadmap"),
-    document.getElementById("changes"), document.getElementById("spec"),
-    document.getElementById("files"), rail.children.find((node) => node.className === "rail-pane jobs-pane"),
-    rail.children.find((node) => node.className === "rail-pane loop-pane"),
-    document.getElementById("rail-tools"),
-  ]);
-  assert.equal(document.getElementById("page").children[0].className, "settings-pane");
-  assert.equal(document.getElementById("page").children.length, 1);
-  assert.ok(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-overview"));
-  assert.equal(find(document.getElementById("roadmap"), (node) => node.className === "roadmap-open"), undefined);
-  assert.match(visibleText(rail), /18 Desktop app/);
-  assert.equal(visibleText(agents), "\nNothing is running.");
-
-  await client.emit(eventFrame("RunStarted", { agent_name: "leader" }));
-  await client.emit(eventFrame("ToolCallStarted", { tool_name: "read", tool_call_id: "one" }));
-  await client.emit(eventFrame("SubagentSpawned", {
-    subagent_agent_id: "agent-2", subagent_name: "worker",
-  }));
-  await client.emit(eventFrame("SubagentSpawned", {
-    subagent_agent_id: "agent-3", subagent_name: "sibling",
-  }));
-  await client.emit(eventFrame("SubagentSpawned", {
-    agent_id: "agent-2", subagent_agent_id: "agent-4", subagent_name: "grandchild",
-  }));
-  await client.emit(eventFrame("ToolCallStarted", { agent_id: "agent-4", tool_name: "search" }));
-  await client.emit(eventFrame("SubagentStopped", { subagent_agent_id: "agent-2" }));
-  const root = agents.children[0];
-  const children = root.children.find((row) => row.className === "agent-children");
-  assert.equal(children.className, "agent-children");
-  assert.deepEqual(children.children.map(agentRowText), ["worker · finished", "sibling · running · thinking"]);
-  const workerChildren = children.children[0].children.find((row) => row.className === "agent-children");
-  assert.deepEqual(workerChildren.children.map(agentRowText), ["grandchild · running · search"]);
-  assert.deepEqual(agents.children.map(agentRowText), ["leader · running · read"]);
-
-  await client.emit(eventFrame("SubagentSpawned", {
-    agent_id: "missing", subagent_agent_id: "orphan", subagent_name: "orphan",
-  }));
-  assert.deepEqual(agents.children.map(agentRowText), [
-    "leader · running · read", "orphan · running · thinking",
-  ]);
 });
 
 test("reopened history and conversation stats render a nested agent tree without run events", async () => {
@@ -5962,114 +5665,6 @@ test("action icons use current-color SVG masks and hidden buttons stay hidden", 
   assert.doesNotMatch(appSource, /controlAgent|agent-controls|agent-redirect|agent-control-error/);
   assert.match(css, /\[hidden\]\s*\{[^}]*display:\s*none\s*!important;/);
   assert.match(css, /\.sidebar-toggle,\s*\.rail-toggle\s*\{[^}]*width:\s*2rem;[^}]*height:\s*2rem;/);
-});
-
-test("items in folded and open roadmap phases open their specs and reports", async () => {
-  const document = new FakeDocument();
-  const client = fakeClient();
-  const app = await start({ global: {}, document, client });
-  const calls = [];
-  const open = app.specView.open;
-  app.specView.open = (...arguments_) => {
-    calls.push(arguments_);
-    return open(...arguments_);
-  };
-  const roadmap = document.getElementById("roadmap");
-  for (const [title, specText, reportText] of [
-    ["Boundary", "base spec text", "base report text"],
-    ["Open boundary", "open spec text", "open report text"],
-  ]) {
-    if (title === "Boundary") {
-      const completed = find(roadmap, (node) => node.attributes.get("data-phase-id") === "17");
-      await find(completed, (node) => node.className === "roadmap-phase-header").dispatch("click");
-    }
-    const button = find(
-      roadmap,
-      (value) => value.tagName === "BUTTON" && value.textContent.includes(title),
-    );
-    await button.dispatch("click");
-    const text = visibleText(document.getElementById("spec"));
-    assert.match(text, new RegExp(specText));
-    assert.match(text, new RegExp(reportText));
-  }
-
-  assert.deepEqual(calls.map(([item]) => item.title), ["Boundary", "Open boundary"]);
-  assert.deepEqual(calls[0][1], { specPaths: [BASE, OPEN_BASE, FOLLOW_UP] });
-});
-
-test("an all-done roadmap leaves every phase folded", async () => {
-  const document = new FakeDocument();
-  await start({
-    global: {},
-    document,
-    client: fakeClient(fixtureRoadmap({ allDone: true })),
-  });
-
-  const roadmap = document.getElementById("roadmap");
-  const chain = find(roadmap, (node) => node.className.startsWith("roadmap-phase-chain-summary"));
-  assert.ok(chain, visibleText(roadmap));
-  assert.equal(find(roadmap, (node) => node.className === "roadmap-phase-tasks"), undefined);
-});
-
-test("done phase chains expand to one-line phases and then to a task graph", async () => {
-  const roadmap = {
-    goal: "Collapse completed phases",
-    phases: [
-      { id: "01", name: "First", status: "done", items: [{ title: "First task", spec: "specs/01/01a-first.md" }] },
-      { id: "02", name: "Second", status: "done", items: [{ title: "Second task", spec: "specs/02/02a-second.md" }] },
-      { id: "03", name: "Third", status: "done", items: [{ title: "Third task", spec: "specs/03/03a-third.md" }] },
-      { id: "04", name: "Open phase", status: "next", items: [{ title: "Open task", spec: "specs/04/04a-open.md" }] },
-    ],
-  };
-  const document = new FakeDocument();
-  await start({ global: {}, document, client: fakeClient(JSON.stringify(roadmap)) });
-  let page = document.getElementById("roadmap");
-  const chain = find(page, (node) => node.className.startsWith("roadmap-phase-chain-summary"));
-  assert.equal(chain?.textContent, "✓ 01–03 · 3 phases", visibleText(page));
-  await chain.dispatch("click");
-  page = document.getElementById("roadmap");
-  for (const id of ["01", "02", "03"]) {
-    assert.ok(find(page, (node) => node.attributes.get("data-phase-id") === id));
-  }
-  const first = find(page, (node) => node.attributes.get("data-phase-id") === "01");
-  assert.equal(first.children.length, 1);
-  await find(first, (node) => node.className === "roadmap-phase-header").dispatch("click");
-  const expandedFirst = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "01");
-  assert.ok(find(expandedFirst, (node) => node.className === "roadmap-phase-tasks"));
-});
-
-test("the removed roadmap route falls back to chat while the rail keeps its graph", async () => {
-  const document = new FakeDocument();
-  const browser = fakeGlobal();
-  const app = await start({ global: browser.global, document, client: fakeClient() });
-  browser.global.location.hash = "#/roadmap";
-  browser.dispatch("hashchange");
-  assert.equal(document.getElementById("page").children[0].className, "chat-pane");
-  assert.equal(app.route().page, "chat");
-  const phase = find(document.getElementById("roadmap"), (node) => node.attributes.get("data-phase-id") === "18");
-  assert.ok(find(phase, (node) => node.className === "roadmap-phase-tasks"));
-});
-
-test("an additional fixture phase renders without a copied count", async () => {
-  const roadmap = JSON.parse(fixtureRoadmap());
-  roadmap.phases.push({
-    id: "22",
-    name: "Fixture phase",
-    status: "planned",
-    items: [],
-  });
-  const document = new FakeDocument();
-
-  await start({
-    global: {},
-    document,
-    client: fakeClient(JSON.stringify(roadmap)),
-  });
-
-  assert.equal(
-    walk(document.getElementById("roadmap")).filter((node) => node.className.startsWith("roadmap-phase-box")).length,
-    roadmap.phases.length,
-  );
 });
 
 test("submit dispatches once and assistant deltas render in order", async () => {
@@ -7726,164 +7321,6 @@ test("an empty run notice removes its row while a populated notice keeps the nor
   assert.doesNotMatch(css, /#run-notice\s*\{[^}]*display:\s*none;/);
 });
 
-function specWorkflowRoadmap(hasSpec = true) {
-  return JSON.stringify({ goal: "Spec workflow test", phases: [{
-    id: "18", name: "Workflow", status: "in_progress",
-    items: [hasSpec ? { title: "Boundary", spec: BASE } : "Boundary"],
-  }] });
-}
-
-function specWorkflowClient({ hasSpec = true, runs = [], onAction = {} } = {}) {
-  const client = fakeClient(specWorkflowRoadmap(hasSpec));
-  let currentRuns = runs;
-  let specRunReads = 0;
-  client.specRuns = async () => {
-    specRunReads += 1;
-    return currentRuns;
-  };
-  client.specRunReadCount = () => specRunReads;
-  client.setSpecRuns = (next) => { currentRuns = next; };
-  client.planSpec = async (...args) => onAction.planSpec?.(...args);
-  client.runSpec = async (...args) => onAction.runSpec?.(...args);
-  client.reviewSpec = async (...args) => onAction.reviewSpec?.(...args);
-  client.commitSpec = async (...args) => onAction.commitSpec?.(...args);
-  return client;
-}
-
-async function openWorkflowItem(client) {
-  const document = new FakeDocument();
-  const app = await start({ global: {}, document, client });
-  const roadmapButton = find(document.getElementById("roadmap"), (node) => node.className.startsWith("roadmap-task "));
-  assert.ok(roadmapButton, visibleText(document.getElementById("page")));
-  await roadmapButton.dispatch("click");
-  assert.ok(find(document.getElementById("spec"), (node) => node.className === "spec-workflow"), visibleText(document.getElementById("page")));
-  return { app, document, roadmapButton };
-}
-
-test("starting a spec plan clears agents from the previous conversation", async () => {
-  const client = specWorkflowClient({ hasSpec: false });
-  const { document } = await openWorkflowItem(client);
-  await client.emit(eventFrame("RunStarted", { agent_id: "leader-a", agent_name: "leader" }));
-  await client.emit(eventFrame("SubagentSpawned", {
-    agent_id: "leader-a", subagent_agent_id: "worker-a", subagent_name: "worker",
-  }));
-  assert.match(
-    agentRowText(find(document.getElementById("agents"), (row) => row.className === "agent-row" && agentRowText(row).startsWith("worker"))),
-    /worker · running/,
-  );
-
-  await documentButton(document, "Plan").dispatch("click");
-  assert.equal(visibleText(document.getElementById("agents")), "\nNothing is running.");
-});
-
-function workflowActions(document) {
-  const panel = find(document.getElementById("spec"), (node) => node.className === "spec-workflow");
-  return {
-    panel,
-    step: find(panel, (node) => node.className === "spec-step")?.textContent,
-    actions: walk(panel).filter((node) => node.tagName === "BUTTON").map((node) => node.textContent),
-  };
-}
-
-test("roadmap spec workflow renders the actions for each run state", async () => {
-  const reviewRun = (verdict) => ({
-    kind: "implement", spec: BASE, session_id: "implement-1", state: "finished",
-    review: { session_id: "review-1", verdict },
-  });
-  const cases = [
-    ["unplanned", false, [], ["Plan"]],
-    ["planning", false, [{ kind: "plan", phase: "18", item: 0, session_id: "plan-1", state: "running" }], ["Open"]],
-    ["planned", true, [], ["Run"]],
-    ["running", true, [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }], ["Open"]],
-    ["ran", true, [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished" }], ["Review", "Open"]],
-    ["in review", true, [{ ...reviewRun("running"), state: "finished" }], ["Open"]],
-    ["reviewed", true, [reviewRun("passed")], ["Commit…", "Open"]],
-    ["reviewed", true, [reviewRun("tree-changed")], ["Review", "Open"]],
-    ["committed", true, [{ ...reviewRun("passed"), committed: { sha: "abc123" } }], []],
-  ];
-  for (const [step, hasSpec, runs, expectedActions] of cases) {
-    const { document } = await openWorkflowItem(specWorkflowClient({ hasSpec, runs }));
-    const rendered = workflowActions(document);
-    assert.equal(rendered.step, step);
-    assert.deepEqual(rendered.actions, expectedActions, `${step} actions`);
-  }
-});
-
-test("unbound planner outcomes show the stop reason and can be reopened or retried", async () => {
-  const stopped = await openWorkflowItem(specWorkflowClient({ hasSpec: false, runs: [
-    { kind: "plan", phase: "18", item: 0, session_id: "plan-budget", state: "stopped", stopped_reason: "budget_turns", created: [] },
-  ] }));
-  const stoppedView = workflowActions(stopped.document);
-  assert.equal(stoppedView.step, "planner stopped: turn limit");
-  assert.deepEqual(stoppedView.actions, ["Plan", "Open"]);
-
-  const empty = await openWorkflowItem(specWorkflowClient({ hasSpec: false, runs: [
-    { kind: "plan", phase: "18", item: 0, session_id: "plan-empty", state: "finished", created: [] },
-  ] }));
-  assert.equal(workflowActions(empty.document).step, "planner wrote no spec");
-  assert.deepEqual(workflowActions(empty.document).actions, ["Plan", "Open"]);
-});
-
-test("roadmap spec actions post their payloads, refresh, open sessions, and show errors", async () => {
-  const planClient = specWorkflowClient({ hasSpec: false, onAction: {
-    planSpec(phase, item) {
-      assert.deepEqual([phase, item], ["18", 0]);
-      planClient.setSpecRuns([{ kind: "plan", phase: "18", item: 0, session_id: "plan-1", state: "running" }]);
-    },
-  } });
-  const plan = await openWorkflowItem(planClient);
-  await documentButton(plan.document, "Plan").dispatch("click");
-  assert.equal(workflowActions(plan.document).step, "planning");
-  assert.deepEqual(workflowActions(plan.document).actions, ["Open"]);
-
-  const runClient = specWorkflowClient({ onAction: {
-    runSpec(path) {
-      assert.equal(path, BASE);
-      runClient.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }]);
-    },
-  } });
-  const run = await openWorkflowItem(runClient);
-  await find(run.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Run").dispatch("click");
-  assert.equal(workflowActions(run.document).step, "running");
-
-  const reviewClient = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished" }], onAction: {
-    reviewSpec(sessionId) {
-      assert.equal(sessionId, "implement-1");
-      reviewClient.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished", review: { session_id: "review-1", verdict: "running" } }]);
-    },
-  } });
-  const review = await openWorkflowItem(reviewClient);
-  await find(review.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Review").dispatch("click");
-  assert.equal(workflowActions(review.document).step, "in review");
-
-  const commitClient = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished", review: { session_id: "review-1", verdict: "passed" } }], onAction: {
-    commitSpec(sessionId, message) {
-      assert.deepEqual([sessionId, message], ["implement-1", "my commit message"]);
-      commitClient.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished", review: { session_id: "review-1", verdict: "passed" }, committed: { sha: "abc123" } }]);
-    },
-  } });
-  const commit = await openWorkflowItem(commitClient);
-  const message = find(commit.document.getElementById("spec"), (node) => node.tagName === "INPUT" && node.attributes.get("aria-label") === "Commit message");
-  message.value = "my commit message";
-  await find(commit.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Commit…").dispatch("click");
-  assert.equal(workflowActions(commit.document).step, "committed");
-
-  const openClient = specWorkflowClient({ hasSpec: false, runs: [{ kind: "plan", phase: "18", item: 0, session_id: "plan-1", state: "running" }] });
-  const opened = await openWorkflowItem(openClient);
-  await find(opened.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Open").dispatch("click");
-  assert.deepEqual(openClient.calls.openSession, ["plan-1"]);
-
-  const errorClient = specWorkflowClient({ onAction: { async runSpec() { throw new Error("run rejected"); } } });
-  const failed = await openWorkflowItem(errorClient);
-  await find(failed.document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === "Run").dispatch("click");
-  assert.equal(workflowActions(failed.document).step, "planned");
-  assert.match(visibleText(workflowActions(failed.document).panel), /run rejected/);
-});
-
-function documentButton(document, label) {
-  return find(document.getElementById("spec"), (node) => node.tagName === "BUTTON" && node.textContent === label);
-}
-
 function fakeClock(start = 10_000) {
   let now = start;
   let nextId = 0;
@@ -7915,43 +7352,6 @@ function withClock(clock) {
   browser.setTimeout = clock.setTimeout;
   return browser;
 }
-
-test("spec-state refresh fetches immediately and once at the window end", async () => {
-  const clock = fakeClock();
-  const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
-  const document = new FakeDocument();
-  const app = await start({ global: withClock(clock), document, client });
-  await find(document.getElementById("roadmap"), (node) => node.className.startsWith("roadmap-task ")).dispatch("click");
-  const before = client.specRunReadCount();
-  const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "pause", phase: "paused", rounds: 1, max_rounds: 5, reason: "stopped" });
-  await app.onFrame(frame);
-  assert.equal(client.specRunReadCount(), before + 1);
-  await clock.advance(100);
-  client.setSpecRuns([{ kind: "implement", spec: BASE, session_id: "implement-1", state: "finished" }]);
-  await app.onFrame(frame);
-  assert.equal(client.specRunReadCount(), before + 1);
-  assert.equal(workflowActions(document).step, "running");
-  await clock.advance(900);
-  assert.equal(client.specRunReadCount(), before + 2);
-  assert.equal(workflowActions(document).step, "ran");
-});
-
-test("three spec-state events inside one window make one trailing refresh", async () => {
-  const clock = fakeClock();
-  const client = specWorkflowClient({ runs: [{ kind: "implement", spec: BASE, session_id: "implement-1", state: "running" }] });
-  const document = new FakeDocument();
-  const app = await start({ global: withClock(clock), document, client });
-  const before = client.specRunReadCount();
-  const frame = eventFrame("GoalChanged", { session_id: "implement-1", change: "round", phase: "active", rounds: 1, max_rounds: 5, reason: "" });
-  await app.onFrame(frame);
-  await clock.advance(100);
-  await app.onFrame(frame);
-  await clock.advance(100);
-  await app.onFrame(frame);
-  assert.equal(client.specRunReadCount(), before + 1);
-  await clock.advance(800);
-  assert.equal(client.specRunReadCount(), before + 2);
-});
 
 test("sidebar activity refreshes immediately and once at the window end", async () => {
   const clock = fakeClock();
@@ -8217,8 +7617,7 @@ test("controls, focus, motion, and prose links use the app states", async () => 
 
   const rowButtons = [
     "session-link", "command-suggestion", "file-suggestion", "picker-row",
-    "roadmap-phase-header", "roadmap-phase-chain-summary", "roadmap-task",
-    "roadmap-follow-up", "roadmap-item",
+    "roadmap-goal-link",
   ];
   const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
   for (const className of rowButtons) {
@@ -8315,7 +7714,7 @@ test("Jobs tab lists, starts, stops, polls, and refreshes jobs on JobChanged", a
   const app = await start({ global: browser.global, document, client });
   const tools = document.getElementById("rail-tools");
   await document.getElementById("rail-tabs").children.at(-1).dispatch("click");
-  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs", "Loop"]);
+  assert.deepEqual(tools.children.slice(1).map((row) => row.textContent), ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop"]);
   await tools.children.find((row) => row.textContent === "Jobs").dispatch("click");
   const pane = walk(document.body).find((node) => node.className === "rail-pane jobs-pane");
   assert.equal(pane.hidden, false);

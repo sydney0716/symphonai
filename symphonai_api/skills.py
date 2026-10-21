@@ -141,8 +141,3 @@ def load_skill_directory(path: Path) -> dict[str, Skill]:
 def roster_text(skills: Iterable[Skill], *, separator: str = "\n\n") -> str:
     """Render a roster for a system prompt, in the given order."""
     return separator.join(skill.discoverability_text() for skill in skills)
-
-
-def roster_cost(skills: Iterable[Skill]) -> int:
-    """Return the discoverability cost of a skill roster."""
-    return sum(skill.always_on_tokens for skill in skills)

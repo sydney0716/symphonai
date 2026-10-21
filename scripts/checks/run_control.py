@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import tempfile
 import threading
 from dataclasses import FrozenInstanceError
@@ -510,27 +509,6 @@ def budget_only_lowers() -> None:
     else:
         fail("price_table=None was accepted with max_cost")
 
-    checks_root = Path(__file__).resolve().parent
-    for check_path in checks_root.glob("*.py"):
-        source = check_path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "sha256"
-            ):
-                call_source = ast.get_source_segment(source, node) or ""
-                if "symphonai_api" in call_source:
-                    fail(f"runtime file hash pin remains in {check_path.name}")
-    agent_file_source = (checks_root / "agent_file.py").read_text(encoding="utf-8")
-    if (
-        "BUDGETS_SHA256" in agent_file_source
-        or "budgets.py changed" in agent_file_source
-    ):
-        fail("agent_file budget hash pin was not removed")
-
-
 @check("run_control.cap_is_phase_guarded")
 def cap_is_phase_guarded() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -977,17 +955,6 @@ def capped_turns_stop_the_run() -> None:
         ).run([Message(Role.USER, "task")])
         if exhausted.stopped_reason != "max_turns" or exhausted_provider.call_count != 1:
             fail("ordinary max_turns exhaustion was not distinguishable")
-
-        source = (
-            Path(__file__).resolve().parents[2] / "symphonai_api/agent_loop.py"
-        ).read_text()
-        if '"budget_turns"' not in source.split("class ApiAgent", 1)[0]:
-            fail("AgentRunResult stopped-reason comment omitted budget_turns")
-
-
-
-
-
 
 @check("run_control.control_lock_scope")
 def control_lock_scope() -> None:

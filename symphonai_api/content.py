@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-from pathlib import Path
 
 from symphonai_api.models import DocumentBlock, ImageBlock
 
@@ -44,9 +43,3 @@ def content_block_from_bytes(
     if media_type == DOCUMENT_MEDIA_TYPE:
         return DocumentBlock(data=data, filename=filename)
     return ImageBlock(data=data, media_type=media_type)
-
-
-def content_block_from_path(path: str | Path) -> ImageBlock | DocumentBlock:
-    """Read `path` and build its block. `filename` comes from the path's name."""
-    resolved = Path(path)
-    return content_block_from_bytes(resolved.read_bytes(), filename=resolved.name)

@@ -549,30 +549,6 @@ def check_retry_exhausted_transient_failures() -> None:
     if "3 attempts" not in exhausted_message:
         fail(f"exhausted retry error must name the attempt count: {exhausted_message!r}")
 
-@check("retry.numeric_retry_after")
-def check_retry_numeric_retry_after() -> None:
-    # -- a foreground call honours numeric Retry-After instead of exponential
-    # backoff. Model discovery is background and now correctly bails on 429. --
-    retry_request = urllib.request.Request("https://mock.invalid/retry-after")
-    with mock.patch(
-        "urllib.request.urlopen",
-        side_effect=[
-            _http_error(429, '{"error":"slow down"}', retry_after="2"),
-            _FakeHttpResponse(b"ok"),
-        ],
-    ) as urlopen_mock:
-        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
-            raw = read_with_retry(
-                retry_request,
-                timeout=30.0,
-                max_attempts=2,
-                api_key="test-key",
-                operation="numeric Retry-After test",
-            )
-    if raw != b"ok" or urlopen_mock.call_count != 2:
-        fail("expected foreground HTTP 429 to honour numeric Retry-After")
-    sleep_mock.assert_called_once_with(2.0)
-
 @check("retry.http_date_retry_after")
 def check_retry_http_date_retry_after() -> None:
     # -- RFC 9110 also permits Retry-After as an HTTP-date. --

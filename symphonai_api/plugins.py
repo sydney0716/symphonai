@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 import re
@@ -182,15 +182,3 @@ def load_plugin_directory(
         for child in sorted(directory.iterdir())
         if child.is_dir()
     }
-
-
-def append_plugin_hooks(
-    local_hooks: Iterable[HookSpec],
-    plugins: Mapping[str, Plugin],
-) -> tuple[HookSpec, ...]:
-    """Append plugin hooks in loaded plugin order after local hooks."""
-    return tuple(local_hooks) + tuple(
-        hook
-        for plugin in plugins.values()
-        for hook in plugin.hooks
-    )

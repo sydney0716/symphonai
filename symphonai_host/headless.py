@@ -121,6 +121,7 @@ def _parser() -> argparse.ArgumentParser:
 
     loop = commands.add_parser("loop", help="run a spec loop without the app")
     loop.add_argument("goal", nargs="?")
+    loop.add_argument("--resume")
     loop.add_argument("--repo-root", type=Path, default=Path.cwd())
     loop.add_argument("--provider")
     loop.add_argument("--model")
@@ -605,7 +606,7 @@ def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None)
         print(f"Reason: {result['reason']}")
 
 
-def _run_loop(arguments, goal: str) -> int:  # noqa: ANN001
+def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
     apply_to_environment(os.environ, load())
     root = arguments.repo_root.expanduser().resolve()
     if not root.is_dir():
@@ -638,7 +639,17 @@ def _run_loop(arguments, goal: str) -> int:  # noqa: ANN001
         provider, model, effort, choice = _select_provider(arguments)
         runtime.run.select_provider(provider, model, effort, choice)
         subscription = broker.subscribe()
-        loop = runtime.run.start_loop(goal, runner_pid=os.getpid())
+        try:
+            if arguments.resume is not None:
+                loop = runtime.run.resume_loop(arguments.resume, runner_pid=os.getpid())
+            else:
+                loop = runtime.run.start_loop(goal, runner_pid=os.getpid())
+        except KeyError:
+            print(f"loop {arguments.resume} is unknown", file=sys.stderr, flush=True)
+            return 1
+        except RunActiveError as exc:
+            print(f"loop {arguments.resume} is {exc}; cannot resume", file=sys.stderr, flush=True)
+            return 1
         store = LoopStore(root)
         approved = False
         last_reported_state = None
@@ -650,8 +661,12 @@ def _run_loop(arguments, goal: str) -> int:  # noqa: ANN001
                 runtime.run.cancel_loop(loop["id"])
                 print(f"loop {loop['id']} cancelled", file=sys.stderr, flush=True)
                 return 130
-            if isinstance(event, LoopChanged) and event.loop_id == loop["id"]:
-                current = store.load(loop["id"])
+            if event is not None and (
+                not isinstance(event, LoopChanged) or event.loop_id != loop["id"]
+            ):
+                continue
+            current = store.load(loop["id"])
+            if isinstance(event, LoopChanged):
                 if event.change == "card":
                     card = next(
                         (item for item in current.get("cards", []) if item.get("id") == event.card_id),
@@ -662,35 +677,24 @@ def _run_loop(arguments, goal: str) -> int:  # noqa: ANN001
                 elif event.state != last_reported_state:
                     print(f"loop {loop['id']} {event.state}", file=sys.stderr, flush=True)
                     last_reported_state = event.state
-                if current.get("state") == "awaiting_plan" and not approved:
-                    approved = True
-                    try:
-                        runtime.run.approve_loop_plan(loop["id"])
-                    except (RunActiveError, ValueError) as exc:
-                        approval_error = str(exc)
-                        break
-                elif (
-                    current.get("state") in terminal_states
-                    and event.state == current.get("state")
-                ):
-                    loop = current
-                    break
-            elif event is None:
-                current = store.load(loop["id"])
+            else:
                 if current.get("state") != last_reported_state:
                     print(f"loop {loop['id']} {current.get('state', 'unknown')}", file=sys.stderr, flush=True)
                     last_reported_state = current.get("state")
-                if current.get("state") == "awaiting_plan" and not approved:
-                    approved = True
-                    try:
-                        runtime.run.approve_loop_plan(loop["id"])
-                    except (RunActiveError, ValueError) as exc:
-                        approval_error = str(exc)
-                        loop = current
-                        break
-                elif current.get("state") in terminal_states:
+            if current.get("state") == "awaiting_plan" and not approved:
+                approved = True
+                try:
+                    runtime.run.approve_loop_plan(loop["id"])
+                except (RunActiveError, ValueError) as exc:
+                    approval_error = str(exc)
                     loop = current
                     break
+            elif (
+                current.get("state") in terminal_states
+                and (event is None or event.state == current.get("state"))
+            ):
+                loop = current
+                break
         loop = store.load(loop["id"])
         _print_loop_result(loop, arguments.json, approval_error)
         return 1 if approval_error or loop.get("state") in ("needs_attention", "cancelled") else 0
@@ -729,6 +733,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_app(arguments)
     if arguments.command == "loop":
         try:
+            if arguments.resume is not None:
+                if arguments.goal is not None:
+                    raise _UsageError("--resume cannot be combined with a goal")
+                return _run_loop(arguments, None)
             goal = arguments.goal
             if goal is None or goal == "-":
                 if goal is None and sys.stdin.isatty():

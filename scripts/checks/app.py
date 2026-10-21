@@ -21,15 +21,11 @@ NODE_TESTS = {
     "app.keys": "keys.test.js",
     "app.host_handle": "host_handle.test.js",
     "app.turn": "turn.test.js",
-    "app.roadmap": "roadmap.test.js",
-    "app.roadmap_graph": "roadmap_graph.test.js",
     "app.agents": "agents.test.js",
     "app.route": "route.test.js",
-    "app.spec_view": "spec_view.test.js",
     "app.settings": "settings.test.js",
     "app.approvals": "approvals.test.js",
     "app.page": "app.test.js",
-    "app.real_roadmap": "app_roadmap.test.js",
 }
 APP_SOURCE_EXTENSIONS = frozenset({".js", ".mjs", ".json", ".html", ".css"})
 
@@ -119,18 +115,6 @@ def turn() -> None:
     _run_node_test("turn.test.js")
 
 
-@check("app.roadmap", needs_repository=True)
-def roadmap() -> None:
-    environment = dict(os.environ)
-    environment["SYMPHONAI_ROADMAP_PATH"] = str(REPO_ROOT / "docs" / "roadmap.json")
-    _run_node_test("roadmap.test.js", environment=environment)
-
-
-@check("app.roadmap_graph")
-def roadmap_graph() -> None:
-    _run_node_test("roadmap_graph.test.js")
-
-
 @check("app.route")
 def route() -> None:
     _run_node_test("route.test.js")
@@ -139,11 +123,6 @@ def route() -> None:
 @check("app.agents")
 def agents() -> None:
     _run_node_test("agents.test.js")
-
-
-@check("app.spec_view", needs_repository=True)
-def spec_view() -> None:
-    _run_node_test("spec_view.test.js")
 
 
 @check("app.settings")
@@ -159,11 +138,6 @@ def approvals() -> None:
 @check("app.page")
 def page() -> None:
     _run_node_test("app.test.js")
-
-
-@check("app.real_roadmap", needs_repository=True)
-def page_roadmap() -> None:
-    _run_node_test("app_roadmap.test.js")
 
 
 @check("app.test_registration")

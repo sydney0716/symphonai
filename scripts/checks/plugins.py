@@ -14,12 +14,10 @@ import symphonai_api.plugins as plugins_module
 from symphonai_api.agent_file import load_agent_directory
 from symphonai_api.agent_spec import ModelSelector
 from symphonai_api.config import CapabilityCeiling
-from symphonai_api.events import RunFinished
-from symphonai_api.hooks import HookRunner, HookSpec, hooks_from_config
+from symphonai_api.hooks import hooks_from_config
 from symphonai_api.mcp import McpClient, McpTool, mcp_servers_from_config
 from symphonai_api.plugins import (
     PluginError,
-    append_plugin_hooks,
     load_plugin,
     load_plugin_directory,
 )
@@ -449,36 +447,6 @@ def composed_mcp_names_are_usable() -> None:
                         f"identifier {server_name!r}"
                     )
                 fail(f"composed-name sweep produced non-identifier {server_name!r}")
-
-
-@check("plugins.hooks_append_in_plugin_order")
-def hooks_append_in_plugin_order() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        repo_root = root / "repo"
-        repo_root.mkdir()
-        plugins_root = root / "plugins"
-        output = root / "order.txt"
-        code = (
-            "from pathlib import Path; import sys; "
-            "p=Path(sys.argv[1]); "
-            "p.write_text(p.read_text() + sys.argv[2] + '\\n' "
-            "if p.exists() else sys.argv[2] + '\\n', encoding='utf-8')"
-        )
-
-        for name, label in (("bravo", "bravo"), ("alpha", "alpha")):
-            path = _plugin(plugins_root, name)
-            _config(path, hook_command=(sys.executable, "-c", code, str(output), label))
-        plugins = load_plugin_directory(plugins_root, repo_root=repo_root)
-        local = HookSpec(
-            events=("RunFinished",),
-            command=(sys.executable, "-c", code, str(output), "local"),
-        )
-        hooks = append_plugin_hooks((local,), plugins)
-        HookRunner(hooks, cwd=repo_root)(RunFinished("agent", "run"))
-        actual = output.read_text(encoding="utf-8").splitlines()
-        if actual != ["local", "alpha", "bravo"]:
-            fail(f"hook append order was {actual!r}")
 
 
 @check("plugins.agent_ceiling_is_forwarded")

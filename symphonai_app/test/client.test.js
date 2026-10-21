@@ -551,22 +551,6 @@ test("source preserves HTTP status on empty error bodies", async () => {
   await assert.rejects(client.source("image.png"), (error) => error.status === 415);
 });
 
-test("specFiles requests the authenticated spec path listing", async () => {
-  const records = [];
-  const client = createClient({
-    port: 4312,
-    token: TOKEN,
-    fetch: async (url, options) => {
-      records.push({ url, options });
-      return response(200, { paths: ["specs/37/37eF-fix.md"] });
-    },
-  });
-  assert.deepEqual(await client.specFiles(), { paths: ["specs/37/37eF-fix.md"] });
-  assert.equal(records[0].url, "http://127.0.0.1:4312/spec/files");
-  assert.equal(records[0].options.method, "GET");
-  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
-});
-
 test("history requests the selected limit", async () => {
   const records = [];
   const client = createClient({
@@ -926,26 +910,31 @@ test("ProtocolError messages created by a token-bearing client are sanitized", (
   });
 });
 
-test("spec workflow methods send the route payloads", async () => {
+test("roadmap methods send the documented routes and payloads", async () => {
   const records = [];
   const client = createClient({
     port: 4312,
     token: TOKEN,
     fetch: async (url, options) => {
       records.push({ url, options });
-      return response(200, url.endsWith("/spec/runs") ? [] : { session_id: "s", run_id: "r" });
+      return response(200, { goals: [{ id: "g", goal: "Build", loop_id: null, done: false, state: "not_started" }] });
     },
   });
-  await client.planSpec("39", 2);
-  await client.runSpec("specs/39/39b-run-a-spec.md");
-  await client.reviewSpec("s");
-  await client.commitSpec("s", "39b: run a spec");
-  await client.specRuns();
-  assert.deepEqual(records.map(({ url, options }) => [new URL(url).pathname, options.method, options.body && JSON.parse(options.body)]), [
-    ["/spec/plan", "POST", { phase: "39", item: 2 }],
-    ["/spec/run", "POST", { path: "specs/39/39b-run-a-spec.md" }],
-    ["/spec/review", "POST", { session_id: "s" }],
-    ["/spec/commit", "POST", { session_id: "s", message: "39b: run a spec" }],
-    ["/spec/runs", "GET", undefined],
+  await client.roadmap();
+  await client.addRoadmapGoal("Build");
+  await client.removeRoadmapGoal("g");
+  await client.moveRoadmapGoal("g", 2);
+  await client.startRoadmapGoal("g");
+  assert.deepEqual(records.map(({ url, options }) => [
+    new URL(url).pathname,
+    options.method,
+    options.body && JSON.parse(options.body),
+    options.headers.Authorization,
+  ]), [
+    ["/roadmap", "GET", undefined, `Bearer ${TOKEN}`],
+    ["/roadmap/add", "POST", { goal: "Build" }, `Bearer ${TOKEN}`],
+    ["/roadmap/remove", "POST", { id: "g" }, `Bearer ${TOKEN}`],
+    ["/roadmap/move", "POST", { id: "g", index: 2 }, `Bearer ${TOKEN}`],
+    ["/roadmap/start", "POST", { id: "g" }, `Bearer ${TOKEN}`],
   ]);
 });

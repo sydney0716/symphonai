@@ -5065,14 +5065,16 @@ def check_spec_workflow_prompts() -> None:
     with workspace() as ws:
         roster = builtin_subagent_specs(FakeModelProvider(), ws.policy)
         requirements = {
-            "planner": ("specs/TEMPLATE.md", "specs/<phase>/<id>-<slug>.md", "Write nothing outside specs/", "End by naming the spec path"),
-            "implementer": ("Implement exactly the given spec", "only files in its Scope", "Run every Validation command", "git status --porcelain verbatim"),
+            "planner": ("path requested by the task", "Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report", "one fenced `sh` block", "project root", "End by naming the spec path"),
+            "implementer": ("Implement exactly the given spec", "only files in its Scope", "Never edit the spec you were given", "Run every Validation command", "git status --porcelain verbatim"),
             "reviewer": ("Read the diff before the report", "scratch directory", "<id>F-<slug>.md", "<id>F2-<slug>.md", "Never commit"),
         }
         for name, phrases in requirements.items():
             prompt = roster[name].prompt
             if any(phrase not in prompt for phrase in phrases):
                 fail(f"{name} prompt omitted required workflow rules: {prompt!r}")
+            if "TEMPLATE.md" in prompt or "REPORT-TEMPLATE.md" in prompt:
+                fail(f"{name} prompt names a repository template: {prompt!r}")
 
 
 @check("leader.spec_workflow_prompt_reaches_child")

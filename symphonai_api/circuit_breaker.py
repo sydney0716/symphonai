@@ -54,14 +54,5 @@ class ConsecutiveFailureBreaker:
             self._consecutive_failures += 1
             return self._consecutive_failures
 
-    def raise_if_open(self) -> None:
-        with self._lock:
-            count = self._consecutive_failures
-            is_open = count >= self._max_consecutive_failures
-        if is_open:
-            raise CircuitOpen(
-                f"{self._name} gave up after {count} consecutive failures"
-            )
-
     def reset(self) -> None:
         self.record_success()

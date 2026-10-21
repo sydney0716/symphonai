@@ -259,24 +259,24 @@ export function createClient({
       return post("stop", { reason });
     },
 
-    planSpec(phase, item) {
-      return request("POST", "/spec/plan", { phase, item }, readReply, { detailOnError: true });
+    roadmap() {
+      return request("GET", "/roadmap");
     },
 
-    runSpec(path) {
-      return request("POST", "/spec/run", { path }, readReply, { detailOnError: true });
+    addRoadmapGoal(goal) {
+      return request("POST", "/roadmap/add", { goal }, readReply, { detailOnError: true });
     },
 
-    reviewSpec(session_id) {
-      return request("POST", "/spec/review", { session_id }, readReply, { detailOnError: true });
+    removeRoadmapGoal(id) {
+      return request("POST", "/roadmap/remove", { id }, readReply, { detailOnError: true });
     },
 
-    commitSpec(session_id, message) {
-      return request("POST", "/spec/commit", { session_id, message }, readReply, { detailOnError: true });
+    moveRoadmapGoal(id, index) {
+      return request("POST", "/roadmap/move", { id, index }, readReply, { detailOnError: true });
     },
 
-    specRuns() {
-      return request("GET", "/spec/runs", undefined, readListReply);
+    startRoadmapGoal(id) {
+      return request("POST", "/roadmap/start", { id }, readReply, { detailOnError: true });
     },
 
     approve(id, allowed, reason = "", remember = false, answerText = "") {
@@ -570,10 +570,6 @@ export function createClient({
     source(path) {
       const parameters = new URLSearchParams({ path });
       return request("GET", `/source?${parameters}`);
-    },
-
-    specFiles() {
-      return request("GET", "/spec/files");
     },
 
     history(limit = 100) {

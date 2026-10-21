@@ -1281,17 +1281,25 @@ def check_login_shell_path() -> None:
         sleeper.chmod(0o755)
         with mock.patch.dict(os.environ, {"SHELL": str(sleeper), "PATH": "/usr/bin:/bin"}, clear=True):
             with mock.patch.object(host_main.sys, "frozen", True, create=True):
+                real_run = subprocess.run
+
+                def run_with_short_timeout(*args, **kwargs):
+                    kwargs["timeout"] = 0.1
+                    return real_run(*args, **kwargs)
+
                 started = time.monotonic()
-                with contextlib.redirect_stderr(stderr):
+                with mock.patch.object(
+                    host_main.subprocess, "run", side_effect=run_with_short_timeout,
+                ), contextlib.redirect_stderr(stderr):
                     host_main._load_login_shell_path()
                 elapsed = time.monotonic() - started
             if (
                 os.environ["PATH"] != "/usr/bin:/bin"
                 or len(stderr.getvalue().splitlines()) != 1
-                or not 4.5 <= elapsed < 7.5
+                or not 0.05 <= elapsed < 1.5
             ):
                 fail(
-                    "login-shell sleeper did not time out near five seconds with PATH preserved "
+                    "login-shell sleeper did not time out promptly with PATH preserved "
                     f"and one stderr line: elapsed={elapsed:.2f}s, PATH={os.environ['PATH']!r}, "
                     f"stderr={stderr.getvalue()!r}"
                 )

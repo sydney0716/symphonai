@@ -4,8 +4,6 @@ import { createClient } from "./client.js";
 import { parseMarkdown } from "./markdown.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
-import { renderRoadmap, parseRoadmap, specPaths, followUpsFor } from "./roadmap.js";
-import { layoutRoadmap } from "./roadmap_graph.js";
 import { append, element, listen, renderDiff, renderMarkdownBlocks, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
@@ -13,7 +11,6 @@ import keymapDefaults from "../keys.default.json" with { type: "json" };
 import { lookup, parseKeymap } from "./keys.js";
 import { createPicker } from "./picker.js";
 import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, rosterRows, serverRows, trustRows } from "./settings.js";
-import { createSpecView } from "./spec_view.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
@@ -73,10 +70,6 @@ function promptCommand(text) {
   }
   const skill = typeof text === "string" && /^Use the (\S+) skill\.(?:\n\n([\s\S]*))?$/.exec(text);
   return skill ? `/${skill[1]}${skill[2] ? ` ${skill[2]}` : ""}` : text;
-}
-
-function filename(path) {
-  return path.split("/").at(-1).replace(/\.md$/, "");
 }
 
 function projectGroups(sessions, currentRoot) {
@@ -145,12 +138,11 @@ function clientFor(global, supplied) {
 const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
 const SIDEBAR_SESSION_LIMIT = 200;
-const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Spec", "Files", "Jobs", "Loop"];
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop"];
 const RAIL_TOOL_ICONS = Object.freeze({
   Agents: "icon-tool-agents",
   Roadmap: "icon-tool-roadmap",
   Changes: "icon-tool-changes",
-  Spec: "icon-tool-spec",
   Files: "icon-tool-files",
   Jobs: "icon-tool-jobs",
   Loop: "icon-tool-loop",
@@ -210,7 +202,6 @@ export async function start({ global, document, client }) {
   const agentsRoot = document.getElementById("agents");
   const roadmapRoot = document.getElementById("roadmap");
   const changesRoot = document.getElementById("changes");
-  const specRoot = document.getElementById("spec");
   const filesRoot = document.getElementById("files");
   const jobsRoot = element(document, "div", { className: "rail-pane jobs-pane" });
   jobsRoot.setAttribute("role", "tabpanel");
@@ -288,7 +279,6 @@ export async function start({ global, document, client }) {
   });
   const approvals = createApprovals({ client: approvalClient });
   const approvalDenyNotes = new Map();
-  const specView = createSpecView({ client: boundary });
   const transcript = createTranscript();
   const agentTranscript = createTranscript();
   let agentView = null;
@@ -309,38 +299,21 @@ export async function start({ global, document, client }) {
   let commandEntry = null;
   let userCommandPending = false;
   const board = createAgentBoard();
-  const readSpecFiles = () => typeof boundary.specFiles === "function"
-    ? boundary.specFiles().catch(() => ({ paths: [] }))
-    : Promise.resolve({ paths: [] });
-  const roadmapResult = (reply, error = null) => {
-    try {
-      if (error !== null) throw error;
-      return { roadmap: renderRoadmap(parseRoadmap(reply?.text)), message: "" };
-    } catch (failure) {
-      return {
-        roadmap: renderRoadmap({ goal: "", phases: [] }),
-        message: failure?.status === 404
-          ? "No roadmap in this repository."
-          : `The roadmap couldn't be read: ${failure?.message ?? String(failure)}`,
-      };
-    }
-  };
   const readRoadmap = async () => {
     try {
-      return roadmapResult(await boundary.file("docs/roadmap.json"));
+      const reply = await boundary.roadmap();
+      return { goals: Array.isArray(reply?.goals) ? reply.goals : [], error: "" };
     } catch (error) {
-      return roadmapResult(null, error);
+      return { goals: [], error: error?.message || String(error) };
     }
   };
   let project = await boundary.project();
   const projectless = project?.repo_root == null;
   let initialSessions = [];
-  let initialRoadmap = { roadmap: { goal: "", phases: [] }, message: "" };
+  let initialRoadmap = { goals: [], error: "" };
   let settingsReply;
   let healthReply;
   let conversationReply = { conversation: null };
-  let initialSpecRuns = [];
-  let initialSpecFiles = { paths: [] };
   let initialProjects = { recent: [] };
   if (projectless) {
     [settingsReply, healthReply, initialProjects] = await Promise.all([
@@ -349,14 +322,12 @@ export async function start({ global, document, client }) {
       (boundary.projects?.() ?? Promise.resolve({ recent: [] })).catch(() => ({ recent: [] })),
     ]);
   } else {
-    [initialSessions, initialRoadmap, settingsReply, healthReply, conversationReply, initialSpecRuns, initialSpecFiles] = await Promise.all([
+    [initialSessions, initialRoadmap, settingsReply, healthReply, conversationReply] = await Promise.all([
       boundary.sessions(SIDEBAR_SESSION_LIMIT),
       readRoadmap(),
       boundary.settings(),
       boundary.health().catch(() => null),
       boundary.conversationStats().catch(() => ({ conversation: null })),
-      (boundary.specRuns?.() ?? Promise.resolve([])).catch(() => []),
-      readSpecFiles(),
     ]);
   }
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
@@ -481,20 +452,11 @@ export async function start({ global, document, client }) {
   }
 
   restoreDraft();
-  let roadmap = initialRoadmap.roadmap;
-  let roadmapMessage = initialRoadmap.message;
-  let specRuns = initialSpecRuns;
-  let allSpecPaths = [...new Set([
-    ...roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item))),
-    ...(Array.isArray(initialSpecFiles?.paths) ? initialSpecFiles.paths.filter((path) => typeof path === "string") : []),
-  ])];
-  const graphTitles = new Map();
-  const graphPhaseLoaded = new Set();
-  const graphTitlesReady = new Map();
-  const expandedDonePhases = new Set();
-  const expandedDoneGroups = new Set();
-  const graphId = (path) => path.split("/").at(-1).replace(/\.md$/, "").split("-", 1)[0];
-  for (const path of allSpecPaths) graphTitles.set(graphId(path), "");
+  let roadmapGoals = Array.isArray(initialRoadmap.goals) ? initialRoadmap.goals : [];
+  let roadmapError = initialRoadmap.error;
+  let roadmapDraft = "";
+  let roadmapPending = false;
+  let showRailTools = false;
   const settingsPane = element(document, "section", { className: "settings-pane" });
   const settingsSections = element(document, "nav", { className: "settings-sections" });
   const settingsContent = element(document, "div", { className: "settings-content" });
@@ -2237,40 +2199,113 @@ export async function start({ global, document, client }) {
     }));
   }
 
-  let selectedSpec = null;
-  let specActionError = "";
-
-  function workflow(item, phase, itemIndex) {
-    const paths = specPaths(item);
-    const path = paths[0] ?? null;
-    const plans = specRuns.filter((run) => run.kind === "plan" && run.phase === phase.id && run.item === itemIndex);
-    const plan = plans[plans.length - 1] ?? null;
-    if (path === null) {
-      if (!plan) return { step: "unplanned", plan };
-      if (plan.state === "running") return { step: "planning", plan };
-      if (plan.state === "stopped" || plan.state === "failed") {
-        const reason = plan.stopped_reason === "budget_turns" ? "turn limit" : plan.stopped_reason || plan.error || "unknown reason";
-        return { step: `planner stopped: ${reason}`, plan };
+  async function saveRoadmapAction(action, { clearDraft = false } = {}) {
+    if (roadmapPending) return;
+    roadmapPending = true;
+    roadmapError = "";
+    renderRoadmapUI();
+    try {
+      const reply = await action();
+      if (Array.isArray(reply?.goals)) roadmapGoals = reply.goals;
+      if (clearDraft) roadmapDraft = "";
+      if (reply?.loop?.id) {
+        selectedLoopId = reply.loop.id;
+        selectedLoop = reply.loop;
+        loops = [reply.loop, ...loops.filter((loop) => loop.id !== reply.loop.id)];
+        await openRailTool("Loop");
       }
-      if (plan.state === "finished" && plan.created?.length === 0) return { step: "planner wrote no spec", plan };
-      if (plan.state === "finished" && plan.created?.length > 1) return { step: "planner wrote several specs", plan };
-      return { step: "unplanned", plan };
+    } catch (error) {
+      roadmapError = error instanceof Error ? error.message : String(error);
+    } finally {
+      roadmapPending = false;
+      renderRoadmapUI();
     }
-    const run = specRuns.find((candidate) => candidate.kind === "implement" && candidate.spec === path);
-    if (!run) return { step: "planned", run: null };
-    if (run.committed) return { step: "committed", run };
-    if (run.review?.verdict === "running") return { step: "in review", run };
-    if (run.review) return { step: "reviewed", run };
-    return { step: run.state === "running" ? "running" : "ran", run };
   }
 
-  function actionButton(label, callback) {
-    const button = element(document, "button", { text: label });
-    listen(button, "click", callback);
-    return button;
+  async function refreshRoadmap() {
+    const reply = await readRoadmap();
+    if (reply.error) {
+      roadmapError = reply.error;
+    } else {
+      roadmapGoals = Array.isArray(reply.goals) ? reply.goals : [];
+      roadmapError = "";
+    }
+    renderRoadmapUI();
   }
 
-  let showRailTools = false;
+  function renderRoadmapUI() {
+    const form = element(document, "form", { className: "roadmap-add-form" });
+    const field = element(document, "input", { className: "roadmap-add-input" });
+    field.type = "text";
+    field.value = roadmapDraft;
+    field.setAttribute("aria-label", "Goal");
+    field.setAttribute("placeholder", "Add a goal");
+    field.disabled = roadmapPending;
+    listen(field, "input", () => {
+      roadmapDraft = field.value;
+      add.disabled = roadmapPending || !roadmapDraft.trim();
+    });
+    const add = element(document, "button", { text: "Add goal" });
+    add.type = "submit";
+    add.disabled = roadmapPending || !roadmapDraft.trim();
+    listen(form, "submit", (event) => {
+      event.preventDefault();
+      if (roadmapDraft.trim()) {
+        return saveRoadmapAction(() => boundary.addRoadmapGoal(roadmapDraft.trim()), { clearDraft: true });
+      }
+    });
+    append(form, field, add);
+
+    const list = element(document, "ol", { className: "roadmap-goals" });
+    for (const [index, goal] of roadmapGoals.entries()) {
+      const row = element(document, "li", { className: "roadmap-goal" });
+      const detail = element(document, "div", { className: "roadmap-goal-detail" });
+      if (typeof goal.loop_id === "string" && goal.loop_id) {
+        const link = element(document, "button", { className: "roadmap-goal-link", text: goal.goal });
+        link.type = "button";
+        link.setAttribute("title", "Open loop");
+        listen(link, "click", () => {
+          selectedLoopId = goal.loop_id;
+          void openRailTool("Loop");
+        });
+        append(detail, link);
+      } else {
+        append(detail, element(document, "span", { className: "roadmap-goal-text", text: goal.goal }));
+      }
+      append(detail, element(document, "span", { className: "roadmap-goal-state", text: goal.state }));
+      const actions = element(document, "div", { className: "roadmap-goal-actions" });
+      for (const [label, delta] of [["Move up", -1], ["Move down", 1]]) {
+        const button = element(document, "button", { text: label });
+        button.type = "button";
+        button.disabled = roadmapPending || index + delta < 0 || index + delta >= roadmapGoals.length;
+        listen(button, "click", () => saveRoadmapAction(() => boundary.moveRoadmapGoal(goal.id, index + delta)));
+        append(actions, button);
+      }
+      const remove = element(document, "button", { text: "Remove" });
+      remove.type = "button";
+      remove.disabled = roadmapPending;
+      listen(remove, "click", () => saveRoadmapAction(() => boundary.removeRoadmapGoal(goal.id)));
+      append(actions, remove);
+      if (["not_started", "cancelled"].includes(goal.state)) {
+        const start = element(document, "button", { text: "Start" });
+        start.type = "button";
+        start.disabled = roadmapPending;
+        listen(start, "click", () => saveRoadmapAction(() => boundary.startRoadmapGoal(goal.id)));
+        append(actions, start);
+      }
+      append(row, detail, actions);
+      append(list, row);
+    }
+    const children = [element(document, "h2", { text: "Roadmap" }), form];
+    if (roadmapError) children.push(element(document, "p", { className: "error", text: roadmapError }));
+    if (roadmapGoals.length === 0 && !roadmapError) {
+      children.push(element(document, "p", { className: "roadmap-empty", text: "No goals yet." }));
+    }
+    children.push(list);
+    replace(roadmapRoot, ...children);
+  }
+
+  renderRoadmapUI();
   const fileListings = new Map();
   const expandedFileDirectories = new Set();
   const fileTreeErrors = new Map();
@@ -2862,13 +2897,7 @@ export async function start({ global, document, client }) {
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
-    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Spec: specRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot };
-    if (!selectedSpec) {
-      replace(specRoot, element(document, "p", {
-        className: "spec-empty",
-        text: "Choose a task in Roadmap to open its spec.",
-      }));
-    }
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot };
     for (const [name, pane] of Object.entries(panes)) {
       pane.hidden = showRailTools || name !== selectedRailTool;
     }
@@ -2876,6 +2905,8 @@ export async function start({ global, document, client }) {
     renderFiles();
     railToolsRoot.hidden = !showRailTools && openRailTools.length > 0;
   }
+
+  renderRail();
 
   function selectRailTool(name) {
     if (!openRailTools.includes(name)) return openRailTool(name);
@@ -2915,375 +2946,6 @@ export async function start({ global, document, client }) {
     if (selectedRailTool === "Changes") await showChanges();
   }
 
-  async function refreshSpecState() {
-    const [roadmapReply, runs, specFilesReply] = await Promise.all([
-      readRoadmap(),
-      boundary.specRuns(),
-      readSpecFiles(),
-    ]);
-    roadmap = roadmapReply.roadmap;
-    roadmapMessage = roadmapReply.message;
-    specRuns = runs;
-    allSpecPaths = [...new Set([
-      ...roadmap.phases.flatMap((phase) => phase.items.flatMap((item) => specPaths(item))),
-      ...(Array.isArray(specFilesReply?.paths) ? specFilesReply.paths.filter((path) => typeof path === "string") : []),
-    ])];
-    graphTitles.clear();
-    for (const path of allSpecPaths) graphTitles.set(graphId(path), "");
-    graphPhaseLoaded.clear();
-    renderRoadmapUI();
-    if (selectedSpec) {
-      const phase = roadmap.phases.find((value) => value.id === selectedSpec.phase.id);
-      const item = phase?.items[selectedSpec.index] ?? selectedSpec.item;
-      selectedSpec = { ...selectedSpec, phase: phase ?? selectedSpec.phase, item };
-      selectedSpec.result = await specView.open(item, { specPaths: allSpecPaths });
-      showSpec(selectedSpec.result, item, selectedSpec.phase, selectedSpec.index);
-    }
-  }
-
-  async function runSpecAction(action, { newConversation = false } = {}) {
-    closeAgentView();
-    specActionError = "";
-    if (newConversation) clearConversationAgents();
-    try {
-      await action();
-      if (newConversation) await refreshConversation();
-      await refreshSelectedChanges();
-      await refreshSpecState();
-    } catch (error) {
-      if (newConversation) await refreshConversation();
-      await refreshSelectedChanges();
-      specActionError = error?.message || "spec action failed";
-      if (selectedSpec) showSpec(selectedSpec.result, selectedSpec.item, selectedSpec.phase, selectedSpec.index);
-    }
-  }
-
-  function showSpec(result, item = null, phase = null, itemIndex = -1) {
-    selectRailTool("Spec");
-    const children = [];
-    if (item && phase) {
-      const current = workflow(item, phase, itemIndex);
-      const panel = element(document, "section", { className: "spec-workflow" });
-      append(panel, element(document, "p", { className: "spec-step", text: current.step }));
-      const actions = element(document, "div", { className: "spec-actions" });
-      const run = current.run;
-      if (current.step === "unplanned" || current.step.startsWith("planner stopped:") || current.step.startsWith("planner wrote ")) append(actions, actionButton("Plan", () => runSpecAction(() => boundary.planSpec(phase.id, itemIndex), { newConversation: true })));
-      if (current.step === "planning" && current.plan) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(current.plan.session_id))));
-      if (current.plan && current.step !== "planning" && current.step !== "unplanned") append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(current.plan.session_id))));
-      if (current.step === "planned" && result.specs[0]) append(actions, actionButton("Run", () => runSpecAction(() => boundary.runSpec(result.specs[0].path), { newConversation: true })));
-      if (current.step === "running" && run) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.session_id))));
-      if (current.step === "ran" && run) {
-        append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id), { newConversation: true })));
-        append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.session_id))));
-      }
-      if (current.step === "in review" && run?.review?.session_id) append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.review.session_id))));
-      if (current.step === "reviewed" && run) {
-        append(actions, element(document, "p", { text: run.review.verdict }));
-        if (run.review.follow_ups?.length) append(actions, element(document, "p", { text: run.review.follow_ups.join(", ") }));
-        if (["passed", "follow-ups"].includes(run.review.verdict)) {
-          const message = element(document, "input");
-          message.value = run.commit_message || "";
-          message.setAttribute("aria-label", "Commit message");
-          append(actions, message, actionButton("Commit…", () => runSpecAction(() => boundary.commitSpec(run.session_id, message.value))));
-        }
-        else append(actions, actionButton("Review", () => runSpecAction(() => boundary.reviewSpec(run.session_id), { newConversation: true })));
-        append(actions, actionButton("Open", () => runSpecAction(() => boundary.openSession(run.review.session_id))));
-      }
-      if (current.step === "committed" && run) append(actions, element(document, "p", { text: run.committed.sha }));
-      if (specActionError) append(panel, element(document, "p", { className: "error", text: specActionError }));
-      append(panel, actions);
-      children.push(panel);
-    }
-    for (const spec of result.specs) {
-      children.push(element(document, "h3", { text: filename(spec.path) }));
-      children.push(element(document, "pre", { text: spec.text }));
-    }
-    if (result.report) {
-      children.push(element(document, "h3", { text: "Report" }));
-      children.push(element(document, "pre", { text: result.report.text }));
-    }
-    if (result.followUps.length > 0) {
-      const list = element(document, "ul", { className: "follow-ups" });
-      for (const followUp of result.followUps) {
-        append(list, element(document, "li", { text: filename(followUp.path) }));
-      }
-      children.push(element(document, "h3", { text: "Follow-ups" }), list);
-    }
-    if (result.error) {
-      children.push(element(document, "p", { className: "error", text: result.error }));
-    }
-    replace(specRoot, ...children);
-  }
-
-  function roadmapItem(item, phase, itemIndex) {
-    const state = workflow(item, phase, itemIndex).step;
-    const button = element(document, "button", {
-      className: "roadmap-item",
-      text: `${item.title} · ${state}`,
-    });
-    listen(button, "click", async () => {
-      selectedSpec = { item, phase, index: itemIndex, result: await specView.open(item, { specPaths: allSpecPaths }) };
-      specActionError = "";
-      showSpec(selectedSpec.result, item, phase, itemIndex);
-    });
-    return button;
-  }
-
-  async function loadGraphTitles(phase) {
-    if (graphPhaseLoaded.has(phase.id)) return graphTitlesReady.get(phase.id);
-    graphPhaseLoaded.add(phase.id);
-    const paths = [...new Set(phase.items.flatMap((item) => {
-      const spec = specPaths(item)[0];
-      return spec ? [spec, ...followUpsFor(spec, allSpecPaths)] : [];
-    }))];
-    const promise = Promise.all(paths.map(async (path) => {
-      try {
-        const reply = await boundary.file(path);
-        const firstLine = reply.text.split(/\r?\n/, 1)[0];
-        const match = /^#\s+[^—]+—\s+(.+)$/.exec(firstLine);
-        if (match) graphTitles.set(graphId(path), match[1].trim());
-      } catch {}
-    })).then(() => {
-      renderRoadmapUI();
-    });
-    graphTitlesReady.set(phase.id, promise);
-    return promise;
-  }
-
-  function openGraphSpec(item, phase, itemIndex) {
-    selectedSpec = { item, phase, index: itemIndex, result: null };
-    return specView.open(item, { specPaths: allSpecPaths }).then((result) => {
-      selectedSpec = { ...selectedSpec, result };
-      specActionError = "";
-      showSpec(result, item, phase, itemIndex);
-    });
-  }
-
-  function graphEdgeElement() {
-    return element(document, "div", { className: "roadmap-edge" });
-  }
-
-  function graphTaskOptions(phase) {
-    const titles = new Map(graphTitles);
-    const followUps = new Map();
-    const states = new Map();
-    phase.items.forEach((item, index) => {
-      const paths = specPaths(item);
-      const id = paths.length ? graphId(paths[0]) : `item-${index}`;
-      followUps.set(id, (paths.length ? followUpsFor(paths[0], allSpecPaths) : []).map((path) => ({
-        id: graphId(path), path,
-        title: graphTitles.get(graphId(path)) || filename(path).replace(/^[^-]+-/, ""),
-      })));
-      states.set(id, workflow(item, phase, index).step);
-    });
-    return { followUps, titles, states };
-  }
-
-  function graphView({ phase, taskLayout: graph }) {
-    const itemById = new Map(phase.items.map((item, index) => {
-      const path = specPaths(item)[0];
-      return [path ? graphId(path) : `item-${index}`, { item, index }];
-    }));
-    if (graph.error) {
-      return [element(document, "p", { className: "error roadmap-graph-error", text: graph.error }),
-        ...phase.items.map((item, index) => roadmapItem(item, phase, index))];
-    }
-    const container = element(document, "div", { className: "roadmap-waves" });
-    if (graph.summary) append(container, element(document, "div", { className: "roadmap-done-summary", text: graph.summary }));
-    for (const row of graph.rows) {
-      const wave = element(document, "div", { className: "roadmap-wave" });
-      for (const node of row) {
-        const bound = itemById.get(node.id);
-        const task = element(document, "button", {
-          className: `roadmap-task roadmap-state-${node.state.replaceAll(" ", "-")}`,
-          text: `${node.id}  ${node.title}`,
-        });
-        task.setAttribute("title", node.title);
-        if (bound) listen(task, "click", () => openGraphSpec(bound.item, phase, bound.index));
-        const waveItem = element(document, "div", { className: "roadmap-wave-item" });
-        append(waveItem, task);
-        for (const tag of node.tags) append(waveItem, element(document, "span", { className: "roadmap-tag", text: tag }));
-        for (const followUp of node.followUps) {
-          const fullTitle = graphTitles.get(followUp.id) || followUp.title;
-          const followButton = element(document, "button", {
-            className: "roadmap-follow-up",
-            text: `${followUp.id}  ${fullTitle}`,
-          });
-          listen(followButton, "click", () => openGraphSpec({ title: fullTitle, spec: followUp.path }, phase, bound?.index ?? -1));
-          append(waveItem, followButton);
-        }
-        append(wave, waveItem);
-      }
-      append(container, wave);
-    }
-    return [container];
-  }
-
-  function phaseDependencies(phase, index) {
-    return phase.after ?? (index > 0 ? [roadmap.phases[index - 1].id] : []);
-  }
-
-  function donePhaseChains() {
-    const dependents = new Map(roadmap.phases.map((phase) => [phase.id, []]));
-    roadmap.phases.forEach((phase, index) => {
-      for (const dependency of phaseDependencies(phase, index)) {
-        dependents.get(dependency)?.push(phase.id);
-      }
-    });
-    const chains = [];
-    for (let index = 0; index < roadmap.phases.length;) {
-      const first = roadmap.phases[index];
-      const members = [first];
-      let nextIndex = index + 1;
-      while (first.status === "done" && nextIndex < roadmap.phases.length) {
-        const previous = members.at(-1);
-        const next = roadmap.phases[nextIndex];
-        const dependencies = phaseDependencies(next, nextIndex);
-        if (
-          next.status !== "done"
-          || dependencies.length !== 1
-          || dependencies[0] !== previous.id
-          || dependents.get(previous.id)?.length !== 1
-          || dependents.get(previous.id)?.[0] !== next.id
-        ) break;
-        members.push(next);
-        nextIndex += 1;
-      }
-      if (members.length > 1) chains.push({ index, members });
-      index += members.length;
-    }
-    return chains;
-  }
-
-  function visibleRoadmapPhases() {
-    const chains = donePhaseChains();
-    const sourceToVisible = new Map();
-    const groups = new Map();
-    for (const chain of chains) {
-      const first = chain.members[0];
-      const last = chain.members.at(-1);
-      const key = `${first.id}..${last.id}`;
-      if (expandedDoneGroups.has(key)) continue;
-      groups.set(chain.index, { ...chain, key, id: `done-${key}` });
-      for (const phase of chain.members) sourceToVisible.set(phase.id, `done-${key}`);
-    }
-    const visible = [];
-    for (let index = 0; index < roadmap.phases.length;) {
-      const group = groups.get(index);
-      if (group) {
-        const first = group.members[0];
-        const total = group.members.reduce((sum, phase) => sum + phase.progress.total, 0);
-        visible.push({
-          id: group.id,
-          name: `✓ ${first.id}–${group.members.at(-1).id} · ${group.members.length} phases`,
-          status: "done",
-          progress: { done: total, total },
-          items: [],
-          after: phaseDependencies(first, index)
-            .filter((id) => !group.members.some((phase) => phase.id === id))
-            .map((id) => sourceToVisible.get(id) ?? id),
-          collapsedMembers: group.members,
-          groupKey: group.key,
-        });
-        index += group.members.length;
-        continue;
-      }
-      const phase = roadmap.phases[index];
-      visible.push({
-        ...phase,
-        after: phaseDependencies(phase, index).map((id) => sourceToVisible.get(id) ?? id),
-      });
-      index += 1;
-    }
-    return visible;
-  }
-
-  function phaseMark(status) {
-    return status === "done" ? "✓" : status === "in_progress" ? "◐" : "○";
-  }
-
-  function phaseBox(node) {
-    const phase = node.phase;
-    if (phase.collapsedMembers) {
-      const summary = element(document, "button", {
-        className: "roadmap-phase-chain-summary",
-        text: phase.name,
-      });
-      listen(summary, "click", () => {
-        expandedDoneGroups.add(phase.groupKey);
-        renderRoadmapUI();
-      });
-      return summary;
-    }
-    const box = element(document, "section", {
-      className: `roadmap-phase-box roadmap-phase-${phase.status}`,
-    });
-    box.setAttribute("data-phase-id", phase.id);
-    const header = element(document, "button", {
-      className: "roadmap-phase-header",
-      text: `${phaseMark(phase.status)} ${phase.id} ${phase.name} · ${phase.progress.done}/${phase.progress.total}`,
-    });
-    listen(header, "click", () => {
-      if (phase.status !== "done") return;
-      if (expandedDonePhases.has(phase.id)) expandedDonePhases.delete(phase.id);
-      else expandedDonePhases.add(phase.id);
-      renderRoadmapUI();
-    });
-    append(box, header);
-    if (node.tags.length) {
-      append(box, ...node.tags.map((tag) => element(document, "span", { className: "roadmap-tag", text: tag })));
-    }
-    if (phase.status !== "done" || expandedDonePhases.has(phase.id)) {
-      const body = element(document, "div", { className: "roadmap-phase-tasks" });
-      append(body, ...graphView(node));
-      append(box, body);
-    }
-    return box;
-  }
-
-  function renderRoadmapUI() {
-    if (roadmapMessage) {
-      replace(roadmapRoot, element(document, "p", { className: "roadmap-message", text: roadmapMessage }));
-      return;
-    }
-    const graph = layoutRoadmap(visibleRoadmapPhases(), { taskOptions: graphTaskOptions, maxColumns: 1 });
-    if (graph.error) {
-      replace(roadmapRoot, element(document, "p", { className: "error roadmap-graph-error", text: graph.error }));
-      return;
-    }
-    const container = element(document, "div", { className: "roadmap-overview" });
-    for (const [rowIndex, row] of graph.rows.entries()) {
-      const boxes = element(document, "div", { className: "roadmap-phase-row" });
-      for (const node of row) {
-        if (node.group) {
-          const group = element(document, "div", { className: "roadmap-phase-group" });
-          append(group, ...node.group.map((member) => phaseBox(member)));
-          append(boxes, group);
-        } else {
-          append(boxes, phaseBox(node));
-        }
-      }
-      append(container, boxes);
-      if (rowIndex < graph.rows.length - 1) {
-        const connectorEdges = graph.edges.flatMap((edge) => {
-          const from = graph.rows.flat().find((node) => node.id === edge.from);
-          const to = graph.rows.flat().find((node) => node.id === edge.to);
-          return from && to && from.row <= rowIndex && to.row > rowIndex
-            ? [{ edge, index: rowIndex - from.row }]
-            : [];
-        });
-        const connectorRow = element(document, "div", { className: "roadmap-connector-row" });
-        if (connectorEdges.length) append(connectorRow, graphEdgeElement());
-        append(container, connectorRow);
-      }
-    }
-    replace(roadmapRoot, container);
-    for (const phase of roadmap.phases) {
-      if (phase.status !== "done" || expandedDonePhases.has(phase.id)) void loadGraphTitles(phase);
-    }
-  }
-  renderRoadmapUI();
-  renderRail();
   if (selectedRailTool === "Changes") void showChanges();
   if (selectedRailTool === "Files") void loadFileDirectory("");
   if (selectedRailTool === "Jobs") void showJobs();
@@ -4964,23 +4626,9 @@ export async function start({ global, document, client }) {
     };
   }
 
-  const requestSpecRefresh = leadingTrailingRefresh(async () => {
-    await refreshSpecState().catch(() => {});
-  });
-
   const requestUsageRefresh = leadingTrailingRefresh(async () => {
     await refreshConversation();
   });
-
-  async function refreshSpecsForEvent(frame) {
-    const type = frame.kind === "event" ? frame.payload?.type : "";
-    if (!["RunFinished", "RunFailed", "GoalChanged"].includes(type)) return;
-    const sessionId = frame.payload?.session_id;
-    if (typeof sessionId !== "string" || !specRuns.some((run) =>
-      run.session_id === sessionId || run.review?.session_id === sessionId
-    )) return;
-    await requestSpecRefresh();
-  }
 
   const requestActivityRefresh = leadingTrailingRefresh(async () => {
     try {
@@ -5021,6 +4669,12 @@ export async function start({ global, document, client }) {
     }
     if (frame.kind === "event" && frame.payload?.type === "LoopChanged") {
       const loopId = frame.payload.loop_id;
+      if (typeof loopId === "string" && typeof frame.payload.state === "string") {
+        roadmapGoals = roadmapGoals.map((goal) => goal.loop_id === loopId
+          ? { ...goal, state: frame.payload.state }
+          : goal);
+        renderRoadmapUI();
+      }
       if (typeof loopId === "string" && !loops.some((loop) => loop.id === loopId)) {
         await loadLoops();
       } else if (typeof loopId === "string") {
@@ -5037,6 +4691,7 @@ export async function start({ global, document, client }) {
           }
         }
       }
+      await refreshRoadmap();
       return;
     }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
@@ -5051,7 +4706,6 @@ export async function start({ global, document, client }) {
         notify(payload.type === "RunFailed" ? "Failed" : "Finished", conversationTitle(frameSessionId), frameSessionId);
       }
     }
-    await refreshSpecsForEvent(frame);
     if (await refreshActivityForOtherSession(frameSessionId)) return;
     const previousLength = transcript.model.length;
     transcript.apply(frame);
@@ -5170,8 +4824,6 @@ export async function start({ global, document, client }) {
     openTool: openRailTool,
     route: () => route,
     sidebar,
-    specPaths: allSpecPaths,
-    specView,
     subscription,
     transcript,
     turn,

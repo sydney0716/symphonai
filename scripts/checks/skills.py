@@ -14,7 +14,6 @@ from symphonai_api.skills import (
     SkillError,
     load_skill,
     load_skill_directory,
-    roster_cost,
     roster_text,
 )
 from symphonai_api.extensions import load_extensions
@@ -180,29 +179,8 @@ def measured_text_is_reachable() -> None:
             fail("10,000 body characters changed discoverability text or cost")
 
 
-@check("skills.roster_cost")
-def roster_cost_is_sum() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        directory = Path(temporary)
-        fixtures = (
-            ("alpha", "Alpha procedure.", "Use for alpha work."),
-            ("bravo", "Bravo procedure with more detail.", "Use for bravo work."),
-            ("charlie", "Charlie procedure.", "Use for charlie work."),
-        )
-        for name, description, when_to_use in fixtures:
-            _write(
-                directory,
-                f"{name}.md",
-                _document(name, description, when_to_use),
-            )
-        roster = load_skill_directory(directory)
-        expected = sum(skill.always_on_tokens for skill in roster.values())
-        if len(roster) != 3 or roster_cost(roster.values()) != expected:
-            fail(f"three-skill roster cost differed: {roster!r}")
-
-
-@check("skills.roster_renders_and_sums")
-def roster_renders_and_sums() -> None:
+@check("skills.roster_renders_in_order")
+def roster_renders_in_order() -> None:
     fixtures = (
         ("alpha", "Alpha procedure.", "Use for alpha work."),
         ("bravo", "Bravo procedure with more detail.", "Use for bravo work."),
@@ -246,17 +224,8 @@ def roster_renders_and_sums() -> None:
         ):
             fail("roster rendering dropped a zero-cost skill")
 
-        if roster_text(()) != "" or roster_cost(()) != 0:
-            fail("empty roster text or cost was not empty or zero")
-        summed_cost = roster_cost(forward)
-        rendered_cost = estimate_text_tokens(roster_text(forward))
-        if summed_cost != 62 or rendered_cost != 63:
-            fail(
-                "known roster estimates differed: "
-                f"per-skill={summed_cost}, rendered={rendered_cost}"
-            )
-        if summed_cost == rendered_cost:
-            fail("per-skill and rendered roster estimates unexpectedly matched")
+        if roster_text(()) != "":
+            fail("empty roster text was not empty")
 
 
 @check("skills.body_is_live")

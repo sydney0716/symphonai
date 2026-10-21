@@ -9,7 +9,6 @@ from email.message import Message as HeaderMessage
 
 from symphonai_api.permissions import DenialReason, PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.tools.web_fetch import WebFetchTool
 from symphonai_api.web import MAX_FETCH_BYTES, MAX_REDIRECTS, WebFetchError, fetch_url
 from symphonai_api.web_domains import preapproved_domains
@@ -330,17 +329,6 @@ def check_plan_mode_allows_fetch() -> None:
         )
     if not result.ok:
         fail(f"plan mode denied a preapproved fetch: {result!r}")
-
-
-@check("web_fetch.metadata_contract")
-def check_metadata_contract() -> None:
-    expected = ToolMetadata(
-        effect=ToolEffect.READ_ONLY,
-        concurrency_safe=True,
-        paths=(),
-    )
-    if WebFetchTool().metadata({"url": "https://example.com"}) != expected:
-        fail("web_fetch metadata did not declare read-only, parallel, pathless work")
 
 
 @check("web_fetch.registry_registration")

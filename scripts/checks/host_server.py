@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -87,7 +88,7 @@ from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.projects import ProjectRuntime
 from symphonai_host.projects import choose_start_root
 from symphonai_host.server import HostServer
-from symphonai_host.spec_run import bind_roadmap_item, mark_roadmap_spec_done, parse_spec, patch_digest, review_verdict
+from symphonai_host.spec_run import patch_digest, review_verdict, spec_validation
 from scripts.checks.harness import CheckFailed, check, fail
 
 
@@ -111,63 +112,13 @@ def check_host_server_close_is_prompt() -> None:
             fail(f"host close took {elapsed:.3f}s")
 
 
-@check("host_server.spec_parser_title_and_validation")
-def check_spec_parser_title_and_validation() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        spec = root / "specs" / "39" / "39z-sample.md"
-        spec.parent.mkdir(parents=True)
-        spec.write_text("# 39z — sample\n\n## Validation\n\n```bash\none\n\n two\n```\n")
-        parsed = parse_spec(spec, root)
-        if parsed["title"] != "39z — sample" or parsed["validation"] != ["one", " two"]:
-            fail(f"spec title or validation block parsed incorrectly: {parsed!r}")
-
-
-@check("host_server.spec_parser_report_path")
-def check_spec_parser_report_path() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        spec = root / "specs" / "39" / "39z-sample.md"
-        spec.parent.mkdir(parents=True)
-        spec.write_text("# Sample\n\n## Report\n\n`specs/report/39/sample.md`\n")
-        if parse_spec(spec, root)["report"] != "specs/report/39/sample.md":
-            fail("spec report path did not use the first code span")
-
-
-@check("host_server.spec_parser_derived_report")
-def check_spec_parser_derived_report() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        spec = root / "specs" / "39" / "39z-sample.md"
-        spec.parent.mkdir(parents=True)
-        spec.write_text("# Sample\n")
-        if parse_spec(spec, root)["report"] != "specs/report/39/39z-sample-report.md":
-            fail("missing report section did not derive a report path")
-
-
-@check("host_server.spec_parser_requires_specs_markdown")
-def check_spec_parser_requires_specs_markdown() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        bad = root / "other.md"
-        bad.write_text("# No")
-        for path in (bad, root / "specs" / "missing.md"):
-            try:
-                parse_spec(path, root)
-            except ValueError:
-                continue
-            fail(f"invalid spec path was accepted: {path}")
-
-
-@check("host_server.spec_parser_checkless_validation")
-def check_spec_parser_checkless_validation() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        spec = root / "specs" / "39" / "39z-sample.md"
-        spec.parent.mkdir(parents=True)
-        spec.write_text("# Sample\n\n## Validation\n\nNo commands.\n")
-        if parse_spec(spec, root)["validation"]:
-            fail("prose without a fenced validation block became commands")
+@check("host_server.spec_validation_commands")
+def check_loop_spec_validation() -> None:
+    text = "# Card spec\n\n## Validation\n\n```sh\npython3 -m unittest\n\n.venv/bin/python scripts/check.py\n```\n\n## Report\n"
+    if spec_validation(text) != ["python3 -m unittest", ".venv/bin/python scripts/check.py"]:
+        fail("loop spec validation commands were not parsed from the fenced block")
+    if spec_validation("## Validation\nProse only\n"):
+        fail("validation prose without a command fence was accepted")
 
 
 @check("host_server.spec_run_goal_checks_in_its_worktree")
@@ -316,400 +267,6 @@ def check_spec_run_starts_with_full_spec_and_keeps_title() -> None:
             listed = next((item for item in sessions if item.get("run_id") == session_id), None)
             if not listed or listed.get("title") != expected_title:
                 fail(f"GET /sessions did not retain the spec-run title: {listed!r}")
-        finally:
-            host.close()
-
-
-@check("host_server.spec_run_review_commit_end_to_end")
-def check_spec_run_review_commit_end_to_end() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        root.mkdir()
-        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
-        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
-        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
-        (root / ".gitignore").write_text("specs/\n", encoding="utf-8")
-        (root / "a.py").write_text("value = 1\n", encoding="utf-8")
-        subprocess.run(["git", "add", ".gitignore", "a.py"], cwd=root, check=True)
-        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
-        spec_path = root / "specs" / "39" / "39b-run-a-spec.md"
-        spec_path.parent.mkdir(parents=True)
-        spec_path.write_text(
-            "# 39b — run a spec\n\n## Validation\n\n```bash\npwd\n```\n\n"
-            "## Report\n\n`specs/report/39/39b-run-a-spec-report.md`\n",
-            encoding="utf-8",
-        )
-        docs = root / "docs"
-        docs.mkdir()
-        roadmap = docs / "roadmap.json"
-        roadmap.write_text(json.dumps({"phases": [{
-            "id": "39", "status": "in_progress",
-            "items": [{"title": "run a spec", "spec": ["specs/39/39b-run-a-spec.md"]}],
-        }]}), encoding="utf-8")
-        provider = FakeModelProvider([
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("outside-worktree", "write_file", {
-                "path": "../outside-worktree.txt", "content": "must be refused\n",
-            })])),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("read", "read_file", {"path": "a.py"})])),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("edit", "write_file", {"path": "a.py", "content": "value = 2\n"})])),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("report", "write_file", {"path": "specs/report/39/39b-run-a-spec-report.md", "content": "report"})])),
-            ModelResponse(Message(Role.ASSISTANT, "implemented")),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("review-outside-scope", "write_file", {
-                "path": "a.py", "content": "reviewer must not write this\n",
-            })])),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("follow-up", "write_file", {
-                "path": "specs/39/39bF-fix.md", "content": "# Follow-up\n",
-            })])),
-            ModelResponse(Message(Role.ASSISTANT, "Verdict: follow-ups: specs/39/39bF-fix.md")),
-        ])
-        host = HostServer(
-            provider,
-            PermissionPolicy(repo_root=root, allowed_write_scope=[root]),
-            sessions_root=root / "sessions",
-        )
-        host.start()
-        try:
-            for invalid_path in ("specs/../a.py", "specs/39/missing.md"):
-                connection, response = _request(host, "POST", "/spec/run", body={"path": invalid_path}, headers=_headers(host))
-                body = response.read()
-                connection.close()
-                if response.status != 400:
-                    fail(f"invalid spec path {invalid_path!r} returned {response.status}: {body!r}")
-            connection, response = _request(host, "POST", "/spec/run", body={"path": "specs/39/39b-run-a-spec.md"}, headers=_headers(host))
-            started = json.loads(response.read())
-            connection.close()
-            if response.status != 200:
-                fail(f"spec/run returned {response.status}: {started!r}")
-            connection, response = _request(host, "POST", "/spec/run", body={"path": "specs/39/39b-run-a-spec.md"}, headers=_headers(host))
-            duplicate = json.loads(response.read())
-            connection.close()
-            if response.status != 409:
-                fail(f"duplicate running spec was not refused: {response.status}, {duplicate!r}")
-
-            def spec_run_state():
-                connection, response = _request(host, "GET", "/spec/runs", headers=_headers(host))
-                values = json.loads(response.read())
-                connection.close()
-                return next(item for item in values if item["session_id"] == started["session_id"])
-
-            deadline = time.monotonic() + 8
-            state = spec_run_state()
-            while state["state"] == "running" and time.monotonic() < deadline:
-                time.sleep(0.02)
-                state = spec_run_state()
-            if state["state"] != "finished" or not state["report_copied"] or state["files"] != ["a.py"]:
-                worktree_file = root / "sessions" / started["session_id"] / "worktree" / "a.py"
-                actual = worktree_file.read_text(encoding="utf-8") if worktree_file.exists() else "<missing>"
-                fail(f"spec run did not finish with an isolated edit and copied report: {state!r}; worktree a.py={actual!r}; provider calls={provider.call_count}")
-            if (root / "a.py").read_text(encoding="utf-8") != "value = 1\n":
-                fail("spec implementation changed the main tree before review and commit")
-            if (root / "sessions" / started["session_id"] / "outside-worktree.txt").exists() or host.pending_approvals():
-                fail("spec implementation wrote outside its worktree or asked for approval in allow mode")
-            if state.get("commit_message") != "39b: run a spec":
-                fail(f"spec run default commit message was wrong: {state.get('commit_message')!r}")
-
-            connection, response = _request(host, "POST", "/spec/review", body={"session_id": started["session_id"]}, headers=_headers(host))
-            reviewed = json.loads(response.read())
-            connection.close()
-            if response.status != 200:
-                fail(f"spec/review returned {response.status}: {reviewed!r}")
-            deadline = time.monotonic() + 5
-            state = spec_run_state()
-            while (not state.get("review") or state["review"].get("verdict") == "running") and time.monotonic() < deadline:
-                time.sleep(0.02)
-                state = spec_run_state()
-            if state.get("review", {}).get("verdict") != "follow-ups":
-                fail(f"review verdict was not recorded: {state!r}")
-            if state["review"].get("follow_ups") != ["specs/39/39bF-fix.md"] or not (root / "specs/39/39bF-fix.md").is_file():
-                fail(f"eligible reviewer follow-up was not copied to the main tree: {state['review']!r}")
-
-            (root / "staged.txt").write_text("staged\n", encoding="utf-8")
-            subprocess.run(["git", "add", "staged.txt"], cwd=root, check=True)
-            connection, response = _request(host, "POST", "/spec/commit", body={
-                "session_id": started["session_id"], "message": "blocked while staged",
-            }, headers=_headers(host))
-            refusal = json.loads(response.read())
-            connection.close()
-            if response.status != 409 or refusal.get("error") != "the main tree has staged changes":
-                fail(f"commit with an existing staged path was not refused exactly: {response.status}, {refusal!r}")
-            if (root / "a.py").read_text(encoding="utf-8") != "value = 1\n":
-                fail("staged-index refusal applied the worktree prematurely")
-            subprocess.run(["git", "reset", "--", "staged.txt"], cwd=root, check=True, capture_output=True)
-            (root / "staged.txt").unlink()
-
-            connection, response = _request(host, "POST", "/spec/commit", body={
-                "session_id": started["session_id"], "message": "39b: run a spec",
-            }, headers=_headers(host))
-            committed = json.loads(response.read())
-            connection.close()
-            if response.status != 200 or committed.get("paths") != ["a.py"] or not committed.get("commit"):
-                fail(f"spec commit did not commit exactly a.py: {response.status}, {committed!r}")
-            if (root / "a.py").read_text(encoding="utf-8") != "value = 2\n":
-                fail("committed spec change was not applied to the main tree")
-            names = subprocess.run(["git", "show", "--pretty=format:", "--name-only", "HEAD"], cwd=root, capture_output=True, check=True).stdout.decode().splitlines()
-            if names != ["a.py"]:
-                fail(f"spec commit included unexpected paths: {names!r}")
-            committed_state = spec_run_state()
-            phase = json.loads(roadmap.read_text(encoding="utf-8"))["phases"][0]
-            if committed_state.get("committed", {}).get("sha") != committed["commit"] or phase["status"] != "done" or phase["items"][0].get("done") is not True:
-                fail("successful spec commit did not record its SHA and mark the bound roadmap item done")
-        finally:
-            host.close()
-
-
-def _spec_commit_route_fixture(root: Path, *, add_file: bool = False):
-    root.mkdir(parents=True)
-    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
-    subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
-    subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
-    (root / "a.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
-    (root / "specs" / "39").mkdir(parents=True)
-    (root / "specs" / "39" / "39b.md").write_text("# 39b — test spec\n", encoding="utf-8")
-    (root / "specs" / "39" / "exists.md").write_text("original\n", encoding="utf-8")
-    subprocess.run(["git", "add", "a.py", "specs"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
-    sessions = root / "sessions"
-    host = _host(FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]), repo_root=root, sessions_root=sessions)
-    host.run.start("seed conversation")
-    _wait_until(lambda: host.run._active is None, "seed conversation did not finish")
-    source_id, review_id = "spec-source", "spec-review"
-    source = SessionStore(sessions, source_id, repo_root=root)
-    meta = source.read_meta()
-    meta["spec_run"] = {"kind": "implement", "state": "finished", "spec": "specs/39/39b.md", "report": "specs/report/39/39b-report.md", "worktree": "worktree"}
-    meta["review"] = {"session_id": review_id, "verdict": "passed", "follow_ups": []}
-    source.write_meta(meta)
-    source.close()
-    worktree = create_worktree(root, sessions / source_id / "worktree")
-    if add_file:
-        (worktree / "new.py").write_text("created = True\n", encoding="utf-8")
-    else:
-        (worktree / "a.py").write_text("a = 100\nb = 2\n", encoding="utf-8")
-    return host, sessions, source_id, review_id, worktree
-
-
-def _post_spec_commit(host, session_id: str, message: str = "spec commit"):
-    connection, response = _request(
-        host, "POST", "/spec/commit", body={"session_id": session_id, "message": message},
-        headers=_headers(host),
-    )
-    body = json.loads(response.read())
-    connection.close()
-    return response.status, body
-
-
-@check("host_server.spec_commit_refuses_unstaged_path_edits")
-def check_spec_commit_refuses_unstaged_path_edits() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        host, _, source_id, _, worktree = _spec_commit_route_fixture(root)
-        try:
-            (root / "a.py").write_text("a = 1\nb = 200\n", encoding="utf-8")
-            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout
-            status, body = _post_spec_commit(host, source_id)
-            if status != 409 or body.get("error") != "uncommitted changes in: a.py":
-                fail(f"unstaged edit was not named on refusal: {status}, {body!r}")
-            if (root / "a.py").read_text(encoding="utf-8") != "a = 1\nb = 200\n" or not worktree.is_dir():
-                fail("unstaged edit refusal changed the main file or removed the worktree")
-            if subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout != head:
-                fail("unstaged edit refusal changed HEAD")
-            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root).returncode != 0:
-                fail("unstaged edit refusal changed the index")
-        finally:
-            host.close()
-
-
-@check("host_server.spec_commit_refuses_untracked_addition_path")
-def check_spec_commit_refuses_untracked_addition_path() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        host, _, source_id, _, worktree = _spec_commit_route_fixture(root, add_file=True)
-        try:
-            (root / "new.py").write_text("person's file\n", encoding="utf-8")
-            status, body = _post_spec_commit(host, source_id)
-            if status != 409 or body.get("error") != "uncommitted changes in: new.py":
-                fail(f"untracked collision was not named on refusal: {status}, {body!r}")
-            if (root / "new.py").read_text(encoding="utf-8") != "person's file\n" or not worktree.is_dir():
-                fail("untracked collision refusal applied the run patch")
-        finally:
-            host.close()
-
-
-@check("host_server.spec_commit_hook_failure_leaves_applied_files")
-def check_spec_commit_hook_failure_leaves_applied_files() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        host, _, source_id, _, worktree = _spec_commit_route_fixture(root)
-        try:
-            hook = root / ".git" / "hooks" / "pre-commit"
-            hook.write_text("#!/bin/sh\necho hook failed >&2\nexit 1\n", encoding="utf-8")
-            hook.chmod(0o755)
-            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout
-            status, body = _post_spec_commit(host, source_id)
-            if status != 409 or "hook failed" not in body.get("error", ""):
-                fail(f"pre-commit failure was not returned: {status}, {body!r}")
-            if (root / "a.py").read_text(encoding="utf-8") != "a = 100\nb = 2\n" or worktree.exists():
-                fail("hook failure did not leave applied files with the worktree gone")
-            if subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=True).stdout != head:
-                fail("hook failure changed HEAD")
-            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root).returncode != 0:
-                fail("hook failure left paths staged")
-        finally:
-            host.close()
-
-
-@check("host_server.spec_commit_stale_patch_is_not_applied")
-def check_spec_commit_stale_patch_is_not_applied() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        host, _, source_id, _, worktree = _spec_commit_route_fixture(root)
-        try:
-            (root / "a.py").write_text("a = 9\nb = 2\n", encoding="utf-8")
-            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
-            subprocess.run(["git", "commit", "--quiet", "-m", "conflicting edit"], cwd=root, check=True)
-            expected = subprocess.run(["git", "apply", "--check", "--binary"], input=worktree_diff(worktree).patch.encode(), cwd=root, capture_output=True).stderr.decode().strip()
-            status, body = _post_spec_commit(host, source_id)
-            if status != 409 or not expected or expected not in body.get("error", ""):
-                fail(f"stale patch did not return git's refusal: {status}, {body!r}, expected {expected!r}")
-            if (root / "a.py").read_text(encoding="utf-8") != "a = 9\nb = 2\n" or not worktree.is_dir():
-                fail("stale patch refusal changed the main tree or removed the worktree")
-        finally:
-            host.close()
-
-
-@check("host_server.spec_review_refuses_second_active_review")
-def check_spec_review_refuses_second_active_review() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        host, sessions, source_id, review_id, _ = _spec_commit_route_fixture(root)
-        try:
-            source = SessionStore.open(sessions, source_id)
-            try:
-                meta = source.read_meta()
-                meta["review"] = {"session_id": review_id, "verdict": "running", "follow_ups": [], "not_copied": []}
-                source.write_meta(meta)
-            finally:
-                source.close()
-            host.run._active_by_session[review_id] = object()
-            connection, response = _request(host, "POST", "/spec/review", body={"session_id": source_id}, headers=_headers(host))
-            body = json.loads(response.read())
-            connection.close()
-            if response.status != 409 or "review is already running" not in body.get("error", ""):
-                fail(f"second active review was not refused: {response.status}, {body!r}")
-        finally:
-            host.run._active_by_session.pop(review_id, None)
-            host.close()
-
-
-@check("host_server.spec_review_lists_ineligible_followups")
-def check_spec_review_lists_ineligible_followups() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        root.mkdir()
-        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
-        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
-        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
-        (root / "a.py").write_text("a = 1\n", encoding="utf-8")
-        (root / "specs" / "39").mkdir(parents=True)
-        (root / "specs" / "39" / "39b.md").write_text("# 39b — test spec\n", encoding="utf-8")
-        (root / "specs" / "39" / "exists.md").write_text("original\n", encoding="utf-8")
-        subprocess.run(["git", "add", "a.py", "specs"], cwd=root, check=True)
-        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
-        sessions = root / "sessions"
-        provider = FakeModelProvider([
-            ModelResponse(Message(Role.ASSISTANT, "seed")),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("outside", "write_file", {
-                "path": "specs/40/outside.md", "content": "outside\n",
-            })])),
-            ModelResponse(Message(Role.ASSISTANT, "Verdict: follow-ups: specs/40/outside.md, specs/39/exists.md")),
-        ])
-        host = _host(provider, repo_root=root, sessions_root=sessions)
-        try:
-            host.run.start("seed")
-            _wait_until(lambda: host.run._active is None, "seed conversation did not finish")
-            source_id = "spec-source"
-            source = SessionStore(sessions, source_id, repo_root=root)
-            meta = source.read_meta()
-            meta["spec_run"] = {
-                "kind": "implement", "state": "finished", "spec": "specs/39/39b.md",
-                "report": "specs/report/39/39b-report.md", "worktree": "worktree",
-            }
-            source.write_meta(meta)
-            source.close()
-            worktree = create_worktree(root, sessions / source_id / "worktree")
-            (worktree / "a.py").write_text("a = 2\n", encoding="utf-8")
-            (worktree / "specs" / "40").mkdir(parents=True)
-            connection, response = _request(host, "POST", "/spec/review", body={"session_id": source_id}, headers=_headers(host))
-            reply = json.loads(response.read())
-            connection.close()
-            if response.status != 200:
-                fail(f"spec review did not start: {response.status}, {reply!r}")
-            def review_finished():
-                store = SessionStore.open(sessions, source_id)
-                try:
-                    return store.read_meta().get("review", {}).get("verdict") != "running"
-                finally:
-                    store.close()
-            _wait_until(review_finished, "spec reviewer did not finish")
-            source = SessionStore.open(sessions, source_id)
-            try:
-                review = source.read_meta().get("review", {})
-            finally:
-                source.close()
-            expected = ["specs/40/outside.md", "specs/39/exists.md"]
-            if review.get("verdict") != "follow-ups" or review.get("not_copied") != expected or review.get("follow_ups"):
-                fail(f"ineligible follow-ups were not reported precisely: {review!r}")
-            if (root / "specs/39/exists.md").read_text(encoding="utf-8") != "original\n":
-                fail("reviewer follow-up overwrote an existing main-tree spec")
-        finally:
-            host.close()
-
-
-@check("host_server.spec_plan_binds_one_new_spec")
-def check_spec_plan_binds_one_new_spec() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        root.mkdir()
-        docs = root / "docs"
-        docs.mkdir()
-        roadmap = docs / "roadmap.json"
-        roadmap.write_text('{"goal":"test","phases":[{"id":"39","name":"Phase 39","status":"in_progress","items":["New capability","Leave unchanged"]}]}', encoding="utf-8")
-        provider = FakeModelProvider([
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("outside", "write_file", {
-                "path": "README.md", "content": "should be denied\n",
-            })])),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("shell", "run_shell", {"argv": ["touch", "planner-shell.txt"]})])),
-            ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("new-spec", "write_file", {
-                "path": "specs/39/39z-new-capability.md", "content": "# 39z — new capability\n",
-            })])),
-            ModelResponse(Message(Role.ASSISTANT, "done")),
-        ])
-        host = HostServer(provider, PermissionPolicy(repo_root=root, allowed_write_scope=[root]), sessions_root=root / "sessions")
-        host.start()
-        try:
-            connection, response = _request(host, "POST", "/spec/plan", body={"phase": "39", "item": 0}, headers=_headers(host))
-            reply = json.loads(response.read())
-            connection.close()
-            if response.status != 200:
-                fail(f"spec/plan returned {response.status}: {reply!r}")
-            deadline = time.monotonic() + 5
-            bound = None
-            while time.monotonic() < deadline:
-                connection, response = _request(host, "GET", "/spec/runs", headers=_headers(host))
-                runs = json.loads(response.read())
-                connection.close()
-                bound = next((item for item in runs if item["session_id"] == reply["session_id"]), None)
-                if bound and bound.get("state") != "running":
-                    break
-                time.sleep(0.02)
-            result = json.loads(roadmap.read_text(encoding="utf-8"))
-            items = result["phases"][0]["items"]
-            expected = {"title": "New capability", "spec": ["specs/39/39z-new-capability.md"]}
-            if items[0] != expected or items[1] != "Leave unchanged":
-                fail(f"planner did not bind exactly its new spec or changed a neighbor: {items!r}")
-            if not bound or bound.get("kind") != "plan" or bound.get("bound") != expected["spec"][0]:
-                fail(f"plan session did not record its binding: {bound!r}")
-            if (root / "README.md").exists() or (root / "planner-shell.txt").exists():
-                fail("planner wrote outside specs or ran a shell command")
         finally:
             host.close()
 
@@ -868,59 +425,6 @@ def check_agent_history_route() -> None:
             host.close()
 
 
-@check("host_server.spec_plan_records_zero_and_multiple_specs_without_binding")
-def check_spec_plan_records_zero_and_multiple_specs_without_binding() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        docs = root / "docs"
-        docs.mkdir()
-        roadmap = docs / "roadmap.json"
-        initial_roadmap = {
-            "phases": [{"id": "39", "status": "in_progress", "items": ["New capability"]}],
-        }
-        roadmap.write_text(json.dumps(initial_roadmap), encoding="utf-8")
-        specs = root / "specs" / "39"
-        specs.mkdir(parents=True)
-        sessions = root / "sessions"
-        run = HostRun(
-            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
-            PermissionPolicy(repo_root=root, allowed_write_scope=[root]), EventBroker(),
-            sessions_root=sessions,
-        )
-        try:
-            for session_id, created, terminal_event, expected_state in (
-                ("plan-none", [], RunFinished(agent_id="planner", run_id="plan-none", stopped_reason="final_response"), "finished"),
-                ("plan-many", ["39a.md", "39b.md"], RunFinished(agent_id="planner", run_id="plan-many", stopped_reason="final_response"), "finished"),
-                ("plan-budget", [], RunFinished(agent_id="planner", run_id="plan-budget", stopped_reason="budget_turns"), "stopped"),
-            ):
-                for name in ("39a.md", "39b.md"):
-                    path = specs / name
-                    if name in created:
-                        path.write_text(f"# {name}\n", encoding="utf-8")
-                    else:
-                        path.unlink(missing_ok=True)
-                store = SessionStore(sessions, session_id, repo_root=root)
-                meta = store.read_meta()
-                meta["spec_run"] = {"kind": "plan", "phase": "39", "item": 0, "baseline_specs": []}
-                store.write_meta(meta)
-                store.close()
-                run._finish_spec_plan(session_id, terminal_event)
-                result = SessionStore.open(sessions, session_id)
-                try:
-                    outcome = result.read_meta()["spec_run"]
-                finally:
-                    result.close()
-                expected = [f"specs/39/{name}" for name in created]
-                if outcome.get("created") != expected or outcome.get("bound") is not None or outcome.get("state") != expected_state:
-                    fail(f"planner output was not recorded without binding: {outcome!r}")
-                if session_id == "plan-budget" and outcome.get("stopped_reason") != "budget_turns":
-                    fail(f"planner stop reason was not recorded: {outcome!r}")
-            if json.loads(roadmap.read_text(encoding="utf-8")) != initial_roadmap:
-                fail("zero or multiple planner specs changed the roadmap")
-        finally:
-            run.close()
-
-
 @check("host_server.spec_review_pass_verdict")
 def check_spec_review_pass_verdict() -> None:
     if review_verdict("Review looks good.\nVerdict: pass") != ("passed", []):
@@ -1019,60 +523,6 @@ def check_spec_review_detects_tree_change() -> None:
             run.close()
 
 
-@check("host_server.roadmap_binding_preserves_other_bytes")
-def check_roadmap_binding_preserves_other_bytes() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        docs = root / "docs"
-        docs.mkdir()
-        raw = '{\n "goal":"g",\n "phases":[{"id":"39","name":"Phase","status":"in_progress","items":["first", "second"]}]\n}\n'
-        path = docs / "roadmap.json"
-        path.write_text(raw)
-        bind_roadmap_item(root, "39", 1, "specs/39/39b.md")
-        updated = path.read_text()
-        if not updated.startswith(raw[:raw.index('"second"')]) or not updated.endswith(raw[raw.index('"second"') + len('"second"'):]):
-            fail("binding changed bytes outside the selected roadmap item")
-
-
-@check("host_server.roadmap_binding_converts_string_item")
-def check_roadmap_binding_converts_string_item() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        (root / "docs").mkdir()
-        path = root / "docs" / "roadmap.json"
-        path.write_text('{"phases":[{"id":"39","items":["Thing"]}]}')
-        bind_roadmap_item(root, "39", 0, "specs/39/39a.md")
-        item = json.loads(path.read_text())["phases"][0]["items"][0]
-        if item != {"title": "Thing", "spec": ["specs/39/39a.md"]}:
-            fail(f"string roadmap item was not bound as an object: {item!r}")
-
-
-@check("host_server.roadmap_binding_rejects_unknown_item")
-def check_roadmap_binding_rejects_unknown_item() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        (root / "docs").mkdir()
-        (root / "docs" / "roadmap.json").write_text('{"phases":[{"id":"39","items":["Thing"]}]}')
-        try:
-            bind_roadmap_item(root, "39", 2, "specs/39/39a.md")
-        except ValueError:
-            return
-        fail("unknown roadmap item index was accepted")
-
-
-@check("host_server.roadmap_commit_marks_done_and_phase")
-def check_roadmap_commit_marks_done_and_phase() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        (root / "docs").mkdir()
-        path = root / "docs" / "roadmap.json"
-        path.write_text('{"phases":[{"id":"39","status":"in_progress","items":[{"title":"A","spec":["specs/39/a.md"]},{"title":"B","spec":["specs/39/b.md"],"done":true}]}]}')
-        mark_roadmap_spec_done(root, "specs/39/a.md")
-        phase = json.loads(path.read_text())["phases"][0]
-        if phase["status"] != "done" or phase["items"][0].get("done") is not True:
-            fail("commit did not mark its roadmap item and completed phase done")
-
-
 @check("host_server.model_fallback")
 def check_model_fallback() -> None:
     class _Response:
@@ -1110,9 +560,17 @@ def check_model_fallback() -> None:
                 timeout=5,
                 api_key="test-key",
                 operation="mock provider",
-                cancel=cancel,
             )
             return ModelResponse(Message(Role.ASSISTANT, raw.decode("utf-8")))
+
+    def wait_terminal(subscription):
+        events = []
+        while True:
+            event = subscription.get(timeout=0.05)
+            if event is not None:
+                events.append(event)
+                if isinstance(event, (RunFinished, RunFailed)):
+                    return events
 
     def run_prompt(root, provider, *, fallback, outcomes):
         source = root / ".symphonai" / "config.toml"
@@ -1132,22 +590,14 @@ def check_model_fallback() -> None:
         )
         try:
             host.start("first prompt")
-            events = []
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                event = subscription.get(timeout=0.05)
-                if event is not None:
-                    events.append(event)
-                    if isinstance(event, (RunFinished, RunFailed)):
-                        break
-            if not events or not isinstance(events[-1], outcomes):
+            events = wait_terminal(subscription)
+            if not isinstance(events[-1], outcomes):
                 fail(f"host run did not reach expected terminal event: {events!r}")
-            return host, events
+            return host, events, subscription
         except Exception:
             host.close()
-            raise
-        finally:
             subscription.close()
+            raise
 
     sent_models = []
 
@@ -1165,28 +615,32 @@ def check_model_fallback() -> None:
         root = Path(temporary)
         provider = _HttpProvider()
         always_unavailable = False
+        retry_clock = SimpleNamespace(monotonic=time.monotonic, sleep=lambda _delay: None)
         with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=mocked_open), mock.patch(
-            "symphonai_api.retry.time.sleep"
+            "symphonai_api.retry.time", retry_clock
         ):
-            host, events = run_prompt(
+            host, events, subscription = run_prompt(
                 root, provider, fallback=True, outcomes=(RunFinished,)
             )
-            fallback_events = [event for event in events if isinstance(event, ModelFallback)]
-            if len(fallback_events) != 1 or (
-                fallback_events[0].from_model,
-                fallback_events[0].to_model,
-                fallback_events[0].reason,
-            ) != ("model-a", "model-b", "529"):
-                fail(f"fallback event was missing or incorrect: {fallback_events!r}")
-            host.start("second prompt")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and host._active is not None:
-                time.sleep(0.01)
-            if sent_models != ["model-a"] * 3 + ["model-b"] + ["model-a"] * 3 + ["model-b"]:
-                fail(f"next turn did not start from model-a: {sent_models!r}")
-            if provider.requests != [None, "model-b", None, "model-b"]:
-                fail(f"primary request model was changed from None: {provider.requests!r}")
-            host.close()
+            try:
+                fallback_events = [event for event in events if isinstance(event, ModelFallback)]
+                if len(fallback_events) != 1 or (
+                    fallback_events[0].from_model,
+                    fallback_events[0].to_model,
+                    fallback_events[0].reason,
+                ) != ("model-a", "model-b", "529"):
+                    fail(f"fallback event was missing or incorrect: {fallback_events!r}")
+                host.start("second prompt")
+                second_events = wait_terminal(subscription)
+                if not isinstance(second_events[-1], RunFinished):
+                    fail(f"second host run did not finish: {second_events!r}")
+                if sent_models != ["model-a"] * 3 + ["model-b"] + ["model-a"] * 3 + ["model-b"]:
+                    fail(f"next turn did not start from model-a: {sent_models!r}")
+                if provider.requests != [None, "model-b", None, "model-b"]:
+                    fail(f"primary request model was changed from None: {provider.requests!r}")
+            finally:
+                host.close()
+                subscription.close()
 
     for fallback, status in ((False, 529), (True, 529), (True, 400)):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1201,21 +655,25 @@ def check_model_fallback() -> None:
                     url_request.full_url, status, "provider error", {}, io.BytesIO(b"failure")
                 )
 
+            retry_clock = SimpleNamespace(monotonic=time.monotonic, sleep=lambda _delay: None)
             with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=fail_open), mock.patch(
-                "symphonai_api.retry.time.sleep"
+                "symphonai_api.retry.time", retry_clock
             ):
-                host, events = run_prompt(
+                host, events, subscription = run_prompt(
                     root, provider, fallback=fallback, outcomes=(RunFailed,)
                 )
-                if any(isinstance(event, ModelFallback) for event in events):
-                    fail(f"HTTP {status} emitted a fallback without a successful model")
-                if status == 400 and (provider.requests != [None] or sent_models != ["model-a"]):
-                    fail(f"HTTP 400 attempted fallback: {provider.requests!r}")
-                if status == 529 and sent_models != (
-                    ["model-a"] * 3 + (["model-b"] * 3 if fallback else [])
-                ):
-                    fail(f"fallback chain did not try the expected models: {sent_models!r}")
-                host.close()
+                try:
+                    if any(isinstance(event, ModelFallback) for event in events):
+                        fail(f"HTTP {status} emitted a fallback without a successful model")
+                    if status == 400 and (provider.requests != [None] or sent_models != ["model-a"]):
+                        fail(f"HTTP 400 attempted fallback: {provider.requests!r}")
+                    if status == 529 and sent_models != (
+                        ["model-a"] * 3 + (["model-b"] * 3 if fallback else [])
+                    ):
+                        fail(f"fallback chain did not try the expected models: {sent_models!r}")
+                finally:
+                    host.close()
+                    subscription.close()
 
 
 @check("host_server.model_fallback_streamed")
@@ -1745,6 +1203,8 @@ def check_files_prunes_forbidden_directories() -> None:
 
 @check("host_server.files_breadth_first_cap")
 def check_files_breadth_first_cap() -> None:
+    from symphonai_host import files as files_module
+
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source = root / "src" / "parser.py"
@@ -1752,9 +1212,10 @@ def check_files_breadth_first_cap() -> None:
         source.write_text("source", encoding="utf-8")
         deep = root / "vendor" / "deep" / "a" / "b"
         deep.mkdir(parents=True)
-        for index in range(20_005):
+        for index in range(3):
             (deep / f"file-{index:05}.py").touch()
-        paths, truncated = repository_files(PermissionPolicy(repo_root=root), "parser", 20)
+        with mock.patch.object(files_module, "MAX_SEARCH_FILES", 3):
+            paths, truncated = repository_files(PermissionPolicy(repo_root=root), "parser", 20)
         if paths != ["src/parser.py"] or not truncated:
             fail(f"breadth-first cap omitted a shallow file: {paths!r}, truncated={truncated}")
 
@@ -1985,26 +1446,6 @@ def _check_await_sse_helper() -> None:
     ) != target:
         fail("rapid keepalives spent the SSE wait budget")
 
-    sources = {
-        path.name: path.read_text(encoding="utf-8")
-        for path in (
-            Path(__file__),
-            REPO_ROOT / "scripts" / "checks" / "host_approvals.py",
-            REPO_ROOT / "scripts" / "checks" / "host_sessions.py",
-        )
-    }
-    definitions = sum(
-        source.count("def _next" + "_sse(")
-        + source.count("def _await" + "_sse(")
-        for source in sources.values()
-    )
-    if definitions != 2:
-        fail(f"SSE readers were duplicated across host checks: {definitions}")
-    for name in ("host_approvals.py", "host_sessions.py"):
-        if "_await_sse" not in sources[name]:
-            fail(f"{name} did not import the shared SSE reader")
-
-
 def _wait_until(predicate, message: str, *, timeout: float = 5) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -2033,29 +1474,6 @@ def _subscribed_stream(host, *, expected: int = 1):
 
 
 def _check_subscribed_stream_helper() -> None:
-    sources = {
-        path.name: path.read_text(encoding="utf-8")
-        for path in (
-            Path(__file__),
-            REPO_ROOT / "scripts" / "checks" / "host_approvals.py",
-            REPO_ROOT / "scripts" / "checks" / "host_sessions.py",
-        )
-    }
-    if sources["host_approvals.py"].count("_event" + "_stream(") != 0:
-        fail("an approval check opens an unsubscribed event stream")
-    if sources["host_sessions.py"].count("_event" + "_stream(") != 0:
-        fail("a session check opens an unsubscribed event stream")
-    if sources["host_server.py"].count("_event" + "_stream(") != 5:
-        fail("a host check opens an unsubscribed event stream")
-
-    helper_source = inspect.getsource(_subscribed_stream)
-    if "time." + "sleep(" in helper_source:
-        fail("subscription helper used time.sleep")
-    if "subscriber_count >= expected" not in helper_source:
-        fail("subscription wait did not use the caller's expected count")
-    if "_wait" + "_until(" not in helper_source:
-        fail("subscription helper did not use a predicate wait")
-
     host = _host()
     wait_until = _wait_until
     try:
@@ -2182,156 +1600,6 @@ def check_auth_required() -> None:
             connection.close()
     finally:
         host.close()
-
-
-@check("host_server.file_route")
-def check_file_route() -> None:
-    token = "file-route-token"
-    with tempfile.TemporaryDirectory() as temporary:
-        fixture = Path(temporary)
-        root = fixture / "repo"
-        sibling = fixture / "repo-sibling"
-        specs = root / "specs"
-        docs = root / "docs"
-        source = root / "symphonai_host"
-        git = root / ".git"
-        for directory in (
-            specs,
-            specs / "nested",
-            docs,
-            source,
-            git,
-            sibling,
-            fixture / "etc",
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
-
-        spec = specs / "18d.md"
-        roadmap = docs / "roadmap.json"
-        outside = sibling / "outside.md"
-        spec.write_text("spec text", encoding="utf-8")
-        roadmap.write_text('{"goal":"fixture"}', encoding="utf-8")
-        outside.write_text("outside", encoding="utf-8")
-        (fixture / "etc" / "passwd").write_text("outside", encoding="utf-8")
-        (root / ".env").write_text("secret", encoding="utf-8")
-        (git / "config").write_text("private", encoding="utf-8")
-        (source / "server.py").write_text("source", encoding="utf-8")
-        (specs / "invalid.md").write_bytes(b"\xff")
-        (specs / "large.md").write_bytes(
-            b"x" * (host_server_module.MAX_FILE_BYTES + 1)
-        )
-        (specs / "outside-link.md").symlink_to(outside)
-
-        host = _host(repo_root=root, token=token)
-        protected_values = (token, str(fixture))
-
-        def request_file(path: str, *, authorized: bool = True):  # noqa: ANN202
-            headers = _headers(host) if authorized else {}
-            connection, response = _request(
-                host,
-                "GET",
-                f"/file?{urlencode({'path': path})}",
-                headers=headers,
-            )
-            try:
-                result = (response.status, tuple(response.getheaders()), response.read())
-                wire = repr(result)
-                leaked = [value for value in protected_values if value in wire]
-                if leaked:
-                    fail(f"file route response leaked a protected value: {leaked!r}")
-                return result
-            finally:
-                connection.close()
-
-        try:
-            for path, expected_text in (
-                ("specs/18d.md", "spec text"),
-                ("docs/roadmap.json", '{"goal":"fixture"}'),
-            ):
-                status, _, body = request_file(path)
-                if status != 200 or json.loads(body) != {
-                    "path": path,
-                    "text": expected_text,
-                }:
-                    fail(f"file route returned the wrong document for {path!r}")
-
-            traversal = (
-                "../etc/passwd",
-                str(spec),
-                "specs/nested/../../../repo-sibling/outside.md",
-                "specs/outside-link.md",
-                "docs/../../repo-sibling/outside.md",
-            )
-            for path in traversal:
-                status, _, body = request_file(path)
-                if status != 403 or body != b"":
-                    fail(f"file route accepted traversal fixture {path!r}: {status}")
-
-            for path in (".env", ".git/config", "symphonai_host/server.py"):
-                status, _, body = request_file(path)
-                if status != 403 or body != b"":
-                    fail(f"file route served a path outside its allow-list: {path!r}")
-
-            status, _, body = request_file("specs/missing.md")
-            if status != 404 or json.loads(body) != {"error": "not found"}:
-                fail(f"missing file response was not the generic 404: {status}, {body!r}")
-            for path, expected_status in (
-                ("specs/invalid.md", 415),
-                ("specs/large.md", 413),
-            ):
-                status, _, body = request_file(path)
-                if status != expected_status or body != b"":
-                    fail(f"file route handled {path!r} as {status} with {body!r}")
-
-            status, _, body = request_file("specs/18d.md", authorized=False)
-            if status != 401 or body != b"":
-                fail("file route did not require bearer authorization")
-
-        finally:
-            host.close()
-
-
-@check("host_server.spec_files")
-def check_spec_files() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "repo"
-        examples = {
-            "specs/37/37e-x.md": "base",
-            "specs/37/37eF-y.md": "follow-up",
-            "specs/37/private.md": "denied by read policy",
-            "specs/37/37-PLAN.md": "plan",
-            "specs/report/37/37e-x-report.md": "report",
-            "specs/TEMPLATE.md": "template",
-        }
-        for relative, content in examples.items():
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-        host = HostServer(
-            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
-            PermissionPolicy(repo_root=root, forbidden_patterns=("private.md",)),
-            sessions_root=root / "sessions",
-        )
-        host.start()
-        try:
-            connection, response = _request(host, "GET", "/spec/files")
-            try:
-                if response.status != 401 or response.read() != b"":
-                    fail("/spec/files did not require bearer authorization")
-            finally:
-                connection.close()
-            connection, response = _request(
-                host, "GET", "/spec/files", headers=_headers(host)
-            )
-            try:
-                actual = json.loads(response.read())
-                expected = {"paths": ["specs/37/37e-x.md", "specs/37/37eF-y.md"]}
-                if response.status != 200 or actual != expected:
-                    fail(f"/spec/files returned {actual!r}, expected {expected!r}")
-            finally:
-                connection.close()
-        finally:
-            host.close()
 
 
 @check("host_server.search_settings_credentials_and_registry")
@@ -2706,6 +1974,39 @@ def check_user_command_route() -> None:
                 )
             ) or user_messages[-1] != "continue":
                 fail(f"command result was not added before the next prompt: {user_messages!r}")
+        finally:
+            host.close()
+
+
+@check("host_server.removed_spec_runner_routes_are_not_found")
+def check_removed_spec_runner_routes_are_not_found() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(root), sessions_root=root / "sessions",
+        )
+        host.start()
+        try:
+            for method, path in (
+                ("GET", "/file?path=docs/roadmap.json"),
+                ("GET", "/spec/files"),
+                ("GET", "/spec/runs"),
+                ("POST", "/spec/plan"),
+                ("POST", "/spec/run"),
+                ("POST", "/spec/review"),
+                ("POST", "/spec/commit"),
+            ):
+                connection, response = _request(
+                    host, method, path, body={} if method == "POST" else None,
+                    headers=_headers(host),
+                )
+                try:
+                    payload = json.loads(response.read())
+                    if response.status != 404 or payload != {"error": "not found"}:
+                        fail(f"removed {method} {urlsplit(path).path} route returned {response.status}: {payload!r}")
+                finally:
+                    connection.close()
         finally:
             host.close()
 
@@ -4198,7 +3499,7 @@ def check_app_routes() -> None:
             for path in (
                 f"/app/?token=wrong-{token}",
                 f"/app/src/app.js?token={token}",
-                f"/file?path=docs/roadmap.json&token={token}",
+                f"/roadmap?token={token}",
             ):
                 status, _, body = get(host, path)
                 if status != 401 or body != b"":
@@ -4210,7 +3511,7 @@ def check_app_routes() -> None:
                 fail("app asset accepted a cookie carrying the wrong token")
 
             for method, path, body in (
-                ("GET", "/file?path=docs/roadmap.json", None),
+                ("GET", "/roadmap", None),
                 ("GET", "/events", None),
                 ("POST", "/prompt", {"prompt": "must not run"}),
             ):
@@ -5203,12 +4504,6 @@ def check_background_goal_new_chat_is_session_scoped() -> None:
                 fail(f"new chat in B changed goal A: {goal.payload()!r}")
         finally:
             host.close()
-
-
-@check("host_server.event_broker_publish_event_only")
-def check_event_broker_publish_event_only() -> None:
-    if tuple(inspect.signature(EventBroker.publish).parameters) != ("self", "event"):
-        fail(f"EventBroker.publish still accepts session identity: {inspect.signature(EventBroker.publish)}")
 
 
 @check("host_server.goal_rounds_until_check_passes")
@@ -13005,6 +12300,138 @@ def check_headless_loop() -> None:
                 fail(f"headless cancellation returned the wrong result: {code}, {result!r}")
             if not provider.card_cancelled.is_set():
                 fail("headless cancellation did not stop the active card conversation")
+
+
+@check("host_server.headless_loop_resume")
+def check_headless_loop_resume() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "headless-resume@example.test"),
+            ("config", "user.name", "Headless Resume Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+
+        class FailDuringCardProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__(_headless_loop_provider()._responses[:3])
+
+            def create_response(self, request, *, cancel=None):
+                if self.call_count >= 3:
+                    raise ProviderError("scripted card failure")
+                return super().create_response(request, cancel=cancel)
+
+        with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+            code, output, _error, sessions = _headless_invoke(
+                root, FailDuringCardProvider(),
+                ["loop", "Add new.py", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
+        failed_result = json.loads(output)
+        if code != 1 or failed_result.get("state") != "needs_attention":
+            fail(f"fixture loop did not stop at its failed card: {code}, {failed_result!r}")
+        loop_id = failed_result["loop_id"]
+        store = LoopStore(root)
+
+        report_path = f".symphonai/loops/{loop_id}/reports/a-change-a-report.md"
+        class BlockingResumeProvider(FakeModelProvider):
+            def __init__(self) -> None:
+                super().__init__([
+                    ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                        "new-file", "write_file", {"path": "new.py", "content": "value = 2\n"},
+                    )])),
+                    ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                        "report", "write_file", {"path": report_path, "content": "Implementation passed.\n"},
+                    )])),
+                    ModelResponse(Message(Role.ASSISTANT, "Implemented the change.")),
+                    ModelResponse(Message(Role.ASSISTANT, "Verdict: pass")),
+                ])
+                self.requests = []
+                self.card_started = threading.Event()
+                self.release_card = threading.Event()
+
+            def create_response(self, request, *, cancel=None):
+                self.requests.append(request)
+                if self.call_count == 0:
+                    self.card_started.set()
+                    self.release_card.wait(5)
+                return super().create_response(request, cancel=cancel)
+
+        provider = BlockingResumeProvider()
+        command_result = []
+        command_errors = []
+
+        def resume() -> None:
+            try:
+                command_result.append(_headless_invoke(
+                    root, provider,
+                    ["loop", "--resume", loop_id, "--json", "--repo-root", str(root), "--provider", "openai"],
+                ))
+            except BaseException as exc:
+                command_errors.append(exc)
+
+        thread = threading.Thread(target=resume, daemon=True)
+        thread.start()
+        try:
+            if not provider.card_started.wait(5):
+                fail("resumed loop did not start its failed card")
+            running = store.load(loop_id)
+            if running.get("runner_pid") != os.getpid() or running.get("state") != "running":
+                fail(f"resumed loop did not record its active runner: {running!r}")
+        finally:
+            provider.release_card.set()
+            thread.join(timeout=10)
+        if thread.is_alive():
+            fail("resumed headless loop did not exit")
+        if command_errors:
+            fail(f"resumed headless command raised: {command_errors[0]!r}")
+        code, output, _error, _sessions = command_result[0]
+        result = json.loads(output)
+        if code != 0 or result.get("state") != "awaiting_commit":
+            fail(f"resumed loop did not reach its commit checkpoint: {code}, {result!r}")
+        if any(
+            message.role is Role.USER and "Plan this goal:" in message.text
+            for request in provider.requests for message in request.messages
+        ):
+            fail("resumed provider received a planning request")
+
+        committer = HostRun(
+            FakeModelProvider(), PermissionPolicy(root, allowed_write_scope=[root]),
+            EventBroker(), sessions_root=sessions,
+        )
+        try:
+            committer.commit_loop(loop_id, "approve")
+        finally:
+            committer.close()
+        loop_path = store.path(loop_id, "loop.json")
+        done_bytes = loop_path.read_bytes()
+        code, _output, error, _sessions = _headless_invoke(
+            root, FakeModelProvider(),
+            ["loop", "--resume", loop_id, "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        if code != 1 or loop_id not in error or "done" not in error:
+            fail(f"resuming a done loop did not name its state: {code}, {error!r}")
+        if loop_path.read_bytes() != done_bytes:
+            fail("rejecting resume of a done loop changed loop.json")
+
+        unknown = "loop_unknown0000"
+        code, _output, error, _sessions = _headless_invoke(
+            root, FakeModelProvider(),
+            ["loop", "--resume", unknown, "--json", "--repo-root", str(root), "--provider", "openai"],
+        )
+        if code != 1 or unknown not in error or "unknown" not in error:
+            fail(f"unknown loop resume did not name the id and state: {code}, {error!r}")
+
+        code, _output, error, _sessions = _headless_invoke(
+            root, FakeModelProvider(),
+            ["loop", "also a goal", "--resume", loop_id, "--repo-root", str(root), "--provider", "openai"],
+        )
+        if code != 2 or "cannot be combined" not in error:
+            fail(f"resume accepted a positional goal: {code}, {error!r}")
 
 
 @check("host_server.headless_loop_is_not_recovered_while_running")

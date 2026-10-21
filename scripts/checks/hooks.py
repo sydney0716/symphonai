@@ -553,6 +553,24 @@ def blocking_fail_closed() -> None:
 
 @check("hooks.agent_veto")
 def agent_veto() -> None:
+    class _ParallelRecordingTool(_RecordingTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self._invocations_lock = threading.Lock()
+
+        def metadata(self, arguments: dict) -> ToolMetadata:
+            return ToolMetadata(ToolEffect.READ_ONLY, True, ())
+
+        def _execute(
+            self,
+            tool_call: ToolCall,
+            policy: PermissionPolicy,
+            cancel=None,
+        ) -> ToolResult:
+            with self._invocations_lock:
+                self.invocations += 1
+            return ToolResult(tool_call_id=tool_call.id, ok=True, content="ran")
+
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         denying = _script(root, "deny.py", "print('deny: guarded')\n")
@@ -566,14 +584,17 @@ def agent_veto() -> None:
             ],
             cwd=root,
         )
-        tool = _RecordingTool()
+        tool = _ParallelRecordingTool()
         result = ApiAgent(
             FakeModelProvider(
                 [
                     ModelResponse(
                         Message(
                             Role.ASSISTANT,
-                            tool_calls=[ToolCall(id="guarded-call", name=tool.name)],
+                            tool_calls=[
+                                ToolCall(id="guarded-call-1", name=tool.name),
+                                ToolCall(id="guarded-call-2", name=tool.name),
+                            ],
                         )
                     ),
                     ModelResponse(Message(Role.ASSISTANT, "done")),
@@ -582,16 +603,15 @@ def agent_veto() -> None:
             {tool.name: tool},
             PermissionPolicy(root),
         ).run([Message(Role.USER, "try tool")], hooks=runner)
-        denied = next(
+        denied = [
             message.tool_result
             for message in result.messages
             if message.tool_result is not None
-        )
-        if tool.invocations != 0 or denied.ok or denied.error != "guarded":
+        ]
+        if tool.invocations != 0 or len(denied) != 2 or any(
+            item.ok or item.error != "guarded" for item in denied
+        ):
             fail(f"refused tool still ran or returned the wrong result: {denied!r}")
-        source = (Path(__file__).resolve().parents[2] / "symphonai_api/agent_loop.py").read_text()
-        if source.count("hooks.pre_tool(") != 1:
-            fail("agent loop does not contain exactly one hook veto point")
 
 
 

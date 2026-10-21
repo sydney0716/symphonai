@@ -178,41 +178,22 @@ line remains machine-readable for a parent process.
 
 ## Sessions
 
-### Spec runs
+### Roadmap
 
-`[worktree] symlink = [".venv"]` may list relative paths that should be
-symlinked from the main repository into newly created worktrees. Authenticated
-`POST /spec/run` accepts `{"path":"specs/<phase>/<file>.md"}` and starts an
-isolated implementation conversation. `GET /spec/runs` lists those runs,
-their worktree changes, state, and whether an ignored report was copied into
-the main tree. A spec validation block runs in the worktree; specs without one
-use a checkless goal.
-
-`POST /spec/review` accepts a spec run's `session_id`. The reviewer reads its
-spec, report and patch, and the final non-empty answer line determines `passed`,
-`follow-ups`, or `no-verdict`. A changed implementation tree overrides the
-answer with `tree-changed`. Follow-up specs under the same phase directory are
-copied to the main tree when new. `POST /spec/commit` accepts `session_id` and
-a non-blank `message`; it applies the worktree, stages only its changed paths,
-and commits them after a person requests it. It refuses with `409` when a
-changed path has unstaged edits in the main tree, or when a path the run adds
-is already untracked there. If commit fails after the patch was applied, its
-worktree is gone and the applied files remain in the main tree for the person
-to handle. Run entries expose `review`,
-`committed`, and the default `commit_message`.
-
-`POST /spec/plan` accepts a roadmap `phase` id and zero-based `item` index.
-Planner sessions are listed as `kind: "plan"` with `phase`, `item`, `created`,
-and `bound`. A planner that ends with `stopped_reason: "final_response"` has
-`state: "finished"`; one stopped for another reason has `state: "stopped"` and
-records its `stopped_reason`. A failed planner has `state: "failed"` and records
-`error`. A single new Markdown spec under that phase binds the roadmap item.
-Review data on an implementation run records its verdict and the review run's
-`stopped_reason`, or `error` if the review run failed.
-After a successful spec commit, every roadmap item bound to the spec is marked
-done, and the phase is marked `done` only when every item is done.
+Each project keeps its ordered goals in `.symphonai/roadmap.json`. Authenticated
+`GET /roadmap` returns the goals and their linked loop state. `POST /roadmap/add`
+accepts `{"goal": str}`, `/roadmap/remove` accepts `{"id": str}`, and
+`/roadmap/move` accepts `{"id": str, "index": int}`. These operations update
+only the roadmap. `POST /roadmap/start` accepts `{"id": str}`, starts a spec
+loop for that goal, and links the loop to it. A goal can be started again only
+when its linked loop was cancelled. Approving a loop at its commit checkpoint
+marks its linked roadmap goal done. Invalid roadmap files return `409` and are
+left unchanged.
 
 ### Spec loops
+
+`[worktree] symlink = [".venv"]` may list relative paths that should be
+symlinked from the main repository into newly created worktrees.
 
 Authenticated `POST /loop/start` accepts `{"goal": str}` and returns the new
 loop plus its planner `session_id`. `GET /loops` lists loop summaries newest
@@ -537,7 +518,7 @@ the query string exactly, so `/app?token=<token>` redirects to
 navigation cannot set a request header. `GET /app` and `GET /app/` are the only
 query-token routes: the former preserves the query during the redirect and the
 latter authenticates it. Query authentication is never accepted on
-`/app/<asset path>`, `/file`, `/events`, or any POST. The host does not log
+`/app/<asset path>`, `/events`, or any POST. The host does not log
 request URLs.
 
 An authenticated `GET /app/` response sets exactly one development session
@@ -550,7 +531,7 @@ Set-Cookie: symphonai_app=<token>; Path=/app/; HttpOnly; SameSite=Strict
 It has no `Max-Age` or `Expires`. `GET /app/` accepts that cookie on later page
 loads. `GET /app/<asset path>` accepts the cookie or the ordinary bearer header
 so native browser stylesheet and module requests can load. No other route
-accepts the cookie: `/file`, `/events`, `/health`, and all POST requests retain
+accepts the cookie: `/events`, `/health`, and all POST requests retain
 their existing authentication behavior. `Path=/app/` limits where the browser
 sends it, `HttpOnly` prevents app JavaScript from reading it, and
 `SameSite=Strict` plus the loopback bind limits ambient use. The `?token=`
@@ -621,20 +602,6 @@ Malformed requests return `400`. `POST /stop` stops the command's process group;
 the reply has a null `exit_code`, `timed_out: false`, and `stopped: true`. The
 host adds the command and result to the open conversation as user context, or
 holds it for the next prompt when no conversation is open.
-
-`GET /file?path=<repository-relative path>` returns a UTF-8 text file as
-`{"path": <path as requested>, "text": <contents>}`. It serves regular files
-only from the resolved repository's `specs/` and `docs/` directories. Absolute
-paths, traversal outside the resolved repository, and symlinks escaping it
-receive `403` with an empty body. Missing files receive `404`, non-UTF-8 files
-receive `415`, and files larger than 1 MiB receive `413`. The route requires the
-same bearer token as every non-health endpoint and never returns the token or an
-absolute filesystem path.
-
-Authenticated `GET /spec/files` returns `{"paths": [...]}` with sorted paths
-for readable Markdown specs under `specs/<directory>/`. It excludes
-`specs/report/`, files named `*-PLAN.md`, and Markdown files directly under
-`specs/`.
 
 `GET /agent?name=<name>&scope=<user|project>` returns one agent definition as
 `{"name": <stem>, "scope": <scope>, "text": <contents>}`. `POST /agent`

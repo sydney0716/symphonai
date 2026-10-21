@@ -7,7 +7,7 @@ import unittest.mock as mock
 
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import OperationCancelled
-from symphonai_api.circuit_breaker import CircuitOpen, ConsecutiveFailureBreaker
+from symphonai_api.circuit_breaker import ConsecutiveFailureBreaker
 from symphonai_api.compaction import CompactionResult, ContextCompactionError
 from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
@@ -50,18 +50,10 @@ def _dispatch(name: str, index: int = 0) -> ToolCall:
 @check("breaker.opens_on_consecutive_failures")
 def check_opens_on_consecutive_failures() -> None:
     breaker = ConsecutiveFailureBreaker("automatic compaction", max_consecutive_failures=2)
-    breaker.raise_if_open()
     if breaker.record_failure() != 1 or breaker.is_open:
         fail("breaker opened before its configured failure threshold")
     if breaker.record_failure() != 2 or not breaker.is_open:
         fail("breaker did not open at its configured failure threshold")
-    try:
-        breaker.raise_if_open()
-    except CircuitOpen as exc:
-        if str(exc) != "automatic compaction gave up after 2 consecutive failures":
-            fail(f"open breaker error was not descriptive: {exc!r}")
-    else:
-        fail("raise_if_open did not raise for an open breaker")
 
     try:
         ConsecutiveFailureBreaker("invalid", max_consecutive_failures=0)

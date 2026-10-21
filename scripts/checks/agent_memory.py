@@ -6,14 +6,12 @@ from collections.abc import Callable
 import json
 import os
 import tempfile
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 import stat
 from types import SimpleNamespace
 from unittest import mock
 
 import symphonai_api.session as session_module
-from symphonai_api.agent_file import AgentFileError, memory_settings
 from symphonai_api.agent_memory import (
     MAX_ENTRIES,
     MAX_ENTRY_CHARS,
@@ -33,19 +31,6 @@ def _write(directory: Path, name: str, content: str) -> Path:
     path = directory / name
     path.write_text(content, encoding="utf-8")
     return path
-
-
-def _settings_error(path: Path, key: str) -> str:
-    try:
-        memory_settings(path)
-    except AgentFileError as exc:
-        message = str(exc)
-        if str(path) not in message or key not in message:
-            fail(f"memory settings error omitted file or key: {message!r}")
-        return message
-    except Exception as exc:
-        fail(f"memory settings exposed {type(exc).__name__}: {exc!r}")
-    fail(f"memory settings accepted invalid {key}")
 
 
 def _expect_unavailable(
@@ -327,52 +312,6 @@ def unreadable_files_are_preserved() -> None:
         first = missing_store.write("first note", agent_name="leader", run_id="first-run")
         if missing_store.read() != (first,):
             fail("a missing memory file did not accept its first entry")
-
-
-@check("agent_memory.settings_from_the_file")
-def settings_from_the_file() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        directory = Path(temporary)
-        plain = _write(directory, "plain.toml", 'prompt = "Review."\n')
-        plain_settings = memory_settings(plain)
-        if plain_settings.enabled is not False or plain_settings.max_entries != MAX_ENTRIES:
-            fail("missing memory table changed the settings default")
-        enabled = _write(
-            directory,
-            "enabled.toml",
-            'prompt = "Review."\n[memory]\nenabled = true\nmax_entries = 16\n',
-        )
-        if memory_settings(enabled) != MemorySettings(enabled=True, max_entries=16):
-            fail("memory settings were not loaded")
-        default_count = _write(
-            directory,
-            "default-count.toml",
-            'prompt = "Review."\n[memory]\nenabled = true\n',
-        )
-        if memory_settings(default_count).max_entries != MAX_ENTRIES:
-            fail("memory max_entries default changed")
-        for value in (0, MAX_ENTRIES + 1):
-            path = _write(
-                directory,
-                f"bad-count-{value}.toml",
-                f'prompt = "Review."\n[memory]\nmax_entries = {value}\n',
-            )
-            message = _settings_error(path, "max_entries")
-            if str(MAX_ENTRIES) not in message:
-                fail(f"max_entries error omitted its ceiling: {message!r}")
-        unknown = _write(
-            directory,
-            "unknown.toml",
-            'prompt = "Review."\n[memory]\nunknown = true\n',
-        )
-        _settings_error(unknown, "unknown")
-        settings = memory_settings(enabled)
-        try:
-            settings.enabled = False  # type: ignore[misc]
-        except FrozenInstanceError:
-            pass
-        else:
-            fail("MemorySettings was mutable")
 
 
 @check("agent_memory.default_root")
