@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import http.client
+from contextlib import redirect_stdout
+import io
 import os
 from pathlib import Path
 import re
@@ -14,7 +16,7 @@ import time
 from unittest import mock
 import threading
 
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
@@ -26,6 +28,7 @@ from symphonai_host.roadmap import RoadmapStore
 from symphonai_host.projects import ProjectRuntime
 from symphonai_host.run import HostRun, LoopChanged, WorktreeApplyConflict
 from symphonai_host.server import HostServer
+from symphonai_host.headless import _print_loop_result
 from symphonai_api.worktree import create_worktree, remove_worktree
 
 _TEST_LOOP_ID = "loop_000000000000"
@@ -205,12 +208,138 @@ def slug_is_never_empty() -> None:
                 fail("approve did not create the integration worktree on the fallback branch")
         finally:
             run.close()
-
     with tempfile.TemporaryDirectory() as temporary:
         with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000001"):
             loop = LoopStore(Path(temporary)).create("Fix the parser")
         if loop["slug"] != "fix-the-parser":
             fail(f"ASCII goal slug changed unexpectedly: {loop['slug']!r}")
+
+
+@check("loops.usage_per_stage")
+def usage_per_stage() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        _git_repo(root)
+        loop_id = _TEST_LOOP_ID
+        report_path = f".symphonai/loops/{loop_id}/reports/a-change-a-report.md"
+        spec = (
+            "# Change a\n\n## Goal\n\nChange a value.\n\n## Scope\n\n`new.py`.\n\n"
+            "## Contract\n\nSet the value.\n\n## Validation\n\n```sh\ntrue\n```\n\n"
+            f"## Report\n\n`{report_path}`\n"
+        )
+
+        def priced(response: ModelResponse, usage: Usage) -> ModelResponse:
+            return ModelResponse(response.message, usage)
+
+        provider = _RecordingProvider([
+            priced(_write("specs/a-change.md", spec, "plan-spec"), Usage(10, 1, 2, 3)),
+            priced(_write("plan.json", json.dumps({"cards": [{
+                "id": "a", "title": "Change a", "spec": "specs/a-change.md",
+                "lane": 1, "after": [],
+            }]}), "plan"), Usage(20, 2, 3, 4)),
+            priced(_finish(), Usage(30, 3, 4, 5)),
+            priced(_write("specs/a-change.md", spec, "revised-plan-spec"), Usage(10, 1, 2, 3)),
+            priced(_write("plan.json", json.dumps({"cards": [{
+                "id": "a", "title": "Change a", "spec": "specs/a-change.md",
+                "lane": 1, "after": [],
+            }]}), "revised-plan"), Usage(20, 2, 3, 4)),
+            priced(_finish(), Usage(30, 3, 4, 5)),
+            priced(ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                "new-file", "write_file", {"path": "new.py", "content": "value = 2\\n"},
+            )])), Usage(40, 4, 5, 6)),
+            priced(ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                "report", "write_file", {"path": report_path, "content": "Passed.\\n"},
+            )])), Usage(50, 5, 6, 7)),
+            priced(ModelResponse(Message(Role.ASSISTANT, "Implemented.")), Usage(60, 6, 7, 8)),
+            priced(ModelResponse(Message(Role.ASSISTANT, "Verdict: pass")), Usage(70, 7, 8, 9)),
+        ])
+        host = _start_host(root, provider)
+        try:
+            with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+                loop = host.run.start_loop("Change a")
+            _wait_loop_state(host, loop["id"], "awaiting_plan")
+            prior_planner_session = loop["planner_session_id"]
+            loop = host.run.revise_loop_plan(loop["id"], "Keep the same small change")
+            _wait_loop_state(host, loop["id"], "awaiting_plan")
+            if loop.get("previous_planner_session_ids") != [prior_planner_session]:
+                fail(f"revised plan did not retain its previous planner session: {loop!r}")
+            host.run.approve_loop_plan(loop["id"])
+            _wait_loop_state(host, loop["id"], "awaiting_commit")
+            status, reply = _http(host, "GET", f"/loop?id={loop['id']}")
+            if status != 200:
+                fail(f"GET /loop failed to return usage: {status}, {reply!r}")
+            expected = {
+                "planning": {
+                    "input_tokens": 120, "output_tokens": 12, "calls": 6,
+                    "cache_read_tokens": 18, "cache_write_tokens": 24,
+                },
+                "cards": {"a": {
+                    "implement": {
+                        "input_tokens": 150, "output_tokens": 15, "calls": 3,
+                        "cache_read_tokens": 18, "cache_write_tokens": 21,
+                    },
+                    "review": {
+                        "input_tokens": 70, "output_tokens": 7, "calls": 1,
+                        "cache_read_tokens": 8, "cache_write_tokens": 9,
+                    },
+                }},
+                "total": {
+                    "input_tokens": 340, "output_tokens": 34, "calls": 10,
+                    "cache_read_tokens": 44, "cache_write_tokens": 54,
+                },
+            }
+            if reply.get("loop", {}).get("usage") != expected:
+                fail(f"GET /loop returned incorrect per-stage usage: {reply!r}")
+            json_output = io.StringIO()
+            with redirect_stdout(json_output):
+                _print_loop_result(reply["loop"], True)
+            if json.loads(json_output.getvalue()).get("usage") != expected:
+                fail("headless --json loop result did not preserve per-stage usage")
+            text_output = io.StringIO()
+            with redirect_stdout(text_output):
+                _print_loop_result(reply["loop"], False)
+            if "Tokens: 340 in · 34 out · 10 calls" not in text_output.getvalue():
+                fail(f"headless loop text omitted its token total: {text_output.getvalue()!r}")
+
+            loop_store = LoopStore(root)
+            loop = loop_store.load(loop["id"])
+            previous_attempt = loop["cards"][0]["session_id"]
+            loop["state"] = "needs_attention"
+            loop["reason"] = "card a failed"
+            loop["cards"][0]["state"] = "failed"
+            loop_store.save(loop)
+            host.run.start_spec_run = lambda _info: ("resume-run", "resume-session")
+            resumed = host.run.resume_loop(loop["id"])
+            if resumed["cards"][0].get("previous_session_ids") != [previous_attempt]:
+                fail(f"resumed card did not retain its previous implementation session: {resumed!r}")
+            extra_session = SessionStore(root / "sessions", "resume-session", repo_root=root)
+            extra_session.writer_for("leader", is_root=True).append(
+                "usage", run_id="resume-run", agent_id="leader", turn_id=None,
+                data={
+                    "model": "test-model", "agent_name": "leader", "input_tokens": 13,
+                    "output_tokens": 2, "calls": 1, "cache_read_tokens": 3,
+                    "cache_write_tokens": 4,
+                },
+            )
+            extra_session.close()
+            resumed["state"] = "awaiting_commit"
+            resumed["cards"][0]["state"] = "done"
+            loop_store.save(resumed)
+            resumed_usage = host.run.loop_usage(resumed)
+            if resumed_usage["cards"]["a"]["implement"] != {
+                "input_tokens": 163, "output_tokens": 17, "calls": 4,
+                "cache_read_tokens": 21, "cache_write_tokens": 25,
+            }:
+                fail(f"resumed implementation usage omitted an attempt: {resumed_usage!r}")
+            summed = {
+                key: resumed_usage["planning"][key] + resumed_usage["cards"]["a"]["implement"][key]
+                     + resumed_usage["cards"]["a"]["review"][key]
+                for key in ("input_tokens", "output_tokens", "calls", "cache_read_tokens", "cache_write_tokens")
+            }
+            if resumed_usage["total"] != summed:
+                fail(f"loop total did not equal the sum of its stages: {resumed_usage!r}")
+        finally:
+            host.close()
 
 
 @check("loops.roadmap_goals_round_trip")

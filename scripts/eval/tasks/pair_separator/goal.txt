@@ -1,0 +1,1 @@
+Keep parse_pair()'s public signature unchanged, but make it accept either a colon or an equals sign between the two values. Preserve existing colon behaviour. Do not edit tests. Validate with `python3 -m unittest`.

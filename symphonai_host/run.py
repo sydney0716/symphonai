@@ -47,6 +47,7 @@ from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import (
     SessionError,
     SessionStore,
+    TranscriptError,
     default_memory_root,
     default_sessions_root,
     fork_run,
@@ -73,6 +74,26 @@ from symphonai_host.questions import plan_proposal_tools, question_tools
 from symphonai_host.protocol import HistoryMessage
 from symphonai_host.loops import LoopStore
 from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
+
+
+def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
+    if record.get("type") != "usage":
+        return None
+    data = record.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("model"), str):
+        return None
+    fields = (
+        "input_tokens", "output_tokens", "calls",
+        "cache_read_tokens", "cache_write_tokens",
+    )
+    values = [data.get(field) for field in fields]
+    if any(type(value) is not int or value < 0 for value in values):
+        return None
+    agent_id = record.get("agent_id")
+    if not isinstance(agent_id, str):
+        return None
+    name = data.get("agent_name")
+    return agent_id, name if isinstance(name, str) else agent_id, UsageTotals(*values)
 
 
 class RunActiveError(RuntimeError):
@@ -794,6 +815,10 @@ class HostRun:
                     }},
                     _title=f"Plan: {loop['goal'][:60]}",
                 )
+                previous_sessions = loop.setdefault("previous_planner_session_ids", [])
+                previous_session_id = loop.get("planner_session_id")
+                if isinstance(previous_session_id, str) and previous_session_id not in previous_sessions:
+                    previous_sessions.append(previous_session_id)
                 loop["planner_session_id"] = self._conversation[1].run_id
                 store.save(loop)
                 self._loop_changed(loop, change)
@@ -1456,6 +1481,9 @@ class HostRun:
                     worktree = self._sessions_root / session_id / "worktree"
                     if worktree.exists():
                         remove_worktree(self._repo_root, worktree)
+                    previous_sessions = card.setdefault("previous_session_ids", [])
+                    if session_id not in previous_sessions:
+                        previous_sessions.append(session_id)
                 card.update(state="planned", session_id=None)
                 self._loop_card_changed(loop, card)
             if str(loop.get("reason", "")).startswith("validation failed:"):
@@ -1598,6 +1626,10 @@ class HostRun:
                         worktree = self._sessions_root / session_id / "worktree"
                         if worktree.exists():
                             remove_worktree(self._repo_root, worktree)
+                    if isinstance(session_id, str):
+                        previous_sessions = card.setdefault("previous_session_ids", [])
+                        if session_id not in previous_sessions:
+                            previous_sessions.append(session_id)
                     card.update(state="planned", session_id=None)
                     changed_cards.append(card["id"])
                     changed = True
@@ -2780,6 +2812,18 @@ class HostRun:
                     except (OSError, TranscriptError):
                         continue
                     subagent_records.append(agent_records)
+                persisted_usage: dict[str, tuple[str, dict[str, UsageTotals]]] = {}
+                for transcript in (records, *subagent_records):
+                    for record in transcript:
+                        entry = _usage_record(record)
+                        if entry is None:
+                            continue
+                        agent_id, agent_name, totals = entry
+                        model = record["data"]["model"]
+                        name, by_model = persisted_usage.get(agent_id, (agent_name, {}))
+                        updated = dict(by_model)
+                        updated[model] = updated.get(model, UsageTotals()).merged(totals)
+                        persisted_usage[agent_id] = (name, updated)
                 metadata = reader.read_meta()
                 checkpoint_keys, replay_edits = self._checkpoint_replay_data(
                     records, subagent_records
@@ -2915,9 +2959,9 @@ class HostRun:
             self._goal = goal
             self._goal_session_id = run_id if goal is not None else None
             self._context_report = None
-            self._usage_by_agent = {}
+            self._usage_by_agent = dict(persisted_usage)
             self._context_by_session[run_id] = None
-            self._usage_by_session[run_id] = {}
+            self._usage_by_session[run_id] = dict(persisted_usage)
             self._plans_by_session.pop(run_id, None)
             if saved_plan is not None:
                 self._plans_by_session[run_id] = saved_plan
@@ -3389,6 +3433,83 @@ class HostRun:
             merged[model] = merged.get(model, UsageTotals()).merged(totals)
         return merged
 
+    def _session_usage(self, session_id: str) -> UsageTotals:
+        directory = self._sessions_root / session_id
+        paths = [directory / "run.jsonl", *sorted(directory.glob("agent-*.jsonl"))]
+        totals = UsageTotals()
+        for path in paths:
+            if not path.is_file():
+                continue
+            try:
+                records, _ = read_records(path)
+            except (OSError, TranscriptError):
+                continue
+            for record in records:
+                entry = _usage_record(record)
+                if entry is not None:
+                    totals = totals.merged(entry[2])
+        return totals
+
+    def loop_usage(self, loop: dict) -> dict:
+        usage: dict = {"cards": {}}
+        total = UsageTotals()
+
+        def add_stage(
+            target: dict, stage: str,
+            session_ids: str | list[str] | tuple[str, ...] | None,
+        ) -> None:
+            nonlocal total
+            if isinstance(session_ids, str):
+                session_ids = [session_ids]
+            if not isinstance(session_ids, (list, tuple)):
+                return
+            stage_usage = UsageTotals()
+            for session_id in dict.fromkeys(item for item in session_ids if isinstance(item, str)):
+                stage_usage = stage_usage.merged(self._session_usage(session_id))
+            if stage_usage.calls == 0:
+                return
+            target[stage] = {
+                "input_tokens": stage_usage.input_tokens,
+                "output_tokens": stage_usage.output_tokens,
+                "calls": stage_usage.calls,
+                "cache_read_tokens": stage_usage.cache_read_tokens,
+                "cache_write_tokens": stage_usage.cache_write_tokens,
+            }
+            total = total.merged(stage_usage)
+
+        add_stage(usage, "planning", [
+            *loop.get("previous_planner_session_ids", []), loop.get("planner_session_id"),
+        ])
+        for card in loop.get("cards", []):
+            card_stages: dict = {}
+            session_ids = [*card.get("previous_session_ids", []), card.get("session_id")]
+            session_ids = list(dict.fromkeys(item for item in session_ids if isinstance(item, str)))
+            add_stage(card_stages, "implement", session_ids)
+            review_ids = []
+            for session_id in session_ids:
+                try:
+                    source = SessionStore.open(self._sessions_root, session_id)
+                    try:
+                        review = source.read_meta().get("review")
+                    finally:
+                        source.close()
+                except (OSError, SessionError, TranscriptError):
+                    review = None
+                review_id = review.get("session_id") if isinstance(review, dict) else None
+                if isinstance(review_id, str):
+                    review_ids.append(review_id)
+            add_stage(card_stages, "review", review_ids)
+            if card_stages:
+                usage["cards"][card["id"]] = card_stages
+        usage["total"] = {
+            "input_tokens": total.input_tokens,
+            "output_tokens": total.output_tokens,
+            "calls": total.calls,
+            "cache_read_tokens": total.cache_read_tokens,
+            "cache_write_tokens": total.cache_write_tokens,
+        }
+        return usage
+
     def _record_background_usage(
         self, session_id: str, model: str, usage: UsageTotals
     ) -> None:
@@ -3404,6 +3525,21 @@ class HostRun:
             updated = dict(by_model)
             updated[model] = updated.get(model, UsageTotals()).merged(usage)
             usage_by_agent[agent_id] = (name, updated)
+            conversation[1].writer_for(agent_id, is_root=True).append(
+                "usage",
+                run_id=session_id,
+                agent_id=agent_id,
+                turn_id=None,
+                data={
+                    "model": model,
+                    "agent_name": conversation[0].agent_ref.name,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "calls": usage.calls,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                    "cache_write_tokens": usage.cache_write_tokens,
+                },
+            )
             if self._conversation is not None and self._conversation[1].run_id == session_id:
                 self._usage_by_agent = dict(usage_by_agent)
         self._publish_session(
@@ -3468,6 +3604,23 @@ class HostRun:
                 budget=leader.chat_token_budget,
             )
             session_id = self._conversation[1].run_id
+            session = self._conversation[1]
+            for model, usage in summary_usage.items():
+                session.writer_for(agent_id, is_root=True).append(
+                    "usage",
+                    run_id=session_id,
+                    agent_id=agent_id,
+                    turn_id=None,
+                    data={
+                        "model": model,
+                        "agent_name": name,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "calls": usage.calls,
+                        "cache_read_tokens": usage.cache_read_tokens,
+                        "cache_write_tokens": usage.cache_write_tokens,
+                    },
+                )
             self._context_by_session[session_id] = self._context_report
             self._usage_by_session[session_id] = dict(self._usage_by_agent)
             return result
@@ -3635,7 +3788,7 @@ class HostRun:
                 _, state = max(latest_states, key=lambda item: item[0])
                 if state is not None:
                     folded["state"] = state
-            if has_usage and report is not None:
+            if has_usage:
                 folded.update(usage_fields(by_model))
             folded_agents.append(folded)
         agents = folded_agents
@@ -3651,26 +3804,24 @@ class HostRun:
             ),
             **selection,
         }
-        if report is None:
-            return result
         all_models: dict[str, UsageTotals] = {}
         for _, by_model in usage_by_agent.values():
             all_models = self._merge_usage(all_models, by_model)
-        result.update({
-            "context": {
-                "used_tokens": report.total_tokens,
-                "budget_tokens": report.budget,
-                "remaining_tokens": report.remaining_tokens,
-                "window_tokens": context_window_for_model(
-                    leader._config.leader_provider.wire_format,
-                    leader._leader_spec.model.model,
-                ),
-                "by_source": {
-                    source.value: tokens for source, tokens in report.by_source().items()
-                },
+        result["usage"] = usage_fields(all_models)
+        if report is None:
+            return result
+        result["context"] = {
+            "used_tokens": report.total_tokens,
+            "budget_tokens": report.budget,
+            "remaining_tokens": report.remaining_tokens,
+            "window_tokens": context_window_for_model(
+                leader._config.leader_provider.wire_format,
+                leader._leader_spec.model.model,
+            ),
+            "by_source": {
+                source.value: tokens for source, tokens in report.by_source().items()
             },
-            "usage": usage_fields(all_models),
-        })
+        }
         return result
 
     def changes(self) -> dict:

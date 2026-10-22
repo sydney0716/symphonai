@@ -1,0 +1,13 @@
+diff --git a/sample.py b/sample.py
+index 0000000..0000000 100644
+--- a/sample.py
++++ b/sample.py
+@@ -1,5 +1,6 @@
+ def parse_pair(text: str) -> tuple[str, str]:
+-    left, separator, right = text.partition(":")
++    separator_char = ":" if ":" in text else "="
++    left, separator, right = text.partition(separator_char)
+     if not separator or not left or not right:
+-        raise ValueError("expected two values separated by ':'")
++        raise ValueError("expected two values separated by ':' or '='")
+     return left, right

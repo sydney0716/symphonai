@@ -1684,6 +1684,7 @@ class HostServer:
                     except (KeyError, ValueError):
                         self._not_found()
                         return
+                    loop["usage"] = host.run.loop_usage(loop)
                     self._json(HTTPStatus.OK, {"loop": loop})
                     return
                 if request_path == "/loop/card":

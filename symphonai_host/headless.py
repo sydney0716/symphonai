@@ -593,6 +593,13 @@ def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None)
             for card in loop.get("cards", [])
         ],
         "summary": loop.get("summary", {}),
+        "usage": loop.get("usage", {"cards": {}, "total": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "calls": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }}),
     }
     if json_output:
         print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -602,6 +609,11 @@ def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None)
         print(f"{card['id']} · {card['state']} · {card['commit'] or ''}")
     for validation in result["summary"].get("validation", []):
         print(f"{validation.get('command', '')} · {validation.get('exit')}")
+    usage = result["usage"].get("total", {})
+    print(
+        f"Tokens: {usage.get('input_tokens', 0):,} in · "
+        f"{usage.get('output_tokens', 0):,} out · {usage.get('calls', 0):,} calls"
+    )
     if result["reason"]:
         print(f"Reason: {result['reason']}")
 

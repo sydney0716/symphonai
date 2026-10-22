@@ -20,7 +20,7 @@ from unittest import mock
 from symphonai_api.events import RunFinished, SessionEnded
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.session import SessionStore, load_run, read_records
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
 from symphonai_api.serialization import message_to_json
 from symphonai_api.identity import new_id
 from symphonai_api.leases import WorkspaceLeases
@@ -919,6 +919,43 @@ def check_reopened_appends_to_original() -> None:
                 fail("continuation did not append to the opened transcript")
         finally:
             host.close()
+
+
+@check("host_sessions.usage_survives_reopen")
+def check_usage_survives_reopen() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        usage = Usage(41, 9, 5, 6)
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"), usage)]),
+            PermissionPolicy(root), sessions_root=root / "sessions",
+            memory_extraction_enabled=False,
+        )
+        host.start()
+        client = HostClient(HostAddress(host.port, host.token))
+        try:
+            run_id = client.send_prompt("first")["run_id"]
+            _wait_idle(client)
+            before = host.run.conversation_stats()
+            if before is None or before.get("usage", {}).get("input_tokens") != 41:
+                fail(f"finished session did not report provider usage: {before!r}")
+        finally:
+            host.close()
+
+        reopened_host = HostServer(
+            FakeModelProvider([]), PermissionPolicy(root),
+            sessions_root=root / "sessions", memory_extraction_enabled=False,
+        )
+        reopened_host.start()
+        try:
+            reopened_host.run.open_session(run_id)
+            after = reopened_host.run.conversation_stats()
+            if after is None or after.get("usage") != before.get("usage"):
+                fail(f"session usage changed after reopening in a fresh host: {before!r} -> {after!r}")
+            if after.get("agents") != before.get("agents"):
+                fail(f"per-agent usage changed after reopening: {before!r} -> {after!r}")
+        finally:
+            reopened_host.close()
 
 
 @check("host_sessions.offloaded_handle_survives")

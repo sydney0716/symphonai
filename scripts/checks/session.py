@@ -15,6 +15,7 @@ from pathlib import Path
 
 from symphonai_api.agent_loop import AgentRunResult, ApiAgent
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
+from symphonai_api.cost import UsageTotals
 from symphonai_api.events import CollectingSink, SessionEnded
 from symphonai_api.identity import SCHEMA_VERSION, new_agent_ref, new_id
 from symphonai_api.leader import Leader, LeaderConfig
@@ -28,6 +29,7 @@ from symphonai_api.models import (
     TextBlock,
     ToolCall,
     ToolResult,
+    Usage,
 )
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
@@ -201,6 +203,7 @@ def check_record_sequence() -> None:
             "message",
             "turn_started",
             "request",
+            "usage",
             "message",
             "turn_finished",
             "run_finished",
@@ -223,6 +226,38 @@ def check_record_sequence() -> None:
             parsed = datetime.fromisoformat(record["ts"].replace("Z", "+00:00"))
             if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
                 fail(f"transcript timestamp is not UTC: {record['ts']!r}")
+        store.close()
+
+
+@check("session.usage_is_recorded")
+def check_usage_is_recorded() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo, _, store = _session_paths(Path(temporary))
+        (repo / "note.txt").write_text("hello", encoding="utf-8")
+        provider = FakeModelProvider([
+            ModelResponse(
+                Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    "usage-read", "read_file", {"path": "note.txt"},
+                )]),
+                Usage(11, 2, 3, 4),
+            ),
+            ModelResponse(Message(Role.ASSISTANT, "done"), Usage(5, 7, 1, 2)),
+        ])
+        result = run_task(provider, PermissionPolicy(repo_root=repo), "read it", session=store)
+        records, _ = read_records(store.directory / "run.jsonl")
+        usage_records = [record["data"] for record in records if record["type"] == "usage"]
+        recorded: dict[str, UsageTotals] = {}
+        for data in usage_records:
+            totals = UsageTotals(
+                input_tokens=data["input_tokens"],
+                output_tokens=data["output_tokens"],
+                calls=data["calls"],
+                cache_read_tokens=data["cache_read_tokens"],
+                cache_write_tokens=data["cache_write_tokens"],
+            )
+            recorded[data["model"]] = recorded.get(data["model"], UsageTotals()).merged(totals)
+        if len(usage_records) != 2 or recorded != result.usage_by_model:
+            fail(f"usage transcript did not match two provider calls: {usage_records!r}, {result.usage_by_model!r}")
         store.close()
 
 
@@ -978,6 +1013,7 @@ def check_seed_messages_persisted() -> None:
             "message",
             "turn_started",
             "request",
+            "usage",
             "message",
             "turn_finished",
             "run_finished",

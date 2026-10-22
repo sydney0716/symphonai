@@ -215,6 +215,12 @@ review findings beyond that limit, and integration conflicts move the loop to
 `validating`. `LoopChanged` announces each card transition with `change: "card"`
 and its `card_id`.
 
+`GET /loop` includes usage totals for planning, each card's implementation and
+review, and the loop total. Each total reports input tokens, output tokens,
+calls, cache-read tokens and cache-write tokens; stages without usage are
+omitted. The headless `loop --json` result includes the same object, and its
+text output prints the input, output and call totals.
+
 Authenticated `POST /loop/commit` accepts `{"loop_id": str, "action":
 "approve" | "decline"}` only while the loop is `awaiting_commit`. Approval
 keeps the loop branch and finishes the loop; decline deletes the branch and
@@ -441,9 +447,9 @@ timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,
 `remaining_tokens`, `window_tokens`, and `by_source`), aggregate `usage`, and per-agent
 `input_tokens`, `output_tokens`, `calls`, `total_tokens`, `cache_read_tokens`,
-and `cache_write_tokens`. Immediately after
-reopening a conversation, `context`, aggregate `usage`, and per-agent usage and
-`cost` are omitted until another run is accounted in this process.
+and `cache_write_tokens`. Aggregate and per-agent token usage are rebuilt from
+session usage records on reopen; `context` remains omitted until another run is
+accounted in this process.
 `plan` is the latest leader plan (`steps` and `explanation`), or `null` when
 none has been set.
 When every used model has a configured price, usage objects also contain

@@ -597,6 +597,19 @@ class ApiAgent:
                 usage_by_model[used_model] = usage_by_model.get(
                     used_model, UsageTotals()
                 ).merged(usage)
+                append_record(
+                    "usage",
+                    turn_id=turn_ref.turn_id,
+                    data={
+                        "model": used_model,
+                        "agent_name": self._agent_ref.name,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "calls": usage.calls,
+                        "cache_read_tokens": usage.cache_read_tokens,
+                        "cache_write_tokens": usage.cache_write_tokens,
+                    },
+                )
                 # Stamp once and reuse, so the message in `conversation` and
                 # `final_response` carry the same turn identity.
                 response = replace(

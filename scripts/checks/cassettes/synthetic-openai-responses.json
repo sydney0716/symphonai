@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "provider": "openai",
+  "model": "gpt-6.1-sol",
+  "task": "Read notes.txt and report its sentence.",
+  "files": {
+    "notes.txt": "The replay note says amber-otter-73041.\n"
+  },
+  "tools": [
+    "read_file"
+  ],
+  "final_answer": "The replay note says amber-otter-73041.",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "body": {
+          "model": "gpt-6.1-sol",
+          "stream": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_lines": [
+          "event: response.completed\n",
+          "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"name\":\"read_file\",\"call_id\":\"call_opaque_replay_0123456789\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"}]}}\n",
+          "\n"
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "body": {
+          "model": "gpt-6.1-sol",
+          "stream": true,
+          "input": [
+            {
+              "type": "function_call",
+              "name": "read_file",
+              "call_id": "call_opaque_replay_0123456789",
+              "arguments": "{\"path\":\"notes.txt\"}"
+            },
+            {
+              "type": "function_call_output",
+              "call_id": "call_opaque_replay_0123456789",
+              "output": "1\tThe replay note says amber-otter-73041."
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body_lines": [
+          "event: response.completed\n",
+          "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"The replay note says amber-otter-73041.\"}]}]}}\n",
+          "\n"
+        ]
+      }
+    }
+  ]
+}

@@ -26,6 +26,7 @@ _RECORD_TYPES = frozenset(
         "run_started",
         "turn_started",
         "request",
+        "usage",
         "message",
         "tool_started",
         "tool_result",
