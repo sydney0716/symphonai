@@ -16,6 +16,7 @@ const OPEN_REPORT = "specs/report/18/18b-three-states-and-a-queue-report.md";
 
 class FakeElement {
   constructor(tagName, id = "") {
+    this.nodeType = 1;
     this.tagName = tagName.toUpperCase();
     this.id = id;
     this.children = [];
@@ -43,8 +44,21 @@ class FakeElement {
     this.children.push(...children);
   }
 
+  get childNodes() {
+    return this.children;
+  }
+
+  replaceChild(next, previous) {
+    const index = this.children.indexOf(previous);
+    if (index < 0) throw new Error("node is not a child");
+    next.parentNode = this;
+    previous.parentNode = null;
+    this.children[index] = next;
+    return previous;
+  }
+
   get textContent() {
-    return this.className === "assistant"
+    return this.className === "assistant" || ["CODE", "A"].includes(this.tagName)
       ? this._textContent + this.children.map((child) => child.textContent).join("")
       : this._textContent;
   }
@@ -189,6 +203,10 @@ export class FakeDocument {
     return new FakeElement(tagName);
   }
 
+  createTextNode(text) {
+    return { nodeType: 3, textContent: String(text), parentNode: null };
+  }
+
   addEventListener(type, listener) {
     this.listeners.set(type, listener);
   }
@@ -245,7 +263,7 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStor
 }
 
 function walk(root) {
-  return [root, ...root.children.flatMap(walk)];
+  return [root, ...(root.children ?? []).flatMap(walk)];
 }
 
 function visibleText(root) {
@@ -253,7 +271,8 @@ function visibleText(root) {
 }
 
 function textInDocumentOrder(root) {
-  return [root._textContent, ...root.children.map(textInDocumentOrder)].join("");
+  if (root.nodeType === 3) return root.textContent;
+  return [root._textContent, ...(root.children ?? []).map(textInDocumentOrder)].join("");
 }
 
 function find(root, predicate) {
@@ -333,6 +352,9 @@ export function fakeClient(
     projects = { current: project, open: [], recent: [] },
     sessions = [],
     settings = { settings: {} },
+    permissions = { shell: [], fetch: [] },
+    permissionsFailure = null,
+    removePermissionFailure = null,
     memory = { project: { entries: [] }, global: { entries: [] } },
     memoryFailure = false,
     health = { protocol_version: 1, state: "idle", run_id: null, runtime_run_id: null },
@@ -350,7 +372,8 @@ export function fakeClient(
     startLoopFailure = null,
   } = {},
 ) {
-  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], roadmap: 0, roadmapActions: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], source: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], roadmap: 0, roadmapActions: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, permissions: 0, removePermission: [], steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  let permissionData = structuredClone(permissions);
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
   let currentGoals = roadmapGoals.map((goal) => ({ ...goal }));
@@ -427,6 +450,13 @@ export function fakeClient(
         throw error;
       }
       return reply;
+    },
+    async tree() {
+      return { entries: [] };
+    },
+    async source(path) {
+      calls.source.push(path);
+      return { path, text: "source text" };
     },
     async changes() {
       calls.changes += 1;
@@ -569,7 +599,7 @@ export function fakeClient(
     async approve(id, allowed, reason, remember = false, answerText = "") {
       calls.approve.push({
         id, allowed, reason,
-        ...(remember ? { remember: true } : {}),
+        ...(remember ? { remember } : {}),
         ...(answerText ? { answer: answerText } : {}),
       });
       return { resolved: true };
@@ -596,6 +626,21 @@ export function fakeClient(
     async settings() {
       calls.settings += 1;
       return settings;
+    },
+    async permissions() {
+      calls.permissions += 1;
+      if (permissionsFailure) throw permissionsFailure;
+      return structuredClone(permissionData);
+    },
+    async removePermission(kind, value) {
+      calls.removePermission.push({ kind, value });
+      if (removePermissionFailure) throw removePermissionFailure;
+      permissionData[kind] = permissionData[kind].filter((entry) => (
+        Array.isArray(value)
+          ? JSON.stringify(entry) !== JSON.stringify(value)
+          : entry !== value
+      ));
+      return { removed: true };
     },
     async memory() {
       calls.memory += 1;
@@ -3236,6 +3281,59 @@ test("code blocks and /copy use the clipboard without changing rendered text", a
   assert.equal(latestCommandOutput(document)[0], "Copied the last reply.");
 });
 
+test("relative file paths in assistant text open Files without line suffixes", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", {
+    text: "Open `src/parser.py:42`, but keep `/etc/passwd`, `../secret.txt`, and `https://x.y/a.py` as code.",
+  }));
+  const chat = document.getElementById("chat");
+  const links = walk(chat).filter((node) => node.tagName === "A" && node.className === "chat-file-path");
+  assert.deepEqual(links.map((link) => link.textContent), ["src/parser.py:42"]);
+  await links[0].dispatch("click");
+  await Promise.resolve();
+  assert.deepEqual(client.calls.source, ["src/parser.py"]);
+  assert.equal(document.getElementById("files").hidden, false);
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("path-call", "read_file", "src/parser.py:42"));
+  await client.emit(toolFinished("path-call", "read_file"));
+  const targetLink = walk(chat).filter((node) => node.tagName === "A" && node.className === "chat-file-path").at(-1);
+  assert.ok(targetLink);
+  await targetLink.dispatch("click");
+  assert.deepEqual(client.calls.source, ["src/parser.py", "src/parser.py"]);
+  assert.deepEqual(walk(chat).filter((node) => node.tagName === "CODE" && node.parentNode?.tagName !== "A").map((node) => node.textContent), [
+    "/etc/passwd", "../secret.txt", "https://x.y/a.py",
+  ]);
+});
+
+test("conversation find highlights and steps matches, then restores transcript", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  const harness = fakeGlobal();
+  harness.global.keymap = { "mod+f": null, "alt+g": "find" };
+  await start({ global: harness.global, document, client });
+  await client.emit(eventFrame("AssistantTextDelta", { text: "Find echo in echo and ECHO." }));
+  const chat = document.getElementById("chat");
+  const before = textInDocumentOrder(chat);
+  await harness.dispatch("keydown", { key: "g", altKey: true, preventDefault() {} });
+  const bar = find(document.getElementById("chat-pane"), (node) => node.className === "transcript-find");
+  const field = bar.children.find((node) => node.className === "transcript-find-input");
+  const count = bar.children.find((node) => node.className === "transcript-find-count");
+  field.value = "echo";
+  await field.dispatch("input");
+  assert.equal(count.textContent, "1 of 3");
+  assert.equal(walk(chat).filter((node) => node.className === "transcript-find-match").length, 3);
+  await field.dispatch("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(count.textContent, "2 of 3");
+  await field.dispatch("keydown", { key: "Enter", shiftKey: true, preventDefault() {} });
+  assert.equal(count.textContent, "1 of 3");
+  await field.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(bar.hidden, true);
+  assert.equal(textInDocumentOrder(chat), before);
+  assert.equal(walk(chat).some((node) => node.tagName === "MARK"), false);
+});
+
 test("/copy reports an empty reply and clipboard failures", async () => {
   const document = new FakeDocument();
   const global = { navigator: { clipboard: { writeText: async () => { throw new Error("permission denied"); } } } };
@@ -5038,7 +5136,7 @@ test("settings navigation renders hooks, ceiling, and trust before inventory", a
 
   assert.deepEqual(sections.children.map((link) => link.textContent), [
     "General", "Models", "Mcp", "Skills", "Plugins", "Agents",
-    "Memory", "Hooks", "Ceiling", "Trust", "Inventory",
+    "Memory", "Hooks", "Ceiling", "Permissions", "Trust", "Inventory",
   ]);
   assert.equal(content.children[0].textContent, "Hooks");
   assert.deepEqual(rowCells(), [
@@ -5066,6 +5164,48 @@ test("settings navigation renders hooks, ceiling, and trust before inventory", a
   browser.dispatch("hashchange");
   assert.equal(content.children[0].textContent, "General");
   assert.deepEqual(rowCells(), [["visible.setting", "on", "user"]]);
+});
+
+test("Permissions settings lists saved grants and removes one without reloading", async () => {
+  const browser = fakeGlobal({ fragment: "#/settings/permissions" });
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    permissions: { shell: [["pnpm", "test"]], fetch: ["example.com"] },
+  });
+  await start({ global: browser.global, document, client });
+  const pane = document.getElementById("page").children[0];
+  const content = find(pane, (node) => node.className === "settings-content");
+  const sections = find(pane, (node) => node.className === "settings-sections");
+  const rows = () => walk(content).filter((node) => node.className === "permission-row");
+  assert.equal(client.calls.permissions, 1);
+  assert.deepEqual(rows().map((row) => row.children[1].textContent), ["pnpm test", "example.com"]);
+  await find(rows()[0], (node) => node.tagName === "BUTTON" && node.textContent === "Remove").dispatch("click");
+  assert.deepEqual(client.calls.removePermission, [{ kind: "shell", value: ["pnpm", "test"] }]);
+  assert.deepEqual(rows().map((row) => row.children[1].textContent), ["example.com"]);
+  assert.equal(client.calls.permissions, 1);
+
+  await find(sections, (node) => node.textContent === "Trust").dispatch("click");
+  await find(sections, (node) => node.textContent === "Permissions").dispatch("click");
+  assert.equal(client.calls.permissions, 2);
+  assert.match(visibleText(content), /example\.com/);
+});
+
+test("Permissions settings shows empty and host error states", async () => {
+  const emptyDocument = new FakeDocument();
+  await start({
+    global: fakeGlobal({ fragment: "#/settings/permissions" }).global,
+    document: emptyDocument,
+    client: fakeClient(fixtureRoadmap(), { permissions: { shell: [], fetch: [] } }),
+  });
+  assert.match(visibleText(emptyDocument.getElementById("page")), /No saved permissions\./);
+
+  const errorDocument = new FakeDocument();
+  await start({
+    global: fakeGlobal({ fragment: "#/settings/permissions" }).global,
+    document: errorDocument,
+    client: fakeClient(fixtureRoadmap(), { permissionsFailure: new Error("host unavailable") }),
+  });
+  assert.match(visibleText(errorDocument.getElementById("page")), /Could not load permissions: host unavailable/);
 });
 
 test("Memory settings loads project and global entries each time it opens", async () => {
@@ -6047,6 +6187,21 @@ test("activity targets render as code while failures and missing targets keep th
   assert.deepEqual(walk(untargetedLine).filter((node) => node.tagName === "CODE"), []);
 });
 
+test("sandbox denials use explicit activity wording", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  await start({ global: {}, document, client });
+  await client.emit(eventFrame("TurnStarted", { index: 1 }));
+  await client.emit(toolStarted("blocked-call", "run_shell", "touch outside.txt"));
+  await client.emit(eventFrame("ToolCallFailed", {
+    tool_call_id: "blocked-call",
+    error: "blocked by the sandbox: write to /tmp/outside.txt outside the project\nOperation not permitted",
+  }));
+  const line = document.getElementById("chat").children[0];
+  assert.equal(textInDocumentOrder(line), "Ran touch outside.txt (Blocked by the sandbox).");
+  assert.equal(line.attributes.get("title"), "Ran touch outside.txt (Blocked by the sandbox).");
+});
+
 test("activity lines use their first tool kind and keep the full sentence in the title", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -6496,15 +6651,52 @@ test("shell approvals show and answer the remember button only when offered", as
   assert.deepEqual(buttons.map((button) => button.textContent), [
     "Allow",
     "Allow, and don't ask again for pytest in this chat",
+    "Always allow pytest in this project",
     "Deny",
   ]);
-  await buttons[1].dispatch("click");
+  await buttons[2].dispatch("click");
   assert.deepEqual(client.calls.approve, [{
     id: "shell-approval",
     allowed: true,
     reason: "",
-    remember: true,
+    remember: "project",
   }]);
+
+  await client.emit({
+    kind: "approval_requested",
+    payload: {
+      approval_id: "shell-chat-approval",
+      operation: "run_shell",
+      target: "pnpm test",
+      details: "run tests",
+      remember: "pnpm test",
+    },
+  });
+  const chatButtons = walk(document.getElementById("approvals"))
+    .filter((node) => node.tagName === "BUTTON");
+  await chatButtons[1].dispatch("click");
+  assert.equal(client.calls.approve.at(-1).remember, true);
+
+  await client.emit({
+    kind: "approval_requested",
+    payload: {
+      approval_id: "fetch-approval",
+      operation: "web_fetch",
+      target: "https://example.com/docs",
+      details: "fetch page",
+      remember: "example.com",
+    },
+  });
+  const fetchButtons = walk(document.getElementById("approvals"))
+    .filter((node) => node.tagName === "BUTTON");
+  assert.deepEqual(fetchButtons.map((button) => button.textContent), [
+    "Allow",
+    "Allow, and don't ask again for example.com in this chat",
+    "Always allow example.com in this project",
+    "Deny",
+  ]);
+  await fetchButtons[2].dispatch("click");
+  assert.equal(client.calls.approve.at(-1).remember, "project");
 
   await client.emit({
     kind: "approval_requested",

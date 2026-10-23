@@ -101,6 +101,22 @@ test("client approval request includes the answer text", async () => {
   });
 });
 
+test("client approval request preserves the project remember scope", async () => {
+  const requests = [];
+  const boundary = createClient({
+    port: 4312,
+    token: "approval-test-token",
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return { status: 200, async json() { return { resolved: true }; } };
+    },
+  });
+  await boundary.approve("A", true, "", "project");
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    approval_id: "A", allowed: true, reason: "", remember: "project",
+  });
+});
+
 test("a repeated frame neither duplicates nor resets an answering question", async () => {
   let resolveApproval;
   const pending = new Promise((resolve) => {

@@ -71,7 +71,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -130,6 +130,26 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    permissions = _table(source, values, "permissions")
+    if permissions is not None:
+        _unknown_keys(source, "permissions", permissions, {"shell", "fetch"})
+        if "shell" in permissions:
+            shell = permissions["shell"]
+            if not isinstance(shell, list):
+                _raise(source, "permissions.shell", "must be an array of command arrays")
+            for prefix in shell:
+                entries = _strings(source, "permissions.shell", prefix)
+                if not entries or any(not entry.strip() for entry in entries):
+                    _raise(source, "permissions.shell", "prefixes must contain non-blank arguments")
+        if "fetch" in permissions:
+            for host in _strings(source, "permissions.fetch", permissions["fetch"]):
+                normalized = host.casefold().rstrip(".")
+                if (
+                    not normalized
+                    or any(char in normalized for char in "/:@?#\\")
+                    or any(char.isspace() for char in normalized)
+                ):
+                    _raise(source, "permissions.fetch", "entries must be host names without a scheme or path")
     memory = _table(source, values, "memory")
     if memory is not None:
         _unknown_keys(source, "memory", memory, {"model", "provider", "extract"})
@@ -316,6 +336,14 @@ def load_config(
             continue
         if not isinstance(values, Mapping):
             _raise(source, "config", "must be a table")
+        if "permissions" in values and scope in {Scope.PROJECT, Scope.PRIVATE}:
+            _raise(
+                source,
+                "permissions",
+                "permission grants are refused from project and private config scopes; use user config",
+            )
+        if "permissions" in values and scope is Scope.SESSION:
+            _raise(source, "permissions", "permission grants are supported only in user config")
         _validate(source, values)
         flattened = _flatten(values)
         if flattened:
@@ -615,3 +643,46 @@ class CapabilityCeiling:
                     _raise(source, "fetch_allowlist", "exceeds capability ceiling")
         if self.modes is not None and policy.mode not in self.modes:
             _raise(source, "modes", "exceeds capability ceiling")
+
+
+def permission_grants(
+    config: ResolvedConfig,
+    ceiling: CapabilityCeiling | None = None,
+) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
+    """Return user-config grants narrowed to the configured capability ceiling."""
+    raw_shell = config.get("permissions.shell", [])
+    raw_fetch = config.get("permissions.fetch", [])
+    return restrict_permission_grants(
+        tuple(tuple(prefix) for prefix in raw_shell),
+        tuple(host.casefold().rstrip(".") for host in raw_fetch),
+        ceiling,
+    )
+
+
+def restrict_permission_grants(
+    shell: tuple[tuple[str, ...], ...],
+    fetch: tuple[str, ...],
+    ceiling: CapabilityCeiling | None = None,
+) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
+    """Narrow remembered grants to the configured capability ceiling."""
+    if ceiling is not None:
+        if ceiling.shell_enabled is False:
+            shell = ()
+        elif ceiling.shell_allowlist is not None:
+            narrowed = []
+            for grant in shell:
+                for allowed in ceiling.shell_allowlist:
+                    if _is_prefix(allowed, grant):
+                        narrowed.append(grant)
+                    elif _is_prefix(grant, allowed):
+                        narrowed.append(allowed)
+            shell = tuple(dict.fromkeys(narrowed))
+
+    fetch = tuple(dict.fromkeys(host.casefold().rstrip(".") for host in fetch))
+    if ceiling is not None:
+        if ceiling.fetch_enabled is False:
+            fetch = ()
+        elif ceiling.fetch_allowlist is not None:
+            allowed_hosts = {host.casefold().rstrip(".") for host in ceiling.fetch_allowlist}
+            fetch = tuple(host for host in fetch if host in allowed_hosts)
+    return shell, fetch

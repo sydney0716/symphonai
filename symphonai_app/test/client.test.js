@@ -112,6 +112,30 @@ test("permission mode uses an authenticated JSON request", async () => {
   assert.deepEqual(JSON.parse(records[0].options.body), { mode: "plan" });
 });
 
+test("project permissions are listed and removed through their host routes", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, url.endsWith("/permissions")
+        ? { shell: [["pnpm", "test"]], fetch: ["example.com"] }
+        : { removed: true });
+    },
+  });
+  assert.deepEqual(await client.permissions(), {
+    shell: [["pnpm", "test"]], fetch: ["example.com"],
+  });
+  await client.removePermission("shell", ["pnpm", "test"]);
+  assert.equal(records[0].url, "http://127.0.0.1:4312/permissions");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[1].url, "http://127.0.0.1:4312/permissions/remove");
+  assert.deepEqual(JSON.parse(records[1].options.body), {
+    kind: "shell", value: ["pnpm", "test"],
+  });
+});
+
 test("memory listing, update, and delete use authenticated host routes", async () => {
   const records = [];
   const client = createClient({

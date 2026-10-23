@@ -9,6 +9,7 @@ A denied command returns `ToolResult(ok=False, ...)` without ever touching
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -73,7 +74,7 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
         str(Path("/private/tmp").resolve()),
         str(Path("/private/var/folders").resolve()),
     }
-    rules = ["(version 1)", "(allow default)", "(deny file-write*)"]
+    rules = ["(version 1)", "(debug deny)", "(allow default)", "(deny file-write*)"]
     rules.extend(
         f"(allow file-write* (subpath {quote_path(path)}))"
         for path in sorted(writable)
@@ -87,6 +88,56 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
             '(allow network-outbound (remote ip "localhost:*"))',
         ))
     return "\n".join(rules)
+
+
+def _mac_sandbox_denial(output: str, pid: int | None = None) -> str | None:
+    """Return a Seatbelt denial that explains a permission failure, if available."""
+    if sys.platform != "darwin":
+        return None
+    lowered_output = output.casefold()
+    if not any(
+        marker in lowered_output
+        for marker in ("operation not permitted", "eperm", "permission denied", "read-only file system")
+    ):
+        return None
+    try:
+        report = subprocess.run(
+            [
+                "/usr/bin/log", "show", "--last", "2m", "--style", "compact",
+                "--predicate",
+                'sender == "Sandbox" AND eventMessage CONTAINS[c] "deny(1)"',
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in report.stdout.splitlines():
+        match = re.search(r"\(\d+\) deny\(1\) (file-write\S*|network\S*)\s*(.*)$", line)
+        if not match:
+            continue
+        operation, resource = match.groups()
+        if operation.startswith("network"):
+            resource = resource.strip()
+            port = re.search(r":(\d+)(?:\s|$)", resource)
+            record_pid = re.search(r"\((\d+)\)\s+deny\(1\)", line)
+            same_process = pid is not None and record_pid is not None and int(record_pid[1]) == pid
+            mentions_port = port is not None and re.search(
+                rf"(?:\bport\s+|[:,]\s*){re.escape(port[1])}(?!\d)",
+                output,
+                re.IGNORECASE,
+            )
+            if same_process or mentions_port:
+                return "network access"
+            continue
+        resource = resource.strip()
+        if resource and not resource.startswith("/dev/") and resource in output:
+            return f"write to {resource} outside the project"
+    return None
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:
@@ -306,7 +357,8 @@ class RunShellTool(LocalTool):
                 ok=False,
                 error="sandbox requested but unavailable on this platform",
             )
-        if policy.shell_sandbox or (policy.mode == "allow" and sandbox_available):
+        sandboxed = policy.shell_sandbox or (policy.mode == "allow" and sandbox_available)
+        if sandboxed:
             if sys.platform == "linux":
                 command = _bwrap_command(policy, command, cwd)
             else:
@@ -388,6 +440,7 @@ class RunShellTool(LocalTool):
             self._cwd = root
             reset_message = "Shell working directory reset to the project root."
         output = stdout + (stderr or "")
+        denial = _mac_sandbox_denial(output, proc.pid) if sandboxed and proc.returncode != 0 else None
         if self._cwd != root:
             output = f"(in {self._cwd.relative_to(root)})\n" + output
         limit = policy.shell_output_limit_chars
@@ -398,9 +451,15 @@ class RunShellTool(LocalTool):
             )
         if reset_message:
             output = (output + "\n" if output else "") + reset_message
+        error = None
+        if proc.returncode != 0:
+            error = (
+                f"blocked by the sandbox: {denial}" + (f"\n{output}" if output else "")
+                if denial else f"exit code {proc.returncode}"
+            )
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=proc.returncode == 0,
             content=output,
-            error=None if proc.returncode == 0 else f"exit code {proc.returncode}",
+            error=error,
         )

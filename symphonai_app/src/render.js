@@ -102,24 +102,24 @@ function renderSteer(document, entry) {
   return prompt;
 }
 
-function renderInline(document, node) {
-  return INLINE_RENDERERS[node.type](document, node);
+function renderInline(document, node, actions) {
+  return INLINE_RENDERERS[node.type](document, node, actions);
 }
 
-function renderInlineBlock(document, tagName, children) {
+function renderInlineBlock(document, tagName, children, actions) {
   const renderer = children.length === 1 && children[0].type === "text"
     ? INLINE_BLOCK_RENDERERS.plain
     : INLINE_BLOCK_RENDERERS.rich;
-  return renderer(document, tagName, children);
+  return renderer(document, tagName, children, actions);
 }
 
 function renderPlainInlineBlock(document, tagName, children) {
   return element(document, tagName, { text: children[0].text });
 }
 
-function renderRichInlineBlock(document, tagName, children) {
+function renderRichInlineBlock(document, tagName, children, actions) {
   const block = element(document, tagName);
-  append(block, ...children.map((child) => renderInline(document, child)));
+  append(block, ...children.map((child) => renderInline(document, child, actions)));
   return block;
 }
 
@@ -134,13 +134,41 @@ function renderText(document, entry, parseMarkdown, actions) {
   return assistant;
 }
 
-function renderInlineCode(document, node) {
-  return element(document, "code", { text: node.text });
+function sourcePath(value) {
+  const valid = typeof value === "string" && !/\s|:\/\//.test(value) && !value.startsWith("/")
+    && !/^[A-Za-z]:[\\/]/.test(value);
+  const lineMatch = valid ? value.match(/^(.*):(\d+)$/) : null;
+  const path = lineMatch ? lineMatch[1] : value;
+  const safePath = valid && path && (!value.includes(":") || lineMatch);
+  const basename = path.split("/").at(-1);
+  return safePath && !path.split("/").some((part) => part === "..")
+    && /^[^.].*\.[^.]+$/.test(basename) ? path : null;
 }
 
-function renderInlineChildren(document, tagName, node) {
+function renderPathCode(document, value, actions) {
+  const path = sourcePath(value);
+  return path && typeof actions?.openSourceFile === "function"
+    ? (() => {
+      const link = element(document, "a", { className: "chat-file-path" });
+      link.href = "#";
+      link.setAttribute("aria-label", `Open ${path} in Files`);
+      append(link, element(document, "code", { text: value }));
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        actions.openSourceFile(path);
+      });
+      return link;
+    })()
+    : element(document, "code", { text: value });
+}
+
+function renderInlineCode(document, node, actions) {
+  return renderPathCode(document, node.text, actions);
+}
+
+function renderInlineChildren(document, tagName, node, actions) {
   const block = element(document, tagName);
-  append(block, ...node.children.map((child) => renderInline(document, child)));
+  append(block, ...node.children.map((child) => renderInline(document, child, actions)));
   return block;
 }
 
@@ -160,37 +188,37 @@ const INLINE_RENDERERS = Object.freeze({
   text: (document, node) => element(document, "span", { text: node.text }),
   break: renderLineBreak,
   code: renderInlineCode,
-  strong: (document, node) => renderInlineChildren(document, "strong", node),
-  em: (document, node) => renderInlineChildren(document, "em", node),
+  strong: (document, node, actions) => renderInlineChildren(document, "strong", node, actions),
+  em: (document, node, actions) => renderInlineChildren(document, "em", node, actions),
   link: renderLink,
 });
 
-function renderParagraph(document, block) {
-  return renderInlineBlock(document, "p", block.children);
+function renderParagraph(document, block, actions) {
+  return renderInlineBlock(document, "p", block.children, actions);
 }
 
-function renderHeading(document, block) {
-  return renderInlineBlock(document, `h${block.level}`, block.children);
+function renderHeading(document, block, actions) {
+  return renderInlineBlock(document, `h${block.level}`, block.children, actions);
 }
 
-function renderList(document, block) {
+function renderList(document, block, actions) {
   const list = element(document, block.ordered ? "ol" : "ul");
   block.ordered && list.setAttribute("start", String(block.start));
   append(list, ...block.items.map((item) => {
-    const row = renderInlineBlock(document, "li", item.children);
-    append(row, ...item.blocks.map((nested) => renderBlock(document, nested)));
+    const row = renderInlineBlock(document, "li", item.children, actions);
+    append(row, ...item.blocks.map((nested) => renderBlock(document, nested, actions)));
     return row;
   }));
   return list;
 }
 
-function renderTableCell(document, tagName, children, alignment) {
-  const cell = renderInlineBlock(document, tagName, children);
+function renderTableCell(document, tagName, children, alignment, actions) {
+  const cell = renderInlineBlock(document, tagName, children, actions);
   alignment && cell.setAttribute("style", `text-align: ${alignment};`);
   return cell;
 }
 
-function renderTable(document, block) {
+function renderTable(document, block, actions) {
   const header = element(document, "thead");
   const headerRow = element(document, "tr");
   append(headerRow, ...block.header.map((cell, index) => renderTableCell(
@@ -198,6 +226,7 @@ function renderTable(document, block) {
     "th",
     cell,
     block.align[index],
+    actions,
   )));
   append(header, headerRow);
 
@@ -209,6 +238,7 @@ function renderTable(document, block) {
       "td",
       cell,
       block.align[index],
+      actions,
     )));
     return tableRow;
   }));
@@ -224,8 +254,16 @@ function renderRule(document) {
 
 function renderCodeBlock(document, block, actions) {
   const pre = element(document, "pre");
-  const code = element(document, "code", { text: block.text });
+  const code = element(document, "code");
   code.setAttribute("data-language", block.language ?? "");
+  const tokens = actions?.highlight?.(block.language, block.text)
+    ?? [{ kind: "plain", text: block.text }];
+  append(code, ...tokens.map((token) => token.kind === "plain"
+    ? document.createTextNode(token.text)
+    : element(document, "span", {
+      className: `syntax-${token.kind}`,
+      text: token.text,
+    })));
   const copy = element(document, "button", { className: "code-copy" });
   copy.type = "button";
   copy.setAttribute("aria-label", "Copy code");
@@ -242,8 +280,8 @@ function renderCodeBlock(document, block, actions) {
   return append(pre, code, copy);
 }
 
-function renderQuote(document, block) {
-  return renderInlineBlock(document, "blockquote", block.children);
+function renderQuote(document, block, actions) {
+  return renderInlineBlock(document, "blockquote", block.children, actions);
 }
 
 const BLOCK_RENDERERS = Object.freeze({
@@ -260,8 +298,8 @@ function renderBlock(document, block, actions) {
   return BLOCK_RENDERERS[block.type](document, block, actions);
 }
 
-export function renderMarkdownBlocks(document, value, parseMarkdown) {
-  return parseMarkdown(value).map((block) => renderBlock(document, block));
+export function renderMarkdownBlocks(document, value, parseMarkdown, actions) {
+  return parseMarkdown(value).map((block) => renderBlock(document, block, actions));
 }
 
 export function renderDiff(document, value) {
@@ -302,12 +340,12 @@ function renderGoal(document, entry) {
   return command;
 }
 
-function renderPlan(document, entry, parseMarkdown) {
+function renderPlan(document, entry, parseMarkdown, actions) {
   const plan = element(document, "section", { className: "plan-entry" });
   append(plan, ...(entry.explanation ? [
     append(
       element(document, "div", { className: "plan-explanation" }),
-      ...parseMarkdown(entry.explanation).map((block) => renderBlock(document, block)),
+      ...parseMarkdown(entry.explanation).map((block) => renderBlock(document, block, actions)),
     ),
   ] : []));
   const list = element(document, "ol", { className: "plan-steps" });
@@ -336,11 +374,11 @@ function renderUserQuestion(document, entry) {
   return question;
 }
 
-function renderUserPlan(document, entry, parseMarkdown) {
+function renderUserPlan(document, entry, parseMarkdown, actions) {
   const plan = element(document, "section", { className: "user-plan" });
   append(
     plan,
-    ...parseMarkdown(entry.plan).map((block) => renderBlock(document, block)),
+    ...parseMarkdown(entry.plan).map((block) => renderBlock(document, block, actions)),
     ...(entry.outcome ? [element(document, "p", { className: "user-plan-outcome", text: entry.outcome })] : []),
   );
   return plan;
@@ -374,9 +412,13 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
       const separator = index === 0 ? "" : index === calls.length - 1
         ? calls.length === 2 ? " and " : ", and "
         : ", ";
-      const failure = call.status === "failed"
-        ? ` (failed${call.error ? `: ${call.error}` : ""})`
-        : "";
+      const sandboxBlocked = call.name === "run_shell"
+        && call.error?.startsWith("blocked by the sandbox:");
+      const failure = sandboxBlocked
+        ? " (Blocked by the sandbox)"
+        : call.status === "failed"
+          ? ` (failed${call.error ? `: ${call.error}` : ""})`
+          : "";
       const memoryTarget = call.target !== null && ["remember", "forget"].includes(call.name);
       const targetText = call.target === null
         ? ""
@@ -387,7 +429,7 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
         element(document, "span", { text: label }),
         ...(call.target === null ? [] : [
           element(document, "span", { text: memoryTarget ? ` "${call.target}"` : " " }),
-          ...(memoryTarget ? [] : [element(document, "code", { text: call.target })]),
+          ...(memoryTarget ? [] : [renderPathCode(document, call.target, actions)]),
         ]),
         ...(failure ? [element(document, "span", { text: failure })] : []),
       ];

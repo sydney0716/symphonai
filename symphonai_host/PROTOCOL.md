@@ -98,12 +98,13 @@ Requests are validated separately from frame decoding so a transport only needs
 to pass a `kind` and object payload to the host. Required fields must have the
 listed type; `reason` is optional and defaults to `""`.
 An approval request's optional `remember` field must be a boolean and defaults
-to `false`; optional `answer` must be a string and defaults to `""`.
+to `false`; optional `answer` must be a string and defaults to `""`. The HTTP
+`POST /approval` endpoint additionally accepts `remember: "project"`.
 
 | Request kind | Payload |
 | --- | --- |
 | `prompt` | `prompt: str`, `attachments?: [{data: str, filename?: str}]` |
-| `approval` | `approval_id: str`, `allowed: bool`, `reason: str`, `remember: bool` (optional), `answer: str` (optional) |
+| `approval` | `approval_id: str`, `allowed: bool`, `reason: str`, `remember: bool` (optional; HTTP also accepts `"project"`), `answer: str` (optional) |
 | `stop` | `reason: str` |
 
 Unknown request kinds and malformed fields are protocol errors. This document
@@ -151,10 +152,11 @@ An `approval_requested` frame carries `approval_id`, `operation`, `target`,
 `kind` is `approval`, `question`, or `plan`; `options` is empty for an approval and has
 the offered choices for a question or plan. A question uses `operation: "ask_user"`,
 with its prompt in `target`. The `tool_call_id` is `""` when the
-approval belongs to no tool call. `remember` is the shell command prefix the
-client may grant for the current chat, or `""` when no grant applies. A client
-answers with the `approval` request above; `remember: true` grants that prefix
-for its conversation. An approval id is single-use; unknown or expired replies are rejected. After any
+approval belongs to no tool call. `remember` is the shell command prefix or
+fetch host the client may grant for the current chat, or `""` when no grant
+applies. A client answers with the `approval` request above; `remember: true`
+grants it for the current conversation, while HTTP `remember: "project"` stores
+it in the project's private config. An approval id is single-use; unknown or expired replies are rejected. After any
 `error` frame carrying `dropped`, a client re-reads `GET /approvals`, because a
 dropped frame may have been a question.
 For `kind: "question"`, an allowed reply includes non-blank `answer`; a denied

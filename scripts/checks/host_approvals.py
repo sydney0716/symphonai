@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
+import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import fields
 from pathlib import Path
+import unittest.mock as mock
 
 from symphonai_api.permissions import ApprovalOutcome, DenialReason, ToolApprovalRequest
 from symphonai_host.approvals import ApprovalBroker, PendingApproval
 from symphonai_api.models import Message, ModelResponse, Role
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.extensions import load_extensions
 from symphonai_host.server import HostServer
+from symphonai_host.run import HostRun
 from symphonai_host.broker import EventBroker
 from symphonai_api.events import RunStarted
 from symphonai_host.protocol import ApprovalRequested, decode_frame
-from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream
+from scripts.checks.host_server import _await_sse, _headers, _request, _subscribed_stream, _wait_until
 from scripts.checks.harness import check, fail
 
 
@@ -506,6 +512,243 @@ def _host(*, broker: EventBroker | None = None, approval_timeout: float = 1) -> 
     )
     host.start()
     return host
+
+
+def _git_repo(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "seed"], cwd=root, check=True)
+
+
+def _project_remember(host: HostServer, operation: str, expected: str) -> None:
+    result = []
+    check = (
+        (lambda: host.run.policy.check_shell(["pnpm", "test", "--run"]))
+        if operation == "run_shell"
+        else (lambda: host.run.policy.check_fetch("https://Remember-This-Host.Example./guide"))
+    )
+    connection, response = _subscribed_stream(host)
+    thread = threading.Thread(target=lambda: result.append(check()))
+    thread.start()
+    try:
+        frame = _await_sse(
+            connection, response,
+            lambda candidate: isinstance(candidate, tuple) and candidate[0] == "approval_requested",
+            what=f"{operation} approval",
+        )
+        if frame[1].get("remember") != expected:
+            fail(f"{operation} approval offered the wrong remembered value: {frame[1]!r}")
+        connection_out, reply = _request(
+            host, "POST", "/approval",
+            body={"approval_id": frame[1]["approval_id"], "allowed": True, "remember": "project"},
+            headers=_headers(host),
+        )
+        body = reply.read()
+        connection_out.close()
+        if reply.status != 200:
+            fail(f"project remember was refused: {reply.status}, {body!r}")
+        thread.join(1)
+        if thread.is_alive() or not result or not result[0].allowed:
+            fail(f"project remembered approval did not resume: {result!r}")
+    finally:
+        if thread.is_alive():
+            pending = host.run.pending_approvals()
+            if pending:
+                host.resolve_approval(pending[0].approval_id, allowed=False, reason="test cleanup")
+            thread.join(1)
+        connection.close()
+
+
+@check("host_approvals.always_allow_persists")
+def always_allow_persists() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, home = base / "project", base / "home"
+        _git_repo(root)
+        extensions = load_extensions(repo_root=root, home=home)
+        host = HostServer(
+            FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
+            PermissionPolicy(repo_root=root, shell_enabled=True),
+            extensions=extensions, home=home, keepalive_seconds=0.05,
+        )
+        host.start()
+        try:
+            _project_remember(host, "run_shell", "pnpm test")
+            _project_remember(host, "web_fetch", "remember-this-host.example")
+            project_key = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+            grants_path = home / ".symphonai" / "permissions" / f"{project_key}.json"
+            saved = json.loads(grants_path.read_text(encoding="utf-8"))
+            if saved != {
+                "schema_version": 1,
+                "shell": [["pnpm", "test"]],
+                "fetch": ["remember-this-host.example"],
+            }:
+                fail(f"project remember wrote the wrong grant file: {saved!r}")
+            if grants_path.stat().st_mode & 0o777 != 0o600:
+                fail(f"project permission grant file was not private: {grants_path.stat().st_mode:o}")
+            host.run.end_conversation()
+            run_id = host.run.start("A new conversation")
+            _wait_until(
+                lambda: run_id not in host.run._active_by_session,
+                "new conversation did not finish",
+            )
+            if not host.run.policy.check_shell(["pnpm", "test", "--run"]).allowed:
+                fail("project shell grant did not reach a new conversation")
+            if not host.run.policy.check_fetch("https://REMEMBER-THIS-HOST.EXAMPLE./new").allowed:
+                fail("project fetch grant did not reach a new conversation")
+        finally:
+            host.close()
+
+        fresh_extensions = load_extensions(repo_root=root, home=home)
+        fresh = HostRun(
+            FakeModelProvider(), PermissionPolicy(repo_root=root, shell_enabled=True),
+            EventBroker(), extensions=fresh_extensions,
+            project_grants_root=home / ".symphonai" / "permissions",
+        )
+        try:
+            if not fresh.policy.check_shell(["pnpm", "test", "--run"]).allowed:
+                fail("project shell grant did not reach a new HostRun")
+            if not fresh.policy.check_fetch("https://remember-this-host.example/next").allowed:
+                fail("project fetch grant did not reach a new HostRun")
+        finally:
+            fresh.close()
+
+        management = HostServer(
+            FakeModelProvider(), PermissionPolicy(repo_root=root, shell_enabled=True),
+            extensions=load_extensions(repo_root=root, home=home), home=home,
+            keepalive_seconds=0.05,
+        )
+        management.start()
+        try:
+            connection, response = _request(management, "GET", "/permissions", headers=_headers(management))
+            listed = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or listed != {
+                "shell": [["pnpm", "test"]], "fetch": ["remember-this-host.example"],
+            }:
+                fail(f"GET /permissions returned the wrong project grants: {response.status}, {listed!r}")
+            connection, response = _request(
+                management, "POST", "/permissions/remove",
+                body={"kind": "fetch", "value": "remember-this-host.example"},
+                headers=_headers(management),
+            )
+            removed = json.loads(response.read())
+            connection.close()
+            if response.status != 200 or removed != {"removed": True}:
+                fail(f"POST /permissions/remove failed: {response.status}, {removed!r}")
+        finally:
+            management.close()
+
+        other_root = base / "other-project"
+        _git_repo(other_root)
+        other = HostServer(
+            FakeModelProvider(), PermissionPolicy(repo_root=other_root, shell_enabled=True),
+            extensions=load_extensions(repo_root=other_root, home=home), home=home,
+            keepalive_seconds=0.05,
+        )
+        other.start()
+        try:
+            _project_remember(other, "run_shell", "pnpm test")
+        finally:
+            other.close()
+
+
+@check("host_approvals.always_allow_stays_private")
+def always_allow_stays_private() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, home = base / "project", base / "home"
+        _git_repo(root)
+        host = HostServer(
+            FakeModelProvider(), PermissionPolicy(repo_root=root, shell_enabled=True),
+            extensions=load_extensions(repo_root=root, home=home), home=home,
+            keepalive_seconds=0.05,
+        )
+        host.start()
+        try:
+            _project_remember(host, "run_shell", "pnpm test")
+        finally:
+            host.close()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, capture_output=True, check=True,
+        ).stdout.decode()
+        if ".symphonai/config.local.toml" in status:
+            fail(f"private permission config appeared in git status: {status!r}")
+        if status:
+            fail(f"project grant created repository changes: {status!r}")
+        if (root / ".symphonai" / "config.local.toml").exists():
+            fail("project grant was written inside the repository")
+        if not list((home / ".symphonai" / "permissions").glob("*.json")):
+            fail("project grant was not saved under the SymphonAI home")
+
+
+@check("host_approvals.project_grant_validation_and_ceiling")
+def project_grant_validation_and_ceiling() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root, home = base / "project", base / "home"
+        _git_repo(root)
+        grants_dir = home / ".symphonai" / "permissions"
+        grants_dir.mkdir(parents=True)
+        grant_key = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+        grants_path = grants_dir / f"{grant_key}.json"
+        invalid_contents = b'{"schema_version":2,"shell":[["pnpm","test"]],"fetch":[]}\n'
+        grants_path.write_bytes(invalid_contents)
+        pending = []
+        published = threading.Event()
+        host = HostRun(
+            FakeModelProvider(), PermissionPolicy(repo_root=root, shell_enabled=True),
+            EventBroker(), extensions=load_extensions(repo_root=root, home=home),
+            project_grants_root=grants_dir, approval_timeout=0.2,
+            publish_approval=lambda approval: (pending.append(approval), published.set(), True)[-1],
+        )
+        result = []
+        worker = threading.Thread(target=lambda: result.append(host.policy.check_shell(["pnpm", "test"])))
+        try:
+            with mock.patch("symphonai_host.run._LOG.error") as reported:
+                worker.start()
+                if not published.wait(2) or not pending:
+                    fail("invalid project grants bypassed the normal approval")
+                host.resolve_approval(pending[0].approval_id, allowed=True, remember="project")
+                worker.join(2)
+                if worker.is_alive() or not result or not result[0].allowed:
+                    fail(f"one-time approval did not work with invalid project grants: {result!r}")
+                if not reported.called:
+                    fail("invalid project grants were not reported")
+            if grants_path.read_bytes() != invalid_contents:
+                fail("invalid project grant file was overwritten")
+        finally:
+            host.close()
+
+        ceiling_home = base / "ceiling-home"
+        ceiling_config = ceiling_home / ".symphonai" / "config.toml"
+        ceiling_config.parent.mkdir(parents=True)
+        ceiling_config.write_text(
+            '[agents.ceiling]\nshell_allowlist = [["pnpm", "test"]]\n', encoding="utf-8",
+        )
+        ceiling_dir = ceiling_home / ".symphonai" / "permissions"
+        ceiling_dir.mkdir(parents=True)
+        ceiling_path = ceiling_dir / f"{grant_key}.json"
+        ceiling_path.write_text(
+            '{"schema_version":1,"shell":[["python3"]],"fetch":[]}\n', encoding="utf-8",
+        )
+        requests = []
+        ceiling_host = HostRun(
+            FakeModelProvider(), PermissionPolicy(repo_root=root, shell_enabled=True),
+            EventBroker(), extensions=load_extensions(repo_root=root, home=ceiling_home),
+            project_grants_root=ceiling_dir, approval_timeout=0.05,
+            publish_approval=lambda approval: (requests.append(approval), True)[-1],
+        )
+        try:
+            decision = ceiling_host.policy.check_shell(["python3"])
+            if decision.allowed or not requests:
+                fail("project grant outside the capability ceiling bypassed approval")
+        finally:
+            ceiling_host.close()
 
 
 @check("host_approvals.round_trip_over_http")

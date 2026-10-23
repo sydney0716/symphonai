@@ -43,10 +43,11 @@ from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
 from symphonai_host.broker import EventBroker, Subscription
-from symphonai_host.approvals import InvalidApprovalAnswer
+from symphonai_host.approvals import InvalidApprovalAnswer, PermissionGrantError
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
 from symphonai_host.files import repository_files, repository_tree
 from symphonai_host.protocol import (
+    ApprovalReply,
     ApprovalRequested,
     HistoryMessage,
     PROTOCOL_VERSION,
@@ -616,6 +617,7 @@ class HostServer:
             sessions_root=sessions_root,
             memory_root=memory_root,
             memory_extraction_enabled=memory_extraction_enabled,
+            project_grants_root=self._home / "permissions",
             extensions=extensions,
             mcp_tools=mcp_tools,
             price_table=price_table,
@@ -1214,7 +1216,7 @@ class HostServer:
                 request_path = request_url.path
                 if host.run is None and request_path not in (
                     "/health", "/events", "/project", "/projects", "/directories",
-                    "/settings", "/models", "/app", "/app/",
+                    "/settings", "/permissions", "/models", "/app", "/app/",
                 ) and not request_path.startswith("/app/"):
                     if not self._authorized():
                         return
@@ -1647,6 +1649,20 @@ class HostServer:
                         return
                     self._json(HTTPStatus.OK, {"pending": host.pending_approvals()})
                     return
+                if self.path == "/permissions":
+                    if not self._authorized():
+                        return
+                    try:
+                        shell, fetch = (
+                            ((), ()) if host.run is None else host.run.project_permission_grants()
+                        )
+                    except PermissionGrantError as exc:
+                        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {
+                        "shell": [list(prefix) for prefix in shell], "fetch": list(fetch),
+                    })
+                    return
                 if request_path == "/sessions":
                     if not self._authorized():
                         return
@@ -1771,7 +1787,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -1801,6 +1817,27 @@ class HostServer:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
                     self._json(HTTPStatus.OK, {"repo_root": str(runtime.root), "name": runtime.root.name})
+                    return
+                if self.path == "/permissions/remove":
+                    try:
+                        payload = self._read_object()
+                        kind, value = payload.get("kind"), payload.get("value")
+                        if set(payload) != {"kind", "value"} or kind not in {"shell", "fetch"}:
+                            raise ProtocolError("permissions/remove requires kind and value")
+                        if (
+                            (kind == "shell" and (not isinstance(value, list) or not value or not all(isinstance(arg, str) for arg in value)))
+                            or (kind == "fetch" and (not isinstance(value, str) or not value))
+                        ):
+                            raise ProtocolError("permissions/remove value must be a shell prefix or fetch host")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    try:
+                        removed = host.run.remove_project_permission_grant(kind, value)
+                    except PermissionGrantError as exc:
+                        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                        return
+                    self._json(HTTPStatus.OK, {"removed": removed})
                     return
                 if self.path == "/git/commit":
                     try:
@@ -2555,7 +2592,16 @@ class HostServer:
                     return
                 kind = self.path.removeprefix("/")
                 try:
-                    request = decode_request(kind, self._read_object())
+                    payload = self._read_object()
+                    remember_project = kind == "approval" and payload.get("remember") == "project"
+                    if remember_project:
+                        payload = {**payload, "remember": False}
+                    request = decode_request(kind, payload)
+                    if remember_project:
+                        request = ApprovalReply(
+                            request.approval_id, request.allowed, request.reason,
+                            "project", request.answer,
+                        )
                 except ProtocolError as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -2584,6 +2630,9 @@ class HostServer:
                         )
                     except InvalidApprovalAnswer as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    except PermissionGrantError as exc:
+                        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                         return
                     if not resolved:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "unknown approval id"})

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows,
-  modelRows, parseAgentText, rosterRows, serverRows, SettingsError, trustRows,
+  modelRows, parseAgentText, permissionRows, rosterRows, serverRows, SettingsError, trustRows,
 } from "../src/settings.js";
 
 test("general rows sort by key, retain scope, and render complete values", () => {
@@ -237,6 +237,20 @@ test("trust and hook rows sort host entries without changing their values", () =
   ]);
   assert.deepEqual(trustRows({ settings: {} }), []);
   assert.deepEqual(hookRows({ settings: {} }), []);
+});
+
+test("permission rows format project shell prefixes and fetch hosts", () => {
+  assert.deepEqual(permissionRows({
+    shell: [["pnpm", "test"], ["git", "status"]],
+    fetch: ["example.com", "api.example.org"],
+  }), [
+    { kind: "shell", value: ["pnpm", "test"], label: "pnpm test" },
+    { kind: "shell", value: ["git", "status"], label: "git status" },
+    { kind: "fetch", value: "example.com", label: "example.com" },
+    { kind: "fetch", value: "api.example.org", label: "api.example.org" },
+  ]);
+  assert.deepEqual(permissionRows({}), []);
+  assert.throws(() => permissionRows(null), SettingsError);
 });
 
 test("invalid replies fail while absent sections are empty", () => {

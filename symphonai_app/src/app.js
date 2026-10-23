@@ -2,17 +2,22 @@ import { createApprovals } from "./approvals.js";
 import { createAgentBoard } from "./agents.js";
 import { createClient } from "./client.js";
 import { parseMarkdown } from "./markdown.js";
+import { highlight } from "./highlight.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent } from "./protocol.js";
 import { append, element, listen, renderDiff, renderMarkdownBlocks, renderTranscript, replace } from "./render.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
-import { lookup, parseKeymap } from "./keys.js";
+import { lookup, mergeKeymap, parseKeymap } from "./keys.js";
 import { createPicker } from "./picker.js";
-import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, rosterRows, serverRows, trustRows } from "./settings.js";
+import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, permissionRows, rosterRows, serverRows, trustRows } from "./settings.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
+
+const userKeymapFile = await import("../keys.json", { with: { type: "json" } })
+  .then(({ default: keymap }) => keymap)
+  .catch(() => ({}));
 
 const STATUS_LINE_KEY = "symphonai.status-line";
 const NOTIFICATIONS_KEY = "symphonai.notifications";
@@ -349,7 +354,12 @@ export async function start({ global, document, client }) {
       }));
   };
   let skillCommands = getSkillCommands(settingsReply);
-  const keymap = parseKeymap(JSON.stringify(keymapDefaults));
+  const defaultKeymap = parseKeymap(JSON.stringify(keymapDefaults));
+  const userKeymap = global.__symphonai?.keys ?? global.keymap ?? userKeymapFile;
+  const keymap = mergeKeymap(
+    defaultKeymap,
+    parseKeymap(JSON.stringify(userKeymap)),
+  ).bindings;
   const platform = /mac/i.test(global.navigator?.platform ?? "") ? "darwin" : "other";
   const allModes = ["ask", "plan", "allow"];
   const ceilingModes = settingsReply?.settings?.ceiling?.modes;
@@ -486,6 +496,9 @@ export async function start({ global, document, client }) {
   let editingMemoryId = null;
   let memoryEditError = "";
   let confirmingMemoryDeleteId = null;
+  let permissionsReply = null;
+  let permissionsError = "";
+  let permissionsLoading = false;
 
   function settingsTable(headings, rows) {
     const table = element(document, "table", { className: "settings-table" });
@@ -648,7 +661,77 @@ export async function start({ global, document, client }) {
     }
   }
 
+  function renderPermissionsContent() {
+    const children = [element(document, "h2", { text: "Permissions" })];
+    if (permissionsLoading) {
+      children.push(element(document, "p", { text: "Loading permissions…" }));
+    } else if (permissionsReply === null) {
+      children.push(element(document, "p", { className: "permissions-error", text: permissionsError }));
+    } else {
+      const rows = permissionRows(permissionsReply);
+      if (permissionsError) {
+        children.push(element(document, "p", { className: "permissions-error", text: permissionsError }));
+      }
+      if (rows.length === 0) {
+        children.push(element(document, "p", { text: "No saved permissions." }));
+      } else {
+        for (const permission of rows) {
+          const row = element(document, "div", { className: "permission-row" });
+          const remove = element(document, "button", { text: "Remove" });
+          remove.type = "button";
+          listen(remove, "click", async () => {
+            permissionsError = "";
+            try {
+              await boundary.removePermission(permission.kind, permission.value);
+              permissionsReply = {
+                ...permissionsReply,
+                [permission.kind]: permissionsReply[permission.kind].filter((value) => (
+                  Array.isArray(permission.value)
+                    ? JSON.stringify(value) !== JSON.stringify(permission.value)
+                    : value !== permission.value
+                )),
+              };
+            } catch (error) {
+              const detail = error instanceof Error ? error.message.trim() : String(error);
+              permissionsError = detail ? `Could not remove permission: ${detail}` : "Could not remove permission.";
+            }
+            renderPermissionsContent();
+          });
+          append(
+            row,
+            element(document, "span", { text: permission.kind === "shell" ? "Command" : "Host" }),
+            element(document, "code", { text: permission.label }),
+            remove,
+          );
+          children.push(row);
+        }
+      }
+    }
+    replace(settingsContent, ...children);
+  }
+
+  async function loadPermissions() {
+    permissionsReply = null;
+    permissionsError = "";
+    permissionsLoading = true;
+    renderPermissionsContent();
+    try {
+      permissionsReply = await boundary.permissions();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message.trim() : String(error);
+      permissionsError = detail ? `Could not load permissions: ${detail}` : "Could not load permissions.";
+    }
+    permissionsLoading = false;
+    if (route?.page === "settings" && route.section === "permissions") {
+      renderPermissionsContent();
+    }
+  }
+
   function showSettings(section) {
+    if (section === "permissions") {
+      void loadPermissions();
+      return;
+    }
     if (section === "memory") {
       void loadMemory();
       return;
@@ -1371,7 +1454,7 @@ export async function start({ global, document, client }) {
     }
   }
 
-  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "memory", "hooks", "ceiling", "trust", "inventory"].map((section) => {
+  const sectionLinks = ["general", "models", "mcp", "skills", "plugins", "agents", "memory", "hooks", "ceiling", "permissions", "trust", "inventory"].map((section) => {
     const link = element(document, "a", {
       text: section[0].toUpperCase() + section.slice(1),
     });
@@ -1522,6 +1605,110 @@ export async function start({ global, document, client }) {
     }
   });
 
+  const findBar = element(document, "div", { className: "transcript-find" });
+  findBar.hidden = true;
+  const findInput = element(document, "input", { className: "transcript-find-input" });
+  findInput.type = "search";
+  findInput.setAttribute("aria-label", "Find in conversation");
+  const findCount = element(document, "span", { className: "transcript-find-count", text: "0 of 0" });
+  const findClose = element(document, "button", { text: "Close" });
+  findClose.type = "button";
+  chatRoot.before(findBar);
+  append(findBar, findInput, findCount, findClose);
+  let findReplacements = [];
+  let findMatches = [];
+  let activeFindMatch = -1;
+
+  function clearFindHighlights() {
+    for (const { parent, original, wrapper } of findReplacements) {
+      if (wrapper.parentNode === parent) parent.replaceChild(original, wrapper);
+    }
+    findReplacements = [];
+    findMatches = [];
+    activeFindMatch = -1;
+  }
+
+  function updateFindCount() {
+    findCount.textContent = findMatches.length === 0
+      ? "0 of 0"
+      : `${activeFindMatch + 1} of ${findMatches.length}`;
+  }
+
+  function highlightFindMatches() {
+    clearFindHighlights();
+    const query = findInput.value.trim();
+    if (!query) {
+      updateFindCount();
+      return;
+    }
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(escaped, "gi");
+    function visit(node) {
+      if (node.nodeType === 3 || (node.nodeType === 1 && !(node.childNodes?.length) && node._textContent)) {
+        const source = node.textContent;
+        pattern.lastIndex = 0;
+        const matches = [...source.matchAll(pattern)];
+        if (matches.length === 0 || !node.parentNode) return;
+        const parent = node.parentNode;
+        const wrapper = element(document, "span", { className: "transcript-find-text" });
+        let cursor = 0;
+        for (const match of matches) {
+          const start = match.index;
+          if (start > cursor) wrapper.append(document.createTextNode(source.slice(cursor, start)));
+          const highlight = element(document, "mark", {
+            className: "transcript-find-match",
+            text: match[0],
+          });
+          wrapper.append(highlight);
+          findMatches.push(highlight);
+          cursor = start + match[0].length;
+        }
+        if (cursor < source.length) wrapper.append(document.createTextNode(source.slice(cursor)));
+        parent.replaceChild(wrapper, node);
+        findReplacements.push({ parent, original: node, wrapper });
+        return;
+      }
+      for (const child of [...(node.childNodes ?? [])]) visit(child);
+    }
+    visit(chatRoot);
+    activeFindMatch = findMatches.length > 0 ? 0 : -1;
+    updateFindCount();
+    findMatches[0]?.scrollIntoView?.({ block: "nearest" });
+  }
+
+  function closeFind() {
+    clearFindHighlights();
+    findInput.value = "";
+    findBar.hidden = true;
+    findCount.textContent = "0 of 0";
+  }
+
+  function openFind() {
+    if (route.page !== "chat") navigate({ page: "chat" });
+    findBar.hidden = false;
+    findInput.focus();
+    findInput.setSelectionRange?.(0, findInput.value.length);
+  }
+
+  function stepFind(direction) {
+    if (findMatches.length === 0) return;
+    activeFindMatch = (activeFindMatch + direction + findMatches.length) % findMatches.length;
+    updateFindCount();
+    findMatches[activeFindMatch]?.scrollIntoView?.({ block: "nearest" });
+  }
+
+  listen(findInput, "input", highlightFindMatches);
+  listen(findInput, "keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      stepFind(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeFind();
+    }
+  });
+  listen(findClose, "click", closeFind);
+
   function showTranscript() {
     const onChatPage = route.page === "chat";
     if (onChatPage && !preserveChatScroll) {
@@ -1529,6 +1716,7 @@ export async function start({ global, document, client }) {
     }
     const actions = {
       promptText: promptCommand,
+      highlight,
       copyText: async (text) => {
         const clipboard = global.navigator?.clipboard;
         if (typeof clipboard?.writeText !== "function") {
@@ -1537,6 +1725,10 @@ export async function start({ global, document, client }) {
         await clipboard.writeText(text);
       },
       onViewChanges: () => openRailTool("Changes"),
+      openSourceFile: (path) => {
+        void openRailTool("Files");
+        void openSourceFile(path);
+      },
       onCommit: async (entry) => {
         const paths = entry.files.filter((file) => file.checked)
           .flatMap((file) => file.paths ?? [file.path]);
@@ -1614,6 +1806,7 @@ export async function start({ global, document, client }) {
         agentView ? { copyText: actions.copyText } : actions,
       );
     }
+    if (!findBar.hidden && findInput.value) highlightFindMatches();
     updateMissingKeyNotice();
     if (!onChatPage) return;
     if (preserveChatScroll) return;
@@ -2478,7 +2671,7 @@ export async function start({ global, document, client }) {
     const markdownSection = (title, source) => {
       const section = element(document, "section", { className: "loop-card-section" });
       append(section, element(document, "h4", { text: title }));
-      append(section, ...renderMarkdownBlocks(document, typeof source === "string" ? source : "", parseMarkdown));
+      append(section, ...renderMarkdownBlocks(document, typeof source === "string" ? source : "", parseMarkdown, { highlight }));
       return section;
     };
     append(details, markdownSection("Spec", cardDetail.spec));
@@ -2499,7 +2692,7 @@ export async function start({ global, document, client }) {
       className: "loop-review-verdict",
       text: review.verdict ?? "No review verdict",
     }));
-    append(reviewSection, ...renderMarkdownBlocks(document, typeof review.text === "string" ? review.text : "", parseMarkdown));
+    append(reviewSection, ...renderMarkdownBlocks(document, typeof review.text === "string" ? review.text : "", parseMarkdown, { highlight }));
     const followUps = Array.isArray(review.follow_ups) ? review.follow_ups : [];
     if (followUps.length > 0) {
       const list = element(document, "ul", { className: "loop-follow-ups" });
@@ -3254,7 +3447,7 @@ export async function start({ global, document, client }) {
         continue;
       }
       if (question.kind === "plan") {
-        append(row, ...renderMarkdownBlocks(document, question.target, parseMarkdown));
+        append(row, ...renderMarkdownBlocks(document, question.target, parseMarkdown, { highlight }));
         if (question.state === "open") {
           for (const [mode, label] of [["ask", "Approve, ask before changes"], ["allow", "Approve, allow changes"]]) {
             if (!(question.options ?? []).includes(mode)) continue;
@@ -3368,7 +3561,18 @@ export async function start({ global, document, client }) {
             },
           );
           remember.type = "button";
-          append(row, allow, remember);
+          const always = listen(
+            element(document, "button", {
+              text: `Always allow ${question.remember} in this project`,
+            }),
+            "click",
+            async () => {
+              await approvals.answer(id, true, "", "project");
+              showApprovals();
+            },
+          );
+          always.type = "button";
+          append(row, allow, remember, always);
         } else {
           append(row, allow);
         }
@@ -3475,6 +3679,17 @@ export async function start({ global, document, client }) {
   }
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
+      if (findBar.hidden && lookup(keymap, event, { platform }) === "find") {
+        event.preventDefault();
+        openFind();
+        return;
+      }
+      if (!findBar.hidden && event.key === "Escape") {
+        event.preventDefault();
+        closeFind();
+        return;
+      }
+      if (!findBar.hidden) return;
       if (agentView && event.key === "Escape") {
         event.preventDefault();
         closeAgentView();

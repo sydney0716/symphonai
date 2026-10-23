@@ -7418,6 +7418,7 @@ class _CountingExtensions:
         self.agents = {}
         self.skills = {}
         self.config = ResolvedConfig({}, {})
+        self.ceiling = None
 
     def hook_runner(self, *, cwd: Path) -> _HookProbe:
         self.calls += 1

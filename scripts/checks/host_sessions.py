@@ -1064,6 +1064,7 @@ def check_prune_startup() -> None:
                     get=lambda key, default=None: values.get(key, default),
                 ),
                 mcp_servers=(), lsp_servers=(),
+                ceiling=None,
             )
             host = mock.Mock()
             host.print_handshake.side_effect = lambda: (events.append("handshake"), print("handshake"))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import signal
@@ -24,7 +25,7 @@ from symphonai_api.agent_spec import AgentSpec
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
-from symphonai_api.config import resolve_run_budgets
+from symphonai_api.config import permission_grants, restrict_permission_grants, resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
 from symphonai_api.events import Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SubagentSpawned, fan_out
@@ -42,6 +43,7 @@ from symphonai_api.leases import WorkspaceLeases
 from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import ContentInput, DocumentBlock, ImageBlock, Message, Role, TextBlock
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.paths import symphonai_home
 from symphonai_api.providers.base import ModelProvider, tool_result_text
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import (
@@ -67,7 +69,14 @@ from symphonai_api.worktree import WorktreeDiff, WorktreeError, _linked_paths, r
 from symphonai_api.worktree import create_worktree
 from symphonai_api.web_search import HttpJsonSearchBackend, search_endpoint
 from symphonai_host.broker import EventBroker
-from symphonai_host.approvals import ApprovalBroker
+from symphonai_host.approvals import (
+    ApprovalBroker,
+    InvalidApprovalAnswer,
+    PermissionGrantError,
+    load_project_permission_grants,
+    remove_project_permission_grant,
+    save_project_permission_grant,
+)
 from symphonai_host.goal import Goal, GoalCheck, GoalChanged, goal_tools, run_check
 from symphonai_host.plan import PlanChanged, plan_tools
 from symphonai_host.questions import plan_proposal_tools, question_tools
@@ -167,6 +176,7 @@ def _checkpoint_file_bytes(checkpoints: CheckpointStore, path: str) -> bytes | N
 
 
 PERMISSION_MODES = ("ask", "plan", "allow")
+_LOG = logging.getLogger(__name__)
 _sleep_keeper_lock = threading.Lock()
 _sleep_keeper_holders: set[int] = set()
 _sleep_keeper_process: subprocess.Popen | None = None
@@ -296,6 +306,7 @@ class HostRun:
         sessions_root: Path | None = None,
         memory_root: Path | None = None,
         memory_extraction_enabled: bool | None = None,
+        project_grants_root: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
         mcp_instructions: tuple[tuple[str, str], ...] = (),
@@ -310,6 +321,36 @@ class HostRun:
         self._leases = WorkspaceLeases(policy.repo_root)
         self._base_policy = replace(policy)
         self._extensions = extensions
+        config_shell_grants, config_fetch_grants = (
+            permission_grants(extensions.config, extensions.ceiling)
+            if extensions is not None else ((), ())
+        )
+        project_root = Path(policy.repo_root).resolve()
+        grant_key = hashlib.sha256(str(project_root).encode("utf-8")).hexdigest()
+        self._project_grants_path = (
+            Path(project_grants_root) if project_grants_root is not None
+            else symphonai_home() / "permissions"
+        ) / f"{grant_key}.json"
+        try:
+            stored_shell_grants, stored_fetch_grants = load_project_permission_grants(
+                self._project_grants_path,
+            )
+        except PermissionGrantError as exc:
+            _LOG.error("Ignoring invalid project permission grants: %s", exc)
+            stored_shell_grants, stored_fetch_grants = (), ()
+        self._configured_shell_grants = config_shell_grants
+        self._configured_fetch_grants = config_fetch_grants
+        self._stored_project_shell_grants = stored_shell_grants
+        self._stored_project_fetch_grants = stored_fetch_grants
+        self._project_shell_grants, self._project_fetch_grants = restrict_permission_grants(
+            (*config_shell_grants, *stored_shell_grants),
+            (*config_fetch_grants, *stored_fetch_grants),
+            None if extensions is None else extensions.ceiling,
+        )
+        self._policy.fetch_allowlist = list(dict.fromkeys([
+            *self._policy.fetch_allowlist, *self._project_fetch_grants,
+        ]))
+        self._base_policy.fetch_allowlist = list(self._policy.fetch_allowlist)
         permitted = self.permitted_modes()
         if not permitted:
             raise ModeSelectionError("agents.ceiling.modes must permit at least one mode")
@@ -425,10 +466,19 @@ class HostRun:
         self._memory: AgentMemory | None = None
         self._memory_open_attempted = False
         self._lock = threading.RLock()
-        self.approvals = ApprovalBroker(publish_approval or (lambda _: False), timeout=approval_timeout)
         self._publish_approval_callback = publish_approval or (lambda _: False)
         self._approval_timeout = approval_timeout
+        self.approvals = self._new_approval_broker(None)
         self._policy.approval_callback = self.approvals.callback
+
+    def _new_approval_broker(self, session_id: str | None) -> ApprovalBroker:
+        return ApprovalBroker(
+            self._publish_approval_callback,
+            timeout=self._approval_timeout,
+            session_id=session_id,
+            shell_grants=self._project_shell_grants,
+            fetch_grants=self._project_fetch_grants,
+        )
 
     @property
     def policy(self) -> PermissionPolicy:
@@ -2308,7 +2358,118 @@ class HostRun:
     def resolve_approval(self, approval_id: str, **decision) -> bool:
         with self._lock:
             brokers = tuple(dict.fromkeys(self._approvals_by_session.values())) + (self.approvals,)
-        return any(broker.resolve(approval_id, **decision) for broker in brokers)
+            if decision.get("remember") == "project":
+                match = next((
+                    (broker, pending)
+                    for broker in brokers
+                    if (pending := broker.pending_grant(approval_id)) is not None
+                ), None)
+                if match is None:
+                    return False
+                broker, (approval, shell_prefixes, fetch_hosts) = match
+                if not decision.get("allowed", False):
+                    return broker.resolve(
+                        approval_id, allowed=False, reason=decision.get("reason", ""),
+                        remember=False, answer=decision.get("answer", ""),
+                    )
+                if not approval.remember:
+                    raise InvalidApprovalAnswer("this approval cannot be remembered")
+                if approval.operation == "run_shell":
+                    try:
+                        self._persist_project_grant("shell", shell_prefixes)
+                    except PermissionGrantError as exc:
+                        _LOG.error("Could not save project permission grant: %s", exc)
+                        return broker.resolve(
+                            approval_id, allowed=True, reason=decision.get("reason", ""),
+                            remember=False, answer=decision.get("answer", ""),
+                        )
+                    updated_shell, updated_fetch = restrict_permission_grants(
+                        tuple(dict.fromkeys((*self._project_shell_grants, *shell_prefixes))),
+                        self._project_fetch_grants,
+                        None if self._extensions is None else self._extensions.ceiling,
+                    )
+                    new_shell = tuple(item for item in updated_shell if item not in self._project_shell_grants)
+                    self._project_shell_grants, self._project_fetch_grants = updated_shell, updated_fetch
+                elif approval.operation == "web_fetch":
+                    try:
+                        self._persist_project_grant("fetch", fetch_hosts)
+                    except PermissionGrantError as exc:
+                        _LOG.error("Could not save project permission grant: %s", exc)
+                        return broker.resolve(
+                            approval_id, allowed=True, reason=decision.get("reason", ""),
+                            remember=False, answer=decision.get("answer", ""),
+                        )
+                    updated_shell, updated_fetch = restrict_permission_grants(
+                        self._project_shell_grants,
+                        tuple(dict.fromkeys((*self._project_fetch_grants, *fetch_hosts))),
+                        None if self._extensions is None else self._extensions.ceiling,
+                    )
+                    new_fetch = tuple(item for item in updated_fetch if item not in self._project_fetch_grants)
+                    self._project_shell_grants, self._project_fetch_grants = updated_shell, updated_fetch
+                    policies = (self._base_policy, self._policy, *self._policy_by_session.values())
+                    seen_policies: set[int] = set()
+                    for policy in policies:
+                        if id(policy) in seen_policies:
+                            continue
+                        seen_policies.add(id(policy))
+                        policy.fetch_allowlist = list(dict.fromkeys([
+                            *policy.fetch_allowlist, *new_fetch,
+                        ]))
+                else:
+                    raise InvalidApprovalAnswer("this approval cannot be remembered")
+                for active_broker in dict.fromkeys((*brokers, broker)):
+                    active_broker.add_project_grant(
+                        approval.operation,
+                        shell_prefixes=new_shell if approval.operation == "run_shell" else (),
+                        fetch_hosts=new_fetch if approval.operation == "web_fetch" else (),
+                    )
+                return broker.resolve(
+                    approval_id, allowed=True, reason=decision.get("reason", ""),
+                    remember=False, answer=decision.get("answer", ""),
+                )
+        remember = decision.get("remember", False) is True
+        return any(
+            broker.resolve(approval_id, **{**decision, "remember": remember})
+            for broker in brokers
+        )
+
+    def _persist_project_grant(self, kind: str, grant: object) -> None:
+        if not grant:
+            raise InvalidApprovalAnswer("this approval has no rememberable grant")
+        save_project_permission_grant(self._project_grants_path, kind, grant)
+        self._stored_project_shell_grants, self._stored_project_fetch_grants = (
+            load_project_permission_grants(self._project_grants_path)
+        )
+
+    def project_permission_grants(self) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
+        return load_project_permission_grants(self._project_grants_path)
+
+    def remove_project_permission_grant(self, kind: str, value: object) -> bool:
+        removed = remove_project_permission_grant(self._project_grants_path, kind, value)
+        if not removed:
+            return False
+        previous_fetch_grants = self._project_fetch_grants
+        self._stored_project_shell_grants, self._stored_project_fetch_grants = (
+            load_project_permission_grants(self._project_grants_path)
+        )
+        self._project_shell_grants, self._project_fetch_grants = restrict_permission_grants(
+            (*self._configured_shell_grants, *self._stored_project_shell_grants),
+            (*self._configured_fetch_grants, *self._stored_project_fetch_grants),
+            None if self._extensions is None else self._extensions.ceiling,
+        )
+        brokers = tuple(dict.fromkeys((*self._approvals_by_session.values(), self.approvals)))
+        for broker in brokers:
+            broker.set_project_grants(self._project_shell_grants, self._project_fetch_grants)
+        policies = []
+        for policy in (self._base_policy, self._policy, *self._policy_by_session.values()):
+            if all(policy is not existing for existing in policies):
+                policies.append(policy)
+        for policy in policies:
+            policy.fetch_allowlist = list(dict.fromkeys([
+                *(host for host in policy.fetch_allowlist if host not in previous_fetch_grants),
+                *self._project_fetch_grants,
+            ]))
+        return True
 
     def start(
         self,
@@ -2346,11 +2507,7 @@ class HostRun:
                     worktree_root = create_worktree(self._repo_root, worktree_admin, start=start_ref)
                     self._policy = self._policy.rerooted(worktree_root)
                     self._policy.mode = "allow"
-                self.approvals = ApprovalBroker(
-                    self._publish_approval_callback,
-                    timeout=self._approval_timeout,
-                    session_id=run_id,
-                )
+                self.approvals = self._new_approval_broker(run_id)
                 self._policy.approval_callback = self.approvals.callback
                 session = SessionStore(
                     self._sessions_root,
@@ -2926,11 +3083,7 @@ class HostRun:
                 )
                 self._policy = replace(self._policy)
                 self._policy.mode = self._starting_mode
-                self.approvals = ApprovalBroker(
-                    self._publish_approval_callback,
-                    timeout=self._approval_timeout,
-                    session_id=run_id,
-                )
+                self.approvals = self._new_approval_broker(run_id)
                 self._policy.approval_callback = self.approvals.callback
                 leader = self._new_leader(store)
                 messages = (

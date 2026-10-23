@@ -53,6 +53,17 @@ test("merging changes one leaf, preserves the rest, and adds new actions", async
   assert.equal(added.bindings.get("alt+n"), "open-notes");
 });
 
+test("a user keymap can rebind find", async () => {
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
+  assert.equal(defaults.get("mod+f"), "find");
+  const user = parseKeymap('{"mod+f":null,"alt+g":"find"}');
+  const { bindings, rejected } = mergeKeymap(defaults, user);
+
+  assert.deepEqual(rejected, []);
+  assert.equal(bindings.has("mod+f"), false);
+  assert.equal(lookup(bindings, { key: "g", altKey: true }, { platform: "linux" }), "find");
+});
+
 
 test("null unbinds a chord and lookup no longer finds it", async () => {
   const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);

@@ -371,6 +371,30 @@ pre {
   position: relative;
 }
 
+.syntax-keyword {
+  color: var(--ui-accent);
+}
+
+.syntax-string {
+  color: var(--ui-success);
+}
+
+.syntax-comment {
+  color: var(--ui-text-secondary);
+}
+
+.syntax-number {
+  color: var(--ui-warning);
+}
+
+code[data-language="diff"] .syntax-keyword {
+  color: var(--ui-success);
+}
+
+code[data-language="diff"] .syntax-comment {
+  color: var(--ui-danger);
+}
+
 button.code-copy {
   position: absolute;
   top: var(--space-1);
@@ -1064,6 +1088,23 @@ button.session-link {
   margin-left: var(--space-3);
 }
 
+.permission-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--ui-border);
+}
+
+.permission-row code {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.permissions-error {
+  color: var(--ui-danger);
+}
+
 .memory-group {
   margin-top: var(--space-6);
 }
@@ -1464,6 +1505,48 @@ button.session-link {
 .assistant a {
   color: var(--ui-accent);
   text-decoration: underline;
+}
+
+.chat-file-path {
+  color: var(--ui-accent);
+  text-decoration: underline;
+  text-decoration-color: var(--ui-border);
+}
+
+.transcript-find {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 var(--space-2) auto;
+  padding: var(--space-2);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--radius-popover);
+  background: var(--ui-panel);
+  box-shadow: var(--ui-shadow);
+}
+
+.transcript-find[hidden] {
+  display: none;
+}
+
+.transcript-find-input {
+  width: 14rem;
+  max-width: 45vw;
+}
+
+.transcript-find-count {
+  color: var(--ui-text-secondary);
+  white-space: nowrap;
+}
+
+.transcript-find-match {
+  background: var(--ui-warning);
+  color: var(--ui-bg);
 }
 
 @media (prefers-reduced-motion: reduce) {

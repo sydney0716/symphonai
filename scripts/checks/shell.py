@@ -170,7 +170,7 @@ def _sandbox_policy(root: Path, *, network: bool = False) -> PermissionPolicy:
         repo_root=root,
         mode="allow",
         shell_enabled=True,
-        shell_allowlist=[("touch",), (sys.executable,), ("rg",), ("/usr/bin/grep",)],
+        shell_allowlist=[("touch",), (sys.executable,), ("rg",), ("/usr/bin/grep",), ("/usr/bin/false",)],
         shell_sandbox=True,
         sandbox_network=network,
     )
@@ -614,6 +614,95 @@ def check_shell_sandbox_command_exit_is_ordinary() -> None:
         )
     if result.ok or result.error != "exit code 1" or "sandbox" in (result.error or "").casefold():
         fail(f"ordinary exit status was misclassified as a sandbox failure: {result!r}")
+
+
+@check("shell.sandbox_denial_is_named")
+def check_shell_sandbox_denial_is_named() -> None:
+    report = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=(
+            "2026-10-22 00:00:00.000 Sandbox (101) deny(1) file-write-create /dev/dtracehelper\n"
+            "2026-10-22 00:00:00.001 Sandbox (102) deny(1) file-write-create /Users/test/outside.txt\n"
+            "2026-10-22 00:00:00.002 Sandbox (103) deny(1) network-outbound remote:*:53\n"
+            "2026-10-22 00:00:00.003 Sandbox (104) deny(1) network-outbound remote:*:443\n"
+            "2026-10-22 00:00:00.004 Sandbox (999) deny(1) network-outbound\n"
+        ), stderr="",
+    )
+    with (
+        mock.patch.object(shell_module.sys, "platform", "darwin"),
+        mock.patch.object(shell_module.subprocess, "run", return_value=report),
+    ):
+        with mock.patch.object(shell_module.subprocess, "run") as log_query:
+            ordinary = shell_module._mac_sandbox_denial("exit code 1")
+            if ordinary is not None or log_query.called:
+                fail("ordinary command failure queried the macOS system log")
+        named = shell_module._mac_sandbox_denial(
+            "touch: /Users/test/outside.txt: Operation not permitted"
+        )
+    if named != "write to /Users/test/outside.txt outside the project":
+        fail(f"sandbox denial parser did not ignore device writes or name the path: {named!r}")
+        network = shell_module._mac_sandbox_denial(
+            "PermissionError: [Errno 1] Operation not permitted for remote port 53",
+            pid=999,
+        )
+        if network != "network access":
+            fail(f"sandbox network denial did not match the failed connection: {network!r}")
+        unrelated = shell_module._mac_sandbox_denial(
+            "PermissionError: [Errno 1] Operation not permitted for remote port 80",
+            pid=999,
+        )
+        if unrelated is not None:
+            fail(f"unrelated sandbox network denial was named: {unrelated!r}")
+        same_process = shell_module._mac_sandbox_denial(
+            "PermissionError: [Errno 1] Operation not permitted",
+            pid=999,
+        )
+        if same_process != "network access":
+            fail(f"sandbox denial from the launched process was not named: {same_process!r}")
+    false_policy = _sandbox_policy(Path.cwd())
+    if not false_policy.check_shell(["/usr/bin/false"]).allowed:
+        fail("sandbox check policy refused /usr/bin/false before it could run")
+    if _sandbox_skip():
+        return
+    started = time.monotonic()
+    false_result = RunShellTool().execute(
+        ToolCall(id="sandbox-false", name="run_shell", arguments={"argv": ["/usr/bin/false"]}),
+        false_policy,
+    )
+    elapsed = time.monotonic() - started
+    if false_result.ok or false_result.error != "exit code 1" or elapsed >= 0.2:
+        fail(f"ordinary false exit was misclassified or delayed ({elapsed:.3f}s): {false_result!r}")
+    with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory(dir="/private/var/tmp") as outside:
+        root = Path(directory)
+        denied_path = Path(outside) / "outside.txt"
+        result = RunShellTool().execute(
+            ToolCall(id="sandbox-denied-write", name="run_shell", arguments={"argv": ["touch", str(denied_path)]}),
+            _sandbox_policy(root),
+        )
+        if result.ok or not (result.error or "").startswith("blocked by the sandbox: write to"):
+            fail(f"sandbox write denial was not named: {result!r}")
+        if str(denied_path) not in (result.error or "") or denied_path.exists():
+            fail(f"sandbox write denial omitted or allowed the path: {result!r}")
+        through_shell = RunShellTool().execute(
+            ToolCall(id="sandbox-denied-write-shell", name="run_shell", arguments={
+                "argv": ["sh", "-c", f"touch {str(denied_path)!r}"],
+            }),
+            _sandbox_policy(root),
+        )
+        if through_shell.ok or not (through_shell.error or "").startswith(
+            f"blocked by the sandbox: write to {denied_path} outside the project"
+        ):
+            fail(f"sandbox child write denial was not named: {through_shell!r}")
+
+        code = "import socket; socket.socket().connect(('8.8.8.8', 53))"
+        network = RunShellTool().execute(
+            ToolCall(id="sandbox-denied-network", name="run_shell", arguments={
+                "argv": [sys.executable, "-c", code],
+            }),
+            _sandbox_policy(root),
+        )
+        if network.ok or not (network.error or "").startswith("blocked by the sandbox: network access"):
+            fail(f"sandbox network denial was not named: {network!r}")
 
 
 @check("config.sandbox_settings")

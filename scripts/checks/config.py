@@ -19,6 +19,7 @@ from symphonai_api.config import (
     Provenance,
     Scope,
     load_config,
+    permission_grants,
     resolve_run_budgets,
 )
 from symphonai_api.cost import ModelPrice, PriceTable
@@ -73,6 +74,48 @@ def _load_subset(scopes: tuple[Scope, ...], temporary: str):
         else:
             _write(_scope_path(scope, repo_root, home), _settings(scope.value))
     return load_config(repo_root=repo_root, home=home, session=session)
+
+
+@check("config.permission_grants_scopes")
+def permission_grants_scopes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        user_path = _scope_path(Scope.USER, repo_root, home)
+        _write(
+            user_path,
+            '[permissions]\nshell = [["pnpm", "test"], ["git", "status"]]\n'
+            'fetch = ["Docs.Python.org."]\n'
+            '[agents.ceiling]\nshell_allowlist = [["pnpm", "test"]]\n'
+            'fetch_allowlist = ["docs.python.org"]\n',
+        )
+        resolved = load_config(repo_root=repo_root, home=home)
+        shell, fetch = permission_grants(resolved, CapabilityCeiling.from_config(
+            resolved, repo_root=repo_root,
+        ))
+        if shell != (("pnpm", "test"),) or fetch != ("docs.python.org",):
+            fail(f"permission grants did not respect the capability ceiling: {shell!r}, {fetch!r}")
+        if resolved.scope_of("permissions.shell") is not Scope.USER:
+            fail(f"user permission grant lost its scope: {resolved.provenance!r}")
+
+        project_path = _scope_path(Scope.PROJECT, repo_root, home)
+        _write(project_path, '[permissions]\nshell = [["pnpm", "test"]]\n')
+        try:
+            load_config(repo_root=repo_root, home=home)
+        except ConfigError as exc:
+            if str(project_path) not in str(exc):
+                fail(f"project permission refusal did not identify the config path: {exc!r}")
+        else:
+            fail("committed project permission grants were accepted")
+        project_path.unlink()
+        private_path = _scope_path(Scope.PRIVATE, repo_root, home)
+        _write(private_path, '[permissions]\nshell = [["python3"]]\n')
+        try:
+            load_config(repo_root=repo_root, home=home)
+        except ConfigError as exc:
+            if str(private_path) not in str(exc):
+                fail(f"private permission refusal did not identify the config path: {exc!r}")
+        else:
+            fail("private permission grants were accepted")
 
 
 @check("config.scope_precedence")

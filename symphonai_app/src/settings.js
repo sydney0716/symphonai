@@ -330,6 +330,22 @@ export function trustRows(reply) {
     .sort((left, right) => left.root.localeCompare(right.root));
 }
 
+export function permissionRows(reply) {
+  if (reply === null || typeof reply !== "object" || Array.isArray(reply)) {
+    throw new SettingsError("permissions reply must be an object");
+  }
+  const shell = Array.isArray(reply.shell) ? reply.shell : [];
+  const fetch = Array.isArray(reply.fetch) ? reply.fetch : [];
+  return [
+    ...shell.filter(Array.isArray).map((value) => ({
+      kind: "shell", value, label: value.join(" "),
+    })),
+    ...fetch.filter((value) => typeof value === "string").map((value) => ({
+      kind: "fetch", value, label: value,
+    })),
+  ];
+}
+
 export function hookRows(reply) {
   return section(reply, "hooks")
     .map(({ event, command }) => ({ event, command }))

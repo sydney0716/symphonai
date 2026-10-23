@@ -284,7 +284,7 @@ export function createClient({
         approval_id: id,
         allowed,
         reason,
-        ...(remember ? { remember: true } : {}),
+        ...(remember ? { remember } : {}),
         ...(typeof answerText === "string" && answerText.length > 0 ? { answer: answerText } : {}),
       });
     },
@@ -476,6 +476,16 @@ export function createClient({
 
     settings() {
       return request("GET", "/settings");
+    },
+
+    permissions() {
+      return request("GET", "/permissions");
+    },
+
+    removePermission(kind, value) {
+      return request("POST", "/permissions/remove", { kind, value }, readReply, {
+        detailOnError: true,
+      });
     },
 
     agent(name, scope) {

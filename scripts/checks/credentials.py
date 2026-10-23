@@ -255,6 +255,7 @@ def check_startup_environment_wins() -> None:
             mcp_servers=(),
             lsp_servers=(),
             config=SimpleNamespace(values={}, get=lambda key, default=None: default),
+            ceiling=None,
         )), \
                 mock.patch.object(host_main, "McpPool") as pool_class, \
                 mock.patch.object(host_main, "HostServer") as host_class, \
