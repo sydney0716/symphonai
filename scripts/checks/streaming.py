@@ -14,6 +14,7 @@ from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.compaction import estimate_messages_tokens
 from symphonai_api.events import (
+    AssistantReasoningDelta,
     AssistantTextDelta,
     CollectingSink,
     ToolCallFailed,
@@ -44,6 +45,7 @@ from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.runner import run_task
 from symphonai_api.serialization import message_to_json
 from symphonai_api.streaming import (
+    ReasoningDelta,
     StreamAssembler,
     StreamCompleted,
     TextDelta,
@@ -398,6 +400,7 @@ def check_loop_matches_non_streaming() -> None:
 def check_deltas_emitted() -> None:
     secret_fragment = "half-written-secret-path"
     first = [
+        ReasoningDelta("streamed thought"),
         TextDelta("thinking"),
         ToolCallDelta(
             0,
@@ -410,7 +413,7 @@ def check_deltas_emitted() -> None:
     second = [TextDelta("done"), _empty_completion()]
     with workspace() as ws:
         sink = CollectingSink()
-        ApiAgent(
+        result = ApiAgent(
             FakeModelProvider(streams=[first, second]),
             {},
             ws.policy,
@@ -420,6 +423,13 @@ def check_deltas_emitted() -> None:
     deltas = sink.of_type(AssistantTextDelta)
     if [event.text for event in deltas] != ["thinking", "done"]:
         fail(f"text delta events did not match chunks: {deltas!r}")
+    reasoning_deltas = sink.of_type(AssistantReasoningDelta)
+    if (
+        [event.text for event in reasoning_deltas] != ["streamed thought"]
+        or reasoning_deltas[0].turn_id != deltas[0].turn_id
+        or result.messages[1].reasoning != "streamed thought"
+    ):
+        fail(f"reasoning did not reach its attributed turn: {reasoning_deltas!r}, {result.messages!r}")
     encoded_events = json.dumps([event.__dict__ for event in sink.events], default=str)
     if secret_fragment in encoded_events:
         fail("an event exposed partial tool arguments")
@@ -604,7 +614,7 @@ def check_anthropic_max_tokens_defaults() -> None:
             provider.create_response(ModelRequest(messages=[message], max_tokens=500))
             list(provider.create_response_stream(ModelRequest(messages=[message])))
             list(provider.create_response_stream(ModelRequest(messages=[message], max_tokens=500)))
-    if [body["max_tokens"] for body in captured] != [1024, 500, 32000, 500]:
+    if [body["max_tokens"] for body in captured] != [32000, 500, 32000, 500]:
         fail(f"Anthropic max_tokens defaults/overrides changed: {captured!r}")
     if any(body.get("cache_control") != {"type": "ephemeral"} for body in captured):
         fail(f"Anthropic non-streaming or streaming request omitted cache_control: {captured!r}")

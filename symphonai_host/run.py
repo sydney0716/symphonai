@@ -3024,6 +3024,7 @@ class HostRun:
                     self._broker.publish(ForkableHistoryMessage(
                         role=message.role.value,
                         text=message.text,
+                        reasoning=message.reasoning,
                         tool_calls=self._replay_tool_calls(message, tool_results),
                         turn_id=message.turn_id, record_id=record_id,
                         attachments=[
@@ -3129,6 +3130,7 @@ class HostRun:
             self._broker.publish(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
+                reasoning=message.reasoning,
                 tool_calls=self._replay_tool_calls(message, tool_results),
                 turn_id=message.turn_id,
                 record_id=record_id,
@@ -3175,6 +3177,7 @@ class HostRun:
                 messages.append(HistoryMessage(
                     role=message.role.value,
                     text=message.text,
+                    reasoning=message.reasoning,
                     tool_calls=self._replay_tool_calls(message, tool_results),
                     turn_id=message.turn_id,
                     attachments=[

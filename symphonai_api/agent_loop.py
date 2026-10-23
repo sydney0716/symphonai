@@ -23,6 +23,7 @@ from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.compaction import estimate_messages_tokens
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
+    AssistantReasoningDelta,
     AssistantTextDelta,
     EventSink,
     ModelFallback,
@@ -67,7 +68,7 @@ from symphonai_api.scheduler import MAX_TOOL_CONCURRENCY, partition_tool_calls
 from symphonai_api.secrets import mask_tool_result
 from symphonai_api.serialization import message_to_json
 from symphonai_api.session import TranscriptWriter
-from symphonai_api.streaming import StreamAssembler, TextDelta
+from symphonai_api.streaming import ReasoningDelta, StreamAssembler, TextDelta
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import call_target
@@ -550,6 +551,16 @@ class ApiAgent:
                                         emit(
                                             event_sink,
                                             AssistantTextDelta(
+                                                agent_id=self._agent_ref.agent_id,
+                                                run_id=run_ref.run_id,
+                                                turn_id=turn_ref.turn_id,
+                                                text=chunk.text,
+                                            ),
+                                        )
+                                    elif isinstance(chunk, ReasoningDelta):
+                                        emit(
+                                            event_sink,
+                                            AssistantReasoningDelta(
                                                 agent_id=self._agent_ref.agent_id,
                                                 run_id=run_ref.run_id,
                                                 turn_id=turn_ref.turn_id,

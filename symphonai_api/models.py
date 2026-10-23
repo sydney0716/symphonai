@@ -167,6 +167,7 @@ class Message:
     tool_result: ToolResult | None = None
     turn_id: str | None = None
     schema_version: int = SCHEMA_VERSION
+    reasoning: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "content", _normalize_content(self.content))

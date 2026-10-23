@@ -46,6 +46,7 @@ const RECORDED_EVENTS = Object.freeze({
   TurnStarted: event("TurnStarted", { index: 1 }),
   TurnFinished: event("TurnFinished", { index: 1 }),
   AssistantTextDelta: event("AssistantTextDelta", { text: "hello" }),
+  AssistantReasoningDelta: event("AssistantReasoningDelta", { text: "thinking" }),
   ModelFallback: event("ModelFallback", {
     from_model: "model-a",
     to_model: "model-b",
@@ -130,6 +131,38 @@ test("assistant deltas join only while consecutive", () => {
   assert.equal(transcript.model[0].agentId, "agent-1");
   assert.equal(transcript.model[0].runId, "run-1");
   assert.equal(transcript.model[2].text, "after tool");
+});
+
+test("reasoning appears folded before the answer live and after replay", () => {
+  const live = applyAll([
+    event("AssistantReasoningDelta", { text: "first " }),
+    event("AssistantReasoningDelta", { text: "thought" }),
+    event("AssistantTextDelta", { text: "answer" }),
+  ]);
+  assert.deepEqual(live.model.map(({ type, text }) => ({ type, text })), [
+    { type: "thought", text: "first thought" },
+    { type: "text", text: "answer" },
+  ]);
+
+  const replayed = applyAll([history("assistant", "answer", [], [], { reasoning: "saved thought" })]);
+  assert.deepEqual(replayed.model.map(({ type, text }) => ({ type, text })), [
+    { type: "thought", text: "saved thought" },
+    { type: "text", text: "answer" },
+  ]);
+  assert.deepEqual(applyAll([history("assistant", "answer")]).model.map(({ type }) => type), ["text"]);
+
+  class Node {
+    constructor(tagName) { this.tagName = tagName.toUpperCase(); this.children = []; this.open = false; }
+    append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = children; }
+    setAttribute() {}
+  }
+  const document = { createElement: (tagName) => new Node(tagName) };
+  const root = new Node("div");
+  renderTranscript(document, root, replayed.model, () => []);
+  assert.equal(root.children[0].tagName, "DETAILS");
+  assert.equal(root.children[0].open, false);
+  assert.equal(root.children[0].children[0].textContent, "Thought");
 });
 
 test("assistant text separates agents even when their run ids collide", () => {

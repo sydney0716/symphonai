@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import urllib.error
 import unittest.mock as mock
 import symphonai_api.model_table as model_table_module
 from symphonai_api.compaction import budget_for_model
@@ -37,6 +39,7 @@ from symphonai_api.providers.openai_provider import (
     _build_responses_request_body,
     _parse_response as _parse_openai_response,
 )
+from symphonai_api.streaming import ReasoningDelta, StreamAssembler
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_host.questions import question_tools
@@ -58,6 +61,27 @@ class _FakeHttpResponse:
 
     def __iter__(self):
         return iter(())
+
+
+class _FakeStreamResponse(_FakeHttpResponse):
+    def __init__(self, lines: list[bytes]) -> None:
+        self.lines = lines
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+def _sse(event: str, payload: dict) -> list[bytes]:
+    return [
+        f"event: {event}\n".encode(),
+        f"data: {json.dumps(payload)}\n".encode(),
+        b"\n",
+    ]
+
+
+def _bad_parameter(url: str, body: str) -> urllib.error.HTTPError:
+    raw = json.dumps({"error": {"message": f"Unsupported parameter: {body}"}}).encode()
+    return urllib.error.HTTPError(url, 400, "Bad Request", {}, io.BytesIO(raw))
 
 
 @check("providers.failed_tool_output_reaches_model")
@@ -152,7 +176,7 @@ def check_effort_request_bodies() -> None:
     expected = {
         "openai": "high",
         "anthropic": {"effort": "xhigh"},
-        "gemini": {"thinkingLevel": "minimal"},
+        "gemini": {"thinkingLevel": "minimal", "includeThoughts": True},
     }
     actual = {
         "openai": bodies["openai"].get("reasoning_effort"),
@@ -307,6 +331,7 @@ def check_default_effort_body_identity() -> None:
         },
         "gemini": {
             "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"thinkingConfig": {"includeThoughts": True}},
         },
     }
     if actual != expected:
@@ -837,9 +862,9 @@ def check_effort_reaches_transports() -> None:
         "compatible": captured["compatible"].get("reasoning_effort"),
     }
     expected = {
-        "openai": {"effort": "high"},
+        "openai": {"effort": "high", "summary": "auto"},
         "anthropic": {"effort": "high"},
-        "gemini": {"thinkingLevel": "high"},
+        "gemini": {"thinkingLevel": "high", "includeThoughts": True},
         "compatible": "high",
     }
     if actual != expected:
@@ -902,7 +927,7 @@ def check_openai_responses_request_and_compatible_chat() -> None:
             "parameters": {"type": "object", "properties": {}},
             "strict": False,
         }],
-        "reasoning": {"effort": "high"},
+        "reasoning": {"effort": "high", "summary": "auto"},
     }:
         fail(f"OpenAI Responses body did not translate the request: {responses_body!r}")
     if (
@@ -950,7 +975,7 @@ def check_openai_responses_effort() -> None:
     with_effort = _build_responses_request_body(
         ModelRequest(messages=request.messages, effort="high"), "gpt-5.6-sol",
     )
-    if "reasoning" in no_effort or with_effort.get("reasoning") != {"effort": "high"}:
+    if no_effort.get("reasoning") != {"summary": "auto"} or with_effort.get("reasoning") != {"effort": "high", "summary": "auto"}:
         fail(f"Responses effort field was absent or misplaced: {no_effort!r}, {with_effort!r}")
 
 
@@ -1140,3 +1165,310 @@ def check_providers_malformed_json() -> None:
                             f"expected {malformed_provider.name} malformed HTTP 200 "
                             "response to raise ProviderError"
                         )
+
+
+@check("providers.openai_reasoning_text_reaches_the_turn")
+def check_openai_reasoning_text_reaches_the_turn() -> None:
+    reasoning = "OpenAI summary."
+    answer = "OpenAI answer."
+    completed = {"response": {"status": "completed", "output": [
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}]},
+        {"type": "message", "content": [{"type": "output_text", "text": answer}]},
+    ]}}
+    lines = (
+        _sse("response.reasoning_summary_text.delta", {"delta": reasoning})
+        + _sse("response.output_text.delta", {"delta": answer})
+        + _sse("response.completed", completed)
+    )
+    request = ModelRequest(messages=[Message(Role.USER, "hello")])
+    captured = []
+
+    def open_stream(http_request, timeout=None):  # noqa: ANN001
+        captured.append(json.loads(http_request.data.decode()))
+        return _FakeStreamResponse(lines)
+
+    with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "reasoning-check-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=open_stream,
+    ):
+        chunks = list(OpenAIProvider().create_response_stream(request))
+    assembler = StreamAssembler()
+    for chunk in chunks:
+        assembler.add(chunk)
+    response = assembler.finish()
+    if response.message.reasoning != reasoning or response.message.text != answer:
+        fail(f"OpenAI reasoning or answer did not reach the assembled turn: {response.message!r}")
+    if captured[0].get("reasoning", {}).get("summary") != "auto" or not any(
+        isinstance(chunk, ReasoningDelta) for chunk in chunks
+    ):
+        fail(f"OpenAI did not request and stream a reasoning summary: {captured!r}, {chunks!r}")
+    if _build_responses_request_body(
+        ModelRequest(messages=[Message(Role.ASSISTANT, "previous", reasoning=reasoning)]),
+        "gpt-6.1-sol",
+    ) != _build_responses_request_body(
+        ModelRequest(messages=[Message(Role.ASSISTANT, "previous")]), "gpt-6.1-sol",
+    ):
+        fail("OpenAI resent stored reasoning in the next request")
+
+    error_bodies = []
+    provider = OpenAIProvider(
+        model="gpt-check-summary-opt-out",
+        base_url="https://openai-reasoning.invalid/v1",
+        max_attempts=1,
+    )
+
+    def reject_summary(http_request, timeout=None):  # noqa: ANN001
+        body = json.loads(http_request.data.decode())
+        error_bodies.append(body)
+        if len(error_bodies) == 1:
+            raise _bad_parameter(http_request.full_url, "reasoning.summary")
+        return _FakeHttpResponse(json.dumps({"output": [{
+            "type": "message", "content": [{"type": "output_text", "text": "ok"}],
+        }]}).encode())
+
+    with mock.patch.dict(os.environ, {API_KEY_ENV_VAR: "reasoning-check-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=reject_summary,
+    ):
+        provider.create_response(request)
+        provider.create_response(request)
+    if len(error_bodies) != 3 or "summary" not in error_bodies[0].get("reasoning", {}) or any(
+        "summary" in body.get("reasoning", {}) for body in error_bodies[1:]
+    ):
+        fail(f"OpenAI did not disable rejected summaries for later calls: {error_bodies!r}")
+
+
+@check("providers.gemini_reasoning_text_reaches_the_turn")
+def check_gemini_reasoning_text_reaches_the_turn() -> None:
+    reasoning = "Gemini thought summary."
+    answer = "Gemini answer."
+    request = ModelRequest(messages=[Message(Role.USER, "hello")])
+    payload = {"candidates": [{"content": {"parts": [
+        {"text": reasoning, "thought": True}, {"text": answer},
+    ]}}]}
+    captured = []
+
+    def open_stream(http_request, timeout=None):  # noqa: ANN001
+        captured.append(json.loads(http_request.data.decode()))
+        return _FakeStreamResponse([f"data: {json.dumps(payload)}\n".encode(), b"\n"])
+
+    with mock.patch.dict(os.environ, {GEMINI_API_KEY_ENV_VAR: "reasoning-check-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=open_stream,
+    ):
+        chunks = list(GeminiProvider().create_response_stream(request))
+    assembler = StreamAssembler()
+    for chunk in chunks:
+        assembler.add(chunk)
+    response = assembler.finish()
+    config = captured[0].get("generationConfig", {}).get("thinkingConfig", {})
+    if response.message.reasoning != reasoning or response.message.text != answer:
+        fail(f"Gemini reasoning or answer did not reach the assembled turn: {response.message!r}")
+    if config.get("includeThoughts") is not True or not any(
+        isinstance(chunk, ReasoningDelta) for chunk in chunks
+    ):
+        fail(f"Gemini did not request and stream thought summaries: {config!r}, {chunks!r}")
+    if _build_gemini_body(
+        ModelRequest(messages=[Message(Role.ASSISTANT, "previous", reasoning=reasoning)]),
+        "gemini-3.5-flash",
+    ) != _build_gemini_body(
+        ModelRequest(messages=[Message(Role.ASSISTANT, "previous")]), "gemini-3.5-flash",
+    ):
+        fail("Gemini resent stored reasoning in the next request")
+
+    error_bodies = []
+    provider = GeminiProvider(
+        model="gemini-check-opt-out",
+        base_url="https://gemini-reasoning.invalid/v1beta",
+        max_attempts=1,
+    )
+
+    def reject_thoughts(http_request, timeout=None):  # noqa: ANN001
+        body = json.loads(http_request.data.decode())
+        error_bodies.append(body)
+        if len(error_bodies) == 1:
+            raise _bad_parameter(http_request.full_url, "includeThoughts")
+        return _FakeHttpResponse(json.dumps({"candidates": [{"content": {
+            "parts": [{"text": "ok"}],
+        }}]}).encode())
+
+    with mock.patch.dict(os.environ, {GEMINI_API_KEY_ENV_VAR: "reasoning-check-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=reject_thoughts,
+    ):
+        provider.create_response(request)
+        provider.create_response(request)
+    if len(error_bodies) != 3 or error_bodies[0].get("generationConfig", {}).get(
+        "thinkingConfig", {}
+    ).get("includeThoughts") is not True or any(
+        body.get("generationConfig", {}).get("thinkingConfig", {}).get("includeThoughts") is not None
+        for body in error_bodies[1:]
+    ):
+        fail(f"Gemini did not disable rejected thought summaries for later calls: {error_bodies!r}")
+
+
+@check("providers.anthropic_reasoning_text_reaches_the_turn")
+def check_anthropic_reasoning_text_reaches_the_turn() -> None:
+    reasoning = "Anthropic thought."
+    answer = "Anthropic answer."
+    events = [
+        ("message_start", {"message": {"usage": {}}}),
+        ("content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        ("content_block_delta", {"index": 0, "delta": {"type": "thinking_delta", "thinking": reasoning}}),
+        ("content_block_start", {"index": 1, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"index": 1, "delta": {"type": "text_delta", "text": answer}}),
+        ("message_stop", {}),
+    ]
+    lines = [line for name, data in events for line in (
+        f"event: {name}\n".encode(), f"data: {json.dumps(data)}\n".encode(), b"\n",
+    )]
+    request = ModelRequest(messages=[Message(Role.USER, "hello")])
+    with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "reasoning-check-key"}), mock.patch(
+        "urllib.request.urlopen", return_value=_FakeStreamResponse(lines),
+    ):
+        chunks = list(AnthropicProvider().create_response_stream(request))
+    assembler = StreamAssembler()
+    for chunk in chunks:
+        assembler.add(chunk)
+    response = assembler.finish()
+    if response.message.reasoning != reasoning or response.message.text != answer:
+        fail(f"Anthropic reasoning or answer did not reach the assembled turn: {response.message!r}")
+    if not any(isinstance(chunk, ReasoningDelta) for chunk in chunks):
+        fail("Anthropic thinking delta was not streamed")
+    if _build_anthropic_body(
+        ModelRequest(messages=[Message(Role.ASSISTANT, "previous", reasoning=reasoning)]),
+        "claude-sonnet-5", 1024,
+    ) != _build_anthropic_body(
+        ModelRequest(messages=[Message(Role.ASSISTANT, "previous")]), "claude-sonnet-5", 1024,
+    ):
+        fail("Anthropic resent stored reasoning in the next request")
+
+
+@check("providers.anthropic_output_limit")
+def check_anthropic_output_limit() -> None:
+    messages = [Message(Role.USER, "write a long answer")]
+    default_body = _build_anthropic_body(
+        ModelRequest(messages=messages), "claude-haiku-output-limit-check", 32000,
+    )
+    explicit_body = _build_anthropic_body(
+        ModelRequest(messages=messages, max_tokens=500),
+        "claude-haiku-output-limit-check",
+        32000,
+    )
+    if default_body.get("max_tokens") != 32000 or explicit_body.get("max_tokens") != 500:
+        fail(f"Anthropic default or explicit max_tokens changed: {default_body!r}, {explicit_body!r}")
+
+    model = "claude-haiku-output-limit-check"
+    provider = AnthropicProvider(
+        model=model,
+        base_url="https://anthropic-output-limit.invalid/v1",
+        max_attempts=1,
+    )
+    captured: list[dict] = []
+
+    def reject_large_output(http_request, timeout=None):  # noqa: ANN001
+        body = json.loads(http_request.data.decode())
+        captured.append(body)
+        if len(captured) == 1:
+            raw = json.dumps({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "max_tokens 32000 exceeds the model limit of 8192",
+                },
+            }).encode()
+            raise urllib.error.HTTPError(http_request.full_url, 400, "Bad Request", {}, io.BytesIO(raw))
+        return _FakeHttpResponse(b'{"content":[]}')
+
+    with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "output-limit-check-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=reject_large_output,
+    ):
+        provider.create_response(ModelRequest(messages=messages))
+        provider.create_response(ModelRequest(messages=messages))
+        provider.create_response(ModelRequest(messages=messages, model="claude-haiku-other-output-limit"))
+        provider.create_response(ModelRequest(messages=messages, max_tokens=500))
+    if [body["max_tokens"] for body in captured] != [32000, 8192, 8192, 32000, 500]:
+        fail(f"Anthropic did not retry and remember the model output limit: {captured!r}")
+    first, retry = captured[:2]
+    first.pop("max_tokens")
+    retry.pop("max_tokens")
+    if first != retry:
+        fail(f"Anthropic changed unrelated request fields while retrying: {first!r}, {retry!r}")
+
+
+@check("providers.anthropic_thinks_with_effort")
+def check_anthropic_thinks_with_effort() -> None:
+    messages = [Message(Role.USER, "think through this")]
+    model = "claude-sonnet-5-5"
+    thinking_body = _build_anthropic_body(
+        ModelRequest(messages=messages, effort="low"), model, 32000,
+    )
+    no_effort_body = _build_anthropic_body(
+        ModelRequest(messages=messages), model, 32000,
+    )
+    temperature_body = _build_anthropic_body(
+        ModelRequest(messages=messages, effort="low", temperature=0.2), model, 32000,
+    )
+    if (
+        thinking_body.get("output_config") != {"effort": "low"}
+        or thinking_body.get("thinking") != {"type": "adaptive", "display": "summarized"}
+        or "thinking" in no_effort_body
+        or "thinking" in temperature_body
+    ):
+        fail(f"Anthropic effort did not control adaptive thinking: {thinking_body!r}, {no_effort_body!r}, {temperature_body!r}")
+
+    provider = AnthropicProvider(
+        model=model,
+        base_url="https://anthropic-thinking-option.invalid/v1",
+        max_attempts=1,
+    )
+    captured: list[dict] = []
+
+    def reject_thinking(http_request, timeout=None):  # noqa: ANN001
+        body = json.loads(http_request.data.decode())
+        captured.append(body)
+        if len(captured) == 1:
+            raise _bad_parameter(http_request.full_url, "thinking")
+        return _FakeHttpResponse(b'{"content":[]}')
+
+    with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "thinking-option-check-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=reject_thinking,
+    ):
+        provider.create_response(ModelRequest(messages=messages, effort="low"))
+        provider.create_response(ModelRequest(messages=messages, effort="low"))
+    if (
+        len(captured) != 3
+        or captured[0].get("thinking") != {"type": "adaptive", "display": "summarized"}
+        or any("thinking" in body for body in captured[1:])
+    ):
+        fail(f"Anthropic did not disable rejected thinking for later calls: {captured!r}")
+    first, retry = captured[:2]
+    first.pop("thinking")
+    if first != retry:
+        fail(f"Anthropic changed unrelated request fields while retrying without thinking: {first!r}, {retry!r}")
+
+    stream_provider = AnthropicProvider(
+        model=model,
+        base_url="https://anthropic-thinking-stream-option.invalid/v1",
+        max_attempts=1,
+    )
+    stream_bodies: list[dict] = []
+
+    def reject_stream_thinking(http_request, timeout=None):  # noqa: ANN001
+        body = json.loads(http_request.data.decode())
+        stream_bodies.append(body)
+        if len(stream_bodies) == 1:
+            raise _bad_parameter(http_request.full_url, "display")
+        lines = _sse("message_start", {"message": {"usage": {}}}) + _sse("message_stop", {})
+        return _FakeStreamResponse(lines)
+
+    with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "thinking-stream-option-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=reject_stream_thinking,
+    ):
+        list(stream_provider.create_response_stream(
+            ModelRequest(messages=messages, effort="low"),
+        ))
+        list(stream_provider.create_response_stream(
+            ModelRequest(messages=messages, effort="low"),
+        ))
+    if (
+        len(stream_bodies) != 3
+        or "thinking" not in stream_bodies[0]
+        or any("thinking" in body for body in stream_bodies[1:])
+    ):
+        fail(f"Anthropic stream did not disable rejected thinking for later calls: {stream_bodies!r}")

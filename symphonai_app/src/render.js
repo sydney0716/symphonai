@@ -134,6 +134,15 @@ function renderText(document, entry, parseMarkdown, actions) {
   return assistant;
 }
 
+function renderThought(document, entry, parseMarkdown, actions) {
+  const thought = element(document, "details", { className: "thought" });
+  const summary = element(document, "summary", { text: "Thought" });
+  const content = element(document, "div", { className: "assistant thought-content" });
+  append(content, ...parseMarkdown(entry.text).map((block) => renderBlock(document, block, actions)));
+  append(thought, summary, content);
+  return thought;
+}
+
 function sourcePath(value) {
   const valid = typeof value === "string" && !/\s|:\/\//.test(value) && !value.startsWith("/")
     && !/^[A-Za-z]:[\\/]/.test(value);
@@ -658,6 +667,7 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
   prompt: renderPrompt,
   steer: renderSteer,
   text: renderText,
+  thought: renderThought,
   command: renderCommand,
   goal: renderGoal,
   plan: renderPlan,

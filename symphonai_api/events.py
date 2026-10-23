@@ -59,6 +59,11 @@ class AssistantTextDelta(Event):
 
 
 @dataclass(frozen=True)
+class AssistantReasoningDelta(Event):
+    text: str = ""
+
+
+@dataclass(frozen=True)
 class ModelFallback(Event):
     from_model: str = ""
     to_model: str = ""

@@ -45,15 +45,25 @@ def _rich_message() -> Message:
             ),
         ],
         turn_id="turn-round-trip",
+        reasoning="A readable thought summary.",
     )
 
 
 @check("serialization.message_round_trip")
 def check_message_round_trip() -> None:
     message = _rich_message()
-    restored = message_from_json(message_to_json(message))
+    encoded = message_to_json(message)
+    restored = message_from_json(encoded)
     if restored != message:
         fail(f"message round trip changed the value: {restored!r}")
+    if encoded.get("reasoning") != "A readable thought summary.":
+        fail(f"message reasoning was not serialized: {encoded!r}")
+    without_reasoning = message_to_json(Message(Role.USER, "hello"))
+    if "reasoning" in without_reasoning:
+        fail(f"message without reasoning gained a serialized field: {without_reasoning!r}")
+    legacy = message_from_json({"role": "assistant", "content": []})
+    if legacy.reasoning != "":
+        fail(f"legacy message without reasoning did not default to empty: {legacy!r}")
 
 
 @check("serialization.tool_result_round_trip")

@@ -77,6 +77,7 @@ class HistoryMessage:
     text: str
     tool_calls: list[dict[str, Any]]
     turn_id: str | None
+    reasoning: str = field(default="", kw_only=True)
     attachments: list[dict] = field(default_factory=list, kw_only=True)
     session_id: str | None = field(default=None, kw_only=True)
     checkpoint_key: str | None = field(default=None, kw_only=True)
@@ -93,6 +94,7 @@ class HistoryMessage:
             "text": self.text,
             "tool_calls": self.tool_calls,
             "turn_id": self.turn_id,
+            "reasoning": self.reasoning,
             "attachments": self.attachments,
             "session_id": self.session_id,
             "checkpoint_key": self.checkpoint_key,

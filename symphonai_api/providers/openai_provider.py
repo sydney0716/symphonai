@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -41,6 +42,7 @@ from symphonai_api.streaming import (
     StreamChunk,
     StreamCompleted,
     StreamEventError,
+    ReasoningDelta,
     TextDelta,
     ToolCallDelta,
     open_stream_with_retry,
@@ -60,6 +62,21 @@ _ROLE_TO_OPENAI = {
     Role.TOOL: "tool",
 }
 _RESPONSES_REASONING_KEY = "responses_reasoning_items"
+_REASONING_SUMMARY_DISABLED: set[tuple[str, str]] = set()
+_REASONING_SUMMARY_LOCK = threading.Lock()
+
+
+def _reasoning_summary_key(base_url: str, model: str) -> tuple[str, str]:
+    return base_url, model
+
+
+def _reasoning_summary_disabled(key: tuple[str, str]) -> bool:
+    with _REASONING_SUMMARY_LOCK:
+        return key in _REASONING_SUMMARY_DISABLED
+
+
+def _reasoning_summary_rejected(error: ProviderError) -> bool:
+    return "reasoning.summary" in str(error).casefold()
 
 
 def _openai_content(message: Message) -> list[dict[str, Any]]:
@@ -172,7 +189,9 @@ def _responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
     return translated
 
 
-def _build_responses_request_body(request: ModelRequest, model: str) -> dict[str, Any]:
+def _build_responses_request_body(
+    request: ModelRequest, model: str, *, include_reasoning_summary: bool = True,
+) -> dict[str, Any]:
     reject_system_attachments(request.messages)
     id_map = wire_tool_call_ids(request.messages)
     items: list[dict[str, Any]] = []
@@ -215,8 +234,13 @@ def _build_responses_request_body(request: ModelRequest, model: str) -> dict[str
     if request.temperature is not None:
         body["temperature"] = request.temperature
     effort = resolve_effort(1, model, request.effort)
+    reasoning = {}
     if effort is not None:
-        body["reasoning"] = {"effort": effort}
+        reasoning["effort"] = effort
+    if include_reasoning_summary:
+        reasoning["summary"] = "auto"
+    if reasoning:
+        body["reasoning"] = reasoning
     return body
 
 
@@ -287,6 +311,9 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
         error = failed_response.get("error", {}) if isinstance(failed_response, dict) else {}
     if isinstance(error, dict) or data.get("status") == "failed":
         detail = error.get("message") if isinstance(error, dict) else None
+        param = error.get("param") if isinstance(error, dict) else None
+        if isinstance(param, str) and param:
+            detail = f"{detail or 'OpenAI API response failed'} ({param})"
         raise ProviderError(redact_secret(
             str(detail or "OpenAI API response failed"),
             os.environ.get(API_KEY_ENV_VAR, "").strip(),
@@ -295,6 +322,7 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
     if not isinstance(output, list):
         raise ProviderError("OpenAI API response contained invalid output")
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     reasoning_items: list[dict[str, Any]] = []
     tool_calls: list[ToolCall] = []
     for item in output:
@@ -302,6 +330,11 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
             continue
         if item.get("type") == "reasoning":
             reasoning_items.append(item)
+            for part in item.get("summary") or []:
+                if isinstance(part, dict) and part.get("type") == "summary_text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        reasoning_parts.append(text)
         elif item.get("type") == "message":
             for part in item.get("content") or []:
                 if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
@@ -345,7 +378,12 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
         "length" if status == "incomplete" or isinstance(incomplete, dict) else "stop"
     )
     return ModelResponse(
-        message=Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls),
+        message=Message(
+            role=Role.ASSISTANT,
+            content="".join(text_parts),
+            tool_calls=tool_calls,
+            reasoning="".join(reasoning_parts),
+        ),
         usage=Usage(
             input_tokens=_usage_count(usage_raw.get("input_tokens")) if isinstance(usage_raw, dict) else 0,
             output_tokens=_usage_count(usage_raw.get("output_tokens")) if isinstance(usage_raw, dict) else 0,
@@ -371,11 +409,18 @@ def _responses_stream_chunks(
                 failed_response = data.get("response")
                 error = failed_response.get("error", {}) if isinstance(failed_response, dict) else {}
             message = error.get("message") if isinstance(error, dict) else None
+            param = error.get("param") if isinstance(error, dict) else None
+            if isinstance(param, str) and param:
+                message = f"{message or f'{operation} stream failed'} ({param})"
             raise StreamEventError(redact_secret(str(message or f"{operation} stream failed"), api_key), error.get("code") if isinstance(error, dict) else None)
         if event == "response.output_text.delta":
             delta = data.get("delta")
             if isinstance(delta, str):
                 yield TextDelta(delta)
+        elif event == "response.reasoning_summary_text.delta":
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                yield ReasoningDelta(delta)
         elif event == "response.output_item.added":
             item = data.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
@@ -512,28 +557,41 @@ class OpenAIProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_responses_request_body(request, model)
-        http_request = urllib.request.Request(
-            f"{self.base_url}/responses",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-            },
-        )
-        raw = read_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation="OpenAI API",
-            cancel=cancel,
-            call_class=request.call_class,
-        )
-        data = parse_json_object(raw, "OpenAI API")
+        key = _reasoning_summary_key(self.base_url, model)
+        include_summary = not _reasoning_summary_disabled(key)
 
-        return _parse_responses_response(data)
+        def send(include_reasoning_summary: bool) -> ModelResponse:
+            body = _build_responses_request_body(
+                request, model, include_reasoning_summary=include_reasoning_summary,
+            )
+            http_request = urllib.request.Request(
+                f"{self.base_url}/responses",
+                data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+            )
+            raw = read_with_retry(
+                http_request,
+                timeout=self.timeout_seconds,
+                max_attempts=self.max_attempts,
+                api_key=api_key,
+                operation="OpenAI API",
+                cancel=cancel,
+                call_class=request.call_class,
+            )
+            return _parse_responses_response(parse_json_object(raw, "OpenAI API"))
+
+        try:
+            return send(include_summary)
+        except ProviderError as exc:
+            if not include_summary or not _reasoning_summary_rejected(exc):
+                raise
+            with _REASONING_SUMMARY_LOCK:
+                _REASONING_SUMMARY_DISABLED.add(key)
+            return send(False)
 
     def create_response_stream(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -543,20 +601,43 @@ class OpenAIProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_responses_request_body(request, model)
-        body["stream"] = True
-        http_request = urllib.request.Request(
-            f"{self.base_url}/responses",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-            },
-        )
-        def attempt(remaining):
-            lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
-                api_key=api_key, operation="OpenAI API", cancel=cancel)
-            return _responses_stream_chunks(lines, operation="OpenAI API", api_key=api_key)
-        yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
-                                       max_attempts=self.max_attempts, cancel=cancel)
+        key = _reasoning_summary_key(self.base_url, model)
+        include_summary = not _reasoning_summary_disabled(key)
+
+        def stream(include_reasoning_summary: bool) -> Iterator[StreamChunk]:
+            body = _build_responses_request_body(
+                request, model, include_reasoning_summary=include_reasoning_summary,
+            )
+            body["stream"] = True
+            http_request = urllib.request.Request(
+                f"{self.base_url}/responses",
+                data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+            )
+
+            def attempt(remaining):
+                lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
+                    api_key=api_key, operation="OpenAI API", cancel=cancel)
+                return _responses_stream_chunks(lines, operation="OpenAI API", api_key=api_key)
+
+            yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
+                                           max_attempts=self.max_attempts, cancel=cancel)
+
+        if not include_summary:
+            yield from stream(False)
+            return
+        emitted = False
+        try:
+            for chunk in stream(True):
+                emitted = True
+                yield chunk
+        except ProviderError as exc:
+            if emitted or not _reasoning_summary_rejected(exc):
+                raise
+            with _REASONING_SUMMARY_LOCK:
+                _REASONING_SUMMARY_DISABLED.add(key)
+            yield from stream(False)

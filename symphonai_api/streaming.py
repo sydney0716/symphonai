@@ -35,6 +35,11 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ReasoningDelta:
+    text: str
+
+
+@dataclass(frozen=True)
 class ToolCallDelta:
     index: int
     id: str | None = None
@@ -64,7 +69,7 @@ class _StreamUnavailableError(ProviderUnavailableError):
         self.retry_after = retry_after
 
 
-StreamChunk = TextDelta | ToolCallDelta | StreamCompleted
+StreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | StreamCompleted
 
 
 def retry_stream_chunks(
@@ -80,24 +85,24 @@ def retry_stream_chunks(
         if remaining <= 0:
             raise ProviderError(f"stream exceeded its {timeout}s overall timeout")
         chunks: list[StreamChunk] = []
-        text_yielded = False
+        output_yielded = False
         try:
             for chunk in factory(remaining):
-                if isinstance(chunk, TextDelta):
-                    if not text_yielded:
+                if isinstance(chunk, (TextDelta, ReasoningDelta)):
+                    if not output_yielded:
                         yield from chunks
                         chunks.clear()
-                        text_yielded = True
+                        output_yielded = True
                     yield chunk
-                elif text_yielded:
+                elif output_yielded:
                     yield chunk
                 else:
                     chunks.append(chunk)
-            if not text_yielded:
+            if not output_yielded:
                 yield from chunks
             return
         except StreamEventError as exc:
-            if text_yielded:
+            if output_yielded:
                 yield from chunks
             permanent_codes = (
                 {"invalid_request_error", "context_length_exceeded", "invalid_prompt"}
@@ -106,14 +111,14 @@ def retry_stream_chunks(
                       "not_found_error", "request_too_large"}
             )
             permanent = exc.code in permanent_codes
-            if text_yielded or permanent:
+            if output_yielded or permanent:
                 raise ProviderError(str(exc)) from None
             if _wait_before_retry(attempt=attempt, max_attempts=max_attempts,
                                   deadline=deadline, retry_after=None, cancel=cancel):
                 continue
             raise ProviderUnavailableError(str(exc), status=None) from None
         except ProviderUnavailableError as exc:
-            if text_yielded:
+            if output_yielded:
                 yield from chunks
                 raise ProviderError(str(exc)) from None
             retry_after = getattr(exc, "retry_after", None)
@@ -141,12 +146,16 @@ class StreamAssembler:
 
     def __init__(self) -> None:
         self._text: list[str] = []
+        self._reasoning: list[str] = []
         self._tool_calls: dict[int, _PartialToolCall] = {}
         self._completed: ModelResponse | None = None
 
     def add(self, chunk: StreamChunk) -> None:
         if isinstance(chunk, TextDelta):
             self._text.append(chunk.text)
+            return
+        if isinstance(chunk, ReasoningDelta):
+            self._reasoning.append(chunk.text)
             return
         if isinstance(chunk, ToolCallDelta):
             partial = self._tool_calls.setdefault(chunk.index, _PartialToolCall())
@@ -189,7 +198,12 @@ class StreamAssembler:
                 else:
                     tool_call = self._finish_tool_call(index, partial)
                 tool_calls.append(tool_call)
-        message = replace(terminal.message, content=content, tool_calls=tool_calls)
+        message = replace(
+            terminal.message,
+            content=content,
+            tool_calls=tool_calls,
+            reasoning=terminal.message.reasoning or "".join(self._reasoning),
+        )
         return replace(terminal, message=message, cut_tool_call_id=cut_tool_call_id)
 
     @staticmethod

@@ -162,7 +162,7 @@ def tool_result_from_json(data: dict) -> ToolResult:
 
 
 def message_to_json(message: Message) -> dict:
-    return {
+    serialized = {
         "role": message.role.value,
         "content": content_blocks_to_json(message.content),
         "tool_calls": [tool_call_to_json(call) for call in message.tool_calls],
@@ -174,6 +174,9 @@ def message_to_json(message: Message) -> dict:
         "turn_id": message.turn_id,
         "schema_version": message.schema_version,
     }
+    if message.reasoning:
+        serialized["reasoning"] = message.reasoning
+    return serialized
 
 
 def message_from_json(data: dict) -> Message:
@@ -185,4 +188,5 @@ def message_from_json(data: dict) -> Message:
         tool_result=None if result is None else tool_result_from_json(result),
         turn_id=data.get("turn_id"),
         schema_version=data.get("schema_version", 1),
+        reasoning=data.get("reasoning", ""),
     )

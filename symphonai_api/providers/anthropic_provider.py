@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -43,6 +45,7 @@ from symphonai_api.streaming import (
     StreamChunk,
     StreamCompleted,
     StreamEventError,
+    ReasoningDelta,
     TextDelta,
     ToolCallDelta,
     open_stream_with_retry,
@@ -55,9 +58,53 @@ DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_MODEL = "claude-opus-5-5"
 ROUTINE_MODEL = "claude-sonnet-5-5"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MAX_TOKENS = 1024
+DEFAULT_MAX_TOKENS = 32000
 DEFAULT_STREAM_MAX_TOKENS = 32000
 _ANTHROPIC_CONTENT_KEY = "anthropic_content"
+_MAX_TOKENS_LIMIT_PATTERNS = (
+    re.compile(r"\bmax_tokens\b.*?>\s*(\d+)", re.IGNORECASE),
+    re.compile(r"\bmax_tokens\b.*?\b(?:limit|maximum)\D{0,24}(\d+)", re.IGNORECASE),
+    re.compile(r"\b(?:limit|maximum)(?:\s+output)?\s+tokens?\s*(?:is|of|:|=)?\s*(\d+)", re.IGNORECASE),
+    re.compile(r"\blimit\s+(?:is|of|:|=)\s*(\d+)", re.IGNORECASE),
+)
+_THINKING_DISABLED: set[tuple[str, str]] = set()
+_MAX_TOKENS_LIMITS: dict[tuple[str, str], int] = {}
+_ANTHROPIC_CAPABILITIES_LOCK = threading.Lock()
+
+
+def _model_key(base_url: str, model: str) -> tuple[str, str]:
+    return base_url, model
+
+
+def _cached_max_tokens(key: tuple[str, str]) -> int | None:
+    with _ANTHROPIC_CAPABILITIES_LOCK:
+        return _MAX_TOKENS_LIMITS.get(key)
+
+
+def _thinking_disabled(key: tuple[str, str]) -> bool:
+    with _ANTHROPIC_CAPABILITIES_LOCK:
+        return key in _THINKING_DISABLED
+
+
+def _max_tokens_limit(error: ProviderError) -> int | None:
+    message = str(error)
+    if "max_tokens" not in message.casefold():
+        return None
+    for pattern in _MAX_TOKENS_LIMIT_PATTERNS:
+        match = pattern.search(message)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _thinking_parameter_rejected(error: ProviderError) -> bool:
+    message = str(error).casefold()
+    parameter = "thinking" in message or "display" in message
+    rejection = any(
+        phrase in message
+        for phrase in ("unsupported", "not supported", "unrecognized", "unknown parameter", "invalid parameter")
+    )
+    return parameter and rejection
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for tool calls that arrive without one.
@@ -174,14 +221,25 @@ def _usage_count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _build_request_body(request: ModelRequest, model: str, default_max_tokens: int) -> dict[str, Any]:
+def _build_request_body(
+    request: ModelRequest,
+    model: str,
+    default_max_tokens: int,
+    *,
+    max_tokens_override: int | None = None,
+    include_thinking: bool = True,
+) -> dict[str, Any]:
     reject_system_attachments(request.messages)
     id_map = wire_tool_call_ids(request.messages)
     system_parts = [m.text for m in request.messages if m.role == Role.SYSTEM and m.text]
     non_system = [m for m in request.messages if m.role != Role.SYSTEM]
     body: dict[str, Any] = {
         "model": model,
-        "max_tokens": request.max_tokens or default_max_tokens,
+        "max_tokens": (
+            max_tokens_override
+            if max_tokens_override is not None
+            else request.max_tokens or default_max_tokens
+        ),
         "messages": _anthropic_messages(non_system, id_map),
         "cache_control": {"type": "ephemeral"},
     }
@@ -194,16 +252,23 @@ def _build_request_body(request: ModelRequest, model: str, default_max_tokens: i
     effort = resolve_effort(2, model, request.effort)
     if effort is not None:
         body["output_config"] = {"effort": effort}
+        if include_thinking and request.temperature is None:
+            body["thinking"] = {"type": "adaptive", "display": "summarized"}
     return body
 
 
 def _parse_response(data: dict[str, Any]) -> ModelResponse:
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     content = data.get("content", [])
     for block in content:
         if block.get("type") == "text":
             text_parts.append(block.get("text", ""))
+        elif block.get("type") == "thinking":
+            thinking = block.get("thinking")
+            if isinstance(thinking, str):
+                reasoning_parts.append(thinking)
         elif block.get("type") == "tool_use":
             vendor_id = block.get("id") or None
             tool_calls.append(
@@ -228,7 +293,12 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     input_tokens = _usage_count(usage_raw.get("input_tokens"))
     cache_read_tokens = _usage_count(usage_raw.get("cache_read_input_tokens"))
     cache_write_tokens = _usage_count(usage_raw.get("cache_creation_input_tokens"))
-    message = Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls)
+    message = Message(
+        role=Role.ASSISTANT,
+        content="".join(text_parts),
+        tool_calls=tool_calls,
+        reasoning="".join(reasoning_parts),
+    )
     return ModelResponse(
         message=message,
         usage=Usage(
@@ -304,10 +374,11 @@ def _anthropic_stream_chunks(
                 yield TextDelta(text)
             elif delta.get("type") == "thinking_delta":
                 block = content_blocks.get(data["index"])
+                thinking = delta.get("thinking", "")
                 if block is not None:
-                    block["thinking"] = block.get("thinking", "") + delta.get(
-                        "thinking", ""
-                    )
+                    block["thinking"] = block.get("thinking", "") + thinking
+                if isinstance(thinking, str) and thinking:
+                    yield ReasoningDelta(thinking)
             elif delta.get("type") == "signature_delta":
                 block = content_blocks.get(data["index"])
                 if block is not None:
@@ -418,29 +489,65 @@ class AnthropicProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model, self.max_tokens)
-        http_request = urllib.request.Request(
-            f"{self.base_url}/messages",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
-            },
+        key = _model_key(self.base_url, model)
+        max_tokens_override = (
+            _cached_max_tokens(key) if request.max_tokens is None else None
         )
-        raw = read_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation="Anthropic API",
-            cancel=cancel,
-            call_class=request.call_class,
+        effort = resolve_effort(2, model, request.effort)
+        include_thinking = (
+            effort is not None
+            and request.temperature is None
+            and not _thinking_disabled(key)
         )
-        data = parse_json_object(raw, "Anthropic API")
-
-        return _parse_response(data)
+        retried_max_tokens = False
+        while True:
+            body = _build_request_body(
+                request,
+                model,
+                self.max_tokens,
+                max_tokens_override=max_tokens_override,
+                include_thinking=include_thinking,
+            )
+            http_request = urllib.request.Request(
+                f"{self.base_url}/messages",
+                data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+            )
+            try:
+                raw = read_with_retry(
+                    http_request,
+                    timeout=self.timeout_seconds,
+                    max_attempts=self.max_attempts,
+                    api_key=api_key,
+                    operation="Anthropic API",
+                    cancel=cancel,
+                    call_class=request.call_class,
+                )
+            except ProviderError as exc:
+                limit = _max_tokens_limit(exc)
+                sent_tokens = body["max_tokens"]
+                if (
+                    not retried_max_tokens
+                    and limit is not None
+                    and sent_tokens > limit
+                ):
+                    with _ANTHROPIC_CAPABILITIES_LOCK:
+                        _MAX_TOKENS_LIMITS[key] = limit
+                    max_tokens_override = limit
+                    retried_max_tokens = True
+                    continue
+                if include_thinking and _thinking_parameter_rejected(exc):
+                    with _ANTHROPIC_CAPABILITIES_LOCK:
+                        _THINKING_DISABLED.add(key)
+                    include_thinking = False
+                    continue
+                raise
+            return _parse_response(parse_json_object(raw, "Anthropic API"))
 
     def create_response_stream(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -450,21 +557,77 @@ class AnthropicProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model, DEFAULT_STREAM_MAX_TOKENS)
-        body["stream"] = True
-        http_request = urllib.request.Request(
-            f"{self.base_url}/messages",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
-            },
+        key = _model_key(self.base_url, model)
+        max_tokens_override = (
+            _cached_max_tokens(key) if request.max_tokens is None else None
         )
-        def attempt(remaining):
-            lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
-                api_key=api_key, operation="Anthropic API", cancel=cancel)
-            return _anthropic_stream_chunks(lines, api_key=api_key)
-        yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
-                                       max_attempts=self.max_attempts, cancel=cancel)
+        effort = resolve_effort(2, model, request.effort)
+        include_thinking = (
+            effort is not None
+            and request.temperature is None
+            and not _thinking_disabled(key)
+        )
+        retried_max_tokens = False
+        while True:
+            body = _build_request_body(
+                request,
+                model,
+                DEFAULT_STREAM_MAX_TOKENS,
+                max_tokens_override=max_tokens_override,
+                include_thinking=include_thinking,
+            )
+            body["stream"] = True
+            http_request = urllib.request.Request(
+                f"{self.base_url}/messages",
+                data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+            )
+
+            def attempt(remaining):
+                lines = open_stream_with_retry(
+                    http_request,
+                    timeout=remaining,
+                    max_attempts=1,
+                    api_key=api_key,
+                    operation="Anthropic API",
+                    cancel=cancel,
+                )
+                return _anthropic_stream_chunks(lines, api_key=api_key)
+
+            emitted = False
+            try:
+                for chunk in retry_stream_chunks(
+                    attempt,
+                    timeout=self.timeout_seconds,
+                    max_attempts=self.max_attempts,
+                    cancel=cancel,
+                ):
+                    emitted = True
+                    yield chunk
+                return
+            except ProviderError as exc:
+                if emitted:
+                    raise
+                limit = _max_tokens_limit(exc)
+                sent_tokens = body["max_tokens"]
+                if (
+                    not retried_max_tokens
+                    and limit is not None
+                    and sent_tokens > limit
+                ):
+                    with _ANTHROPIC_CAPABILITIES_LOCK:
+                        _MAX_TOKENS_LIMITS[key] = limit
+                    max_tokens_override = limit
+                    retried_max_tokens = True
+                    continue
+                if include_thinking and _thinking_parameter_rejected(exc):
+                    with _ANTHROPIC_CAPABILITIES_LOCK:
+                        _THINKING_DISABLED.add(key)
+                    include_thinking = False
+                    continue
+                raise

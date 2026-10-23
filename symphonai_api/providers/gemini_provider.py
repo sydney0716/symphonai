@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -51,6 +52,7 @@ from symphonai_api.retry import DEFAULT_MAX_ATTEMPTS, read_with_retry, redact_se
 from symphonai_api.streaming import (
     StreamChunk,
     StreamCompleted,
+    ReasoningDelta,
     TextDelta,
     ToolCallDelta,
     open_stream_with_retry,
@@ -67,6 +69,21 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # The leader plans and delegates, so use the pro alias by default.
 DEFAULT_MODEL = "gemini-pro-latest"
 ROUTINE_MODEL = "gemini-flash-latest"
+_THOUGHTS_DISABLED: set[tuple[str, str]] = set()
+_THOUGHTS_LOCK = threading.Lock()
+
+
+def _thoughts_key(base_url: str, model: str) -> tuple[str, str]:
+    return base_url, model
+
+
+def _thoughts_disabled(key: tuple[str, str]) -> bool:
+    with _THOUGHTS_LOCK:
+        return key in _THOUGHTS_DISABLED
+
+
+def _thoughts_rejected(error: ProviderError) -> bool:
+    return "includethoughts" in str(error).casefold()
 
 def _synthesize_tool_call_id() -> str:
     """Build a fallback canonical id for Gemini functionCalls that omit one.
@@ -198,7 +215,7 @@ def _build_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _build_request_body(
-    request: ModelRequest, model: str | None = None
+    request: ModelRequest, model: str | None = None, *, include_thoughts: bool = True,
 ) -> dict[str, Any]:
     reject_system_attachments(request.messages)
     body: dict[str, Any] = {"contents": _build_contents(request.messages)}
@@ -222,6 +239,8 @@ def _build_request_body(
         generation_config["thinkingConfig"] = {"thinkingLevel": effort}
     elif isinstance(effort, int):
         generation_config["thinkingConfig"] = {"thinkingBudget": effort}
+    if include_thoughts:
+        generation_config.setdefault("thinkingConfig", {})["includeThoughts"] = True
     if generation_config:
         body["generationConfig"] = generation_config
 
@@ -229,6 +248,15 @@ def _build_request_body(
 
 
 def _parse_response(data: dict[str, Any]) -> ModelResponse:
+    error = data.get("error")
+    if isinstance(error, dict):
+        detail = error.get("message")
+        serialized_error = json.dumps(error, ensure_ascii=False)
+        if not isinstance(detail, str):
+            detail = serialized_error
+        elif "includethoughts" in serialized_error.casefold() and "includethoughts" not in detail.casefold():
+            detail = f"{detail} ({serialized_error})"
+        raise ProviderError(redact_secret(detail, os.environ.get(API_KEY_ENV_VAR, "").strip()))
     candidates = data.get("candidates") or []
     if not candidates:
         # A prompt blocked by safety filters comes back with no candidates.
@@ -237,10 +265,12 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
 
     candidate = candidates[0]
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     for part in candidate.get("content", {}).get("parts", []) or []:
         if "text" in part:
-            text_parts.append(part["text"] or "")
+            target = reasoning_parts if part.get("thought") is True else text_parts
+            target.append(part["text"] or "")
         function_call = part.get("functionCall")
         if isinstance(function_call, dict) and function_call.get("name"):
             name = function_call["name"]
@@ -263,7 +293,12 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
         usage_raw = {}
     cache_read_tokens = _usage_count(usage_raw.get("cachedContentTokenCount"))
     return ModelResponse(
-        message=Message(role=Role.ASSISTANT, content="".join(text_parts), tool_calls=tool_calls),
+        message=Message(
+            role=Role.ASSISTANT,
+            content="".join(text_parts),
+            tool_calls=tool_calls,
+            reasoning="".join(reasoning_parts),
+        ),
         usage=Usage(
             input_tokens=_usage_count(usage_raw.get("promptTokenCount")),
             output_tokens=_usage_count(usage_raw.get("candidatesTokenCount")),
@@ -287,6 +322,16 @@ def _gemini_stream_chunks(
             raise ProviderError(f"Gemini API stream returned invalid JSON: {exc}") from None
         if not isinstance(data, dict):
             raise ProviderError("Gemini API stream returned non-object JSON")
+
+        error = data.get("error")
+        if isinstance(error, dict):
+            detail = error.get("message")
+            serialized_error = json.dumps(error, ensure_ascii=False)
+            if not isinstance(detail, str):
+                detail = serialized_error
+            elif "includethoughts" in serialized_error.casefold() and "includethoughts" not in detail.casefold():
+                detail = f"{detail} ({serialized_error})"
+            raise ProviderError(redact_secret(detail, api_key))
 
         feedback = data.get("promptFeedback")
         if isinstance(feedback, dict) and feedback.get("blockReason") is not None:
@@ -318,7 +363,10 @@ def _gemini_stream_chunks(
             if not isinstance(part, dict):
                 continue
             if "text" in part:
-                yield TextDelta(part["text"] or "")
+                if part.get("thought") is True:
+                    yield ReasoningDelta(part["text"] or "")
+                else:
+                    yield TextDelta(part["text"] or "")
             function_call = part.get("functionCall")
             if not isinstance(function_call, dict) or not function_call.get("name"):
                 continue
@@ -384,28 +432,39 @@ class GeminiProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model)
-        http_request = urllib.request.Request(
-            f"{self.base_url}/models/{model}:generateContent",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "x-goog-api-key": api_key,
-                "content-type": "application/json",
-            },
-        )
-        raw = read_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation="Gemini API",
-            cancel=cancel,
-            call_class=request.call_class,
-        )
-        data = parse_json_object(raw, "Gemini API")
+        key = _thoughts_key(self.base_url, model)
+        include_thoughts = not _thoughts_disabled(key)
 
-        return _parse_response(data)
+        def send(include: bool) -> ModelResponse:
+            body = _build_request_body(request, model, include_thoughts=include)
+            http_request = urllib.request.Request(
+                f"{self.base_url}/models/{model}:generateContent",
+                data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={
+                    "x-goog-api-key": api_key,
+                    "content-type": "application/json",
+                },
+            )
+            raw = read_with_retry(
+                http_request,
+                timeout=self.timeout_seconds,
+                max_attempts=self.max_attempts,
+                api_key=api_key,
+                operation="Gemini API",
+                cancel=cancel,
+                call_class=request.call_class,
+            )
+            return _parse_response(parse_json_object(raw, "Gemini API"))
+
+        try:
+            return send(include_thoughts)
+        except ProviderError as exc:
+            if not include_thoughts or not _thoughts_rejected(exc):
+                raise
+            with _THOUGHTS_LOCK:
+                _THOUGHTS_DISABLED.add(key)
+            return send(False)
 
     def create_response_stream(
         self, request: ModelRequest, *, cancel: CancellationToken | None = None
@@ -415,22 +474,41 @@ class GeminiProvider(ModelProvider):
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
         model = request.model if request.model is not None else self.model
-        body = _build_request_body(request, model)
-        http_request = urllib.request.Request(
-            f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse",
-            data=json.dumps(body).encode("utf-8"),
-            method="POST",
-            headers={
-                "x-goog-api-key": api_key,
-                "content-type": "application/json",
-            },
-        )
-        lines = open_stream_with_retry(
-            http_request,
-            timeout=self.timeout_seconds,
-            max_attempts=self.max_attempts,
-            api_key=api_key,
-            operation="Gemini API",
-            cancel=cancel,
-        )
-        yield from _gemini_stream_chunks(lines, api_key=api_key)
+        key = _thoughts_key(self.base_url, model)
+        include_thoughts = not _thoughts_disabled(key)
+
+        def stream(include: bool) -> Iterator[StreamChunk]:
+            body = _build_request_body(request, model, include_thoughts=include)
+            http_request = urllib.request.Request(
+                f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse",
+                data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={
+                    "x-goog-api-key": api_key,
+                    "content-type": "application/json",
+                },
+            )
+            lines = open_stream_with_retry(
+                http_request,
+                timeout=self.timeout_seconds,
+                max_attempts=self.max_attempts,
+                api_key=api_key,
+                operation="Gemini API",
+                cancel=cancel,
+            )
+            yield from _gemini_stream_chunks(lines, api_key=api_key)
+
+        if not include_thoughts:
+            yield from stream(False)
+            return
+        emitted = False
+        try:
+            for chunk in stream(True):
+                emitted = True
+                yield chunk
+        except ProviderError as exc:
+            if emitted or not _thoughts_rejected(exc):
+                raise
+            with _THOUGHTS_LOCK:
+                _THOUGHTS_DISABLED.add(key)
+            yield from stream(False)

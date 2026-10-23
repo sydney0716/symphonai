@@ -245,11 +245,14 @@ def check_document_covers_registry() -> None:
                 fail(f"protocol document omitted {name}.{field.name}")
     message = HistoryMessage(
         role="user", text="work", tool_calls=[], turn_id="turn",
+        reasoning="thought text",
         turn_started_at="2026-10-12T17:21:00.000Z",
         turn_ended_at="2026-10-12T17:27:34.000Z",
         turn_outcome="finished",
     )
     payload = message.payload()
+    if payload.get("reasoning") != "thought text":
+        fail(f"HistoryMessage dropped its reasoning text: {payload!r}")
     if payload["turn_started_at"] != "2026-10-12T17:21:00.000Z" or payload["turn_ended_at"] != "2026-10-12T17:27:34.000Z":
         fail(f"HistoryMessage dropped its root turn times: {payload!r}")
     doc = (REPO_ROOT / "symphonai_host" / "PROTOCOL.md").read_text()

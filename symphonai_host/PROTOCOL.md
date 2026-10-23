@@ -36,6 +36,7 @@ fields on a known event are ignored for forward compatibility.
 | `TurnStarted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `index: int` |
 | `TurnFinished` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `index: int` |
 | `AssistantTextDelta` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str` |
+| `AssistantReasoningDelta` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `text: str` |
 | `ModelFallback` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `from_model: str`, `to_model: str`, `reason: str` |
 | `ToolCallStarted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `target: str` |
 | `ToolCallFinished` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `ok: bool`, `result_kind: str`, `result_path: str`, `lines_added: int`, `lines_removed: int`, `diff: str`, `truncated: bool`, `output: str`, `output_truncated: bool` |
@@ -116,7 +117,8 @@ value is strict standard base64 for a PNG, JPEG, GIF, WEBP, or PDF no larger
 than 5,000,000 bytes. Invalid base64, unsupported content, oversized content,
 or malformed attachment entries return `400` with the attachment index in the
 error. An empty prompt is allowed when an attachment is present. Replay
-`HistoryMessage` events include `attachments`, an array of `{kind, media_type,
+`HistoryMessage` events include `reasoning`, the assistant's readable reasoning
+text (empty when none was returned), and `attachments`, an array of `{kind, media_type,
 filename}` metadata for non-text blocks; attachment data is never included.
 They also include `checkpoint_key: str | null`, `edits: [{path: str, added: int,
 removed: int}]`, and `undone: bool`. For a user message these identify its prompt

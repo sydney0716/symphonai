@@ -7287,9 +7287,9 @@ test("transcript prose, activity, approvals, and turns use their assigned surfac
 
 test("agent turns use colored dots joined only between consecutive blocks", async () => {
   const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
-  const entryMargins = css.match(/#chat\s*>\s*:is\(\.prompt,\s*\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\s*\{([^}]*)\}/)?.[1];
-  const dotRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)::before\s*\{([^}]*)\}/)?.[1];
-  const threadRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\):has\(\+ :is\(\.assistant,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\)::after\s*\{([^}]*)\}/)?.[1];
+  const entryMargins = css.match(/#chat\s*>\s*:is\(\.prompt,\s*\.assistant,\s*\.thought,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\s*\{([^}]*)\}/)?.[1];
+  const dotRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.thought,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)::before\s*\{([^}]*)\}/)?.[1];
+  const threadRule = css.match(/#chat\s*>\s*:is\(\.assistant,\s*\.thought,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\):has\(\+ :is\(\.assistant,\s*\.thought,\s*\.activity,\s*\.edit,\s*\.question,\s*\.plan-entry,\s*\.user-question,\s*\.compaction,\s*\.gap,\s*\.unknown-event\)\)::after\s*\{([^}]*)\}/)?.[1];
   assert.match(entryMargins, /margin-top:\s*0;/);
   assert.match(entryMargins, /margin-bottom:\s*0;/);
   assert.match(css, /#chat\s*>\s*\.prompt:not\(:first-child\)\s*\{[^}]*margin-top:\s*var\(--space-6\);/s);

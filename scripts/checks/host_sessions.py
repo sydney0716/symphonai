@@ -974,11 +974,28 @@ def check_offloaded_handle_survives() -> None:
 @check("host_sessions.client_session_calls")
 def check_client_session_calls() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        host, client, run_id = _finished_session(Path(directory))
+        host, client = _host(
+            Path(directory),
+            [ModelResponse(Message(Role.ASSISTANT, "done", reasoning="saved thought"))],
+        )
+        subscription = host.run._broker.subscribe()
         try:
-            if not client.list_sessions() or client.open_session(run_id)["replayed"] != 4:
+            run_id = client.send_prompt("first")["run_id"]
+            _wait_idle(client)
+            reopened = client.open_session(run_id)
+            if not client.list_sessions() or reopened.get("replayed", 0) < 2:
                 fail("client session calls did not round-trip")
+            history = []
+            while True:
+                event = subscription.get(timeout=0.05)
+                if event is None:
+                    break
+                if type(event).__name__ == "ForkableHistoryMessage" and event.role == "assistant":
+                    history.append(event)
+            if not history or history[-1].reasoning != "saved thought":
+                fail(f"reopened assistant history lost its reasoning: {history!r}")
         finally:
+            subscription.close()
             host.close()
 
 
@@ -1378,7 +1395,7 @@ def check_fork_prefix_current_parent() -> None:
                     or "/" in frame["record_id"]
                     or str(root) in json.dumps(frame)
                     or set(frame) != {
-                        "type", "role", "text", "tool_calls", "turn_id", "attachments",
+                        "type", "role", "text", "tool_calls", "turn_id", "reasoning", "attachments",
                         "record_id", "session_id", "checkpoint_key", "edits", "undone",
                     }
                     or not isinstance(frame.get("checkpoint_key"), str)
