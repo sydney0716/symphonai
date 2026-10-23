@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
 
 def spec_validation(text: str) -> list[str]:
     validation = []
     in_section = False
     in_fence = False
+    section_level = 0
     for line in text.splitlines():
-        if line.startswith("## "):
-            if in_section and in_fence:
-                break
-            in_section = line[3:].strip().lower() == "validation"
-            continue
+        if not in_fence:
+            heading = re.match(r"^(#{1,6})[ \t]+(.+?)\s*$", line)
+            if heading:
+                level = len(heading.group(1))
+                title = heading.group(2).rstrip("# ").strip()
+                if in_section:
+                    if level <= section_level:
+                        break
+                elif title.casefold() == "validation":
+                    in_section = True
+                    section_level = level
+                continue
         if not in_section:
             continue
         if line.startswith("```"):

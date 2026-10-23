@@ -24,10 +24,13 @@ from symphonai_api.tool_schema import tool_registry_schemas
 
 CASSETTE_DIR = Path(__file__).parent / "cassettes"
 SYNTHETIC_CASSETTE = "synthetic-openai-responses.json"
-FILES = {"notes.txt": "The launch code is amber-otter-73041.\n"}
+FILES = {
+    "notes.txt": "The launch code is amber-otter-73041.\n",
+    "field-observations.txt": "This file is discoverable only by listing the project.\n",
+}
 RECORDER_TASK = (
-    "Read notes.txt first. On your next turn, run the harmless command `pwd`. "
-    "Then answer with the note's exact sentence and the command's working directory. "
+    "Read notes.txt first. On your next turn, run the harmless command `ls`. "
+    "Then answer with the note's exact sentence and every file name from the command output. "
     "Make exactly one tool call per turn."
 )
 PROVIDER_KEYS = {"openai": OPENAI_KEY, "anthropic": ANTHROPIC_KEY, "gemini": GEMINI_KEY}
@@ -92,11 +95,22 @@ def _request_record(request: Request, root: str) -> dict[str, Any]:
 
 def privacy_violations(cassette: dict[str, Any], api_key: str, home: str, username: str) -> list[str]:
     serialized = json.dumps(cassette, ensure_ascii=False)
-    return [
+    violations = [
         label
         for label, value in (("API key", api_key), ("home path", home), ("user name", username))
         if value and value in serialized
     ]
+    temp_segments = {
+        segment for segment in Path(tempfile.gettempdir()).parts if len(segment) >= 8
+    }
+    violations.extend(
+        f"temporary directory segment ({segment})"
+        for segment in sorted(temp_segments)
+        if segment in serialized
+    )
+    if "/var/folders" in serialized:
+        violations.append("temporary directory path (/var/folders)")
+    return violations
 
 
 def require_private(cassette: dict[str, Any], api_key: str, home: str, username: str) -> None:
@@ -118,6 +132,10 @@ def _string_leaves(value: Any, location: str = ""):
 
 def needed_back_values(cassette: dict[str, Any]) -> list[tuple[int, int, str, str]]:
     exchanges = cassette["exchanges"]
+    request_texts = [
+        json.dumps(exchange["request"].get("body", {}), ensure_ascii=False)
+        for exchange in exchanges
+    ]
     needed = []
     for earlier, exchange in enumerate(exchanges):
         response = exchange["response"]
@@ -135,10 +153,10 @@ def needed_back_values(cassette: dict[str, Any]) -> list[tuple[int, int, str, st
             except json.JSONDecodeError:
                 pass
         for later in range(earlier + 1, len(exchanges)):
-            request_text = json.dumps(exchanges[later]["request"].get("body", {}), ensure_ascii=False)
             for response_value in response_values:
                 for location, value in _string_leaves(response_value, f"exchanges[{earlier}].response"):
-                    if len(value) >= 16 and value in request_text:
+                    appeared_in_request = any(value in request_texts[index] for index in range(earlier + 1))
+                    if len(value) >= 16 and not appeared_in_request and value in request_texts[later]:
                         item = (earlier, later, location, value)
                         if item not in needed:
                             needed.append(item)
@@ -176,7 +194,7 @@ def replay_cassette(
         tools = _tools(cassette["tools"])
         policy = PermissionPolicy(
             repo_root=Path(temporary), allowed_write_scope=[Path(temporary)],
-            shell_enabled=True, shell_allowlist=[("pwd",)],
+            shell_enabled=True, shell_allowlist=[("ls",)],
         )
         provider = _provider(provider_name, cassette["model"])
         agent = ApiAgent(
@@ -247,10 +265,13 @@ def _cassette_capture(provider_name: str, model: str, key: str, output: Path) ->
     with tempfile.TemporaryDirectory(prefix="symphonai-vendor-project-") as temporary:
         root = Path(temporary).resolve()
         project_root.append(str(root))
-        (root / "notes.txt").write_text(FILES["notes.txt"], encoding="utf-8")
+        for relative, content in FILES.items():
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
         policy = PermissionPolicy(
             repo_root=root, allowed_write_scope=[root], shell_enabled=True,
-            shell_allowlist=[("pwd",)],
+            shell_allowlist=[("ls",)],
         )
         agent = ApiAgent(
             provider, tools, policy, max_turns=6,
@@ -329,6 +350,98 @@ def check_cassettes() -> None:
         if failures:
             fail(f"{path.name}: {failures!r}")
         ok(f"replayed {path.name}")
+
+
+def _openai_response(output: list[dict[str, Any]]) -> dict[str, Any]:
+    event = {"type": "response.completed", "response": {"status": "completed", "output": output}}
+    return {
+        "status": 200,
+        "body_lines": [f"event: response.completed\n", f"data: {json.dumps(event)}\n", "\n"],
+    }
+
+
+@check("vendor_replay.privacy_rejects_temp_path_fragments")
+def check_privacy_rejects_temp_path_fragments() -> None:
+    segments = [segment for segment in Path(tempfile.gettempdir()).parts if len(segment) >= 8]
+    for fragment in [*segments, "/var/folders"]:
+        violations = privacy_violations({"response": fragment}, "", "", "")
+        if not violations:
+            fail(f"privacy check accepted temporary path fragment {fragment!r}")
+    if privacy_violations({"response": "safe cassette content"}, "", "", ""):
+        fail("privacy check rejected content with no temporary path fragment")
+    ok("privacy check rejects split temp-directory segments and /var/folders")
+
+
+@check("vendor_replay.recording_task_replays")
+def check_recording_task_replays() -> None:
+    filenames = sorted(FILES)
+    answer = f"{FILES['notes.txt'].strip()} Files: {', '.join(filenames)}"
+    cassette = {
+        "version": 1,
+        "provider": "openai",
+        "model": "gpt-6.1-sol",
+        "task": RECORDER_TASK,
+        "files": FILES,
+        "tools": ["read_file", "run_shell"],
+        "final_answer": answer,
+        "exchanges": [
+            {"request": {"method": "POST", "url": "https://api.openai.com/v1/responses", "body": {}},
+             "response": _openai_response([{
+                 "type": "function_call", "name": "read_file", "call_id": "call_recording_read_0123456789",
+                 "arguments": json.dumps({"path": "notes.txt"}),
+             }])},
+            {"request": {"method": "POST", "url": "https://api.openai.com/v1/responses", "body": {}},
+             "response": _openai_response([{
+                 "type": "function_call", "name": "run_shell", "call_id": "call_recording_ls_0123456789",
+                 "arguments": json.dumps({"command": "ls"}),
+             }])},
+            {"request": {"method": "POST", "url": "https://api.openai.com/v1/responses", "body": {}},
+             "response": _openai_response([{
+                 "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": answer}],
+             }])},
+        ],
+    }
+    outgoing, replayed_answer, failures = replay_cassette(cassette)
+    if failures:
+        fail(f"recording task replay failed: {failures!r}")
+    if replayed_answer != answer or len(outgoing) != 3:
+        fail("recording task replay did not preserve the expected answer and three exchanges")
+    ok("recording task replays its read, ls, and final-answer turns")
+
+
+@check("vendor_replay.needed_back_values_excludes_request_echoes")
+def check_needed_back_values_excludes_request_echoes() -> None:
+    openai = json.loads((CASSETTE_DIR / "openai.json").read_text(encoding="utf-8"))
+    openai_needed = needed_back_values(openai)
+    if any(location.endswith("description") for _earlier, _later, location, _value in openai_needed):
+        fail("OpenAI tool description was incorrectly listed as needed back")
+    if not any(location.endswith("call_id") for _earlier, _later, location, _value in openai_needed):
+        fail("OpenAI call_id values were not listed as needed back")
+
+    gemini = json.loads((CASSETTE_DIR / "gemini.json").read_text(encoding="utf-8"))
+    gemini_needed = needed_back_values(gemini)
+    if not any("thoughtSignature" in location for _earlier, _later, location, _value in gemini_needed):
+        fail("Gemini thoughtSignature values were not listed as needed back")
+
+    echoed = "a request string that is repeated by the vendor"
+    opaque_id = "opaque-round-trip-id-0123456789"
+    synthetic = {
+        "exchanges": [
+            {
+                "request": {"body": {"text": echoed}},
+                "response": {"body": json.dumps({"echo": echoed, "id": opaque_id})},
+            },
+            {
+                "request": {"body": {"echo": echoed, "id": opaque_id}},
+                "response": {"body": "{}"},
+            },
+        ],
+    }
+    synthetic_needed = needed_back_values(synthetic)
+    if [(location.rsplit(".", 1)[-1], value) for _earlier, _later, location, value in synthetic_needed] != [("id", opaque_id)]:
+        fail(f"synthetic echo cassette listed unexpected needed-back values: {synthetic_needed!r}")
+    ok("needed-back values exclude request echoes and retain vendor-originated IDs")
 
 
 def main() -> None:

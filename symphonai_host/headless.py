@@ -708,6 +708,7 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                 loop = current
                 break
         loop = store.load(loop["id"])
+        loop["usage"] = runtime.run.loop_usage(loop)
         _print_loop_result(loop, arguments.json, approval_error)
         return 1 if approval_error or loop.get("state") in ("needs_attention", "cancelled") else 0
     except KeyboardInterrupt:

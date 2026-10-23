@@ -114,9 +114,18 @@ def check_host_server_close_is_prompt() -> None:
 
 @check("host_server.spec_validation_commands")
 def check_loop_spec_validation() -> None:
-    text = "# Card spec\n\n## Validation\n\n```sh\npython3 -m unittest\n\n.venv/bin/python scripts/check.py\n```\n\n## Report\n"
-    if spec_validation(text) != ["python3 -m unittest", ".venv/bin/python scripts/check.py"]:
-        fail("loop spec validation commands were not parsed from the fenced block")
+    commands = ["python3 -m unittest", ".venv/bin/python scripts/check.py"]
+    for heading in ("# Validation", "## Validation", "### Validation", "## vAlIdAtIoN"):
+        text = f"# Card spec\n\n{heading}\n\n```sh\n" + "\n".join(commands) + "\n```\n\n## Report\n"
+        if spec_validation(text) != commands:
+            fail(f"loop spec validation commands were not parsed under {heading!r}")
+    nested = (
+        "## Validation\n\n### Notes\n\nThis subsection remains inside Validation.\n\n"
+        "```sh\npython3 -m unittest\n```\n\n## Report\n"
+        "```sh\nnot-a-validation-command\n```\n"
+    )
+    if spec_validation(nested) != ["python3 -m unittest"]:
+        fail("a lower-level subsection ended Validation or Report commands were included")
     if spec_validation("## Validation\nProse only\n"):
         fail("validation prose without a command fence was accepted")
 
@@ -12081,8 +12090,9 @@ def check_empty_chat_mode_is_one_chat() -> None:
             host.close()
 
 
-def _headless_loop_provider(validation_command: str = "true") -> FakeModelProvider:
-    loop_id = "loop_000000000000"
+def _headless_loop_provider(
+    validation_command: str = "true", loop_id: str = "loop_000000000000",
+) -> FakeModelProvider:
     spec_path = f".symphonai/loops/{loop_id}/specs/a-change.md"
     report_path = f".symphonai/loops/{loop_id}/reports/a-change-a-report.md"
     spec = (
@@ -12093,7 +12103,7 @@ def _headless_loop_provider(validation_command: str = "true") -> FakeModelProvid
         "id": "a", "title": "Change a", "spec": "specs/a-change.md",
         "lane": 1, "after": [],
     }]}
-    return FakeModelProvider([
+    responses = [
         ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
             "plan-spec", "write_file", {"path": spec_path, "content": spec},
         )])),
@@ -12112,6 +12122,10 @@ def _headless_loop_provider(validation_command: str = "true") -> FakeModelProvid
         )])),
         ModelResponse(Message(Role.ASSISTANT, "Implemented the change.")),
         ModelResponse(Message(Role.ASSISTANT, "Verdict: pass")),
+    ]
+    return FakeModelProvider([
+        ModelResponse(response.message, Usage(10, 2, 3, 4))
+        for response in responses
     ])
 
 
@@ -12155,6 +12169,30 @@ def check_headless_loop() -> None:
                 or result["summary"]["validation"][0].get("exit") != 0
                 or not (sessions / "loops" / loop["id"] / "integration").is_dir()):
             fail(f"headless loop did not stop at a committed checkpoint: {code}, {result!r}, {loop!r}, {error!r}")
+        expected_usage = {
+            "cards": {
+                "a": {
+                    "implement": {
+                        "input_tokens": 30, "output_tokens": 6, "calls": 3,
+                        "cache_read_tokens": 9, "cache_write_tokens": 12,
+                    },
+                    "review": {
+                        "input_tokens": 10, "output_tokens": 2, "calls": 1,
+                        "cache_read_tokens": 3, "cache_write_tokens": 4,
+                    },
+                },
+            },
+            "planning": {
+                "input_tokens": 30, "output_tokens": 6, "calls": 3,
+                "cache_read_tokens": 9, "cache_write_tokens": 12,
+            },
+            "total": {
+                "input_tokens": 70, "output_tokens": 14, "calls": 7,
+                "cache_read_tokens": 21, "cache_write_tokens": 28,
+            },
+        }
+        if result.get("usage") != expected_usage:
+            fail(f"headless --json loop omitted real usage: {result.get('usage')!r}")
         branch_ref = subprocess.run(
             ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{loop['branch']}"],
             cwd=root, check=False,
@@ -12164,6 +12202,7 @@ def check_headless_loop() -> None:
         integration = sessions / "loops" / loop["id"] / "integration"
         if not (integration / "new.py").is_file() or "card a" not in error:
             fail(f"headless loop did not run its card or report card changes: {error!r}")
+
         committer = HostRun(
             FakeModelProvider(), PermissionPolicy(root, allowed_write_scope=[root]),
             EventBroker(), sessions_root=sessions,
@@ -12174,6 +12213,60 @@ def check_headless_loop() -> None:
             committer.close()
         if LoopStore(root).load(loop["id"])["state"] != "done":
             fail("later checkpoint approval did not finish the headless loop")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "headless-text-usage@example.test"),
+            ("config", "user.name", "Headless Text Usage Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+        with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+            code, output, _error, _sessions = _headless_invoke(
+                root,
+                _headless_loop_provider(),
+                ["loop", "Add new.py", "--repo-root", str(root), "--provider", "openai"],
+            )
+        if code != 0 or "Tokens: 70 in · 14 out · 7 calls" not in output:
+            fail(f"headless loop text omitted actual usage: {code}, {output!r}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
+            ("config", "user.email", "headless-plan-usage@example.test"),
+            ("config", "user.name", "Headless Plan Usage Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+
+        with mock.patch.object(
+            HostRun, "approve_loop_plan", side_effect=RunActiveError("approval unavailable"),
+        ), mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000002"):
+            code, output, _error, _sessions = _headless_invoke(
+                root,
+                _headless_loop_provider(loop_id="loop_000000000002"),
+                ["loop", "Plan only", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
+        result = json.loads(output)
+        if (code != 1 or result.get("state") != "awaiting_plan"
+                or result.get("usage", {}).get("planning") != {
+                    "input_tokens": 30, "output_tokens": 6, "calls": 3,
+                    "cache_read_tokens": 9, "cache_write_tokens": 12,
+                }
+                or result.get("usage", {}).get("total") != {
+                    "input_tokens": 30, "output_tokens": 6, "calls": 3,
+                    "cache_read_tokens": 9, "cache_write_tokens": 12,
+                }):
+            fail(f"headless planning stop omitted planner usage: {code}, {result!r}")
 
     class TerminalInput(io.StringIO):
         def isatty(self):

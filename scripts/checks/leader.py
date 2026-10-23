@@ -5065,7 +5065,7 @@ def check_spec_workflow_prompts() -> None:
     with workspace() as ws:
         roster = builtin_subagent_specs(FakeModelProvider(), ws.policy)
         requirements = {
-            "planner": ("path requested by the task", "Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report", "one fenced `sh` block", "project root", "End by naming the spec path"),
+            "planner": ("path requested by the task", "Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report", "as `##` headings", "one fenced `sh` block", "project root", "End by naming the spec path"),
             "implementer": ("Implement exactly the given spec", "only files in its Scope", "Never edit the spec you were given", "Run every Validation command", "git status --porcelain verbatim"),
             "reviewer": ("Read the diff before the report", "scratch directory", "<id>F-<slug>.md", "<id>F2-<slug>.md", "Never commit"),
         }
