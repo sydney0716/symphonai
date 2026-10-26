@@ -16,7 +16,7 @@ import time
 import unittest.mock as mock
 import uuid
 from pathlib import Path
-from symphonai_api.config import ConfigError, load_config
+from symphonai_api.config import load_config
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.jobs import JobManager
 from symphonai_api.models import ToolCall
@@ -711,6 +711,7 @@ def check_sandbox_settings() -> None:
         root = Path(temporary)
         project_config = root / ".symphonai" / "config.toml"
         project_config.parent.mkdir()
+        defaults = load_config(repo_root=root, home=root / "home")
         project_config.write_text("[sandbox]\nshell = true\nnetwork = false\n", encoding="utf-8")
         resolved = load_config(repo_root=root, home=root / "home")
         if resolved.get("sandbox.shell") is not True or resolved.get("sandbox.network") is not False:
@@ -720,13 +721,11 @@ def check_sandbox_settings() -> None:
             ("[sandbox]\nother = true\n", "sandbox.other"),
         ):
             project_config.write_text(content, encoding="utf-8")
-            try:
-                load_config(repo_root=root, home=root / "home")
-            except ConfigError as exc:
-                if key not in str(exc):
-                    fail(f"sandbox validation error omitted {key}: {exc!r}")
-            else:
-                fail(f"invalid sandbox setting was accepted for {key}")
+            skipped = load_config(repo_root=root, home=root / "home")
+            if skipped.get(key) != defaults.get(key):
+                fail(f"invalid project sandbox setting {key} replaced its default")
+            if not any(str(project_config) in warning and key in warning for warning in skipped.warnings):
+                fail(f"skipped project sandbox setting warning omitted its path or key: {skipped.warnings!r}")
 
 
 @check("shell.process_group_fallback")

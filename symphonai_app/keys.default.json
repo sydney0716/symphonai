@@ -7,6 +7,8 @@
   "mod+.": "stop-run",
   "mod+l": "focus-input",
   "mod+shift+p": "command-palette",
+  "mod+p": "quick-open",
   "mod+f": "find",
+  "ctrl+r": "history-search",
   "mod+k": "clear-chat"
 }

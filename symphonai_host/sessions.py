@@ -112,7 +112,7 @@ def prune_sessions(root: Path, *, period_days: int, now: datetime) -> int:
 
 def list_sessions(
     root: Path, *, limit: int | None = None, activity: dict[str, str] | None = None,
-    query: str | None = None,
+    query: str | None = None, archived: bool = False,
 ) -> list[dict]:
     """List every session directory, retaining damaged entries for recovery."""
     root = Path(root)
@@ -133,6 +133,7 @@ def list_sessions(
             "parent_run_id": None,
             "parent_session_id": None,
             "repo_root": "",
+            "archived": False,
             "state": "unreadable",
             "message_count": 0,
             "activity": (activity or {}).get(directory.name, "idle"),
@@ -145,11 +146,13 @@ def list_sessions(
                 key: meta.get(key)
                 for key in ("run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id")
             })
+            item["archived"] = meta.get("archived") is True
             repo_root = meta.get("repo_root")
             item["repo_root"] = repo_root if isinstance(repo_root, str) else ""
         except (OSError, TranscriptError, ValueError, KeyError, TypeError):
             store = None
         sessions.append((item, store))
+    sessions = [entry for entry in sessions if entry[0]["archived"] is archived]
     sessions.sort(key=lambda entry: entry[0]["updated_at"] or "", reverse=True)
     if query:
         needle = query.casefold()
@@ -187,4 +190,6 @@ def list_sessions(
             item["message_count"] = len(loaded.messages)
         except (OSError, TranscriptError, ValueError, KeyError, TypeError):
             pass
+    for item, _ in selected:
+        item.pop("archived", None)
     return [item for item, _ in selected]

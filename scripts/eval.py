@@ -23,7 +23,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a vendor model on fixed SymphonAI loop tasks.")
     parser.add_argument("--provider", required=True, help="provider name, such as openai or anthropic")
     parser.add_argument("--model", required=True, help="vendor model name")
-    parser.add_argument("--task", choices=task_names, help="run one task instead of all three")
+    parser.add_argument("--task", choices=task_names, help="run one task instead of all six")
     parser.add_argument("--out", type=Path, help="write the result rows as JSON to this path")
     return parser
 

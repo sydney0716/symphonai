@@ -52,6 +52,8 @@ def _event_instance(event_class: type[Event], *, turn_id_none: bool = False) -> 
             values[field.name] = {"exit": 1, "ok": False, "output": "out"}
         elif hints[field.name] == list[dict]:
             values[field.name] = [{"step": "Run the tests", "status": "in_progress"}]
+        elif hints[field.name] == list[str]:
+            values[field.name] = ["path/one.py"]
         else:
             raise AssertionError(f"unsupported event field {event_class.__name__}.{field.name}")
     return event_class(**values)

@@ -90,6 +90,12 @@ export const COMMANDS = Object.freeze([
     argumentHint: "",
   }),
   Object.freeze({
+    name: "export",
+    aliases: Object.freeze([]),
+    description: "Download this conversation as Markdown",
+    argumentHint: "",
+  }),
+  Object.freeze({
     name: "review",
     aliases: Object.freeze([]),
     description: "Review the uncommitted changes",

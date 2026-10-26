@@ -54,6 +54,7 @@ class ResolvedConfig:
     values: Mapping[str, object]
     provenance: Mapping[str, Provenance]
     layers: tuple[ConfigLayer, ...] = ()
+    warnings: tuple[str, ...] = ()
 
     def get(self, key: str, default: object = None) -> object:
         return self.values.get(key, default)
@@ -195,7 +196,11 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
             for entry in _strings(source, "worktree.symlink", worktree["symlink"]):
                 path = Path(entry)
                 if not entry or path.is_absolute() or ".." in path.parts:
-                    _raise(source, "worktree.symlink", "entries must be relative paths without '..'")
+                    _raise(
+                        source,
+                        "worktree.symlink",
+                        f"unsafe path {entry!r}; entries must be relative paths without '..'",
+                    )
     budgets = _table(source, values, "budgets")
     if budgets is not None:
         _unknown_keys(source, "budgets", budgets, {"leader", "subagent", "price_table"})
@@ -325,26 +330,46 @@ def load_config(
     resolved: dict[str, object] = {}
     provenance: dict[str, Provenance] = {}
     layers: list[ConfigLayer] = []
+    warnings: list[str] = []
     for scope, source, supplied in sources:
         if scope is Scope.SESSION:
             values = supplied
         else:
             if source is None:
                 raise AssertionError("file-backed config scope has no source")
-            values = _read_toml(source)
+            try:
+                values = _read_toml(source)
+            except ConfigError as exc:
+                if scope not in {Scope.PROJECT, Scope.PRIVATE}:
+                    raise
+                warnings.append(str(exc))
+                continue
         if values is None:
             continue
         if not isinstance(values, Mapping):
+            if scope in {Scope.PROJECT, Scope.PRIVATE}:
+                warnings.append(f"{source}: config: must be a table; file skipped")
+                continue
             _raise(source, "config", "must be a table")
-        if "permissions" in values and scope in {Scope.PROJECT, Scope.PRIVATE}:
-            _raise(
-                source,
-                "permissions",
-                "permission grants are refused from project and private config scopes; use user config",
-            )
+        if scope in {Scope.PROJECT, Scope.PRIVATE}:
+            safe_values: dict[str, object] = {}
+            for section, value in values.items():
+                if section == "permissions":
+                    warnings.append(
+                        f"{source}: permissions: grants are refused from project and private config scopes; section skipped"
+                    )
+                    continue
+                try:
+                    _validate(source, {section: value})
+                except ConfigError as exc:
+                    warnings.append(f"{exc}; section skipped")
+                    continue
+                safe_values[section] = value
+            values = safe_values
         if "permissions" in values and scope is Scope.SESSION:
             _raise(source, "permissions", "permission grants are supported only in user config")
-        _validate(source, values)
+        if scope not in {Scope.PROJECT, Scope.PRIVATE}:
+            _validate(source, values)
         flattened = _flatten(values)
         if flattened:
             layers.append(
@@ -361,6 +386,7 @@ def load_config(
         values=MappingProxyType(resolved),
         provenance=MappingProxyType(provenance),
         layers=tuple(layers),
+        warnings=tuple(warnings),
     )
 
 

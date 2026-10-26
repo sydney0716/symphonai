@@ -653,9 +653,13 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
         subscription = broker.subscribe()
         try:
             if arguments.resume is not None:
-                loop = runtime.run.resume_loop(arguments.resume, runner_pid=os.getpid())
+                loop = runtime.run.resume_loop(
+                    arguments.resume, runner_pid=os.getpid(), runner_lock=True,
+                )
             else:
-                loop = runtime.run.start_loop(goal, runner_pid=os.getpid())
+                loop = runtime.run.start_loop(
+                    goal, runner_pid=os.getpid(), runner_lock=True,
+                )
         except KeyError:
             print(f"loop {arguments.resume} is unknown", file=sys.stderr, flush=True)
             return 1

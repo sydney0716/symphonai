@@ -30,9 +30,23 @@ test("the configured default file returns every binding", async () => {
   assert.equal(bindings.get("shift+enter"), "newline");
   assert.equal(bindings.get("alt+enter"), "newline");
   assert.equal(bindings.get("mod+enter"), "newline");
+  assert.equal(bindings.get("mod+p"), "quick-open");
+  assert.equal(bindings.get("ctrl+r"), "history-search");
   for (const chord of RESERVED) {
     assert.ok(bindings.has(chord), `default keymap omitted reserved chord ${chord}`);
   }
+});
+
+
+test("quick-open can be rebound through the user keymap", async () => {
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
+  const { bindings, rejected } = mergeKeymap(
+    defaults,
+    parseKeymap('{"mod+p":null,"alt+o":"quick-open"}'),
+  );
+  assert.deepEqual(rejected, []);
+  assert.equal(lookup(bindings, { key: "p", ctrlKey: true }, { platform: "linux" }), null);
+  assert.equal(lookup(bindings, { key: "o", altKey: true }, { platform: "linux" }), "quick-open");
 });
 
 
@@ -62,6 +76,19 @@ test("a user keymap can rebind find", async () => {
   assert.deepEqual(rejected, []);
   assert.equal(bindings.has("mod+f"), false);
   assert.equal(lookup(bindings, { key: "g", altKey: true }, { platform: "linux" }), "find");
+});
+
+
+test("a user keymap can rebind prompt history search", async () => {
+  const defaults = await loadKeymap(DEFAULT_KEYMAP_PATH);
+  const { bindings, rejected } = mergeKeymap(
+    defaults,
+    parseKeymap('{"ctrl+r":null,"alt+r":"history-search"}'),
+  );
+
+  assert.deepEqual(rejected, []);
+  assert.equal(bindings.has("ctrl+r"), false);
+  assert.equal(lookup(bindings, { key: "r", altKey: true }, { platform: "linux" }), "history-search");
 });
 
 

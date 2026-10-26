@@ -163,13 +163,12 @@ def load_real_config() -> None:
             if len(populated) != 1:
                 fail(f"trusted repository {capability} was not accepted: {trusted!r}")
             _write(source, "")
-            try:
-                load_extensions(repo_root=root, home=home)
-            except ConfigError as exc:
-                if str(project) not in str(exc):
-                    fail(f"untrusted {capability} refusal lost its source: {exc!r}")
-            else:
-                fail(f"repository {capability} was accepted without owner trust")
+            refused = load_extensions(repo_root=root, home=home)
+            refused_values = refused.hooks if capability == "hooks" else refused.mcp_servers
+            if refused_values:
+                fail(f"untrusted repository {capability} was applied: {refused_values!r}")
+            if not any(str(project) in warning and capability in warning for warning in refused.config.warnings):
+                fail(f"untrusted {capability} warning omitted its source or reason: {refused.config.warnings!r}")
 
 
 @check("extensions.errors_are_atomic")

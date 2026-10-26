@@ -55,8 +55,8 @@ def tasks_are_sound() -> None:
     ok("missing usage reports tokens and calls as unavailable")
 
     tasks = sorted(path for path in TASKS_ROOT.iterdir() if path.is_dir())
-    if len(tasks) != 3:
-        fail(f"expected three evaluation tasks, found {len(tasks)}")
+    if len(tasks) != 6:
+        fail(f"expected six evaluation tasks, found {len(tasks)}")
 
     for task in tasks:
         project_source = task / "project"

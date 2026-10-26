@@ -110,6 +110,10 @@ const RECORDED_EVENTS = Object.freeze({
     card_id: "",
     reason: "",
   }),
+  FilesChanged: event("FilesChanged", {
+    paths: ["path/one.py"],
+    truncated: false,
+  }),
 });
 
 test("assistant deltas join only while consecutive", () => {

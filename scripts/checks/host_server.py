@@ -83,7 +83,7 @@ from symphonai_host.broker import EventBroker
 from symphonai_host.goal import GoalChanged
 from symphonai_host.loops import LoopStore
 from symphonai_host.plan import PlanChanged
-from symphonai_host.protocol import ApprovalRequested, decode_event, decode_frame
+from symphonai_host.protocol import ApprovalRequested, FilesChanged, decode_event, decode_frame
 from symphonai_host.run import HostRun, RunActiveError
 from symphonai_host.projects import ProjectRuntime
 from symphonai_host.projects import choose_start_root
@@ -110,6 +110,63 @@ def check_host_server_close_is_prompt() -> None:
         elapsed = time.monotonic() - started
         if elapsed >= 0.2:
             fail(f"host close took {elapsed:.3f}s")
+
+
+@check("host_server.files_changed_event")
+def check_files_changed_event() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        root.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "check@example.test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Check"], cwd=root, check=True)
+        (root / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        (root / ".gitignore").write_text("ignored.log\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt", ".gitignore"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        broker = EventBroker()
+        host = SimpleNamespace(
+            _watch_stop=threading.Event(),
+            _event_watch_subscription=None,
+            _runtimes_lock=threading.RLock(),
+            _current_root=root,
+            broker=broker,
+        )
+        subscription = None
+        watcher = threading.Thread(target=HostServer._watch_files, args=(host,), daemon=True)
+        try:
+            watcher.start()
+            (root / "tracked.txt").write_text("changed with no app\n", encoding="utf-8")
+            time.sleep(0.4)
+            subscription = host.broker.subscribe()
+            time.sleep(0.4)
+            if subscription.get(timeout=0.05) is not None:
+                fail("file watcher published changes made before an app connected")
+
+            (root / "tracked.txt").write_text("first connected edit\n", encoding="utf-8")
+            event = subscription.get(timeout=2.0)
+            if not isinstance(event, FilesChanged) or event.paths != ["tracked.txt"] or event.truncated:
+                fail(f"tracked file change was not published correctly: {event!r}")
+
+            for value in ("burst one\n", "burst two\n", "burst three\n"):
+                (root / "tracked.txt").write_text(value, encoding="utf-8")
+                time.sleep(0.1)
+            event = subscription.get(timeout=2.0)
+            if not isinstance(event, FilesChanged) or event.paths != ["tracked.txt"]:
+                fail(f"settled burst was not coalesced into one file event: {event!r}")
+            if subscription.get(timeout=1.2) is not None:
+                fail("three quick writes produced more than one file event")
+
+            (root / "ignored.log").write_text("ignored\n", encoding="utf-8")
+            (root / ".git" / "watch-check").write_text("git metadata\n", encoding="utf-8")
+            if subscription.get(timeout=1.4) is not None:
+                fail("ignored or .git changes produced a FilesChanged event")
+        finally:
+            if subscription is not None:
+                subscription.close()
+            host._watch_stop.set()
+            broker.close()
+            watcher.join(timeout=1)
 
 
 @check("host_server.spec_validation_commands")
@@ -9932,6 +9989,97 @@ def _project_runtime(root: Path, broker: EventBroker, sessions_root: Path, *, pr
     return ProjectRuntime(root.resolve(), run, pool, lsp)
 
 
+@check("host_server.refused_project_still_opens")
+def check_refused_project_still_opens() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        initial = base / "initial"
+        project = base / "hook-project"
+        home = base / "home"
+        initial.mkdir()
+        project.mkdir()
+        config_path = project / ".symphonai" / "config.toml"
+        config_path.parent.mkdir()
+        marker = base / "hook-ran"
+        command = [
+            sys.executable, "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+        ]
+        config_path.write_text(
+            "[[hooks]]\non = [\"RunStarted\"]\ncommand = "
+            + json.dumps(command) + "\n",
+            encoding="utf-8",
+        )
+        private_config_path = project / ".symphonai" / "config.local.toml"
+        private_config_path.write_text('[permissions]\nshell = [["python3"]]\n', encoding="utf-8")
+        sessions_root = base / "sessions"
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "private-shell", "run_shell", {"argv": ["python3", "--version"]},
+            )])),
+        ])
+
+        def factory(root, broker, approval):
+            extensions = load_extensions(repo_root=root, home=home)
+            run = HostRun(
+                provider, PermissionPolicy(
+                    repo_root=root, shell_enabled=True, shell_allowlist=[], mode="ask",
+                ), broker,
+                sessions_root=sessions_root,
+                memory_extraction_enabled=False,
+                extensions=extensions,
+                publish_approval=approval,
+            )
+            return ProjectRuntime(root.resolve(), run)
+
+        host = HostServer(
+            provider, PermissionPolicy(
+                repo_root=initial, shell_enabled=True, shell_allowlist=[], mode="ask",
+            ), sessions_root=sessions_root,
+            project_factory=factory,
+        )
+        host.start()
+        try:
+            connection, response = _request(
+                host, "POST", "/project/open", body={"path": str(project)},
+                headers=_headers(host),
+            )
+            try:
+                reply = json.loads(response.read())
+                if response.status != 200 or reply.get("repo_root") != str(project.resolve()):
+                    fail(f"project with refused hooks failed to open: {response.status}, {reply!r}")
+                warnings = reply.get("config_warnings", [])
+                if not any(str(config_path) in warning and "hooks were refused" in warning for warning in warnings):
+                    fail(f"project/open did not explain the refused hooks: {reply!r}")
+                if not any(str(private_config_path) in warning and "permissions" in warning for warning in warnings):
+                    fail(f"project/open did not explain the private permissions refusal: {reply!r}")
+            finally:
+                connection.close()
+            connection, response = _request(host, "GET", "/settings", headers=_headers(host))
+            try:
+                settings = json.loads(response.read()).get("settings", {})
+                if settings.get("config_warnings") != warnings:
+                    fail(f"settings did not expose config warnings before a conversation: {settings!r}")
+            finally:
+                connection.close()
+            if host.run.extensions.hooks:
+                fail(f"refused project hooks were applied: {host.run.extensions.hooks!r}")
+            if host.run.project_permission_grants()[0]:
+                fail("private project permission grants were honored")
+            _send_host_prompt(host, "confirm refused hook does not run")
+            if marker.exists():
+                fail("a hook from the untrusted project configuration ran")
+            conversation = host.run.conversation_stats()
+            warnings = [] if conversation is None else conversation.get("config_warnings", [])
+            if not any(str(config_path) in warning and "hooks were refused" in warning for warning in warnings):
+                fail(f"conversation stats did not explain the refused hooks: {conversation!r}")
+            if not any(str(private_config_path) in warning and "permissions" in warning for warning in warnings):
+                fail(f"conversation stats omitted the project config warning: {conversation!r}")
+        finally:
+            host.close()
+
+
 @check("host_server.project_open_and_switch")
 def check_project_open_and_switch() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -12545,10 +12693,19 @@ def check_headless_loop_is_not_recovered_while_running() -> None:
         loop.update(
             state="running",
             runner_pid=os.getpid(),
+            runner_lock=True,
             cards=[{"id": "a", "title": "A", "state": "running", "session_id": "run_card"}],
             lanes=[{"id": 1, "cards": ["a"]}],
         )
         store.save(loop)
+        lock_owner = HostRun(
+            FakeModelProvider(), PermissionPolicy(root), EventBroker(),
+            sessions_root=sessions,
+        )
+        lock_fd = lock_owner._acquire_loop_runner_lock(loop["id"])
+        if lock_fd is None:
+            fail("could not acquire the headless runner lock")
+        lock_owner._loop_runner_lock_fds[loop["id"]] = lock_fd
 
         with mock.patch.object(HostRun, "_advance_loop", lambda _self, _loop_id: None):
             live_host = HostServer(
@@ -12560,6 +12717,7 @@ def check_headless_loop_is_not_recovered_while_running() -> None:
                     fail(f"host recovered a card while its headless runner was alive: {live_loop!r}")
             finally:
                 live_host.close()
+            lock_owner.close()
 
             stale = store.load(loop["id"])
             stale["runner_pid"] = os.getpid() + 10_000_000

@@ -54,6 +54,7 @@ fields on a known event are ignored for forward compatibility.
 | `BackgroundUsageRecorded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str` |
 | `JobChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `job_id: str`, `status: str`, `session_id: str | null` |
 | `LoopChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `loop_id: str`, `state: str`, `change: str`, `card_id: str`, `reason: str` |
+| `FilesChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `paths: list[str]`, `truncated: bool` |
 
 `target` is a bounded display string derived from the call, not the argument
 itself. For a shell call it is the program name, for a fetch it is the origin,
@@ -83,7 +84,9 @@ not current closes after its last turn, approval, question, goal check, or
 command ends. Session operations on a conversation from another project return
 409 with `{"error":"that conversation belongs to another project"}`; clients
 switch to its project first.
-
+When project or private config is skipped, `POST /project/open` includes
+`config_warnings` naming each file and reason. `GET /settings` includes the
+same list under `settings.config_warnings` when non-empty.
 The host may start with no project. In that state `GET /project` returns
 `{"repo_root":null,"name":null}` and project-dependent routes return 409 with
 `{"error":"open a project first"}`. `GET /projects` lists the current and open
@@ -277,12 +280,23 @@ An optional positive `limit` query parameter bounds the entries returned and
 classified; missing, empty, non-numeric, zero, and negative values return the
 full listing. An optional `query` filters by a case-insensitive substring in
 the title or a user or assistant message, before applying `limit`.
+Archived sessions are omitted by default; `archived=1` lists only archived
+sessions, with `query` and `limit` applied to that set.
+`GET /session/export?id=<run_id>` returns `{"filename": "<title or run_id>.md",
+"markdown": str}` for an open or closed session, or `404` for an unknown id.
+The Markdown contains the title, creation date, user prompts, assistant text,
+attachment names, and tool names, display-safe targets, and outcomes. It omits
+reasoning, tool arguments, tool output, and image data.
 `POST /session/rename` takes `{"run_id": str, "title": str}` and trims a
 non-blank title of at most 200 characters; it returns `{"renamed": true}` or
 `404` for an unknown session. `POST /session/delete` takes `{"run_id": str}`;
 it returns `{"deleted": true}`, `404` when unknown, or `409` while a turn,
 approval, question, or goal check is pending. An idle open session is closed
-before its directory is removed. `POST /session/open` takes a `run_id`, replays `HistoryMessage` event frames before
+before its directory is removed. `POST /session/archive` takes
+`{"run_id": str, "archived": bool}`, updates that metadata flag, and returns
+`{"archived": bool}` or `404` for an unknown session. Archiving an open
+conversation leaves it open. `POST /session/open` takes a `run_id`, replays
+`HistoryMessage` event frames before
 its reply, and makes that conversation current. Each history and runtime event
 frame includes the originating `session_id`. Later prompts append to the same
 session directory and transcript, while each prompt still has a distinct run
@@ -446,6 +460,8 @@ agents report the state of their most recent run. `mode` reports the mode
 currently in force. `instruction_warnings` is a list of instruction loading
 warnings for conversations started by this host, and is empty for clean or
 reopened conversations.
+When project or private config was skipped, `config_warnings` contains the
+file and reason; clean conversations omit that field.
 Each agent appears once; the first run in the
 timestamp-ordered run graph determines its parent. After a run completes in
 this process, the payload also contains `context` (`used_tokens`, `budget_tokens`,

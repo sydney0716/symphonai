@@ -1,0 +1,25 @@
+diff --git a/names.py b/names.py
+index 0000000..0000000 100644
+--- a/names.py
++++ b/names.py
+@@ -1,2 +1,7 @@
+-def format_name(value):
++def display_name(value):
+     return value.strip().title()
++
++
++def format_name(value):
++    """Deprecated alias; use display_name()."""
++    return display_name(value)
+diff --git a/report.py b/report.py
+index 0000000..0000000 100644
+--- a/report.py
++++ b/report.py
+@@ -1,5 +1,5 @@
+-from names import format_name
++from names import display_name
+ 
+ 
+ def report_title(value):
+-    return f"Report: {format_name(value)}"
++    return f"Report: {display_name(value)}"

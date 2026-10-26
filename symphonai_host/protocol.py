@@ -31,6 +31,14 @@ class UnknownEvent:
 
 
 @dataclass(frozen=True)
+class FilesChanged(Event):
+    """A settled set of readable project paths changed on disk."""
+
+    paths: list[str] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
 class PromptRequest:
     prompt: str
     attachments: tuple[ImageBlock | DocumentBlock, ...] = ()

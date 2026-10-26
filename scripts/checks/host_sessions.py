@@ -20,7 +20,7 @@ from unittest import mock
 from symphonai_api.events import RunFinished, SessionEnded
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.session import SessionStore, load_run, read_records
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
 from symphonai_api.serialization import message_to_json
 from symphonai_api.identity import new_id
 from symphonai_api.leases import WorkspaceLeases
@@ -523,6 +523,130 @@ def check_limit_route() -> None:
                         fail(f"sessions query failed open listing for {path!r}: {response.status}, {body!r}")
                 finally:
                     connection.close()
+        finally:
+            host.close()
+
+
+@check("host_sessions.archive_and_restore")
+def check_archive_and_restore() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host, client = _host(root)
+        try:
+            client.send_prompt("searchable archive prompt")
+            _wait_idle(client)
+            session_id = client.list_sessions()[0]["run_id"]
+            transcript = root / "sessions" / session_id / "run.jsonl"
+            original_messages = [
+                record for record in read_records(transcript)[0]
+                if record.get("type") == "message"
+            ]
+
+            connection, response = _request(
+                host, "POST", "/session/archive",
+                body={"run_id": session_id, "archived": True}, headers=_headers(host),
+            )
+            try:
+                reply = json.loads(response.read())
+                if response.status != 200 or reply != {"archived": True}:
+                    fail(f"archive returned {response.status}: {reply!r}")
+            finally:
+                connection.close()
+
+            active_connection, active_response = _request(
+                host, "GET", "/sessions?query=searchable+archive+prompt", headers=_headers(host),
+            )
+            try:
+                active = json.loads(active_response.read())
+            finally:
+                active_connection.close()
+            archived_connection, archived_response = _request(
+                host, "GET", "/sessions?archived=1&query=searchable+archive+prompt",
+                headers=_headers(host),
+            )
+            try:
+                archived = json.loads(archived_response.read())
+                if active_response.status != 200 or session_id in {item["run_id"] for item in active}:
+                    fail("archived conversation remained in the default search")
+                if archived_response.status != 200 or [item["run_id"] for item in archived] != [session_id]:
+                    fail(f"archived listing did not return the session: {archived!r}")
+            finally:
+                archived_connection.close()
+            current_messages = [
+                record for record in read_records(transcript)[0]
+                if record.get("type") == "message"
+            ]
+            if current_messages != original_messages:
+                # Metadata updates leave the transcript byte-for-byte untouched.
+                fail("archiving changed transcript messages")
+
+            connection, response = _request(
+                host, "POST", "/session/archive",
+                body={"run_id": session_id, "archived": False}, headers=_headers(host),
+            )
+            try:
+                reply = json.loads(response.read())
+                if response.status != 200 or reply != {"archived": False}:
+                    fail(f"unarchive did not clear the archived flag: {response.status}, {reply!r}")
+            finally:
+                connection.close()
+            if session_id not in {item["run_id"] for item in client.list_sessions()}:
+                fail("unarchived conversation did not return to the default listing")
+        finally:
+            host.close()
+
+
+@check("host_sessions.export_markdown")
+def check_export_markdown() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        host, client = _host(root)
+        try:
+            store = SessionStore(root / "sessions", "export-run", repo_root=root)
+            meta = store.read_meta()
+            meta["title"] = "Export title"
+            meta["created_at"] = "2026-10-20T12:00:00+00:00"
+            store.write_meta(meta)
+            writer = store.writer_for("agent-export", is_root=True)
+            writer.append("run_started", run_id="runtime-export", agent_id="agent-export", turn_id=None, data={"parent_run_id": None})
+            messages = [
+                Message(Role.USER, "Please inspect the file"),
+                Message(Role.ASSISTANT, "I checked it.", tool_calls=[
+                    ToolCall("read-1", "read_file", {"path": "src/main.py", "unused": "private"}),
+                    ToolCall("shell-1", "run_shell", {"command": "printf secret-argument", "env": {"TOKEN": "secret-argument"}}),
+                ]),
+                Message(Role.TOOL, tool_result=ToolResult("read-1", True, content="secret output")),
+                Message(Role.TOOL, tool_result=ToolResult("shell-1", False, error="secret output")),
+            ]
+            for message in messages:
+                writer.append("message", run_id="runtime-export", agent_id="agent-export", turn_id="turn-export", data=message_to_json(message))
+            store.close()
+
+            connection, response = _request(host, "GET", "/session/export?id=export-run", headers=_headers(host))
+            try:
+                exported = json.loads(response.read())
+                markdown = exported.get("markdown", "")
+                if response.status != 200 or exported.get("filename") != "Export title.md":
+                    fail(f"session export returned an unexpected reply: {response.status}, {exported!r}")
+                for expected in (
+                    "# Export title", "2026-10-20", "## You", "Please inspect the file",
+                    "## Assistant", "I checked it.", "- ran `read_file` src/main.py — ok",
+                    "- ran `run_shell` printf — failed",
+                ):
+                    if expected not in markdown:
+                        fail(f"session export omitted {expected!r}: {markdown!r}")
+                for secret in ("secret-argument", "secret output", "unused", "env"):
+                    if secret in markdown:
+                        fail(f"session export disclosed {secret!r}: {markdown!r}")
+            finally:
+                connection.close()
+            connection, response = _request(host, "GET", "/session/export?id=missing", headers=_headers(host))
+            try:
+                response.read()
+                if response.status != 404:
+                    fail(f"unknown export returned {response.status}, expected 404")
+            finally:
+                connection.close()
         finally:
             host.close()
 

@@ -220,7 +220,7 @@ export class FakeDocument {
   }
 }
 
-function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, statusStored = null, notificationsStored = null, draftsStored = null, storageThrows = false } = {}) {
+function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStored = null, diffModeStored = null, statusStored = null, notificationsStored = null, draftsStored = null, storageThrows = false } = {}) {
   const listeners = new Map();
   const writes = [];
   const reloads = [];
@@ -235,6 +235,7 @@ function fakeGlobal({ fragment = "", stored = null, themeStored = null, railStor
         if (key === "symphonai.route") return stored;
         if (key === "symphonai.theme") return themeStored;
         if (key === "symphonai.rail-tools") return railStored;
+        if (key === "symphonai.diff-mode") return diffModeStored;
         if (key === "symphonai.status-line") return statusStored;
         if (key === "symphonai.notifications") return notificationsStored;
         if (key === "symphonai.drafts") return drafts;
@@ -372,7 +373,7 @@ export function fakeClient(
     startLoopFailure = null,
   } = {},
 ) {
-  const calls = { agent: [], agentHistory: [], approve: [], command: [], compact: [], conversationStats: 0, credentials: [], file: [], files: [], source: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], roadmap: 0, roadmapActions: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, permissions: 0, removePermission: [], steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
+  const calls = { agent: [], agentHistory: [], approve: [], archiveSession: [], command: [], compact: [], conversationStats: 0, credentials: [], exportSession: [], file: [], files: [], source: [], history: [], forkSession: [], goal: [], goalState: [], jobs: 0, startJob: [], stopJob: [], roadmap: 0, roadmapActions: [], loops: 0, loop: [], startLoop: [], loopPlan: [], loopCancel: [], loopResume: [], loopCard: [], loopCommit: [], memory: 0, updateMemory: [], deleteMemory: [], models: [], newSession: 0, openSession: [], openProject: [], projectActions: [], directoryPaths: [], projects: 0, prompt: [], promptAttachments: [], saveAgent: [], selectMode: [], selectProvider: [], sessions: [], renameSession: [], deleteSession: [], settings: 0, permissions: 0, removePermission: [], steer: [], stop: [], changes: 0, gitStatus: 0, gitDiff: [], commits: [], pullRequestInfo: 0, pullRequests: [], revertChanges: [], applyWorktree: [], discardWorktree: [] };
   let permissionData = structuredClone(permissions);
   let memoryData = memory;
   let currentRoadmapFailure = roadmapFailure;
@@ -683,9 +684,9 @@ export function fakeClient(
       calls.credentials.push({ name, value });
       return { stored: true, name };
     },
-    async sessions(limit, query) {
-      calls.sessions.push(query === undefined ? limit : [limit, query]);
-      return sessions;
+    async sessions(limit, query, archived = false) {
+      if (!archived) calls.sessions.push(query === undefined ? limit : [limit, query]);
+      return sessions.filter((session) => Boolean(session.archived) === archived);
     },
     async renameSession(runId, title) {
       calls.renameSession.push([runId, title]);
@@ -694,6 +695,16 @@ export function fakeClient(
     async deleteSession(runId) {
       calls.deleteSession.push(runId);
       return { deleted: true };
+    },
+    async archiveSession(runId, archived) {
+      calls.archiveSession.push([runId, archived]);
+      const session = sessions.find((item) => item.run_id === runId);
+      if (session) session.archived = archived;
+      return { archived };
+    },
+    async exportSession(runId) {
+      calls.exportSession.push(runId);
+      return { filename: "Project notes.md", markdown: "# Project notes\n" };
     },
     async openSession(runId) {
       calls.openSession.push(runId);
@@ -777,6 +788,7 @@ test("help lists commands and their aliases in table order", async () => {
     "/init — Have the agent write .symphonai/INSTRUCTIONS.md",
     "/rename <title> — Rename this conversation",
     "/copy — Copy the last reply as Markdown",
+    "/export — Download this conversation as Markdown",
     "/review [<focus>] — Review the uncommitted changes",
     "/commit [<message>] — Commit selected changes",
     "/pr — Open a pull request",
@@ -891,7 +903,8 @@ test("the current sidebar row refreshes when its root run ends", async () => {
       ],
     },
   });
-  client.sessions = async (limit) => {
+  client.sessions = async (limit, _query, archived = false) => {
+    if (archived) return [];
     client.calls.sessions.push(limit);
     return [{ ...session, activity: client.calls.sessions.length > 1 ? "idle" : "working" }];
   };
@@ -957,6 +970,137 @@ test("pasted images send with text, clear the chips and render in the transcript
   assert.deepEqual(replayedPrompt.attachments, [{ kind: "document", filename: "spec.pdf" }]);
   const replayedAttachment = find(document.getElementById("chat"), (node) => node.textContent === "PDF · spec.pdf");
   assert.ok(replayedAttachment);
+});
+
+test("long pasted text is a removable, expandable chip and expands exactly on send", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "paste-run" };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  const pasted = Array.from({ length: 42 }, (_unused, index) => `log line ${index + 1}`).join("\n");
+  input.value = "before after";
+  input.selectionStart = 7;
+  input.selectionEnd = 7;
+  let prevented = false;
+  await input.dispatch("paste", {
+    clipboardData: { items: [], getData: () => pasted },
+    preventDefault() { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  const chip = find(document.getElementById("prompt-attachments"), (node) => node.className.includes("pasted-text-chip"));
+  assert.ok(chip);
+  assert.equal(chip.children[0].textContent, "Pasted text #1 · 42 lines");
+  assert.doesNotMatch(input.value, /log line 42/);
+  await find(chip, (node) => node.tagName === "BUTTON" && node.textContent === "Expand").dispatch("click");
+  assert.equal(find(document.getElementById("prompt-attachments"), (node) => node.className === "pasted-text-preview").textContent, pasted);
+
+  const expected = `before ${pasted}after`;
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, [expected]);
+  await client.emit(eventFrame("PromptSubmitted", { text: expected }));
+  assert.ok(find(document.getElementById("chat"), (node) => node.className === "prompt" && node.textContent === expected));
+  assert.equal(document.getElementById("prompt-attachments").children.length, 0);
+});
+
+test("removing a pasted-text chip drops its token and a short paste stays plain", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "paste-remove-run" };
+  };
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  const longText = Array.from({ length: 10 }, (_unused, index) => `row ${index + 1}`).join("\n");
+  await input.dispatch("paste", {
+    clipboardData: { items: [], getData: () => longText },
+    preventDefault() {},
+  });
+  assert.ok(input.value.includes("Pasted text #1"));
+  const chip = find(document.getElementById("prompt-attachments"), (node) => node.className.includes("pasted-text-chip"));
+  await find(chip, (node) => node.tagName === "BUTTON" && node.textContent === "Remove").dispatch("click");
+  assert.equal(input.value, "");
+  assert.equal(document.getElementById("prompt-attachments").children.length, 0);
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, []);
+
+  let prevented = false;
+  await input.dispatch("paste", {
+    clipboardData: { items: [], getData: () => "one\ntwo\nthree" },
+    preventDefault() { prevented = true; },
+  });
+  assert.equal(prevented, false);
+  input.value = "one\ntwo\nthree";
+  await input.dispatch("input");
+  assert.equal(document.getElementById("prompt-attachments").children.length, 0);
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(client.calls.prompt, ["one\ntwo\nthree"]);
+});
+
+test("pasted-text chips survive composer-draft reloads", async () => {
+  const browser = fakeGlobal();
+  const options = { conversation: { session_id: "paste-draft" } };
+  const document = new FakeDocument();
+  await start({ global: browser.global, document, client: fakeClient(fixtureRoadmap(), options) });
+  const input = document.getElementById("prompt");
+  const pasted = Array.from({ length: 10 }, (_unused, index) => `saved ${index + 1}`).join("\n");
+  await input.dispatch("paste", {
+    clipboardData: { items: [], getData: () => pasted },
+    preventDefault() {},
+  });
+  await new Promise((resolve) => setTimeout(resolve, 320));
+
+  const reloaded = new FakeDocument();
+  const reloadedClient = fakeClient(fixtureRoadmap(), options);
+  reloadedClient.prompt = async (text) => {
+    reloadedClient.calls.prompt.push(text);
+    return { accepted: true, run_id: "paste-draft" };
+  };
+  await start({ global: browser.global, document: reloaded, client: reloadedClient });
+  assert.ok(reloaded.getElementById("prompt").value.includes("Pasted text #1"));
+  assert.equal(
+    find(reloaded.getElementById("prompt-attachments"), (node) => node.className.includes("pasted-text-chip")).children[0].textContent,
+    "Pasted text #1 · 10 lines",
+  );
+  await reloaded.getElementById("prompt-form").dispatch("submit");
+  assert.deepEqual(reloadedClient.calls.prompt, [pasted]);
+});
+
+test("shortcut help lists live bindings and closes with Escape", async () => {
+  const document = new FakeDocument();
+  const global = { keymap: { "mod+k": null, "alt+c": "clear-chat" } };
+  await start({ global, document, client: fakeClient() });
+  const input = document.getElementById("prompt");
+  const panel = find(document.getElementById("prompt-form").parentNode, (node) => node.className === "shortcut-help-panel");
+  let prevented = false;
+  await input.dispatch("keydown", { key: "?", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(panel.hidden, false);
+  const rows = panel.children.map((node) => node.textContent);
+  assert.ok(rows.some((row) => row.includes("Send message · Enter")));
+  assert.ok(rows.some((row) => row.includes("Clear conversation · Alt+C")));
+
+  await input.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  assert.equal(panel.hidden, true);
+  assert.equal(document.activeElement, input);
+  assert.equal(input.value, "");
+});
+
+test("question mark after composer text does not open shortcut help", async () => {
+  const document = new FakeDocument();
+  await start({ global: {}, document, client: fakeClient() });
+  const input = document.getElementById("prompt");
+  input.value = "already typed";
+  const panel = find(document.getElementById("prompt-form").parentNode, (node) => node.className === "shortcut-help-panel");
+  let prevented = false;
+  await input.dispatch("keydown", { key: "?", preventDefault() { prevented = true; } });
+  assert.equal(prevented, false);
+  assert.equal(panel.hidden, true);
+  assert.equal(input.value, "already typed");
 });
 
 test("dropped PDFs allow an empty prompt and removals or invalid files do not send", async () => {
@@ -1061,6 +1205,76 @@ test("@ mentions search paths, insert on Enter and leave slash commands alone", 
   assert.ok(find(document.getElementById("chat-pane"), (node) => node.className === "command-menu").children.length > 0);
 });
 
+test("quick open searches project files and opens the keyboard-selected result", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.files = async (query, limit) => {
+    client.calls.files.push([query, limit]);
+    return { files: ["src/app.js", "test/app.test.js"] };
+  };
+  const browser = fakeGlobal();
+  await start({ global: browser.global, document, client });
+  await browser.dispatch("keydown", { key: "p", ctrlKey: true, preventDefault() {} });
+  const overlay = find(document.getElementById("chat-pane"), (node) => node.className === "quick-open-overlay");
+  const search = find(overlay, (node) => node.className === "quick-open-input");
+  search.value = "app";
+  await search.dispatch("input");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(client.calls.files, [["app", 50]]);
+  assert.equal(overlay.children[0].children[2].children.length, 2);
+  await overlay.dispatch("keydown", { key: "ArrowDown" });
+  await overlay.dispatch("keydown", { key: "Enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(client.calls.source, ["test/app.test.js"]);
+  assert.equal(document.getElementById("files").hidden, false);
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "quick-open-overlay"), undefined);
+});
+
+test("quick open debounces searches, ignores stale replies, and shows failures", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  let releaseFirst;
+  client.files = (query, limit) => {
+    client.calls.files.push([query, limit]);
+    if (query === "a") return new Promise((resolve) => { releaseFirst = resolve; });
+    if (query === "bad") throw new Error("search unavailable");
+    return Promise.resolve({ files: ["fresh/app.js"] });
+  };
+  const browser = fakeGlobal();
+  await start({ global: browser.global, document, client });
+  await browser.dispatch("keydown", { key: "p", ctrlKey: true, preventDefault() {} });
+  const overlay = find(document.getElementById("chat-pane"), (node) => node.className === "quick-open-overlay");
+  const search = find(overlay, (node) => node.className === "quick-open-input");
+  search.value = "a";
+  await search.dispatch("input");
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  search.value = "ap";
+  await search.dispatch("input");
+  search.value = "app";
+  await search.dispatch("input");
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.deepEqual(client.calls.files, [["a", 50], ["app", 50]]);
+  releaseFirst({ files: ["stale/old.js"] });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(overlay.children[0].children[2].children[0].children[0].textContent, "app.js");
+
+  search.value = "bad";
+  await search.dispatch("input");
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(find(overlay, (node) => node.className === "quick-open-message").textContent, "search unavailable");
+});
+
+test("quick open respects a user keymap rebinding", async () => {
+  const document = new FakeDocument();
+  const browser = fakeGlobal();
+  browser.global.keymap = { "mod+p": null, "alt+o": "quick-open" };
+  await start({ global: browser.global, document, client: fakeClient() });
+  await browser.dispatch("keydown", { key: "p", ctrlKey: true, preventDefault() {} });
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "quick-open-overlay"), undefined);
+  await browser.dispatch("keydown", { key: "o", altKey: true, preventDefault() {} });
+  assert.ok(find(document.getElementById("chat-pane"), (node) => node.className === "quick-open-overlay"));
+});
+
 test("prompt arrows recall project history and drafts", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -1090,6 +1304,174 @@ test("prompt arrows recall project history and drafts", async () => {
   await input.dispatch("keydown", { key: "ArrowUp" });
   assert.deepEqual(client.calls.history, [100]);
   assert.equal(input.value, "/he");
+});
+
+test("Ctrl+R searches prompt history and restores the draft on Escape", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.history = async () => ({ prompts: ["run tests", "fix lint", "run build"] });
+  await start({ global: {}, document, client });
+  const input = document.getElementById("prompt");
+  input.value = "unfinished draft  ";
+  await input.dispatch("keydown", { key: "r", ctrlKey: true });
+
+  const bar = find(document.getElementById("chat-pane"), (node) => node.className === "history-search-bar");
+  const search = bar.children[0];
+  search.value = "run";
+  await search.dispatch("input");
+  assert.equal(bar.children[1].textContent, "run tests");
+  assert.equal(bar.children[2].textContent, "1 of 2");
+  await search.dispatch("keydown", { key: "r", ctrlKey: true });
+  assert.equal(bar.children[1].textContent, "run build");
+  assert.equal(bar.children[2].textContent, "2 of 2");
+  await search.dispatch("keydown", { key: "Enter" });
+  assert.equal(input.value, "run build");
+
+  input.value = "another exact draft  ";
+  await input.dispatch("keydown", { key: "r", ctrlKey: true });
+  const reopenedSearch = find(document.getElementById("chat-pane"), (node) => node.className === "history-search-bar").children[0];
+  reopenedSearch.value = "no such prompt";
+  await reopenedSearch.dispatch("input");
+  assert.equal(bar.children[1].textContent, "no match");
+  assert.equal(input.value, "another exact draft  ");
+  await reopenedSearch.dispatch("keydown", { key: "Escape" });
+  assert.equal(input.value, "another exact draft  ");
+  assert.equal(document.activeElement, input);
+});
+
+test("prompt history search follows a user key rebind", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.history = async () => ({ prompts: ["earlier"] });
+  const global = { keymap: { "ctrl+r": null, "alt+r": "history-search" } };
+  await start({ global, document, client });
+  const input = document.getElementById("prompt");
+  await input.dispatch("keydown", { key: "r", altKey: true });
+  assert.equal(find(document.getElementById("chat-pane"), (node) => node.className === "history-search-bar").hidden, false);
+});
+
+test("Escape twice edits the previous prompt by forking through its prior reply", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { session_id: "source-run" },
+    sessions: [{ run_id: "source-run", title: "Source", repo_root: "/work/current" }],
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "fork-run" };
+  };
+  await start({ global: {}, document, client });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "first prompt", record_id: "user-1", tool_calls: [],
+  } });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "assistant", text: "first reply", record_id: "reply-1", tool_calls: [],
+  } });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "second prompt", record_id: "user-2", tool_calls: [],
+  } });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "assistant", text: "second reply", record_id: "reply-2", tool_calls: [],
+  } });
+
+  const chatRoot = document.getElementById("chat");
+  let chatChildren = chatRoot.children;
+  Object.defineProperty(chatRoot, "children", {
+    configurable: true,
+    get() {
+      const collection = { length: chatChildren.length };
+      for (let index = 0; index < chatChildren.length; index += 1) {
+        collection[index] = chatChildren[index];
+      }
+      collection[Symbol.iterator] = function* () { yield* chatChildren; };
+      return collection;
+    },
+    set(value) {
+      chatChildren = value;
+    },
+  });
+
+  const input = document.getElementById("prompt");
+  await input.dispatch("keydown", { key: "Escape" });
+  await input.dispatch("keydown", { key: "Escape" });
+  Object.defineProperty(chatRoot, "children", {
+    configurable: true,
+    writable: true,
+    value: chatChildren,
+  });
+  assert.equal(input.value, "second prompt");
+  assert.ok(find(document.getElementById("chat"), (node) => node.className === "prompt editing-previous-prompt"));
+  input.value = "edited second prompt";
+  await input.dispatch("input");
+  await document.getElementById("prompt-form").dispatch("submit");
+
+  assert.deepEqual(client.calls.forkSession, [["source-run", "reply-1"]]);
+  assert.deepEqual(client.calls.openSession, ["fork-run"]);
+  assert.deepEqual(client.calls.prompt, ["edited second prompt"]);
+});
+
+test("editing the first prompt starts a new conversation and Escape cancels an edit", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: { session_id: "first-run" },
+    sessions: [{ run_id: "first-run", title: "First", repo_root: "/work/current" }],
+  });
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "new-run" };
+  };
+  await start({ global: {}, document, client });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "first prompt", record_id: "first-user", tool_calls: [],
+  } });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "assistant", text: "first reply", record_id: "first-reply", tool_calls: [],
+  } });
+  const input = document.getElementById("prompt");
+  await input.dispatch("keydown", { key: "Escape" });
+  await input.dispatch("keydown", { key: "Escape" });
+  input.value = "revised first prompt";
+  await document.getElementById("prompt-form").dispatch("submit");
+  assert.equal(client.calls.newSession, 1);
+  assert.deepEqual(client.calls.forkSession, []);
+  assert.deepEqual(client.calls.prompt, ["revised first prompt"]);
+
+  const cancelDocument = new FakeDocument();
+  const cancelClient = fakeClient(fixtureRoadmap(), {
+    conversation: { session_id: "cancel-run" },
+  });
+  await start({ global: {}, document: cancelDocument, client: cancelClient });
+  await cancelClient.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "cancel me", record_id: "cancel-user", tool_calls: [],
+  } });
+  const cancelInput = cancelDocument.getElementById("prompt");
+  await cancelInput.dispatch("keydown", { key: "Escape" });
+  await cancelInput.dispatch("keydown", { key: "Escape" });
+  await cancelInput.dispatch("keydown", { key: "Escape" });
+  assert.equal(cancelInput.value, "");
+  assert.equal(find(cancelDocument.getElementById("chat"), (node) => node.className.includes("editing-previous-prompt")), undefined);
+});
+
+test("Escape twice during a run stops once and does not select a prompt", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  client.prompt = async (text) => {
+    client.calls.prompt.push(text);
+    return { accepted: true, run_id: "active-run" };
+  };
+  await start({ global: {}, document, client });
+  await client.emit({ kind: "event", payload: {
+    type: "HistoryMessage", role: "user", text: "prior prompt", record_id: "prior-user", tool_calls: [],
+  } });
+  document.getElementById("prompt").value = "active prompt";
+  await document.getElementById("prompt-form").dispatch("submit");
+  await client.emit(eventFrame("RunStarted", { agent_id: "leader", run_id: "active-run" }));
+  const input = document.getElementById("prompt");
+  await input.dispatch("keydown", { key: "Escape" });
+  await input.dispatch("keydown", { key: "Escape" });
+  assert.deepEqual(client.calls.stop, [""]);
+  assert.equal(input.value, "");
+  assert.equal(find(document.getElementById("chat"), (node) => node.className.includes("editing-previous-prompt")), undefined);
 });
 
 test("a prompt sent from this page becomes the next recalled prompt", async () => {
@@ -2374,6 +2756,7 @@ test("slash suggestions render above the composer without taking focus", async (
     "/init    Have the agent write .symphonai/INSTRUCTIONS.md",
     "/rename  <title>  Rename this conversation",
     "/copy    Copy the last reply as Markdown",
+    "/export    Download this conversation as Markdown",
     "/review  [<focus>]  Review the uncommitted changes",
     "/commit  [<message>]  Commit selected changes",
     "/pr    Open a pull request",
@@ -2924,6 +3307,7 @@ test("context command omits an unknown window and handles unmeasured context", a
 test("sidebar lets the person switch projects and keeps unknown projects unopenable", async () => {
   const document = new FakeDocument();
   const browser = fakeGlobal();
+  const openedWarning = "/work/other/.symphonai/config.toml: hooks were refused";
   const client = fakeClient(fixtureRoadmap(), {
     project: { repo_root: "/work/current", name: "Current project" },
     sessions: [
@@ -2932,6 +3316,11 @@ test("sidebar lets the person switch projects and keeps unknown projects unopena
       { run_id: "legacy", title: null, repo_root: "", updated_at: "2026-02-01" },
     ],
   });
+  client.openProject = async (path) => {
+    client.calls.openProject.push(path);
+    client.calls.projectActions.push(["openProject", path]);
+    return { repo_root: path, name: "other", config_warnings: [openedWarning] };
+  };
 
   await start({ global: browser.global, document, client });
   const projects = find(document.getElementById("sidebar"), (value) =>
@@ -2969,10 +3358,38 @@ test("sidebar lets the person switch projects and keeps unknown projects unopena
   assert.equal(propagationStopped, true);
   assert.equal(groups[1].open, false);
   assert.deepEqual(client.calls.openProject, ["/work/other"]);
+  assert.deepEqual(latestCommandOutput(document), [`Configuration warning: ${openedWarning}`]);
   assert.deepEqual(browser.reloads, [true]);
 
   await find(groups[0], (value) => value.tagName === "BUTTON").dispatch("click");
   assert.deepEqual(client.calls.openSession, ["current-old"]);
+});
+
+test("conversation shows configuration warnings with instruction warnings", async () => {
+  const document = new FakeDocument();
+  const warning = "/work/current/.symphonai/config.toml: sandbox section skipped";
+  const client = fakeClient(fixtureRoadmap(), {
+    conversation: {
+      session_id: "warning-session",
+      config_warnings: [warning],
+      instruction_warnings: ["instruction file was skipped"],
+    },
+  });
+  await start({ global: {}, document, client });
+  assert.deepEqual(latestCommandOutput(document), [
+    `Configuration warning: ${warning}`,
+    "Instruction warning: instruction file was skipped",
+  ]);
+});
+
+test("startup shows project configuration warnings before a conversation exists", async () => {
+  const document = new FakeDocument();
+  const warning = "/work/current/.symphonai/config.toml: sandbox.shell: must be a boolean; section skipped";
+  const client = fakeClient(fixtureRoadmap(), {
+    settings: { settings: { config_warnings: [warning] } },
+  });
+  await start({ global: {}, document, client });
+  assert.deepEqual(latestCommandOutput(document), [`Configuration warning: ${warning}`]);
 });
 
 test("opening another project's conversation switches, opens it, then reloads", async () => {
@@ -3154,14 +3571,24 @@ test("sidebar manages and searches conversations without changing the session li
     { run_id: "run-2", title: "Release notes", repo_root: "/work/current", updated_at: "2026-01-02" },
   ];
   const client = fakeClient(fixtureRoadmap(), { sessions: entries });
-  client.sessions = async (limit, query) => {
-    client.calls.sessions.push(query === undefined ? limit : [limit, query]);
-    return query ? entries.filter((entry) => entry.title.toLowerCase().includes(query.toLowerCase())) : entries;
+  client.sessions = async (limit, query, archived = false) => {
+    if (!archived) client.calls.sessions.push(query === undefined ? limit : [limit, query]);
+    return (query ? entries.filter((entry) => entry.title.toLowerCase().includes(query.toLowerCase())) : entries)
+      .filter((entry) => Boolean(entry.archived) === archived);
   };
   await start({ global: {}, document, client });
   const projects = find(document.getElementById("sidebar"), (value) => value.className === "projects");
   const currentGroup = () => find(projects, (value) => value.className === "project openable");
   assert.equal(find(currentGroup(), (value) => value.className === "session-link").tagName, "BUTTON");
+
+  const lexerRow = () => find(currentGroup(), (value) => value.className === "session-row"
+    && value.children.some((child) => child.className === "session-link" && child.textContent === "Lexer notes"));
+  await find(lexerRow(), (value) => value.attributes.get("aria-label") === "Archive").dispatch("click");
+  assert.deepEqual(client.calls.archiveSession, [["run-1", true]]);
+  assert.equal(find(currentGroup(), (value) => value.className === "archived-sessions")?.children[0].textContent, "Archived (1)");
+  await find(currentGroup(), (value) => value.attributes.get("aria-label") === "Unarchive").dispatch("click");
+  assert.deepEqual(client.calls.archiveSession, [["run-1", true], ["run-1", false]]);
+  assert.equal(find(currentGroup(), (value) => value.className === "archived-sessions"), undefined);
 
   const rename = find(currentGroup(), (value) => value.attributes.get("aria-label") === "Rename");
   await rename.dispatch("click");
@@ -3292,7 +3719,7 @@ test("relative file paths in assistant text open Files without line suffixes", a
   const links = walk(chat).filter((node) => node.tagName === "A" && node.className === "chat-file-path");
   assert.deepEqual(links.map((link) => link.textContent), ["src/parser.py:42"]);
   await links[0].dispatch("click");
-  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(client.calls.source, ["src/parser.py"]);
   assert.equal(document.getElementById("files").hidden, false);
   await client.emit(eventFrame("TurnStarted", { index: 1 }));
@@ -3350,6 +3777,45 @@ test("/copy reports an empty reply and clipboard failures", async () => {
   assert.equal(latestCommandOutput(document)[0], "Could not copy: permission denied");
 });
 
+test("/export downloads the current conversation and reports an empty conversation", async () => {
+  const emptyDocument = new FakeDocument();
+  await start({ global: {}, document: emptyDocument, client: fakeClient() });
+  await submitCommand(emptyDocument, "/export");
+  assert.equal(latestCommandOutput(emptyDocument)[0], "There is nothing to export.");
+
+  const document = new FakeDocument();
+  let downloadAnchor;
+  const createElement = document.createElement.bind(document);
+  document.createElement = (tagName) => {
+    const node = createElement(tagName);
+    if (tagName === "a") downloadAnchor = node;
+    return node;
+  };
+  const urls = [];
+  const global = {
+    Blob,
+    URL: {
+      createObjectURL(blob) {
+        urls.push(blob);
+        return "blob:export";
+      },
+      revokeObjectURL(url) { urls.push(url); },
+    },
+  };
+  const session = { run_id: "run-export", title: "Project notes", repo_root: "/work/current" };
+  const client = fakeClient(fixtureRoadmap(), { sessions: [session] });
+  await start({ global, document, client });
+  await find(document.getElementById("sidebar"), (node) => node.className === "session-link").click();
+  await submitCommand(document, "/export");
+  assert.deepEqual(client.calls.exportSession, ["run-export"]);
+  assert.equal(urls[0].type, "text/markdown;charset=utf-8");
+  assert.equal(urls[1], "blob:export");
+  assert.equal(latestCommandOutput(document)[0], "Conversation exported.");
+  assert.equal(downloadAnchor.download, "Project notes.md");
+  assert.equal(downloadAnchor.href, "blob:export");
+  assert.equal(downloadAnchor.clicked, true);
+});
+
 test("new chat clears the transcript and the next prompt adds a session link", async () => {
   const document = new FakeDocument();
   const initial = {
@@ -3369,7 +3835,8 @@ test("new chat clears the transcript and the next prompt adds a session link", a
     client.calls.prompt.push(text);
     return { accepted: true, run_id: "host-run" };
   };
-  client.sessions = async (limit) => {
+  client.sessions = async (limit, _query, archived = false) => {
+    if (archived) return [];
     client.calls.sessions.push(limit);
     return client.calls.sessions.length === 1 ? [initial] : [added, initial];
   };
@@ -4483,6 +4950,48 @@ test("rail tabs open tools, close to the Tools list, and persist the selected la
   assert.equal(legacyTabs[0].children[0].attributes.get("aria-selected"), "true");
 });
 
+test("Changes diff mode persists and narrow panels keep unified diffs", async () => {
+  const client = fakeClient();
+  client.changes = async () => ({
+    files: [{
+      path: "a.py", status: "modified",
+      diff: "@@ -1,3 +1,4 @@\n context\n-old one\n-old two\n+new one\n+new two\n+new three",
+    }],
+    turns: [], worktrees: [],
+  });
+  const browser = fakeGlobal();
+  const document = new FakeDocument();
+  await start({ global: browser.global, document, client });
+  await find(document.getElementById("rail-tabs"), (node) => node.attributes.get("aria-label") === "Open a tool").dispatch("click");
+  await document.getElementById("rail-tools").children.find((row) => row.textContent === "Changes").dispatch("click");
+  const changes = document.getElementById("changes");
+  const toggle = find(changes, (node) => node.className === "changes-diff-toggle");
+  await toggle.dispatch("click");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(find(changes, (node) => node.className === "changes-diff").attributes.get("data-mode"), "side-by-side");
+  assert.deepEqual(browser.writes.filter(([key]) => key === "symphonai.diff-mode").at(-1), ["symphonai.diff-mode", "side-by-side"]);
+
+  const restored = new FakeDocument();
+  const restoredClient = fakeClient();
+  restoredClient.changes = async () => ({
+    files: [{ path: "a.py", status: "modified", diff: "@@ -1 +1 @@\n-old\n+new" }],
+    turns: [], worktrees: [],
+  });
+  await start({
+    global: fakeGlobal({
+      railStored: JSON.stringify({ open: ["Changes"], selected: "Changes" }),
+      diffModeStored: "side-by-side",
+    }).global,
+    document: restored,
+    client: restoredClient,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(find(restored.getElementById("changes"), (node) => node.className === "changes-diff").attributes.get("data-mode"), "side-by-side");
+  const css = await readFile(new URL("../app.css", import.meta.url), "utf8");
+  assert.match(css, /@media\s*\(max-width:\s*640px\)[\s\S]*?\.changes-diff\[data-mode="side-by-side"\] \.diff-unified\s*\{\s*display:\s*block;/);
+  assert.match(css, /@media\s*\(max-width:\s*640px\)[\s\S]*?\.changes-diff\[data-mode="side-by-side"\] \.diff-side-by-side\s*\{\s*display:\s*none;/);
+});
+
 test("Changes tool restores revert conflict and worktree actions", async () => {
   const document = new FakeDocument();
   const client = fakeClient();
@@ -4521,6 +5030,54 @@ test("Changes tool restores revert conflict and worktree actions", async () => {
   assert.deepEqual(client.calls.applyWorktree, ["w1"]);
   assert.deepEqual(client.calls.discardWorktree, ["w1"]);
   assert.equal(client.calls.changes, 5);
+});
+
+test("FilesChanged refreshes visible panels and marks hidden Changes dirty", async () => {
+  const document = new FakeDocument();
+  const client = fakeClient();
+  let changesReads = 0;
+  let treeReads = 0;
+  let sourceReads = 0;
+  client.changes = async () => {
+    changesReads += 1;
+    return { files: [], turns: [], worktrees: [] };
+  };
+  client.tree = async () => {
+    treeReads += 1;
+    return { entries: [{ name: "a.py", kind: "file" }] };
+  };
+  client.source = async (path) => {
+    sourceReads += 1;
+    return { path, text: `source version ${sourceReads}` };
+  };
+  await start({
+    global: fakeGlobal({
+      railStored: JSON.stringify({ open: ["Changes"], selected: "Changes" }),
+    }).global,
+    document,
+    client,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(changesReads, 1);
+  await client.emit(eventFrame("FilesChanged", { paths: ["a.py"], truncated: false }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(changesReads, 2);
+
+  const tabs = document.getElementById("rail-tabs");
+  await tabs.children.at(-1).dispatch("click");
+  await document.getElementById("rail-tools").children.find((row) => row.textContent === "Files").dispatch("click");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await find(document.getElementById("files"), (node) => node.className.includes("files-file")).dispatch("click");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const initialTreeReads = treeReads;
+  const initialSourceReads = sourceReads;
+  await client.emit(eventFrame("FilesChanged", { paths: ["a.py"], truncated: false }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(treeReads > initialTreeReads);
+  assert.ok(sourceReads > initialSourceReads);
+  assert.equal(changesReads, 2);
+  await tabs.children.find((row) => row.className === "rail-tab-item").children[0].dispatch("click");
+  assert.equal(changesReads, 3);
 });
 
 test("Changes shows the project working tree separately from conversation changes", async () => {
@@ -5008,7 +5565,7 @@ test("opening another conversation and starting a new chat clears prior agents",
   const agents = document.getElementById("agents");
   let conversation = null;
   const replayBoard = [];
-  client.sessions = async () => sessions;
+  client.sessions = async (_limit, _query, archived = false) => archived ? [] : sessions;
   client.conversationStats = async () => ({ conversation });
   client.openSession = async (runId) => {
     client.calls.openSession.push(runId);
@@ -7573,7 +8130,8 @@ test("sidebar activity refreshes immediately and once at the window end", async 
     [{ ...initial, activity: "working" }],
     [{ ...initial, activity: "waiting" }],
   ];
-  client.sessions = async (limit) => {
+  client.sessions = async (limit, _query, archived = false) => {
+    if (archived) return [];
     client.calls.sessions.push(limit);
     return replies[Math.min(client.calls.sessions.length - 1, replies.length - 1)];
   };

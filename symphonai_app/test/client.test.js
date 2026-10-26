@@ -470,6 +470,42 @@ test("approval sends remember only when requested", async () => {
   ]);
 });
 
+test("exportSession sends the authenticated documented request", async () => {
+  const records = [];
+  const reply = { filename: "A title.md", markdown: "# A title\n" };
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, reply);
+    },
+  });
+  assert.deepEqual(await client.exportSession("run / 1"), reply);
+  assert.equal(records[0].url, "http://127.0.0.1:4312/session/export?id=run+%2F+1");
+  assert.equal(records[0].options.method, "GET");
+  assert.equal(records[0].options.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.ok(!records[0].url.includes(TOKEN));
+});
+
+test("sessions selects archived results and archiveSession updates the flag", async () => {
+  const records = [];
+  const client = createClient({
+    port: 4312,
+    token: TOKEN,
+    fetch: async (url, options) => {
+      records.push({ url, options });
+      return response(200, options.method === "GET" ? [] : { archived: true });
+    },
+  });
+  await client.sessions(50, "parser", true);
+  await client.archiveSession("run-4", true);
+  assert.equal(new URL(records[0].url).searchParams.get("archived"), "1");
+  assert.equal(new URL(records[0].url).searchParams.get("query"), "parser");
+  assert.equal(records[1].options.method, "POST");
+  assert.deepEqual(JSON.parse(records[1].options.body), { run_id: "run-4", archived: true });
+});
+
 test("steer posts the redirect text to the host route", async () => {
   let record;
   const client = createClient({

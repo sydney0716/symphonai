@@ -176,13 +176,11 @@ def vocabulary_and_shape() -> None:
 
         bad = base / "repo" / ".symphonai" / "config.toml"
         _write(bad, "[outside]\nvalue = true\n")
-        try:
-            load_config(repo_root=base / "repo", home=base / "home")
-        except ConfigError as exc:
-            if str(bad) not in str(exc) or "outside" not in str(exc):
-                fail(f"outside-section error omitted source or key: {exc!r}")
-        else:
-            fail("widening _SECTIONS accepted an unrelated top-level key")
+        resolved = load_config(repo_root=base / "repo", home=base / "home")
+        if "outside.value" in resolved.values:
+            fail("unrelated project config section was applied")
+        if not any(str(bad) in warning and "outside" in warning for warning in resolved.warnings):
+            fail(f"unrelated project section warning omitted source or reason: {resolved.warnings!r}")
 
 
 @check("trust.matching_is_exact")

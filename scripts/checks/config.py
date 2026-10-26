@@ -99,23 +99,61 @@ def permission_grants_scopes() -> None:
 
         project_path = _scope_path(Scope.PROJECT, repo_root, home)
         _write(project_path, '[permissions]\nshell = [["pnpm", "test"]]\n')
-        try:
-            load_config(repo_root=repo_root, home=home)
-        except ConfigError as exc:
-            if str(project_path) not in str(exc):
-                fail(f"project permission refusal did not identify the config path: {exc!r}")
-        else:
-            fail("committed project permission grants were accepted")
+        project_config = load_config(repo_root=repo_root, home=home)
+        if not any(str(project_path) in warning and "permissions" in warning for warning in project_config.warnings):
+            fail(f"project permission refusal did not become a warning: {project_config.warnings!r}")
+        if project_config.scope_of("permissions.shell") is not Scope.USER:
+            fail("project permission grants replaced the user's grant")
         project_path.unlink()
         private_path = _scope_path(Scope.PRIVATE, repo_root, home)
         _write(private_path, '[permissions]\nshell = [["python3"]]\n')
-        try:
-            load_config(repo_root=repo_root, home=home)
-        except ConfigError as exc:
-            if str(private_path) not in str(exc):
-                fail(f"private permission refusal did not identify the config path: {exc!r}")
-        else:
-            fail("private permission grants were accepted")
+        private_config = load_config(repo_root=repo_root, home=home)
+        if not any(str(private_path) in warning and "permissions" in warning for warning in private_config.warnings):
+            fail(f"private permission refusal did not become a warning: {private_config.warnings!r}")
+        if private_config.scope_of("permissions.shell") is not Scope.USER:
+            fail("private permission grants replaced the user's grant")
+
+
+@check("config.repository_config_is_skipped_not_fatal")
+def repository_config_is_skipped_not_fatal() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        user_path = _scope_path(Scope.USER, repo_root, home)
+        project_path = _scope_path(Scope.PROJECT, repo_root, home)
+        private_path = _scope_path(Scope.PRIVATE, repo_root, home)
+        _write(user_path, '[sandbox]\nnetwork = false\n')
+        _write(project_path, '[sandbox]\nshell = true\n[models]\nopenai = "invalid"\n')
+        _write(private_path, '[sandbox\nshell = true')
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("sandbox.shell") is not True or resolved.get("sandbox.network") is not False:
+            fail(f"valid config did not survive a refused section/file: {resolved.values!r}")
+        if "models.openai" in resolved.values:
+            fail(f"invalid project section was applied: {resolved.values!r}")
+        if not any(str(project_path) in warning and "models" in warning for warning in resolved.warnings):
+            fail(f"invalid project section warning omitted its path or key: {resolved.warnings!r}")
+        if not any(str(private_path) in warning and "could not be parsed" in warning for warning in resolved.warnings):
+            fail(f"malformed private config warning omitted its path or parse reason: {resolved.warnings!r}")
+        _write(project_path, "[sandbox\nshell = true")
+        malformed_project = load_config(repo_root=repo_root, home=home)
+        if not any(str(project_path) in warning and "could not be parsed" in warning for warning in malformed_project.warnings):
+            fail(f"malformed project config warning omitted its path or parse reason: {malformed_project.warnings!r}")
+        if malformed_project.get("sandbox.network") is not False:
+            fail("malformed project config prevented the user's valid setting from loading")
+        for content, key, rejected_value in (
+            ('[worktree]\nsymlink = ["../outside"]\n', "worktree.symlink", ["../outside"]),
+            ('[sandbox]\nshell = "maybe"\n', "sandbox.shell", "maybe"),
+        ):
+            _write(project_path, content)
+            skipped = load_config(repo_root=repo_root, home=home)
+            if skipped.get(key) == rejected_value:
+                fail(f"invalid project setting {key} was applied")
+            warning = next(
+                (item for item in skipped.warnings if str(project_path) in item and key in item),
+                "",
+            )
+            reason = warning.partition(": ")[2].strip()
+            if not reason or key not in reason:
+                fail(f"skipped {key} warning omitted its reason: {warning!r}")
 
 
 @check("config.scope_precedence")
@@ -172,17 +210,26 @@ def missing_and_malformed() -> None:
         for scope in (Scope.USER, Scope.PROJECT, Scope.PRIVATE):
             path = _scope_path(scope, repo_root, home)
             _write(path, "[agents\n")
-            try:
-                load_config(
+            if scope is Scope.USER:
+                try:
+                    load_config(
+                        repo_root=repo_root,
+                        home=home,
+                        session={"agents": {"directory": "higher"}},
+                    )
+                except ConfigError as exc:
+                    if str(path) not in str(exc):
+                        fail(f"malformed {scope.value} error omitted its path: {exc!r}")
+                else:
+                    fail("malformed user scope was skipped")
+            else:
+                resolved = load_config(
                     repo_root=repo_root,
                     home=home,
                     session={"agents": {"directory": "higher"}},
                 )
-            except ConfigError as exc:
-                if str(path) not in str(exc):
-                    fail(f"malformed {scope.value} error omitted its path: {exc!r}")
-            else:
-                fail(f"malformed {scope.value} scope was skipped")
+                if not any(str(path) in warning for warning in resolved.warnings):
+                    fail(f"malformed {scope.value} config was not warned about: {resolved.warnings!r}")
             path.unlink()
         for malformed_session in ({"agents": []}, {"agents": None}):
             try:
@@ -199,13 +246,11 @@ def missing_and_malformed() -> None:
             ("accept_edits", "ask, plan, or allow"),
         ):
             _write(project_path, f'[agents.ceiling]\nmodes = ["{old}"]\n')
-            try:
-                load_config(repo_root=repo_root, home=home)
-            except ConfigError as exc:
-                if old not in str(exc) or replacement not in str(exc):
-                    fail(f"renamed mode error omitted its replacement: {exc!r}")
-            else:
-                fail(f"renamed configuration mode {old!r} was accepted")
+            resolved = load_config(repo_root=repo_root, home=home)
+            if not any(str(project_path) in warning and old in warning and replacement in warning for warning in resolved.warnings):
+                fail(f"renamed mode skip omitted its replacement warning: {resolved.warnings!r}")
+            if resolved.get("agents.ceiling.modes") is not None:
+                fail(f"invalid project mode section was applied: {resolved.values!r}")
         project_path.unlink()
 
 
@@ -825,13 +870,11 @@ def sections_are_open() -> None:
         repo_root, home = _roots(temporary)
         unknown_path = _scope_path(Scope.PROJECT, repo_root, home)
         _write(unknown_path, "[hook]\nenabled = true\n")
-        try:
-            load_config(repo_root=repo_root, home=home)
-        except ConfigError as exc:
-            if str(unknown_path) not in str(exc) or "hook" not in str(exc):
-                fail(f"unknown top-level file key lacked path or key: {exc!r}")
-        else:
-            fail("unknown top-level file section was accepted")
+        resolved = load_config(repo_root=repo_root, home=home)
+        if not any(str(unknown_path) in warning and "hook" in warning for warning in resolved.warnings):
+            fail(f"unknown top-level file key warning lacked path or key: {resolved.warnings!r}")
+        if resolved.values:
+            fail(f"unknown top-level file section was applied: {resolved.values!r}")
         unknown_path.unlink()
         invalid_sessions = (
             ({"hook": {"enabled": True}}, "hook"),
@@ -975,13 +1018,11 @@ def sessions_cleanup() -> None:
         )
         for value, key in invalid:
             _write(source, f"[sessions]\ncleanup_period_days = {value}\n")
-            try:
-                load_config(repo_root=repo_root, home=home)
-            except ConfigError as exc:
-                if str(source) not in str(exc) or key not in str(exc):
-                    fail(f"invalid session setting lacked source or key: {exc}")
-            else:
-                fail(f"invalid session setting was accepted: {value!r}")
+            resolved = load_config(repo_root=repo_root, home=home)
+            if not any(str(source) in warning and key in warning for warning in resolved.warnings):
+                fail(f"invalid session setting warning lacked source or key: {resolved.warnings!r}")
+            if resolved.get(key) is not None:
+                fail(f"invalid session setting was applied: {value!r}")
 
 
 @check("config.budget_fields_and_price_table")
@@ -1026,13 +1067,12 @@ def budget_integer_validation() -> None:
             for key in ("max_turns", "max_total_tokens"):
                 for value in ('"2"', "-1", "true", "2.5"):
                     _write(source, f"[budgets.{role}]\n{key} = {value}\n")
-                    try:
-                        load_config(repo_root=repo_root, home=home)
-                    except ConfigError as exc:
-                        if str(source) not in str(exc) or f"budgets.{role}.{key}" not in str(exc):
-                            fail(f"invalid budget lacked source and key: {exc}")
-                    else:
-                        fail(f"invalid {role} {key}={value} was accepted")
+                    resolved = load_config(repo_root=repo_root, home=home)
+                    full_key = f"budgets.{role}.{key}"
+                    if not any(str(source) in warning and full_key in warning for warning in resolved.warnings):
+                        fail(f"invalid budget warning lacked source and key: {resolved.warnings!r}")
+                    if resolved.get(full_key) is not None:
+                        fail(f"invalid {role} {key} was applied")
 
 
 @check("config.budget_cost_requires_price_table")
@@ -1077,13 +1117,11 @@ def search_endpoint_validation() -> None:
         if resolved.get("search.endpoint") != "brave" or resolved.scope_of("search.endpoint") is not Scope.PROJECT:
             fail("configured search endpoint lost its value or provenance")
         _write(source, '[search]\nendpoint = "unknown-search"\n')
-        try:
-            load_config(repo_root=repo_root, home=home)
-        except ConfigError as exc:
-            if str(source) not in str(exc) or "search.endpoint" not in str(exc) or "unknown-search" not in str(exc):
-                fail(f"unknown endpoint error omitted source or key: {exc!r}")
-        else:
-            fail("unknown search endpoint was accepted")
+        resolved = load_config(repo_root=repo_root, home=home)
+        if not any(str(source) in warning and "search.endpoint" in warning and "unknown-search" in warning for warning in resolved.warnings):
+            fail(f"unknown endpoint warning omitted source or key: {resolved.warnings!r}")
+        if resolved.get("search.endpoint") is not None:
+            fail("unknown search endpoint was applied")
 
 
 @check("config.model_preferences")
@@ -1128,11 +1166,11 @@ def model_preferences() -> None:
             '[fallback]\nanthropic = ["  "]\n',
         ):
             _write(source, invalid)
-            try:
-                load_config(repo_root=repo_root, home=home)
-            except ConfigError:
-                continue
-            fail(f"invalid fallback settings were accepted: {invalid!r}")
+            resolved = load_config(repo_root=repo_root, home=home)
+            if not any(str(source) in warning and "fallback" in warning for warning in resolved.warnings):
+                fail(f"invalid fallback settings were not warned about: {resolved.warnings!r}")
+            if any(key.startswith("fallback.") for key in resolved.values):
+                fail(f"invalid fallback settings were applied: {invalid!r}")
         for invalid in (
             '[memory]\nmodel = " "\n',
             '[memory]\nprovider = "unknown"\n',
@@ -1140,11 +1178,11 @@ def model_preferences() -> None:
             '[memory]\nextract = "false"\n',
         ):
             _write(source, invalid)
-            try:
-                load_config(repo_root=repo_root, home=home)
-            except ConfigError:
-                continue
-            fail(f"invalid memory settings were accepted: {invalid!r}")
+            resolved = load_config(repo_root=repo_root, home=home)
+            if not any(str(source) in warning and "memory" in warning for warning in resolved.warnings):
+                fail(f"invalid memory settings were not warned about: {resolved.warnings!r}")
+            if any(key.startswith("memory.") for key in resolved.values):
+                fail(f"invalid memory settings were applied: {invalid!r}")
 
 
 @check("config.invalid_model_preferences")
@@ -1157,10 +1195,8 @@ def invalid_model_preferences() -> None:
             ('[models]\nopenai = ["gpt-1", 2]\n', "models.openai"),
         ):
             _write(source, content)
-            try:
-                load_config(repo_root=repo_root, home=home)
-            except ConfigError as exc:
-                if str(source) not in str(exc) or key not in str(exc):
-                    fail(f"model preference error omitted source or key {key}: {exc!r}")
-            else:
-                fail(f"invalid model preference was accepted for {key}")
+            resolved = load_config(repo_root=repo_root, home=home)
+            if not any(str(source) in warning and key in warning for warning in resolved.warnings):
+                fail(f"model preference warning omitted source or key {key}: {resolved.warnings!r}")
+            if any(name.startswith("models.") for name in resolved.values):
+                fail(f"invalid model preference was applied for {key}")

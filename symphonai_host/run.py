@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -460,6 +461,7 @@ class HostRun:
         self._closing = False
         self._loop_validation_cancel: dict[str, threading.Event] = {}
         self._loop_validation_processes: dict[str, subprocess.Popen] = {}
+        self._loop_runner_lock_fds: dict[str, int] = {}
         self._sleep_keeper_released = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
         self._memory_root = default_memory_root() if memory_root is None else Path(memory_root)
@@ -789,11 +791,30 @@ class HostRun:
                 self._conversation, self._policy, self._active = previous
                 raise
 
-    def start_loop(self, goal: str, *, runner_pid: int | None = None) -> dict:
+    def _acquire_loop_runner_lock(self, loop_id: str) -> int | None:
+        path = LoopStore(self._repo_root).path(loop_id, "runner.lock")
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            return None
+        return descriptor
+
+    def start_loop(
+        self, goal: str, *, runner_pid: int | None = None, runner_lock: bool = False,
+    ) -> dict:
         store = LoopStore(self._repo_root)
         loop = store.create(goal)
         if runner_pid is not None:
             loop["runner_pid"] = runner_pid
+        if runner_lock:
+            descriptor = self._acquire_loop_runner_lock(loop["id"])
+            if descriptor is None:
+                raise RunActiveError(loop["id"])
+            self._loop_runner_lock_fds[loop["id"]] = descriptor
+            loop["runner_lock"] = True
+        if runner_pid is not None or runner_lock:
             store.save(loop)
         return self._start_loop_planner(loop, "created")
 
@@ -1514,7 +1535,9 @@ class HostRun:
             self._loop_changed(loop, "state")
             return loop
 
-    def resume_loop(self, loop_id: str, *, runner_pid: int | None = None) -> dict:
+    def resume_loop(
+        self, loop_id: str, *, runner_pid: int | None = None, runner_lock: bool = False,
+    ) -> dict:
         with self._lock:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
@@ -1522,6 +1545,13 @@ class HostRun:
                 raise RunActiveError(loop.get("state", "unknown"))
             if runner_pid is not None:
                 loop["runner_pid"] = runner_pid
+            if runner_lock:
+                descriptor = self._acquire_loop_runner_lock(loop_id)
+                if descriptor is None:
+                    raise RunActiveError(loop_id)
+                self._loop_runner_lock_fds[loop_id] = descriptor
+                loop["runner_lock"] = True
+            if runner_pid is not None or runner_lock:
                 store.save(loop)
             for card in loop.get("cards", []):
                 if card.get("state") != "failed":
@@ -1643,16 +1673,23 @@ class HostRun:
                     continue
                 if loop.get("state") != "running":
                     continue
-                runner_pid = loop.get("runner_pid")
-                if type(runner_pid) is int and runner_pid > 0:
-                    try:
-                        os.kill(runner_pid, 0)
-                    except ProcessLookupError:
-                        pass
-                    except OSError:
+                if loop.get("runner_lock") is True:
+                    descriptor = self._acquire_loop_runner_lock(loop["id"])
+                    if descriptor is None:
                         continue
-                    else:
-                        continue
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                else:
+                    runner_pid = loop.get("runner_pid")
+                    if type(runner_pid) is int and runner_pid > 0:
+                        try:
+                            os.kill(runner_pid, 0)
+                        except ProcessLookupError:
+                            pass
+                        except OSError:
+                            continue
+                        else:
+                            continue
                 changed = False
                 changed_cards = []
                 for card in loop.get("cards", []):
@@ -3394,6 +3431,66 @@ class HostRun:
             shutil.rmtree(directory)
             return True
 
+    def export_session(self, session_id: str) -> dict:
+        """Return a display-safe Markdown export of one session transcript."""
+        if session_id in (".", "..") or Path(session_id).name != session_id:
+            raise KeyError(session_id)
+        if not (self._sessions_root / session_id).is_dir():
+            raise KeyError(session_id)
+        store = SessionStore.open(self._sessions_root, session_id)
+        try:
+            loaded = load_run(store)
+        except (OSError, TranscriptError, SessionError, ValueError, KeyError, TypeError):
+            store.close()
+            raise
+        try:
+            title = loaded.meta.get("title")
+            title = title.strip() if isinstance(title, str) else ""
+            title = title or session_id
+            created_at = loaded.meta.get("created_at")
+            date = created_at[:10] if isinstance(created_at, str) else ""
+            results = self._replay_tool_results(loaded.messages)
+            lines = [f"# {title}", "", date]
+            for message in loaded.messages:
+                if message.role is Role.USER:
+                    lines.extend(("", "## You", "", message.text))
+                    for attachment in message.content:
+                        if isinstance(attachment, DocumentBlock):
+                            lines.append(f"\n_Attachment: {attachment.filename or 'document'}_")
+                        elif isinstance(attachment, ImageBlock):
+                            lines.append("\n_Attachment: image")
+                elif message.role is Role.ASSISTANT:
+                    if message.text:
+                        lines.extend(("", "## Assistant", "", message.text))
+                    for call in message.tool_calls:
+                        result = results.get(call.id)
+                        outcome = "ok" if result is not None and result.ok else "failed"
+                        target = call_target(call.name, call.arguments)
+                        suffix = f" {target}" if target else ""
+                        lines.append(f"- ran `{call.name}`{suffix} — {outcome}")
+            return {"filename": f"{title}.md", "markdown": "\n".join(lines).rstrip() + "\n"}
+        finally:
+            store.close()
+
+    def archive_session(self, session_id: str, archived: bool) -> bool:
+        """Set a session's archived metadata flag without closing it."""
+        if session_id in (".", "..") or Path(session_id).name != session_id:
+            return False
+        directory = self._sessions_root / session_id
+        if not directory.is_dir():
+            return False
+        with self._lock:
+            opened = self._open_conversations.get(session_id)
+            store = opened[1] if opened is not None else SessionStore.open(self._sessions_root, session_id)
+            try:
+                meta = store.read_meta()
+                meta["archived"] = archived
+                store.write_meta(meta)
+            finally:
+                if opened is None:
+                    store.close()
+        return True
+
     def close(self) -> None:
         self._closing = True
         self._release_sleep_prevention()
@@ -3430,6 +3527,14 @@ class HostRun:
             leader.close()
             session.close()
         self._person_jobs.close()
+        with self._lock:
+            runner_lock_fds = tuple(self._loop_runner_lock_fds.values())
+            self._loop_runner_lock_fds.clear()
+        for descriptor in runner_lock_fds:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
     def stop(self) -> None:
         with self._lock:
@@ -3960,6 +4065,8 @@ class HostRun:
             ),
             **selection,
         }
+        if self._extensions is not None and self._extensions.config.warnings:
+            result["config_warnings"] = list(self._extensions.config.warnings)
         all_models: dict[str, UsageTotals] = {}
         for _, by_model in usage_by_agent.values():
             all_models = self._merge_usage(all_models, by_model)

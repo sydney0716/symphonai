@@ -625,7 +625,14 @@ pre:focus-within > .code-copy {
 }
 
 .session-row-action.icon-pencil {
-  right: 2rem;
+  right: 6rem;
+}
+
+.session-row-action.icon-archive {
+  right: 4rem;
+  width: 4rem;
+  padding: 0 var(--space-1);
+  white-space: nowrap;
 }
 
 .session-row-action.icon-trash {
@@ -642,6 +649,22 @@ pre:focus-within > .code-copy {
   flex-basis: 100%;
   margin: 0 0 var(--space-2);
   color: var(--ui-danger);
+}
+
+.archived-sessions {
+  margin: var(--space-2) 0 0 var(--space-4);
+  border-top: 1px solid var(--ui-border);
+  padding-top: var(--space-2);
+}
+
+.archived-sessions > summary {
+  min-height: 2rem;
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+}
+
+.archived-session-row .session-row-action.icon-archive {
+  right: 4rem;
 }
 
 .session-rename-input {
@@ -969,6 +992,66 @@ button.session-link {
 
 .diff-hunk {
   color: var(--ui-text-secondary);
+}
+
+.changes-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--space-3);
+}
+
+.changes-diff-toggle {
+  min-height: 2rem;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--radius-control);
+  background: var(--ui-panel);
+  color: var(--ui-text);
+  cursor: pointer;
+}
+
+.changes-diff[data-mode="side-by-side"] .diff-unified,
+.diff-side-by-side {
+  display: none;
+}
+
+.changes-diff[data-mode="side-by-side"] .diff-side-by-side {
+  display: grid;
+}
+
+.diff-side-by-side {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  overflow: auto;
+  background: var(--ui-inset);
+  font-family: var(--font-code);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.diff-side-by-side > span,
+.diff-split-header {
+  display: block;
+  min-height: 1.55em;
+  padding: 0 var(--space-2);
+}
+
+.diff-split-header {
+  grid-column: 1 / -1;
+}
+
+.diff-split-context {
+  color: var(--ui-text);
+}
+
+@media (max-width: 640px) {
+  .changes-diff[data-mode="side-by-side"] .diff-unified {
+    display: block;
+  }
+
+  .changes-diff[data-mode="side-by-side"] .diff-side-by-side {
+    display: none;
+  }
 }
 
 .changes-outside,
@@ -1303,6 +1386,21 @@ button.session-link {
   margin: 0;
 }
 
+.pasted-text-chip {
+  flex-wrap: wrap;
+}
+
+.pasted-text-preview {
+  flex-basis: 100%;
+  max-height: 12rem;
+  overflow: auto;
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-control);
+  background: var(--ui-inset);
+  white-space: pre-wrap;
+}
+
 .conversation-usage {
   min-width: 0;
   margin: 0;
@@ -1345,6 +1443,99 @@ button.session-link {
   border-radius: var(--radius-popover);
   background: var(--ui-panel);
   box-shadow: var(--ui-shadow);
+}
+
+.history-search-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--radius-popover);
+  background: var(--ui-panel);
+}
+
+.history-search-bar[hidden] {
+  display: none;
+}
+
+.history-search-input {
+  min-width: 0;
+  flex: 1;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--radius-control);
+  background: var(--ui-inset);
+  color: var(--ui-text);
+}
+
+.history-search-result {
+  overflow: hidden;
+  color: var(--ui-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-search-count {
+  flex: none;
+  color: var(--ui-text-secondary);
+  font-size: 0.75rem;
+}
+
+.shortcut-help-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--radius-popover);
+  background: var(--ui-panel);
+  color: var(--ui-text-secondary);
+}
+
+.shortcut-help-panel[hidden] {
+  display: none;
+}
+
+.shortcut-help-panel strong {
+  color: var(--ui-text);
+}
+
+.shortcut-help-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.edit-conflict-panel {
+  grid-column: 1 / -1;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--ui-warning);
+  border-radius: var(--radius-popover);
+  background: var(--ui-panel);
+}
+
+.edit-conflict-panel[hidden] {
+  display: none;
+}
+
+.edit-conflict-panel p {
+  margin: 0 0 var(--space-2);
+}
+
+.edit-conflict-panel ul {
+  margin: 0 0 var(--space-2);
+  padding-inline-start: var(--space-6);
+}
+
+.edit-conflict-panel button + button {
+  margin-inline-start: var(--space-2);
+}
+
+.prompt.editing-previous-prompt {
+  outline: 2px solid var(--ui-accent);
+  outline-offset: 2px;
 }
 
 .file-menu {
@@ -1398,6 +1589,75 @@ button.session-link {
 
 .picker-host {
   grid-column: 1 / -1;
+}
+
+.quick-open-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  align-content: start;
+  justify-items: center;
+  padding: 12vh var(--space-4) var(--space-4);
+  background: color-mix(in srgb, var(--ui-bg) 78%, transparent);
+}
+
+.quick-open-dialog {
+  display: grid;
+  gap: var(--space-2);
+  width: min(42rem, 100%);
+  max-height: 70vh;
+  padding: var(--space-3);
+  overflow: hidden;
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--radius-popover);
+  background: var(--ui-raised);
+  box-shadow: var(--ui-shadow);
+}
+
+.quick-open-dialog h2,
+.quick-open-message {
+  margin: 0;
+}
+
+.quick-open-input {
+  width: 100%;
+}
+
+.quick-open-results {
+  display: grid;
+  gap: var(--space-1);
+  overflow: auto;
+}
+
+.quick-open-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1) var(--space-4);
+  width: 100%;
+  min-height: 2rem;
+  padding: var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--ui-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.quick-open-result.focused {
+  border-color: var(--ui-accent);
+  background: var(--ui-selected);
+}
+
+.quick-open-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.quick-open-folder {
+  color: var(--ui-text-secondary);
+  overflow-wrap: anywhere;
 }
 
 .picker {

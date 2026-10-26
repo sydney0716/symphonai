@@ -17,6 +17,7 @@ NODE_MINIMUM = 18
 NODE_TESTS = {
     "app.protocol": "protocol.test.js",
     "app.highlight": "highlight.test.js",
+    "app.diff_split": "diff_split.test.js",
     "app.highlight": "highlight.test.js",
     "app.transcript": "transcript.test.js",
     "app.client": "client.test.js",
@@ -91,6 +92,11 @@ def protocol() -> None:
 @check("app.highlight")
 def highlight() -> None:
     _run_node_test("highlight.test.js")
+
+
+@check("app.diff_split")
+def diff_split() -> None:
+    _run_node_test("diff_split.test.js")
 
 
 @check("app.transcript")

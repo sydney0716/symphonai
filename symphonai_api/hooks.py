@@ -77,7 +77,7 @@ def hooks_from_config(
         and not (trust is not None and trust.allows(repo_root, "hooks"))
     ):
         raise ConfigError(
-            f"{source}: hooks: hooks are not read from configuration inside "
+            f"{source}: hooks: hooks were refused and are not read from configuration inside "
             "a repository; define them in ~/.symphonai/config.toml or grant "
             f"{str(Path(repo_root).resolve())!r} under [[trust.repositories]]"
         )

@@ -10,6 +10,7 @@ import shutil
 import sys
 import subprocess
 import threading
+import time
 import tempfile
 import stat
 from datetime import datetime, timezone
@@ -49,6 +50,7 @@ from symphonai_host.files import repository_files, repository_tree
 from symphonai_host.protocol import (
     ApprovalReply,
     ApprovalRequested,
+    FilesChanged,
     HistoryMessage,
     PROTOCOL_VERSION,
     ProtocolError,
@@ -74,6 +76,9 @@ from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
 
 
 MAX_FILE_BYTES = 1024 * 1024
+FILES_CHANGED_LIMIT = 100
+FILES_CHANGED_POLL_SECONDS = 0.25
+FILES_CHANGED_SETTLE_SECONDS = 1.0
 APP_CONTENT_TYPES = {
     ".css": "text/css",
     ".html": "text/html",
@@ -92,6 +97,41 @@ PROVIDERS = (
     (key, CATALOG[key].api_key_env_var, None)
     for key in catalog_keys()
 )
+
+
+def _working_tree_fingerprint(root: Path) -> dict[str, tuple[str, int, int, int, int, int]] | None:
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=root, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    entries = result.stdout.split(b"\0")
+    paths: list[tuple[str, str]] = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        status = os.fsdecode(entry[:2])
+        paths.append((os.fsdecode(entry[3:]), status))
+        if "R" in status or "C" in status:
+            if index < len(entries):
+                paths.append((os.fsdecode(entries[index]), status))
+                index += 1
+    fingerprint = {}
+    for relative, status in paths:
+        try:
+            stat_result = (root / relative).lstat()
+            metadata = (
+                status, stat_result.st_size, stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns, stat_result.st_mode, stat_result.st_ino,
+            )
+        except FileNotFoundError:
+            metadata = (status, -1, -1, -1, -1, -1)
+        fingerprint[relative] = metadata
+    return fingerprint
 
 
 def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
@@ -635,9 +675,7 @@ class HostServer:
         self._watch_stop = threading.Event()
         self._event_watch: threading.Thread | None = None
         self._event_watch_subscription: Subscription | None = None
-        if self._project_factory is not None:
-            self._event_watch = threading.Thread(target=self._watch_project_events, daemon=True)
-            self._event_watch.start()
+        self._file_watch: threading.Thread | None = None
         self.keepalive_seconds = keepalive_seconds
         self._handshake_printed = False
         self._thread: threading.Thread | None = None
@@ -647,6 +685,11 @@ class HostServer:
         handler = self._handler_type()
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self._httpd.daemon_threads = True
+        if self._project_factory is not None:
+            self._event_watch = threading.Thread(target=self._watch_project_events, daemon=True)
+            self._event_watch.start()
+        self._file_watch = threading.Thread(target=self._watch_files, daemon=True)
+        self._file_watch.start()
         if initial_run is not None:
             initial_run.recover_loops()
 
@@ -808,6 +851,55 @@ class HostServer:
             subscription.close()
             self._event_watch_subscription = None
 
+    def _watch_files(self) -> None:
+        watched_root: Path | None = None
+        fingerprint: dict[str, tuple[str, int, int, int, int, int]] | None = None
+        pending_paths: set[str] = set()
+        last_change = 0.0
+        last_poll = 0.0
+        while not self._watch_stop.wait(FILES_CHANGED_POLL_SECONDS):
+            watcher_count = int(
+                self._event_watch_subscription is not None
+                and not self._event_watch_subscription.closed
+            )
+            connected = self.broker.subscriber_count > watcher_count
+            with self._runtimes_lock:
+                root = self._current_root
+            root = root if connected else None
+            if root is None:
+                watched_root = None
+                fingerprint = None
+                pending_paths.clear()
+                continue
+            if root != watched_root:
+                watched_root = root
+                fingerprint = _working_tree_fingerprint(root)
+                pending_paths.clear()
+                last_poll = time.monotonic()
+                continue
+            now = time.monotonic()
+            if now - last_poll < FILES_CHANGED_POLL_SECONDS:
+                continue
+            current = _working_tree_fingerprint(root)
+            now = time.monotonic()
+            last_poll = now
+            if current is not None and fingerprint is not None:
+                changed = {
+                    path for path in fingerprint.keys() | current.keys()
+                    if fingerprint.get(path) != current.get(path)
+                }
+                pending_paths.update(changed)
+                if changed:
+                    last_change = now
+                fingerprint = current
+            if pending_paths and now - last_change >= FILES_CHANGED_SETTLE_SECONDS:
+                changed_paths = sorted(pending_paths)
+                self.broker.publish(FilesChanged(
+                    agent_id="", run_id="", paths=changed_paths[:FILES_CHANGED_LIMIT],
+                    truncated=len(changed_paths) > FILES_CHANGED_LIMIT,
+                ))
+                pending_paths.clear()
+
     def print_handshake(self) -> None:
         if not self._handshake_printed:
             handshake = self.handshake()
@@ -849,6 +941,8 @@ class HostServer:
         self.broker.close()
         if self._event_watch is not None:
             self._event_watch.join(timeout=1)
+        if self._file_watch is not None:
+            self._file_watch.join(timeout=1)
         if self._serving:
             self._httpd.shutdown()
         self._httpd.server_close()
@@ -1642,6 +1736,9 @@ class HostServer:
                             }
                         ],
                     }
+                    config_warnings = [] if extensions is None else list(extensions.config.warnings)
+                    if config_warnings:
+                        settings["config_warnings"] = config_warnings
                     self._json(HTTPStatus.OK, {"settings": settings})
                     return
                 if self.path == "/approvals":
@@ -1669,6 +1766,8 @@ class HostServer:
                     values = parse_qs(request_url.query, keep_blank_values=True).get("limit", [])
                     queries = parse_qs(request_url.query, keep_blank_values=True).get("query", [])
                     query = queries[0] if len(queries) == 1 else None
+                    archived_values = parse_qs(request_url.query, keep_blank_values=True).get("archived", [])
+                    archived = archived_values == ["1"]
                     try:
                         limit = int(values[0]) if len(values) == 1 else None
                     except ValueError:
@@ -1677,7 +1776,25 @@ class HostServer:
                         limit = None
                     self._json(HTTPStatus.OK, list_sessions(
                         host.run.sessions_root, limit=limit, activity=host.session_activity(), query=query,
+                        archived=archived,
                     ))
+                    return
+                if request_path == "/session/export":
+                    if not self._authorized():
+                        return
+                    values = parse_qs(request_url.query, keep_blank_values=True).get("id", [])
+                    if len(values) != 1 or not values[0]:
+                        self._not_found()
+                        return
+                    try:
+                        exported = host.run.export_session(values[0])
+                    except (KeyError, FileNotFoundError):
+                        self._not_found()
+                        return
+                    except (OSError, TranscriptError, ValueError, TypeError):
+                        self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "session transcript cannot be exported"})
+                        return
+                    self._json(HTTPStatus.OK, exported)
                     return
                 if request_path == "/loops":
                     if not self._authorized():
@@ -1787,7 +1904,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -1816,7 +1933,12 @@ class HostServer:
                     except Exception as exc:
                         self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                         return
-                    self._json(HTTPStatus.OK, {"repo_root": str(runtime.root), "name": runtime.root.name})
+                    reply = {"repo_root": str(runtime.root), "name": runtime.root.name}
+                    extensions = runtime.run.extensions
+                    config_warnings = [] if extensions is None else list(extensions.config.warnings)
+                    if config_warnings:
+                        reply["config_warnings"] = config_warnings
+                    self._json(HTTPStatus.OK, reply)
                     return
                 if self.path == "/permissions/remove":
                     try:
@@ -2449,6 +2571,37 @@ class HostServer:
                             if opened is None:
                                 session_store.close()
                     self._json(HTTPStatus.OK, {"renamed": True})
+                    return
+                if self.path == "/session/archive":
+                    try:
+                        payload = self._read_object()
+                        if (
+                            set(payload) != {"run_id", "archived"}
+                            or type(payload.get("run_id")) is not str
+                            or not payload["run_id"]
+                            or payload["run_id"] in (".", "..")
+                            or Path(payload["run_id"]).name != payload["run_id"]
+                            or type(payload.get("archived")) is not bool
+                        ):
+                            raise ProtocolError("session/archive requires run_id and archived")
+                    except ProtocolError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        return
+                    if not (host.run.sessions_root / payload["run_id"]).is_dir():
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown session"})
+                        return
+                    if not host._session_belongs_here(payload["run_id"]):
+                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
+                        return
+                    try:
+                        updated = host.run.archive_session(payload["run_id"], payload["archived"])
+                    except RunActiveError as exc:
+                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                        return
+                    self._json(
+                        HTTPStatus.OK if updated else HTTPStatus.NOT_FOUND,
+                        {"archived": payload["archived"]} if updated else {"archived": False},
+                    )
                     return
                 if self.path == "/session/delete":
                     try:

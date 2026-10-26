@@ -323,6 +323,27 @@ export function renderDiff(document, value) {
   return pre;
 }
 
+export function renderSplitDiff(document, value, actions) {
+  const table = element(document, "div", { className: "diff-side-by-side" });
+  const rows = actions?.splitDiff?.(value) ?? [];
+  append(table, ...rows.flatMap((row) => row.kind === "hunk" || row.kind === "header"
+    ? [element(document, "div", {
+        className: `diff-split-header ${row.kind === "hunk" ? "diff-hunk" : ""}`,
+        text: row.text,
+      })]
+    : [
+      element(document, "span", {
+        className: row.kind === "context" ? "diff-split-context" : "diff-remove",
+        text: row.old,
+      }),
+      element(document, "span", {
+        className: row.kind === "context" ? "diff-split-context" : "diff-add",
+        text: row.new,
+      }),
+    ]));
+  return table;
+}
+
 function renderCommand(document, entry) {
   const command = element(document, "div", { className: "command" });
   append(

@@ -433,10 +433,11 @@ export function createClient({
       return request("GET", "/approvals");
     },
 
-    sessions(limit, query) {
+    sessions(limit, query, archived = false) {
       const params = new URLSearchParams();
       if (limit !== undefined) params.set("limit", String(limit));
       if (query !== undefined && query !== "") params.set("query", query);
+      if (archived) params.set("archived", "1");
       return request(
         "GET",
         params.size ? `/sessions?${params}` : "/sessions",
@@ -445,8 +446,21 @@ export function createClient({
       );
     },
 
+    exportSession(runId) {
+      const params = new URLSearchParams({ id: runId });
+      return request("GET", `/session/export?${params}`, undefined, readReply, {
+        detailOnError: true,
+      });
+    },
+
     renameSession(runId, title) {
       return request("POST", "/session/rename", { run_id: runId, title }, readReply, {
+        detailOnError: true,
+      });
+    },
+
+    archiveSession(runId, archived) {
+      return request("POST", "/session/archive", { run_id: runId, archived }, readReply, {
         detailOnError: true,
       });
     },

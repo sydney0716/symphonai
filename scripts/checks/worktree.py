@@ -615,10 +615,11 @@ def check_configured_symlink_escape_refused() -> None:
         config = repo / ".symphonai" / "config.toml"
         for entry in ("../outside", "/absolute"):
             config.write_text(f'[worktree]\nsymlink = ["{entry}"]\n')
-            try:
-                load_config(repo_root=repo, home=root / "home")
-            except ConfigError as exc:
-                if "worktree.symlink" not in str(exc):
-                    fail(f"invalid symlink path error omitted its key: {exc}")
-            else:
-                fail(f"unsafe worktree symlink path was accepted: {entry}")
+            resolved = load_config(repo_root=repo, home=root / "home")
+            if resolved.get("worktree.symlink") is not None:
+                fail(f"unsafe worktree symlink path was applied: {entry}")
+            if not any(
+                str(config) in warning and "worktree.symlink" in warning and entry in warning
+                for warning in resolved.warnings
+            ):
+                fail(f"unsafe worktree symlink warning omitted its source or reason: {resolved.warnings!r}")

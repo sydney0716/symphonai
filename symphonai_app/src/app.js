@@ -4,8 +4,9 @@ import { createClient } from "./client.js";
 import { parseMarkdown } from "./markdown.js";
 import { highlight } from "./highlight.js";
 import { resolveHost } from "./host_handle.js";
-import { decodeEvent } from "./protocol.js";
-import { append, element, listen, renderDiff, renderMarkdownBlocks, renderTranscript, replace } from "./render.js";
+import { decodeEvent, FILES_CHANGED_EVENT_TYPE } from "./protocol.js";
+import { append, element, listen, renderDiff, renderMarkdownBlocks, renderSplitDiff, renderTranscript, replace } from "./render.js";
+import { splitDiff } from "./diff_split.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
@@ -148,6 +149,7 @@ function clientFor(global, supplied) {
 
 const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
+const DIFF_MODE_KEY = "symphonai.diff-mode";
 const SIDEBAR_SESSION_LIMIT = 200;
 const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop"];
 const RAIL_TOOL_ICONS = Object.freeze({
@@ -197,8 +199,25 @@ function rememberRoute(global, route) {
   }
 }
 
+function storedDiffMode(global) {
+  try {
+    return global.localStorage?.getItem(DIFF_MODE_KEY) === "side-by-side" ? "side-by-side" : "unified";
+  } catch {
+    return "unified";
+  }
+}
+
+function rememberDiffMode(global, mode) {
+  try {
+    global.localStorage?.setItem(DIFF_MODE_KEY, mode);
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
+  }
+}
+
 export async function start({ global, document, client }) {
   const boundary = clientFor(global, client);
+  let diffMode = storedDiffMode(global);
   const shell = document.getElementById("app-shell");
   const sidebar = document.getElementById("sidebar");
   const homeLink = document.getElementById("home-link");
@@ -251,14 +270,32 @@ export async function start({ global, document, client }) {
   const promptError = document.getElementById("prompt-error");
   const attachmentList = document.getElementById("prompt-attachments");
   const pendingFiles = [];
+  const pastedTextChips = [];
+  let nextPastedTextId = 1;
   const promptAttachments = [];
   let following = true;
   let savedScrollTop = 0;
   input.required = false;
   const commandMenu = element(document, "div", { className: "command-menu" });
   const fileMenu = element(document, "div", { className: "file-menu" });
+  const historySearchBar = element(document, "div", { className: "history-search-bar" });
+  historySearchBar.hidden = true;
+  const shortcutHelpPanel = element(document, "div", { className: "shortcut-help-panel" });
+  shortcutHelpPanel.hidden = true;
+  const historySearchInput = element(document, "input", { className: "history-search-input" });
+  historySearchInput.type = "search";
+  historySearchInput.setAttribute("aria-label", "Search prompt history");
+  historySearchInput.placeholder = "Search prompt history";
+  const historySearchResult = element(document, "span", { className: "history-search-result" });
+  const historySearchCount = element(document, "span", { className: "history-search-count" });
+  append(historySearchBar, historySearchInput, historySearchResult, historySearchCount);
+  const editConflictPanel = element(document, "div", { className: "edit-conflict-panel" });
+  editConflictPanel.hidden = true;
   const pickerHost = element(document, "div", { className: "picker-host" });
-  form.before(commandMenu, fileMenu, pickerHost);
+  form.before(commandMenu, fileMenu, historySearchBar, shortcutHelpPanel, editConflictPanel, pickerHost);
+  let quickOpenState = null;
+  let quickOpenTimer = null;
+  let quickOpenVersion = 0;
   let commandMatches = [];
   let highlightedCommand = 0;
   let fileMatches = [];
@@ -271,6 +308,13 @@ export async function start({ global, document, client }) {
   let historyIndex = -1;
   let historyDraft = "";
   let recalledPrompt = null;
+  let historySearchDraft = "";
+  let historySearchMatches = [];
+  let historySearchIndex = 0;
+  let editingPreviousPrompt = null;
+  let lastIdleEscapeAt = 0;
+  let suppressEditUntil = 0;
+  let escapeStopRequested = false;
   const approvalDiffs = new Map();
   const approvalClient = new Proxy(boundary, {
     get(target, property, receiver) {
@@ -321,6 +365,7 @@ export async function start({ global, document, client }) {
   let project = await boundary.project();
   const projectless = project?.repo_root == null;
   let initialSessions = [];
+  let initialArchivedSessions = [];
   let initialRoadmap = { goals: [], error: "" };
   let settingsReply;
   let healthReply;
@@ -333,8 +378,9 @@ export async function start({ global, document, client }) {
       (boundary.projects?.() ?? Promise.resolve({ recent: [] })).catch(() => ({ recent: [] })),
     ]);
   } else {
-    [initialSessions, initialRoadmap, settingsReply, healthReply, conversationReply] = await Promise.all([
+    [initialSessions, initialArchivedSessions, initialRoadmap, settingsReply, healthReply, conversationReply] = await Promise.all([
       boundary.sessions(SIDEBAR_SESSION_LIMIT),
+      boundary.sessions(SIDEBAR_SESSION_LIMIT, undefined, true),
       readRoadmap(),
       boundary.settings(),
       boundary.health().catch(() => null),
@@ -375,17 +421,28 @@ export async function start({ global, document, client }) {
   let selection = settingsReply?.settings?.selection ?? { provider: "", model: null, effort: null };
   let rememberedPlanMode = null;
   let sessions = initialSessions;
+  let archivedSessions = initialArchivedSessions;
   let sessionQuery = "";
   let editingSessionId = null;
   let editingSessionTitle = "";
   let focusSessionRename = false;
   let sessionRowError = "";
+  let sessionArchiveError = "";
   let confirmingSessionId = null;
   let sessionSearchSequence = 0;
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
   let conversation = conversationReply?.conversation ?? null;
   let draftSaveTimer = null;
+
+  async function refreshSessionLists() {
+    const [active, archived] = await Promise.all([
+      boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery),
+      boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery, true),
+    ]);
+    sessions = active;
+    archivedSessions = archived;
+  }
 
   function draftKey() {
     return JSON.stringify([project?.repo_root ?? "", currentSessionId ?? "new"]);
@@ -422,8 +479,15 @@ export async function start({ global, document, client }) {
     try {
       const key = draftKey();
       const drafts = readDrafts().filter((draft) => draft.key !== key);
-      if (input.value) {
-        drafts.push({ key, text: input.value, savedAt: Date.now() });
+      if (input.value || pastedTextChips.length > 0) {
+        drafts.push({
+          key,
+          text: input.value,
+          pastes: pastedTextChips.map(({ id, text, placeholder, lines }) => ({
+            id, text, placeholder, lines,
+          })),
+          savedAt: Date.now(),
+        });
         drafts.sort((left, right) => left.savedAt - right.savedAt);
         if (drafts.length > 50) drafts.splice(0, drafts.length - 50);
       }
@@ -435,7 +499,22 @@ export async function start({ global, document, client }) {
 
   function restoreDraft() {
     const key = draftKey();
-    input.value = readDrafts().find((draft) => draft.key === key)?.text ?? "";
+    const draft = readDrafts().find((entry) => entry.key === key);
+    input.value = draft?.text ?? "";
+    pastedTextChips.splice(0);
+    for (const paste of Array.isArray(draft?.pastes) ? draft.pastes : []) {
+      if (
+        Number.isInteger(paste?.id)
+        && typeof paste.text === "string"
+        && typeof paste.placeholder === "string"
+        && Number.isInteger(paste.lines)
+        && input.value.includes(paste.placeholder)
+      ) {
+        pastedTextChips.push({ ...paste, expanded: false });
+        nextPastedTextId = Math.max(nextPastedTextId, paste.id + 1);
+      }
+    }
+    showPendingAttachments();
   }
 
   function clearDraft() {
@@ -1102,6 +1181,7 @@ export async function start({ global, document, client }) {
   }
 
   let pageNavLinks = [];
+  let changesDirty = false;
   async function showChanges() {
     replace(
       changesRoot,
@@ -1180,9 +1260,27 @@ export async function start({ global, document, client }) {
     const turns = Array.isArray(reply?.turns) ? reply.turns : [];
     const worktrees = Array.isArray(reply?.worktrees) ? reply.worktrees : [];
     function diffView(diff) {
-      return renderDiff(document, diff);
+      const view = element(document, "div", { className: "changes-diff" });
+      view.setAttribute("data-mode", diffMode);
+      const unified = element(document, "div", { className: "diff-unified" });
+      append(unified, renderDiff(document, diff));
+      append(view, unified, renderSplitDiff(document, diff, { splitDiff }));
+      return view;
     }
-    const children = [element(document, "h1", { text: "Changes" })];
+    const modeToggle = element(document, "button", {
+      className: "changes-diff-toggle",
+      text: diffMode === "side-by-side" ? "Unified" : "Side by side",
+    });
+    modeToggle.type = "button";
+    modeToggle.setAttribute("aria-pressed", String(diffMode === "side-by-side"));
+    listen(modeToggle, "click", () => {
+      diffMode = diffMode === "side-by-side" ? "unified" : "side-by-side";
+      rememberDiffMode(global, diffMode);
+      void showChanges();
+    });
+    const toolbar = element(document, "div", { className: "changes-toolbar" });
+    append(toolbar, modeToggle);
+    const children = [element(document, "h1", { text: "Changes" }), toolbar];
     const workingTree = element(document, "section", { className: "changes-working-tree" });
     append(workingTree, element(document, "h2", { text: "Working tree" }));
     if (gitResult.status === "rejected") {
@@ -1208,7 +1306,9 @@ export async function start({ global, document, client }) {
         if (file.staged) append(summary, element(document, "span", { className: "changes-staged", text: "Staged" }));
         let diffLoaded = file.diff_deferred !== true;
         let diffLoading = false;
-        const diff = diffView(file.diff ?? "");
+        const diff = file.diff_deferred === true
+          ? renderDiff(document, "")
+          : diffView(file.diff ?? "");
         listen(row, "toggle", async () => {
           if (!row.open || diffLoaded || diffLoading) return;
           diffLoading = true;
@@ -1300,6 +1400,7 @@ export async function start({ global, document, client }) {
       }
     }
     replace(changesRoot, ...children);
+    changesDirty = false;
   }
 
   function jobsPaneVisible() {
@@ -1496,7 +1597,8 @@ export async function start({ global, document, client }) {
     closeAgentView();
     projectActionError = "";
     try {
-      await boundary.openProject(path);
+      const opened = await boundary.openProject(path);
+      showConfigurationWarnings(opened?.config_warnings);
       if (sessionId) await boundary.openSession(sessionId);
       global.location?.reload?.();
       return true;
@@ -1725,9 +1827,9 @@ export async function start({ global, document, client }) {
         await clipboard.writeText(text);
       },
       onViewChanges: () => openRailTool("Changes"),
-      openSourceFile: (path) => {
-        void openRailTool("Files");
-        void openSourceFile(path);
+      openSourceFile: async (path) => {
+        await openRailTool("Files");
+        await openSourceFile(path);
       },
       onCommit: async (entry) => {
         const paths = entry.files.filter((file) => file.checked)
@@ -1805,6 +1907,14 @@ export async function start({ global, document, client }) {
         parseMarkdown,
         agentView ? { copyText: actions.copyText } : actions,
       );
+    }
+    if (editingPreviousPrompt && !agentView) {
+      const promptIndex = transcript.model
+        .slice(0, transcript.model.indexOf(editingPreviousPrompt))
+        .filter((entry) => entry.type === "prompt").length;
+      const promptNode = Array.from(chatRoot.children)
+        .filter((node) => node.className === "prompt")[promptIndex];
+      if (promptNode) promptNode.className += " editing-previous-prompt";
     }
     if (!findBar.hidden && findInput.value) highlightFindMatches();
     updateMissingKeyNotice();
@@ -1935,7 +2045,7 @@ export async function start({ global, document, client }) {
 
   async function openSession(runId) {
     closeAgentView();
-    const targetSession = sessions.find((session) => session.run_id === runId);
+    const targetSession = [...sessions, ...archivedSessions].find((session) => session.run_id === runId);
     if (targetSession?.repo_root && targetSession.repo_root !== project.repo_root) {
       return openProjectAt(targetSession.repo_root, runId);
     }
@@ -2014,8 +2124,10 @@ export async function start({ global, document, client }) {
           const sequence = ++sessionSearchSequence;
           try {
             const results = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+            const archivedResults = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery, true);
             if (sequence !== sessionSearchSequence) return;
             sessions = results;
+            archivedSessions = archivedResults;
             showProjects();
           } catch (error) {
             sessionRowError = error instanceof Error ? error.message : String(error);
@@ -2092,6 +2204,11 @@ export async function start({ global, document, client }) {
           remove.type = "button";
           remove.setAttribute("aria-label", "Delete");
           remove.setAttribute("title", "Delete");
+          const archive = element(document, "button", { className: "session-row-action icon-archive", text: "Archive" });
+          archive.type = "button";
+          archive.setAttribute("aria-label", "Archive");
+          archive.setAttribute("title", "Archive");
+          listen(archive, "click", () => updateSessionArchive(session.run_id, true));
           listen(rename, "click", () => {
             editingSessionId = session.run_id;
             editingSessionTitle = session.title || "";
@@ -2106,7 +2223,7 @@ export async function start({ global, document, client }) {
             sessionRowError = "";
             showProjects();
           });
-          append(row, rename, remove);
+          append(row, rename, archive, remove);
           if (confirmingSessionId === session.run_id) {
             const confirmation = element(document, "div", { className: "session-delete-confirmation" });
             append(confirmation, element(document, "span", { text: "Delete this conversation? This cannot be undone." }));
@@ -2129,6 +2246,66 @@ export async function start({ global, document, client }) {
         }
         append(section, row);
       }
+      if (current) {
+        const projectArchived = archivedSessions.filter((session) => session.repo_root === group.root);
+        if (projectArchived.length > 0) {
+          const archived = element(document, "details", { className: "archived-sessions" });
+          append(archived, element(document, "summary", { text: `Archived (${projectArchived.length})` }));
+          for (const session of projectArchived) {
+            const row = element(document, "div", { className: "session-row archived-session-row" });
+            const link = element(document, "button", {
+              className: "session-link",
+              text: session.title || session.run_id,
+            });
+            link.type = "button";
+            link.setAttribute("title", session.title || session.run_id);
+            if (session.run_id === currentSessionId) link.setAttribute("aria-current", "true");
+            listen(link, "click", () => openSession(session.run_id));
+            const unarchive = element(document, "button", {
+              className: "session-row-action icon-archive",
+              text: "Unarchive",
+            });
+            unarchive.type = "button";
+            unarchive.setAttribute("aria-label", "Unarchive");
+            unarchive.setAttribute("title", "Unarchive");
+            listen(unarchive, "click", () => updateSessionArchive(session.run_id, false));
+            const remove = element(document, "button", { className: "session-row-action icon-trash" });
+            remove.type = "button";
+            remove.setAttribute("aria-label", "Delete");
+            remove.setAttribute("title", "Delete");
+            listen(remove, "click", () => {
+              confirmingSessionId = session.run_id;
+              sessionRowError = "";
+              showProjects();
+            });
+            append(row, link, unarchive, remove);
+            if (confirmingSessionId === session.run_id) {
+              const confirmation = element(document, "div", { className: "session-delete-confirmation" });
+              append(confirmation, element(document, "span", { text: "Delete this conversation? This cannot be undone." }));
+              const confirm = element(document, "button", { text: "Delete" });
+              confirm.type = "button";
+              const cancel = element(document, "button", { text: "Cancel" });
+              cancel.type = "button";
+              listen(confirm, "click", () => deleteSession(session.run_id));
+              listen(cancel, "click", () => {
+                confirmingSessionId = null;
+                sessionRowError = "";
+                showProjects();
+              });
+              append(confirmation, confirm, cancel);
+              append(row, confirmation);
+            }
+            if (sessionRowError && confirmingSessionId === session.run_id) {
+              append(row, element(document, "p", { className: "session-row-error", text: sessionRowError }));
+            }
+            append(archived, row);
+          }
+          append(section, archived);
+        }
+        if (sessionArchiveError) {
+          append(section, element(document, "p", { className: "session-row-error", text: sessionArchiveError }));
+        }
+      }
       groups.push(section);
     }
     replace(projectsRoot, ...groups);
@@ -2144,7 +2321,7 @@ export async function start({ global, document, client }) {
     }
   }
   async function saveSessionTitle(runId, title) {
-    const session = sessions.find((item) => item.run_id === runId);
+    const session = [...sessions, ...archivedSessions].find((item) => item.run_id === runId);
     const nextTitle = title.trim();
     if (!nextTitle || nextTitle === (session?.title || "")) {
       editingSessionId = null;
@@ -2156,7 +2333,7 @@ export async function start({ global, document, client }) {
       await boundary.renameSession(runId, nextTitle);
       editingSessionId = null;
       sessionRowError = "";
-      sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+      await refreshSessionLists();
     } catch (error) {
       sessionRowError = error instanceof Error ? error.message : String(error);
     }
@@ -2166,6 +2343,7 @@ export async function start({ global, document, client }) {
     try {
       await boundary.deleteSession(runId);
       sessions = sessions.filter((session) => session.run_id !== runId);
+      archivedSessions = archivedSessions.filter((session) => session.run_id !== runId);
       confirmingSessionId = null;
       sessionRowError = "";
       if (currentSessionId === runId) {
@@ -2184,6 +2362,18 @@ export async function start({ global, document, client }) {
       sessionRowError = error instanceof Error ? error.message : String(error);
       showProjects();
     }
+  }
+  async function updateSessionArchive(runId, archived) {
+    try {
+      await boundary.archiveSession(runId, archived);
+      await refreshSessionLists();
+      sessionRowError = "";
+      sessionArchiveError = "";
+      confirmingSessionId = null;
+    } catch (error) {
+      sessionArchiveError = error instanceof Error ? error.message : String(error);
+    }
+    showProjects();
   }
   showProjects();
   async function startNewChat() {
@@ -2345,8 +2535,151 @@ export async function start({ global, document, client }) {
     return true;
   }
 
+  function updateHistorySearch() {
+    const query = historySearchInput.value.toLocaleLowerCase();
+    historySearchMatches = (historyPrompts ?? []).filter((prompt) => (
+      prompt.toLocaleLowerCase().includes(query)
+    ));
+    historySearchIndex = 0;
+    showHistorySearchMatch();
+  }
+
+  function showHistorySearchMatch() {
+    const match = historySearchMatches[historySearchIndex];
+    historySearchResult.textContent = match ?? (historySearchInput.value ? "no match" : "");
+    historySearchCount.textContent = match
+      ? `${historySearchIndex + 1} of ${historySearchMatches.length}`
+      : "";
+  }
+
+  async function openHistorySearch() {
+    historySearchDraft = input.value;
+    if (!(await loadPromptHistory())) historyPrompts = [];
+    historySearchBar.hidden = false;
+    historySearchInput.value = "";
+    updateHistorySearch();
+    historySearchInput.focus();
+  }
+
+  function closeHistorySearch(restoreDraft) {
+    historySearchBar.hidden = true;
+    historySearchInput.value = "";
+    historySearchMatches = [];
+    if (restoreDraft) input.value = historySearchDraft;
+    historySearchCount.textContent = "";
+    input.focus();
+  }
+
+  function stepHistorySearch() {
+    if (historySearchMatches.length === 0) return;
+    historySearchIndex = (historySearchIndex + 1) % historySearchMatches.length;
+    showHistorySearchMatch();
+  }
+
+  listen(historySearchInput, "input", updateHistorySearch);
+  listen(historySearchInput, "keydown", (event) => {
+    if (lookup(keymap, event, { platform }) === "history-search") {
+      event.preventDefault();
+      stepHistorySearch();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (historySearchMatches.length > 0) {
+        input.value = historySearchMatches[historySearchIndex];
+        queueDraftSave();
+        closeHistorySearch(false);
+      }
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeHistorySearch(true);
+    }
+  });
+
+  function selectPreviousMessageForEdit() {
+    editingPreviousPrompt = [...transcript.model].reverse()
+      .find((entry) => entry.type === "prompt") ?? null;
+    if (!editingPreviousPrompt) return false;
+    input.value = editingPreviousPrompt.text;
+    queueDraftSave();
+    showTranscript();
+    input.focus();
+    return true;
+  }
+
+  function cancelPreviousMessageEdit() {
+    editingPreviousPrompt = null;
+    editConflictPanel.hidden = true;
+    replace(editConflictPanel);
+    input.value = "";
+    queueDraftSave();
+    showTranscript();
+    input.focus();
+  }
+
+  function showEditConflict(paths, text, recordId) {
+    const force = element(document, "button", { text: "Fork anyway" });
+    force.type = "button";
+    listen(force, "click", () => forkEditedPrompt(text, recordId, true));
+    const cancel = element(document, "button", { text: "Cancel edit" });
+    cancel.type = "button";
+    listen(cancel, "click", cancelPreviousMessageEdit);
+    const list = element(document, "ul");
+    for (const path of paths) append(list, element(document, "li", { text: path }));
+    replace(
+      editConflictPanel,
+      element(document, "p", { text: "These files changed outside the agent:" }),
+      list,
+      force,
+      cancel,
+    );
+    editConflictPanel.hidden = false;
+  }
+
+  async function forkEditedPrompt(text, recordId, force = false) {
+    try {
+      const reply = await boundary.forkSession(currentSessionId, recordId, force);
+      if (typeof reply?.run_id !== "string") throw new Error("The host did not return the forked conversation.");
+      editingPreviousPrompt = null;
+      editConflictPanel.hidden = true;
+      replace(editConflictPanel);
+      await openSession(reply.run_id);
+      input.value = text;
+      queueDraftSave();
+      return form.requestSubmit();
+    } catch (error) {
+      if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
+        showEditConflict(error.paths, text, recordId);
+      } else {
+        promptFailure = error instanceof Error ? error.message : String(error);
+        showPromptError();
+      }
+    }
+  }
+
+  async function submitEditedPreviousPrompt(text) {
+    const promptIndex = transcript.model.indexOf(editingPreviousPrompt);
+    const earlierPrompts = transcript.model
+      .slice(0, promptIndex)
+      .filter((entry) => entry.type === "prompt");
+    if (earlierPrompts.length === 0) {
+      editingPreviousPrompt = null;
+      editConflictPanel.hidden = true;
+      showTranscript();
+      await startNewChat();
+      input.value = text;
+      return form.requestSubmit();
+    }
+    const reply = transcript.model.slice(0, promptIndex).reverse()
+      .find((entry) => entry.type === "text" && typeof entry.recordId === "string");
+    if (!reply || !currentSessionId) {
+      promptFailure = "Could not find the earlier reply needed to fork this conversation.";
+      showPromptError();
+      return;
+    }
+    return forkEditedPrompt(text, reply.recordId);
+  }
+
   function showPendingAttachments() {
-    replace(attachmentList, ...pendingFiles.map((file, index) => {
+    const files = pendingFiles.map((file, index) => {
       const chip = element(document, "span", {
         className: "attachment-chip",
         text: `${file.name || "image"} · ${file.size}`,
@@ -2358,7 +2691,57 @@ export async function start({ global, document, client }) {
         showPendingAttachments();
       });
       return append(chip, remove);
-    }));
+    });
+    const pastes = pastedTextChips.map((paste) => {
+      const chip = element(document, "span", {
+        className: "attachment-chip pasted-text-chip",
+      });
+      const label = element(document, "span", {
+        text: `Pasted text #${paste.id} · ${paste.lines} lines`,
+      });
+      const expand = element(document, "button", { text: paste.expanded ? "Hide" : "Expand" });
+      expand.type = "button";
+      listen(expand, "click", () => {
+        paste.expanded = !paste.expanded;
+        showPendingAttachments();
+      });
+      const remove = element(document, "button", { text: "Remove" });
+      remove.type = "button";
+      listen(remove, "click", () => {
+        input.value = input.value.replace(paste.placeholder, "");
+        pastedTextChips.splice(pastedTextChips.indexOf(paste), 1);
+        showPendingAttachments();
+        queueDraftSave();
+      });
+      append(chip, label, expand, remove);
+      if (paste.expanded) {
+        append(chip, element(document, "pre", {
+          className: "pasted-text-preview",
+          text: paste.text,
+        }));
+      }
+      return chip;
+    });
+    replace(attachmentList, ...files, ...pastes);
+  }
+
+  function expandPastedText(value) {
+    let result = "";
+    let cursor = 0;
+    while (cursor < value.length) {
+      let next = null;
+      for (const paste of pastedTextChips) {
+        const index = value.indexOf(paste.placeholder, cursor);
+        if (index !== -1 && (next === null || index < next.index)) next = { paste, index };
+      }
+      if (next === null) {
+        result += value.slice(cursor);
+        break;
+      }
+      result += value.slice(cursor, next.index) + next.paste.text;
+      cursor = next.index + next.paste.placeholder.length;
+    }
+    return result;
   }
 
   function addFiles(files) {
@@ -2508,6 +2891,7 @@ export async function start({ global, document, client }) {
   const fileListings = new Map();
   const expandedFileDirectories = new Set();
   const fileTreeErrors = new Map();
+  let filesDirty = false;
   let selectedFilePath = null;
   let fileSourceText = null;
   let fileSourceError = null;
@@ -2646,6 +3030,21 @@ export async function start({ global, document, client }) {
       fileSourceLoading = false;
       renderFiles();
     }
+  }
+
+  async function refreshFiles() {
+    filesDirty = false;
+    const paths = ["", ...expandedFileDirectories];
+    await Promise.all(paths.map(async (path) => {
+      try {
+        fileListings.set(path, await boundary.tree(path));
+        fileTreeErrors.delete(path);
+      } catch {
+        fileTreeErrors.set(path, true);
+      }
+    }));
+    if (selectedFilePath !== null) await openSourceFile(selectedFilePath);
+    else renderFiles();
   }
 
   function renderLoopCardDetails() {
@@ -3116,9 +3515,9 @@ export async function start({ global, document, client }) {
     rememberRail(global, openRailTools, selectedRailTool);
     renderRail();
     if (name === "Loop") return loadLoops();
+    if (name === "Changes") return changed || changesDirty ? showChanges() : undefined;
+    if (name === "Files") return changed || filesDirty ? refreshFiles() : undefined;
     if (!changed) return undefined;
-    if (name === "Changes") return showChanges();
-    if (name === "Files") return loadFileDirectory("");
     if (name === "Jobs") return showJobs();
     return undefined;
   }
@@ -3146,7 +3545,7 @@ export async function start({ global, document, client }) {
   }
 
   if (selectedRailTool === "Changes") void showChanges();
-  if (selectedRailTool === "Files") void loadFileDirectory("");
+  if (selectedRailTool === "Files") void refreshFiles();
   if (selectedRailTool === "Jobs") void showJobs();
 
   function costText(cost) {
@@ -3343,8 +3742,19 @@ export async function start({ global, document, client }) {
   }
 
   const instructionWarningsShown = new Set();
+  const configWarningsShown = new Set();
+
+  function showConfigurationWarnings(warnings) {
+    if (!Array.isArray(warnings)) return;
+    for (const warning of warnings) {
+      if (typeof warning !== "string" || configWarningsShown.has(warning)) continue;
+      configWarningsShown.add(warning);
+      answerCommand(`Configuration warning: ${warning}`);
+    }
+  }
 
   function showInstructionWarnings(current) {
+    showConfigurationWarnings(current?.config_warnings);
     const sessionId = current?.session_id;
     const warnings = current?.instruction_warnings;
     if (!sessionId || instructionWarningsShown.has(sessionId) || !Array.isArray(warnings) || warnings.length === 0) return;
@@ -3354,6 +3764,7 @@ export async function start({ global, document, client }) {
 
   showConversationUsage();
   showAgents();
+  showConfigurationWarnings(settingsReply?.settings?.config_warnings);
   showInstructionWarnings(conversation);
 
   async function refreshConversation() {
@@ -3657,7 +4068,7 @@ export async function start({ global, document, client }) {
             promptFailure = "";
             await perform(turn.accepted());
             try {
-              sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+              await refreshSessionLists();
               showProjects();
             } catch {
               // The accepted prompt remains valid if refreshing history fails.
@@ -3679,6 +4090,12 @@ export async function start({ global, document, client }) {
   }
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
+      if (!quickOpenState && lookup(keymap, event, { platform }) === "quick-open") {
+        event.preventDefault();
+        openQuickOpen();
+        return;
+      }
+      if (quickOpenState) return;
       if (findBar.hidden && lookup(keymap, event, { platform }) === "find") {
         event.preventDefault();
         openFind();
@@ -3712,7 +4129,23 @@ export async function start({ global, document, client }) {
     if (files.length > 0) {
       event.preventDefault();
       addFiles(files);
+      return;
     }
+    const text = event.clipboardData?.getData?.("text/plain");
+    if (typeof text !== "string") return;
+    const lines = text.split(/\r\n|\r|\n/).length;
+    if (lines < 10 && text.length < 1000) return;
+    event.preventDefault();
+    const id = nextPastedTextId++;
+    const placeholder = `⟦Pasted text #${id}⟧`;
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    input.value = `${input.value.slice(0, start)}${placeholder}${input.value.slice(end)}`;
+    input.setSelectionRange?.(start + placeholder.length, start + placeholder.length);
+    pastedTextChips.push({ id, text, placeholder, lines, expanded: false });
+    showPendingAttachments();
+    queueDraftSave();
+    renderComposerMenus();
   });
   listen(form, "dragover", (event) => event.preventDefault());
   listen(form, "drop", (event) => {
@@ -3722,7 +4155,8 @@ export async function start({ global, document, client }) {
 
   listen(form, "submit", async (event) => {
     event.preventDefault();
-    const text = input.value;
+    const text = expandPastedText(input.value);
+    if (editingPreviousPrompt) return submitEditedPreviousPrompt(text);
     const command = text.trim();
     if (command.startsWith("/")) {
       clearDraft();
@@ -3784,6 +4218,7 @@ export async function start({ global, document, client }) {
     input.value = "";
     clearDraft();
     pendingFiles.length = 0;
+    pastedTextChips.length = 0;
     showPendingAttachments();
     promptFailure = "";
     rememberPrompt(text);
@@ -3793,7 +4228,13 @@ export async function start({ global, document, client }) {
   });
 
   listen(input, "input", () => {
+    lastIdleEscapeAt = 0;
     queueDraftSave();
+    const remainingPastes = pastedTextChips.filter((paste) => input.value.includes(paste.placeholder));
+    if (remainingPastes.length !== pastedTextChips.length) {
+      pastedTextChips.splice(0, pastedTextChips.length, ...remainingPastes);
+      showPendingAttachments();
+    }
     if (historyIndex >= 0) {
       historyIndex = -1;
       recalledPrompt = null;
@@ -3850,6 +4291,113 @@ export async function start({ global, document, client }) {
   function closePicker() {
     replace(pickerHost);
     input.focus?.();
+  }
+
+  function closeQuickOpen() {
+    clearTimeout(quickOpenTimer);
+    quickOpenTimer = null;
+    quickOpenVersion += 1;
+    const opener = quickOpenState?.opener;
+    quickOpenState = null;
+    replace(pickerHost);
+    opener?.focus?.();
+  }
+
+  function openQuickOpen() {
+    if (quickOpenState) return;
+    const opener = document.activeElement;
+    const overlay = element(document, "section", { className: "quick-open-overlay" });
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Quick open");
+    const dialog = element(document, "div", { className: "quick-open-dialog" });
+    append(dialog, element(document, "h2", { text: "Quick open" }));
+    const search = element(document, "input", { className: "quick-open-input" });
+    search.type = "search";
+    search.setAttribute("aria-label", "Search project files");
+    search.placeholder = "Search files by name or path";
+    const results = element(document, "div", { className: "quick-open-results" });
+    results.setAttribute("role", "listbox");
+    const message = element(document, "p", { className: "quick-open-message", text: "Type to search project files." });
+    let rows = [];
+    let selected = -1;
+
+    function renderResults() {
+      replace(results, ...rows.map((file, index) => {
+        const path = typeof file === "string" ? file : file.path;
+        const name = path.split("/").at(-1);
+        const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "Project root";
+        const row = element(document, "button", {
+          className: `quick-open-result${index === selected ? " focused" : ""}`,
+        });
+        row.type = "button";
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", String(index === selected));
+        append(row,
+          element(document, "span", { className: "quick-open-name", text: name }),
+          element(document, "span", { className: "quick-open-folder", text: folder }),
+        );
+        listen(row, "click", () => void choose(file));
+        return row;
+      }));
+    }
+
+    async function choose(file) {
+      const path = typeof file === "string" ? file : file.path;
+      closeQuickOpen();
+      await openRailTool("Files");
+      await openSourceFile(path);
+    }
+
+    function searchFiles() {
+      clearTimeout(quickOpenTimer);
+      const query = search.value.trim();
+      const version = ++quickOpenVersion;
+      rows = [];
+      selected = -1;
+      renderResults();
+      message.textContent = query ? "Searching…" : "Type to search project files.";
+      if (!query) return;
+      quickOpenTimer = setTimeout(async () => {
+        try {
+          const reply = await boundary.files(query, 50);
+          if (!quickOpenState || version !== quickOpenVersion) return;
+          rows = Array.isArray(reply?.files) ? reply.files : [];
+          selected = rows.length ? 0 : -1;
+          renderResults();
+          message.textContent = rows.length ? "" : "No matching files.";
+        } catch (error) {
+          if (!quickOpenState || version !== quickOpenVersion) return;
+          rows = [];
+          renderResults();
+          message.textContent = error instanceof Error ? error.message : String(error);
+        }
+      }, 120);
+    }
+
+    listen(search, "input", searchFiles);
+    listen(overlay, "keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeQuickOpen();
+      } else if (event.key === "ArrowDown" && rows.length) {
+        event.preventDefault();
+        selected = (selected + 1) % rows.length;
+        renderResults();
+      } else if (event.key === "ArrowUp" && rows.length) {
+        event.preventDefault();
+        selected = (selected - 1 + rows.length) % rows.length;
+        renderResults();
+      } else if (event.key === "Enter" && selected >= 0) {
+        event.preventDefault();
+        void choose(rows[selected]);
+      }
+    });
+    quickOpenState = { opener, overlay };
+    append(dialog, search, results, message);
+    append(overlay, dialog);
+    replace(pickerHost, overlay);
+    search.focus?.();
   }
 
   function currentModelLabel() {
@@ -4402,8 +4950,65 @@ export async function start({ global, document, client }) {
     renderCommandMenuRows();
   }
 
+  function renderShortcutHelp() {
+    const descriptions = {
+      submit: "Send message",
+      newline: "Insert a new line",
+      cancel: "Cancel or close",
+      "stop-run": "Stop the current run",
+      "focus-input": "Focus the composer",
+      "command-palette": "Open command palette",
+      "quick-open": "Open quick file search",
+      find: "Find in conversation",
+      "history-search": "Search prompt history",
+      "clear-chat": "Clear conversation",
+    };
+    const labels = new Map();
+    for (const [chord, action] of keymap) {
+      if (!action || !descriptions[action]) continue;
+      const parts = chord.split("+").map((part) => {
+        if (part === "mod") return platform === "darwin" ? "⌘" : "Ctrl";
+        if (part === "ctrl") return "Ctrl";
+        if (part === "meta") return "⌘";
+        if (part === "alt") return platform === "darwin" ? "⌥" : "Alt";
+        if (part === "shift") return "Shift";
+        if (part === "enter") return "Enter";
+        if (part === "escape") return "Esc";
+        return part.length === 1 ? part.toUpperCase() : part;
+      });
+      if (!labels.has(action)) labels.set(action, []);
+      labels.get(action).push(parts.join("+").replace("⌘+", "⌘"));
+    }
+    replace(shortcutHelpPanel, element(document, "strong", { text: "Keyboard shortcuts" }));
+    for (const [action, keys] of labels) {
+      append(shortcutHelpPanel, element(document, "div", {
+        className: "shortcut-help-row",
+        text: `${descriptions[action]} · ${keys.join(", ")}`,
+      }));
+    }
+  }
+
   async function handleComposerKeydown(event) {
     if (event.isComposing || event.keyCode === 229) return;
+    if (!shortcutHelpPanel.hidden) {
+      shortcutHelpPanel.hidden = true;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        input.focus();
+        return;
+      }
+    }
+    if (event.key === "?" && input.value === "" && !editingPreviousPrompt) {
+      event.preventDefault();
+      renderShortcutHelp();
+      shortcutHelpPanel.hidden = false;
+      return;
+    }
+    if (lookup(keymap, event, { platform }) === "history-search") {
+      event.preventDefault();
+      await openHistorySearch();
+      return;
+    }
     if (fileFragment !== null) {
       if (fileMatches.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
         event.preventDefault();
@@ -4449,12 +5054,41 @@ export async function start({ global, document, client }) {
     if (fileFragment !== null) return;
     if (await handlePromptHistory(event)) return;
     if (lookup(keymap, event, { platform }) === "cancel") {
+      const now = global.Date?.now() ?? Date.now();
+      if (event.key === "Escape" && editingPreviousPrompt) {
+        event.preventDefault();
+        cancelPreviousMessageEdit();
+        return;
+      }
       if (turn.state === DISPATCHING || turn.state === RUNNING) {
+        if (event.key === "Escape") {
+          suppressEditUntil = now + 500;
+          if (escapeStopRequested) {
+            event.preventDefault();
+            return;
+          }
+          escapeStopRequested = true;
+        }
+        lastIdleEscapeAt = 0;
         event.preventDefault();
         await perform(turn.stop());
+        return;
       }
+      if (event.key === "Escape" && !userCommandPending && input.value === "") {
+        event.preventDefault();
+        if (now < suppressEditUntil) return;
+        if (lastIdleEscapeAt > 0 && now - lastIdleEscapeAt <= 500) {
+          lastIdleEscapeAt = 0;
+          selectPreviousMessageForEdit();
+        } else {
+          lastIdleEscapeAt = now;
+        }
+        return;
+      }
+      lastIdleEscapeAt = 0;
       return;
     }
+    lastIdleEscapeAt = 0;
     if (lookup(keymap, event, { platform }) === "submit") {
       event.preventDefault();
       await form.requestSubmit();
@@ -4589,7 +5223,7 @@ export async function start({ global, document, client }) {
       }
       try {
         await boundary.renameSession(currentSessionId, title);
-        sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+        await refreshSessionLists();
         showProjects();
         answerCommand("Conversation renamed.");
       } catch (error) {
@@ -4614,6 +5248,31 @@ export async function start({ global, document, client }) {
         answerCommand("Copied the last reply.");
       } catch (error) {
         answerCommand(`Could not copy: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (entry.name === "export") {
+      if (args.length > 0) {
+        answerCommand("Usage: /export");
+        return;
+      }
+      if (!currentSessionId) {
+        answerCommand("There is nothing to export.");
+        return;
+      }
+      try {
+        const exported = await boundary.exportSession(currentSessionId);
+        const url = global.URL.createObjectURL(new global.Blob([exported.markdown], {
+          type: "text/markdown;charset=utf-8",
+        }));
+        const link = element(document, "a");
+        link.href = url;
+        link.download = exported.filename;
+        link.click();
+        global.URL.revokeObjectURL(url);
+        answerCommand("Conversation exported.");
+      } catch (error) {
+        answerCommand(`Could not export: ${error instanceof Error ? error.message : String(error)}`);
       }
       return;
     }
@@ -4853,7 +5512,7 @@ export async function start({ global, document, client }) {
 
   const requestActivityRefresh = leadingTrailingRefresh(async () => {
     try {
-      sessions = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
+      await refreshSessionLists();
       showProjects();
     } catch {
       // A transient listing failure does not affect the current transcript.
@@ -4913,6 +5572,13 @@ export async function start({ global, document, client }) {
         }
       }
       await refreshRoadmap();
+      return;
+    }
+    if (frame.kind === "event" && frame.payload?.type === FILES_CHANGED_EVENT_TYPE) {
+      if (selectedRailTool === "Changes" && !changesRoot.hidden) void showChanges();
+      else changesDirty = true;
+      if (selectedRailTool === "Files" && !filesRoot.hidden) void refreshFiles();
+      else filesDirty = true;
       return;
     }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
@@ -5004,6 +5670,7 @@ export async function start({ global, document, client }) {
       runNotice.textContent = "";
     }
     await perform(turn.event({ ...event, ...event.fields }));
+    if (event.type === "RunFinished" || event.type === "RunFailed") escapeStopRequested = false;
     updateWindowTitle();
     if (event.type === "RunFinished" || event.type === "RunFailed") {
       await refreshConversation();

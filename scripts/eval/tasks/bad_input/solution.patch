@@ -1,0 +1,11 @@
+diff --git a/counts.py b/counts.py
+index 0000000..0000000 100644
+--- a/counts.py
++++ b/counts.py
+@@ -1,5 +1,5 @@
+ def parse_count(value):
+     try:
+         return int(value)
+     except ValueError:
+-        return 0
++        raise ValueError(f"invalid count: {value!r}") from None

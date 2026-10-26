@@ -95,6 +95,35 @@ def _run_loop(root: Path, provider: FakeModelProvider):
         threading.excepthook = original_hook
 
 
+@check("loops.reused_pid_is_not_a_runner")
+def reused_pid_is_not_a_runner() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        store = LoopStore(root)
+        loop = store.create("Recover a loop with a reused pid")
+        loop.update(
+            state="running",
+            runner_pid=os.getpid(),
+            runner_lock=True,
+            cards=[{"id": "card", "title": "Card", "state": "running", "session_id": None}],
+            lanes=[{"id": 1, "cards": ["card"]}],
+        )
+        store.save(loop)
+        run = HostRun(
+            FakeModelProvider(), PermissionPolicy(root), EventBroker(),
+            sessions_root=root / "sessions",
+        )
+        try:
+            with mock.patch.object(HostRun, "_advance_loop", lambda _self, _loop_id: None):
+                run.recover_loops()
+            recovered = store.load(loop["id"])
+            if recovered["cards"][0]["state"] != "planned":
+                fail(f"a reused live pid kept the loop runner alive: {recovered!r}")
+        finally:
+            run.close()
+
+
 def _start_host(root: Path, provider: FakeModelProvider) -> HostServer:
     root.mkdir(parents=True, exist_ok=True)
     host = HostServer(

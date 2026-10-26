@@ -318,13 +318,11 @@ def config_parsing_and_disabled_default() -> None:
             bad,
             '[[mcp_servers]]\nname = "docs"\ncommand = ["fake-server"]\n',
         )
-        try:
-            load_config(repo_root=root, home=home)
-        except ConfigError as exc:
-            if str(bad) not in str(exc) or "mcp_servers" not in str(exc):
-                fail(f"unnested-key error omitted source or key: {exc!r}")
-        else:
-            fail("unnested mcp_servers key was accepted")
+        resolved = load_config(repo_root=root, home=home)
+        if "mcp_servers" in resolved.values:
+            fail("unnested mcp_servers project value was applied")
+        if not any(str(bad) in warning and "mcp_servers" in warning for warning in resolved.warnings):
+            fail(f"unnested-key warning omitted source or key: {resolved.warnings!r}")
 
 
 @check("mcp.owner_scope_controls_enablement")
