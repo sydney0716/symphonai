@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from symphonai_api.config import load_config
 
 
 _PROJECT_ROOT_METADATA = "symphonai-project-root"
+WORKTREE_SETUP_TIMEOUT_SECONDS = 30 * 60
 
 
 class WorktreeError(RuntimeError):
@@ -73,7 +75,8 @@ def create_worktree(repo_root: Path, path: Path, start: str = "HEAD") -> Path:
     if not git_dir.is_absolute():
         git_dir = (path / git_dir).resolve()
     (git_dir / _PROJECT_ROOT_METADATA).write_text(relative_root.as_posix(), encoding="utf-8")
-    configured = load_config(repo_root=repo_root).get(
+    config = load_config(repo_root=repo_root)
+    configured = config.get(
         "worktree.symlink", ["node_modules", ".venv", "venv"],
     )
     for entry in configured if isinstance(configured, list) else ():
@@ -82,6 +85,70 @@ def create_worktree(repo_root: Path, path: Path, start: str = "HEAD") -> Path:
         if source.exists() and not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(source, target_is_directory=source.is_dir())
+    setup = config.get("worktree.setup")
+    if isinstance(setup, str):
+        from symphonai_api.tools.shell import shell_environment
+
+        try:
+            process = subprocess.Popen(
+                ["/bin/sh", "-c", setup],
+                cwd=worktree_root,
+                env=shell_environment(worktree_root, for_agent=True),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+            try:
+                output, _ = process.communicate(
+                    timeout=WORKTREE_SETUP_TIMEOUT_SECONDS
+                )
+            except subprocess.TimeoutExpired as exc:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                output, _ = process.communicate()
+                if not output:
+                    output = exc.stdout or ""
+                    if isinstance(output, bytes):
+                        output = output.decode("utf-8", errors="replace")
+                try:
+                    remove_worktree(repo_root, path)
+                except WorktreeError as cleanup_error:
+                    raise WorktreeError(
+                        f"worktree setup command {setup!r} timed out after 1800 seconds; "
+                        f"output: {output[-4000:]}; cleanup failed: {cleanup_error}"
+                    ) from exc
+                raise WorktreeError(
+                    f"worktree setup command {setup!r} timed out after 1800 seconds; "
+                    f"output: {output[-4000:]}"
+                ) from exc
+        except OSError as exc:
+            try:
+                remove_worktree(repo_root, path)
+            except WorktreeError as cleanup_error:
+                raise WorktreeError(
+                    f"worktree setup command {setup!r} could not start: {exc}; "
+                    f"cleanup failed: {cleanup_error}"
+                ) from exc
+            raise WorktreeError(
+                f"worktree setup command {setup!r} could not start: {exc}"
+            ) from exc
+        if process.returncode != 0:
+            try:
+                remove_worktree(repo_root, path)
+            except WorktreeError as cleanup_error:
+                raise WorktreeError(
+                    f"worktree setup command {setup!r} exited with code {process.returncode}; "
+                    f"output: {output[-4000:]}; cleanup failed: {cleanup_error}"
+                )
+            raise WorktreeError(
+                f"worktree setup command {setup!r} exited with code {process.returncode}; "
+                f"output: {output[-4000:]}"
+            )
     return worktree_root
 
 

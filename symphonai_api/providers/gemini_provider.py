@@ -452,6 +452,7 @@ class GeminiProvider(ModelProvider):
                 max_attempts=self.max_attempts,
                 api_key=api_key,
                 operation="Gemini API",
+                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
                 cancel=cancel,
                 call_class=request.call_class,
             )
@@ -494,6 +495,7 @@ class GeminiProvider(ModelProvider):
                 max_attempts=self.max_attempts,
                 api_key=api_key,
                 operation="Gemini API",
+                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
                 cancel=cancel,
             )
             yield from _gemini_stream_chunks(lines, api_key=api_key)

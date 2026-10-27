@@ -205,11 +205,15 @@ def builtin_subagent_specs(
     *,
     model_override: str | None = None,
     use_routine_model: bool = False,
+    role_selectors: Mapping[str, ModelSelector] | None = None,
 ) -> dict[str, AgentSpec]:
     job_tools = ("job_output", "job_stop") if jobs is not None else ()
     provider_name = getattr(provider, "name", None) or "unknown"
 
     def selector(name: str) -> ModelSelector:
+        configured = None if role_selectors is None else role_selectors.get(name)
+        if configured is not None:
+            return configured
         model = model_override or getattr(provider, "model", None)
         if model_override is None and use_routine_model and name in {
             "worker", "explorer", "implementer", "reviewer",
@@ -246,7 +250,7 @@ def builtin_subagent_specs(
         "planner": AgentSpec(
             name="planner", prompt=PLANNER_PROMPT, model=selector("planner"),
             policy_ceiling=policy,
-            tool_names=EXPLORER_TOOL_NAMES + ("write_file", "edit_file") + optional,
+            tool_names=EXPLORER_TOOL_NAMES + ("run_shell", "write_file", "edit_file") + optional,
             mcp_tool_names=(),
             call_class=CallClass.BACKGROUND,
         ),
@@ -478,6 +482,7 @@ class DispatchSubagentTool(LocalTool):
         lsp: LspManager | None = None,
         jobs: JobManager | None = None,
         provider_for: Callable[[str, str | None], ModelProvider | None] | None = None,
+        model_summary: bool = False,
     ) -> None:
         self._subagent_provider = subagent_provider
         self._leader_policy = leader_policy
@@ -509,6 +514,7 @@ class DispatchSubagentTool(LocalTool):
         self._lsp = lsp
         self._jobs = jobs
         self._provider_for = provider_for
+        self._model_summary = model_summary
         self._pool_lock = threading.RLock()
         self._reserved_names: set[str] = set()
         self._active_runs_lock = threading.Lock()
@@ -914,6 +920,7 @@ class DispatchSubagentTool(LocalTool):
                     read_ledger=read_ledger,
                     budget=spec.budget,
                     call_class=spec.call_class,
+                    model_summary=self._model_summary,
                     transcript=(
                         None
                         if self._session is None
@@ -1376,6 +1383,7 @@ class Leader:
             lsp=config.lsp,
             jobs=config.jobs,
             provider_for=config.provider_for,
+            model_summary=config.model_summary,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
         leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
@@ -1462,6 +1470,13 @@ class Leader:
             transcript=(
                 self._transcript
             ),
+            model_summary=config.model_summary,
+            context_budget=lambda model: math.floor(
+                budget_for_model(config.leader_provider.wire_format, model)
+                / self._token_ratio
+            ),
+            context_overflow=self._record_context_overflow,
+            context_recent_turns=config.chat_recent_turns,
         )
         self._chat_messages = self._initial_leader_messages()
         self._memory_extractor = (
@@ -1508,6 +1523,14 @@ class Leader:
             )
         )
         return math.floor(base / self._token_ratio)
+
+    def _record_context_overflow(
+        self, request_tokens: int, actual_tokens: int | None
+    ) -> None:
+        if actual_tokens is not None and request_tokens > 0:
+            self._token_ratio = max(
+                self._token_ratio, actual_tokens / request_tokens
+            )
 
     def _stopped_repairs(self) -> tuple[str, ...]:
         with self._dispatch_tool._pool_lock:
@@ -1992,45 +2015,13 @@ class Leader:
         self._chat_messages.append(Message(role=Role.USER, content=message))
         self._compaction_usage_by_model.clear()
         self._automatic_compact_chat(cancel=cancel)
-        recovered_overflow = False
         try:
             result = self._run_messages(self._chat_messages, cancel=cancel)
-        except ContextLengthExceededError as overflow:
-            before_tokens = estimate_messages_tokens(self._chat_messages)
-            request_tokens = overflow.request_tokens
-            denominator = (
-                request_tokens
-                if request_tokens is not None and request_tokens > 0
-                else before_tokens
-            )
-            if overflow.actual_tokens is not None and denominator > 0:
-                self._token_ratio = max(
-                    self._token_ratio,
-                    overflow.actual_tokens / denominator,
-                )
-            if self._automatic_compaction_breaker.is_open:
-                raise
-            try:
-                changed = self._compact_after_context_overflow(
-                    overflow,
-                    cancel=cancel,
-                )
-            except ContextCompactionError:
-                self._automatic_compaction_breaker.record_failure()
-                self._context_overflow_repair_failed = True
-                raise overflow from None
-            if not changed:
-                self._automatic_compaction_breaker.record_failure()
-                self._context_overflow_repair_failed = True
-                raise
-            try:
-                result = self._run_messages(self._chat_messages, cancel=cancel)
-            except ContextLengthExceededError:
-                self._automatic_compaction_breaker.record_failure()
-                self._context_overflow_repair_failed = True
-                raise
-            recovered_overflow = True
-        if recovered_overflow or self._context_overflow_repair_failed:
+        except ContextLengthExceededError:
+            self._automatic_compaction_breaker.record_failure()
+            self._context_overflow_repair_failed = True
+            raise
+        if self._context_overflow_repair_failed:
             self._automatic_compaction_breaker.record_success()
             self._context_overflow_repair_failed = False
         self._chat_messages = result.leader_messages

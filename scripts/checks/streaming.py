@@ -1445,7 +1445,9 @@ def check_anthropic_error_event() -> None:
         b'data: {"error":{"message":"vendor rejected anthropic-secret-to-redact"}}\n\n',
     ]
     with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": key}):
-        with mock.patch("urllib.request.urlopen", return_value=_LinesResponse(transcript)):
+        with mock.patch("urllib.request.urlopen", return_value=_LinesResponse(transcript)), mock.patch(
+            "symphonai_api.retry.time.sleep", return_value=None,
+        ):
             try:
                 list(AnthropicProvider().create_response_stream(_request()))
             except ProviderError as exc:

@@ -19,6 +19,8 @@ from symphonai_api.providers.base import (
     ProviderUnavailableError,
 )
 from symphonai_api.retry import (
+    FALLBACK_OVERLOAD_MAX_ATTEMPTS,
+    OVERLOAD_STATUS_CODES,
     _context_token_counts,
     _is_context_length_error,
     _is_retryable_status,
@@ -74,6 +76,7 @@ StreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | StreamCompleted
 
 def retry_stream_chunks(
     factory, *, timeout: float, max_attempts: int,
+    fallback_configured: bool = False,
     cancel: CancellationToken | None = None,
 ):
     """Retry transient stream failures until answer text has been yielded."""
@@ -122,7 +125,10 @@ def retry_stream_chunks(
                 yield from chunks
                 raise ProviderError(str(exc)) from None
             retry_after = getattr(exc, "retry_after", None)
-            if _wait_before_retry(attempt=attempt, max_attempts=max_attempts,
+            attempt_limit = max_attempts
+            if fallback_configured and exc.status in OVERLOAD_STATUS_CODES:
+                attempt_limit = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
+            if _wait_before_retry(attempt=attempt, max_attempts=attempt_limit,
                                   deadline=deadline, retry_after=retry_after, cancel=cancel):
                 continue
             raise ProviderUnavailableError(str(exc), status=exc.status) from None
@@ -238,6 +244,7 @@ def open_stream_with_retry(
     max_attempts: int,
     api_key: str,
     operation: str,
+    fallback_configured: bool = False,
     cancel: CancellationToken | None = None,
 ) -> Iterator[bytes]:
     """Yield response lines, retrying only before the first yielded line."""
@@ -288,9 +295,12 @@ def open_stream_with_retry(
                 ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             retryable_status = _is_retryable_status(exc.code)
+            attempt_limit = max_attempts
+            if fallback_configured and exc.code in OVERLOAD_STATUS_CODES:
+                attempt_limit = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
             if not yielded and retryable_status and _wait_before_retry(
                 attempt=attempt,
-                max_attempts=max_attempts,
+                max_attempts=attempt_limit,
                 deadline=deadline,
                 retry_after=retry_after,
                 cancel=cancel,

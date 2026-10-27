@@ -82,17 +82,19 @@ def _openai_success(content: str) -> _FakeHttpResponse:
 @check("retry.unavailable_is_distinguished")
 def check_unavailable_is_distinguished() -> None:
     request = urllib.request.Request("https://mock.invalid/test")
-    unavailable = _http_error(529, "busy")
+    def overloaded(request, timeout=None):  # noqa: ANN001
+        raise _http_error(529, "busy")
+
     with mock.patch("symphonai_api.retry.time.sleep"), mock.patch(
         "symphonai_api.retry.urllib.request.urlopen",
-        side_effect=[unavailable, _http_error(529, "busy"), _http_error(529, "busy")],
+        side_effect=overloaded,
     ):
         try:
             read_with_retry(
                 request, timeout=5, api_key="test-key", operation="call"
             )
         except ProviderUnavailableError as exc:
-            if exc.status != 529 or str(exc) != "call returned HTTP 529 after 3 attempts: busy":
+            if exc.status != 529 or str(exc) != "call returned HTTP 529 after 5 attempts: busy":
                 fail(f"unavailable error lost status or message: {exc!r}")
         else:
             fail("exhausted HTTP 529 did not raise ProviderUnavailableError")
@@ -525,7 +527,7 @@ def check_context_markers_keep_retryable_statuses() -> None:
 @check("retry.exhausted_transient_failures")
 def check_retry_exhausted_transient_failures() -> None:
     basic_request = ModelRequest(messages=[Message(role=Role.USER, content="hello")])
-    # -- exhausting the default three attempts must report that count. --
+    # -- exhausting the default ten attempts must report that count. --
     openai_retry_key = "openai-retry-test-key-do-not-use"
 
     def _always_503(request, timeout=None):  # noqa: ANN001
@@ -541,12 +543,12 @@ def check_retry_exhausted_transient_failures() -> None:
                         exhausted_message = str(exc)
                     else:
                         fail("expected repeated OpenAI HTTP 503 responses to exhaust retries")
-    if urlopen_mock.call_count != 3 or sleep_mock.call_count != 2:
+    if urlopen_mock.call_count != 10 or sleep_mock.call_count != 9:
         fail(
-            "expected exhausted retries to make three attempts and two patched sleeps, "
+            "expected exhausted retries to make ten attempts and nine patched sleeps, "
             f"got {urlopen_mock.call_count} attempts and {sleep_mock.call_count} sleeps"
         )
-    if "3 attempts" not in exhausted_message:
+    if "10 attempts" not in exhausted_message:
         fail(f"exhausted retry error must name the attempt count: {exhausted_message!r}")
 
 @check("retry.http_date_retry_after")
@@ -614,14 +616,34 @@ def check_retry_retry_after_capped() -> None:
         with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
             raw = read_with_retry(
                 retry_request,
-                timeout=30.0,
+                timeout=300.0,
                 max_attempts=2,
                 api_key="test-key",
                 operation="capped Retry-After test",
             )
     if raw != b"ok" or urlopen_mock.call_count != 2:
         fail("expected capped Retry-After to retry foreground")
-    sleep_mock.assert_called_once_with(8.0)
+    sleep_mock.assert_called_once_with(120.0)
+
+
+@check("retry.long_retry_after_is_honored")
+def check_retry_long_retry_after_is_honored() -> None:
+    request = urllib.request.Request("https://mock.invalid/retry-after")
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=[
+            *[_http_error(429, '{"error":"busy"}', retry_after="20") for _ in range(4)],
+            _FakeHttpResponse(b"ok"),
+        ],
+    ) as urlopen_mock:
+        with mock.patch("symphonai_api.retry.time.sleep") as sleep_mock:
+            raw = read_with_retry(
+                request, timeout=600, api_key="test-key", operation="long Retry-After test",
+            )
+    if raw != b"ok" or urlopen_mock.call_count != 5:
+        fail(f"expected five attempts and a successful response, got {urlopen_mock.call_count}")
+    if [call.args[0] for call in sleep_mock.call_args_list] != [20.0] * 4:
+        fail(f"expected four waits of 20 seconds, got {sleep_mock.call_args_list!r}")
 
 @check("retry.keys_redacted")
 def check_retry_keys_redacted() -> None:

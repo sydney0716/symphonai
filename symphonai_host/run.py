@@ -22,7 +22,7 @@ from pathlib import Path
 
 from symphonai_api.agent_memory import AgentMemory
 from symphonai_api.checkpoints import CheckpointEntry, CheckpointStore
-from symphonai_api.agent_spec import AgentSpec
+from symphonai_api.agent_spec import AgentSpec, ModelSelector
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
@@ -804,6 +804,26 @@ class HostRun:
     def start_loop(
         self, goal: str, *, runner_pid: int | None = None, runner_lock: bool = False,
     ) -> dict:
+        if self._extensions is not None:
+            for role in ("planner", "implementer", "reviewer", "worker", "explorer"):
+                provider_name = self._extensions.config.get(f"roles.{role}.provider")
+                if provider_name is None or (
+                    self._provider is not None and self._provider.name == provider_name
+                ):
+                    continue
+                if self._provider_factory is None:
+                    raise ProviderSelectionError(
+                        f"role {role} provider {provider_name!r} is unavailable"
+                    )
+                model = self._extensions.config.get(f"roles.{role}.model")
+                try:
+                    provider = self._provider_factory(provider_name, model, None)
+                except ProviderSelectionError:
+                    provider = None
+                if provider is None:
+                    raise ProviderSelectionError(
+                        f"role {role} provider {provider_name!r} is unavailable"
+                    )
         store = LoopStore(self._repo_root)
         loop = store.create(goal)
         if runner_pid is not None:
@@ -843,8 +863,14 @@ class HostRun:
         self, loop: dict, change: str, *, note: str | None = None,
         current_plan: dict | None = None,
     ) -> dict:
+        from symphonai_api.tools.shell import _sandbox_available
+
         store = LoopStore(self._repo_root)
         folder = store.path(loop["id"], ".")
+        specs_folder = folder / "specs"
+        plan_path = folder / "plan.json"
+        sandbox_available = _sandbox_available()
+        specs_folder.mkdir(parents=True, exist_ok=True)
         revision = ""
         if note is not None:
             revision = (
@@ -866,7 +892,14 @@ class HostRun:
             "\"spec\":\"specs/a-short-title.md\",\"lane\":1,\"after\":[]}]}}. "
             "A card whose work documents, tests, or builds on another card's change lists that card in `after`, "
             "whether or not they share a lane. A card starts from the work of the cards before it and sees nothing else. "
-            "Write plan.json last." + revision
+            "Write plan.json last."
+            + (
+                " commands are unavailable in this environment; inspect files with the read tools."
+                if not sandbox_available else
+                " Reproduce the problem where the goal describes one. Find how the project runs its tests. "
+                "Run every Validation command before writing it. A Validation command must pass once the card's work is done. "
+                "A command that already fails for reasons the card does not fix does not belong in Validation."
+            ) + revision
         )
         with self._lock:
             if len(self._active_by_session) >= 4:
@@ -875,9 +908,16 @@ class HostRun:
             self._conversation = None
             self._active = None
             self._policy = replace(self._base_policy, repo_root=self._repo_root)
-            self._policy.allowed_write_scope = [folder / "specs", folder / "plan.json"]
-            self._policy.shell_enabled = False
+            self._policy.allowed_write_scope = [specs_folder, plan_path]
+            self._policy.sandbox_write_scope = [specs_folder, plan_path]
+            self._policy.shell_enabled = sandbox_available
+            self._policy.shell_allowlist = [()] if sandbox_available else []
             self._policy.mode = "allow"
+            previous_restriction = self._restricted_tool_names
+            if not sandbox_available:
+                self._restricted_tool_names = frozenset(
+                    set(self.available_tool_names()) - {"run_shell"}
+                )
             try:
                 self.start(
                     prompt,
@@ -899,6 +939,8 @@ class HostRun:
                     self._loop_changed(loop, change)
                 self._conversation, self._policy, self._active = previous
                 raise
+            finally:
+                self._restricted_tool_names = previous_restriction
 
     def _loop_changed(self, loop: dict, change: str, card_id: str = "") -> None:
         self._broker.publish(LoopChanged(
@@ -1726,7 +1768,10 @@ class HostRun:
                         self._loop_changed(loop, "card", card_id)
                 self._advance_loop(loop["id"])
 
-    def _finish_loop_plan(self, session_id: str, terminal_event: RunFinished | RunFailed | None) -> None:
+    def _finish_loop_plan(
+        self, session_id: str, terminal_event: RunFinished | RunFailed | None,
+        *, error: Exception | None = None,
+    ) -> None:
         session = SessionStore.open(self._sessions_root, session_id)
         try:
             meta = session.read_meta()
@@ -1746,7 +1791,9 @@ class HostRun:
         if loop.get("state") != "planning":
             return
         reason = ""
-        if isinstance(terminal_event, RunFailed):
+        if error is not None:
+            reason = f"planner failed: {error}"
+        elif isinstance(terminal_event, RunFailed):
             reason = f"planner failed: {terminal_event.error}"
         elif not isinstance(terminal_event, RunFinished) or terminal_event.stopped_reason != "final_response":
             stopped_reason = terminal_event.stopped_reason if isinstance(terminal_event, RunFinished) else "unknown"
@@ -2751,6 +2798,16 @@ class HostRun:
         ):
             result_store = None
         skills = None if self._extensions is None else self._extensions.skills
+        role_selectors = {}
+        if self._extensions is not None:
+            for name in ("planner", "implementer", "reviewer", "worker", "explorer"):
+                provider_name = self._extensions.config.get(f"roles.{name}.provider")
+                if provider_name is not None:
+                    role_selectors[name] = ModelSelector(
+                        provider=provider_name,
+                        model=self._extensions.config.get(f"roles.{name}.model"),
+                        effort=self._extensions.config.get(f"roles.{name}.effort"),
+                    )
         roster = builtin_subagent_specs(
             self._provider,
             self._policy,
@@ -2760,6 +2817,7 @@ class HostRun:
             jobs=jobs,
             model_override=self._model,
             use_routine_model=self._model is None,
+            role_selectors=role_selectors,
         )
         if self._extensions is not None:
             roster.update(self._extensions.agents)
@@ -2810,8 +2868,11 @@ class HostRun:
             }
         meta = session.read_meta()
         role = meta.get("spec_run", {}).get("role") if isinstance(meta.get("spec_run"), dict) else None
+        leader_effort = self._effort
         if isinstance(role, str) and role in roster:
             roster["leader"] = roster[role]
+            if role in role_selectors:
+                leader_effort = role_selectors[role].effort
         defined_leader = roster.get("leader")
         if (
             defined_leader is not None
@@ -2890,7 +2951,7 @@ class HostRun:
                 extra_tools=self._mcp_tools,
                 leader_policy=self._policy,
                 leader_model=leader_model,
-                leader_effort=self._effort,
+                leader_effort=leader_effort,
                 model_summary=True,
                 subagent_specs=roster,
                 subagent_budget=self._subagent_budget,
@@ -4618,7 +4679,7 @@ class HostRun:
                     self._active = None
         if not goal_round:
             self._finish_spec_review(session_id, leader, terminal_event)
-            self._finish_loop_plan(session_id, terminal_event)
+            self._finish_loop_plan(session_id, terminal_event, error=failure)
             with self._lock:
                 self._close_idle_conversations_locked()
             if failure is not None:

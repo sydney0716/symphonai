@@ -95,6 +95,7 @@ class OpenAICompatibleProvider(ModelProvider):
             max_attempts=self.max_attempts,
             api_key=api_key,
             operation=f"{self.provider_label} API",
+            fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
             cancel=cancel,
             call_class=request.call_class,
         )
@@ -126,7 +127,11 @@ class OpenAICompatibleProvider(ModelProvider):
         operation = f"{self.provider_label} API"
         def attempt(remaining):
             lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
-                api_key=api_key, operation=operation, cancel=cancel)
+                api_key=api_key, operation=operation,
+                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+                cancel=cancel)
             return _openai_stream_chunks(lines, operation=operation, api_key=api_key)
         yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
-                                       max_attempts=self.max_attempts, cancel=cancel)
+                                       max_attempts=self.max_attempts,
+                                       fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+                                       cancel=cancel)

@@ -69,11 +69,17 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
         return '"' + path.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
 
     writable = {
-        str(policy.repo_root.resolve()),
         str(os.path.realpath(os.environ.get("TMPDIR", tempfile.gettempdir()))),
         str(Path("/private/tmp").resolve()),
         str(Path("/private/var/folders").resolve()),
     }
+    writable.update(
+        str(path.resolve())
+        for path in (
+            [policy.repo_root] if policy.sandbox_write_scope is None
+            else policy.sandbox_write_scope
+        )
+    )
     rules = ["(version 1)", "(debug deny)", "(allow default)", "(deny file-write*)"]
     rules.extend(
         f"(allow file-write* (subpath {quote_path(path)}))"
@@ -201,10 +207,15 @@ def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None =
         "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--proc", "/proc",
-        "--bind", root, root,
-        "--bind", temporary, temporary,
-        "--bind", "/tmp", "/tmp",
     ]
+    writable = [root] if policy.sandbox_write_scope is None else [
+        str(path.resolve()) for path in policy.sandbox_write_scope
+    ]
+    for path in writable:
+        if path != root and not Path(path).exists():
+            continue
+        command.extend(("--bind", path, path))
+    command.extend(("--bind", temporary, temporary, "--bind", "/tmp", "/tmp"))
     if not policy.sandbox_network:
         # Each call gets its own loopback; only server and client in one command can connect.
         command.append("--unshare-net")

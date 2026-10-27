@@ -655,8 +655,10 @@ def planner_writes_a_plan() -> None:
         ]
         if not refused or any("outside the explicit allowed write scope" not in str(result) for result in refused):
             fail(f"out-of-scope planner write was not refused: {refused!r}")
-        if run._policy.shell_enabled or run._policy.mode != "allow":
-            fail("planner policy did not disable shell in allow mode")
+        from symphonai_api.tools.shell import _sandbox_available
+
+        if run._policy.shell_enabled != _sandbox_available() or run._policy.mode != "allow":
+            fail("planner shell availability did not match the sandbox in allow mode")
         expected_scope = [
             LoopStore(root).path(loop["id"], "specs"),
             LoopStore(root).path(loop["id"], "plan.json"),
@@ -685,6 +687,95 @@ def planner_writes_a_plan() -> None:
             for message in provider.requests[0].messages
         ):
             fail("planner task omitted the Validation command format")
+
+
+@check("loops.planner_shell_is_scoped")
+def planner_shell_is_scoped() -> None:
+    from symphonai_api.tools.shell import _sandbox_available
+
+    if not _sandbox_available():
+        print("SKIP: shell sandbox is unavailable")
+        return
+    with tempfile.TemporaryDirectory(dir="/private/var/tmp") as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        (root / "README.md").write_text("project is readable\n", encoding="utf-8")
+        folder = root / ".symphonai" / "loops" / _TEST_LOOP_ID
+        specs = folder / "specs"
+        read = ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "planner-read", "run_shell", {"argv": ["cat", "README.md"]},
+        )]))
+        inside = ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "planner-inside", "run_shell", {
+                "command": f"printf inside > {str(specs / 'shell.txt')!r}",
+            },
+        )]))
+        outside = ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+            "planner-outside", "run_shell", {
+                "command": f"printf outside > {str(root / 'outside.txt')!r}",
+            },
+        )]))
+        spec = "# a — Read files\n\n## Validation\n\n```sh\ntrue\n```\n"
+        plan = {"cards": [{
+            "id": "a", "title": "Read files", "spec": "specs/a-read-files.md",
+            "lane": 1, "after": [],
+        }]}
+        provider = _RecordingProvider([
+            read, inside, outside,
+            _write("specs/a-read-files.md", spec, "spec"),
+            _write("plan.json", json.dumps(plan), "plan"),
+            _finish(),
+        ])
+        loop, _events, run = _run_loop(root, provider)
+        try:
+            results = {
+                message.tool_result.tool_call_id: message.tool_result
+                for request in provider.requests for message in request.messages
+                if message.tool_result is not None
+            }
+            if loop["state"] != "awaiting_plan":
+                fail(f"sandboxed planner did not finish its plan: {loop!r}")
+            if not results.get("planner-read") or not results["planner-read"].ok or "project is readable" not in results["planner-read"].content:
+                fail(f"planner shell could not read the project: {results.get('planner-read')!r}")
+            if not results.get("planner-inside") or not results["planner-inside"].ok:
+                fail(f"planner shell could not write its specs folder: {results.get('planner-inside')!r}")
+            if not results.get("planner-outside") or results["planner-outside"].ok:
+                fail(f"planner shell wrote outside its scope: {results.get('planner-outside')!r}")
+            if (specs / "shell.txt").read_text(encoding="utf-8") != "inside":
+                fail("planner shell did not create its in-scope file")
+            if (root / "outside.txt").exists():
+                fail("planner shell created a file outside its specs folder")
+        finally:
+            run.close()
+
+
+@check("loops.planner_without_sandbox_hides_shell")
+def planner_without_sandbox_hides_shell() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        provider = _RecordingProvider([
+            _write("specs/a.md", "# A\n\n## Validation\n\n```sh\ntrue\n```\n", "spec"),
+            _write("plan.json", json.dumps({"cards": [{
+                "id": "a", "title": "A", "spec": "specs/a.md", "lane": 1, "after": [],
+            }]}), "plan"),
+            _finish(),
+        ])
+        with mock.patch("symphonai_api.tools.shell._sandbox_available", return_value=False):
+            loop, _events, run = _run_loop(root, provider)
+        try:
+            first = provider.requests[0]
+            tools = {tool.get("function", {}).get("name") for tool in first.tools or []}
+            if "run_shell" in tools:
+                fail("planner without a sandbox was given run_shell")
+            if not any(
+                message.role is Role.USER and "commands are unavailable" in message.text
+                for message in first.messages
+            ):
+                fail("planner without a sandbox was not told commands are unavailable")
+            if loop["state"] != "awaiting_plan":
+                fail(f"no-sandbox planner did not complete: {loop!r}")
+        finally:
+            run.close()
 
 
 @check("loops.cards_need_validation_commands")

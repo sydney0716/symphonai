@@ -148,6 +148,7 @@ def microcompact_messages(
     *,
     budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
     recent_turns: int = DEFAULT_RECENT_TURNS,
+    assistant_turn_window: bool | None = None,
     cancel: CancellationToken | None = None,
 ) -> MicrocompactionResult:
     """Clear old re-derivable tool results until the conversation fits."""
@@ -171,7 +172,9 @@ def microcompact_messages(
             recent_turns=recent_turns,
         )
 
-    recent_start = recent_window_start(original, recent_turns)
+    recent_start = recent_window_start(
+        original, recent_turns, assistant_turn_window=assistant_turn_window
+    )
     tool_names: dict[str, str] = {}
     clearable_indices: list[int] = []
     for index, message in enumerate(original):
@@ -229,15 +232,17 @@ def compact_messages_for_budget(
     *,
     budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
     recent_turns: int = DEFAULT_RECENT_TURNS,
+    assistant_turn_window: bool | None = None,
     cancel: CancellationToken | None = None,
     summarize: Callable[[list[Message]], str] | None = None,
     force: bool = False,
 ) -> CompactionResult:
     """Compact a conversation if it exceeds `budget`, or when `force` is true.
 
-    The compactor preserves all system messages before the recent window, the
-    earliest user goal, and the most recent `recent_turns` user turns. Older
-    middle messages are replaced by a small deterministic summary when there
+    The compactor preserves system messages, the first user goal, and the
+    recent window. When user turns are fewer than `recent_turns`, that window
+    counts assistant turns with their following tool results and preserves all
+    user messages. Older middle messages are replaced by a summary when there
     is room. If the preserved context alone cannot fit, a clear
     `ContextCompactionError` is raised before a provider request is made.
     """
@@ -275,6 +280,7 @@ def compact_messages_for_budget(
             original,
             budget=budget,
             recent_turns=recent_turns,
+            assistant_turn_window=assistant_turn_window,
             cancel=cancel,
         )
     )
@@ -290,8 +296,17 @@ def compact_messages_for_budget(
         )
 
     working = microcompacted.messages
-    recent_start = recent_window_start(working, recent_turns)
-    prefix_indices = _preserved_prefix_indices(working, recent_start)
+    assistant_window = (
+        sum(message.role == Role.USER for message in working) < recent_turns
+        if assistant_turn_window is None
+        else assistant_turn_window
+    )
+    recent_start = recent_window_start(
+        working, recent_turns, assistant_turn_window=assistant_window
+    )
+    prefix_indices = _preserved_prefix_indices(
+        working, recent_start, assistant_window
+    )
     recent_indices = set(range(recent_start, len(working)))
     dropped_indices = [
         index
@@ -467,27 +482,44 @@ def _is_cleared_tool_result_content(content: str) -> bool:
     )
 
 
-def recent_window_start(messages: list[Message], recent_turns: int) -> int:
+def recent_window_start(
+    messages: list[Message],
+    recent_turns: int,
+    *,
+    assistant_turn_window: bool | None = None,
+) -> int:
     user_indices = [index for index, message in enumerate(messages) if message.role == Role.USER]
-    if not user_indices:
-        return max(0, len(messages) - recent_turns)
-    if len(user_indices) <= recent_turns:
+    use_assistant_window = (
+        len(user_indices) < recent_turns
+        if assistant_turn_window is None
+        else assistant_turn_window
+    )
+    if not use_assistant_window:
+        return user_indices[-recent_turns] if user_indices else max(0, len(messages) - recent_turns)
+    assistant_indices = [
+        index for index, message in enumerate(messages)
+        if message.role == Role.ASSISTANT
+    ]
+    if len(assistant_indices) <= recent_turns:
         return 0
-    return user_indices[-recent_turns]
+    return assistant_indices[-recent_turns]
 
 
-def _preserved_prefix_indices(messages: list[Message], recent_start: int) -> set[int]:
+def _preserved_prefix_indices(
+    messages: list[Message], recent_start: int, assistant_turn_window: bool
+) -> set[int]:
     prefix_indices = {
         index
         for index, message in enumerate(messages[:recent_start])
         if message.role == Role.SYSTEM
     }
-    first_user_index = next(
-        (index for index, message in enumerate(messages) if message.role == Role.USER),
-        None,
-    )
-    if first_user_index is not None and first_user_index < recent_start:
-        prefix_indices.add(first_user_index)
+    user_indices = [
+        index for index, message in enumerate(messages) if message.role == Role.USER
+    ]
+    if assistant_turn_window:
+        prefix_indices.update(index for index in user_indices if index < recent_start)
+    elif user_indices and user_indices[0] < recent_start:
+        prefix_indices.add(user_indices[0])
     return prefix_indices
 
 

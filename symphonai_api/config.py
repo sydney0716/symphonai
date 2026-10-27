@@ -13,6 +13,7 @@ import tomllib
 
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cost import PriceTable, load_price_table
+from symphonai_api.model_table import model_capabilities, resolve_effort
 from symphonai_api.permissions import (
     PermissionPolicy,
     _contains_path,
@@ -72,7 +73,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -80,6 +81,7 @@ _PROVIDER_NAMES = {
     "anthropic", "gemini", "openai", "deepseek", "grok", "groq", "kimi",
     "ollama", "openrouter", "qwen", "together",
 }
+_BUILTIN_ROLES = {"planner", "implementer", "reviewer", "worker", "explorer"}
 
 
 def _raise(source: Path | None, key: str, detail: str) -> None:
@@ -162,6 +164,36 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
             provider = _string(source, "memory.provider", memory["provider"])
             if provider not in _PROVIDER_NAMES:
                 _raise(source, "memory.provider", f"unknown provider {provider!r}")
+    roles = _table(source, values, "roles")
+    if roles is not None:
+        for role, raw in roles.items():
+            key = f"roles.{role}"
+            if role not in _BUILTIN_ROLES:
+                _raise(source, key, "unknown built-in role")
+            if not isinstance(raw, Mapping):
+                _raise(source, key, "must be a table")
+            _unknown_keys(source, key, raw, {"provider", "model", "effort"})
+            for required in ("provider", "model"):
+                if required not in raw:
+                    _raise(source, f"{key}.{required}", "is required")
+                if not _string(source, f"{key}.{required}", raw[required]).strip():
+                    _raise(source, f"{key}.{required}", "must be a non-empty string")
+            provider = raw["provider"]
+            if provider not in _PROVIDER_NAMES:
+                _raise(source, f"{key}.provider", f"unknown provider {provider!r}")
+            if "effort" in raw:
+                effort = _string(source, f"{key}.effort", raw["effort"])
+                if not effort.strip():
+                    _raise(source, f"{key}.effort", "must be a non-empty string")
+                capability = next((
+                    item for item in model_capabilities()
+                    if item.provider == provider and item.model == raw["model"]
+                ), None)
+                if capability is not None:
+                    try:
+                        resolve_effort(capability.wire_format, raw["model"], effort)
+                    except ValueError as exc:
+                        _raise(source, f"{key}.effort", str(exc))
     models = _table(source, values, "models")
     if models is not None:
         _unknown_keys(source, "models", models, _PROVIDER_NAMES)
@@ -191,7 +223,7 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
                 _boolean(source, f"sandbox.{key}", sandbox[key])
     worktree = _table(source, values, "worktree")
     if worktree is not None:
-        _unknown_keys(source, "worktree", worktree, {"symlink"})
+        _unknown_keys(source, "worktree", worktree, {"symlink", "setup"})
         if "symlink" in worktree:
             for entry in _strings(source, "worktree.symlink", worktree["symlink"]):
                 path = Path(entry)
@@ -201,6 +233,8 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
                         "worktree.symlink",
                         f"unsafe path {entry!r}; entries must be relative paths without '..'",
                     )
+        if "setup" in worktree and not _string(source, "worktree.setup", worktree["setup"]).strip():
+            _raise(source, "worktree.setup", "must be a non-empty string")
     budgets = _table(source, values, "budgets")
     if budgets is not None:
         _unknown_keys(source, "budgets", budgets, {"leader", "subagent", "price_table"})
@@ -359,6 +393,11 @@ def load_config(
                         f"{source}: permissions: grants are refused from project and private config scopes; section skipped"
                     )
                     continue
+                if section == "roles":
+                    warnings.append(
+                        f"{source}: roles: role models are accepted only from user config; section skipped"
+                    )
+                    continue
                 try:
                     _validate(source, {section: value})
                 except ConfigError as exc:
@@ -368,6 +407,8 @@ def load_config(
             values = safe_values
         if "permissions" in values and scope is Scope.SESSION:
             _raise(source, "permissions", "permission grants are supported only in user config")
+        if "roles" in values and scope is Scope.SESSION:
+            _raise(source, "roles", "role models are supported only in user config")
         if scope not in {Scope.PROJECT, Scope.PRIVATE}:
             _validate(source, values)
         flattened = _flatten(values)
@@ -382,12 +423,47 @@ def load_config(
         for key, value in flattened.items():
             resolved[key] = value
             provenance[key] = Provenance(key=key, scope=scope, source=source)
-    return ResolvedConfig(
+    config = ResolvedConfig(
         values=MappingProxyType(resolved),
         provenance=MappingProxyType(provenance),
         layers=tuple(layers),
         warnings=tuple(warnings),
     )
+    setup_origin = config.provenance.get("worktree.setup")
+    if setup_origin is not None and setup_origin.scope in {Scope.PROJECT, Scope.PRIVATE}:
+        from symphonai_api.trust import trust_from_config
+
+        try:
+            trusted = trust_from_config(config).allows(root, "hooks")
+        except ConfigError:
+            trusted = False
+        if not trusted:
+            values = dict(config.values)
+            values.pop("worktree.setup", None)
+            provenance = dict(config.provenance)
+            provenance.pop("worktree.setup", None)
+            layers = tuple(
+                ConfigLayer(
+                    scope=layer.scope,
+                    source=layer.source,
+                    values=MappingProxyType({
+                        key: value for key, value in layer.values.items()
+                        if key != "worktree.setup"
+                    }),
+                )
+                for layer in config.layers
+            )
+            warnings.append(
+                f"{setup_origin.source}: worktree.setup: ignored unless the repository "
+                "is granted hooks under [[trust.repositories]]"
+            )
+            config = ResolvedConfig(
+                values=MappingProxyType(values),
+                provenance=MappingProxyType(provenance),
+                layers=layers,
+                warnings=tuple(warnings),
+            )
+    return config
 
 
 def resolve_run_budgets(

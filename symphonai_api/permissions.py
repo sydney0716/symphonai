@@ -386,10 +386,13 @@ class PermissionPolicy:
     shell_output_limit_chars: int = DEFAULT_SHELL_OUTPUT_CHARS
     mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
+    sandbox_write_scope: list[Path] | None = None
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
         self.allowed_write_scope = [Path(p).resolve() for p in self.allowed_write_scope]
+        if self.sandbox_write_scope is not None:
+            self.sandbox_write_scope = [Path(p).resolve() for p in self.sandbox_write_scope]
         self.fetch_allowlist = [
             host.casefold().rstrip(".") for host in self.fetch_allowlist
         ]
@@ -530,6 +533,12 @@ class PermissionPolicy:
             allowed_write_scope=_intersect_write_scopes(
                 self.allowed_write_scope, ceiling.allowed_write_scope
             ),
+            sandbox_write_scope=(
+                _intersect_write_scopes(self.sandbox_write_scope, ceiling.sandbox_write_scope)
+                if self.sandbox_write_scope is not None and ceiling.sandbox_write_scope is not None
+                else self.sandbox_write_scope if self.sandbox_write_scope is not None
+                else ceiling.sandbox_write_scope
+            ),
             forbidden_patterns=_ordered_union(
                 self.forbidden_patterns, ceiling.forbidden_patterns
             ),
@@ -567,9 +576,19 @@ class PermissionPolicy:
             except ValueError:
                 continue
             write_scope.append(new_root / relative)
+        sandbox_write_scope = None
+        if self.sandbox_write_scope is not None:
+            sandbox_write_scope = []
+            for path in self.sandbox_write_scope:
+                try:
+                    relative = path.relative_to(self.repo_root)
+                except ValueError:
+                    continue
+                sandbox_write_scope.append(new_root / relative)
         return PermissionPolicy(
             repo_root=new_root,
             allowed_write_scope=write_scope,
+            sandbox_write_scope=sandbox_write_scope,
             forbidden_patterns=self.forbidden_patterns,
             shell_enabled=self.shell_enabled,
             shell_allowlist=list(self.shell_allowlist),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -593,6 +594,7 @@ def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None)
             for card in loop.get("cards", [])
         ],
         "summary": loop.get("summary", {}),
+        "retries": loop.get("retries", []),
         "usage": loop.get("usage", {"cards": {}, "total": {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -605,6 +607,11 @@ def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
     print(f"Branch: {result['branch'] or ''}")
+    for retry in result["retries"]:
+        stage = retry.get("stage", "stage")
+        card = retry.get("card")
+        label = f"{stage} card {card}" if card else stage
+        print(f"Retrying {label}: {retry.get('reason', '')}")
     for card in result["cards"]:
         print(f"{card['id']} · {card['state']} · {card['commit'] or ''}")
     for validation in result["summary"].get("validation", []):
@@ -616,6 +623,23 @@ def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None)
     )
     if result["reason"]:
         print(f"Reason: {result['reason']}")
+
+
+def _loop_retry_target(reason: str) -> tuple[str | None, str | None]:
+    """Classify only loop failures that can be retried automatically."""
+    if reason.startswith(("planner failed:", "planner stopped:", "plan.json is missing", "plan.json is invalid:")):
+        return "planner", None
+    card_id_pattern = r"([a-h](?:F2?)?)"
+    match = re.match(rf"card {card_id_pattern} could not (start|finish): (.*)", reason)
+    if match and "validation still failing after" not in match.group(3):
+        return "implementer", match.group(1)
+    match = re.match(rf"card {card_id_pattern} review failed:", reason)
+    no_verdict = re.match(rf"card {card_id_pattern} review gave no verdict", reason)
+    if match or no_verdict:
+        return "reviewer", (match or no_verdict).group(1)
+    if reason == "review gave no verdict":
+        return "reviewer", None
+    return None, None
 
 
 def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
@@ -631,6 +655,8 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
     threading.excepthook = lambda _args: None
     loop = None
     approval_error = None
+    retries = []
+    retried_stages = set()
     try:
         runtime = build_project(
             root,
@@ -705,6 +731,34 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                     approval_error = str(exc)
                     loop = current
                     break
+            elif current.get("state") == "needs_attention":
+                reason = str(current.get("reason", ""))
+                stage, card_id = _loop_retry_target(reason)
+                key = ("planner", None) if stage == "planner" else ("card", card_id)
+                if stage is not None and key not in retried_stages:
+                    retried_stages.add(key)
+                    entry = {"stage": stage, "card": card_id, "reason": reason}
+                    retries.append(entry)
+                    label = f"{stage} card {card_id}" if card_id else stage
+                    print(f"retrying {label}: {reason}", file=sys.stderr, flush=True)
+                    if stage == "planner":
+                        (store.path(loop["id"], "plan.json")).unlink(missing_ok=True)
+                        specs_folder = store.path(loop["id"], "specs")
+                        for path in specs_folder.iterdir():
+                            if path.is_dir():
+                                shutil.rmtree(path)
+                            else:
+                                path.unlink()
+                        store.set_state(current, "planning", "")
+                        try:
+                            runtime.run._start_loop_planner(current, "state")
+                        except Exception as exc:
+                            store.set_state(current, "needs_attention", f"planner failed: {exc}")
+                    else:
+                        runtime.run.resume_loop(loop["id"])
+                    continue
+                loop = current
+                break
             elif (
                 current.get("state") in terminal_states
                 and (event is None or event.state == current.get("state"))
@@ -712,6 +766,7 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                 loop = current
                 break
         loop = store.load(loop["id"])
+        loop["retries"] = retries
         loop["usage"] = runtime.run.loop_usage(loop)
         _print_loop_result(loop, arguments.json, approval_error)
         return 1 if approval_error or loop.get("state") in ("needs_attention", "cancelled") else 0

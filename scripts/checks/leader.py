@@ -42,7 +42,11 @@ from symphonai_api.events import (
     SubagentSpawned,
     ToolCallStarted,
 )
-from symphonai_api.compaction import ContextCompactionError, estimate_messages_tokens
+from symphonai_api.compaction import (
+    MODEL_SUMMARY_PROMPT,
+    ContextCompactionError,
+    estimate_messages_tokens,
+)
 import symphonai_api.leader as leader_module
 from symphonai_api.leader import (
     DispatchSubagentTool,
@@ -79,7 +83,7 @@ from symphonai_api.providers.openai_provider import (
 )
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
-from symphonai_api.session import SessionStore, load_run_for_resume, read_records
+from symphonai_api.session import SessionStore, load_run, load_run_for_resume, read_records
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
@@ -246,6 +250,237 @@ class _GrowingRequestProvider(_AnthropicFakeProvider):
                 ],
             )
         )
+
+
+class _RepeatedReadProvider(_AnthropicFakeProvider):
+    def __init__(
+        self,
+        reads: int,
+        *,
+        summary_text: str = "summary",
+        tool_name: str = "read_file",
+    ) -> None:
+        super().__init__()
+        self.reads = reads
+        self.calls = 0
+        self.estimates: list[int] = []
+        self.summary_calls = 0
+        self.summary_text = summary_text
+        self.summary_requests: list[ModelRequest] = []
+        self.tool_name = tool_name
+        self.requests: list[ModelRequest] = []
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        if request.messages and request.messages[0].text == MODEL_SUMMARY_PROMPT:
+            self.summary_calls += 1
+            self.summary_requests.append(request)
+            return ModelResponse(
+                Message(Role.ASSISTANT, self.summary_text),
+                usage=Usage(input_tokens=10, output_tokens=5),
+            )
+        self.requests.append(request)
+        self.estimates.append(estimate_messages_tokens(request.messages))
+        if self.calls >= self.reads:
+            return ModelResponse(Message(Role.ASSISTANT, "finished"))
+        index = self.calls
+        self.calls += 1
+        return ModelResponse(
+            Message(
+                Role.ASSISTANT,
+                tool_calls=[ToolCall(
+                    f"read-{index}", self.tool_name, {"path": f"large-{index}.txt"}
+                )],
+            )
+        )
+
+
+class _LargeResultTool(LocalTool):
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "large_result"
+
+    @property
+    def description(self) -> str:
+        return "Return a large scripted result."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return ToolMetadata(ToolEffect.READ_ONLY, True, ())
+
+    def _execute(self, tool_call, policy, cancel=None):
+        self.calls.append(tool_call.id)
+        return ToolResult(tool_call_id=tool_call.id, ok=True, content="z" * 100_000)
+
+
+class _FourthRequestOverflowProvider(_RepeatedReadProvider):
+    def __init__(self) -> None:
+        super().__init__(4, tool_name="large_result")
+        self.overflowed = False
+
+    def create_response(
+        self, request: ModelRequest, *, cancel: CancellationToken | None = None
+    ) -> ModelResponse:
+        if not self.overflowed and len(self.requests) == 3:
+            self.requests.append(request)
+            estimate = estimate_messages_tokens(request.messages)
+            self.estimates.append(estimate)
+            self.overflowed = True
+            raise ContextLengthExceededError(
+                "scripted fourth request overflow",
+                actual_tokens=estimate * 2,
+                limit_tokens=estimate,
+            )
+        return super().create_response(request, cancel=cancel)
+
+
+@check("leader.compacts_inside_single_message_run")
+def check_compacts_inside_single_message_run() -> None:
+    with workspace() as ws, tempfile.TemporaryDirectory() as temporary:
+        for index in range(60):
+            (ws.root / f"large-{index}.txt").write_text("x" * 96_000)
+        provider = _RepeatedReadProvider(60)
+        session = SessionStore(Path(temporary), "compact-run", repo_root=ws.root)
+        events = CollectingSink()
+        leader = Leader(
+            LeaderConfig(
+                provider,
+                FakeModelProvider(),
+                str(ws.root),
+                leader_model="claude-haiku-4-5",
+                events=events,
+            ),
+            session=session,
+        )
+        result = leader.chat("read the large files one at a time")
+        if result.final_answer != "finished" or provider.calls != 60:
+            fail("large one-message tool run did not complete all scripted reads")
+        applied = [event for event in events.events if isinstance(event, CompactionApplied)]
+        if not applied:
+            fail(
+                "long run did not emit an in-run compaction event: "
+                f"max request estimate={max(provider.estimates, default=0)}, "
+                f"requests={len(provider.estimates)}, "
+                f"last request messages={len(provider.requests[-1].messages) if provider.requests else 0}, "
+                f"tool chars={sum(len(message.tool_result.content) for message in provider.requests[-1].messages if message.tool_result) if provider.requests else 0}, "
+                f"last tool error={next((message.tool_result.error for message in reversed(provider.requests[-1].messages) if message.tool_result), None)!r}"
+            )
+        if applied[0].before_tokens <= leader.chat_token_budget or applied[0].after_tokens > leader.chat_token_budget:
+            fail(
+                "in-run compaction token estimates did not cross the budget: "
+                f"{applied[0].before_tokens} -> {applied[0].after_tokens}, "
+                f"budget {leader.chat_token_budget}"
+            )
+        if any(estimate > leader.chat_token_budget for estimate in provider.estimates):
+            fail(f"a request exceeded the budget after compaction: {provider.estimates!r}")
+        if estimate_messages_tokens(leader._chat_messages) > leader.chat_token_budget:
+            fail("leader chat history did not retain the in-run compacted conversation")
+        replayed = load_run(session).messages
+        if replayed != leader._chat_messages:
+            fail("replaying the transcript did not produce the compacted chat history")
+        records, _ = read_records(session.writer_for(leader.agent_ref.agent_id, is_root=True).path)
+        if not any(record.get("type") == "compaction" for record in records):
+            fail("leader transcript did not record in-run compaction")
+        session.close()
+
+
+@check("leader.subagent_compacts_with_its_provider")
+def check_subagent_compacts_with_its_provider() -> None:
+    with workspace() as ws, tempfile.TemporaryDirectory() as temporary:
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch("worker", "inspect")])) ,
+            ModelResponse(Message(Role.ASSISTANT, "delegated")),
+        ])
+        child_provider = _RepeatedReadProvider(10, tool_name="large_result")
+        large_tool = _LargeResultTool()
+        session = SessionStore(Path(temporary), "subagent-compact", repo_root=ws.root)
+        leader = Leader(
+            LeaderConfig(
+                leader_provider,
+                child_provider,
+                str(ws.root),
+                model_summary=True,
+                extra_tools={"large_result": large_tool},
+                subagent_specs={
+                    "worker": _spec(
+                        ws.root, "worker", provider="anthropic", model="claude-haiku-4-5"
+                    )
+                },
+            ),
+            session=session,
+        )
+        result = leader.chat("delegate the long inspection")
+        if result.final_answer != "delegated" or len(large_tool.calls) != 10:
+            fail(
+                "subagent's long run did not complete: "
+                f"answer={result.final_answer!r}, calls={len(large_tool.calls)}, "
+                f"provider_calls={child_provider.calls}, stopped={result.stopped_reason}"
+            )
+        if child_provider.summary_calls < 1:
+            fail("subagent compaction did not request a model summary")
+        if not any(
+            request.messages[0].text == MODEL_SUMMARY_PROMPT
+            and request.max_tokens == 20_000
+            for request in child_provider.summary_requests
+        ):
+            fail("subagent summary request did not use the shared prompt and token limit")
+        child_id = leader.subagents["worker"].agent_ref.agent_id
+        child_usage = result.usage_by_agent.get(child_id, {}).get("claude-haiku-4-5")
+        if child_usage is None or child_usage.input_tokens < 10 or child_usage.output_tokens < 5:
+            fail(
+                "subagent summary usage was not included in stage/model totals: "
+                f"{child_usage!r}; all={result.usage_by_agent.get(child_id)!r}; "
+                f"summary calls={child_provider.summary_calls}"
+            )
+        child_records, _ = read_records(session.writer_for(child_id).path)
+        if not any(
+            record.get("type") == "usage"
+            and record.get("data", {}).get("agent_name") == "worker"
+            and record.get("data", {}).get("model") == "claude-haiku-4-5"
+            and record.get("data", {}).get("input_tokens") == 10
+            for record in child_records
+        ):
+            fail("subagent transcript omitted the model summary usage record")
+        if any(message.text == MODEL_SUMMARY_PROMPT
+               for request in leader_provider.requests for message in request.messages):
+            fail("subagent summary was sent to the leader provider")
+        session.close()
+
+
+@check("leader.mid_run_overflow_retries_current_turn")
+def check_mid_run_overflow_retries_current_turn() -> None:
+    with workspace() as ws:
+        provider = _FourthRequestOverflowProvider()
+        large_tool = _LargeResultTool()
+        leader = Leader(
+            LeaderConfig(
+                provider,
+                FakeModelProvider(),
+                str(ws.root),
+                leader_tools={"large_result": large_tool},
+            )
+        )
+        result = leader.chat("continue through the large results")
+        if result.final_answer != "finished":
+            fail("overflowed run did not finish after its in-place retry")
+        if not provider.overflowed or len(provider.requests) != 6:
+            fail(f"expected requests 1-3, overflow 4, retry 5 and completion 6; got {len(provider.requests)}")
+        if large_tool.calls != ["read-0", "read-1", "read-2", "read-3"]:
+            fail(f"tool calls were repeated or skipped across retry: {large_tool.calls!r}")
+        retry_messages = provider.requests[4].messages
+        if not any(
+            message.tool_result is not None
+            and message.tool_result.tool_call_id == "read-2"
+            for message in retry_messages
+        ):
+            fail("retry request did not continue from turn 3's tool result")
 
 
 class _RaisingProvider(FakeModelProvider):
@@ -2112,13 +2347,10 @@ def check_context_overflow_compacts_and_recovers() -> None:
         recovered = leader.chat("current request")
         if recovered.final_answer != "recovered" or len(provider.requests) != 2:
             fail("context overflow did not compact and retry exactly once")
-        if len(provider.requests[1].messages) >= len(provider.requests[0].messages):
-            fail("overflow retry did not send fewer messages than the rejected request")
-        if not any(
-            "Earlier conversation compacted" in message.text
-            for message in provider.requests[1].messages
+        if estimate_messages_tokens(provider.requests[1].messages) >= estimate_messages_tokens(
+            provider.requests[0].messages
         ):
-            fail("overflow retry did not carry the compacted conversation summary")
+            fail("overflow retry did not use the compacted in-run history")
 
         following = leader.chat("following request")
         if following.final_answer != "recovered" or len(provider.requests) != 3:
@@ -2203,7 +2435,7 @@ def check_mid_turn_overflow_uses_failed_request_ratio() -> None:
     with workspace() as ws:
         for index in range(12):
             (ws.root / f"growth-{index}.txt").write_text(("x" * 400 + "\n") * 200)
-        provider = _GrowingRequestProvider()
+        provider = _GrowingRequestProvider(window=100_000)
         leader = Leader(
             LeaderConfig(
                 provider,
@@ -2212,36 +2444,11 @@ def check_mid_turn_overflow_uses_failed_request_ratio() -> None:
                 leader_model="claude-haiku-4-5",
             )
         )
-        history = [Message(Role.SYSTEM, "system instructions")]
-        for index in range(4):
-            call_id = f"history-read-{index}"
-            history.extend(
-                [
-                    Message(Role.USER, f"inspect history file {index}"),
-                    Message(
-                        Role.ASSISTANT,
-                        tool_calls=[
-                            ToolCall(
-                                call_id,
-                                "read_file",
-                                {"path": f"history-{index}.txt"},
-                            )
-                        ],
-                    ),
-                    Message(
-                        Role.TOOL,
-                        tool_result=ToolResult(
-                            tool_call_id=call_id,
-                            ok=True,
-                            content="h" * 24_000,
-                        ),
-                    ),
-                ]
-            )
+        history = [
+            Message(Role.SYSTEM, "system instructions"),
+            Message(Role.USER, "inspect the growth files"),
+        ]
         leader.seed_chat(history, persisted=True)
-        initial_estimate = estimate_messages_tokens(leader._chat_messages)
-        if not 23_000 <= initial_estimate <= 26_000:
-            fail(f"seeded history estimate was {initial_estimate}, expected about 24164")
         first = leader.chat("read the requested files")
         if first.final_answer != "recovered" or not provider.overflowed:
             fail("mid-turn overflow did not recover")
@@ -2327,10 +2534,11 @@ def check_context_overflow_narrows_recent_window() -> None:
         result = leader.chat("current request must stay")
         if result.final_answer != "recovered" or len(provider.requests) != 2:
             fail("narrowing the recent window did not recover the overflow")
-        first_count = len(provider.requests[0].messages)
         second_messages = provider.requests[1].messages
-        if len(second_messages) >= first_count:
-            fail("narrowed overflow retry did not contain fewer messages")
+        if estimate_messages_tokens(second_messages) >= estimate_messages_tokens(
+            provider.requests[0].messages
+        ):
+            fail("narrowed overflow retry did not compact the in-run context")
         second_text = [message.text for message in second_messages]
         for preserved in (
             "first goal must stay",
@@ -2668,17 +2876,12 @@ def check_context_overflow_retry_failure() -> None:
             pass
         else:
             fail("another second overflow did not propagate")
-        if len(provider.requests) != 3 or not breaker.is_open:
+        if len(provider.requests) != 4 or not breaker.is_open:
             fail("consecutive overflow repairs did not open the breaker")
 
-        try:
-            leader.chat("breaker is open")
-        except ContextLengthExceededError:
-            pass
-        else:
-            fail("open compaction breaker hid the next overflow")
-        if len(provider.requests) != 4:
-            fail("open compaction breaker allowed another compact-and-retry attempt")
+        continued = leader.chat("breaker is open")
+        if continued.final_answer != "recovered" or len(provider.requests) != 6:
+            fail("in-run overflow did not recover after the chat breaker opened")
 
 
 @check("leader.standard_tools")
@@ -5047,7 +5250,7 @@ def check_spec_workflow_role_roster() -> None:
         expected = {
             "worker": tuple(standard_tool_registry(search_backend=object(), skills={"release": skill})),
             "explorer": leader_module.EXPLORER_TOOL_NAMES + ("web_search", "use_skill"),
-            "planner": leader_module.EXPLORER_TOOL_NAMES + ("write_file", "edit_file", "web_search", "use_skill"),
+            "planner": leader_module.EXPLORER_TOOL_NAMES + ("run_shell", "write_file", "edit_file", "web_search", "use_skill"),
             "implementer": tuple(standard_tool_registry(search_backend=object(), skills={"release": skill})),
             "reviewer": leader_module.EXPLORER_TOOL_NAMES + ("run_shell", "write_file", "web_search", "use_skill"),
         }
@@ -5056,7 +5259,7 @@ def check_spec_workflow_role_roster() -> None:
         if any(spec.call_class is not CallClass.BACKGROUND for spec in roster.values()):
             fail("a built-in workflow role was not a background agent")
         no_optional = builtin_subagent_specs(provider, ws.policy)
-        if no_optional["planner"].tool_names != leader_module.EXPLORER_TOOL_NAMES + ("write_file", "edit_file"):
+        if no_optional["planner"].tool_names != leader_module.EXPLORER_TOOL_NAMES + ("run_shell", "write_file", "edit_file"):
             fail("planner acquired optional tools without configured backends")
 
 

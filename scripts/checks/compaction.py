@@ -13,12 +13,109 @@ from symphonai_api.compaction import (
     describe_compaction,
     estimate_messages_tokens,
     microcompact_messages,
+    recent_window_start,
     render_dropped_messages,
 )
 from symphonai_api.models import ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from scripts.checks.harness import check, fail
+
+
+@check("compaction.assistant_turn_window_keeps_pairs")
+def check_assistant_turn_window_keeps_pairs() -> None:
+    messages = [Message(Role.SYSTEM, "system"), Message(Role.USER, "first goal")]
+    for index in range(5):
+        call_id = f"call-{index}"
+        messages.extend([
+            Message(
+                Role.ASSISTANT,
+                f"assistant turn {index} " + ("old detail " * 500 if index < 2 else "recent"),
+                tool_calls=[ToolCall(call_id, "read_file", {"path": f"{index}.txt"})],
+            ),
+            Message(
+                Role.TOOL,
+                tool_result=ToolResult(
+                    call_id, ok=True, content=("large output " * 500 if index < 2 else "small output")
+                ),
+            ),
+        ])
+    messages.append(Message(Role.ASSISTANT, "last assistant turn"))
+    start = recent_window_start(messages, 3)
+    if messages[start].role is not Role.ASSISTANT:
+        fail("assistant recent window did not start at an assistant turn")
+    result = compact_messages_for_budget(
+        messages, budget=3_000, recent_turns=3
+    )
+    if not result.changed or result.after_tokens > result.budget:
+        fail(f"assistant-turn compaction did not fit: {result!r}")
+    if not any(message.role is Role.USER and message.text == "first goal" for message in result.messages):
+        fail("assistant-turn compaction dropped the first user goal")
+    if not any(message.text == "last assistant turn" for message in result.messages):
+        fail("assistant-turn compaction dropped the last assistant turn")
+    calls = {
+        call.id for message in result.messages for call in message.tool_calls
+    }
+    results = {
+        message.tool_result.tool_call_id
+        for message in result.messages
+        if message.tool_result is not None
+    }
+    if calls != results:
+        fail(f"compaction left tool calls/results unpaired: calls={calls}, results={results}")
+
+
+@check("compaction.assistant_window_keeps_each_user_once")
+def check_assistant_window_keeps_each_user_once() -> None:
+    messages = [Message(Role.SYSTEM, "system"), Message(Role.USER, "goal")]
+    notice = Message(Role.USER, "files changed on disk after turn 9")
+    for index in range(10):
+        call_id = f"edit-{index}"
+        messages.extend([
+            Message(
+                Role.ASSISTANT,
+                tool_calls=[ToolCall(call_id, "edit_file", {"path": f"file-{index}.txt"})],
+            ),
+            Message(
+                Role.TOOL,
+                tool_result=ToolResult(call_id, ok=True, content=f"result {index} " + "x" * 8_000),
+            ),
+        ])
+        if index == 8:
+            messages.append(notice)
+    recent_start = recent_window_start(
+        messages, 4, assistant_turn_window=True
+    )
+    recent_window = messages[recent_start:]
+    result = compact_messages_for_budget(
+        messages,
+        budget=12_000,
+        recent_turns=4,
+        assistant_turn_window=True,
+    )
+    if not result.changed or result.after_tokens > result.budget:
+        fail(f"repro conversation did not compact under budget: {result!r}")
+    if sum(message == notice for message in result.messages) != 1:
+        fail("user notice in the recent window was duplicated or dropped")
+    positions = [result.messages.index(message) for message in recent_window]
+    if positions != sorted(positions) or any(
+        sum(candidate == message for candidate in result.messages) != 1
+        for message in recent_window
+    ):
+        fail("the original recent window was duplicated or reordered")
+    if any(
+        sum(candidate == message for candidate in result.messages) > 1
+        for message in messages
+    ):
+        fail("an original conversation message appears more than once")
+    again = compact_messages_for_budget(
+        result.messages,
+        budget=12_000,
+        recent_turns=4,
+        assistant_turn_window=True,
+    )
+    if again.messages != result.messages or sum(message == notice for message in again.messages) != 1:
+        fail("compacting the result again introduced another copy")
 
 
 def _single_clearable_conversation() -> list[Message]:

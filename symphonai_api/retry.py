@@ -21,11 +21,13 @@ from symphonai_api.providers.base import (
     ProviderUnavailableError,
 )
 
-DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_ATTEMPTS = 10
 RETRY_BASE_SECONDS = 0.5
-MAX_RETRY_DELAY_SECONDS = 8.0
+MAX_RETRY_DELAY_SECONDS = 32.0
+MAX_RETRY_AFTER_SECONDS = 120.0
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 529})
 OVERLOAD_STATUS_CODES = frozenset({429, 529})
+FALLBACK_OVERLOAD_MAX_ATTEMPTS = 3
 NON_RETRYABLE_SERVER_STATUS_CODES = frozenset({501, 505, 511})
 MAX_ERROR_DETAIL_BYTES = 500
 
@@ -71,6 +73,7 @@ def read_with_retry(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     api_key: str,
     operation: str,
+    fallback_configured: bool = False,
     cancel: CancellationToken | None = None,
     call_class: CallClass = CallClass.FOREGROUND,
 ) -> bytes:
@@ -126,9 +129,12 @@ def read_with_retry(
                     "and did not retry: background calls do not retry provider overload"
                 ) from None
             retryable_status = _is_retryable_status(exc.code)
+            retry_attempts = max_attempts
+            if fallback_configured and exc.code in OVERLOAD_STATUS_CODES:
+                retry_attempts = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
             if retryable_status and _wait_before_retry(
                 attempt=attempt,
-                max_attempts=max_attempts,
+                max_attempts=retry_attempts,
                 deadline=deadline,
                 retry_after=exc.headers.get("Retry-After") if exc.headers else None,
                 cancel=cancel,
@@ -261,8 +267,10 @@ def _wait_before_retry(
         return False
 
     hint = _retry_after_delay(retry_after) if retry_after is not None else None
-    delay = hint if hint is not None else _exponential_delay(attempt)
-    delay = min(delay, MAX_RETRY_DELAY_SECONDS)
+    delay = (
+        min(hint, MAX_RETRY_AFTER_SECONDS)
+        if hint is not None else min(_exponential_delay(attempt), MAX_RETRY_DELAY_SECONDS)
+    )
     if delay >= remaining:
         return False
     if delay > 0:

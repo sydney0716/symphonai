@@ -525,6 +525,7 @@ class AnthropicProvider(ModelProvider):
                     max_attempts=self.max_attempts,
                     api_key=api_key,
                     operation="Anthropic API",
+                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
                     cancel=cancel,
                     call_class=request.call_class,
                 )
@@ -595,6 +596,7 @@ class AnthropicProvider(ModelProvider):
                     max_attempts=1,
                     api_key=api_key,
                     operation="Anthropic API",
+                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
                     cancel=cancel,
                 )
                 return _anthropic_stream_chunks(lines, api_key=api_key)
@@ -605,6 +607,7 @@ class AnthropicProvider(ModelProvider):
                     attempt,
                     timeout=self.timeout_seconds,
                     max_attempts=self.max_attempts,
+                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
                     cancel=cancel,
                 ):
                     emitted = True

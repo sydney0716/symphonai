@@ -340,21 +340,25 @@ def check_spec_run_starts_with_full_spec_and_keeps_title() -> None:
 @check("host_server.spec_roles_use_the_routine_model")
 def check_spec_roles_use_the_routine_model() -> None:
     class RecordingProvider(FakeModelProvider):
-        model = "claude-opus-5-5"
-        DEFAULT_MODEL = "claude-opus-5-5"
-        ROUTINE_MODEL = "claude-sonnet-5-5"
+        def __init__(self, name, model, responses=None, routine_model=None) -> None:
+            super().__init__(responses or [ModelResponse(Message(Role.ASSISTANT, "done"))])
+            self.provider_name = name
+            self.model = model
+            self.DEFAULT_MODEL = model
+            self.ROUTINE_MODEL = routine_model
+            self.requests: list[tuple[str | None, str | None]] = []
 
-        def __init__(self) -> None:
-            super().__init__([ModelResponse(Message(Role.ASSISTANT, "done"))])
-            self.requested_models: list[str | None] = []
+        @property
+        def name(self):
+            return self.provider_name
 
         def create_response(self, request, *, cancel=None):
-            self.requested_models.append(request.model)
+            self.requests.append((request.model, request.effort))
             return super().create_response(request, cancel=cancel)
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        provider = RecordingProvider()
+        provider = RecordingProvider("anthropic", "claude-opus-5-5", routine_model="claude-sonnet-5-5")
         run = HostRun(
             provider, PermissionPolicy(root), EventBroker(),
             sessions_root=root / "sessions", memory_extraction_enabled=False,
@@ -376,11 +380,75 @@ def check_spec_roles_use_the_routine_model() -> None:
                     leader.run(f"run {role}")
                 finally:
                     session.close()
-                if provider.requested_models[-1] != expected:
+                if provider.requests[-1][0] != expected:
                     fail(
-                        f"spec {role} used {provider.requested_models[-1]!r}; "
+                        f"spec {role} used {provider.requests[-1][0]!r}; "
                         f"expected {expected!r}"
                     )
+        finally:
+            run.close()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        (home / ".symphonai").mkdir(parents=True)
+        (home / ".symphonai" / "config.toml").write_text(
+            '[roles.implementer]\nprovider = "openai"\nmodel = "gpt-6-luna"\neffort = "high"\n'
+            '[roles.worker]\nprovider = "openai"\nmodel = "gpt-6-luna"\neffort = "low"\n',
+            encoding="utf-8",
+        )
+        anthropic = RecordingProvider("anthropic", "claude-opus-5-5")
+        openai = RecordingProvider(
+            "openai",
+            "gpt-6-luna",
+            [
+                ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
+                    "dispatch-worker", "dispatch_subagent", {
+                        "subagent_name": "worker", "task": "inspect the implementation stage",
+                    },
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "worker done")),
+                ModelResponse(Message(Role.ASSISTANT, "implementer done")),
+            ],
+        )
+
+        def provider_factory(name, _model, _base_url):
+            return openai if name == "openai" else anthropic if name == "anthropic" else None
+
+        extensions = load_extensions(repo_root=root, home=home)
+        run = HostRun(
+            anthropic, PermissionPolicy(root), EventBroker(),
+            model="claude-picked", provider_factory=provider_factory,
+            sessions_root=root / "sessions", memory_extraction_enabled=False,
+            extensions=extensions,
+        )
+        try:
+            session = SessionStore(root / "sessions", "role-implementer", repo_root=root)
+            meta = session.read_meta()
+            meta["spec_run"] = {"role": "implementer", "kind": "implement"}
+            session.write_meta(meta)
+            try:
+                run._new_leader(session).run("run implementer")
+            finally:
+                session.close()
+            if openai.requests != [
+                ("gpt-6-luna", "high"),
+                ("gpt-6-luna", "low"),
+                ("gpt-6-luna", "high"),
+            ]:
+                fail(f"loop implementer and dispatched worker used the wrong provider/model/effort: {openai.requests!r}")
+
+            for role in ("planner", "reviewer"):
+                session = SessionStore(root / "sessions", f"role-picked-{role}", repo_root=root)
+                meta = session.read_meta()
+                meta["spec_run"] = {"role": role, "kind": role}
+                session.write_meta(meta)
+                try:
+                    run._new_leader(session).run(f"run {role}")
+                finally:
+                    session.close()
+                if anthropic.requests[-1][0] != "claude-picked":
+                    fail(f"unconfigured {role} did not use the picked model: {anthropic.requests[-1]!r}")
         finally:
             run.close()
 
@@ -623,9 +691,10 @@ def check_model_fallback() -> None:
             request_bytes = json.dumps({"model": request.model or self.model}).encode()
             raw = read_with_retry(
                 urllib.request.Request("https://mock.invalid/messages", data=request_bytes),
-                timeout=5,
+                timeout=600,
                 api_key="test-key",
                 operation="mock provider",
+                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
             )
             return ModelResponse(Message(Role.ASSISTANT, raw.decode("utf-8")))
 
@@ -681,7 +750,7 @@ def check_model_fallback() -> None:
         root = Path(temporary)
         provider = _HttpProvider()
         always_unavailable = False
-        retry_clock = SimpleNamespace(monotonic=time.monotonic, sleep=lambda _delay: None)
+        retry_clock = SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _delay: None)
         with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=mocked_open), mock.patch(
             "symphonai_api.retry.time", retry_clock
         ):
@@ -721,7 +790,7 @@ def check_model_fallback() -> None:
                     url_request.full_url, status, "provider error", {}, io.BytesIO(b"failure")
                 )
 
-            retry_clock = SimpleNamespace(monotonic=time.monotonic, sleep=lambda _delay: None)
+            retry_clock = SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _delay: None)
             with mock.patch("symphonai_api.retry.urllib.request.urlopen", side_effect=fail_open), mock.patch(
                 "symphonai_api.retry.time", retry_clock
             ):
@@ -733,9 +802,11 @@ def check_model_fallback() -> None:
                         fail(f"HTTP {status} emitted a fallback without a successful model")
                     if status == 400 and (provider.requests != [None] or sent_models != ["model-a"]):
                         fail(f"HTTP 400 attempted fallback: {provider.requests!r}")
-                    if status == 529 and sent_models != (
+                    expected = (
                         ["model-a"] * 3 + (["model-b"] * 3 if fallback else [])
-                    ):
+                        if fallback else ["model-a"] * 10
+                    )
+                    if status == 529 and sent_models != expected:
                         fail(f"fallback chain did not try the expected models: {sent_models!r}")
                 finally:
                     host.close()
@@ -11243,7 +11314,10 @@ def check_jobs_keep_a_project_open() -> None:
             host.close()
 
 
-def _headless_invoke(root: Path, provider, arguments: list[str], *, stdin_text: str = ""):
+def _headless_invoke(
+    root: Path, provider, arguments: list[str], *, stdin_text: str = "",
+    provider_factory=None,
+):
     home = root.parent / "home"
     sessions = root.parent / "sessions"
     stdout, stderr = io.StringIO(), io.StringIO()
@@ -11251,7 +11325,12 @@ def _headless_invoke(root: Path, provider, arguments: list[str], *, stdin_text: 
         "SYMPHONAI_HOME": str(home),
         "SYMPHONAI_SESSIONS_DIR": str(sessions),
     }):
-        with mock.patch.object(headless_module, "_provider", return_value=provider):
+        provider_patch = (
+            mock.patch.object(headless_module, "_provider", side_effect=provider_factory)
+            if provider_factory is not None
+            else mock.patch.object(headless_module, "_provider", return_value=provider)
+        )
+        with provider_patch:
             with mock.patch.object(headless_module.sys, "stdin", io.StringIO(stdin_text)):
                 with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     code = headless_module.main(arguments)
@@ -12277,8 +12356,47 @@ def _headless_loop_provider(
     ])
 
 
+@check("host_server.headless_loop_checks_role_providers_before_planning")
+def check_headless_loop_checks_role_providers_before_planning() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        home = root.parent / "home"
+        home.mkdir()
+        (home / "config.toml").write_text(
+            '[roles.implementer]\nprovider = "anthropic"\nmodel = "claude-sonnet-4-5"\n',
+            encoding="utf-8",
+        )
+        openai = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "unexpected"))])
+
+        def provider_factory(name, _model=None, _base_url=None):
+            return openai if name == "openai" else None
+
+        code, _output, error, _sessions = _headless_invoke(
+            root,
+            openai,
+            ["loop", "Run the configured role", "--json", "--repo-root", str(root), "--provider", "openai"],
+            provider_factory=provider_factory,
+        )
+        if code != 2 or "implementer" not in error or "anthropic" not in error:
+            fail(f"unavailable role provider did not stop the headless loop: {code}, {error!r}")
+        if openai.call_count:
+            fail(f"headless loop called the conversation provider before role preflight: {openai.call_count}")
+        if (root / ".symphonai" / "loops").exists():
+            fail("headless loop created a loop before role preflight completed")
+
+
 @check("host_server.headless_loop")
 def check_headless_loop() -> None:
+    if headless_module._loop_retry_target("card aF could not finish: provider error") != ("implementer", "aF"):
+        fail("failed follow-up card was not classified for an implementer retry")
+    if headless_module._loop_retry_target("card aF review gave no verdict") != ("reviewer", "aF"):
+        fail("follow-up review without a verdict was not classified for a reviewer retry")
+    if headless_module._loop_retry_target(
+        "card aF could not finish: validation still failing after 3 rounds"
+    ) != (None, None):
+        fail("follow-up card with exhausted validation was incorrectly classified for retry")
+
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "project"
         root.mkdir()
@@ -12367,6 +12485,46 @@ def check_headless_loop() -> None:
         root.mkdir()
         for arguments in (
             ("init", "--quiet"),
+            ("config", "user.email", "headless-retry@example.test"),
+            ("config", "user.name", "Headless Retry Check"),
+        ):
+            subprocess.run(["git", *arguments], cwd=root, check=True)
+        (root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
+
+        class FailImplementerOnce(FakeModelProvider):
+            def create_response(self, request, *, cancel=None):
+                is_implementer = any(
+                    "Write your report at" in message.text for message in request.messages
+                )
+                if is_implementer and not getattr(self, "failed_once", False):
+                    self.failed_once = True
+                    raise ProviderError("scripted provider failure")
+                return super().create_response(request, cancel=cancel)
+
+        provider = FailImplementerOnce(
+            _headless_loop_provider(loop_id="loop_000000000003")._responses
+        )
+        with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000003"):
+            code, output, _error, _sessions = _headless_invoke(
+                root, provider,
+                ["loop", "Add new.py", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
+        result = json.loads(output)
+        retries = result.get("retries")
+        if (code != 0 or result.get("state") != "awaiting_commit"
+                or not isinstance(retries, list) or len(retries) != 1
+                or retries[0].get("stage") != "implementer"
+                or retries[0].get("card") != "a"
+                or "scripted provider failure" not in retries[0].get("reason", "")):
+            fail(f"headless loop did not retry the failed implementer stage: {code}, {result!r}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        for arguments in (
+            ("init", "--quiet"),
             ("config", "user.email", "headless-text-usage@example.test"),
             ("config", "user.name", "Headless Text Usage Check"),
         ):
@@ -12443,14 +12601,16 @@ def check_headless_loop() -> None:
         (root / "base.py").write_text("value = 1\n", encoding="utf-8")
         subprocess.run(["git", "add", "base.py"], cwd=root, check=True)
         subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=root, check=True)
-        code, output, error, _sessions = _headless_invoke(
-            root, _headless_loop_provider("false"),
-            ["loop", "Add blocked.py", "--json", "--repo-root", str(root), "--provider", "openai"],
-        )
+        with mock.patch("symphonai_host.loops.secrets.token_hex", return_value="000000000000"):
+            code, output, error, _sessions = _headless_invoke(
+                root, _headless_loop_provider("false"),
+                ["loop", "Add blocked.py", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
         result = json.loads(output)
         if (code != 1 or result.get("state") != "needs_attention"
                 or not result.get("reason") or result["reason"] not in output
-                or "loop " not in error):
+                or "validation still failing after" not in result.get("reason", "")
+                or "loop " not in error or result.get("retries") != []):
             fail(f"blocked loop did not report needs_attention: {code}, {result!r}, {error!r}")
 
     with tempfile.TemporaryDirectory() as temporary:

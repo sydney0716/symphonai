@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import subprocess
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -154,6 +155,148 @@ def repository_config_is_skipped_not_fatal() -> None:
             reason = warning.partition(": ")[2].strip()
             if not reason or key not in reason:
                 fail(f"skipped {key} warning omitted its reason: {warning!r}")
+
+
+@check("config.role_models_are_user_only_and_validated")
+def role_models_are_user_only_and_validated() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        user_path = _scope_path(Scope.USER, repo_root, home)
+        project_path = _scope_path(Scope.PROJECT, repo_root, home)
+        private_path = _scope_path(Scope.PRIVATE, repo_root, home)
+        _write(user_path, '[roles.implementer]\nprovider = "anthropic"\nmodel = "opus"\n')
+        _write(project_path, '[roles.implementer]\nprovider = "openai"\nmodel = "repo-model"\n')
+        _write(private_path, '[roles.worker]\nprovider = "openai"\nmodel = "private-model"\n')
+        resolved = load_config(repo_root=repo_root, home=home)
+        if (
+            resolved.get("roles.implementer.provider") != "anthropic"
+            or resolved.get("roles.implementer.model") != "opus"
+            or resolved.scope_of("roles.implementer.model") is not Scope.USER
+        ):
+            fail(f"repository role models replaced the user's role model: {resolved.values!r}")
+        if "roles.worker.provider" in resolved.values:
+            fail("private role model was applied")
+        for path in (project_path, private_path):
+            if not any(str(path) in warning and "roles" in warning for warning in resolved.warnings):
+                fail(f"skipped role config warning omitted its path or section: {resolved.warnings!r}")
+
+        for content, expected in (
+            ('[roles.implementer]\nprovider = "openai"\nmodel = "gpt-6-luna"\neffort = "high"\n', "high"),
+            ('[roles.implementer]\nprovider = "openai"\nmodel = "unlisted-model"\neffort = "max"\n', "max"),
+        ):
+            _write(user_path, content)
+            configured = load_config(repo_root=repo_root, home=home)
+            if configured.get("roles.implementer.effort") != expected:
+                fail(f"valid role effort was not retained: {configured.values!r}")
+        _write(
+            user_path,
+            '[roles.implementer]\nprovider = "openai"\nmodel = "gpt-6-luna"\neffort = "max"\n',
+        )
+        try:
+            load_config(repo_root=repo_root, home=home)
+        except ConfigError as exc:
+            if "roles.implementer.effort" not in str(exc) or "accepted efforts" not in str(exc):
+                fail(f"unsupported role effort error omitted its key or accepted values: {exc!r}")
+        else:
+            fail("unsupported effort for a listed role model was accepted")
+
+        try:
+            load_config(
+                repo_root=repo_root,
+                home=home,
+                session={"roles": {"worker": {"provider": "openai", "model": "worker"}}},
+            )
+        except ConfigError as exc:
+            if "roles" not in str(exc):
+                fail(f"session role refusal omitted its key: {exc!r}")
+        else:
+            fail("session role models were accepted")
+
+        for content, key in (
+            ('[roles.unknown]\nprovider = "openai"\nmodel = "m"\n', "roles.unknown"),
+            ('[roles.worker]\nprovider = "unknown"\nmodel = "m"\n', "roles.worker.provider"),
+            ('[roles.reviewer]\nprovider = "openai"\n', "roles.reviewer.model"),
+        ):
+            _write(user_path, content)
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError as exc:
+                if key not in str(exc):
+                    fail(f"invalid role model error omitted {key}: {exc!r}")
+            else:
+                fail(f"invalid role model config was accepted for {key}")
+
+
+@check("config.worktree_setup_requires_hooks_trust")
+def worktree_setup_requires_hooks_trust() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo_root = root / "repo"
+        repo_root.mkdir()
+        home = root / "home"
+        project_config = repo_root / ".symphonai" / "config.toml"
+        user_config = home / ".symphonai" / "config.toml"
+        _write(project_config, '[worktree]\nsetup = "printf trusted > setup-marker"\n')
+
+        resolved = load_config(repo_root=repo_root, home=home)
+        if resolved.get("worktree.setup") is not None:
+            fail("untrusted project worktree setup was applied")
+        if not any(
+            str(project_config) in warning and "worktree.setup" in warning
+            for warning in resolved.warnings
+        ):
+            fail(f"untrusted setup warning omitted its file or key: {resolved.warnings!r}")
+
+        def git(*arguments: str) -> None:
+            result = subprocess.run(
+                ["git", *arguments], cwd=repo_root, capture_output=True, text=True, check=False,
+            )
+            if result.returncode:
+                fail(f"git {' '.join(arguments)} failed: {result.stderr.strip()}")
+
+        (repo_root / "base.py").write_text("value = 1\n", encoding="utf-8")
+        git("init", "--quiet")
+        git("config", "user.email", "config-check@example.test")
+        git("config", "user.name", "Config Check")
+        git("add", "base.py")
+        git("commit", "--quiet", "-m", "initial")
+
+        from symphonai_api.worktree import create_worktree, remove_worktree
+
+        admin = root / "sessions" / "untrusted"
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(home / ".symphonai")}):
+            child = create_worktree(repo_root, admin)
+            try:
+                if (child / "setup-marker").exists():
+                    fail("untrusted project setup command ran in its worktree")
+            finally:
+                remove_worktree(repo_root, admin)
+
+        _write(
+            user_config,
+            f'[[trust.repositories]]\nroot = "{repo_root}"\nallow = ["hooks"]\n',
+        )
+        trusted = load_config(repo_root=repo_root, home=home)
+        if trusted.get("worktree.setup") != "printf trusted > setup-marker":
+            fail("hooks trust did not enable project worktree setup")
+        trusted_admin = root / "sessions" / "trusted"
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(home / ".symphonai")}):
+            child = create_worktree(repo_root, trusted_admin)
+            try:
+                marker = child / "setup-marker"
+                if not marker.is_file() or marker.read_text(encoding="utf-8") != "trusted":
+                    fail("trusted project setup command did not run in its worktree")
+            finally:
+                remove_worktree(repo_root, trusted_admin)
+
+        _write(user_config, '[worktree]\nsetup = ""\n')
+        try:
+            load_config(repo_root=repo_root, home=home)
+        except ConfigError as exc:
+            if "worktree.setup" not in str(exc):
+                fail(f"empty setup error omitted worktree.setup: {exc!r}")
+        else:
+            fail("empty worktree setup command was accepted")
 
 
 @check("config.scope_precedence")

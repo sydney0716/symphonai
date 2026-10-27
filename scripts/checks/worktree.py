@@ -623,3 +623,102 @@ def check_configured_symlink_escape_refused() -> None:
                 for warning in resolved.warnings
             ):
                 fail(f"unsafe worktree symlink warning omitted its source or reason: {resolved.warnings!r}")
+
+
+@check("worktree.setup_runs_in_fresh_tree")
+def check_setup_runs_in_fresh_tree() -> None:
+    from symphonai_api.worktree import create_worktree, remove_worktree
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = _repository(root / "repo")
+        (repo / ".gitignore").write_text("/build-output/\n", encoding="utf-8")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "--quiet", "-m", "ignore build output")
+        home = root / "home"
+        config = home / ".symphonai" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(
+            '[worktree]\nsetup = "mkdir -p build-output && printf built > build-output/generated.txt"\n',
+            encoding="utf-8",
+        )
+        admin = root / "sessions" / "worktree"
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(home / ".symphonai")}):
+            child = create_worktree(repo, admin)
+            try:
+                output = child / "build-output" / "generated.txt"
+                if not output.is_file() or output.read_text(encoding="utf-8") != "built":
+                    fail("worktree setup output was missing when create_worktree returned")
+                if (repo / "build-output" / "generated.txt").exists():
+                    fail("worktree setup wrote its ignored output into the project")
+            finally:
+                remove_worktree(repo, admin)
+
+
+@check("worktree.setup_failure_removes_tree")
+def check_setup_failure_removes_tree() -> None:
+    from symphonai_api.worktree import WorktreeError, create_worktree
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = _repository(root / "repo")
+        home = root / "home"
+        config = home / ".symphonai" / "config.toml"
+        config.parent.mkdir(parents=True)
+        command = "echo first line; echo last setup output; exit 3"
+        config.write_text(f'[worktree]\nsetup = "{command}"\n', encoding="utf-8")
+        admin = root / "sessions" / "failed-worktree"
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(home / ".symphonai")}):
+            try:
+                create_worktree(repo, admin)
+            except WorktreeError as exc:
+                message = str(exc)
+                if "3" not in message or command not in message or "last setup output" not in message:
+                    fail(f"setup failure omitted its command, exit code, or final output: {message!r}")
+            else:
+                fail("non-zero worktree setup did not raise WorktreeError")
+        if admin.exists():
+            fail("failed setup left the worktree path behind")
+
+
+@check("worktree.setup_timeout_kills_process_group")
+def check_setup_timeout_kills_process_group() -> None:
+    from symphonai_api.worktree import WorktreeError, create_worktree
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = _repository(root / "repo")
+        home = root / "home"
+        config = home / ".symphonai" / "config.toml"
+        config.parent.mkdir(parents=True)
+        pid_file = root / "setup-child.pid"
+        command = f"sleep 30 & echo $! > {pid_file}; wait"
+        config.write_text(f"[worktree]\nsetup = '{command}'\n", encoding="utf-8")
+        admin = root / "sessions" / "timed-out-worktree"
+        started = time.monotonic()
+        with mock.patch.dict("os.environ", {"SYMPHONAI_HOME": str(home / ".symphonai")}), mock.patch(
+            "symphonai_api.worktree.WORKTREE_SETUP_TIMEOUT_SECONDS", 1
+        ):
+            try:
+                create_worktree(repo, admin)
+            except WorktreeError as exc:
+                if "timed out after 1800 seconds" not in str(exc):
+                    fail(f"setup timeout changed its error message: {exc}")
+            else:
+                fail("timed-out worktree setup did not raise WorktreeError")
+        if time.monotonic() - started >= 5:
+            fail("setup timeout did not return within a few seconds")
+        if admin.exists():
+            fail("timed-out setup left the worktree path behind")
+        if not pid_file.is_file():
+            fail("setup command did not write the child PID")
+        child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            fail(f"timed-out setup child {child_pid} was still alive")

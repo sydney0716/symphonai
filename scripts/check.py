@@ -78,6 +78,7 @@ from scripts.checks import worktree  # noqa: E402, F401
 from scripts.checks import lsp  # noqa: E402, F401
 from scripts.checks import loops  # noqa: E402, F401
 from scripts.checks import eval_tasks  # noqa: E402, F401
+from scripts.checks import bench  # noqa: E402, F401
 from scripts.checks.harness import names, run  # noqa: E402
 
 

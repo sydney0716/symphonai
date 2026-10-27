@@ -342,6 +342,7 @@
       "provider": "openai",
       "wire_format": 1,
       "id": "gpt-6-luna",
+      "context_window": 1050000,
       "efforts": [
         {"id": "none", "value": "none"},
         {"id": "low", "value": "low"},

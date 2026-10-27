@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -20,7 +21,15 @@ from pathlib import Path
 from symphonai_api.budgets import BudgetState, RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
-from symphonai_api.compaction import estimate_messages_tokens
+from symphonai_api.compaction import (
+    ContextCompactionError,
+    DEFAULT_RECENT_TURNS,
+    MODEL_SUMMARY_PROMPT,
+    budget_for_model,
+    compact_messages_for_budget,
+    estimate_messages_tokens,
+    render_dropped_messages,
+)
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
     AssistantReasoningDelta,
@@ -31,6 +40,7 @@ from symphonai_api.events import (
     RunFailed,
     RunFinished,
     RunStarted,
+    CompactionApplied,
     ToolCallFailed,
     ToolCallFinished,
     ToolCallStarted,
@@ -170,6 +180,10 @@ class ApiAgent:
         transcript: TranscriptWriter | None = None,
         stream: bool = False,
         read_ledger: ReadLedger | None = None,
+        model_summary: bool = False,
+        context_budget: Callable[[str | None], int] | None = None,
+        context_overflow: Callable[[int, int | None], None] | None = None,
+        context_recent_turns: int = DEFAULT_RECENT_TURNS,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns is not None and effective_max_turns < 1:
@@ -186,6 +200,10 @@ class ApiAgent:
         self._transcript = transcript
         self._stream = stream
         self._read_ledger = read_ledger
+        self._model_summary = model_summary
+        self._context_budget = context_budget
+        self._context_overflow = context_overflow
+        self._context_recent_turns = context_recent_turns
         self._persisted_digests: list[str] = []
         # Schemas actually sent to the model so it knows these tools exist.
         # `tools` above is only the *execution* registry, keyed by name --
@@ -289,6 +307,126 @@ class ApiAgent:
                     turn_id=turn_id,
                     data=data,
                 )
+
+        def compact_conversation(
+            budget: int, *, recent_turns: int | None = None, turn_id: str | None
+        ) -> bool:
+            recent_turns = (
+                self._context_recent_turns if recent_turns is None else recent_turns
+            )
+            before = estimate_messages_tokens(conversation)
+
+            def summarize(dropped: list[Message]) -> str:
+                summary_request = ModelRequest(
+                    messages=[
+                        Message(role=Role.SYSTEM, content=MODEL_SUMMARY_PROMPT),
+                        Message(role=Role.USER, content=render_dropped_messages(dropped)),
+                    ],
+                    model=model,
+                    tools=[],
+                    max_tokens=20_000,
+                    call_class=self._call_class,
+                )
+                summary_response = (
+                    self._provider.create_response(summary_request)
+                    if cancel is None
+                    else self._provider.create_response(summary_request, cancel=cancel)
+                )
+                summary_usage = UsageTotals.from_usage(summary_response.usage)
+                summary_model = model or getattr(self._provider, "model", None) or "unknown"
+                usage_by_model[summary_model] = usage_by_model.get(
+                    summary_model, UsageTotals()
+                ).merged(summary_usage)
+                append_record(
+                    "usage",
+                    turn_id=turn_id,
+                    data={
+                        "model": summary_model,
+                        "agent_name": self._agent_ref.name,
+                        "input_tokens": summary_usage.input_tokens,
+                        "output_tokens": summary_usage.output_tokens,
+                        "calls": summary_usage.calls,
+                        "cache_read_tokens": summary_usage.cache_read_tokens,
+                        "cache_write_tokens": summary_usage.cache_write_tokens,
+                    },
+                )
+                return summary_response.message.text
+
+            errors: list[ContextCompactionError] = []
+            result = None
+            assistant_turn_window = sum(
+                message.role == Role.USER for message in conversation
+            ) < recent_turns
+            for keep_turns in range(recent_turns, 0, -1):
+                try:
+                    result = compact_messages_for_budget(
+                        conversation,
+                        budget=budget,
+                        recent_turns=keep_turns,
+                        assistant_turn_window=assistant_turn_window,
+                        cancel=cancel,
+                        summarize=summarize if self._model_summary else None,
+                    )
+                    break
+                except ContextCompactionError as exc:
+                    errors.append(exc)
+            if result is None:
+                raise errors[-1]
+            if not result.changed:
+                return False
+            rewritten = []
+            for message in result.messages:
+                calls = [
+                    replace(call, provider_metadata={
+                        key: value for key, value in call.provider_metadata.items()
+                        if key != "anthropic_content"
+                    })
+                    for call in message.tool_calls
+                ]
+                rewritten.append(
+                    replace(message, tool_calls=calls)
+                    if calls != message.tool_calls else message
+                )
+            kept_prefix = 0
+            new_digests = [_message_digest(message) for message in rewritten]
+            for old, new in zip(self._persisted_digests, new_digests):
+                if old != new:
+                    break
+                kept_prefix += 1
+            append_record(
+                "conversation_rewritten",
+                turn_id=None,
+                data={
+                    "kept_prefix": kept_prefix,
+                    "replaced": len(self._persisted_digests) - kept_prefix,
+                },
+            )
+            for message in rewritten[kept_prefix:]:
+                append_record(
+                    "message", turn_id=message.turn_id, data=message_to_json(message)
+                )
+            self._persisted_digests = new_digests
+            conversation[:] = rewritten
+            append_record(
+                "compaction",
+                turn_id=turn_id,
+                data={
+                    "before_tokens": before,
+                    "after_tokens": result.after_tokens,
+                    "dropped_messages": result.dropped_messages,
+                },
+            )
+            emit(
+                event_sink,
+                CompactionApplied(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    before_tokens=before,
+                    after_tokens=result.after_tokens,
+                    dropped_messages=result.dropped_messages,
+                ),
+            )
+            return True
 
         def append_unread_redirects() -> None:
             if run is None:
@@ -474,135 +612,170 @@ class ApiAgent:
                     return finish_for_budget(budget_reason)
                 if provider_calls > 0:
                     append_outside_change_notice()
-                request = ModelRequest(
-                    messages=list(conversation),
-                    model=model,
-                    tools=self._tool_schemas,
-                    effort=effort,
-                    call_class=self._call_class,
-                )
-                append_record(
-                    "request",
-                    turn_id=turn_ref.turn_id,
-                    data={
-                        "model": model,
-                        "message_count": len(request.messages),
-                        "tool_names": sorted(self._tools),
-                    },
-                )
-                try:
-                    primary_model = request.model or getattr(self._provider, "model", None)
-                    fallback_chain = list(fallback_models)
-                    if primary_model in fallback_chain:
-                        fallback_chain = fallback_chain[fallback_chain.index(primary_model) + 1:]
-                    attempted_model = primary_model
-                    candidate_models = [request.model, *(
-                        candidate for candidate in fallback_chain
-                        if candidate != primary_model
-                    )]
-                    unavailable: ProviderUnavailableError | None = None
-                    used_model = primary_model or "unknown"
-                    for candidate_model in candidate_models:
-                        candidate_request = request
-                        candidate_effective_model = candidate_model or primary_model
-                        if candidate_model is not None and candidate_model != request.model:
-                            fallback_messages = [
-                                replace(
-                                    message,
-                                    tool_calls=[
-                                        replace(call, provider_metadata={}, vendor_id=None)
-                                        for call in message.tool_calls
-                                    ],
-                                ) if message.tool_calls else message
-                                for message in request.messages
-                            ]
-                            from symphonai_api.model_table import model_capabilities
+                for request_attempt in range(2):
+                    context_budget = (
+                        self._context_budget(model)
+                        if self._context_budget is not None
+                        else budget_for_model(self._provider.wire_format, model)
+                    )
+                    if estimate_messages_tokens(conversation) > context_budget:
+                        compact_conversation(context_budget, turn_id=turn_ref.turn_id)
+                    request = ModelRequest(
+                        messages=list(conversation),
+                        model=model,
+                        tools=self._tool_schemas,
+                        effort=effort,
+                        call_class=self._call_class,
+                    )
+                    append_record(
+                        "request",
+                        turn_id=turn_ref.turn_id,
+                        data={
+                            "model": model,
+                            "message_count": len(request.messages),
+                            "tool_names": sorted(self._tools),
+                        },
+                    )
+                    try:
+                        primary_model = request.model or getattr(self._provider, "model", None)
+                        fallback_chain = list(fallback_models)
+                        if primary_model in fallback_chain:
+                            fallback_chain = fallback_chain[fallback_chain.index(primary_model) + 1:]
+                        attempted_model = primary_model
+                        candidate_models = [request.model, *(
+                            candidate for candidate in fallback_chain
+                            if candidate != primary_model
+                        )]
+                        unavailable: ProviderUnavailableError | None = None
+                        used_model = primary_model or "unknown"
+                        for candidate_model in candidate_models:
+                            candidate_request = request
+                            candidate_effective_model = candidate_model or primary_model
+                            if candidate_model is not None and candidate_model != request.model:
+                                fallback_messages = [
+                                    replace(
+                                        message,
+                                        tool_calls=[
+                                            replace(call, provider_metadata={}, vendor_id=None)
+                                            for call in message.tool_calls
+                                        ],
+                                    ) if message.tool_calls else message
+                                    for message in request.messages
+                                ]
+                                from symphonai_api.model_table import model_capabilities
 
-                            capability = next((
-                                item for item in model_capabilities()
-                                if item.wire_format == self._provider.wire_format
-                                and item.model == candidate_model
-                            ), None)
-                            effort = request.effort
-                            if capability is None or not any(
-                                option.id == effort for option in capability.efforts
-                            ):
-                                effort = None
-                            candidate_request = replace(
-                                request,
-                                model=candidate_model,
-                                messages=fallback_messages,
-                                effort=effort,
-                            )
-                        try:
-                            if self._stream:
-                                assembler = StreamAssembler()
-                                chunks = (
-                                    self._provider.create_response_stream(candidate_request)
-                                    if cancel is None
-                                    else self._provider.create_response_stream(
+                                capability = next((
+                                    item for item in model_capabilities()
+                                    if item.wire_format == self._provider.wire_format
+                                    and item.model == candidate_model
+                                ), None)
+                                effort = request.effort
+                                if capability is None or not any(
+                                    option.id == effort for option in capability.efforts
+                                ):
+                                    effort = None
+                                candidate_request = replace(
+                                    request,
+                                    model=candidate_model,
+                                    messages=fallback_messages,
+                                    effort=effort,
+                                )
+                            try:
+                                if self._stream:
+                                    assembler = StreamAssembler()
+                                    chunks = (
+                                        self._provider.create_response_stream(candidate_request)
+                                        if cancel is None
+                                        else self._provider.create_response_stream(
+                                            candidate_request, cancel=cancel
+                                        )
+                                    )
+                                    for chunk in chunks:
+                                        if cancel is not None:
+                                            cancel.raise_if_cancelled()
+                                        if isinstance(chunk, TextDelta):
+                                            emit(
+                                                event_sink,
+                                                AssistantTextDelta(
+                                                    agent_id=self._agent_ref.agent_id,
+                                                    run_id=run_ref.run_id,
+                                                    turn_id=turn_ref.turn_id,
+                                                    text=chunk.text,
+                                                ),
+                                            )
+                                        elif isinstance(chunk, ReasoningDelta):
+                                            emit(
+                                                event_sink,
+                                                AssistantReasoningDelta(
+                                                    agent_id=self._agent_ref.agent_id,
+                                                    run_id=run_ref.run_id,
+                                                    turn_id=turn_ref.turn_id,
+                                                    text=chunk.text,
+                                                ),
+                                            )
+                                        assembler.add(chunk)
+                                    response = assembler.finish()
+                                elif cancel is None:
+                                    response = self._provider.create_response(candidate_request)
+                                else:
+                                    response = self._provider.create_response(
                                         candidate_request, cancel=cancel
                                     )
-                                )
-                                for chunk in chunks:
-                                    if cancel is not None:
-                                        cancel.raise_if_cancelled()
-                                    if isinstance(chunk, TextDelta):
-                                        emit(
-                                            event_sink,
-                                            AssistantTextDelta(
-                                                agent_id=self._agent_ref.agent_id,
-                                                run_id=run_ref.run_id,
-                                                turn_id=turn_ref.turn_id,
-                                                text=chunk.text,
-                                            ),
-                                        )
-                                    elif isinstance(chunk, ReasoningDelta):
-                                        emit(
-                                            event_sink,
-                                            AssistantReasoningDelta(
-                                                agent_id=self._agent_ref.agent_id,
-                                                run_id=run_ref.run_id,
-                                                turn_id=turn_ref.turn_id,
-                                                text=chunk.text,
-                                            ),
-                                        )
-                                    assembler.add(chunk)
-                                response = assembler.finish()
-                            elif cancel is None:
-                                response = self._provider.create_response(candidate_request)
-                            else:
-                                response = self._provider.create_response(
-                                    candidate_request, cancel=cancel
-                                )
-                        except ProviderUnavailableError as exc:
-                            unavailable = exc
-                            attempted_model = candidate_effective_model
-                            continue
-                        used_model = candidate_effective_model or "unknown"
-                        if candidate_effective_model != primary_model:
-                            emit(
-                                event_sink,
-                                ModelFallback(
-                                    agent_id=self._agent_ref.agent_id,
-                                    run_id=run_ref.run_id,
-                                    turn_id=turn_ref.turn_id,
-                                    from_model=attempted_model or "unknown",
-                                    to_model=used_model,
-                                    reason=(
-                                        "network" if unavailable.status is None
-                                        else str(unavailable.status)
+                            except ProviderUnavailableError as exc:
+                                unavailable = exc
+                                attempted_model = candidate_effective_model
+                                continue
+                            used_model = candidate_effective_model or "unknown"
+                            if candidate_effective_model != primary_model:
+                                emit(
+                                    event_sink,
+                                    ModelFallback(
+                                        agent_id=self._agent_ref.agent_id,
+                                        run_id=run_ref.run_id,
+                                        turn_id=turn_ref.turn_id,
+                                        from_model=attempted_model or "unknown",
+                                        to_model=used_model,
+                                        reason=(
+                                            "network" if unavailable.status is None
+                                            else str(unavailable.status)
+                                        ),
                                     ),
-                                ),
+                                )
+                                model = candidate_effective_model
+                            break
+                        else:
+                            if unavailable is not None:
+                                raise unavailable
+                    except ContextLengthExceededError as exc:
+                        request_tokens = estimate_messages_tokens(request.messages)
+                        exc.request_tokens = request_tokens
+                        if self._context_overflow is not None:
+                            self._context_overflow(request_tokens, exc.actual_tokens)
+                        if request_attempt:
+                            raise
+                        budget = (
+                            self._context_budget(model)
+                            if self._context_budget is not None
+                            else budget_for_model(self._provider.wire_format, model)
+                        )
+                        forced_budget = min(
+                            budget,
+                            max(1, request_tokens - 1)
+                            if exc.actual_tokens is not None
+                            else max(1, request_tokens * 3 // 4),
+                        )
+                        try:
+                            changed = compact_conversation(
+                                forced_budget, turn_id=turn_ref.turn_id
                             )
-                            model = candidate_effective_model
-                        break
-                    else:
-                        if unavailable is not None:
-                            raise unavailable
-                except ContextLengthExceededError as exc:
-                    exc.request_tokens = estimate_messages_tokens(request.messages)
-                    raise
+                        except ContextCompactionError:
+                            raise exc from None
+                        if not changed:
+                            raise
+                        continue
+                    break
+                else:
+                    raise RuntimeError("request retry loop did not produce a response")
                 provider_calls += 1
                 usage = UsageTotals.from_usage(response.usage)
                 usage_by_model[used_model] = usage_by_model.get(
