@@ -26,6 +26,7 @@ class AgentFileError(ValueError):
 
 
 _TOP_LEVEL_KEYS = {
+    "description",
     "prompt",
     "tools",
     "deny_tools",
@@ -403,6 +404,11 @@ def load_agent_file(
     if "prompt" not in data:
         _raise(source, "prompt", "is required")
     prompt = _string(source, "prompt", data["prompt"])
+    description = None
+    if "description" in data:
+        description = _string(source, "description", data["description"])
+        if not description.strip():
+            _raise(source, "description", "must be a non-empty string")
     memory_table = _table(source, data, "memory")
     model_table = _table(source, data, "model")
     isolation_table = _table(source, data, "isolation")
@@ -413,6 +419,7 @@ def load_agent_file(
     values: dict[str, object] = {
         "name": source.stem,
         "prompt": prompt,
+        "description": description,
         "model": _model(source, model_table, default_model),
         "policy_ceiling": _policy(source, policy_table, Path(repo_root)),
         "tool_names": _tool_names(source, data),

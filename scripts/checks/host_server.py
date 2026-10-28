@@ -455,6 +455,9 @@ def check_spec_roles_use_the_routine_model() -> None:
 
 @check("host_server.agent_history_route")
 def check_agent_history_route() -> None:
+    def first_user_message(messages):
+        return next((message for message in messages if message["role"] == "user"), None)
+
     class BlockingProvider(FakeModelProvider):
         def __init__(self) -> None:
             super().__init__([
@@ -516,9 +519,8 @@ def check_agent_history_route() -> None:
                 connection, response = _request(host, "GET", path, headers=_headers(host))
                 partial = json.loads(response.read())
                 connection.close()
-                if response.status != 200 or not partial["messages"] or (
-                    partial["messages"][0]["role"], partial["messages"][0]["text"]
-                ) != ("user", "inspect live explorer history"):
+                task_message = first_user_message(partial.get("messages", []))
+                if response.status != 200 or task_message is None or task_message["text"] != "inspect live explorer history":
                     fail(f"running history did not return the explorer task: {partial!r}")
                 if subscription.get(timeout=0.02) is not None:
                     fail("agent history GET published an event")
@@ -533,7 +535,8 @@ def check_agent_history_route() -> None:
             history = json.loads(response.read())
             connection.close()
             messages = history.get("messages", [])
-            if response.status != 200 or not messages or messages[0]["text"] != "inspect live explorer history":
+            task_message = first_user_message(messages)
+            if response.status != 200 or task_message is None or task_message["text"] != "inspect live explorer history":
                 fail(f"closed history did not start with the explorer task: {history!r}")
             tool_calls = [call for message in messages for call in message["tool_calls"]]
             if not any(call["name"] == "list_files" and call.get("output") for call in tool_calls):
@@ -11335,6 +11338,23 @@ def _headless_invoke(
                 with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     code = headless_module.main(arguments)
     return code, stdout.getvalue(), stderr.getvalue(), sessions
+
+
+@check("host_server.headless_prompt")
+def check_headless_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "project"
+        root.mkdir()
+        code, output, error, _ = _headless_invoke(
+            root, FakeModelProvider(), ["prompt", "worker", "--repo-root", str(root)]
+        )
+        if code != 0 or "You are a subagent in SymphonAI." not in output or "built-in: SUBAGENT_BASE_PROMPT" not in error:
+            fail(f"prompt command did not show worker layers: {code}, {output!r}, {error!r}")
+        code, _output, error, _ = _headless_invoke(
+            root, FakeModelProvider(), ["prompt", "nobody", "--repo-root", str(root)]
+        )
+        if code != 2 or "known roles:" not in error or "worker" not in error:
+            fail(f"unknown prompt role did not list known roles: {code}, {error!r}")
 
 
 @check("host_server.headless_review")

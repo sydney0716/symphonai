@@ -97,7 +97,14 @@ from symphonai_api.providers.openai_provider import (
     ROUTINE_MODEL as OPENAI_ROUTINE_MODEL,
 )
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
-from symphonai_api.roles import IMPLEMENTER_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT
+from symphonai_api.roles import (
+    EXPLORER_PROMPT,
+    IMPLEMENTER_PROMPT,
+    PLANNER_PROMPT,
+    REVIEWER_PROMPT,
+    ROLE_GUIDANCE,
+    WORKER_PROMPT,
+)
 from symphonai_api.session import SessionStore, TranscriptError, load_run, read_records
 from symphonai_api.skills import Skill
 from symphonai_api.streaming import StreamAssembler
@@ -227,7 +234,7 @@ def builtin_subagent_specs(
     specs = {
         name: AgentSpec(
             name=name,
-            prompt="",
+            prompt={"worker": WORKER_PROMPT, "explorer": EXPLORER_PROMPT}[name],
             model=selector(name),
             policy_ceiling=policy,
             tool_names=tools,
@@ -329,23 +336,16 @@ _DISPATCH_DESCRIPTION = (
     "diff comes back in the result for you to apply. Explorers, and "
     "follow-ups on uncommitted work, share the tree."
 )
-_BUILTIN_PURPOSES = {
-    "worker": "implements coding tasks",
-    "explorer": "reads and searches the repository",
-    "planner": "writes implementation specs",
-    "implementer": "implements a provided spec and reports validation",
-    "reviewer": "reviews changes and writes follow-up specs",
-}
-
-
 def _dispatch_description(subagents: Mapping[str, AgentSpec] | None = None) -> str:
-    names = _BUILTIN_PURPOSES if subagents is None else {
-        name: _BUILTIN_PURPOSES.get(name, "") for name in subagents
+    names = ROLE_GUIDANCE if subagents is None else {
+        name: ROLE_GUIDANCE.get(name, "") for name in subagents
     }
     available = []
     for name, purpose in names.items():
-        entry = f"{name}: {purpose}." if purpose else name
         spec = None if subagents is None else subagents[name]
+        description = spec.description if spec is not None else None
+        purpose = description or purpose
+        entry = f"{name}: {purpose}." if purpose else name
         if spec is not None and spec.io.input_schema is not None:
             def json_value(value):
                 if isinstance(value, Mapping):

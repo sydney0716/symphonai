@@ -45,6 +45,7 @@ from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import ContentInput, DocumentBlock, ImageBlock, Message, Role, TextBlock
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.paths import symphonai_home
+from symphonai_api.role_prompts import load_role_additions
 from symphonai_api.providers.base import ModelProvider, tool_result_text
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import (
@@ -896,9 +897,7 @@ class HostRun:
             + (
                 " commands are unavailable in this environment; inspect files with the read tools."
                 if not sandbox_available else
-                " Reproduce the problem where the goal describes one. Find how the project runs its tests. "
-                "Run every Validation command before writing it. A Validation command must pass once the card's work is done. "
-                "A command that already fails for reasons the card does not fix does not belong in Validation."
+                ""
             ) + revision
         )
         with self._lock:
@@ -2821,6 +2820,16 @@ class HostRun:
         )
         if self._extensions is not None:
             roster.update(self._extensions.agents)
+        for name, spec in tuple(roster.items()):
+            if name == "leader":
+                continue
+            addition, _, warnings = load_role_additions(
+                name, repo_root=self._policy.repo_root, policy=self._policy
+            )
+            for warning in warnings:
+                logging.warning("%s", warning)
+            if addition:
+                roster[name] = replace(spec, prompt="\n\n".join(filter(None, (spec.prompt, addition))))
         if self._restricted_tool_names is not None:
             available_extra = set(self._mcp_tools or {})
             restricted_roster = {}
@@ -2874,6 +2883,21 @@ class HostRun:
             if role in role_selectors:
                 leader_effort = role_selectors[role].effort
         defined_leader = roster.get("leader")
+        leader_base_prompt = self._base_prompt
+        if not isinstance(role, str) or role not in roster:
+            leader_addition, _, warnings = load_role_additions(
+                "leader", repo_root=self._policy.repo_root, policy=self._policy
+            )
+            for warning in warnings:
+                logging.warning("%s", warning)
+            if defined_leader is not None and leader_addition:
+                defined_leader = replace(
+                    defined_leader,
+                    prompt="\n\n".join(filter(None, (defined_leader.prompt, leader_addition))),
+                )
+                roster["leader"] = defined_leader
+            elif leader_addition:
+                leader_base_prompt = "\n\n".join((leader_base_prompt, leader_addition))
         if (
             defined_leader is not None
             and not skills
@@ -2935,7 +2959,7 @@ class HostRun:
                 leader_provider=leader_provider,
                 subagent_provider=self._provider,
                 repo_root=str(self._policy.repo_root),
-                base_prompt=self._base_prompt,
+                base_prompt=leader_base_prompt,
                 subagent_base_prompt=self._subagent_base_prompt,
                 max_leader_turns=self._max_turns,
                 leader_budget=self._leader_budget,

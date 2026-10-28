@@ -885,3 +885,22 @@ def check_mcp_tool_names() -> None:
                 fail(f"malformed MCP name gave the wrong error: {exc!r}")
         else:
             fail("malformed MCP tool name was accepted")
+
+
+@check("agent_file.description")
+def check_description() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        path = _write(root, "notes.toml", 'prompt = "Write notes."\ndescription = "Writes release notes"\n')
+        spec = load_agent_file(path, repo_root=root, default_model=ModelSelector("fake"))
+        if spec.description != "Writes release notes":
+            fail(f"agent description was not loaded: {spec.description!r}")
+        for value in ('""', "4"):
+            bad = _write(root, "bad.toml", f'prompt = "Write notes."\ndescription = {value}\n')
+            try:
+                load_agent_file(bad, repo_root=root, default_model=ModelSelector("fake"))
+            except AgentFileError as exc:
+                if "description" not in str(exc):
+                    fail(f"description error omitted its key: {exc!r}")
+            else:
+                fail(f"invalid description was accepted: {value}")

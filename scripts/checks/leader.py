@@ -82,7 +82,10 @@ from symphonai_api.providers.openai_provider import (
     OpenAIProvider,
 )
 from symphonai_api.runner import standard_tool_registry
-from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
+from symphonai_api.roles import (
+    EXPLORER_PROMPT, IMPLEMENTER_PROMPT, LEADER_BASE_PROMPT, PLANNER_PROMPT,
+    REVIEWER_PROMPT, SUBAGENT_BASE_PROMPT, WORKER_PROMPT, ROLE_GUIDANCE,
+)
 from symphonai_api.session import SessionStore, load_run, load_run_for_resume, read_records
 from symphonai_api.streaming import StreamCompleted, TextDelta
 from symphonai_api.tool_results import ToolResultStore
@@ -5267,10 +5270,28 @@ def check_spec_workflow_role_roster() -> None:
 def check_spec_workflow_prompts() -> None:
     with workspace() as ws:
         roster = builtin_subagent_specs(FakeModelProvider(), ws.policy)
+        expected_prompts = {
+            "worker": WORKER_PROMPT,
+            "explorer": EXPLORER_PROMPT,
+            "planner": PLANNER_PROMPT,
+            "implementer": IMPLEMENTER_PROMPT,
+            "reviewer": REVIEWER_PROMPT,
+        }
+        if {name: roster[name].prompt for name in expected_prompts} != expected_prompts:
+            fail("built-in role prompt text does not match the role definitions")
+        expected_guidance = {
+            "explorer": "Read-only. Answers one specific question about the code, with path:line evidence. Ask one well-scoped question per explorer, and dispatch several at once for independent questions. Rely on what it reports reading; check yourself only what your change depends on.",
+            "worker": "Makes one well-defined change and verifies it. Name the files it owns and the outcome you need, and tell it when other agents are editing nearby. Give it work that can proceed on its own; a small edit is faster to make yourself.",
+            "planner": "Writes implementation specs for a goal. Give it the goal, the constraints, and where to write the specs.",
+            "implementer": "Implements one spec exactly and reports with evidence. Give it the spec and the path for its report.",
+            "reviewer": "Looks for what is wrong with a change and writes follow-up specs for its findings. Give it the spec, the report and the diff, or where to find them.",
+        }
+        if ROLE_GUIDANCE != expected_guidance:
+            fail("built-in leader guidance does not match the role definitions")
         requirements = {
-            "planner": ("path requested by the task", "Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report", "as `##` headings", "one fenced `sh` block", "project root", "End by naming the spec path"),
-            "implementer": ("Implement exactly the given spec", "only files in its Scope", "Never edit the spec you were given", "Run every Validation command", "git status --porcelain verbatim"),
-            "reviewer": ("Read the diff before the report", "scratch directory", "<id>F-<slug>.md", "<id>F2-<slug>.md", "Never commit"),
+            "planner": ("You are a planner. You turn a goal into specs", "Find out before you write", "Every Validation command is one you ran", "Keep each spec to one change", "End by naming the spec path"),
+            "implementer": ("You are an implementer. You carry out one spec exactly", "The spec is the contract", "The host runs them again", "If the spec is wrong", "git status --porcelain verbatim"),
+            "reviewer": ("You are a reviewer. Your job is to find what is wrong", "The report is the implementer's claim", "run at least one probe", "<id>F-<slug>.md", "Never commit"),
         }
         for name, phrases in requirements.items():
             prompt = roster[name].prompt
@@ -5285,7 +5306,7 @@ def check_spec_workflow_prompt_reaches_child() -> None:
     with workspace() as ws:
         provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
         roster = builtin_subagent_specs(provider, ws.policy)
-        for name in ("planner", "implementer", "reviewer"):
+        for name in ("worker", "explorer", "planner", "implementer", "reviewer"):
             requests = []
             dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs=roster)
             with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response:
@@ -5322,8 +5343,14 @@ def check_dispatch_description_lists_roster() -> None:
         for name in ("worker", "explorer", "planner", "implementer", "reviewer", "defined_helper"):
             if name not in description:
                 fail(f"first model request's dispatch description omitted {name}: {description!r}")
-        if "writes implementation specs" not in description or "reviews changes" not in description:
-            fail(f"built-in role purposes were missing from dispatch description: {description!r}")
+        for phrase in (
+            "Writes implementation specs for a goal.",
+            "Looks for what is wrong with a change",
+            "Makes one well-defined change and verifies it.",
+            "Read-only. Answers one specific question",
+        ):
+            if phrase not in description:
+                fail(f"built-in role guidance was missing from dispatch description: {description!r}")
 
         from dataclasses import replace
         from symphonai_api.extensions import load_extensions
@@ -5333,7 +5360,7 @@ def check_dispatch_description_lists_roster() -> None:
 
         extensions = load_extensions(repo_root=ws.root, home=ws.root / "home")
         custom_reviewer = _spec(ws.root, "reviewer", prompt="custom review prompt").with_overrides(
-            tool_names=("read_file",),
+            tool_names=("read_file",), description="Writes release notes",
         )
         extensions = replace(
             extensions,
@@ -5349,6 +5376,67 @@ def check_dispatch_description_lists_roster() -> None:
             replacement = configured_leader._dispatch_tool._subagent_specs["reviewer"]
             if replacement.prompt != "custom review prompt" or replacement.tool_names != ("read_file",):
                 fail(f"defined reviewer did not replace the built-in role: {replacement!r}")
+            description = leader_module._dispatch_description({"reviewer": replacement})
+            if "reviewer: Writes release notes." not in description:
+                fail(f"defined agent description was not used for dispatch: {description!r}")
         finally:
             host_run.close()
             session.close()
+
+
+@check("leader.role_prompt_additions")
+def check_role_prompt_additions() -> None:
+    from symphonai_api.session import SessionStore
+    from symphonai_host.broker import EventBroker
+    from symphonai_host.run import HostRun
+
+    with workspace() as ws, tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary) / "home"
+        (home / "roles").mkdir(parents=True)
+        (ws.root / ".symphonai" / "roles").mkdir(parents=True)
+        (home / "roles" / "worker.md").write_text("USER WORKER", encoding="utf-8")
+        (ws.root / ".symphonai" / "roles" / "worker.md").write_text("PROJECT WORKER", encoding="utf-8")
+        (home / "roles" / "leader.md").write_text("USER LEADER", encoding="utf-8")
+        (home / "roles" / "implementer.md").write_text("USER IMPLEMENTER", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"SYMPHONAI_HOME": str(home)}):
+            provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+            host = HostRun(
+                provider, ws.policy, EventBroker(), sessions_root=ws.root / "sessions",
+                base_prompt=LEADER_BASE_PROMPT, subagent_base_prompt=SUBAGENT_BASE_PROMPT,
+            )
+            session = SessionStore(ws.root / "sessions", "role-additions", repo_root=ws.root)
+            try:
+                leader = host._new_leader(session)
+                worker_prompt = leader._dispatch_tool._subagent_specs["worker"].prompt
+                if "USER WORKER" not in worker_prompt or "PROJECT WORKER" not in worker_prompt:
+                    fail(f"worker additions missing from dispatched role prompt: {worker_prompt!r}")
+                leader._dispatch_tool._set_event_context(
+                    agent_id="leader", run_id="role-additions", turn_id="turn"
+                )
+                with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response:
+                    result = leader._dispatch_tool.execute(_dispatch("worker", "inspect", "worker"), ws.policy)
+                requests = [call.args[0] for call in response.call_args_list]
+                system = next(
+                    (message.text for message in requests[0].messages if message.role is Role.SYSTEM),
+                    "",
+                ) if requests else ""
+                ordered_layers = (
+                    SUBAGENT_BASE_PROMPT,
+                    worker_prompt.split("\n\nAdditional instructions for worker", 1)[0],
+                    "Additional instructions for worker from your SymphonAI settings:\nUSER WORKER",
+                    "Additional instructions for worker from this project:\nPROJECT WORKER",
+                )
+                positions = [system.find(layer) for layer in ordered_layers]
+                if not result.ok or any(position < 0 for position in positions) or positions != sorted(positions):
+                    fail(f"worker system prompt layers were missing or out of order: {positions!r}, {system!r}")
+                if "USER LEADER" not in leader._leader_prompt or "USER WORKER" in leader._leader_prompt:
+                    fail("leader prompt did not isolate its own addition")
+                meta = session.read_meta()
+                meta["spec_run"] = {"role": "implementer"}
+                session.write_meta(meta)
+                stage = host._new_leader(session)
+                if "USER IMPLEMENTER" not in stage._leader_prompt or "USER LEADER" in stage._leader_prompt:
+                    fail(f"implementer stage got the wrong role additions: {stage._leader_prompt!r}")
+            finally:
+                host.close()
+                session.close()

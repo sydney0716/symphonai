@@ -25,8 +25,13 @@ from symphonai_api.mcp import McpError
 from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.paths import symphonai_home
+from symphonai_api.role_prompts import load_role_additions
 from symphonai_api.providers.base import ProviderError
-from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
+from symphonai_api.roles import (
+    EXPLORER_PROMPT,
+    IMPLEMENTER_PROMPT, LEADER_BASE_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT,
+    ROLE_GUIDANCE, SUBAGENT_BASE_PROMPT, WORKER_PROMPT,
+)
 from symphonai_api.session import SessionError, SessionStore, default_sessions_root, load_run
 from symphonai_host.broker import EventBroker
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
@@ -104,6 +109,10 @@ def _parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="check whether this machine is ready")
     doctor.add_argument("--repo-root", type=Path, default=Path.cwd())
     doctor.add_argument("--json", action="store_true")
+    prompt = commands.add_parser("prompt", help="show an assembled role prompt")
+    prompt.add_argument("name")
+    prompt.add_argument("--stage", action="store_true")
+    prompt.add_argument("--repo-root", type=Path, default=Path.cwd())
     run = commands.add_parser("run", help="run one task without the app")
     run.add_argument("task", nargs="?")
     run.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -253,6 +262,64 @@ def _run_doctor(arguments) -> int:  # noqa: ANN001
         for check in checks:
             print(f"{check['status']} {check['name']}: {check['detail']}")
     return 1 if any(check["status"] == "fail" for check in checks) else 0
+
+
+def _show_prompt(arguments) -> int:  # noqa: ANN001
+    from symphonai_api.extensions import load_extensions
+
+    root = arguments.repo_root.resolve()
+    try:
+        extensions = load_extensions(repo_root=root)
+    except (ConfigError, OSError, ValueError) as exc:
+        print(f"symphonai: {exc}", file=sys.stderr)
+        return 2
+    builtins = {
+        "worker": WORKER_PROMPT,
+        "explorer": EXPLORER_PROMPT,
+        "planner": PLANNER_PROMPT,
+        "implementer": IMPLEMENTER_PROMPT,
+        "reviewer": REVIEWER_PROMPT,
+    }
+    known = {"leader", *ROLE_GUIDANCE, *extensions.agents}
+    name = arguments.name
+    if name not in known:
+        print(f"symphonai: unknown role {name!r}; known roles: {', '.join(sorted(known))}", file=sys.stderr)
+        return 2
+    if arguments.stage and name not in {"planner", "implementer", "reviewer"}:
+        print("symphonai: --stage is only valid for planner, implementer, or reviewer", file=sys.stderr)
+        return 2
+    spec = extensions.agents.get(name)
+    definition_prompt = spec.prompt if spec is not None else builtins.get(name, "")
+    base = LEADER_BASE_PROMPT if name == "leader" or arguments.stage else SUBAGENT_BASE_PROMPT
+    policy = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
+    addition, sources, warnings = load_role_additions(
+        name, repo_root=root, policy=policy
+    )
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    layers = [base]
+    if definition_prompt:
+        layers.append(definition_prompt)
+    if addition:
+        layers.append(addition)
+    print("\n\n".join(layers))
+    print(f"built-in: {'LEADER_BASE_PROMPT' if base == LEADER_BASE_PROMPT else 'SUBAGENT_BASE_PROMPT'}", file=sys.stderr)
+    if definition_prompt:
+        agent_path = _agent_definition_path(name, root, spec)
+        print(f"{agent_path if agent_path is not None else 'built-in: ' + name}", file=sys.stderr)
+    for source in sources:
+        print(source, file=sys.stderr)
+    return 0
+
+
+def _agent_definition_path(name: str, root: Path, spec) -> str | None:  # noqa: ANN001
+    if spec is None:
+        return None
+    candidates = (
+        root / ".symphonai" / "agents" / f"{name}.toml",
+        symphonai_home() / "agents" / f"{name}.toml",
+    )
+    return str(next((path for path in candidates if path.is_file()), candidates[0]))
 
 
 def _review_task(arguments) -> str:  # noqa: ANN001
@@ -801,6 +868,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "doctor":
         return _run_doctor(arguments)
+    if arguments.command == "prompt":
+        return _show_prompt(arguments)
     if arguments.command == "app":
         return _run_app(arguments)
     if arguments.command == "loop":

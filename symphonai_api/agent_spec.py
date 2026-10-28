@@ -171,6 +171,7 @@ class AgentSpec:
     call_class: CallClass = CallClass.BACKGROUND
     max_depth: int = 0
     schema_version: int = SCHEMA_VERSION
+    description: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name or self.name != self.name.strip():
