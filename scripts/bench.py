@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -41,19 +42,24 @@ def _tasks() -> list[str]:
 def _select_tasks(tasks: list[str], requested: list[str] | None) -> list[str]:
     if not requested:
         return tasks
-    unknown = [
-        name for name in requested
-        if not any(name == task or name == task.rsplit("/", 1)[-1] for task in tasks)
-    ]
-    if unknown:
-        raise ValueError(
-            f"unknown pilot task {unknown[0]!r}; choose from: {', '.join(tasks)}"
-        )
-    selected = set(requested)
-    return [
-        task for task in tasks
-        if task in selected or task.rsplit("/", 1)[-1] in selected
-    ]
+    pilot_names = {
+        name
+        for task in tasks
+        for name in (task, task.rsplit("/", 1)[-1])
+    }
+    selected_pilot: set[str] = set()
+    selected_other: list[str] = []
+    for name in requested:
+        if name in pilot_names:
+            selected_pilot.add(next(
+                task for task in tasks
+                if name == task or name == task.rsplit("/", 1)[-1]
+            ))
+        else:
+            full_name = name if name.startswith("terminal-bench/") else f"terminal-bench/{name}"
+            if full_name not in selected_other:
+                selected_other.append(full_name)
+    return [task for task in tasks if task in selected_pilot] + selected_other
 
 
 def _roles(arguments: argparse.Namespace) -> dict[str, dict[str, str]]:
@@ -156,6 +162,65 @@ def _run_harbor(
     return completed.returncode
 
 
+def _resolve_harbor_tasks(
+    arguments: argparse.Namespace, output: Path, task_names: list[str],
+    roles_path: Path | None,
+) -> tuple[list[str] | None, int]:
+    command = _harbor_command(arguments, output, task_names, roles_path)
+    command.append("--print-config")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT), environment.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    configured = subprocess.run(
+        command, cwd=REPO_ROOT, env=environment, text=True,
+        capture_output=True, check=False,
+    )
+    if configured.returncode:
+        print(configured.stdout, end="")
+        print(configured.stderr, end="", file=sys.stderr)
+        return None, configured.returncode
+
+    harbor_executable = Path(_harbor_executable()).resolve()
+    harbor_python = harbor_executable.with_name("python")
+    if not harbor_python.is_file():
+        harbor_python = harbor_executable.with_name("python3")
+    if not harbor_python.is_file():
+        harbor_python = Path(sys.executable)
+    resolver = """import asyncio, json, sys
+from harbor.job_plan import JobPlan
+from harbor.models.job.config import JobConfig
+
+async def main():
+    config = JobConfig.model_validate(json.load(sys.stdin))
+    tasks = await JobPlan.resolve_task_configs(config)
+    print(json.dumps([task.name for task in tasks]))
+
+try:
+    asyncio.run(main())
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(1)
+"""
+    resolved = subprocess.run(
+        [str(harbor_python), "-c", resolver], cwd=REPO_ROOT, env=environment,
+        input=configured.stdout, text=True, capture_output=True, check=False,
+    )
+    if resolved.returncode:
+        print(resolved.stdout, end="")
+        print(resolved.stderr, end="", file=sys.stderr)
+        return None, resolved.returncode
+    try:
+        names = json.loads(resolved.stdout)
+    except json.JSONDecodeError:
+        print("Harbor returned invalid resolved task names", file=sys.stderr)
+        return None, 1
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        print("Harbor returned invalid resolved task names", file=sys.stderr)
+        return None, 1
+    return names, 0
+
+
 def _trial_rows(output: Path) -> list[dict[str, Any]]:
     rows = []
     for result_path in output.glob("harbor/*/*/result.json"):
@@ -242,6 +307,7 @@ def _search_smoke_keys(output: Path) -> bool:
 
 def _usage_from_trials(
     rows: list[dict[str, Any]], prices: Any = None,
+    cache_write_1h_rates: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     rendered = []
     for row in rows:
@@ -286,10 +352,29 @@ def _usage_from_trials(
                 prices,
                 symphonai_usage=symphonai,
                 trajectory_path=row["trial_path"] / "agent" / "trajectory.json",
+                claude_stream_path=row["trial_path"] / "agent" / "claude-code.txt",
+                cache_write_1h_rates=cache_write_1h_rates,
             )
             row["cost"] = rendered_row["cost"]
         rendered.append(rendered_row)
     return rendered
+
+
+def _cache_write_1h_rates(path: str | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, dict):
+        return {}
+    return {
+        model: entry["cache_write_1h"]
+        for model, entry in models.items()
+        if isinstance(model, str) and isinstance(entry, dict) and "cache_write_1h" in entry
+    }
 
 
 def _print_table(rows: list[dict[str, Any]], *, smoke: bool = False, prices: bool = False) -> None:
@@ -380,6 +465,16 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
+    resolution_output = (
+        Path(arguments.out).expanduser().resolve()
+        if arguments.out else Path(tempfile.gettempdir()) / "symphonai-bench-resolution"
+    )
+    resolved_tasks, resolve_code = _resolve_harbor_tasks(
+        arguments, resolution_output, task_names, None,
+    )
+    if resolve_code:
+        return resolve_code
+    task_names = resolved_tasks or []
     output = _new_output(arguments.out)
     roles_path = None
     if arguments.agent == "symphonai" and not arguments.oracle:
@@ -389,8 +484,10 @@ def main() -> int:
         models = {name: value for name, value in roles.items()}
         models.setdefault("implementer", {"provider": _parse_model(arguments.model)[0],
                                            "model": _parse_model(arguments.model)[1]})
-        print(f"BILLED RUN: {len(task_names)} tasks; agent={arguments.agent}; models per role={json.dumps(models, sort_keys=True)}")
-
+        print(
+            f"BILLED RUN: tasks={', '.join(task_names)}; agent={arguments.agent}; "
+            f"models per role={json.dumps(models, sort_keys=True)}"
+        )
     return_code = _run_harbor(arguments, output, task_names, roles_path)
     if return_code:
         return return_code
@@ -417,7 +514,7 @@ def main() -> int:
                 prices = load_price_table(arguments.prices) if arguments.prices else None
                 row["usage"] = usage_summary(records, prices)
     prices = load_price_table(arguments.prices) if arguments.prices else None
-    report_rows = _usage_from_trials(rows, prices)
+    report_rows = _usage_from_trials(rows, prices, _cache_write_1h_rates(arguments.prices))
     report = {
         "dataset": DATASET, "agent": "oracle" if arguments.oracle else arguments.agent,
         "tasks": report_rows,

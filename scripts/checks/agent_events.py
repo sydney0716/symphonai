@@ -45,7 +45,7 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.session import SessionStore
 from scripts.checks.harness import check, fail
-from scripts.checks.workspace import workspace
+from scripts.checks.workspace import handoff_spec, workspace
 
 
 class _RaisingProvider(ModelProvider):
@@ -605,7 +605,7 @@ def _one_subagent_leader(root: Path, events) -> Leader:
                                     name="dispatch_subagent",
                                     arguments={
                                         "subagent_name": "worker",
-                                        "task": "work",
+                                        "task": handoff_spec("work"),
                                     },
                                 )
                             ],
@@ -618,6 +618,9 @@ def _one_subagent_leader(root: Path, events) -> Leader:
                 [ModelResponse(Message(Role.ASSISTANT, "worker done"))]
             ),
             repo_root=str(root),
+            leader_policy=PermissionPolicy(
+                root, shell_enabled=True, shell_allowlist=[()],
+            ),
             events=events,
         )
     )
@@ -748,7 +751,7 @@ def _scripted_leader_outcome(root: Path, events, session_id: str):
                                     name="dispatch_subagent",
                                     arguments={
                                         "subagent_name": "worker",
-                                        "task": "inspect",
+                                        "task": handoff_spec("inspect"),
                                     },
                                 )
                             ],
@@ -789,6 +792,9 @@ def _scripted_leader_outcome(root: Path, events, session_id: str):
                 ]
             ),
             repo_root=str(root),
+            leader_policy=PermissionPolicy(
+                root, shell_enabled=True, shell_allowlist=[()],
+            ),
             events=events,
         ),
         session=session,

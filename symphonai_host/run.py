@@ -43,7 +43,7 @@ from symphonai_api.leader import (
 from symphonai_api.leases import WorkspaceLeases
 from symphonai_api.model_table import context_window_for_model
 from symphonai_api.models import ContentInput, DocumentBlock, ImageBlock, Message, Role, TextBlock
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import ALWAYS_DENY_COMMANDS, PermissionPolicy
 from symphonai_api.paths import symphonai_home
 from symphonai_api.role_prompts import load_role_additions
 from symphonai_api.providers.base import ModelProvider, tool_result_text
@@ -321,6 +321,13 @@ class HostRun:
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
         lsp: LspManager | None = None,
     ) -> None:
+        if extensions is not None:
+            lifted = set(extensions.config.get("always_deny.lift", []))
+            if lifted:
+                policy = replace(policy, always_deny_commands=tuple(
+                    command for command in ALWAYS_DENY_COMMANDS
+                    if " ".join(command) not in lifted
+                ))
         self._provider = provider
         self._policy = policy
         self._repo_root = policy.repo_root
@@ -1272,7 +1279,7 @@ class HostRun:
                         raise ValueError("card has no spec path")
                     spec_path = store.path(loop_id, spec_value)
                     source = spec_path.read_text(encoding="utf-8")
-                    from symphonai_host.spec_run import spec_validation
+                    from symphonai_api.spec_text import spec_validation
                     validation = spec_validation(source)
                     if not validation:
                         raise ValueError(f"card {card['id']} has no Validation commands")
@@ -1484,7 +1491,7 @@ class HostRun:
                 self._loop_validation_processes.pop(loop_id, None)
 
     def _validate_loop(self, loop_id: str, cancelled: threading.Event) -> None:
-        from symphonai_host.spec_run import spec_validation
+        from symphonai_api.spec_text import spec_validation
 
         store = LoopStore(self._repo_root)
         try:
@@ -1882,7 +1889,7 @@ class HostRun:
             specs_root = store.path(loop_id, "specs")
             if not path.is_relative_to(specs_root) or not path.is_file():
                 return f"card {card_id} spec file is missing or outside loop specs"
-            from symphonai_host.spec_run import spec_validation
+            from symphonai_api.spec_text import spec_validation
             if not spec_validation(path.read_text(encoding="utf-8")):
                 return f"card {card_id} has no Validation commands"
         visiting: set[str] = set()

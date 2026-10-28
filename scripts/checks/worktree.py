@@ -19,6 +19,7 @@ from symphonai_api.session import SessionStore
 from symphonai_api.leader import DispatchSubagentTool, dispatch_subagent_tool_schema
 
 from scripts.checks.harness import check, fail
+from scripts.checks.workspace import handoff_spec
 
 
 class _RecordingProvider(FakeModelProvider):
@@ -63,7 +64,7 @@ def _response(text: str = "", *calls: ToolCall) -> ModelResponse:
 
 
 def _call(name: str, task: str, isolation: str | None = None) -> ToolCall:
-    arguments = {"subagent_name": name, "task": task}
+    arguments = {"subagent_name": name, "task": handoff_spec(task, "pwd")}
     if isolation is not None:
         arguments["isolation"] = isolation
     return ToolCall("dispatch", "dispatch_subagent", arguments)

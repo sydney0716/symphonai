@@ -11,6 +11,7 @@ from dataclasses import dataclass
 class ShellCommand:
     argv: tuple[str, ...]
     writes: bool = False
+    stdin_scripts: tuple[str, ...] = ()
 
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
@@ -23,6 +24,7 @@ _WRAPPERS = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xarg
 def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
     segments: list[list[tuple[str, str, bool, bool, bool]]] = []
     current: list[tuple[str, str, bool, bool, bool]] = []
+    pending_heredocs: list[tuple[list, str, bool, bool]] = []
     word: list[str] = []
     active = False
     expands = False
@@ -41,12 +43,94 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
             expands = pattern = brace = False
 
     def flush_segment() -> bool:
+        nonlocal current
         flush_word()
         if not current:
             return False
-        segments.append(current.copy())
-        current.clear()
+        segments.append(current)
+        current = []
         return True
+
+    def heredoc_delimiter(start: int) -> tuple[str, int, bool] | None:
+        while start < len(text) and text[start] in " \t":
+            start += 1
+        value: list[str] = []
+        state = "plain"
+        quoted = False
+        while start < len(text):
+            char = text[start]
+            if state == "single":
+                if char == "'":
+                    state = "plain"
+                else:
+                    value.append(char)
+                start += 1
+                continue
+            if state == "double":
+                if char == '"':
+                    state = "plain"
+                elif char == "\\" and start + 1 < len(text):
+                    start += 1
+                    value.append(text[start])
+                else:
+                    if char == "$" or char == "`":
+                        return None
+                    value.append(char)
+                start += 1
+                continue
+            if char in " \t\r\n|;&<>()":
+                break
+            if char == "'":
+                quoted = True
+                state = "single"
+            elif char == '"':
+                quoted = True
+                state = "double"
+            elif char == "\\" and start + 1 < len(text):
+                quoted = True
+                start += 1
+                value.append(text[start])
+            elif char == "$" or char == "`":
+                return None
+            else:
+                value.append(char)
+            start += 1
+        if state != "plain" or not value:
+            return None
+        return "".join(value), start, quoted
+
+    def consume_heredocs(start: int) -> int | None:
+        nonlocal pending_heredocs
+        for owner, delimiter, strip_tabs, quoted in pending_heredocs:
+            body: list[str] = []
+            found = False
+            while start <= len(text):
+                end = text.find("\n", start)
+                if end < 0:
+                    line, next_start = text[start:], len(text)
+                else:
+                    line, next_start = text[start:end], end + 1
+                compare = line.lstrip("\t") if strip_tabs else line
+                if compare.endswith("\r"):
+                    compare = compare[:-1]
+                if compare == delimiter:
+                    start = next_start
+                    found = True
+                    break
+                body.append(line.lstrip("\t") if strip_tabs else line)
+                if end < 0:
+                    break
+                start = next_start
+            if not found:
+                return None
+            body_text = "\n".join(body)
+            # Here-doc contents are opaque data; only command substitutions
+            # make an unquoted body impossible to check safely.
+            if not quoted and ("$(" in body_text or "`" in body_text):
+                return None
+            owner.append(("heredoc", body_text, False, False, False))
+        pending_heredocs = []
+        return start
 
     while index < len(text):
         char = text[index]
@@ -140,8 +224,22 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
             elif char == ";" or char == "\n":
                 operator, width = char, 1
             else:
-                if text.startswith("<<", index):
-                    return None
+                if text.startswith("<<<", index):
+                    current.append(("redir", "<<<", False, False, False))
+                    index += 3
+                    continue
+                if text.startswith("<<-", index) or text.startswith("<<", index):
+                    strip_tabs = text.startswith("<<-", index)
+                    op_width = 3 if strip_tabs else 2
+                    delimiter = heredoc_delimiter(index + op_width)
+                    if delimiter is None:
+                        return None
+                    delimiter_word, index, quoted = delimiter
+                    owner = current
+                    current.append(("redir", "<<-" if strip_tabs else "<<", False, False, False))
+                    current.append(("word", delimiter_word, False, False, False))
+                    pending_heredocs.append((owner, delimiter_word, strip_tabs, quoted))
+                    continue
                 fd = ""
                 if text.startswith(">>", index):
                     redir, width = ">>", 2
@@ -159,6 +257,11 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
             if not flush_segment():
                 return None
             index += width
+            if char == "\n" and pending_heredocs:
+                consumed = consume_heredocs(index)
+                if consumed is None:
+                    return None
+                index = consumed
             continue
 
         # A descriptor number belongs to an adjacent redirection, not argv.
@@ -167,8 +270,19 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
             while end < len(text) and text[end].isdigit():
                 end += 1
             if end < len(text) and text[end] in "<>":
-                if text.startswith("<<", end):
-                    return None
+                if text.startswith("<<-", end) or text.startswith("<<", end):
+                    strip_tabs = text.startswith("<<-", end)
+                    op_width = 3 if strip_tabs else 2
+                    delimiter = heredoc_delimiter(end + op_width)
+                    if delimiter is None:
+                        return None
+                    delimiter_word, next_index, quoted = delimiter
+                    owner = current
+                    current.append(("redir", text[index:end] + ("<<-" if strip_tabs else "<<"), False, False, False))
+                    current.append(("word", delimiter_word, False, False, False))
+                    pending_heredocs.append((owner, delimiter_word, strip_tabs, quoted))
+                    index = next_index
+                    continue
                 if text.startswith(">>", end):
                     redir, width = ">>", 2
                 elif text.startswith(">&", end):
@@ -194,10 +308,13 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
 
     if state != "plain":
         return None
-    flush_word()
-    if not current:
+    if pending_heredocs:
         return None
-    segments.append(current)
+    flush_word()
+    if current:
+        segments.append(current)
+    elif not segments:
+        return None
     return segments
 
 
@@ -249,14 +366,24 @@ def _expand(command: ShellCommand, depth: int) -> tuple[ShellCommand, ...] | Non
         return (command,)
     shell_index, script = nested
     if script is None:
-        return None
+        if not command.stdin_scripts:
+            return None
+        scripts = command.stdin_scripts
+    else:
+        scripts = (script,)
     if depth >= 3:
         return None
-    parsed = _parse_command_line(script, depth + 1)
-    if parsed is None:
-        return None
+    parsed_commands: list[ShellCommand] = []
+    for script in scripts:
+        parsed = _parse_command_line(script, depth + 1)
+        if parsed is None:
+            return None
+        parsed_commands.extend(parsed)
     prefix = command.argv[:shell_index]
-    return tuple(ShellCommand(prefix + item.argv, item.writes or command.writes) for item in parsed)
+    return tuple(
+        ShellCommand(prefix + item.argv, item.writes or command.writes)
+        for item in parsed_commands
+    )
 
 
 def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellCommand | None:
@@ -264,10 +391,15 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
     dollar_words: list[bool] = []
     pattern_words: list[bool] = []
     brace_words: list[bool] = []
+    stdin_scripts: list[str] = []
     writes = False
     index = 0
     while index < len(tokens):
         kind, value, expands, pattern, _brace = tokens[index]
+        if kind == "heredoc":
+            stdin_scripts.append(value)
+            index += 1
+            continue
         if kind == "brace":
             return None
         if kind == "word":
@@ -281,6 +413,8 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
             return None
         operator = value.lstrip("0123456789")
         target = tokens[index + 1][1]
+        if operator == "<<<":
+            stdin_scripts.append(target)
         if operator.startswith(">") or operator.startswith("&>"):
             duplicate = operator.endswith("&") and target.isdigit()
             if target != "/dev/null" and not duplicate:
@@ -309,7 +443,7 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
         or (os.path.basename(argv[0]) in _WRAPPERS and any(dollar_words[1:]))
     ):
         return None
-    return ShellCommand(tuple(argv), writes)
+    return ShellCommand(tuple(argv), writes, tuple(stdin_scripts))
 
 
 def _parse_command_line(text: str, depth: int) -> tuple[ShellCommand, ...] | None:

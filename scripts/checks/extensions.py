@@ -27,6 +27,7 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import run_task
 from symphonai_api.trust import RepositoryTrust, TrustList
 from scripts.checks.harness import check, fail
+from scripts.checks.workspace import handoff_spec
 
 
 
@@ -59,7 +60,7 @@ def _leader_providers(*, with_child_tool: bool):
                         ToolCall(
                             id="dispatch",
                             name="dispatch_subagent",
-                            arguments={"subagent_name": "worker", "task": "read"},
+                            arguments={"subagent_name": "worker", "task": handoff_spec("read")},
                         )
                     ],
                 )
@@ -419,6 +420,9 @@ def leader_hooks() -> None:
                 leader_provider=leader_provider,
                 subagent_provider=child_provider,
                 repo_root=str(root),
+                leader_policy=PermissionPolicy(
+                    repo_root=root, shell_enabled=True, shell_allowlist=[()],
+                ),
                 extensions=extensions,
             )
         )

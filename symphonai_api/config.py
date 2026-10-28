@@ -15,6 +15,7 @@ from symphonai_api.budgets import RunBudget
 from symphonai_api.cost import PriceTable, load_price_table
 from symphonai_api.model_table import model_capabilities, resolve_effort
 from symphonai_api.permissions import (
+    ALWAYS_DENY_COMMANDS,
     PermissionPolicy,
     _contains_path,
     _intersect_shell_allowlists,
@@ -73,7 +74,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles", "compaction")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles", "compaction", "always_deny")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -133,6 +134,14 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    always_deny = _table(source, values, "always_deny")
+    if always_deny is not None:
+        _unknown_keys(source, "always_deny", always_deny, {"lift"})
+        if "lift" in always_deny:
+            allowed = {" ".join(command) for command in ALWAYS_DENY_COMMANDS}
+            for value in _strings(source, "always_deny.lift", always_deny["lift"]):
+                if value not in allowed:
+                    _raise(source, "always_deny.lift", f"unsupported built-in command {value!r}")
     compaction = _table(source, values, "compaction")
     if compaction is not None:
         _unknown_keys(source, "compaction", compaction, {"limit"})
@@ -405,6 +414,11 @@ def load_config(
                         f"{source}: roles: role models are accepted only from user config; section skipped"
                     )
                     continue
+                if section == "always_deny":
+                    warnings.append(
+                        f"{source}: always_deny: lifts are accepted only from user config; section skipped"
+                    )
+                    continue
                 try:
                     _validate(source, {section: value})
                 except ConfigError as exc:
@@ -416,6 +430,8 @@ def load_config(
             _raise(source, "permissions", "permission grants are supported only in user config")
         if "roles" in values and scope is Scope.SESSION:
             _raise(source, "roles", "role models are supported only in user config")
+        if "always_deny" in values and scope is Scope.SESSION:
+            _raise(source, "always_deny", "rule lifts are supported only in user config")
         if scope not in {Scope.PROJECT, Scope.PRIVATE}:
             _validate(source, values)
         flattened = _flatten(values)

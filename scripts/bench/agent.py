@@ -83,6 +83,7 @@ class SymphonaiAgent(BaseInstalledAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         before = await self._task_python(environment)
+        self._task_python_before = before
         await self.ensure_system_dependencies(environment, ("curl",))
         archive = _source_archive()
         try:
@@ -131,6 +132,10 @@ class SymphonaiAgent(BaseInstalledAgent):
                 "/tmp/symphonai-uv/uv pip install --python /tmp/symphonai-venv/bin/python "
                 "--no-progress /tmp/symphonai-source; "
                 "chmod -R a+rX /tmp/symphonai-uv /tmp/symphonai-python /tmp/symphonai-venv; "
+                "mkdir -p /tmp/symphonai-agent-python; "
+                "ln -sf /tmp/symphonai-python/bin/python3.11 /tmp/symphonai-agent-python/python3; "
+                "ln -sf /tmp/symphonai-python/bin/python3.11 /tmp/symphonai-agent-python/python; "
+                "chmod -R a+rX /tmp/symphonai-agent-python; "
                 "else /tmp/symphonai-venv/bin/python -m pip install "
                 "--disable-pip-version-check --no-input /tmp/symphonai-source; fi"
             ),
@@ -143,6 +148,30 @@ class SymphonaiAgent(BaseInstalledAgent):
         if before != after:
             raise RuntimeError(f"task python changed during install: {before!r} -> {after!r}")
         if self.smoke:
+            python_added = before == "absent"
+            base_path_result = await self.exec_as_agent(
+                environment, command="printf '%s' \"$PATH\"", timeout_sec=15,
+            )
+            if base_path_result.return_code:
+                raise RuntimeError("could not read task PATH for smoke check")
+            task_path = base_path_result.stdout.strip()
+            agent_path = task_path + (":/tmp/symphonai-agent-python" if python_added else "")
+            agent_python = await self._exec_with_env(
+                environment,
+                "export PATH=" + shlex.quote(agent_path)
+                + "; command -v python3; python3 --version",
+                env={"PATH": agent_path},
+                timeout_sec=15,
+            )
+            if agent_python.return_code:
+                raise RuntimeError(f"agent Python smoke check failed: {agent_python.stderr[-1000:]}")
+            agent_python_info = agent_python.stdout.strip()
+            if python_added and "Python 3.11" not in agent_python_info:
+                raise RuntimeError(f"agent Python smoke check found the wrong interpreter: {agent_python_info!r}")
+            if python_added and not agent_python_info.splitlines()[0].startswith("/tmp/symphonai-agent-python/"):
+                raise RuntimeError(f"agent Python was not resolved from its added directory: {agent_python_info!r}")
+            if not python_added and before.splitlines()[-1] not in agent_python_info:
+                raise RuntimeError(f"task Python changed in the agent environment: {agent_python_info!r}")
             keys = {
                 key: value for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
                 if (value := os.environ.get(key))
@@ -169,6 +198,9 @@ class SymphonaiAgent(BaseInstalledAgent):
                 "result": doctor_data, "return_code": doctor.return_code,
                 "task_python": before, "task_python_before": before,
                 "task_python_after": after, "host_keys_reached_container": True,
+                "agent_python_added": python_added,
+                "agent_python": agent_python_info,
+                "agent_python_path": agent_path,
             }
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             (self.logs_dir / "symphonai-smoke.json").write_text(
@@ -197,6 +229,15 @@ class SymphonaiAgent(BaseInstalledAgent):
         if task_root_result.return_code:
             raise RuntimeError(f"could not determine task root: {task_root_result.stderr[-1000:]}")
         task_root = task_root_result.stdout.strip().splitlines()[-1]
+        task_python_before = getattr(self, "_task_python_before", None)
+        python_added = task_python_before == "absent"
+        base_path_result = await self.exec_as_agent(
+            environment, command="printf '%s' \"$PATH\"", timeout_sec=15,
+        )
+        if base_path_result.return_code:
+            raise RuntimeError("could not determine the task PATH")
+        base_path = base_path_result.stdout.strip()
+        agent_path = base_path + (":/tmp/symphonai-agent-python" if python_added else "")
         provider, model = self._provider_model()
         sessions = "/tmp/symphonai-sessions"
         remote_config = "/tmp/symphonai-user-config.toml"
@@ -216,6 +257,7 @@ class SymphonaiAgent(BaseInstalledAgent):
             if (value := os.environ.get(key))
         }
         env = {
+            "PATH": agent_path,
             "SYMPHONAI_HOME": "/tmp/symphonai-home/.symphonai",
             "SYMPHONAI_SESSIONS_DIR": sessions,
             "SYMPHONAI_MEMORY_DIR": "/tmp/symphonai-memory",
@@ -233,7 +275,9 @@ class SymphonaiAgent(BaseInstalledAgent):
         run_error: BaseException | None = None
         try:
             result = await self._exec_with_env(
-                environment, command, cwd=task_root, env=env, timeout_sec=28_800,
+                environment,
+                "export PATH=" + shlex.quote(agent_path) + "; " + command,
+                cwd=task_root, env=env, timeout_sec=28_800,
             )
             if result.return_code:
                 run_error = RuntimeError(f"symphonai run failed: {result.stderr[-3000:]}")
@@ -255,6 +299,11 @@ class SymphonaiAgent(BaseInstalledAgent):
             }
             context.metadata = dict(context.metadata or {})
             context.metadata["symphonai_usage"] = summary
+            context.metadata["symphonai_agent_python"] = {
+                "added": python_added,
+                "path": "/tmp/symphonai-agent-python" if python_added else None,
+                "base_path": base_path,
+            }
         except Exception as exc:
             collection_error = exc
             message = f"SymphonAI session and usage collection failed: {type(exc).__name__}: {exc}"

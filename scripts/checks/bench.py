@@ -35,39 +35,96 @@ def pilot_task_selection() -> None:
     bench_module = importlib.util.module_from_spec(runner_spec)
     runner_spec.loader.exec_module(bench_module)
     tasks = bench_module._tasks()
+    if bench_module._select_tasks(tasks, None) != tasks:
+        fail("no --task selection did not keep the five pilot tasks")
     selected = bench_module._select_tasks(tasks, ["regex-log"])
     if selected != ["terminal-bench/regex-log"]:
         fail(f"short task name selected the wrong pilot task: {selected!r}")
+    if bench_module._select_tasks(tasks, ["terminal-bench/regex-log"]) != [
+        "terminal-bench/regex-log",
+    ]:
+        fail("full pilot task name no longer resolves")
     selected = bench_module._select_tasks(
-        tasks, ["regex-log", "chess-best-move"]
+        tasks, ["regex-log", "bn-fit-modify"]
     )
     expected = [
-        "terminal-bench/chess-best-move",
         "terminal-bench/regex-log",
+        "terminal-bench/bn-fit-modify",
     ]
     if selected != expected:
-        fail(f"task selection did not preserve pilot-file order: {selected!r}")
-    try:
-        bench_module._select_tasks(tasks, ["nope"])
-    except ValueError as exc:
-        if any(task not in str(exc) for task in tasks):
-            fail(f"unknown task error omitted pilot tasks: {exc!r}")
-    else:
-        fail("unknown pilot task was accepted")
+        fail(f"pilot task was not followed by the qualified dataset task: {selected!r}")
+    selected = bench_module._select_tasks(
+        tasks, ["bn-fit-modify", "chess-best-move", "fix-ocaml-gc"]
+    )
+    if selected != [
+        "terminal-bench/chess-best-move",
+        "terminal-bench/bn-fit-modify",
+        "terminal-bench/fix-ocaml-gc",
+    ]:
+        fail(f"mixed task names did not preserve pilot-first resolution: {selected!r}")
+    unknown_task = bench_module._select_tasks(tasks, ["no-such-task"])
+    if unknown_task != [
+        "terminal-bench/no-such-task",
+    ]:
+        fail("an unknown task was rejected before Harbor could resolve it")
     arguments = SimpleNamespace(
         n_concurrent=1, attempts=3, oracle=True, smoke=False, agent="symphonai",
         model=None, effort=None, prices=None,
     )
     with mock.patch.object(bench_module, "_harbor_executable", return_value="harbor"):
-        command = bench_module._harbor_command(arguments, Path("/tmp/out"), selected, None)
+        command = bench_module._harbor_command(arguments, Path("/tmp/out"), unknown_task, None)
     if command[command.index("--n-attempts") + 1] != "3":
         fail(f"Harbor attempts option was not forwarded: {command!r}")
+    passed_tasks = [command[index + 1] for index, value in enumerate(command[:-1])
+                    if value == "--include-task-name"]
+    if passed_tasks != ["terminal-bench/no-such-task"]:
+        fail(f"normalized task name was not passed to Harbor: {passed_tasks!r}")
     summary = bench_module._attempt_summary([
         {"task": "a", "resolved": True}, {"task": "a", "resolved": False},
         {"task": "b", "resolved": True},
     ])
     if summary["tasks"]["a"]["resolved_rate"] != 0.5 or summary["resolved_rate"] != 2 / 3:
         fail(f"attempt summary resolved rates are incorrect: {summary!r}")
+
+
+@check("bench.billed_notice_precedes_trial_run")
+def billed_notice_precedes_trial_run() -> None:
+    runner_spec = importlib.util.spec_from_file_location(
+        "terminal_bench_runner_notice", Path(__file__).resolve().parents[1] / "bench.py"
+    )
+    if runner_spec is None or runner_spec.loader is None:
+        fail("could not load the Terminal-Bench runner")
+    bench_module = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(bench_module)
+    with tempfile.TemporaryDirectory() as temporary:
+        output = Path(temporary) / "output"
+        output.mkdir()
+        observed: list[str] = []
+
+        def run_harbor(_arguments, _output, tasks, _roles_path):
+            observed.append(captured.getvalue())
+            if tasks != ["terminal-bench/resolved-task"]:
+                fail(f"trial run did not receive resolved task names: {tasks!r}")
+            return 1
+
+        captured = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [
+                "bench.py", "--agent", "symphonai", "--model", "anthropic/test-model",
+                "--task", "unresolved-alias", "--out", str(output),
+            ]),
+            mock.patch.object(bench_module, "_new_output", return_value=output),
+            mock.patch.object(
+                bench_module, "_resolve_harbor_tasks",
+                return_value=(["terminal-bench/resolved-task"], 0),
+            ),
+            mock.patch.object(bench_module, "_run_harbor", side_effect=run_harbor),
+            redirect_stdout(captured),
+        ):
+            result = bench_module.main()
+    notice = "BILLED RUN: tasks=terminal-bench/resolved-task"
+    if result != 1 or not observed or notice not in observed[0]:
+        fail(f"billed notice did not precede Harbor's trial run: {observed!r}")
 
 
 @check("bench.harbor_usage_cost_is_normalized")
@@ -194,6 +251,65 @@ def symphonai_and_agent_reported_cost() -> None:
             fail(f"agent-reported cost affected computed cost: {rendered!r}")
 
 
+@check("bench.provider_prefixed_model_prices")
+def provider_prefixed_model_prices() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        price_file = Path(temporary) / "prices.json"
+        price_file.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
+            "gpt-6.1-sol": {"input": 2, "cache_read": 0.10, "output": 10},
+        }}), encoding="utf-8")
+        prices = load_price_table(price_file)
+        priced = price_agent_usage({"openai/gpt-6.1-sol": {
+            "n_input_tokens": 60347, "n_cache_tokens": 57600,
+            "n_output_tokens": 1589,
+        }}, prices)
+    if priced["total"] != "0.027144" or priced["unknown_models"]:
+        fail(f"provider-prefixed model was not priced by its base name: {priced!r}")
+
+
+@check("bench.claude_cache_write_lifetimes")
+def claude_cache_write_lifetimes() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        price_file = root / "prices.json"
+        price_file.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
+            "claude-opus-5-5": {"input": 4, "cache_read": 0.20,
+                                "cache_write": 5, "cache_write_1h": 8, "output": 20},
+        }}), encoding="utf-8")
+        stream = root / "claude-code.txt"
+        message = {
+            "type": "assistant",
+            "message": {
+                "id": "message-1", "model": "claude-opus-5-5",
+                "usage": {"cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 6641,
+                }},
+            },
+        }
+        stream.write_text("\n".join(json.dumps(event) for event in (
+            message, message, {**message, "type": "content_block_delta"},
+        )), encoding="utf-8")
+        prices = load_price_table(price_file)
+        usage = {"claude-opus-5-5": {
+            "n_input_tokens": 34365, "n_cache_tokens": 27720,
+            "n_output_tokens": 1580,
+        }}
+        rates = {"claude-opus-5-5": "8"}
+        priced = price_agent_usage(
+            usage, prices, claude_stream_path=stream, cache_write_1h_rates=rates,
+        )
+        fallback = price_agent_usage(usage, prices, claude_stream_path=stream)
+    if priced["total"] != "0.090288" or priced["estimated"]:
+        fail(f"one-hour cache writes did not use their rate exactly: {priced!r}")
+    buckets = priced["models"]["claude-opus-5-5"]
+    if (buckets.get("cache_write_5m") != 0 or buckets.get("cache_write_1h") != 6641
+            or buckets.get("uncached_input") != 4):
+        fail(f"one-hour cache writes were not kept in separate buckets: {buckets!r}")
+    if fallback["total"] != "0.070365" or not fallback["estimated"]:
+        fail(f"missing one-hour rate was not reported as an estimate: {fallback!r}")
+
+
 def _agent_module_with_harbor_stubs():
     packages = (
         "harbor", "harbor.agents", "harbor.agents.installed", "harbor.environments",
@@ -287,6 +403,64 @@ def pre_agent_failure_rows() -> None:
         fail("task Python probe failed to record the absent state")
     if len(calls) != 1 or "else printf 'absent'" not in calls[0]:
         fail(f"task Python probe did not handle command absence safely: {calls!r}")
+
+
+@check("bench.agent_python_path")
+def agent_python_path() -> None:
+    agent_module = _agent_module_with_harbor_stubs()
+    base_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    class FakeEnvironment:
+        async def upload_file(self, _local, _remote):
+            return None
+
+        async def download_dir(self, _remote, local):
+            Path(local).mkdir(parents=True, exist_ok=True)
+
+    async def run_with_python_state(root: Path, task_python: str) -> tuple[str, str, dict]:
+        agent = object.__new__(agent_module.SymphonaiAgent)
+        agent._task_python_before = task_python
+        agent.model_name = "openai/test-model"
+        agent.roles = {}
+        agent.effort = None
+        agent.prices_path = None
+        agent.logs_dir = root / "logs"
+        calls: list[tuple[str, dict]] = []
+
+        async def exec_as_agent(_environment, command, *, timeout_sec):
+            if command == "pwd":
+                return SimpleNamespace(return_code=0, stdout="/task\n", stderr="")
+            if command == "printf '%s' \"$PATH\"":
+                return SimpleNamespace(return_code=0, stdout=base_path, stderr="")
+            return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+        async def exec_with_env(_environment, command, **kwargs):
+            calls.append((command, kwargs["env"]))
+            return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+        agent.exec_as_agent = exec_as_agent
+        agent._exec_with_env = exec_with_env
+        context = SimpleNamespace(metadata=None, model_usage={})
+        await agent.run("instruction", FakeEnvironment(), context)
+        return calls[0][1]["PATH"], calls[0][0], context.metadata
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        absent_path, absent_command, absent_metadata = asyncio.run(
+            run_with_python_state(root / "absent", "absent")
+        )
+        present_path, present_command, present_metadata = asyncio.run(
+            run_with_python_state(root / "present", "/usr/bin/python3\nPython 3.13.0")
+        )
+    expected_added = base_path + ":/tmp/symphonai-agent-python"
+    if absent_path != expected_added or "export PATH=" not in absent_command:
+        fail(f"missing task Python did not append the standalone directory: {absent_path!r}")
+    if present_path != base_path:
+        fail(f"existing task PATH was changed: {present_path!r}")
+    if absent_metadata["symphonai_agent_python"]["added"] is not True:
+        fail(f"run metadata omitted the added Python state: {absent_metadata!r}")
+    if present_metadata["symphonai_agent_python"]["added"] is not False:
+        fail(f"run metadata incorrectly reported an added Python: {present_metadata!r}")
 
 
 @check("bench.user_config_roundtrips")

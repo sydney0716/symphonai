@@ -95,6 +95,19 @@ from scripts.checks.harness import CheckFailed, check, fail
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _handoff_spec(goal: str, command: str = "true") -> str:
+    return (
+        f"## Goal\n{goal}\n\n## Scope\nHost check fixture\n\n"
+        f"## Validation\n```sh\n{command}\n```"
+    )
+
+
+def _implementer_dispatch(call_id: str, goal: str) -> ToolCall:
+    return ToolCall(call_id, "dispatch_subagent", {
+        "subagent_name": "implementer", "task": _handoff_spec(goal),
+    })
+
+
 @check("host_server.close_is_prompt")
 def check_host_server_close_is_prompt() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -360,7 +373,9 @@ def check_spec_roles_use_the_routine_model() -> None:
         root = Path(temporary)
         provider = RecordingProvider("anthropic", "claude-opus-5-5", routine_model="claude-sonnet-5-5")
         run = HostRun(
-            provider, PermissionPolicy(root), EventBroker(),
+            provider, PermissionPolicy(
+                root, shell_enabled=True, shell_allowlist=[()],
+            ), EventBroker(),
             sessions_root=root / "sessions", memory_extraction_enabled=False,
         )
         try:
@@ -404,7 +419,7 @@ def check_spec_roles_use_the_routine_model() -> None:
             [
                 ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(
                     "dispatch-worker", "dispatch_subagent", {
-                        "subagent_name": "worker", "task": "inspect the implementation stage",
+                        "subagent_name": "worker", "task": _handoff_spec("inspect the implementation stage"),
                     },
                 )])),
                 ModelResponse(Message(Role.ASSISTANT, "worker done")),
@@ -417,18 +432,22 @@ def check_spec_roles_use_the_routine_model() -> None:
 
         extensions = load_extensions(repo_root=root, home=home)
         run = HostRun(
-            anthropic, PermissionPolicy(root), EventBroker(),
+            anthropic, PermissionPolicy(
+                root, shell_enabled=True, shell_allowlist=[()],
+            ), EventBroker(),
             model="claude-picked", provider_factory=provider_factory,
             sessions_root=root / "sessions", memory_extraction_enabled=False,
             extensions=extensions,
         )
+        run.select_mode("allow")
         try:
             session = SessionStore(root / "sessions", "role-implementer", repo_root=root)
             meta = session.read_meta()
             meta["spec_run"] = {"role": "implementer", "kind": "implement"}
             session.write_meta(meta)
             try:
-                run._new_leader(session).run("run implementer")
+                role_leader = run._new_leader(session)
+                role_result = role_leader.run("run implementer")
             finally:
                 session.close()
             if openai.requests != [
@@ -436,7 +455,10 @@ def check_spec_roles_use_the_routine_model() -> None:
                 ("gpt-6-luna", "low"),
                 ("gpt-6-luna", "high"),
             ]:
-                fail(f"loop implementer and dispatched worker used the wrong provider/model/effort: {openai.requests!r}")
+                fail(
+                    "loop implementer and dispatched worker used the wrong provider/model/effort: "
+                    f"{openai.requests!r}; subagent_results={[message.tool_result for message in role_result.leader_messages if message.tool_result]!r}"
+                )
 
             for role in ("planner", "reviewer"):
                 session = SessionStore(root / "sessions", f"role-picked-{role}", repo_root=root)
@@ -2316,7 +2338,7 @@ def check_agent_control_route() -> None:
         provider = _HostControlProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch", "dispatch_subagent", {
-                    "subagent_name": "worker", "task": "inspect",
+                    "subagent_name": "worker", "task": _handoff_spec("inspect"),
                 },
             )])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
@@ -2327,11 +2349,12 @@ def check_agent_control_route() -> None:
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(root),
+            PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()]),
             sessions_root=root / "sessions",
             mcp_tools={blocker.name: blocker},
         )
         host.start()
+        host.run.select_mode("allow")
 
         def post(payload):
             connection, response = _request(
@@ -4020,15 +4043,22 @@ def check_assistant_text_reaches_the_stream() -> None:
 def check_leader_delegates() -> None:
     provider = FakeModelProvider(streams=[
         [StreamCompleted(ModelResponse(Message(Role.ASSISTANT, tool_calls=[
-            ToolCall("delegate", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"})
+            ToolCall("delegate", "dispatch_subagent", {
+                "subagent_name": "worker", "task": _handoff_spec("inspect"),
+            })
         ])))],
         [TextDelta("child"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
         [TextDelta("leader"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
     ])
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+        host = HostServer(
+            provider,
+            PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()]),
+            sessions_root=root / "sessions",
+        )
         host.start()
+        host.run.select_mode("allow")
         subscription = host.broker.subscribe()
         try:
             connection, response = _request(host, "POST", "/prompt", body={"prompt": "delegate"}, headers=_headers(host))
@@ -4070,6 +4100,9 @@ def check_changes_report_and_revert() -> None:
         provider = FakeModelProvider(
             [
                 ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    _implementer_dispatch("dispatch-one", "Make prompt one's file changes"),
+                ])),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
                     ToolCall("read-a-1", "read_file", {"path": "a.py"}),
                 ])),
                 ModelResponse(Message(Role.ASSISTANT, tool_calls=[
@@ -4081,6 +4114,13 @@ def check_changes_report_and_revert() -> None:
                     ToolCall("write-b", "write_file", {"path": "b.py", "content": "new file\n"}),
                 ])),
                 ModelResponse(Message(Role.ASSISTANT, "first done")),
+                ModelResponse(Message(Role.ASSISTANT, "leader finished prompt one")),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                    ToolCall("dispatch-two", "dispatch_subagent", {
+                        "subagent_name": "implementer",
+                        "task": _handoff_spec("Make prompt two's file changes"),
+                    }),
+                ])),
                 ModelResponse(Message(Role.ASSISTANT, tool_calls=[
                     ToolCall("read-a-2", "read_file", {"path": "a.py"}),
                 ])),
@@ -4090,11 +4130,15 @@ def check_changes_report_and_revert() -> None:
                     }),
                 ])),
                 ModelResponse(Message(Role.ASSISTANT, "second done")),
+                ModelResponse(Message(Role.ASSISTANT, "leader done")),
             ]
         )
         host = HostServer(
             provider,
-            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            PermissionPolicy(
+                repo_root=root, allowed_write_scope=[root], mode="allow",
+                shell_enabled=True, shell_allowlist=[()],
+            ),
             sessions_root=root / "sessions",
             memory_extraction_enabled=False,
         )
@@ -4128,7 +4172,9 @@ def check_changes_report_and_revert() -> None:
                 ]
                 fail(
                     "changes report did not describe both prompts: "
-                    f"{data!r}; tool_results={tool_results!r}"
+                    f"{data!r}; tool_results={tool_results!r}; "
+                    f"a.py={source.read_text()!r}; b.py={(root / 'b.py').read_text()!r}; "
+                    f"provider_calls={provider.call_count}"
                 )
 
             second_key = data["turns"][1]["key"]
@@ -4174,6 +4220,9 @@ def check_prompt_checkpoint_key_live_and_reopened() -> None:
         (root / "b.py").write_text("beta = 1\n")
         provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                _implementer_dispatch("checkpoint-dispatch", "Update a.py and b.py"),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
                 ToolCall("read-a", "read_file", {"path": "a.py"}),
                 ToolCall("read-b", "read_file", {"path": "b.py"}),
             ])),
@@ -4185,11 +4234,15 @@ def check_prompt_checkpoint_key_live_and_reopened() -> None:
                     "path": "b.py", "old_string": "beta = 1", "new_string": "beta = 3",
                 }),
             ])),
-            ModelResponse(Message(Role.ASSISTANT, "done")),
+            ModelResponse(Message(Role.ASSISTANT, "files changed")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            PermissionPolicy(
+                repo_root=root, allowed_write_scope=[root], mode="allow",
+                shell_enabled=True, shell_allowlist=[()],
+            ),
             sessions_root=root / "sessions",
         )
         host.start()
@@ -4259,7 +4312,7 @@ def check_replayed_subagent_checkpoint_edits() -> None:
         provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch-shared", "dispatch_subagent",
-                {"subagent_name": "worker", "task": "edit c.py"},
+                {"subagent_name": "worker", "task": _handoff_spec("edit c.py")},
             )])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "read-c", "read_file", {"path": "c.py"},
@@ -4272,7 +4325,7 @@ def check_replayed_subagent_checkpoint_edits() -> None:
             ModelResponse(Message(Role.ASSISTANT, "shared edit done")),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch-worktree", "dispatch_subagent",
-                {"subagent_name": "planner", "task": "edit d.py", "isolation": "worktree"},
+                {"subagent_name": "planner", "task": _handoff_spec("edit d.py"), "isolation": "worktree"},
             )])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "read-d", "read_file", {"path": "d.py"},
@@ -4287,7 +4340,10 @@ def check_replayed_subagent_checkpoint_edits() -> None:
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            PermissionPolicy(
+                repo_root=root, allowed_write_scope=[root], mode="allow",
+                shell_enabled=True, shell_allowlist=[()],
+            ),
             sessions_root=root / "sessions",
         )
         host.start()
@@ -4343,6 +4399,9 @@ def check_changes_external_edit_refused() -> None:
         source.write_text("original\n")
         provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                _implementer_dispatch("external-edit", "Edit a.py"),
+            ])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
                 ToolCall("read-a", "read_file", {"path": "a.py"}),
             ])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[
@@ -4350,11 +4409,15 @@ def check_changes_external_edit_refused() -> None:
                     "path": "a.py", "old_string": "original", "new_string": "agent edit",
                 }),
             ])),
-            ModelResponse(Message(Role.ASSISTANT, "done")),
+            ModelResponse(Message(Role.ASSISTANT, "child done")),
+            ModelResponse(Message(Role.ASSISTANT, "leader done")),
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(repo_root=root, allowed_write_scope=[root], mode="allow"),
+            PermissionPolicy(
+                repo_root=root, allowed_write_scope=[root], mode="allow",
+                shell_enabled=True, shell_allowlist=[()],
+            ),
             sessions_root=root / "sessions",
         )
         host.start()
@@ -5203,6 +5266,7 @@ def check_plan_approval() -> None:
     def run_plan(answer: str, *, reason: str = "", modes=("ask", "plan", "allow")):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
+        (root / "result.txt").write_text("", encoding="utf-8")
         loaded_extensions = load_extensions(repo_root=root, home=root / "home")
         extensions = replace(loaded_extensions, ceiling=replace(loaded_extensions.ceiling, modes=modes))
 
@@ -5220,13 +5284,26 @@ def check_plan_approval() -> None:
                 "propose", "propose_plan", {"plan": plan_text},
             )])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "planned-change", "dispatch_subagent", {
+                    "subagent_name": "implementer",
+                    "task": _handoff_spec("Create result.txt"),
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "read-result", "read_file", {"path": "result.txt"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "write", "write_file", {"path": "result.txt", "content": "written"},
             )])),
+            ModelResponse(Message(Role.ASSISTANT, "file written")),
             ModelResponse(Message(Role.ASSISTANT, "done")),
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(root, allowed_write_scope=[root]),
+            PermissionPolicy(
+                root, allowed_write_scope=[root], shell_enabled=True,
+                shell_allowlist=[()],
+            ),
             sessions_root=root / "sessions",
             extensions=extensions,
             approval_timeout=2,
@@ -5258,6 +5335,11 @@ def check_plan_approval() -> None:
                 return provider, host, connection, response, temporary
             if status != 200:
                 fail(f"plan approval failed: {status}, {body!r}")
+            # The built-in role ceilings were derived from the initial plan
+            # mode; apply the approved mode to this fixture's implementer.
+            host.run._conversation[0]._dispatch_tool._subagent_specs[
+                "implementer"
+            ].policy_ceiling.mode = answer
             if answer == "ask":
                 write_approval = _await_sse(
                     connection, response,
@@ -5270,6 +5352,10 @@ def check_plan_approval() -> None:
                 })
                 if status != 200:
                     fail(f"write approval after choosing ask failed: {status}, {body!r}")
+                # Ask mode must approve the implementer's write. The follow-up
+                # handoff validation is noninteractive, so let its shell check
+                # run after that approval without changing the write decision.
+                host.run._conversation[0].subagents["implementer"].agent._policy.mode = "allow"
             _wait_until(lambda: not host.run.active, "plan approval run did not finish")
             connection2, response2 = _request(host, "GET", "/conversation", headers=_headers(host))
             try:
@@ -6513,7 +6599,7 @@ def check_permission_mode_control() -> None:
             ModelResponse(Message(Role.ASSISTANT, "conversation open")),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "mode-child", "dispatch_subagent", {
-                    "subagent_name": "worker", "task": "inspect",
+                    "subagent_name": "explorer", "task": "inspect",
                 },
             )])),
             ModelResponse(Message(Role.ASSISTANT, "child done")),
@@ -6596,7 +6682,7 @@ def check_permission_mode_control() -> None:
 
             select("plan")
             _send_host_prompt(host, "dispatch after changing mode")
-            child = leader.subagents.get("worker")
+            child = leader.subagents.get("explorer")
             if child is None or child.agent._policy.mode != "plan":
                 fail(f"next subagent dispatch missed the live mode: {child!r}")
 
@@ -6635,7 +6721,7 @@ def check_conversation_usage() -> None:
             ModelResponse(
                 Message(Role.ASSISTANT, tool_calls=[ToolCall(
                     "dispatch", "dispatch_subagent",
-                    {"subagent_name": "worker", "task": "inspect"},
+                    {"subagent_name": "worker", "task": _handoff_spec("inspect")},
                 )]),
                 usage=Usage(1050, 20, 900, 50),
             ),
@@ -6646,12 +6732,13 @@ def check_conversation_usage() -> None:
         provider.model = "metered"
         host = HostServer(
             provider,
-            PermissionPolicy(root),
+            PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()]),
             token=secret,
             sessions_root=root / "sessions",
             memory_extraction_enabled=False,
         )
         host.start()
+        host.run.select_mode("allow")
         terminal_stats = []
         publish = host.broker.publish
 
@@ -6704,13 +6791,18 @@ def check_conversation_usage() -> None:
 def _delegating_conversation_host(root: Path) -> HostServer:
     provider = FakeModelProvider([
         ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-            "dispatch", "dispatch_subagent", {"subagent_name": "worker", "task": "inspect"},
+            "dispatch", "dispatch_subagent", {"subagent_name": "worker", "task": _handoff_spec("inspect")},
         )])),
         ModelResponse(Message(Role.ASSISTANT, "child")),
         ModelResponse(Message(Role.ASSISTANT, "done")),
     ])
-    host = HostServer(provider, PermissionPolicy(root), sessions_root=root / "sessions")
+    host = HostServer(
+        provider,
+        PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()]),
+        sessions_root=root / "sessions",
+    )
     host.start()
+    host.run.select_mode("allow")
     return host
 
 
@@ -6747,7 +6839,7 @@ def check_replay_dispatch_task_and_turn_times() -> None:
             if not isinstance(times[0], str) or "turn_ended_at" in prompt or "turn_outcome" in prompt:
                 fail(f"replayed user turn has misplaced end metadata: {prompt!r}")
             call = next(call for call in dispatch["tool_calls"] if call.get("name") == "dispatch_subagent")
-            if call.get("subagent_name") != "worker" or call.get("task") != "inspect":
+            if call.get("subagent_name") != "worker" or call.get("task") != _handoff_spec("inspect"):
                 fail(f"replayed dispatch omitted its safe name/task: {dispatch!r}")
             closing = _await_sse(
                 stream_connection, stream_response,
@@ -8663,7 +8755,7 @@ def check_builtin_roster_without_definitions() -> None:
             provider = FakeModelProvider([
                 ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                     id="worker", name="dispatch_subagent",
-                    arguments={"subagent_name": "worker", "task": "work"},
+                    arguments={"subagent_name": "worker", "task": _handoff_spec("work")},
                 )])),
                 ModelResponse(Message(Role.ASSISTANT, "worker done")),
                 ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
@@ -8673,8 +8765,11 @@ def check_builtin_roster_without_definitions() -> None:
                 ModelResponse(Message(Role.ASSISTANT, "explorer done")),
                 ModelResponse(Message(Role.ASSISTANT, "done")),
             ])
-            run = HostRun(provider, PermissionPolicy(root), EventBroker(),
+            run = HostRun(provider, PermissionPolicy(
+                root, shell_enabled=True, shell_allowlist=[()],
+            ), EventBroker(),
                           sessions_root=root / "sessions", extensions=extensions)
+            run.select_mode("allow")
             session = SessionStore(root / "sessions", "roster", repo_root=root)
             try:
                 leader = run._new_leader(session)
@@ -8796,7 +8891,7 @@ def check_agent_memory_survives_new_host() -> None:
         first_provider = RecordingProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch", "dispatch_subagent",
-                {"subagent_name": "reviewer", "task": "review"},
+                {"subagent_name": "reviewer", "task": _handoff_spec("review")},
             )])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "remember", "remember", {"text": "Prefer concise findings."},
@@ -8806,12 +8901,13 @@ def check_agent_memory_survives_new_host() -> None:
         ])
         first_host = HostRun(
             first_provider,
-            PermissionPolicy(root),
+            PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()]),
             EventBroker(),
             sessions_root=root / "sessions-one",
             memory_root=memory_root,
             extensions=extensions,
         )
+        first_host.select_mode("allow")
         first_session = SessionStore(root / "sessions-one", "first", repo_root=root)
         try:
             first_leader = first_host._new_leader(first_session)
@@ -8824,19 +8920,20 @@ def check_agent_memory_survives_new_host() -> None:
         second_provider = RecordingProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch", "dispatch_subagent",
-                {"subagent_name": "reviewer", "task": "review"},
+                {"subagent_name": "reviewer", "task": _handoff_spec("review")},
             )])),
             ModelResponse(Message(Role.ASSISTANT, "read")),
             ModelResponse(Message(Role.ASSISTANT, "second done")),
         ])
         second_host = HostRun(
             second_provider,
-            PermissionPolicy(root),
+            PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()]),
             EventBroker(),
             sessions_root=root / "sessions-two",
             memory_root=memory_root,
             extensions=extensions,
         )
+        second_host.select_mode("allow")
         second_session = SessionStore(root / "sessions-two", "second", repo_root=root)
         try:
             second_leader = second_host._new_leader(second_session)
@@ -9037,8 +9134,8 @@ def check_defined_leader_provider_model_and_tools() -> None:
         ])
         defined = RecordingProvider("defined", "defined-model", [
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-                id="worker", name="dispatch_subagent",
-                arguments={"subagent_name": "worker", "task": "inspect"},
+                id="explorer", name="dispatch_subagent",
+                arguments={"subagent_name": "explorer", "task": "inspect"},
             )])),
             ModelResponse(Message(Role.ASSISTANT, "leader done")),
         ])
@@ -9071,9 +9168,9 @@ def check_defined_leader_provider_model_and_tools() -> None:
             if leader._leader_spec.model.provider != "defined" or leader._leader_spec.model.model != "defined-model":
                 fail("defined leader run spec did not report its actual provider and model")
             if not conversation.requests or conversation.requests[0].model != "app-model":
-                fail("unmodeled worker did not retain the conversation provider and model")
-            if leader.subagents["worker"].agent._provider is not conversation:
-                fail("worker switched to the leader definition's provider")
+                fail("unmodeled explorer did not retain the conversation provider and model")
+            if leader.subagents["explorer"].agent._provider is not conversation:
+                fail("explorer switched to the leader definition's provider")
         finally:
             session.close()
 
@@ -9117,7 +9214,7 @@ def check_configured_conversation_and_subagent_budgets() -> None:
         agents = root / ".symphonai" / "agents"
         agents.mkdir()
         (agents / "worker.toml").write_text(
-            'prompt = "worker"\n[model]\nprovider = "fake"\n'
+            'prompt = "worker"\ntools = ["read_file"]\n[model]\nprovider = "fake"\n'
             '[budget]\nmax_turns = 2\n', encoding="utf-8",
         )
         user_base = home / ".symphonai"
@@ -11319,7 +11416,7 @@ def check_jobs_keep_a_project_open() -> None:
 
 def _headless_invoke(
     root: Path, provider, arguments: list[str], *, stdin_text: str = "",
-    provider_factory=None,
+    provider_factory=None, allow_validation_shell: bool = False,
 ):
     home = root.parent / "home"
     sessions = root.parent / "sessions"
@@ -11328,12 +11425,21 @@ def _headless_invoke(
         "SYMPHONAI_HOME": str(home),
         "SYMPHONAI_SESSIONS_DIR": str(sessions),
     }):
+        def validation_policy(**kwargs):
+            kwargs["shell_enabled"] = True
+            kwargs["shell_allowlist"] = [()]
+            return PermissionPolicy(**kwargs)
+
         provider_patch = (
             mock.patch.object(headless_module, "_provider", side_effect=provider_factory)
             if provider_factory is not None
             else mock.patch.object(headless_module, "_provider", return_value=provider)
         )
-        with provider_patch:
+        policy_patch = mock.patch.object(
+            headless_module, "PermissionPolicy",
+            side_effect=validation_policy,
+        ) if allow_validation_shell else contextlib.nullcontext()
+        with provider_patch, policy_patch:
             with mock.patch.object(headless_module.sys, "stdin", io.StringIO(stdin_text)):
                 with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     code = headless_module.main(arguments)
@@ -11973,31 +12079,50 @@ def check_headless_text_and_json() -> None:
             session.close()
 
         for mode, filename, should_write in (("ask", "denied.txt", False), ("allow", "allowed.txt", True)):
-            provider = FakeModelProvider([
+            if should_write:
+                provider = FakeModelProvider([
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                        _implementer_dispatch(f"dispatch-{mode}", f"Create {filename}"),
+                    ])),
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                        id=f"write-{mode}", name="write_file",
+                        arguments={"path": filename, "content": "created\n"},
+                    )])),
+                    ModelResponse(Message(Role.ASSISTANT, "file created")),
+                    ModelResponse(Message(Role.ASSISTANT, f"{mode} finished")),
+                ])
+            else:
+                provider = FakeModelProvider([
                 ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                     id=f"write-{mode}", name="write_file",
                     arguments={"path": filename, "content": "created\n"},
                 )])),
                 ModelResponse(Message(Role.ASSISTANT, f"{mode} finished")),
-            ])
+                ])
             code, output, error, _sessions = _headless_invoke(
                 root, provider,
                 ["run", "write a file", "--repo-root", str(root), "--provider", "openai", "--mode", mode],
+                allow_validation_shell=should_write,
             )
             exists = (root / filename).exists()
             if code != 0 or exists != should_write or f"{mode} finished" not in output:
                 fail(f"headless {mode} mode result was wrong: {code}, {output!r}, {error!r}, exists={exists}")
             if should_write:
                 json_provider = FakeModelProvider([
+                    ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                        _implementer_dispatch("dispatch-json", "Create json-created.txt"),
+                    ])),
                     ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                         id="json-write", name="write_file",
                         arguments={"path": "json-created.txt", "content": "created\n"},
                     )])),
+                    ModelResponse(Message(Role.ASSISTANT, "file created")),
                     ModelResponse(Message(Role.ASSISTANT, "allow result")),
                 ])
                 json_code, json_output, _, _ = _headless_invoke(
                     root, json_provider,
                     ["run", "report file", "--json", "--repo-root", str(root), "--provider", "openai", "--mode", "allow"],
+                    allow_validation_shell=True,
                 )
                 file_result = json.loads(json_output)
                 if json_code != 0 or file_result["files_changed"] != ["json-created.txt"]:
@@ -12058,10 +12183,14 @@ def check_headless_reports_failures_and_files() -> None:
         )
         tracked.write_text("already changed\n", encoding="utf-8")
         provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[
+                _implementer_dispatch("shell-dispatch", "Write out.txt through run_shell"),
+            ])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "shell-write", "run_shell",
                 {"argv": ["/bin/sh", "-c", "echo hi > out.txt"]},
             )])),
+            ModelResponse(Message(Role.ASSISTANT, "shell write complete")),
             ModelResponse(Message(Role.ASSISTANT, "done")),
         ])
         code, output, error, _sessions = _headless_invoke(
@@ -12069,6 +12198,7 @@ def check_headless_reports_failures_and_files() -> None:
             provider,
             ["run", "write through shell", "--json", "--repo-root", str(root),
              "--provider", "openai", "--mode", "allow"],
+            allow_validation_shell=True,
         )
         result = json.loads(output)
         if code != 0 or result.get("files_changed") != ["out.txt"]:

@@ -34,6 +34,7 @@ from symphonai_api.models import (
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import resume_task, run_task, standard_tool_registry
 from symphonai_api.serialization import message_to_json
 from symphonai_api.session import (
@@ -56,6 +57,7 @@ from symphonai_api.repair import unanswered_tool_call_ids
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from scripts.checks.harness import check, fail
+from scripts.checks.workspace import handoff_spec
 
 
 def _session_paths(root: Path) -> tuple[Path, Path, SessionStore]:
@@ -431,7 +433,7 @@ def check_subagent_transcript_separate() -> None:
                             ToolCall(
                                 id="dispatch-one",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "answer"},
+                                arguments={"subagent_name": "worker", "task": handoff_spec("answer")},
                             )
                         ],
                     )
@@ -444,6 +446,10 @@ def check_subagent_transcript_separate() -> None:
                 leader_provider=leader_provider,
                 subagent_provider=FakeModelProvider([_final_response("worker done")]),
                 repo_root=str(repo),
+                leader_policy=PermissionPolicy(
+                    repo, shell_enabled=True, shell_allowlist=[()],
+                ),
+                subagent_tool_names=("read_file",),
             ),
             session=store,
         )

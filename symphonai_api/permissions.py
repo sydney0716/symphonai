@@ -367,7 +367,7 @@ class PermissionPolicy:
     `allowed_write_scope` is a list of directories writes may target,
     empty by default so nothing is writable until explicitly configured.
     `shell_enabled` and `shell_allowlist` gate `run_shell`; a command must
-    pass both, and `ALWAYS_DENY_COMMANDS` overrides either.
+    pass both, and `always_deny_commands` overrides either.
 
     `mode="allow"` uses only the static rules. `ask` asks before writes or
     shell calls, and `plan` permits reads only.
@@ -387,6 +387,7 @@ class PermissionPolicy:
     mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
     sandbox_write_scope: list[Path] | None = None
+    always_deny_commands: tuple[tuple[str, ...], ...] = ALWAYS_DENY_COMMANDS
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
@@ -542,6 +543,7 @@ class PermissionPolicy:
             forbidden_patterns=_ordered_union(
                 self.forbidden_patterns, ceiling.forbidden_patterns
             ),
+            always_deny_commands=self.always_deny_commands,
             shell_enabled=self.shell_enabled and ceiling.shell_enabled,
             shell_allowlist=_intersect_shell_allowlists(
                 self.shell_allowlist, ceiling.shell_allowlist
@@ -590,6 +592,7 @@ class PermissionPolicy:
             allowed_write_scope=write_scope,
             sandbox_write_scope=sandbox_write_scope,
             forbidden_patterns=self.forbidden_patterns,
+            always_deny_commands=self.always_deny_commands,
             shell_enabled=self.shell_enabled,
             shell_allowlist=list(self.shell_allowlist),
             shell_sandbox=self.shell_sandbox,
@@ -811,7 +814,7 @@ class PermissionPolicy:
                             denial=DenialReason.ALWAYS_DENY,
                             tool_name="run_shell",
                         )
-                    for denied_prefix in ALWAYS_DENY_COMMANDS:
+                    for denied_prefix in self.always_deny_commands:
                         if (
                             candidate
                             and os.path.basename(candidate[0]) == denied_prefix[0]
@@ -828,7 +831,7 @@ class PermissionPolicy:
             if commands is None:
                 return self._deny(
                     "this command uses shell syntax that cannot be checked "
-                    "(command or process substitution, a subshell, a here-document, or a background job); "
+                    "(command or process substitution, a subshell, or a background job); "
                     "run it as simpler commands",
                     denial=DenialReason.UNCHECKABLE_COMMAND,
                     tool_name="run_shell",
@@ -890,7 +893,7 @@ class PermissionPolicy:
         if commands is None:
             return self._deny(
                 "this command uses shell syntax that cannot be checked "
-                "(command or process substitution, a subshell, a here-document, or a background job); "
+                "(command or process substitution, a subshell, or a background job); "
                 "run it as simpler commands",
                 denial=DenialReason.UNCHECKABLE_COMMAND,
                 tool_name="run_shell",

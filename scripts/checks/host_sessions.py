@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,7 @@ from symphonai_host.server import HostServer
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, list_sessions, prompt_history, prune_sessions
 from scripts.checks.host_server import _WaitingProvider, _await_sse, _headers, _request, _subscribed_stream
 from scripts.checks.harness import check, fail
+from scripts.checks.workspace import handoff_spec
 
 
 def _wait_idle(client: HostClient) -> None:
@@ -80,7 +82,9 @@ def check_conversations_share_workspace_leases() -> None:
         root = Path(temporary)
         provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
         host = HostRun(
-            provider, PermissionPolicy(repo_root=root), EventBroker(),
+            provider, PermissionPolicy(
+                repo_root=root, shell_enabled=True, shell_allowlist=[()],
+            ), EventBroker(),
             sessions_root=root / "sessions",
         )
         first_session = SessionStore(root / "sessions", "first", repo_root=root)
@@ -88,6 +92,10 @@ def check_conversations_share_workspace_leases() -> None:
         try:
             first = host._new_leader(first_session)
             second = host._new_leader(second_session)
+            second._dispatch_tool._subagent_specs["worker"] = replace(
+                second._dispatch_tool._subagent_specs["worker"],
+                tool_names=("read_file",),
+            )
             if first._leases is not second._leases or not isinstance(host._leases, WorkspaceLeases):
                 fail("conversations did not share the host lease owner")
             second._dispatch_tool._set_event_context(
@@ -96,7 +104,7 @@ def check_conversations_share_workspace_leases() -> None:
             with first._leases.held("first-child", None):
                 conflict = second._dispatch_tool.execute(
                     ToolCall("lease-conflict", "dispatch_subagent", {
-                        "subagent_name": "worker", "task": "inspect",
+                        "subagent_name": "worker", "task": handoff_spec("inspect"),
                     }),
                     second._leader_policy,
                 )
@@ -104,7 +112,7 @@ def check_conversations_share_workspace_leases() -> None:
                     fail(f"second conversation did not see the shared lease: {conflict!r}")
             success = second._dispatch_tool.execute(
                 ToolCall("lease-released", "dispatch_subagent", {
-                    "subagent_name": "worker", "task": "inspect",
+                    "subagent_name": "worker", "task": handoff_spec("inspect"),
                 }),
                 second._leader_policy,
             )

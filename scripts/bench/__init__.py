@@ -10,11 +10,19 @@ from typing import Any
 
 from symphonai_api.config import load_config
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
+from symphonai_api.permissions import ALWAYS_DENY_COMMANDS
 
 
 def write_user_config(home: Path, roles: dict[str, dict[str, str]]) -> Path:
     """Write the task's isolated user config for SymphonAI."""
-    lines = ["[memory]", "extract = false", ""]
+    lines = [
+        "[always_deny]",
+        f"lift = {json.dumps([' '.join(command) for command in ALWAYS_DENY_COMMANDS])}",
+        "",
+        "[memory]",
+        "extract = false",
+        "",
+    ]
     for role, model in roles.items():
         lines.extend((f"[roles.{role}]", f'provider = {json.dumps(model["provider"])}',
                       f'model = {json.dumps(model["model"])}'))
@@ -39,6 +47,9 @@ def verify_user_config(
             raise ValueError(f"role config did not load as provided: {role}")
     if config.get("memory.extract") is not False:
         raise ValueError("memory extraction was not disabled")
+    expected_lifts = [" ".join(command) for command in ALWAYS_DENY_COMMANDS]
+    if config.get("always_deny.lift") != expected_lifts:
+        raise ValueError("always-deny lifts were not loaded as provided")
 
 
 def usage_summary(
@@ -136,6 +147,8 @@ def price_agent_usage(
     *,
     symphonai_usage: dict[str, Any] | None = None,
     trajectory_path: Path | None = None,
+    claude_stream_path: Path | None = None,
+    cache_write_1h_rates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Price Harbor or SymphonAI usage from one normalized token breakdown."""
     harbor_usage = model_usage if isinstance(model_usage, dict) else {}
@@ -164,6 +177,40 @@ def price_agent_usage(
                                     final_extra.get("total_cache_write_input_tokens"))
             if len(models) == 1 and type(count) is int and count >= 0:
                 cache_writes[next(iter(models))] = count
+
+    cache_write_splits: dict[str, dict[str, int]] = {}
+    if claude_stream_path is not None:
+        try:
+            with claude_stream_path.open(encoding="utf-8") as stream:
+                seen_messages: set[str] = set()
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    message = event.get("message") if isinstance(event, dict) else None
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = message.get("id")
+                    model = message.get("model")
+                    usage = message.get("usage")
+                    if (not isinstance(message_id, str) or message_id in seen_messages
+                            or not isinstance(model, str) or not isinstance(usage, dict)):
+                        continue
+                    creation = usage.get("cache_creation")
+                    if not isinstance(creation, dict):
+                        continue
+                    five_minute = creation.get("ephemeral_5m_input_tokens", 0)
+                    one_hour = creation.get("ephemeral_1h_input_tokens", 0)
+                    if (type(five_minute) is not int or five_minute < 0
+                            or type(one_hour) is not int or one_hour < 0):
+                        continue
+                    seen_messages.add(message_id)
+                    split = cache_write_splits.setdefault(model, {"5m": 0, "1h": 0})
+                    split["5m"] += five_minute
+                    split["1h"] += one_hour
+        except OSError:
+            pass
 
     normalized: dict[str, dict[str, int]] = {}
     costs: dict[str, str] = {}
@@ -199,13 +246,47 @@ def price_agent_usage(
                 "long_context_cache_read": long_cache_read,
                 "long_context_cache_write": long_cache_write,
             })
-        if not symphony and model not in cache_writes:
+        split = cache_write_splits.get(model)
+        if split is None:
+            split = cache_write_splits.get(model.rsplit("/", 1)[-1])
+        if split is not None:
+            cache_write = split["5m"] + split["1h"]
+            normalized[model]["cache_write"] = cache_write
+            normalized[model]["uncached_input"] = max(
+                0, total_input - cache_read - cache_write,
+            )
+            normalized[model]["cache_write_5m"] = split["5m"]
+            normalized[model]["cache_write_1h"] = split["1h"]
+        if not symphony and model not in cache_writes and split is None:
             estimated = True
         totals = UsageTotals(
             total_input, output_tokens, 0, cache_read, cache_write, long_input,
             long_output, long_cache_read, long_cache_write,
         )
-        cost = prices.cost(model, totals)
+        price_model = model if model in prices.prices else model.rsplit("/", 1)[-1]
+        if split is not None and price_model in prices.prices:
+            price = prices.prices[price_model]
+            one_hour_rate = (cache_write_1h_rates or {}).get(price_model)
+            one_hour_rate = Decimal(str(one_hour_rate)) if one_hour_rate is not None else None
+            if split["1h"] and one_hour_rate is None:
+                estimated = True
+            base_totals = UsageTotals(
+                max(0, totals.input_tokens - split["5m"] - split["1h"]),
+                totals.output_tokens, totals.calls,
+                totals.cache_read_tokens, 0, totals.long_context_input_tokens,
+                totals.long_context_output_tokens, totals.long_context_cache_read_tokens,
+                0,
+            )
+            base_cost = prices.cost(price_model, base_totals)
+            write_5m_rate = (price.cache_write_per_million
+                             if price.cache_write_per_million is not None
+                             else price.input_per_million)
+            write_1h_rate = one_hour_rate if one_hour_rate is not None else write_5m_rate
+            cost = (base_cost + Decimal(split["5m"]) * write_5m_rate / Decimal(1_000_000)
+                    + Decimal(split["1h"]) * write_1h_rate / Decimal(1_000_000)
+                    if base_cost is not None else None)
+        else:
+            cost = prices.cost(price_model, totals)
         if cost is None:
             unknown.append(model)
         else:

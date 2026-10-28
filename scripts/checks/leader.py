@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import contextlib
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import tempfile
 import threading
 from pathlib import Path
 import unittest.mock as mock
-from dataclasses import fields
+from dataclasses import fields, replace
 
 from symphonai_api.agent_memory import MAX_ENTRY_CHARS, AgentMemory, MemorySettings
 from symphonai_api.agent_run import RunPhase, new_agent_run
@@ -99,10 +100,19 @@ from symphonai_api.tools.metadata import (
 )
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.skills import Skill
+import symphonai_api.tools.shell as shell_module
 
 from scripts.checks.harness import check, fail
 from scripts.checks import memory_extract as _memory_extract_checks  # noqa: F401
-from scripts.checks.workspace import workspace
+from scripts.checks.workspace import Workspace, workspace as _workspace
+
+
+@contextlib.contextmanager
+def workspace():
+    with _workspace() as ws:
+        ws.policy.shell_enabled = True
+        ws.policy.shell_allowlist = [()]
+        yield ws
 
 
 @check("leader.background_job_registry")
@@ -555,6 +565,7 @@ def _spec(
     model: str = "test-model",
     provider: str = "fake",
     memory: MemorySettings = MemorySettings(),
+    tool_names: tuple[str, ...] | None = None,
 ) -> AgentSpec:
     return AgentSpec(
         name=name,
@@ -567,6 +578,7 @@ def _spec(
         memory=memory,
         call_class=CallClass.BACKGROUND,
         max_depth=max_depth,
+        tool_names=tool_names,
     )
 
 
@@ -574,12 +586,108 @@ def _leader_without_memory(root: Path) -> dict[str, AgentSpec]:
     return {"leader": _spec(root, "leader", memory=MemorySettings(enabled=False))}
 
 
-def _dispatch(name: str, task: str, call_id: str = "dispatch") -> ToolCall:
+def _dispatch(
+    name: str, task: str, call_id: str = "dispatch", *, needs_validation: bool = True,
+) -> ToolCall:
+    if needs_validation and name in {"worker", "implementer", "planner", "reviewer"} and "## Validation" not in task:
+        task = _handoff_spec(task)
     return ToolCall(
         id=call_id,
         name="dispatch_subagent",
         arguments={"subagent_name": name, "task": task},
     )
+
+
+def _handoff_spec(goal: str, command: str = "true") -> str:
+    return (
+        f"## Goal\n{goal}\n\n## Scope\nTest fixture files\n\n"
+        f"## Validation\n```sh\n{command}\n```"
+    )
+
+
+@check("leader.edit_handoff_requires_validation")
+def check_edit_handoff_requires_validation() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([ModelResponse(Message(Role.ASSISTANT, "unused"))])
+        dispatch = DispatchSubagentTool(provider, ws.policy)
+        call = ToolCall(
+            id="missing-validation", name="dispatch_subagent",
+            arguments={"subagent_name": "implementer", "task": "make the change"},
+        )
+        result = dispatch.execute(call, ws.policy)
+        if result.ok or "## Validation" not in (result.error or "") or provider.requests:
+            fail(f"edit handoff without Validation was not refused before the model call: {result!r}")
+
+
+@check("leader.edit_handoff_retries_validation")
+def check_edit_handoff_retries_validation() -> None:
+    with workspace() as ws:
+        ws.policy.allowed_write_scope = [ws.root]
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "I am done")),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "write-done", "write_file", {"path": "done.txt", "content": "done\n"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "fixed")),
+        ])
+        dispatch = DispatchSubagentTool(provider, ws.policy)
+        task = _handoff_spec("Create done.txt", "test -f done.txt")
+        result = dispatch.execute(_dispatch("implementer", task), ws.policy)
+        record = dispatch.pool.get("implementer")
+        correction = next((
+            message.text for message in provider.requests[1].messages
+            if message.role is Role.USER and "Validation failed" in message.text
+        ), "") if len(provider.requests) > 1 else ""
+        if (
+            not result.ok or record is None or len(record.runs) != 2
+            or "test -f done.txt exited 0" not in result.content
+            or "Validation failed (round 1 of 5)" not in correction
+            or not (ws.root / "done.txt").is_file()
+        ):
+            fail(f"failed validation was not sent back and fixed in round two: {result!r}")
+
+
+@check("leader.edit_handoff_stops_after_five_validation_failures")
+def check_edit_handoff_stops_after_five_validation_failures() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, f"attempt {index}"))
+            for index in range(5)
+        ])
+        dispatch = DispatchSubagentTool(provider, ws.policy)
+        task = _handoff_spec("Never pass", "false")
+        result = dispatch.execute(_dispatch("implementer", task), ws.policy)
+        record = dispatch.pool.get("implementer")
+        if (
+            result.ok or record is None or len(record.runs) != 5
+            or "validation failed after 5 rounds" not in (result.error or "")
+            or "false exited 1" not in result.content
+        ):
+            fail(f"failed validation did not stop after five rounds: {result!r}")
+
+
+@check("leader.handoff_validation_uses_shell_policy")
+def check_handoff_validation_uses_shell_policy() -> None:
+    with workspace() as ws:
+        provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, f"attempt {index}"))
+            for index in range(5)
+        ])
+        dispatch = DispatchSubagentTool(provider, ws.policy)
+        task = _handoff_spec("Do not delete", "rm x")
+        result = dispatch.execute(_dispatch("implementer", task), ws.policy)
+        record = dispatch.pool.get("implementer")
+        correction = next((
+            message.text for request in provider.requests[1:2]
+            for message in request.messages
+            if message.role is Role.USER and "Validation failed" in message.text
+        ), "")
+        if (
+            result.ok or record is None or len(record.runs) != 5
+            or "rm x exited 126" not in correction
+            or "rm x exited 126" not in result.content
+        ):
+            fail(f"always-denied validation command did not fail the handoff round: {result!r}")
 
 
 @check("leader.base_prompts_lead_their_agents")
@@ -591,10 +699,13 @@ def base_prompts_lead_their_agents() -> None:
         or "ask in your reply" in LEADER_BASE_PROMPT
     ):
         fail("leader base prompt does not direct the model to the host tools")
+    if "- Keep the person's uncommitted changes. When their change is the cause, say so and ask before undoing it." not in LEADER_BASE_PROMPT:
+        fail("leader prompt does not preserve uncommitted changes")
     preservation = "- Keep the person's uncommitted changes. Fix forward with edits, and when their change is the cause, say so and ask before undoing it."
-    for prompt in (LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT):
-        if "- Leave nothing behind. Put scratch output in a temporary directory, never in the repository.\n" + preservation not in prompt:
-            fail("base prompt does not preserve uncommitted work after scratch guidance")
+    if "- Leave nothing behind. Put scratch output in a temporary directory, never in the repository.\n" + preservation not in SUBAGENT_BASE_PROMPT:
+        fail("subagent base prompt does not preserve uncommitted work after scratch guidance")
+    if "every change is made by a subagent working from a spec you write" not in LEADER_BASE_PROMPT:
+        fail("leader prompt does not require subagent changes to follow a spec")
     expected_subagent_prompt = """You are a subagent in SymphonAI. The leader gave you one task. You do not see its conversation with the person, so the task message is everything you know.
 
 - Read before you change. Change existing files with edit_file or multi_edit_file, and use write_file only to create a file or replace one completely.
@@ -623,8 +734,10 @@ def base_prompts_lead_their_agents() -> None:
             subagent_base_prompt="SUB",
             subagent_specs={
                 "leader": _spec(ws.root, "leader", prompt="DEFINED", memory=MemorySettings(enabled=False)),
-                "worker": _spec(ws.root, "worker", prompt="ROLE", memory=MemorySettings(enabled=False)),
-                "explorer": _spec(ws.root, "explorer", memory=MemorySettings(enabled=False)),
+                "worker": _spec(ws.root, "worker", prompt="ROLE", memory=MemorySettings(enabled=False),
+                                tool_names=leader_module.EXPLORER_TOOL_NAMES),
+                "explorer": _spec(ws.root, "explorer", memory=MemorySettings(enabled=False),
+                                  tool_names=leader_module.EXPLORER_TOOL_NAMES),
             },
         ))
         leader.run("start")
@@ -742,11 +855,11 @@ def check_spec_effort_reaches_requests() -> None:
         specs = {
             "quick": _spec(
                 ws.root, "quick", effort="low", model="gpt-5.4-mini",
-                provider=child_provider.name,
+                provider=child_provider.name, tool_names=leader_module.EXPLORER_TOOL_NAMES,
             ),
             "deep": _spec(
                 ws.root, "deep", effort="high", model="gpt-5.4-mini",
-                provider=child_provider.name,
+                provider=child_provider.name, tool_names=leader_module.EXPLORER_TOOL_NAMES,
             ),
         }
         dispatching_provider = FakeModelProvider(
@@ -829,8 +942,10 @@ def check_conversation_effort_stays_with_leader() -> None:
                     "configured",
                     effort="low",
                     model="configured-model",
+                    tool_names=leader_module.EXPLORER_TOOL_NAMES,
                 ),
-                "plain": _spec(ws.root, "plain", model="plain-model"),
+                "plain": _spec(ws.root, "plain", model="plain-model",
+                               tool_names=leader_module.EXPLORER_TOOL_NAMES),
             },
         ))
         result = leader.run("delegate both tasks")
@@ -916,7 +1031,7 @@ def _default_specs_probe() -> tuple[dict, int]:
                                     name="dispatch_subagent",
                                     arguments={
                                         "subagent_name": "worker",
-                                        "task": "inspect",
+                                        "task": _handoff_spec("inspect"),
                                     },
                                 )
                             ],
@@ -1030,12 +1145,12 @@ def check_run_dispatches_subagent() -> None:
                             ToolCall(
                                 id="lc1",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "researcher", "task": "why is the sky blue?"},
+                                arguments={"subagent_name": "researcher", "task": _handoff_spec("why is the sky blue?")},
                             ),
                             ToolCall(
                                 id="lc2",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "reviewer", "task": "check the explanation"},
+                                arguments={"subagent_name": "reviewer", "task": _handoff_spec("check the explanation")},
                             ),
                         ],
                     )
@@ -1204,7 +1319,7 @@ def check_cancellation_transcript() -> None:
                                 name="dispatch_subagent",
                                 arguments={
                                     "subagent_name": "cancellable",
-                                    "task": "start cancellable work",
+                                    "task": _handoff_spec("start cancellable work"),
                                 },
                             )
                         ],
@@ -1342,7 +1457,7 @@ def check_standalone_dispatch() -> None:
                 ToolCall(
                     id="standalone-dispatch",
                     name="dispatch_subagent",
-                    arguments={"subagent_name": "standalone", "task": "work"},
+                    arguments={"subagent_name": "standalone", "task": _handoff_spec("work")},
                 ),
                 policy,
             )
@@ -1365,7 +1480,7 @@ def check_dispatch_metadata() -> None:
             subagent_provider=pool_provider, leader_policy=policy, max_subagents=2, subagent_max_turns=3
         )
         dispatch_metadata = tool.metadata(
-            {"subagent_name": "worker", "task": "inspect metadata"}
+            {"subagent_name": "worker", "task": _handoff_spec("inspect metadata")}
         )
         expected_dispatch_metadata = ToolMetadata(
             effect=ToolEffect.DESTRUCTIVE,
@@ -1417,7 +1532,7 @@ def check_dispatch_pool() -> None:
             subagent_provider=pool_provider, leader_policy=policy, max_subagents=2, subagent_max_turns=3
         )
         r1 = tool.execute(
-            ToolCall(id="c1", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": "task one"}),
+            ToolCall(id="c1", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": _handoff_spec("task one")}),
             policy,
         )
         if not r1.ok:
@@ -1427,7 +1542,7 @@ def check_dispatch_pool() -> None:
             fail("expected a 'worker' entry in the pool after first dispatch")
 
         r2 = tool.execute(
-            ToolCall(id="c2", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": "task two"}),
+            ToolCall(id="c2", name="dispatch_subagent", arguments={"subagent_name": "worker", "task": _handoff_spec("task two")}),
             policy,
         )
         if not r2.ok:
@@ -1438,14 +1553,14 @@ def check_dispatch_pool() -> None:
             fail(f"expected message history to grow across both calls, got {len(worker_record.messages)}")
 
         r3 = tool.execute(
-            ToolCall(id="c3", name="dispatch_subagent", arguments={"subagent_name": "helper", "task": "task three"}),
+            ToolCall(id="c3", name="dispatch_subagent", arguments={"subagent_name": "helper", "task": _handoff_spec("task three")}),
             policy,
         )
         if not r3.ok or tool.pool.get("helper") is worker_record:
             fail("expected a different name to create an isolated second subagent")
 
         r4 = tool.execute(
-            ToolCall(id="c4", name="dispatch_subagent", arguments={"subagent_name": "third", "task": "x"}), policy
+            ToolCall(id="c4", name="dispatch_subagent", arguments={"subagent_name": "third", "task": _handoff_spec("x")}), policy
         )
         if r4.ok or len(tool.pool) != 2:
             fail("expected max_subagents to be enforced once the limit is reached")
@@ -1468,7 +1583,9 @@ def check_session_agent_identity_and_subagent_resume() -> None:
                         leader_provider=provider,
                         subagent_provider=child_provider,
                         repo_root=str(ws.root),
-                        subagent_specs={"explorer": _spec(ws.root, "explorer")},
+                        subagent_specs={"explorer": _spec(
+                            ws.root, "explorer", tool_names=leader_module.EXPLORER_TOOL_NAMES,
+                        )},
                     ),
                     store,
                 )
@@ -1541,7 +1658,9 @@ def check_forgotten_subagents_stay_forgotten() -> None:
                     leader_provider=parent_provider,
                     subagent_provider=child_provider,
                     repo_root=str(ws.root),
-                    subagent_specs={name: _spec(ws.root, name) for name in names},
+                    subagent_specs={name: _spec(
+                        ws.root, name, tool_names=leader_module.EXPLORER_TOOL_NAMES,
+                    ) for name in names},
                 ),
                 session,
             )
@@ -1706,7 +1825,7 @@ def check_typed_event_lifecycle() -> None:
                             ToolCall(
                                 id="lc1",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "researcher", "task": "why blue?"},
+                                arguments={"subagent_name": "researcher", "task": _handoff_spec("why blue?")},
                             )
                         ],
                     )
@@ -1718,6 +1837,7 @@ def check_typed_event_lifecycle() -> None:
             leader_provider=status_leader_provider,
             subagent_provider=status_subagent_provider,
             repo_root=str(root),
+            leader_policy=ws.policy,
             events=status_events,
         )
         Leader(status_config).run("why is the sky blue?")
@@ -1810,7 +1930,7 @@ def check_subagent_failure_events() -> None:
                             ToolCall(
                                 id="failed-dispatch",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "broken", "task": "fail"},
+                                arguments={"subagent_name": "broken", "task": _handoff_spec("fail")},
                             )
                         ],
                     )
@@ -1947,7 +2067,7 @@ def check_subagent_max_turns() -> None:
                             ToolCall(
                                 id="exhausted-dispatch",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "limited", "task": "list forever"},
+                                arguments={"subagent_name": "limited", "task": _handoff_spec("list forever")},
                             )
                         ],
                     )
@@ -2019,7 +2139,7 @@ def check_fresh_run_subagents() -> None:
                             ToolCall(
                                 id="pool-first",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "first"},
+                                arguments={"subagent_name": "worker", "task": _handoff_spec("first")},
                             )
                         ],
                     )
@@ -2032,7 +2152,7 @@ def check_fresh_run_subagents() -> None:
                             ToolCall(
                                 id="pool-second",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "second"},
+                                arguments={"subagent_name": "worker", "task": _handoff_spec("second")},
                             )
                         ],
                     )
@@ -2045,7 +2165,7 @@ def check_fresh_run_subagents() -> None:
                             ToolCall(
                                 id="pool-third",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "third"},
+                                arguments={"subagent_name": "worker", "task": _handoff_spec("third")},
                             )
                         ],
                     )
@@ -2090,7 +2210,7 @@ def check_pool_reset() -> None:
                             ToolCall(
                                 id="pool-first",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "first"},
+                                arguments={"subagent_name": "worker", "task": _handoff_spec("first")},
                             )
                         ],
                     )
@@ -2103,7 +2223,7 @@ def check_pool_reset() -> None:
                             ToolCall(
                                 id="pool-second",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "second"},
+                                arguments={"subagent_name": "worker", "task": _handoff_spec("second")},
                             )
                         ],
                     )
@@ -2116,7 +2236,7 @@ def check_pool_reset() -> None:
                             ToolCall(
                                 id="pool-third",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "worker", "task": "third"},
+                                arguments={"subagent_name": "worker", "task": _handoff_spec("third")},
                             )
                         ],
                     )
@@ -3003,7 +3123,10 @@ def check_leader_streaming() -> None:
         child_provider = FakeModelProvider(streams=[
             [TextDelta("chi"), TextDelta("ld"), StreamCompleted(ModelResponse(Message(Role.ASSISTANT, "")))],
         ])
-        leader = Leader(LeaderConfig(leader_provider, child_provider, str(ws.root), events=sink, stream=True))
+        leader = Leader(LeaderConfig(
+            leader_provider, child_provider, str(ws.root), events=sink, stream=True,
+            subagent_tool_names=leader_module.EXPLORER_TOOL_NAMES,
+        ))
         result = leader.run("delegate")
         child = result.subagents.get("worker")
         if child is None or "dispatch_subagent" in child.agent._tools:
@@ -3159,7 +3282,7 @@ def check_anthropic_subagent_tool_schemas() -> None:
                                 "type": "tool_use",
                                 "id": "c1",
                                 "name": "dispatch_subagent",
-                                "input": {"subagent_name": "researcher", "task": "read a.txt"},
+                                "input": {"subagent_name": "researcher", "task": _handoff_spec("read a.txt")},
                             }
                         ],
                         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -3237,7 +3360,7 @@ def check_subagent_tool_subsets() -> None:
                                 "name": "dispatch_subagent",
                                 "input": {
                                     "subagent_name": "reader",
-                                    "task": "inspect a.txt",
+                                    "task": _handoff_spec("inspect a.txt"),
                                 },
                             }
                         ],
@@ -3388,7 +3511,7 @@ def check_openai_compatible_tool_schemas() -> None:
                                             "function": {
                                                 "name": "dispatch_subagent",
                                                 "arguments": json.dumps(
-                                                    {"subagent_name": "researcher", "task": "read a.txt"}
+                                                    {"subagent_name": "researcher", "task": _handoff_spec("read a.txt")}
                                                 ),
                                             },
                                         }
@@ -3535,7 +3658,10 @@ def check_outside_changes_reach_leader_and_subagents() -> None:
 
         specs = {
             "leader": _spec(ws.root, "leader", memory=MemorySettings(enabled=False)),
-            "explorer": _spec(ws.root, "explorer", memory=MemorySettings(enabled=False)),
+            "explorer": _spec(
+                ws.root, "explorer", memory=MemorySettings(enabled=False),
+                tool_names=leader_module.EXPLORER_TOOL_NAMES,
+            ),
         }
         leader = Leader(LeaderConfig(
             leader_provider=leader_provider,
@@ -3582,7 +3708,7 @@ def check_routine_roles_use_the_routine_model() -> None:
     def dispatch_models(*, model_override=None, named_explorer_model=None):
         calls = [
             ToolCall(f"call-{name}", "dispatch_subagent", {
-                "subagent_name": name, "task": f"inspect {name}",
+                "subagent_name": name, "task": _handoff_spec(f"inspect {name}"),
             })
             for name in ("explorer", "worker", "planner")
         ]
@@ -3594,7 +3720,7 @@ def check_routine_roles_use_the_routine_model() -> None:
             [ModelResponse(Message(Role.ASSISTANT, "done"))],
             "gpt-6.1-sol" if model_override is None else model_override,
         )
-        policy = PermissionPolicy(Path.cwd())
+        policy = PermissionPolicy(Path.cwd(), shell_enabled=True, shell_allowlist=[()])
         specs = builtin_subagent_specs(
             child_provider,
             policy,
@@ -3609,6 +3735,7 @@ def check_routine_roles_use_the_routine_model() -> None:
             leader_provider=leader_provider,
             subagent_provider=child_provider,
             repo_root=str(Path.cwd()),
+            leader_policy=policy,
             subagent_specs=specs,
         ))
         leader.run("dispatch routine work")
@@ -3650,12 +3777,13 @@ def check_subagent_policy_is_narrowed() -> None:
         forbidden = PermissionPolicy(root / ".git")
         tighter_mode = PermissionPolicy(root, mode="ask")
         specs = {
-            "ceiling-denies": _spec(root, "ceiling-denies", policy=denied),
-            "leader-denies": _spec(root, "leader-denies", policy=allowed),
-            "outside": _spec(root, "outside", policy=outside),
-            "forbidden": _spec(root, "forbidden", policy=forbidden),
-            "tighter-mode": _spec(root, "tighter-mode", policy=tighter_mode),
-            "still-works": _spec(root, "still-works", policy=denied),
+            name: _spec(root, name, policy=spec_policy,
+                        tool_names=leader_module.EXPLORER_TOOL_NAMES)
+            for name, spec_policy in (
+                ("ceiling-denies", denied), ("leader-denies", allowed),
+                ("outside", outside), ("forbidden", forbidden),
+                ("tighter-mode", tighter_mode), ("still-works", denied),
+            )
         }
         ceiling_tool = DispatchSubagentTool(
             FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))]),
@@ -3805,7 +3933,10 @@ def check_child_token_isolation() -> None:
 @check("leader.dispatch_records_a_run")
 def check_dispatch_records_a_run() -> None:
     with workspace() as ws:
-        failing = DispatchSubagentTool(_RaisingProvider(), ws.policy)
+        failing = DispatchSubagentTool(
+            _RaisingProvider(), ws.policy,
+            subagent_tool_names=leader_module.EXPLORER_TOOL_NAMES,
+        )
         try:
             failing.execute(_dispatch("worker", "fail"), ws.policy)
         except RuntimeError:
@@ -3829,6 +3960,7 @@ def check_dispatch_records_a_run() -> None:
                     ModelResponse(Message(Role.ASSISTANT, "child"))
                 ]),
                 repo_root=str(ws.root),
+                subagent_tool_names=leader_module.EXPLORER_TOOL_NAMES,
             ),
             session=session,
         )
@@ -3867,12 +3999,14 @@ def check_child_context_seeding() -> None:
             ModelResponse(Message(Role.ASSISTANT, "done"))
         ])
         specs = {
-            "fresh": _spec(ws.root, "fresh", prompt="fresh prompt"),
+            "fresh": _spec(ws.root, "fresh", prompt="fresh prompt",
+                           tool_names=leader_module.EXPLORER_TOOL_NAMES),
             "all": _spec(
                 ws.root,
                 "all",
                 prompt="all prompt",
                 isolation=Isolation(inherit=ContextInheritance.ALL),
+                tool_names=leader_module.EXPLORER_TOOL_NAMES,
             ),
             "tail": _spec(
                 ws.root,
@@ -3881,6 +4015,7 @@ def check_child_context_seeding() -> None:
                 isolation=Isolation(
                     inherit=ContextInheritance.TAIL, inherit_tail=1
                 ),
+                tool_names=leader_module.EXPLORER_TOOL_NAMES,
             ),
         }
         parent_run = new_agent_run(_spec(ws.root, "leader"))
@@ -3927,7 +4062,8 @@ def check_dispatch_holds_a_lease() -> None:
         observing = _LeaseObservingProvider(leases, "work")
         specs = {
             "worker": _spec(
-                ws.root, "worker", isolation=Isolation(workspace_prefix="work")
+                ws.root, "worker", isolation=Isolation(workspace_prefix="work"),
+                tool_names=leader_module.EXPLORER_TOOL_NAMES,
             )
         }
         tool = DispatchSubagentTool(
@@ -3970,7 +4106,9 @@ def check_max_depth_is_enforced() -> None:
         tool = DispatchSubagentTool(
             FakeModelProvider(),
             ws.policy,
-            subagent_specs={"leaf": _spec(ws.root, "leaf", max_depth=0)},
+            subagent_specs={"leaf": _spec(
+                ws.root, "leaf", max_depth=0, tool_names=leader_module.EXPLORER_TOOL_NAMES,
+            )},
             dispatching_depth=0,
         )
         result = tool.execute(_dispatch("leaf", "recurse"), ws.policy)
@@ -3993,8 +4131,10 @@ def check_typed_subagent_output() -> None:
             }
         )
         specs = {
-            "valid": _spec(ws.root, "valid", io=schema),
-            "invalid": _spec(ws.root, "invalid", io=schema),
+            "valid": _spec(ws.root, "valid", io=schema,
+                           tool_names=leader_module.EXPLORER_TOOL_NAMES),
+            "invalid": _spec(ws.root, "invalid", io=schema,
+                             tool_names=leader_module.EXPLORER_TOOL_NAMES),
         }
         provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, '{"answer":"yes"}')),
@@ -4044,8 +4184,131 @@ def check_default_spec_reports_actual_tools() -> None:
         leader = Leader(LeaderConfig(FakeModelProvider(), FakeModelProvider(), str(ws.root)))
         actual = set(leader._agent._tools)
         reported = set(leader._leader_spec.tool_names or ())
-        if actual != {"dispatch_subagent", *standard_tool_registry()} or reported != actual:
+        expected = {"dispatch_subagent", *standard_tool_registry()}
+        expected.difference_update({"write_file", "edit_file", "multi_edit_file", "run_shell", "job_output", "job_stop"})
+        if leader_module._sandbox_available():
+            expected.add("run_shell")
+        if actual != expected or reported != actual:
             fail(f"leader spec did not report its actual dispatch and standard tools: {reported!r}, {actual!r}")
+
+
+@check("leader.never_has_edit_tools")
+def check_leader_never_has_edit_tools() -> None:
+    editing = {"write_file", "edit_file", "multi_edit_file"}
+    with workspace() as ws:
+        provider = FakeModelProvider()
+        defined = replace(
+            _spec(ws.root, "leader", policy=ws.policy),
+            tool_names=("write_file", "edit_file", "multi_edit_file", "read_file"),
+        )
+        leader = Leader(LeaderConfig(
+            provider, FakeModelProvider(), str(ws.root),
+            subagent_specs={"leader": defined},
+        ))
+        if editing.intersection(leader._agent._tools):
+            fail(f"defined leader retained edit tools: {leader._agent._tools!r}")
+        stage = replace(defined, name="implementer")
+        loop_leader = Leader(LeaderConfig(
+            FakeModelProvider(), FakeModelProvider(), str(ws.root),
+            subagent_specs={"leader": stage},
+        ))
+        if not editing.issubset(loop_leader._agent._tools):
+            fail(f"loop implement stage lost its edit tools: {loop_leader._agent._tools!r}")
+
+
+@check("leader.shell_is_confined_to_temporary_directories")
+def check_leader_shell_is_confined_to_temporary_directories() -> None:
+    if not leader_module._sandbox_available():
+        print("SKIP: shell sandbox is unavailable")
+        return
+    with (tempfile.TemporaryDirectory(dir="/private/var/tmp", prefix="symphonai-project-") as project,
+          tempfile.TemporaryDirectory(prefix="symphonai-leader-") as temporary):
+        root = Path(project).resolve()
+        ws = Workspace(
+            root=root,
+            outside=Path(temporary).resolve(),
+            policy=PermissionPolicy(
+                repo_root=root, allowed_write_scope=[root],
+                shell_enabled=True, shell_allowlist=[()],
+            ),
+            tools=standard_tool_registry(),
+        )
+        ws.policy.allowed_write_scope = [ws.root]
+        scratch = Path(temporary) / "leader.txt"
+        blocked = ws.root / "leader-blocked.txt"
+        leader_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "tmp-write", "run_shell", {"command": f"printf safe > {scratch}"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "project-write", "run_shell", {"command": f"printf blocked > {blocked}"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch(
+                "implementer", _handoff_spec(
+                    "Create child outputs", "test -f child-shell.txt && test -f child-file.txt"
+                ), "child-dispatch",
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "finished")),
+        ])
+        child_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "child-shell", "run_shell", {"command": "printf shell > child-shell.txt"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "child-file", "write_file", {"path": "child-file.txt", "content": "file\n"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "outputs created")),
+        ])
+        leader = Leader(LeaderConfig(
+            leader_provider, child_provider, str(ws.root), leader_policy=ws.policy,
+        ))
+        run_result = leader.run("hand off the changes")
+        results = [
+            message.tool_result for message in run_result.leader_messages
+            if message.tool_result is not None
+        ]
+        if not scratch.is_file() or blocked.exists():
+            fail(f"leader shell could not write to temp or changed the project: {results!r}")
+        if not (ws.root / "child-shell.txt").is_file() or not (ws.root / "child-file.txt").is_file():
+            fail("implementer did not retain project shell and write tools")
+        if len(results) < 3 or results[0].ok is False or results[1].ok is True:
+            fail(f"leader shell confinement did not hold: {results!r}")
+        expected_leader_message = (
+            "the leader's shell can write only to temporary directories; "
+            "changes go to an implementer with a spec"
+        )
+        if expected_leader_message not in (results[1].error or ""):
+            fail(f"leader shell denial did not explain its restriction: {results[1]!r}")
+        leader_policy = replace(ws.policy, shell_sandbox=True, sandbox_write_scope=[])
+        child_policy = replace(ws.policy, shell_sandbox=True, sandbox_write_scope=[ws.root])
+        if shell_module._sandbox_denial_message(leader_policy, "write to project") != expected_leader_message:
+            fail("leader sandbox denial wording changed")
+        if shell_module._sandbox_denial_message(child_policy, "write to project") != "blocked by the sandbox: write to project":
+            fail("subagent sandbox denial wording changed")
+
+
+@check("leader.no_sandbox_removes_leader_shell_only")
+def check_no_sandbox_removes_leader_shell_only() -> None:
+    with workspace() as ws, mock.patch(
+        "symphonai_api.leader._sandbox_available", return_value=False,
+    ):
+        provider = _RecordingFakeProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        jobs = JobManager()
+        leader = Leader(LeaderConfig(
+            provider, provider, str(ws.root), jobs=jobs, leader_policy=ws.policy,
+        ))
+        if {"run_shell", "job_output", "job_stop"}.intersection(leader._agent._tools):
+            fail(f"leader retained shell or background tools without a sandbox: {leader._agent._tools!r}")
+        leader._dispatch_tool._set_event_context(
+            agent_id=leader.agent_ref.agent_id, run_id="run-test", turn_id=None,
+        )
+        result = leader._dispatch_tool.execute(
+            _dispatch("implementer", _handoff_spec("Inspect", "true")), ws.policy,
+        )
+        child = leader._dispatch_tool.pool.get("implementer")
+        if not result.ok or child is None or "run_shell" not in child.agent._tools:
+            fail(f"no-sandbox leader restriction leaked to its implementer: {result!r}")
+        jobs.close()
 
 
 @check("leader.search_roster_dispatch")
@@ -4190,14 +4453,19 @@ def check_mcp_tools_follow_subagent_allowlist() -> None:
             return "mcp__fs__write"
 
     with workspace() as ws:
-        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")) for _ in range(10)
+        ])
         extra = {"mcp__fs__write": ExtraTool()}
         roster = {
-            "default": _spec(ws.root, "default"),
+            "default": _spec(ws.root, "default", tool_names=leader_module.EXPLORER_TOOL_NAMES),
             "limited": _spec(ws.root, "limited").with_overrides(tool_names=("read_file",), mcp_tool_names=()),
             "named": _spec(ws.root, "named").with_overrides(tool_names=("read_file",), mcp_tool_names=("mcp__fs__write",)),
             "mcp_only": _spec(ws.root, "mcp_only").with_overrides(tool_names=(), mcp_tool_names=("mcp__fs__write",)),
-            "missing": _spec(ws.root, "missing").with_overrides(mcp_tool_names=("mcp__nope__x",)),
+            "missing": _spec(ws.root, "missing").with_overrides(
+                tool_names=leader_module.EXPLORER_TOOL_NAMES,
+                mcp_tool_names=("mcp__nope__x",),
+            ),
         }
         dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs=roster, extra_tools=extra)
         for name, expected in (("default", True), ("limited", False), ("named", True), ("mcp_only", True)):
@@ -4227,7 +4495,10 @@ def check_subagent_input_contract() -> None:
     with workspace() as ws:
         provider = _RecordingFakeProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
         schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
-        spec = replace(_spec(ws.root, "typed"), io=IOContract(input_schema=schema))
+        spec = replace(
+            _spec(ws.root, "typed", tool_names=leader_module.EXPLORER_TOOL_NAMES),
+            io=IOContract(input_schema=schema),
+        )
         dispatch = DispatchSubagentTool(provider, ws.policy, subagent_specs={"typed": spec})
         for task in ("fix a.py", '{"file":1}'):
             result = dispatch.execute(_dispatch("typed", task), ws.policy)
@@ -4258,7 +4529,7 @@ def check_pause_resume_gate() -> None:
         leader_provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch", "dispatch_subagent", {
-                    "subagent_name": "worker", "task": "inspect",
+                    "subagent_name": "worker", "task": _handoff_spec("inspect"),
                 },
             )])),
             ModelResponse(Message(Role.ASSISTANT, "leader complete")),
@@ -4325,7 +4596,7 @@ def check_redirects_reach_next_requests() -> None:
         leader_provider = _ControlProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch", "dispatch_subagent", {
-                    "subagent_name": "worker", "task": "inspect",
+                    "subagent_name": "worker", "task": _handoff_spec("inspect"),
                 },
             )])),
             ModelResponse(Message(Role.ASSISTANT, "leader complete")),
@@ -4435,7 +4706,7 @@ def check_stop_subagent_is_local() -> None:
         leader_provider = FakeModelProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch", "dispatch_subagent", {
-                    "subagent_name": "worker", "task": "inspect",
+                    "subagent_name": "worker", "task": _handoff_spec("inspect"),
                 },
             )])),
             ModelResponse(Message(Role.ASSISTANT, "leader continued")),
@@ -4492,8 +4763,10 @@ def check_memory_registry_and_seeding() -> None:
             "enabled",
             prompt="enabled prompt",
             memory=MemorySettings(enabled=True, max_entries=1),
+            tool_names=leader_module.EXPLORER_TOOL_NAMES,
         )
-        disabled = _spec(ws.root, "disabled", prompt="disabled prompt")
+        disabled = _spec(ws.root, "disabled", prompt="disabled prompt",
+                         tool_names=leader_module.EXPLORER_TOOL_NAMES)
         provider = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, "enabled done")),
             ModelResponse(Message(Role.ASSISTANT, "disabled done")),
@@ -4626,6 +4899,7 @@ def check_memory_requires_store() -> None:
         child_spec = _spec(
             ws.root, "reviewer", prompt="child prompt",
             memory=MemorySettings(enabled=True),
+            tool_names=leader_module.EXPLORER_TOOL_NAMES,
         )
         child_provider = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, "child done")),
@@ -4688,6 +4962,7 @@ def check_memory_shared_scope_round_trip() -> None:
             ws.root,
             "reviewer",
             memory=MemorySettings(enabled=True),
+            tool_names=leader_module.EXPLORER_TOOL_NAMES,
         )
         writing = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
@@ -4729,6 +5004,7 @@ def check_memory_shared_scope_round_trip() -> None:
             ws.root,
             "analyzer",
             memory=MemorySettings(enabled=True),
+            tool_names=leader_module.EXPLORER_TOOL_NAMES,
         )
         shared_provider = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, "isolated")),
@@ -4753,6 +5029,7 @@ def check_memory_failures_do_not_fail_run() -> None:
             "reviewer",
             prompt="review prompt",
             memory=MemorySettings(enabled=True),
+            tool_names=leader_module.EXPLORER_TOOL_NAMES,
         )
         oversized = "x" * (MAX_ENTRY_CHARS + 1)
         store = AgentMemory(ws.root / "memory")
@@ -4768,7 +5045,9 @@ def check_memory_failures_do_not_fail_run() -> None:
             subagent_specs={"reviewer": spec},
             memory=store,
         )
-        result = limited.execute(_dispatch("reviewer", "review", "limited"), ws.policy)
+        result = limited.execute(
+            _dispatch("reviewer", "review", "limited", needs_validation=False), ws.policy,
+        )
         tool_results = [
             message.tool_result
             for message in limited_provider.requests[1].messages
@@ -4786,42 +5065,48 @@ def check_memory_failures_do_not_fail_run() -> None:
         unavailable_root = ws.root / "unavailable-memory"
         unavailable_root.mkdir()
         unavailable = AgentMemory(unavailable_root)
-        original_mode = unavailable_root.stat().st_mode
-        unavailable_root.chmod(0o500)
-        try:
-            unavailable_provider = _RecordingFakeProvider([
-                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-                    "unavailable", "remember", {"text": "durable lesson"},
-                )])),
-                ModelResponse(Message(Role.ASSISTANT, "continued")),
-            ])
-            dispatch = DispatchSubagentTool(
-                unavailable_provider,
+        unavailable_provider = _RecordingFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "unavailable", "remember", {"text": "durable lesson"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "continued")),
+        ])
+        dispatch = DispatchSubagentTool(
+            unavailable_provider,
+            ws.policy,
+            subagent_specs={"reviewer": spec},
+            memory=unavailable,
+        )
+        original_write_text = Path.write_text
+
+        def fail_unavailable_path(path, *args, **kwargs):  # noqa: ANN001
+            if path.is_relative_to(unavailable_root):
+                raise PermissionError("read-only test fixture")
+            return original_write_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", autospec=True, side_effect=fail_unavailable_path):
+            result = dispatch.execute(
+                _dispatch("reviewer", "review", "unavailable", needs_validation=False),
                 ws.policy,
-                subagent_specs={"reviewer": spec},
-                memory=unavailable,
             )
-            result = dispatch.execute(_dispatch("reviewer", "review", "unavailable"), ws.policy)
-            unavailable_results = [
-                message.tool_result
-                for message in unavailable_provider.requests[1].messages
-                if message.tool_result is not None
-            ]
-            initial = [message.text for message in unavailable_provider.requests[0].messages]
-            if (
-                not result.ok
-                or len(unavailable_results) != 1
-                or unavailable_results[0].ok
-                or not any("review prompt" == text for text in initial)
-                or not any(text == "review" for text in initial)
-                or not any(MEMORY_GUIDE in text for text in initial)
-            ):
-                fail(
-                    "unavailable memory did not degrade to an empty seed and failed tool: "
-                    f"{result!r}, {initial!r}, {unavailable_results!r}"
-                )
-        finally:
-            unavailable_root.chmod(original_mode)
+        unavailable_results = [
+            message.tool_result
+            for message in unavailable_provider.requests[1].messages
+            if message.tool_result is not None
+        ]
+        initial = [message.text for message in unavailable_provider.requests[0].messages]
+        if (
+            not result.ok
+            or len(unavailable_results) != 1
+            or unavailable_results[0].ok
+            or not any("review prompt" == text for text in initial)
+            or not any(text == "review" for text in initial)
+            or not any(MEMORY_GUIDE in text for text in initial)
+        ):
+            fail(
+                "unavailable memory did not degrade to an empty seed and failed tool: "
+                f"{result!r}, {initial!r}, {unavailable_results!r}"
+            )
 
 
 @check("leader.checkpoint_subagent")
@@ -4955,7 +5240,7 @@ def check_leader_only_tools() -> None:
         leader_provider = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                 "dispatch-worker", "dispatch_subagent",
-                {"subagent_name": "worker", "task": "inspect"},
+                {"subagent_name": "worker", "task": _handoff_spec("inspect")},
             )])),
             ModelResponse(Message(Role.ASSISTANT, "finished")),
         ])
@@ -5011,7 +5296,8 @@ class _ParallelWorktreeProvider(FakeModelProvider):
     def create_response(self, request: ModelRequest, *, cancel=None) -> ModelResponse:
         if not hasattr(self.local, "name"):
             task = next(message.text for message in reversed(request.messages) if message.role is Role.USER)
-            self.local.name = task.rsplit(" ", 1)[-1]
+            goal = task.split("## Goal\n", 1)[-1].splitlines()[0]
+            self.local.name = goal.rsplit(" ", 1)[-1]
             self.local.step = 0
             self.barrier.wait(timeout=4)
             name = self.local.name
@@ -5041,7 +5327,9 @@ def _worktree_leader(
     memory: AgentMemory | None = None,
     max_subagents: int | None = None,
 ) -> tuple[Leader, _RecordingFakeProvider]:
-    policy = PermissionPolicy(root, allowed_write_scope=[root])
+    policy = PermissionPolicy(
+        root, allowed_write_scope=[root], shell_enabled=True, shell_allowlist=[()],
+    )
     specs = {
         name: _spec(
             root,
@@ -5055,7 +5343,7 @@ def _worktree_leader(
         ToolCall(
             f"dispatch-{name}",
             "dispatch_subagent",
-            {"subagent_name": name, "task": f"write file for {name}", "isolation": "worktree"},
+            {"subagent_name": name, "task": _handoff_spec(f"write file for {name}"), "isolation": "worktree"},
         )
         for name in names
     ]
@@ -5149,7 +5437,7 @@ def check_shared_dispatches_remain_serial() -> None:
         policy = PermissionPolicy(root)
         provider = SerialProvider()
         shared_calls = [
-            ToolCall(f"shared-{name}", "dispatch_subagent", {"subagent_name": name, "task": "inspect"})
+            ToolCall(f"shared-{name}", "dispatch_subagent", {"subagent_name": name, "task": _handoff_spec("inspect")})
             for name in ("a", "b")
         ]
         leader_provider = _RecordingFakeProvider([
@@ -5203,7 +5491,7 @@ def check_same_name_parallel_dispatch_is_refused() -> None:
         leader, _ = _worktree_leader(root, ("a",), BlockingProvider(), session=session)
         calls = [
             ToolCall(f"duplicate-{index}", "dispatch_subagent", {
-                "subagent_name": "a", "task": f"duplicate {index}", "isolation": "worktree",
+                "subagent_name": "a", "task": _handoff_spec(f"duplicate {index}"), "isolation": "worktree",
             })
             for index in (1, 2)
         ]
@@ -5280,7 +5568,8 @@ def check_control_one_parallel_child() -> None:
             def create_response(self, request, *, cancel=None):  # noqa: ANN001
                 if not hasattr(self.local, "name"):
                     task = next(message.text for message in reversed(request.messages) if message.role is Role.USER)
-                    self.local.name = task.rsplit(" ", 1)[-1]
+                    goal = task.split("## Goal\n", 1)[-1].splitlines()[0]
+                    self.local.name = goal.rsplit(" ", 1)[-1]
                     name = self.local.name
                     return ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
                         f"write-{name}", "write_file", {
@@ -5356,7 +5645,7 @@ def check_spec_workflow_prompts() -> None:
             "explorer": "Read-only. Answers one specific question about the code, with path:line evidence. Ask one well-scoped question per explorer, and dispatch several at once for independent questions. Rely on what it reports reading; check yourself only what your change depends on.",
             "worker": "Makes one well-defined change and verifies it. Name the files it owns and the outcome you need, and tell it when other agents are editing nearby. Give it work that can proceed on its own; a small edit is faster to make yourself.",
             "planner": "Writes implementation specs for a goal. Give it the goal, the constraints, and where to write the specs.",
-            "implementer": "Implements one spec exactly and reports with evidence. Give it the spec and the path for its report.",
+            "implementer": "Implements one spec exactly and reports with evidence. Give it the spec in the task: Goal, Scope, Context, Contract, Acceptance criteria, and a Validation section the host will run.",
             "reviewer": "Looks for what is wrong with a change and writes follow-up specs for its findings. Give it the spec, the report and the diff, or where to find them.",
         }
         if ROLE_GUIDANCE != expected_guidance:
@@ -5377,7 +5666,9 @@ def check_spec_workflow_prompts() -> None:
 @check("leader.spec_workflow_prompt_reaches_child")
 def check_spec_workflow_prompt_reaches_child() -> None:
     with workspace() as ws:
-        provider = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
+        provider = FakeModelProvider([
+            ModelResponse(Message(Role.ASSISTANT, "done")) for _ in range(5)
+        ])
         roster = builtin_subagent_specs(provider, ws.policy)
         for name in ("worker", "explorer", "planner", "implementer", "reviewer"):
             requests = []
@@ -5477,17 +5768,26 @@ def check_role_prompt_additions() -> None:
                 provider, ws.policy, EventBroker(), sessions_root=ws.root / "sessions",
                 base_prompt=LEADER_BASE_PROMPT, subagent_base_prompt=SUBAGENT_BASE_PROMPT,
             )
+            host.select_mode("allow")
             session = SessionStore(ws.root / "sessions", "role-additions", repo_root=ws.root)
             try:
                 leader = host._new_leader(session)
                 worker_prompt = leader._dispatch_tool._subagent_specs["worker"].prompt
+                leader._dispatch_tool._subagent_specs["worker"] = (
+                    leader._dispatch_tool._subagent_specs["worker"].with_overrides(
+                        policy_ceiling=ws.policy,
+                    )
+                )
                 if "USER WORKER" not in worker_prompt or "PROJECT WORKER" not in worker_prompt:
                     fail(f"worker additions missing from dispatched role prompt: {worker_prompt!r}")
                 leader._dispatch_tool._set_event_context(
                     agent_id="leader", run_id="role-additions", turn_id="turn"
                 )
                 with mock.patch.object(provider, "create_response", wraps=provider.create_response) as response:
-                    result = leader._dispatch_tool.execute(_dispatch("worker", "inspect", "worker"), ws.policy)
+                    result = leader._dispatch_tool.execute(
+                        _dispatch("worker", _handoff_spec("Inspect", "pwd"), "worker"),
+                        ws.policy,
+                    )
                 requests = [call.args[0] for call in response.call_args_list]
                 system = next(
                     (message.text for message in requests[0].messages if message.role is Role.SYSTEM),
@@ -5501,7 +5801,7 @@ def check_role_prompt_additions() -> None:
                 )
                 positions = [system.find(layer) for layer in ordered_layers]
                 if not result.ok or any(position < 0 for position in positions) or positions != sorted(positions):
-                    fail(f"worker system prompt layers were missing or out of order: {positions!r}, {system!r}")
+                    fail(f"worker system prompt layers were missing or out of order: {positions!r}, {system!r}, result={result!r}")
                 if "USER LEADER" not in leader._leader_prompt or "USER WORKER" in leader._leader_prompt:
                     fail("leader prompt did not isolate its own addition")
                 meta = session.read_meta()

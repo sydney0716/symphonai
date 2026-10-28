@@ -13,10 +13,11 @@ from symphonai_api.events import CollectingSink, RunFailed, RunFinished
 from symphonai_api.identity import AgentRef, RunRef, TurnRef
 from symphonai_api.leader import Leader, LeaderConfig
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import run_task
 from scripts.checks.harness import check, fail
-from scripts.checks.workspace import workspace
+from scripts.checks.workspace import handoff_spec, workspace
 
 
 def _response(
@@ -360,6 +361,8 @@ def check_stop_answers_every_tool_call() -> None:
 @check("budget.subagents_have_their_own")
 def check_subagents_have_their_own() -> None:
     with workspace() as ws:
+        ws.policy.shell_enabled = True
+        ws.policy.shell_allowlist = [()]
         leader_provider = FakeModelProvider(
             [
                 ModelResponse(
@@ -369,12 +372,12 @@ def check_subagents_have_their_own() -> None:
                             ToolCall(
                                 id="dispatch-a",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "a", "task": "exhaust"},
+                                arguments={"subagent_name": "a", "task": handoff_spec("exhaust")},
                             ),
                             ToolCall(
                                 id="dispatch-b",
                                 name="dispatch_subagent",
-                                arguments={"subagent_name": "b", "task": "finish"},
+                                arguments={"subagent_name": "b", "task": handoff_spec("finish")},
                             ),
                         ],
                     )
@@ -397,6 +400,10 @@ def check_subagents_have_their_own() -> None:
                 leader_provider=leader_provider,
                 subagent_provider=subagent_provider,
                 repo_root=str(ws.root),
+                leader_policy=PermissionPolicy(
+                    ws.root, shell_enabled=True, shell_allowlist=[()],
+                ),
+                subagent_tool_names=("read_file",),
                 subagent_budget=RunBudget(max_total_tokens=10),
             )
         ).run("dispatch both")

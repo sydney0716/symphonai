@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import threading
 import time
@@ -10,10 +11,12 @@ from dataclasses import fields
 from pathlib import Path
 
 from symphonai_api.events import CollectingSink, PermissionDenied, PermissionRequested
+from symphonai_api.agent_spec import AgentSpec, ModelSelector
 from symphonai_api.config import CapabilityCeiling
-from symphonai_api.models import ToolCall
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import (
     ApprovalOutcome,
+    ALWAYS_DENY_COMMANDS,
     DENIAL_OUTCOMES,
     DenialReason,
     PermissionDecision,
@@ -21,9 +24,16 @@ from symphonai_api.permissions import (
     ToolApprovalRequest,
     shell_grant_prefix,
 )
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.session import SessionStore
+from symphonai_api.leader import DispatchSubagentTool
 from symphonai_api.tools.edit import EditFileTool
 from symphonai_api.tools.filesystem import ReadFileTool, WriteFileTool
 from symphonai_api.tools.read_ledger import ReadLedger
+from symphonai_api.tools.shell import RunShellTool, _sandbox_available
+from symphonai_api.extensions import load_extensions
+from symphonai_host.broker import EventBroker
+from symphonai_host.run import HostRun
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 
@@ -270,7 +280,7 @@ def check_command_line_policy() -> None:
         uncheckable = allow.check_shell(["sh", "-c", "echo $(id)"])
         expected_reason = (
             "this command uses shell syntax that cannot be checked "
-            "(command or process substitution, a subshell, a here-document, or a background job); "
+            "(command or process substitution, a subshell, or a background job); "
             "run it as simpler commands"
         )
         if (
@@ -318,6 +328,137 @@ def check_always_deny_precedes_shell_approval() -> None:
         decision = policy.check_shell(["rm", "-rf", "/"])
         if decision.allowed or requests:
             fail(f"always-denied command reached the approval callback: {decision!r}, {requests!r}")
+
+
+@check("permissions.user_can_lift_always_deny")
+def user_can_lift_always_deny() -> None:
+    from symphonai_api.extensions import load_extensions
+    from symphonai_host.broker import EventBroker
+    from symphonai_host.run import HostRun
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "repo"
+        home = Path(temporary) / "home"
+        root.mkdir()
+        (home / ".symphonai").mkdir(parents=True)
+        (home / ".symphonai" / "config.toml").write_text(
+            '[always_deny]\nlift = ["rm"]\n', encoding="utf-8",
+        )
+        extensions = load_extensions(repo_root=root, home=home)
+        policy = PermissionPolicy(
+            root, allowed_write_scope=[root], shell_enabled=True,
+            shell_allowlist=[()], shell_sandbox=_sandbox_available(),
+            sandbox_write_scope=[root],
+        )
+        run = HostRun(
+            None, policy, EventBroker(), extensions=extensions,
+            sessions_root=Path(temporary) / "sessions",
+            project_grants_root=home / "permissions",
+        )
+        try:
+            effective = run.policy
+            effective.mode = "allow"
+            if ("rm",) in effective.always_deny_commands:
+                fail("user-configured rm lift was not applied to the host base policy")
+            if ("mv",) not in effective.always_deny_commands:
+                fail("lifting rm also lifted the unrelated mv rule")
+            if not effective.check_shell(["rm", "scratch.txt"]).allowed:
+                fail("lifted rm was not allowed through the shell policy")
+            if not _sandbox_available():
+                print("SKIP: shell sandbox is unavailable; exercising the allowed run_shell without it")
+            scratch = root / "scratch.txt"
+            scratch.write_text("remove me", encoding="utf-8")
+            result = RunShellTool().execute(
+                ToolCall("rm-scratch", "run_shell", {"argv": ["rm", "scratch.txt"]}),
+                effective,
+            )
+            if not result.ok or scratch.exists():
+                fail(f"sandboxed run_shell did not remove scratch.txt: {result!r}")
+            moved = effective.check_shell(["mv", "a", "b"])
+            if moved.allowed or moved.denial is not DenialReason.ALWAYS_DENY:
+                fail(f"unlifted mv was not refused as always-deny: {moved!r}")
+        finally:
+            run.close()
+
+        default = PermissionPolicy(
+            root, shell_enabled=True, shell_allowlist=[()],
+        )
+        if default.always_deny_commands != ALWAYS_DENY_COMMANDS:
+            fail("the built-in always-deny list changed by default")
+        if default.check_shell(["rm", "scratch.txt"]).denial is not DenialReason.ALWAYS_DENY:
+            fail("rm is no longer denied when no user lift is configured")
+
+
+@check("permissions.subagents_keep_always_deny_lifts")
+def subagents_keep_always_deny_lifts() -> None:
+    from symphonai_api.worktree import remove_worktree
+
+    def git(root: Path, *arguments: str) -> None:
+        result = subprocess.run(
+            ["git", *arguments], cwd=root, capture_output=True, check=False, timeout=15,
+        )
+        if result.returncode:
+            fail(f"git {' '.join(arguments)} failed: {result.stderr.decode(errors='replace')}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        root = base / "repo"
+        root.mkdir()
+        git(root, "init", "--quiet")
+        git(root, "config", "user.email", "permissions-check@example.test")
+        git(root, "config", "user.name", "Permissions Check")
+        scratch = root / "scratch.txt"
+        scratch.write_text("remove me", encoding="utf-8")
+        git(root, "add", "scratch.txt")
+        git(root, "commit", "--quiet", "-m", "seed scratch")
+        lifted = tuple(command for command in ALWAYS_DENY_COMMANDS if command != ("rm",))
+        policy = PermissionPolicy(
+            root, allowed_write_scope=[root], shell_enabled=True,
+            shell_allowlist=[()], always_deny_commands=lifted,
+        )
+        session = SessionStore(base / "sessions", "lift-test", repo_root=root)
+
+        def dispatch(name: str, isolation: str | None = None):
+            provider = FakeModelProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    f"remove-{name}", "run_shell", {"argv": ["rm", "scratch.txt"]},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "removed")),
+            ])
+            spec = AgentSpec(
+                name=name, prompt="", model=ModelSelector("fake"),
+                policy_ceiling=policy, tool_names=("run_shell",),
+            )
+            tool = DispatchSubagentTool(
+                provider, policy, session=session, subagent_specs={name: spec},
+                subagent_max_turns=3,
+            )
+            arguments = {"subagent_name": name, "task": "remove scratch.txt"}
+            if isolation is not None:
+                arguments["isolation"] = isolation
+            result = tool.execute(
+                ToolCall(f"dispatch-{name}", "dispatch_subagent", arguments), policy,
+            )
+            return result, tool
+
+        try:
+            shared_result, shared_tool = dispatch("shared")
+            if not shared_result.ok or scratch.exists():
+                fail(f"dispatched shared subagent could not run rm: {shared_result!r}")
+            worktree_result, worktree_tool = dispatch("worker", "worktree")
+            record = worktree_tool.pool.get("worker")
+            worktree = None if record is None else record.worktree_path
+            if (not worktree_result.ok or worktree is None
+                    or (worktree / "scratch.txt").exists()):
+                fail(f"worktree subagent could not run rm: {worktree_result!r}, {worktree!r}")
+            if scratch.exists():
+                fail("worktree subagent changed the shared project")
+        finally:
+            session.close()
+            if "worktree_tool" in locals():
+                record = worktree_tool.pool.get("worker")
+                if record is not None and record.worktree_path is not None:
+                    remove_worktree(root, record.worktree_path)
 
 
 @check("permissions.read_inside_root")

@@ -116,6 +116,50 @@ def compaction_limit_validation() -> None:
             fail("invalid session compaction limit was accepted")
 
 
+@check("config.always_deny_lifts_are_user_only")
+def always_deny_lifts_are_user_only() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        repo_root.mkdir(parents=True)
+        user_path = _scope_path(Scope.USER, repo_root, home)
+        project_path = _scope_path(Scope.PROJECT, repo_root, home)
+        private_path = _scope_path(Scope.PRIVATE, repo_root, home)
+        _write(user_path, '[always_deny]\nlift = ["rm"]\n')
+        configured = load_config(repo_root=repo_root, home=home)
+        if (configured.get("always_deny.lift") != ["rm"]
+                or configured.scope_of("always_deny.lift") is not Scope.USER):
+            fail(f"user always-deny lift did not load with user provenance: {configured!r}")
+
+        for path in (project_path, private_path):
+            _write(path, '[always_deny]\nlift = ["rm"]\n')
+        scoped = load_config(repo_root=repo_root, home=home)
+        for path in (project_path, private_path):
+            if not any(str(path) in warning and "always_deny" in warning
+                       for warning in scoped.warnings):
+                fail(f"ignored always_deny warning omitted source or table: {scoped.warnings!r}")
+        if scoped.get("always_deny.lift") != ["rm"] or scoped.scope_of("always_deny.lift") is not Scope.USER:
+            fail("project or private config replaced the user always-deny lift")
+
+        for invalid in ("rm -rf", "python"):
+            _write(user_path, f'[always_deny]\nlift = ["{invalid}"]\n')
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError as exc:
+                if "always_deny.lift" not in str(exc) or invalid not in str(exc):
+                    fail(f"invalid always-deny lift error omitted key or value: {exc!r}")
+            else:
+                fail(f"invalid always-deny value was accepted: {invalid!r}")
+
+        _write(user_path, "")
+        try:
+            load_config(repo_root=repo_root, home=home, session={"always_deny": {"lift": ["rm"]}})
+        except ConfigError as exc:
+            if "always_deny" not in str(exc):
+                fail(f"session always-deny error omitted its table: {exc!r}")
+        else:
+            fail("session always-deny lifts were accepted")
+
+
 def _settings(value: str) -> str:
     return f'[agents]\ndirectory = "{value}"\n'
 

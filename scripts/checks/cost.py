@@ -19,7 +19,9 @@ from symphonai_api.cost import (
 from symphonai_api.leader import Leader, LeaderConfig
 from symphonai_api.models import Message, ModelRequest, ModelResponse, Role, ToolCall, Usage
 from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.permissions import PermissionPolicy
 from scripts.checks.harness import check, fail
+from scripts.checks.workspace import handoff_spec
 from scripts.checks.workspace import workspace
 
 
@@ -331,7 +333,7 @@ def check_leader_usage_per_agent() -> None:
                     tool_call=ToolCall(
                         id="dispatch-1",
                         name="dispatch_subagent",
-                        arguments={"subagent_name": "researcher", "task": "first"},
+                        arguments={"subagent_name": "researcher", "task": handoff_spec("first")},
                     ),
                 ),
                 _response(
@@ -340,7 +342,7 @@ def check_leader_usage_per_agent() -> None:
                     tool_call=ToolCall(
                         id="dispatch-2",
                         name="dispatch_subagent",
-                        arguments={"subagent_name": "researcher", "task": "second"},
+                        arguments={"subagent_name": "researcher", "task": handoff_spec("second")},
                     ),
                 ),
                 _response("done", input_tokens=30, output_tokens=3),
@@ -359,6 +361,10 @@ def check_leader_usage_per_agent() -> None:
                 leader_provider=leader_provider,
                 subagent_provider=subagent_provider,
                 repo_root=str(ws.root),
+                leader_policy=PermissionPolicy(
+                    ws.root, shell_enabled=True, shell_allowlist=[()],
+                ),
+                subagent_tool_names=("read_file",),
             )
         ).run("delegate twice")
 

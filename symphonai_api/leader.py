@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -97,6 +98,8 @@ from symphonai_api.providers.openai_provider import (
     ROUTINE_MODEL as OPENAI_ROUTINE_MODEL,
 )
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
+from symphonai_api.spec_text import spec_validation
+from symphonai_api.tools.shell import RunShellTool, _sandbox_available
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
     IMPLEMENTER_PROMPT,
@@ -117,6 +120,27 @@ from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
+
+
+def _run_handoff_validation(
+    commands: Sequence[str], policy: PermissionPolicy,
+) -> list[dict[str, object]]:
+    tool = RunShellTool()
+    results: list[dict[str, object]] = []
+    for index, command in enumerate(commands):
+        result = tool.execute(ToolCall(
+            id=f"handoff-validation-{index}",
+            name="run_shell",
+            arguments={"command": command},
+        ), policy)
+        error = result.error or ""
+        match = re.search(r"exit code (\d+)", error)
+        code = 0 if result.ok else int(match.group(1)) if match else 126
+        output = result.content or error
+        results.append({"command": command, "exit": code, "output": output[-4000:]})
+        if code != 0:
+            break
+    return results
 
 
 class AgentControlError(RuntimeError):
@@ -682,6 +706,23 @@ class DispatchSubagentTool(LocalTool):
                     f"{input_error}"
                 ),
             )
+        selected_tool_names = (
+            spec.tool_names if spec.tool_names is not None else self._subagent_tool_names
+        )
+        editable_tools = {"write_file", "edit_file", "multi_edit_file"}
+        can_edit = selected_tool_names is None or bool(
+            editable_tools.intersection(selected_tool_names)
+        )
+        validation_commands = spec_validation(task) if can_edit else []
+        if can_edit and not validation_commands:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=(
+                    "a change needs a spec with a ## Validation section "
+                    "holding one fenced sh block"
+                ),
+            )
         available_extra = self._extra_tools or {}
         named_mcp_tools = spec.mcp_tool_names
         if named_mcp_tools is not None:
@@ -1038,7 +1079,7 @@ class DispatchSubagentTool(LocalTool):
             with self._active_runs_lock:
                 if self._active_runs.get(record.agent_ref.agent_id) is child_run:
                     self._active_runs.pop(record.agent_ref.agent_id, None)
-            if record.worktree_path is None:
+            if record.worktree_path is None and not validation_commands:
                 with self._pool_lock:
                     record.running = False
             if child_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
@@ -1084,6 +1125,108 @@ class DispatchSubagentTool(LocalTool):
             record.usage_by_model[model] = record.usage_by_model.get(
                 model, UsageTotals()
             ).merged(usage)
+        validation_passed = not validation_commands
+        validation_evidence: list[dict[str, object]] = []
+        validation_round = 1
+        while (
+            validation_commands
+            and run_result.stopped_reason == "final_response"
+        ):
+            validation_evidence = _run_handoff_validation(
+                validation_commands, effective_policy
+            )
+            failed_check = next(
+                (item for item in validation_evidence if item["exit"] != 0), None
+            )
+            if failed_check is None:
+                validation_passed = True
+                break
+            if validation_round == 5:
+                break
+            record.messages.append(Message(
+                role=Role.USER,
+                content=(
+                    f"Validation failed (round {validation_round} of 5): "
+                    f"{failed_check['command']} exited {failed_check['exit']}\n"
+                    f"{str(failed_check['output'])[-4000:]}\n"
+                    "Fix the cause and finish again; do not edit the spec."
+                ),
+            ))
+            validation_round += 1
+            child_run = self._new_run(spec, record.agent_ref)
+            record.runs.append(child_run)
+            child_run.start(token)
+            pause_gate = PauseGate()
+            record.pause_gate = pause_gate
+            with self._active_runs_lock:
+                self._active_runs[record.agent_ref.agent_id] = child_run
+            retry_result = None
+            retry_failure: str | None = None
+            try:
+                if record.worktree_path is not None:
+                    retry_result = record.agent.run(
+                        record.messages,
+                        model=spec.model.model,
+                        effort=spec.model.effort,
+                        parent_run_id=(
+                            None if self._parent_run is None
+                            else self._parent_run.run.run_id
+                        ),
+                        cancel=token,
+                        run=child_run,
+                        pause=pause_gate,
+                        hooks=self._hooks,
+                    )
+                else:
+                    with self._leases.held(
+                        child_run.run.run_id, spec.isolation.workspace_prefix
+                    ):
+                        retry_result = record.agent.run(
+                            record.messages,
+                            model=spec.model.model,
+                            effort=spec.model.effort,
+                            parent_run_id=(
+                                None if self._parent_run is None
+                                else self._parent_run.run.run_id
+                            ),
+                            cancel=token,
+                            run=child_run,
+                            pause=pause_gate,
+                            hooks=self._hooks,
+                        )
+            except Exception as exc:
+                retry_failure = str(exc)
+                if record.worktree_path is None:
+                    raise
+            finally:
+                with self._active_runs_lock:
+                    if self._active_runs.get(record.agent_ref.agent_id) is child_run:
+                        self._active_runs.pop(record.agent_ref.agent_id, None)
+                if child_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
+                    if retry_result is None:
+                        if token.cancelled:
+                            child_run.cancel()
+                        else:
+                            child_run.fail(retry_failure or "subagent dispatch failed")
+                    elif retry_result.stopped_reason == "cancelled":
+                        child_run.cancel()
+                    else:
+                        if child_run.phase is RunPhase.PAUSED:
+                            child_run.resume()
+                            pause_gate.resume()
+                        child_run.finish(retry_result)
+            if retry_result is None:
+                failure = retry_failure or "validation retry failed"
+                break
+            run_result = retry_result
+            record.messages = run_result.messages
+            record.turns_used += run_result.turns_used
+            for model, usage in run_result.usage_by_model.items():
+                record.usage_by_model[model] = record.usage_by_model.get(
+                    model, UsageTotals()
+                ).merged(usage)
+        with self._pool_lock:
+            record.running = False
         if run_result.stopped_reason == "cancelled":
             if token.reason is CancelReason.PARENT:
                 with self._pool_lock:
@@ -1109,7 +1252,7 @@ class DispatchSubagentTool(LocalTool):
                 payload=payload,
             )
 
-        succeeded = run_result.stopped_reason == "final_response"
+        succeeded = run_result.stopped_reason == "final_response" and validation_passed
         output_error = None
         if succeeded and spec.io.output_schema is not None:
             _, output_error = validate_output(
@@ -1125,6 +1268,15 @@ class DispatchSubagentTool(LocalTool):
             error = output_error
         elif succeeded:
             error = None
+        elif validation_commands and not validation_passed:
+            last_failure = next(
+                (item for item in validation_evidence if item["exit"] != 0), None
+            )
+            error = (
+                "validation failed after 5 rounds"
+                if last_failure is not None and validation_round == 5
+                else failure or "validation retry failed"
+            )
         elif run_result.stopped_reason == "max_turns":
             error = "subagent reached max_turns without a final answer"
         else:
@@ -1140,6 +1292,12 @@ class DispatchSubagentTool(LocalTool):
             if record.worktree_path is not None:
                 with self._pool_lock:
                     record.running = False
+        if validation_commands:
+            evidence_text = "\n".join(
+                f"{item['command']} exited {item['exit']}\n{item['output']}"
+                for item in validation_evidence
+            )
+            content = f"{content}\n\nValidation:\n{evidence_text}"
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,
@@ -1333,6 +1491,10 @@ class Leader:
         self._leader_policy = leader_policy
         self._leases = config.leases or WorkspaceLeases(config.repo_root)
         defined_leader = None if config.subagent_specs is None else config.subagent_specs.get("leader")
+        is_loop_stage = defined_leader is not None and defined_leader.name != "leader"
+        restrict_leader = not is_loop_stage
+        sandbox_available = _sandbox_available() if restrict_leader else True
+        leader_agent_policy = leader_policy
         self._leader_prompt = "\n\n".join(
             prompt for prompt in (
                 config.base_prompt,
@@ -1422,9 +1584,34 @@ class Leader:
             ),
             config.extra_tools,
         )
+        if restrict_leader:
+            for name in ("write_file", "edit_file", "multi_edit_file"):
+                standard_tools.pop(name, None)
+            if sandbox_available:
+                # The sandbox itself exposes only temporary locations as writable.
+                leader_agent_policy = replace(
+                    leader_agent_policy,
+                    shell_sandbox=True,
+                    sandbox_write_scope=[],
+                )
+            else:
+                for name in ("run_shell", "job_output", "job_stop"):
+                    standard_tools.pop(name, None)
         leader_tools.update(standard_tools)
         leader_only_tools = dict(config.leader_tools or {})
+        if restrict_leader:
+            for name in ("write_file", "edit_file", "multi_edit_file"):
+                leader_only_tools.pop(name, None)
+            if not sandbox_available:
+                for name in ("run_shell", "job_output", "job_stop"):
+                    leader_only_tools.pop(name, None)
         leader_tools.update(leader_only_tools)
+        if restrict_leader:
+            for name in ("write_file", "edit_file", "multi_edit_file"):
+                leader_tools.pop(name, None)
+            if not sandbox_available:
+                for name in ("run_shell", "job_output", "job_stop"):
+                    leader_tools.pop(name, None)
         provider_name = getattr(config.leader_provider, "name", None) or "unknown"
         self._leader_spec = AgentSpec(
             name="leader",
@@ -1438,7 +1625,7 @@ class Leader:
                 ),
                 effort=self._leader_effort,
             ),
-            policy_ceiling=leader_policy,
+            policy_ceiling=leader_agent_policy,
             tool_names=tuple(leader_tools),
             budget=config.leader_budget,
             memory=(
@@ -1452,7 +1639,7 @@ class Leader:
         self._agent = ApiAgent(
             provider=config.leader_provider,
             tools=leader_tools,
-            policy=leader_policy,
+            policy=leader_agent_policy,
             max_turns=config.max_leader_turns,
             budget=config.leader_budget,
             tool_schemas=[

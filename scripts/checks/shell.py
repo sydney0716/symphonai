@@ -253,6 +253,68 @@ def check_command_lines_parse() -> None:
         fail("argv words were incorrectly split on shell operators")
 
 
+@check("shell.heredoc_payloads_parse")
+def check_heredoc_payloads_parse() -> None:
+    cat = parse_command_line("cat > regex.txt <<'EOF'\n| ; & ( ) $(id)\nEOF")
+    python = parse_command_line("python3 - <<'PY'\nprint('checked')\nPY")
+    consecutive = parse_command_line(
+        "cat > regex.txt <<'EOF'\nbody\nEOF\npython3 - <<'PY'\nprint(1)\nPY"
+    )
+    if cat != (ShellCommand(("cat",), True, ("| ; & ( ) $(id)",)),):
+        fail(f"quoted heredoc data changed the cat command or write marker: {cat!r}")
+    if python != (ShellCommand(("python3", "-"), False, ("print('checked')",)),):
+        fail(f"Python heredoc did not parse as one command: {python!r}")
+    if consecutive != (
+        ShellCommand(("cat",), True, ("body",)),
+        ShellCommand(("python3", "-"), False, ("print(1)",)),
+    ):
+        fail(f"consecutive heredocs did not remain paired with their commands: {consecutive!r}")
+    if parse_command_line("cat 0<<-END\n\tvalue\n\tEND\n") is None:
+        fail("descriptor and tab-stripped heredoc forms were rejected")
+
+
+@check("shell.heredoc_scripts_are_checked")
+def check_heredoc_scripts_are_checked() -> None:
+    script = parse_command_line("bash <<'EOF'\ngit push\nEOF")
+    if script != (ShellCommand(("git", "push")),):
+        fail(f"shell stdin script was not checked as commands: {script!r}")
+    policy = PermissionPolicy(
+        repo_root=Path.cwd(), mode="allow", shell_enabled=True, shell_allowlist=[()],
+    )
+    result = RunShellTool().execute(ToolCall(
+        id="heredoc-always-deny", name="run_shell",
+        arguments={"command": "bash <<'EOF'\ngit push\nEOF"},
+    ), policy)
+    if result.ok or "always-deny" not in (result.error or ""):
+        fail(f"heredoc script bypassed the git-push always-deny rule: {result!r}")
+    for text in ("bash <<EOF\necho $(id)\nEOF", "cat <<EOF"):
+        if parse_command_line(text) is not None:
+            fail(f"unsafe or unterminated heredoc was accepted: {text!r}")
+    if parse_command_line("cat <<< 'literal $(text)'") != (
+        ShellCommand(("cat",), False, ("literal $(text)",)),
+    ):
+        fail("quoted here-string was not treated as literal data")
+
+
+@check("shell.heredoc_write_runs")
+def check_heredoc_write_runs() -> None:
+    if not shell_module._sandbox_available():
+        print("SKIP: shell sandbox is unavailable")
+        return
+    with tempfile.TemporaryDirectory(prefix="symphonai-heredoc-") as temporary:
+        root = Path(temporary).resolve()
+        policy = PermissionPolicy(
+            repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+        )
+        result = RunShellTool().execute(ToolCall(
+            id="heredoc-write", name="run_shell",
+            arguments={"command": "cat > out.txt <<'EOF'\nhello\nEOF"},
+        ), policy)
+        output = root / "out.txt"
+        if not result.ok or not output.is_file() or output.read_text(encoding="utf-8") != "hello\n":
+            fail(f"heredoc did not write the expected output file: {result!r}")
+
+
 @check("shell.cwd_carries_between_calls")
 def check_shell_cwd_carries_between_calls() -> None:
     with tempfile.TemporaryDirectory() as temporary:

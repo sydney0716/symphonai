@@ -29,6 +29,13 @@ class Workspace:
     tools: dict[str, LocalTool]
 
 
+def handoff_spec(goal: str, command: str = "true") -> str:
+    return (
+        f"## Goal\n{goal}\n\n## Scope\nCheck fixture\n\n"
+        f"## Validation\n```sh\n{command}\n```"
+    )
+
+
 @contextmanager
 def workspace() -> Iterator[Workspace]:
     """A seeded temp root, an unrelated outside dir, a policy, and a registry."""

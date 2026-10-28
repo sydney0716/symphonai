@@ -11,9 +11,10 @@ from symphonai_api.circuit_breaker import ConsecutiveFailureBreaker
 from symphonai_api.compaction import CompactionResult, ContextCompactionError
 from symphonai_api.leader import DispatchSubagentTool, Leader, LeaderConfig
 from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from scripts.checks.harness import check, fail
-from scripts.checks.workspace import workspace
+from scripts.checks.workspace import handoff_spec, workspace
 
 
 def _final_response(content: str = "done") -> ModelResponse:
@@ -43,7 +44,7 @@ def _dispatch(name: str, index: int = 0) -> ToolCall:
     return ToolCall(
         id=f"dispatch-{name}-{index}",
         name="dispatch_subagent",
-        arguments={"subagent_name": name, "task": f"task {index}"},
+        arguments={"subagent_name": name, "task": handoff_spec(f"task {index}")},
     )
 
 
@@ -202,10 +203,14 @@ def check_manual_compaction_still_runs() -> None:
 @check("breaker.subagent_refused_after_repeated_failure")
 def check_subagent_refused_after_repeated_failure() -> None:
     with workspace() as ws:
+        ws.policy.shell_enabled = True
+        ws.policy.shell_allowlist = [()]
+        ws.policy.mode = "allow"
         provider = FakeModelProvider([_unfinished_response()])
         tool = DispatchSubagentTool(
             provider,
             ws.policy,
+            subagent_tool_names=("read_file",),
             subagent_max_turns=1,
             max_consecutive_subagent_failures=3,
         )
@@ -236,6 +241,7 @@ def check_subagent_refused_after_repeated_failure() -> None:
                 ]
             ),
             ws.policy,
+            subagent_tool_names=("read_file",),
             subagent_max_turns=1,
             max_consecutive_subagent_failures=2,
         )
@@ -259,6 +265,7 @@ def check_subagent_refused_after_repeated_failure() -> None:
                 ]
             ),
             ws.policy,
+            subagent_tool_names=("read_file",),
             subagent_max_turns=2,
             subagent_budget=RunBudget(max_total_tokens=1),
         )
@@ -301,6 +308,10 @@ def check_stopped_repairs_reported() -> None:
                 leader_provider=leader_provider,
                 subagent_provider=FakeModelProvider([_unfinished_response()]),
                 repo_root=str(ws.root),
+                leader_policy=PermissionPolicy(
+                    ws.root, shell_enabled=True, shell_allowlist=[()],
+                ),
+                subagent_tool_names=("read_file",),
                 subagent_max_turns=1,
                 max_consecutive_compaction_failures=1,
                 max_consecutive_subagent_failures=1,

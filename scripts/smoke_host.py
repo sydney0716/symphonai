@@ -144,9 +144,9 @@ def _smoke_binary(binary: Path) -> None:
                 if client.health().get("state") != "idle":
                     raise RuntimeError("stop failed: active run did not finish")
                 print("OK:   client stopped an active host run")
-                if provider.requests != 3:
+                if provider.requests != 6:
                     raise RuntimeError(
-                        f"provider routing failed: expected 3 loopback requests, got {provider.requests}"
+                        f"provider routing failed: expected 6 loopback requests, got {provider.requests}"
                     )
             finally:
                 if client is not None:
@@ -186,7 +186,7 @@ def _read_binary_handshake(child: subprocess.Popen[str]) -> HostAddress:
 
 
 class _ScriptedProvider:
-    """Three local OpenAI-compatible replies for the binary smoke scenario."""
+    """Local OpenAI-compatible replies for the binary smoke scenario."""
 
     def __init__(self) -> None:
         self.requests = 0
@@ -233,8 +233,18 @@ class _ScriptedProvider:
 
     def _response(self) -> dict:
         if self.requests == 1:
-            return self._tool_response("smoke-write", "approved.txt", "ok")
+            return self._dispatch_response("smoke-dispatch", "create approved.txt")
         if self.requests == 2:
+            return self._tool_response("smoke-write", "approved.txt", "ok")
+        if self.requests == 3:
+            return {
+                "choices": [{
+                    "message": {"role": "assistant", "content": "file created"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            }
+        if self.requests == 4:
             return {
                 "choices": [{
                     "message": {"role": "assistant", "content": "done"},
@@ -242,9 +252,35 @@ class _ScriptedProvider:
                 }],
                 "usage": {},
             }
-        if self.requests == 3:
+        if self.requests == 5:
+            return self._dispatch_response("smoke-stop-dispatch", "create stopped.txt")
+        if self.requests == 6:
             return self._tool_response("smoke-stop", "stopped.txt", "not written")
         return {"choices": [], "usage": {}}
+
+    @staticmethod
+    def _dispatch_response(call_id: str, goal: str) -> dict:
+        task = f"## Goal\n{goal}\n\n## Scope\nSmoke fixture\n\n## Validation\n```sh\ntrue\n```"
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "dispatch_subagent",
+                            "arguments": json.dumps({
+                                "subagent_name": "implementer", "task": task,
+                            }),
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {},
+        }
 
     @staticmethod
     def _tool_response(call_id: str, path: str, content: str) -> dict:
@@ -271,16 +307,29 @@ class _ScriptedProvider:
 def _smoke_interpreter() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        (root / "approved.txt").write_text("", encoding="utf-8")
+        task = "## Goal\nCreate approved.txt\n\n## Scope\nSmoke fixture\n\n## Validation\n```sh\ntrue\n```"
         provider = _SmokeProvider([
-            ModelResponse(Message(
-                Role.ASSISTANT,
-                tool_calls=[ToolCall("smoke-write", "write_file", {"path": "approved.txt", "content": "ok"})],
-            )),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "smoke-dispatch", "dispatch_subagent", {
+                    "subagent_name": "implementer", "task": task,
+                },
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "smoke-read", "read_file", {"path": "approved.txt"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                "smoke-write", "write_file", {"path": "approved.txt", "content": "ok"},
+            )])),
+            ModelResponse(Message(Role.ASSISTANT, "file created")),
             ModelResponse(Message(Role.ASSISTANT, "done")),
         ])
         host = HostServer(
             provider,
-            PermissionPolicy(repo_root=root, mode="ask"),
+            PermissionPolicy(
+                repo_root=root, mode="ask", shell_enabled=True,
+                shell_allowlist=[()],
+            ),
             sessions_root=root / "sessions",
         )
         host.start()
@@ -293,9 +342,15 @@ def _smoke_interpreter() -> None:
             try:
                 for kind, payload in client.events():
                     if kind == "approval_requested":
+                        if payload.get("operation") != "write_file":
+                            failed.append(f"unexpected approval request: {payload.get('operation')!r}")
+                            return
                         if not client.send_approval(payload["approval_id"], allowed=True).get("resolved"):
                             failed.append("approval reply was rejected")
                             return
+                        host.run._conversation[0].subagents[
+                            "implementer"
+                        ].agent._policy.mode = "allow"
                         approved.set()
                     elif kind == "event" and isinstance(decode_event(payload), RunFinished):
                         finished.set()
@@ -321,6 +376,8 @@ def _smoke_interpreter() -> None:
             deadline = time.monotonic() + 5
             while client.health().get("state") == "active" and time.monotonic() < deadline:
                 time.sleep(0.05)
+            if client.health().get("state") != "idle":
+                raise RuntimeError("finished run did not return the host to idle")
             if (root / "approved.txt").read_text(encoding="utf-8") != "ok":
                 raise RuntimeError("approved tool did not execute")
             print("OK:   approved run finished")

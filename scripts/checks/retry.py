@@ -35,6 +35,7 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.retry import read_with_retry
 from symphonai_api.streaming import open_stream_with_retry
 from scripts.checks.harness import check, fail
+from scripts.checks.workspace import handoff_spec
 
 
 class _FakeHttpResponse:
@@ -910,7 +911,7 @@ def check_leader_subagents_are_background() -> None:
                         ToolCall(
                             id="dispatch",
                             name="dispatch_subagent",
-                            arguments={"subagent_name": "worker", "task": "work"},
+                            arguments={"subagent_name": "worker", "task": handoff_spec("work")},
                         )
                     ],
                 )
