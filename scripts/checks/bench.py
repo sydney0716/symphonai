@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stdout
 import importlib
+import io
 import json
 import sys
 import tempfile
@@ -228,6 +230,63 @@ def _agent_module_with_harbor_stubs():
     with mock.patch.dict(sys.modules, modules):
         sys.modules.pop("scripts.bench.agent", None)
         return importlib.import_module("scripts.bench.agent")
+
+
+@check("bench.pre_agent_failure_rows")
+def pre_agent_failure_rows() -> None:
+    runner_spec = importlib.util.spec_from_file_location(
+        "terminal_bench_runner_setup_failure", Path(__file__).resolve().parents[1] / "bench.py"
+    )
+    if runner_spec is None or runner_spec.loader is None:
+        fail("could not load the runner for setup-failure fixture")
+    runner = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(runner)
+    with tempfile.TemporaryDirectory() as temporary:
+        output = Path(temporary)
+        trial = output / "harbor" / "job" / "regex-log__failed"
+        trial.mkdir(parents=True)
+        (trial / "result.json").write_text(json.dumps({
+            "task_name": "terminal-bench/regex-log",
+            "agent_result": None,
+            "verifier_result": None,
+            "exception_info": {
+                "exception_type": "NonZeroAgentExitCodeError",
+                "exception_message": "python3 is unavailable",
+            },
+            "started_at": "2026-10-28T00:00:00",
+            "finished_at": "2026-10-28T00:00:05",
+        }), encoding="utf-8")
+        rows = runner._trial_rows(output)
+        rendered = runner._usage_from_trials(rows)
+        if len(rendered) != 1 or rendered[0]["resolved"] is not False:
+            fail(f"pre-agent failure did not become an unresolved row: {rendered!r}")
+        expected = {
+            "type": "NonZeroAgentExitCodeError",
+            "message": "python3 is unavailable",
+        }
+        if rendered[0].get("exception") != expected:
+            fail(f"pre-agent exception was not retained: {rendered!r}")
+        if any(key in rendered[0] for key in ("model_usage", "usage", "cost", "agent_reported_cost")):
+            fail(f"pre-agent failure row contains token or cost fields: {rendered!r}")
+        table = io.StringIO()
+        with redirect_stdout(table):
+            runner._print_table(rows)
+        if "NonZeroAgentExitCodeError: python3 is unavailable" not in table.getvalue():
+            fail(f"failure table omitted the exception: {table.getvalue()!r}")
+
+    agent_module = _agent_module_with_harbor_stubs()
+    agent = object.__new__(agent_module.SymphonaiAgent)
+    calls = []
+
+    async def no_python(_environment, command, *, timeout_sec):
+        calls.append(command)
+        return SimpleNamespace(return_code=0, stdout="absent", stderr="")
+
+    agent.exec_as_agent = no_python
+    if asyncio.run(agent._task_python(None)) != "absent":
+        fail("task Python probe failed to record the absent state")
+    if len(calls) != 1 or "else printf 'absent'" not in calls[0]:
+        fail(f"task Python probe did not handle command absence safely: {calls!r}")
 
 
 @check("bench.user_config_roundtrips")

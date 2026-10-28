@@ -215,10 +215,13 @@ def _smoke_rows(output: Path) -> list[dict[str, Any]]:
         if trial_root is None:
             continue
         task = trial_root.name.split("__", 1)[0]
-        if not isinstance(details.get("result"), dict) or not details.get("host_keys_reached_container"):
+        if (not isinstance(details.get("result"), dict)
+                or not details.get("host_keys_reached_container")):
             continue
+        before = details.get("task_python_before")
+        after = details.get("task_python_after")
         rows.append({"task": task, "doctor": f"JSON (exit {details.get('return_code')})",
-                     "task_python_unchanged": True,
+                     "task_python_unchanged": isinstance(before, str) and before == after,
                      "details": details})
     return sorted(rows, key=lambda row: row["task"])
 
@@ -242,7 +245,21 @@ def _usage_from_trials(
 ) -> list[dict[str, Any]]:
     rendered = []
     for row in rows:
-        context = row["result"].get("agent_result", {})
+        result = row["result"]
+        context = result.get("agent_result")
+        if not isinstance(context, dict):
+            exception_info = result.get("exception_info")
+            exception = None
+            if isinstance(exception_info, dict):
+                exception = {
+                    "type": exception_info.get("exception_type"),
+                    "message": exception_info.get("exception_message"),
+                }
+            rendered.append({
+                "task": row["task"], "resolved": False,
+                "wall_seconds": row["wall_seconds"], "exception": exception,
+            })
+            continue
         reported_cost = context.get("cost_usd") if isinstance(context, dict) else None
         model_usage = context.get("model_usage") if isinstance(context, dict) else None
         if isinstance(model_usage, dict):
@@ -281,13 +298,21 @@ def _print_table(rows: list[dict[str, Any]], *, smoke: bool = False, prices: boo
         for row in rows:
             print(f"{row['task']} | {row['doctor']} | {row['task_python_unchanged']}")
         return
-    header = "task | resolved | wall seconds | tokens per model | tokens per agent | max request"
+    header = "task | resolved | wall seconds | tokens per model | tokens per agent | max request | exception"
     print(header + (" | cost" if prices else ""))
     for row in rows:
         if "result" not in row:
-            print(f"{row['task']} | {row.get('resolved')} | {row.get('wall_seconds')} | - | - | -")
+            print(f"{row['task']} | {row.get('resolved')} | {row.get('wall_seconds')} | - | - | - | {row.get('exception', '-')}")
             continue
         agent_result = row["result"].get("agent_result", {})
+        if not isinstance(agent_result, dict):
+            info = row["result"].get("exception_info")
+            detail = "-"
+            if isinstance(info, dict):
+                detail = f"{info.get('exception_type', 'Exception')}: {info.get('exception_message', '')}"
+                detail = " ".join(detail.split())
+            print(f"{row['task']} | False | {row['wall_seconds']} | - | - | - | {detail}")
+            continue
         metadata = agent_result.get("metadata", {})
         usage = row.get("usage") or (
             metadata.get("symphonai_usage", {}) if isinstance(metadata, dict) else {}
@@ -298,7 +323,7 @@ def _print_table(rows: list[dict[str, Any]], *, smoke: bool = False, prices: boo
         line = (f"{row['task']} | {row['resolved']} | {row['wall_seconds']} | "
                 f"{json.dumps(models, sort_keys=True)} | "
                 f"{json.dumps(agents, sort_keys=True)} | "
-                f"{table_data.get('largest_single_request', '-')}")
+                f"{table_data.get('largest_single_request', '-')} | -")
         if prices:
             line += f" | {json.dumps(row.get('cost') or {}, sort_keys=True)}"
         print(line)
@@ -375,7 +400,8 @@ def main() -> int:
         (output / "results.json").write_text(json.dumps({"smoke": rows,
             "dummy_key_search_found": key_found}, indent=2), encoding="utf-8")
         _print_table(rows, smoke=True)
-        if len(rows) != len(task_names) or key_found:
+        unchanged = all(row["task_python_unchanged"] for row in rows)
+        if len(rows) != len(task_names) or key_found or not unchanged:
             print(f"Smoke incomplete: {len(rows)}/{len(task_names)} tasks; dummy key found={key_found}", file=sys.stderr)
             return 1
         print("Dummy key search: clean")

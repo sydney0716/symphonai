@@ -83,6 +83,7 @@ class SymphonaiAgent(BaseInstalledAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         before = await self._task_python(environment)
+        await self.ensure_system_dependencies(environment, ("curl",))
         archive = _source_archive()
         try:
             await environment.upload_file(archive, "/tmp/symphonai-source.tar.gz")
@@ -106,18 +107,15 @@ class SymphonaiAgent(BaseInstalledAgent):
                 " >/dev/null 2>&1; then python_bin=$(command -v \"$candidate\"); install_mode=copy; break; "
                 "else rm -rf /tmp/symphonai-venv; fi; done; "
                 "if [ -z \"$python_bin\" ]; then "
-                "if ! command -v uv >/dev/null 2>&1; then "
-                "if command -v curl >/dev/null 2>&1; then "
+                "export UV_INSTALL_DIR=/tmp/symphonai-uv; "
+                "export UV_PYTHON_INSTALL_DIR=/tmp/symphonai-python; "
+                "export UV_PYTHON_BIN_DIR=/tmp/symphonai-python/bin; "
+                "export PATH=\"$UV_INSTALL_DIR:$PATH\"; "
                 "curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh; "
-                "elif command -v wget >/dev/null 2>&1; then "
-                "wget -q https://astral.sh/uv/install.sh -O /tmp/uv-install.sh; "
-                "else python3 -c 'import urllib.request; urllib.request.urlretrieve(" 
-                "\"https://astral.sh/uv/install.sh\", \"/tmp/uv-install.sh\")'; fi; "
                 "sh /tmp/uv-install.sh >/tmp/uv-install.log 2>&1; rm -f /tmp/uv-install.sh; "
-                "export PATH=\"$HOME/.local/bin:$PATH\"; fi; "
-                "uv python install 3.11 >/tmp/uv-python-install.log 2>&1; "
-                "export PATH=\"$HOME/.local/bin:$PATH\"; "
-                "uv venv --python 3.11 /tmp/symphonai-venv; install_mode=pip; fi; "
+                "/tmp/symphonai-uv/uv python install 3.11 >/tmp/uv-python-install.log 2>&1; "
+                "/tmp/symphonai-uv/uv venv --python 3.11 /tmp/symphonai-venv; "
+                "install_mode=uv; fi; "
                 "if [ \"$install_mode\" = copy ]; then "
                 "site_packages=$(/tmp/symphonai-venv/bin/python -c "
                 "'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])'); "
@@ -129,6 +127,10 @@ class SymphonaiAgent(BaseInstalledAgent):
                 "from symphonai_host.headless import main\n"
                 "raise SystemExit(main())\n"
                 "PY\nchmod +x /tmp/symphonai-venv/bin/symphonai; "
+                "elif [ \"$install_mode\" = uv ]; then "
+                "/tmp/symphonai-uv/uv pip install --python /tmp/symphonai-venv/bin/python "
+                "--no-progress /tmp/symphonai-source; "
+                "chmod -R a+rX /tmp/symphonai-uv /tmp/symphonai-python /tmp/symphonai-venv; "
                 "else /tmp/symphonai-venv/bin/python -m pip install "
                 "--disable-pip-version-check --no-input /tmp/symphonai-source; fi"
             ),
@@ -165,7 +167,8 @@ class SymphonaiAgent(BaseInstalledAgent):
                 raise RuntimeError(f"symphonai doctor did not return JSON: {exc}") from None
             self._doctor = {
                 "result": doctor_data, "return_code": doctor.return_code,
-                "task_python": before, "host_keys_reached_container": True,
+                "task_python": before, "task_python_before": before,
+                "task_python_after": after, "host_keys_reached_container": True,
             }
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             (self.logs_dir / "symphonai-smoke.json").write_text(
@@ -174,10 +177,16 @@ class SymphonaiAgent(BaseInstalledAgent):
 
     async def _task_python(self, environment: BaseEnvironment) -> str:
         result = await self.exec_as_agent(
-            environment, command="command -v python3 && python3 --version", timeout_sec=15,
+            environment,
+            command=(
+                "if command -v python3 >/dev/null 2>&1; then "
+                "command -v python3; python3 --version; "
+                "else printf 'absent'; fi"
+            ),
+            timeout_sec=15,
         )
         if result.return_code:
-            raise RuntimeError(f"task python3 is unavailable: {result.stderr[-1000:]}")
+            raise RuntimeError(f"could not check task python3: {result.stderr[-1000:]}")
         return result.stdout.strip()
 
     @with_prompt_template
