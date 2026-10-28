@@ -244,7 +244,13 @@ def _build_request_body(
         "cache_control": {"type": "ephemeral"},
     }
     if system_parts:
-        body["system"] = "\n".join(system_parts)
+        body["system"] = [{
+            "type": "text",
+            "text": system_parts[0],
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }]
+        if len(system_parts) > 1:
+            body["system"].append({"type": "text", "text": "\n".join(system_parts[1:])})
     if request.tools:
         body["tools"] = request.tools
     if request.temperature is not None:
@@ -293,6 +299,9 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
     input_tokens = _usage_count(usage_raw.get("input_tokens"))
     cache_read_tokens = _usage_count(usage_raw.get("cache_read_input_tokens"))
     cache_write_tokens = _usage_count(usage_raw.get("cache_creation_input_tokens"))
+    cache_creation = usage_raw.get("cache_creation")
+    if not isinstance(cache_creation, dict):
+        cache_creation = {}
     message = Message(
         role=Role.ASSISTANT,
         content="".join(text_parts),
@@ -306,6 +315,7 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             output_tokens=_usage_count(usage_raw.get("output_tokens")),
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            cache_write_1h_tokens=_usage_count(cache_creation.get("ephemeral_1h_input_tokens")),
         ),
         stop_reason=data.get("stop_reason") or "end_turn",
     )
@@ -318,6 +328,7 @@ def _anthropic_stream_chunks(
     input_tokens = 0
     cache_read_tokens = 0
     cache_write_tokens = 0
+    cache_write_1h_tokens = 0
     output_tokens = 0
     stop_reason = "end_turn"
     content_blocks: dict[int, dict[str, Any]] = {}
@@ -346,6 +357,11 @@ def _anthropic_stream_chunks(
                 cache_write_tokens = _usage_count(
                     usage.get("cache_creation_input_tokens")
                 )
+                cache_creation = usage.get("cache_creation")
+                if isinstance(cache_creation, dict):
+                    cache_write_1h_tokens = _usage_count(
+                        cache_creation.get("ephemeral_1h_input_tokens")
+                    )
             continue
         if event == "content_block_start":
             block = data.get("content_block", {})
@@ -446,6 +462,7 @@ def _anthropic_stream_chunks(
                         output_tokens=output_tokens,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
+                        cache_write_1h_tokens=cache_write_1h_tokens,
                     ),
                     stop_reason=stop_reason,
                 )

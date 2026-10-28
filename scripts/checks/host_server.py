@@ -12591,20 +12591,24 @@ def check_headless_loop() -> None:
                     "implement": {
                         "input_tokens": 30, "output_tokens": 6, "calls": 3,
                         "cache_read_tokens": 9, "cache_write_tokens": 12,
+                        "cache_write_1h_tokens": 0,
                     },
                     "review": {
                         "input_tokens": 10, "output_tokens": 2, "calls": 1,
                         "cache_read_tokens": 3, "cache_write_tokens": 4,
+                        "cache_write_1h_tokens": 0,
                     },
                 },
             },
             "planning": {
                 "input_tokens": 30, "output_tokens": 6, "calls": 3,
                 "cache_read_tokens": 9, "cache_write_tokens": 12,
+                "cache_write_1h_tokens": 0,
             },
             "total": {
                 "input_tokens": 70, "output_tokens": 14, "calls": 7,
                 "cache_read_tokens": 21, "cache_write_tokens": 28,
+                "cache_write_1h_tokens": 0,
             },
         }
         if result.get("usage") != expected_usage:
@@ -12717,10 +12721,12 @@ def check_headless_loop() -> None:
                 or result.get("usage", {}).get("planning") != {
                     "input_tokens": 30, "output_tokens": 6, "calls": 3,
                     "cache_read_tokens": 9, "cache_write_tokens": 12,
+                    "cache_write_1h_tokens": 0,
                 }
                 or result.get("usage", {}).get("total") != {
                     "input_tokens": 30, "output_tokens": 6, "calls": 3,
                     "cache_read_tokens": 9, "cache_write_tokens": 12,
+                    "cache_write_1h_tokens": 0,
                 }):
             fail(f"headless planning stop omitted planner usage: {code}, {result!r}")
 

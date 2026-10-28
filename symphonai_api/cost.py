@@ -24,6 +24,7 @@ class UsageTotals:
     long_context_output_tokens: int = 0
     long_context_cache_read_tokens: int = 0
     long_context_cache_write_tokens: int = 0
+    cache_write_1h_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -40,6 +41,7 @@ class UsageTotals:
             long_context_output_tokens=self.long_context_output_tokens + other.long_context_output_tokens,
             long_context_cache_read_tokens=self.long_context_cache_read_tokens + other.long_context_cache_read_tokens,
             long_context_cache_write_tokens=self.long_context_cache_write_tokens + other.long_context_cache_write_tokens,
+            cache_write_1h_tokens=self.cache_write_1h_tokens + other.cache_write_1h_tokens,
         )
 
     @classmethod
@@ -54,6 +56,7 @@ class UsageTotals:
             long_context_output_tokens=usage.output_tokens if long_context else 0,
             long_context_cache_read_tokens=usage.cache_read_tokens if long_context else 0,
             long_context_cache_write_tokens=usage.cache_write_tokens if long_context else 0,
+            cache_write_1h_tokens=usage.cache_write_1h_tokens,
         )
 
 
@@ -64,6 +67,7 @@ class ModelPrice:
     cache_read_per_million: Decimal | None = None
     cache_write_per_million: Decimal | None = None
     long_context: "ModelPrice | None" = None
+    cache_write_1h_per_million: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -77,35 +81,50 @@ class PriceTable:
             return None
         million = Decimal(1_000_000)
         def bucket_cost(rates: ModelPrice, input_tokens: int, output_tokens: int,
-                        cache_read_tokens: int, cache_write_tokens: int) -> Decimal:
+                        cache_read_tokens: int, cache_write_tokens: int,
+                        cache_write_1h_tokens: int = 0) -> Decimal:
             uncached = max(0, input_tokens - cache_read_tokens - cache_write_tokens)
             read_rate = rates.cache_read_per_million if rates.cache_read_per_million is not None else rates.input_per_million
             write_rate = rates.cache_write_per_million if rates.cache_write_per_million is not None else rates.input_per_million
+            one_hour_tokens = min(cache_write_tokens, cache_write_1h_tokens)
+            one_hour_rate = rates.cache_write_1h_per_million if rates.cache_write_1h_per_million is not None else write_rate
             return (Decimal(uncached) * rates.input_per_million
                     + Decimal(cache_read_tokens) * read_rate
-                    + Decimal(cache_write_tokens) * write_rate
+                    + Decimal(cache_write_tokens - one_hour_tokens) * write_rate
+                    + Decimal(one_hour_tokens) * one_hour_rate
                     + Decimal(output_tokens) * rates.output_per_million)
 
         long = totals.long_context_input_tokens > 0
         if long and price.long_context is not None:
+            long_write_1h_tokens = min(
+                totals.cache_write_1h_tokens, totals.long_context_cache_write_tokens,
+            )
             base_cost = bucket_cost(
                 price, totals.input_tokens - totals.long_context_input_tokens,
                 totals.output_tokens - totals.long_context_output_tokens,
                 totals.cache_read_tokens - totals.long_context_cache_read_tokens,
                 totals.cache_write_tokens - totals.long_context_cache_write_tokens,
+                totals.cache_write_1h_tokens - long_write_1h_tokens,
             )
             long_cost = bucket_cost(
                 price.long_context, totals.long_context_input_tokens,
                 totals.long_context_output_tokens, totals.long_context_cache_read_tokens,
                 totals.long_context_cache_write_tokens,
+                long_write_1h_tokens,
             )
             return (base_cost + long_cost) / million
         return bucket_cost(price, totals.input_tokens, totals.output_tokens,
-                           totals.cache_read_tokens, totals.cache_write_tokens) / million
+                           totals.cache_read_tokens, totals.cache_write_tokens,
+                           totals.cache_write_1h_tokens) / million
 
     def long_context_is_estimated(self, model: str, totals: UsageTotals) -> bool:
         price = self.prices.get(model)
         return totals.long_context_input_tokens > 0 and price is not None and price.long_context is None
+
+    def cache_write_1h_is_estimated(self, model: str, totals: UsageTotals) -> bool:
+        price = self.prices.get(model)
+        return (totals.cache_write_1h_tokens > 0 and price is not None
+                and price.cache_write_1h_per_million is None)
 
 
 def _rate(value: object, *, model: str, kind: str) -> Decimal:
@@ -162,6 +181,7 @@ def load_price_table(path: str | Path) -> PriceTable:
                 output_per_million=_rate(source.get("output"), model=model, kind=f"{prefix}output"),
                 cache_read_per_million=_rate(source["cache_read"], model=model, kind=f"{prefix}cache_read") if "cache_read" in source else None,
                 cache_write_per_million=_rate(source["cache_write"], model=model, kind=f"{prefix}cache_write") if "cache_write" in source else None,
+                cache_write_1h_per_million=_rate(source["cache_write_1h"], model=model, kind=f"{prefix}cache_write_1h") if "cache_write_1h" in source else None,
             )
         base = parse_rates(entry)
         prices[model] = ModelPrice(
@@ -169,6 +189,7 @@ def load_price_table(path: str | Path) -> PriceTable:
             cache_read_per_million=base.cache_read_per_million,
             cache_write_per_million=base.cache_write_per_million,
             long_context=parse_rates(long_context, prefix="long_context.") if long_context is not None else None,
+            cache_write_1h_per_million=base.cache_write_1h_per_million,
         )
     return PriceTable(prices=prices, currency=currency)
 

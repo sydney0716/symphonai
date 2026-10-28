@@ -379,6 +379,7 @@ def check_anthropic_cache_control_and_tool_message_merging() -> None:
     if [block.get("tool_use_id") for block in tool_blocks] != expected_ids:
         fail(f"merged Anthropic tool results changed call order: {tool_blocks!r}")
 
+
     redirected = _build_anthropic_body(
         ModelRequest(
             messages=[
@@ -411,6 +412,73 @@ def check_anthropic_cache_control_and_tool_message_merging() -> None:
     )
     if lone["messages"] != [{"role": "user", "content": "hello"}]:
         fail(f"lone Anthropic user message changed shape: {lone['messages']!r}")
+
+
+@check("providers.anthropic_system_prompt_cache_lifetime")
+def check_anthropic_system_prompt_cache_lifetime() -> None:
+    request = ModelRequest(messages=[
+        Message(Role.SYSTEM, "agent prompt"),
+        Message(Role.SYSTEM, "environment details"),
+        Message(Role.USER, "question"),
+    ])
+    expected_system = [
+        {
+            "type": "text", "text": "agent prompt",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+        {"type": "text", "text": "environment details"},
+    ]
+    provider = AnthropicProvider()
+    body = _build_anthropic_body(request, "claude-sonnet-5-5", 1024)
+    if body.get("system") != expected_system or body.get("cache_control") != {"type": "ephemeral"}:
+        fail(f"plain Anthropic request did not cache only the first system block for 1h: {body!r}")
+
+    captured: dict[str, dict] = {}
+
+    def stream_urlopen(http_request, timeout=None):  # noqa: ANN001
+        captured["body"] = json.loads(http_request.data.decode("utf-8"))
+        return _FakeStreamResponse(
+            _sse("message_start", {"message": {"usage": {}}})
+            + _sse("message_stop", {})
+        )
+
+    with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "anthropic-system-cache-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=stream_urlopen,
+    ):
+        list(provider.create_response_stream(request))
+    streamed_body = captured.get("body", {})
+    if (streamed_body.get("system") != expected_system
+            or streamed_body.get("cache_control") != {"type": "ephemeral"}):
+        fail(f"streamed Anthropic request did not preserve the 1h system breakpoint: {streamed_body!r}")
+
+
+@check("providers.anthropic_cache_write_1h_usage")
+def check_anthropic_cache_write_1h_usage() -> None:
+    request = ModelRequest(messages=[Message(Role.USER, "usage")])
+
+    def anthropic_urlopen(http_request, timeout=None):  # noqa: ANN001
+        return _FakeHttpResponse(json.dumps({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 10000,
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 8000,
+                    "ephemeral_5m_input_tokens": 2000,
+                },
+                "output_tokens": 20,
+            },
+            "stop_reason": "end_turn",
+        }).encode())
+
+    with mock.patch.dict(os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "anthropic-cache-split-key"}), mock.patch(
+        "urllib.request.urlopen", side_effect=anthropic_urlopen,
+    ):
+        response = AnthropicProvider().create_response(request)
+    expected = Usage(11000, 20, 900, 10000, 8000)
+    if response.usage != expected:
+        fail(f"Anthropic 1h cache-write usage was not separated from total writes: {response.usage!r}")
 
 
 @check("providers.anthropic_thinking_capture")

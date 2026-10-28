@@ -73,6 +73,36 @@ def check_cache_write_rates() -> None:
         fail(f"cache writes were not priced at their own rate: {actual!r}")
 
 
+@check("cost.cache_write_1h_rates")
+def check_cache_write_1h_rates() -> None:
+    totals = UsageTotals(
+        input_tokens=10_000,
+        calls=1,
+        cache_write_tokens=10_000,
+        cache_write_1h_tokens=8_000,
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        priced_path = root / "priced.json"
+        priced_path.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
+            "claude-opus": {"input": 4, "output": 20, "cache_write": 5, "cache_write_1h": 8},
+        }}), encoding="utf-8")
+        fallback_path = root / "fallback.json"
+        fallback_path.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
+            "claude-opus": {"input": 4, "output": 20, "cache_write": 5},
+        }}), encoding="utf-8")
+        priced = load_price_table(priced_path)
+        fallback = load_price_table(fallback_path)
+    actual = priced.cost("claude-opus", totals)
+    expected = (Decimal(8_000) * Decimal(8) + Decimal(2_000) * Decimal(5)) / Decimal(1_000_000)
+    if actual != expected or priced.cache_write_1h_is_estimated("claude-opus", totals):
+        fail(f"one-hour and five-minute writes were not priced separately: {actual!r}")
+    if fallback.cost("claude-opus", totals) != Decimal("0.05"):
+        fail("missing one-hour price did not fall back to the cache-write rate")
+    if not fallback.cache_write_1h_is_estimated("claude-opus", totals):
+        fail("fallback one-hour write cost was not marked estimated")
+
+
 @check("cost.long_context_tier")
 def check_long_context_tier() -> None:
     usage = UsageTotals(400000, 20, 2, long_context_input_tokens=300000,
@@ -164,6 +194,8 @@ def check_price_table_loads_example() -> None:
         fail(f"example rates did not load exactly: {price!r}")
     if price.cache_read_per_million != Decimal("0.00") or price.cache_write_per_million != Decimal("0.00"):
         fail(f"example cache rates did not load exactly: {price!r}")
+    if price.cache_write_1h_per_million != Decimal("0.00"):
+        fail(f"example one-hour cache-write rate did not load exactly: {price!r}")
     if not isinstance(price.input_per_million, Decimal) or not isinstance(
         price.output_per_million, Decimal
     ) or not isinstance(price.cache_read_per_million, Decimal) or not isinstance(

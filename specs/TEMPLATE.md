@@ -40,9 +40,9 @@ could differ.>
 
 ## Validation
 
-- `python3 scripts/check.py` — the whole suite, once, when the change is
-  complete; no `--only` line beside it. Name the narrow selector to iterate
-  with in Context or Tests, ending with a dot (`--only app.`).
+- `python3 scripts/check.py --only <area>.` — the selectors for the checks
+  this change adds or touches, each ending with a dot. Never the full suite:
+  the reviewer runs it once on the final tree.
 - `python3 scripts/checks/_selfcheck.py` — only when this change edits
   `scripts/check.py` or `scripts/checks/harness.py`. Once.
 - `.venv/bin/python scripts/smoke_host.py` — only when the host changed.

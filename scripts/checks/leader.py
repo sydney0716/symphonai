@@ -641,6 +641,11 @@ def check_edit_handoff_retries_validation() -> None:
         if (
             not result.ok or record is None or len(record.runs) != 2
             or "test -f done.txt exited 0" not in result.content
+            or not result.content.endswith(
+                "The host ran these Validation commands after the subagent finished, "
+                "and all passed. Do not run them again, or any equivalent of them; "
+                "read the diff instead."
+            )
             or "Validation failed (round 1 of 5)" not in correction
             or not (ws.root / "done.txt").is_file()
         ):
@@ -662,6 +667,7 @@ def check_edit_handoff_stops_after_five_validation_failures() -> None:
             result.ok or record is None or len(record.runs) != 5
             or "validation failed after 5 rounds" not in (result.error or "")
             or "false exited 1" not in result.content
+            or "The host ran these Validation commands" in result.content
         ):
             fail(f"failed validation did not stop after five rounds: {result!r}")
 
@@ -699,9 +705,10 @@ def base_prompts_lead_their_agents() -> None:
         "spec and hand it to the implementer."
     )
     verification_rule = (
-        "Verify. When a handoff returns, read the diff and run the project's existing "
-        "checks yourself; any new test belongs in the next spec. A subagent's report "
-        "is its claim."
+        "Verify. When a handoff returns with its Validation passed, those checks are "
+        "done: do not run them again, or any equivalent of them. Read the diff, and "
+        "run another existing check only for something the Validation does not cover. "
+        "A subagent's report is its claim."
     )
     if (leader_rule not in LEADER_BASE_PROMPT
             or "Your commands may build, test and generate files, but you never write or edit code yourself." in LEADER_BASE_PROMPT):
@@ -5691,7 +5698,18 @@ def check_spec_workflow_prompts() -> None:
             fail("built-in leader guidance does not match the role definitions")
         requirements = {
             "planner": ("You are a planner. You turn a goal into specs", "Find out before you write", "Every Validation command is one you ran", "Keep each spec to one change", "End by naming the spec path"),
-            "implementer": ("You are an implementer. You carry out one spec exactly", "The spec is the contract", "The host runs them again", "If the spec is wrong", "git status --porcelain verbatim when the project is a git repository"),
+            "implementer": (
+                "You are an implementer. You carry out one spec exactly",
+                "The spec is the contract",
+                "Use the Validation commands while you work, when running them tells you "
+                "something new. Do not re-run them only to report: the host runs them "
+                "when you finish, the work does not pass until they succeed, and its "
+                "result is the record.",
+                "Validation (the last result you saw for each command; do not re-run a "
+                "command to fill this in)",
+                "If the spec is wrong",
+                "git status --porcelain verbatim when the project is a git repository",
+            ),
             "reviewer": ("You are a reviewer. Your job is to find what is wrong", "The report is the implementer's claim", "run at least one probe", "<id>F-<slug>.md", "Never commit"),
         }
         for name, phrases in requirements.items():
@@ -5700,6 +5718,11 @@ def check_spec_workflow_prompts() -> None:
                 fail(f"{name} prompt omitted required workflow rules: {prompt!r}")
             if "TEMPLATE.md" in prompt or "REPORT-TEMPLATE.md" in prompt:
                 fail(f"{name} prompt names a repository template: {prompt!r}")
+            if name == "implementer" and (
+                "The host runs them again" in prompt
+                or "Validation (each command and its result)" in prompt
+            ):
+                fail(f"implementer prompt retains superseded verification text: {prompt!r}")
 
 
 @check("leader.spec_workflow_prompt_reaches_child")

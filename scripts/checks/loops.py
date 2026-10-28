@@ -301,20 +301,24 @@ def usage_per_stage() -> None:
                 "planning": {
                     "input_tokens": 120, "output_tokens": 12, "calls": 6,
                     "cache_read_tokens": 18, "cache_write_tokens": 24,
+                    "cache_write_1h_tokens": 0,
                 },
                 "cards": {"a": {
                     "implement": {
                         "input_tokens": 150, "output_tokens": 15, "calls": 3,
                         "cache_read_tokens": 18, "cache_write_tokens": 21,
+                        "cache_write_1h_tokens": 0,
                     },
                     "review": {
                         "input_tokens": 70, "output_tokens": 7, "calls": 1,
                         "cache_read_tokens": 8, "cache_write_tokens": 9,
+                        "cache_write_1h_tokens": 0,
                     },
                 }},
                 "total": {
                     "input_tokens": 340, "output_tokens": 34, "calls": 10,
                     "cache_read_tokens": 44, "cache_write_tokens": 54,
+                    "cache_write_1h_tokens": 0,
                 },
             }
             if reply.get("loop", {}).get("usage") != expected:
@@ -358,12 +362,13 @@ def usage_per_stage() -> None:
             if resumed_usage["cards"]["a"]["implement"] != {
                 "input_tokens": 163, "output_tokens": 17, "calls": 4,
                 "cache_read_tokens": 21, "cache_write_tokens": 25,
+                "cache_write_1h_tokens": 0,
             }:
                 fail(f"resumed implementation usage omitted an attempt: {resumed_usage!r}")
             summed = {
                 key: resumed_usage["planning"][key] + resumed_usage["cards"]["a"]["implement"][key]
                      + resumed_usage["cards"]["a"]["review"][key]
-                for key in ("input_tokens", "output_tokens", "calls", "cache_read_tokens", "cache_write_tokens")
+                for key in ("input_tokens", "output_tokens", "calls", "cache_read_tokens", "cache_write_tokens", "cache_write_1h_tokens")
             }
             if resumed_usage["total"] != summed:
                 fail(f"loop total did not equal the sum of its stages: {resumed_usage!r}")

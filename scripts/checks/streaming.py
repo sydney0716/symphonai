@@ -1231,7 +1231,7 @@ def check_stream_cache_usage_accounting() -> None:
     anthropic_stream = _LinesResponse(
         [
             b"event: message_start\n",
-            b'data: {"message":{"usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50}}}\n\n',
+            b'data: {"message":{"usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":10000,"cache_creation":{"ephemeral_1h_input_tokens":8000,"ephemeral_5m_input_tokens":2000}}}}\n\n',
             b"event: message_delta\n",
             b'data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}\n\n',
             b"event: message_stop\n",
@@ -1242,7 +1242,7 @@ def check_stream_cache_usage_accounting() -> None:
         "urllib.request.urlopen", return_value=anthropic_stream
     ):
         anthropic = _assemble(AnthropicProvider().create_response_stream(request))
-    if anthropic.usage != Usage(1050, 20, 900, 50):
+    if anthropic.usage != Usage(11000, 20, 900, 10000, 8000):
         fail(f"streamed Anthropic cache usage was wrong: {anthropic.usage!r}")
 
     responses_stream = _LinesResponse(

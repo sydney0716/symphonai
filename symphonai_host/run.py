@@ -102,6 +102,7 @@ def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
         "long_context_input_tokens", "long_context_output_tokens",
         "long_context_cache_read_tokens", "long_context_cache_write_tokens",
     ))
+    values.append(data.get("cache_write_1h_tokens", 0))
     if any(type(value) is not int or value < 0 for value in values):
         return None
     agent_id = record.get("agent_id")
@@ -3844,6 +3845,7 @@ class HostRun:
                 "calls": stage_usage.calls,
                 "cache_read_tokens": stage_usage.cache_read_tokens,
                 "cache_write_tokens": stage_usage.cache_write_tokens,
+                "cache_write_1h_tokens": stage_usage.cache_write_1h_tokens,
             }
             total = total.merged(stage_usage)
 
@@ -3877,6 +3879,7 @@ class HostRun:
             "calls": total.calls,
             "cache_read_tokens": total.cache_read_tokens,
             "cache_write_tokens": total.cache_write_tokens,
+            "cache_write_1h_tokens": total.cache_write_1h_tokens,
         }
         return usage
 
@@ -3908,6 +3911,7 @@ class HostRun:
                     "calls": usage.calls,
                     "cache_read_tokens": usage.cache_read_tokens,
                     "cache_write_tokens": usage.cache_write_tokens,
+                    "cache_write_1h_tokens": usage.cache_write_1h_tokens,
                 },
             )
             if self._conversation is not None and self._conversation[1].run_id == session_id:
@@ -3989,6 +3993,7 @@ class HostRun:
                         "calls": usage.calls,
                         "cache_read_tokens": usage.cache_read_tokens,
                         "cache_write_tokens": usage.cache_write_tokens,
+                        "cache_write_1h_tokens": usage.cache_write_1h_tokens,
                     },
                 )
             self._context_by_session[session_id] = self._context_report
@@ -4053,6 +4058,7 @@ class HostRun:
                 "total_tokens": totals.total_tokens,
                 "cache_read_tokens": totals.cache_read_tokens,
                 "cache_write_tokens": totals.cache_write_tokens,
+                "cache_write_1h_tokens": totals.cache_write_1h_tokens,
                 "long_context_input_tokens": totals.long_context_input_tokens,
                 "long_context_output_tokens": totals.long_context_output_tokens,
                 "long_context_cache_read_tokens": totals.long_context_cache_read_tokens,
@@ -4065,6 +4071,7 @@ class HostRun:
                     "currency": self._price_table.currency,
                     "estimated": any(
                         self._price_table.long_context_is_estimated(model, usage)
+                        or self._price_table.cache_write_1h_is_estimated(model, usage)
                         for model, usage in by_model.items()
                     ),
                 }

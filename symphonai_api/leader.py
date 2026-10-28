@@ -1299,6 +1299,12 @@ class DispatchSubagentTool(LocalTool):
                 for item in validation_evidence
             )
             content = f"{content}\n\nValidation:\n{evidence_text}"
+            if succeeded:
+                content += (
+                    "\nThe host ran these Validation commands after the subagent "
+                    "finished, and all passed. Do not run them again, or any "
+                    "equivalent of them; read the diff instead."
+                )
         return ToolResult(
             tool_call_id=tool_call.id,
             ok=succeeded,

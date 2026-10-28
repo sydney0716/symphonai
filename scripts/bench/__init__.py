@@ -72,6 +72,7 @@ def usage_summary(
             "input_tokens", "output_tokens", "calls", "cache_read_tokens", "cache_write_tokens",
             "long_context_input_tokens", "long_context_output_tokens",
             "long_context_cache_read_tokens", "long_context_cache_write_tokens",
+            "cache_write_1h_tokens",
         )]
         if any(type(value) is not int or value < 0 for value in values):
             continue
@@ -229,20 +230,22 @@ def price_agent_usage(
         output_tokens = values.get("output", 0) if symphony else values.get("n_output_tokens", 0)
         cache_read = values.get("cache_read", 0) if symphony else values.get("n_cache_tokens", 0)
         cache_write = values.get("cache_write", 0) if symphony else cache_writes.get(model, 0)
+        cache_write_1h = values.get("cache_write_1h", 0) if symphony else 0
         long_input = values.get("long_context_input", 0) if symphony else 0
         long_output = values.get("long_context_output", 0) if symphony else 0
         long_cache_read = values.get("long_context_cache_read", 0) if symphony else 0
         long_cache_write = values.get("long_context_cache_write", 0) if symphony else 0
         if not all(type(value) is int and value >= 0 for value in (
             input_tokens, output_tokens, cache_read, cache_write, long_input,
-            long_output, long_cache_read, long_cache_write,
+            long_output, long_cache_read, long_cache_write, cache_write_1h,
         )):
             continue
         # Both APIs report input as the whole prompt, including cached tokens.
         total_input = input_tokens
         normalized[model] = {
             "input": total_input, "uncached_input": max(0, total_input - cache_read - cache_write),
-            "cache_read": cache_read, "cache_write": cache_write, "output": output_tokens,
+            "cache_read": cache_read, "cache_write": cache_write,
+            "cache_write_1h": cache_write_1h, "output": output_tokens,
         }
         if long_input or long_output or long_cache_read or long_cache_write:
             normalized[model].update({
@@ -262,13 +265,17 @@ def price_agent_usage(
             )
             normalized[model]["cache_write_5m"] = split["5m"]
             normalized[model]["cache_write_1h"] = split["1h"]
+            cache_write_1h = split["1h"]
         if not symphony and model not in cache_writes and split is None:
             estimated = True
         totals = UsageTotals(
             total_input, output_tokens, 0, cache_read, cache_write, long_input,
-            long_output, long_cache_read, long_cache_write,
+            long_output, long_cache_read, long_cache_write, cache_write_1h,
         )
         price_model = model if model in prices.prices else model.rsplit("/", 1)[-1]
+        if (cache_write_1h and price_model in prices.prices
+                and prices.cache_write_1h_is_estimated(price_model, totals)):
+            estimated = True
         if split is not None and price_model in prices.prices:
             price = prices.prices[price_model]
             one_hour_rate = (cache_write_1h_rates or {}).get(price_model)
@@ -338,6 +345,7 @@ def _usage_dict(value: UsageTotals) -> dict[str, int]:
         "output": value.output_tokens,
         "cache_read": value.cache_read_tokens,
         "cache_write": value.cache_write_tokens,
+        "cache_write_1h": value.cache_write_1h_tokens,
         "calls": value.calls,
     }
     long_context = {

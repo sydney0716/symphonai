@@ -149,7 +149,7 @@ def harbor_usage_cost_is_normalized() -> None:
         )
         if usage["models"]["model-a"] != {
             "input": 1000, "uncached_input": 700, "cache_read": 200,
-            "cache_write": 100, "output": 100,
+            "cache_write": 100, "cache_write_1h": 0, "output": 100,
         }:
             fail(f"Harbor token counts were not split exactly once: {usage!r}")
         if usage["total"] != "0.0023" or usage["estimated"]:
@@ -163,7 +163,7 @@ def symphonai_and_agent_reported_cost() -> None:
         price_file = root / "prices.json"
         price_file.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
             "claude-opus-5-5": {"input": 4, "output": 20, "cache_read": 0.20,
-                                "cache_write": 5},
+                                "cache_write": 5, "cache_write_1h": 8},
             "gpt-6-luna": {"input": 0.10, "output": 0.50, "cache_read": 0.01,
                            "cache_write": 0.125, "long_context": {
                                "input": 0.20, "output": 0.75,
@@ -191,6 +191,26 @@ def symphonai_and_agent_reported_cost() -> None:
         if (opus_report_cost["total"] != "0.083"
                 or opus_report_cost["models"]["claude-opus-5-5"]["input"] != 100000):
             fail(f"Opus displayed cost or prompt size was incorrect: {opus_report_cost!r}")
+
+        hour_record = {"type": "usage", "data": {
+            "model": "claude-opus-5-5", "input_tokens": 10000,
+            "output_tokens": 0, "calls": 1, "cache_write_tokens": 10000,
+            "cache_write_1h_tokens": 8000,
+        }}
+        hour_summary = usage_summary([hour_record], prices)
+        hour_usage = UsageTotals(
+            10000, 0, 1, 0, 10000, cache_write_1h_tokens=8000,
+        )
+        hour_cost = total_cost({"claude-opus-5-5": hour_usage}, prices)
+        if (hour_summary["models"]["claude-opus-5-5"]["cache_write_1h"] != 8000
+                or hour_summary["cost"]["total"] != "0.074"
+                or hour_summary["cost"]["total"] != str(hour_cost)):
+            fail(f"SymphonAI one-hour write count or cost was incorrect: {hour_summary!r}")
+        hour_report_cost = price_agent_usage(None, prices, symphonai_usage=hour_summary)
+        if (hour_report_cost["models"]["claude-opus-5-5"]["cache_write_1h"] != 8000
+                or hour_report_cost["total"] != "0.074"
+                or hour_report_cost["estimated"]):
+            fail(f"SymphonAI one-hour write report was incorrect: {hour_report_cost!r}")
 
         luna_record = {"type": "usage", "data": {
             "model": "gpt-6-luna", "input_tokens": 300000,
@@ -530,7 +550,8 @@ def usage_populates_context_and_report() -> None:
     if "cost" in summary:
         fail("cost appeared without a price file")
     if summary["models"]["model-a"] != {
-        "input": 30, "output": 6, "cache_read": 8, "cache_write": 3, "calls": 3,
+        "input": 30, "output": 6, "cache_read": 8, "cache_write": 3,
+        "cache_write_1h": 0, "calls": 3,
     }:
         fail(f"per-model usage is incorrect: {summary['models']!r}")
     if summary["agents"]["worker"]["calls"] != 2 or summary["agents"]["explorer"]["input"] != 7:
