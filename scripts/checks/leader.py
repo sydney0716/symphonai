@@ -692,6 +692,23 @@ def check_handoff_validation_uses_shell_policy() -> None:
 
 @check("leader.base_prompts_lead_their_agents")
 def base_prompts_lead_their_agents() -> None:
+    leader_rule = (
+        "You run existing commands to inspect, build and test, but you never write "
+        "code, scripts or solution content yourself, not even in a temporary directory. "
+        "When a problem needs new code to reproduce or solve, describe that code in a "
+        "spec and hand it to the implementer."
+    )
+    verification_rule = (
+        "Verify. When a handoff returns, read the diff and run the project's existing "
+        "checks yourself; any new test belongs in the next spec. A subagent's report "
+        "is its claim."
+    )
+    if (leader_rule not in LEADER_BASE_PROMPT
+            or "Your commands may build, test and generate files, but you never write or edit code yourself." in LEADER_BASE_PROMPT):
+        fail("leader prompt does not prohibit writing code or scratch content")
+    if (verification_rule not in LEADER_BASE_PROMPT
+            or "run the checks that matter yourself." in LEADER_BASE_PROMPT):
+        fail("leader prompt does not limit verification to existing project checks")
     if (
         "ask_user" not in LEADER_BASE_PROMPT
         or "update_plan" not in LEADER_BASE_PROMPT
@@ -5674,7 +5691,7 @@ def check_spec_workflow_prompts() -> None:
             fail("built-in leader guidance does not match the role definitions")
         requirements = {
             "planner": ("You are a planner. You turn a goal into specs", "Find out before you write", "Every Validation command is one you ran", "Keep each spec to one change", "End by naming the spec path"),
-            "implementer": ("You are an implementer. You carry out one spec exactly", "The spec is the contract", "The host runs them again", "If the spec is wrong", "git status --porcelain verbatim"),
+            "implementer": ("You are an implementer. You carry out one spec exactly", "The spec is the contract", "The host runs them again", "If the spec is wrong", "git status --porcelain verbatim when the project is a git repository"),
             "reviewer": ("You are a reviewer. Your job is to find what is wrong", "The report is the implementer's claim", "run at least one probe", "<id>F-<slug>.md", "Never commit"),
         }
         for name, phrases in requirements.items():
