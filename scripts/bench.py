@@ -19,7 +19,9 @@ sys.dont_write_bytecode = True
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.bench import price_agent_usage, read_usage_files, usage_table_data  # noqa: E402
+from scripts.bench import (  # noqa: E402
+    price_agent_usage, read_leader_shell_changes, read_usage_files, usage_table_data,
+)
 from symphonai_api.cost import load_price_table  # noqa: E402
 from symphonai_api.paths import symphonai_home  # noqa: E402
 
@@ -324,6 +326,9 @@ def _usage_from_trials(
             rendered.append({
                 "task": row["task"], "resolved": False,
                 "wall_seconds": row["wall_seconds"], "exception": exception,
+                "leader_shell_changes": read_leader_shell_changes(
+                    row["trial_path"] / "agent"
+                ),
             })
             continue
         reported_cost = context.get("cost_usd") if isinstance(context, dict) else None
@@ -341,6 +346,9 @@ def _usage_from_trials(
             "model_usage": model_usage,
             "metadata": context.get("metadata"),
             "agent_reported_cost": reported_cost,
+            "leader_shell_changes": read_leader_shell_changes(
+                row["trial_path"] / "agent"
+            ),
         }
         if "usage" in row:
             rendered_row["usage"] = row["usage"]

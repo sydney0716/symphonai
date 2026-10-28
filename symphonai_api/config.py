@@ -136,7 +136,12 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
     always_deny = _table(source, values, "always_deny")
     if always_deny is not None:
-        _unknown_keys(source, "always_deny", always_deny, {"lift"})
+        _unknown_keys(source, "always_deny", always_deny, {
+            "lift", "allow_uncheckable_shell", "allow_discarding_work",
+        })
+        for key in ("allow_uncheckable_shell", "allow_discarding_work"):
+            if key in always_deny:
+                _boolean(source, f"always_deny.{key}", always_deny[key])
         if "lift" in always_deny:
             allowed = {" ".join(command) for command in ALWAYS_DENY_COMMANDS}
             for value in _strings(source, "always_deny.lift", always_deny["lift"]):
@@ -416,7 +421,7 @@ def load_config(
                     continue
                 if section == "always_deny":
                     warnings.append(
-                        f"{source}: always_deny: lifts are accepted only from user config; section skipped"
+                        f"{source}: always_deny: settings are accepted only from user config; section skipped"
                     )
                     continue
                 try:

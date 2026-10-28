@@ -19,6 +19,13 @@ from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
 
 DEFAULT_HEAD_LIMIT = 250
 CANCEL_CHECK_INTERVAL_FILES = 64
+DEFAULT_SKIP_DIRECTORIES = frozenset({
+    ".venv", "__pycache__", "node_modules", "dist", "build",
+})
+
+
+def _default_skipped_directory(name: str) -> bool:
+    return name in DEFAULT_SKIP_DIRECTORIES or fnmatch.fnmatchcase(name, "*.egg-info")
 
 
 def apply_head_limit(
@@ -106,6 +113,8 @@ def _walk_candidates(
     search_root: Path,
     policy: PermissionPolicy,
     cancel: CancellationToken | None,
+    *,
+    include_skipped: bool = False,
 ):
     files_seen = 0
     ignored = _git_ignored_paths(search_root, policy)
@@ -116,6 +125,7 @@ def _walk_candidates(
         dirnames[:] = [
             name
             for name in dirnames
+            if (include_skipped or not _default_skipped_directory(name))
             if not (directory_path / name).is_symlink()
             and not _is_git_ignored(
                 (directory_path / name).relative_to(policy.repo_root).as_posix(), ignored
@@ -233,9 +243,15 @@ class GlobTool(LocalTool):
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         search_root = policy._resolve_within_root(path)
+        explicit = (
+            any(_default_skipped_directory(part) for part in search_root.relative_to(policy.repo_root).parts)
+            or any(_default_skipped_directory(part) for part in tool_call.arguments["pattern"].split("/"))
+        )
         candidates = [
             candidate
-            for candidate in _walk_candidates(search_root, policy, cancel)
+            for candidate in _walk_candidates(
+                search_root, policy, cancel, include_skipped=explicit,
+            )
             if _matches_path(tool_call.arguments["pattern"], candidate.search_relative)
         ]
         candidates.sort(key=lambda candidate: (-candidate.mtime, candidate.repo_relative))
@@ -351,9 +367,15 @@ class GrepTool(LocalTool):
         expression = re.compile(arguments["pattern"], flags)
         search_root = policy._resolve_within_root(path)
         glob_pattern = arguments.get("glob")
+        explicit = any(
+            _default_skipped_directory(part)
+            for part in search_root.relative_to(policy.repo_root).parts
+        )
         candidates = [
             candidate
-            for candidate in _walk_candidates(search_root, policy, cancel)
+            for candidate in _walk_candidates(
+                search_root, policy, cancel, include_skipped=explicit,
+            )
             if glob_pattern is None or _matches_path(glob_pattern, candidate.search_relative)
         ]
         candidates.sort(key=lambda candidate: (-candidate.mtime, candidate.repo_relative))

@@ -35,6 +35,7 @@ _RECORD_TYPES = frozenset(
         "compaction",
         "checkpoint",
         "conversation_rewritten",
+        "leader_shell_changes",
         "run_finished",
         "run_failed",
     }

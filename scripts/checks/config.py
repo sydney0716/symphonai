@@ -124,14 +124,26 @@ def always_deny_lifts_are_user_only() -> None:
         user_path = _scope_path(Scope.USER, repo_root, home)
         project_path = _scope_path(Scope.PROJECT, repo_root, home)
         private_path = _scope_path(Scope.PRIVATE, repo_root, home)
-        _write(user_path, '[always_deny]\nlift = ["rm"]\n')
+        _write(
+            user_path,
+            '[always_deny]\nlift = ["rm"]\n'
+            'allow_uncheckable_shell = true\nallow_discarding_work = true\n',
+        )
         configured = load_config(repo_root=repo_root, home=home)
         if (configured.get("always_deny.lift") != ["rm"]
                 or configured.scope_of("always_deny.lift") is not Scope.USER):
             fail(f"user always-deny lift did not load with user provenance: {configured!r}")
+        for key in ("allow_uncheckable_shell", "allow_discarding_work"):
+            full_key = f"always_deny.{key}"
+            if configured.get(full_key) is not True or configured.scope_of(full_key) is not Scope.USER:
+                fail(f"user {full_key} did not load with user provenance: {configured!r}")
 
         for path in (project_path, private_path):
-            _write(path, '[always_deny]\nlift = ["rm"]\n')
+            _write(
+                path,
+                '[always_deny]\nlift = ["rm"]\n'
+                'allow_uncheckable_shell = false\nallow_discarding_work = false\n',
+            )
         scoped = load_config(repo_root=repo_root, home=home)
         for path in (project_path, private_path):
             if not any(str(path) in warning and "always_deny" in warning
@@ -139,6 +151,9 @@ def always_deny_lifts_are_user_only() -> None:
                 fail(f"ignored always_deny warning omitted source or table: {scoped.warnings!r}")
         if scoped.get("always_deny.lift") != ["rm"] or scoped.scope_of("always_deny.lift") is not Scope.USER:
             fail("project or private config replaced the user always-deny lift")
+        for key in ("always_deny.allow_uncheckable_shell", "always_deny.allow_discarding_work"):
+            if scoped.get(key) is not True or scoped.scope_of(key) is not Scope.USER:
+                fail(f"project or private config replaced user setting {key}")
 
         for invalid in ("rm -rf", "python"):
             _write(user_path, f'[always_deny]\nlift = ["{invalid}"]\n')

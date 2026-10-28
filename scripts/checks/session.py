@@ -56,6 +56,7 @@ from symphonai_api.session import (
 from symphonai_api.repair import unanswered_tool_call_ids
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_host.sessions import list_sessions, prompt_history
 from scripts.checks.harness import check, fail
 from scripts.checks.workspace import handoff_spec
 
@@ -679,6 +680,75 @@ def check_load_ignores_unknown_record_type() -> None:
         loaded = load_run(store)
         if [message.text for message in loaded.messages] != ["known"]:
             fail(f"unknown record type changed the loaded conversation: {loaded!r}")
+
+
+@check("session.leader_shell_changes_does_not_change_reopen_history_or_listing")
+def check_leader_shell_changes_does_not_change_reopen_history_or_listing() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sessions = root / "sessions"
+        repo = root / "repo"
+        repo.mkdir()
+        baseline, agent_id = _seed_persisted_messages(
+            sessions,
+            "baseline",
+            [
+                Message(role=Role.USER, content="question", turn_id="turn-user"),
+                Message(role=Role.ASSISTANT, content="answer", turn_id="turn-answer"),
+            ],
+        )
+        meta = baseline.read_meta()
+        meta["repo_root"] = str(repo)
+        baseline.write_meta(meta)
+        changed_dir = sessions / "with-change-record"
+        shutil.copytree(baseline.directory, changed_dir)
+        changed_meta_path = changed_dir / "meta.json"
+        changed_meta = json.loads(changed_meta_path.read_text(encoding="utf-8"))
+        changed_meta["run_id"] = "with-change-record"
+        changed_meta_path.write_text(json.dumps(changed_meta), encoding="utf-8")
+        changed_store = SessionStore.open(sessions, "with-change-record")
+        writer = TranscriptWriter(changed_dir / "run.jsonl")
+        writer.append(
+            "leader_shell_changes",
+            run_id="run-baseline",
+            agent_id=agent_id,
+            turn_id=None,
+            data={"changed_existing_paths": ["src/main.py"], "new_files_count": 1},
+        )
+        writer.close()
+
+        baseline_store = SessionStore.open(sessions, "baseline")
+        baseline_loaded = load_run(baseline_store)
+        changed_loaded = load_run(changed_store)
+        if changed_loaded.messages != baseline_loaded.messages:
+            fail("leader shell change record altered reopened messages")
+        if (load_run_for_resume(changed_store)[0].messages
+                != load_run_for_resume(baseline_store)[0].messages):
+            fail("leader shell change record altered resumed history")
+
+        for run_id, store in (("baseline", baseline_store), ("with-change-record", changed_store)):
+            records, _ = read_records(store.directory / "run.jsonl")
+            last_message = next(record for record in reversed(records) if record["type"] == "message")
+            fork_store = SessionStore(sessions / "forks", run_id)
+            forked = fork_run(
+                store,
+                through_record_id=last_message["record_id"],
+                new_store=fork_store,
+            )
+            if forked.messages != baseline_loaded.messages:
+                fail("leader shell change record altered forked history")
+            fork_store.close()
+
+        listings = list_sessions(sessions)
+        baseline_listing = next(item for item in listings if item["run_id"] == "baseline")
+        changed_listing = next(item for item in listings if item["run_id"] == "with-change-record")
+        comparable = lambda item: {key: value for key, value in item.items() if key != "run_id"}
+        if comparable(baseline_listing) != comparable(changed_listing) or baseline_listing["message_count"] != 2:
+            fail(f"leader shell change record altered session listing: {listings!r}")
+        if prompt_history(sessions, repo) != ["question"]:
+            fail("leader shell change record altered prompt history")
+        baseline_store.close()
+        changed_store.close()
 
 
 def _resume_source_messages() -> list[Message]:

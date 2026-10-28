@@ -49,6 +49,7 @@ from symphonai_api.compaction import (
     estimate_messages_tokens,
 )
 import symphonai_api.leader as leader_module
+import symphonai_api.tools.shell as shell_module
 from symphonai_api.leader import (
     DispatchSubagentTool,
     Leader,
@@ -100,7 +101,6 @@ from symphonai_api.tools.metadata import (
 )
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.skills import Skill
-import symphonai_api.tools.shell as shell_module
 
 from scripts.checks.harness import check, fail
 from scripts.checks import memory_extract as _memory_extract_checks  # noqa: F401
@@ -4184,12 +4184,11 @@ def check_default_spec_reports_actual_tools() -> None:
         leader = Leader(LeaderConfig(FakeModelProvider(), FakeModelProvider(), str(ws.root)))
         actual = set(leader._agent._tools)
         reported = set(leader._leader_spec.tool_names or ())
-        expected = {"dispatch_subagent", *standard_tool_registry()}
-        expected.difference_update({"write_file", "edit_file", "multi_edit_file", "run_shell", "job_output", "job_stop"})
-        if leader_module._sandbox_available():
-            expected.add("run_shell")
+        expected = {"dispatch_subagent", *standard_tool_registry(jobs=leader.background_jobs)}
+        expected.difference_update({"write_file", "edit_file", "multi_edit_file"})
         if actual != expected or reported != actual:
             fail(f"leader spec did not report its actual dispatch and standard tools: {reported!r}, {actual!r}")
+        leader.close()
 
 
 @check("leader.never_has_edit_tools")
@@ -4217,88 +4216,70 @@ def check_leader_never_has_edit_tools() -> None:
 
 
 @check("leader.shell_is_confined_to_temporary_directories")
-def check_leader_shell_is_confined_to_temporary_directories() -> None:
-    if not leader_module._sandbox_available():
+def check_leader_shell_reports_project_changes() -> None:
+    if not shell_module._sandbox_available():
         print("SKIP: shell sandbox is unavailable")
         return
-    with (tempfile.TemporaryDirectory(dir="/private/var/tmp", prefix="symphonai-project-") as project,
-          tempfile.TemporaryDirectory(prefix="symphonai-leader-") as temporary):
+    with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as session_root:
         root = Path(project).resolve()
-        ws = Workspace(
-            root=root,
-            outside=Path(temporary).resolve(),
-            policy=PermissionPolicy(
-                repo_root=root, allowed_write_scope=[root],
-                shell_enabled=True, shell_allowlist=[()],
-            ),
-            tools=standard_tool_registry(),
+        (root / "a.txt").write_text("new contents\n")
+        (root / "b.txt").write_text("old contents\n")
+        (root / "x.c").write_text("int main(void) { return 0; }\n")
+        (root / "build").mkdir()
+        policy = PermissionPolicy(
+            repo_root=root, mode="allow", shell_enabled=True, shell_allowlist=[()],
         )
-        ws.policy.allowed_write_scope = [ws.root]
-        scratch = Path(temporary) / "leader.txt"
-        blocked = ws.root / "leader-blocked.txt"
-        leader_provider = _RecordingFakeProvider([
+        session = SessionStore(Path(session_root), "leader-shell-changes")
+        provider = _RecordingFakeProvider([
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-                "tmp-write", "run_shell", {"command": f"printf safe > {scratch}"},
+                "new-file", "run_shell", {"command": "printf built > build/out"},
             )])),
             ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-                "project-write", "run_shell", {"command": f"printf blocked > {blocked}"},
-            )])),
-            ModelResponse(Message(Role.ASSISTANT, tool_calls=[_dispatch(
-                "implementer", _handoff_spec(
-                    "Create child outputs", "test -f child-shell.txt && test -f child-file.txt"
-                ), "child-dispatch",
+                "existing-file", "run_shell", {"command": "cp a.txt b.txt"},
             )])),
             ModelResponse(Message(Role.ASSISTANT, "finished")),
         ])
-        child_provider = _RecordingFakeProvider([
-            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-                "child-shell", "run_shell", {"command": "printf shell > child-shell.txt"},
-            )])),
-            ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
-                "child-file", "write_file", {"path": "child-file.txt", "content": "file\n"},
-            )])),
-            ModelResponse(Message(Role.ASSISTANT, "outputs created")),
-        ])
         leader = Leader(LeaderConfig(
-            leader_provider, child_provider, str(ws.root), leader_policy=ws.policy,
-        ))
-        run_result = leader.run("hand off the changes")
+            provider, FakeModelProvider(), str(root), leader_policy=policy,
+        ), session=session)
+        run_result = leader.run("build and update the fixture")
         results = [
             message.tool_result for message in run_result.leader_messages
             if message.tool_result is not None
         ]
-        if not scratch.is_file() or blocked.exists():
-            fail(f"leader shell could not write to temp or changed the project: {results!r}")
-        if not (ws.root / "child-shell.txt").is_file() or not (ws.root / "child-file.txt").is_file():
-            fail("implementer did not retain project shell and write tools")
-        if len(results) < 3 or results[0].ok is False or results[1].ok is True:
-            fail(f"leader shell confinement did not hold: {results!r}")
-        expected_leader_message = (
-            "the leader's shell can write only to temporary directories; "
-            "changes go to an implementer with a spec"
-        )
-        if expected_leader_message not in (results[1].error or ""):
-            fail(f"leader shell denial did not explain its restriction: {results[1]!r}")
-        leader_policy = replace(ws.policy, shell_sandbox=True, sandbox_write_scope=[])
-        child_policy = replace(ws.policy, shell_sandbox=True, sandbox_write_scope=[ws.root])
-        if shell_module._sandbox_denial_message(leader_policy, "write to project") != expected_leader_message:
-            fail("leader sandbox denial wording changed")
-        if shell_module._sandbox_denial_message(child_policy, "write to project") != "blocked by the sandbox: write to project":
-            fail("subagent sandbox denial wording changed")
+        if not (root / "build" / "out").is_file() or (root / "b.txt").read_text() != "new contents\n":
+            fail(f"leader shell could not write to new and existing project files: {results!r}")
+        if len(results) != 2 or any(not result.ok for result in results):
+            fail(f"leader shell commands did not succeed: {results!r}")
+        if "This command changed existing project files:" in results[0].content:
+            fail(f"new project file was incorrectly listed in the tool result: {results[0]!r}")
+        if not results[1].content.endswith("This command changed existing project files: b.txt"):
+            fail(f"existing changed path was missing from the tool result: {results[1]!r}")
+        records, _ = read_records(session.directory / "run.jsonl")
+        change_records = [record for record in records if record.get("type") == "leader_shell_changes"]
+        if (len(change_records) != 2
+                or change_records[0]["data"].get("new_files_count") < 1
+                or change_records[0]["data"].get("changed_existing_paths") != []
+                or change_records[1]["data"].get("changed_existing_paths") != ["b.txt"]):
+            fail(f"leader shell changes were not recorded correctly: {change_records!r}")
+        leader.close()
+        session.close()
 
 
 @check("leader.no_sandbox_removes_leader_shell_only")
 def check_no_sandbox_removes_leader_shell_only() -> None:
     with workspace() as ws, mock.patch(
-        "symphonai_api.leader._sandbox_available", return_value=False,
+        "symphonai_api.tools.shell._sandbox_available", return_value=False,
     ):
         provider = _RecordingFakeProvider([ModelResponse(Message(Role.ASSISTANT, "done"))])
         jobs = JobManager()
         leader = Leader(LeaderConfig(
             provider, provider, str(ws.root), jobs=jobs, leader_policy=ws.policy,
         ))
-        if {"run_shell", "job_output", "job_stop"}.intersection(leader._agent._tools):
-            fail(f"leader retained shell or background tools without a sandbox: {leader._agent._tools!r}")
+        if not {"run_shell", "job_output", "job_stop"}.issubset(leader._agent._tools):
+            fail(f"leader lost shell or background tools without a sandbox: {leader._agent._tools!r}")
+        if leader._agent._policy != ws.policy or leader._leader_spec.policy_ceiling != ws.policy:
+            fail("no-sandbox leader policy was changed")
         leader._dispatch_tool._set_event_context(
             agent_id=leader.agent_ref.agent_id, run_id="run-test", turn_id=None,
         )
@@ -4309,6 +4290,47 @@ def check_no_sandbox_removes_leader_shell_only() -> None:
         if not result.ok or child is None or "run_shell" not in child.agent._tools:
             fail(f"no-sandbox leader restriction leaked to its implementer: {result!r}")
         jobs.close()
+        with tempfile.TemporaryDirectory() as session_root:
+            (ws.root / "changed.txt").write_text("updated\n")
+            policy = PermissionPolicy(
+                repo_root=ws.root, mode="allow", shell_enabled=True, shell_allowlist=[()],
+            )
+            session = SessionStore(Path(session_root), "no-sandbox-shell-changes")
+            provider = _RecordingFakeProvider([
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    "new-file", "run_shell", {"command": "printf new > output.txt"},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, tool_calls=[ToolCall(
+                    "existing-file", "run_shell", {"command": "cp changed.txt existing.txt"},
+                )])),
+                ModelResponse(Message(Role.ASSISTANT, "finished")),
+            ])
+            change_leader = Leader(LeaderConfig(
+                provider, FakeModelProvider(), str(ws.root), leader_policy=policy,
+            ), session=session)
+            run_result = change_leader.run("write an output and update the existing fixture")
+            results = [
+                message.tool_result for message in run_result.leader_messages
+                if message.tool_result is not None
+            ]
+            if (not (ws.root / "output.txt").is_file()
+                    or (ws.root / "existing.txt").read_text() != "updated\n"):
+                fail(f"leader shell could not write project files without a sandbox: {results!r}")
+            if (len(results) != 2 or any(not result.ok for result in results)
+                    or "This command changed existing project files:" in results[0].content
+                    or not results[1].content.endswith(
+                        "This command changed existing project files: existing.txt"
+                    )):
+                fail(f"no-sandbox shell results did not report project changes: {results!r}")
+            records, _ = read_records(session.directory / "run.jsonl")
+            changes = [record for record in records if record.get("type") == "leader_shell_changes"]
+            if (len(changes) != 2
+                    or changes[0]["data"].get("new_files_count") < 1
+                    or changes[0]["data"].get("changed_existing_paths") != []
+                    or changes[1]["data"].get("changed_existing_paths") != ["existing.txt"]):
+                fail(f"no-sandbox leader changes were not recorded correctly: {changes!r}")
+            change_leader.close()
+            session.close()
 
 
 @check("leader.search_roster_dispatch")

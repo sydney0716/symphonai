@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 from collections.abc import Mapping, Sequence
@@ -99,7 +100,7 @@ from symphonai_api.providers.openai_provider import (
 )
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.spec_text import spec_validation
-from symphonai_api.tools.shell import RunShellTool, _sandbox_available
+from symphonai_api.tools.shell import RunShellTool
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
     IMPLEMENTER_PROMPT,
@@ -1449,6 +1450,90 @@ class _LeaderTranscript:
         return record_id
 
 
+def _project_snapshot(root: Path) -> dict[str, tuple[int, int]] | None:
+    """Capture file size and mtime for a reasonably sized project tree."""
+    snapshot: dict[str, tuple[int, int]] = {}
+    entries = 0
+    for directory, dirnames, filenames in os.walk(root):
+        entries += len(dirnames) + len(filenames)
+        if entries > 50_000:
+            return None
+        for filename in filenames:
+            path = Path(directory) / filename
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            snapshot[path.relative_to(root).as_posix()] = (info.st_size, info.st_mtime_ns)
+    return snapshot
+
+
+class _LeaderShellTool(LocalTool):
+    """Run the normal shell while recording changes to existing project files."""
+
+    def __init__(self, delegate: LocalTool, *, root: Path, leader: "Leader") -> None:
+        self._delegate = delegate
+        self._root = root.resolve()
+        self._leader = leader
+
+    @property
+    def name(self) -> str:
+        return self._delegate.name
+
+    @property
+    def description(self) -> str:
+        return self._delegate.description
+
+    @property
+    def parameters(self) -> dict:
+        return self._delegate.parameters
+
+    def validate(self, arguments: dict) -> str | None:
+        return self._delegate.validate(arguments)
+
+    def metadata(self, arguments: dict) -> ToolMetadata:
+        return self._delegate.metadata(arguments)
+
+    def _execute(
+        self, tool_call: ToolCall, policy: PermissionPolicy,
+        cancel: CancellationToken | None = None,
+    ) -> ToolResult:
+        before = _project_snapshot(self._root)
+        result = self._delegate.execute(tool_call, policy, cancel=cancel)
+        after = _project_snapshot(self._root)
+        skipped = before is None or after is None
+        changed_existing: list[str] = []
+        new_files_count = 0
+        if not skipped:
+            changed_existing = sorted(
+                path for path, details in before.items()
+                if path not in after or after[path] != details
+            )
+            new_files_count = sum(path not in before for path in after)
+        transcript = self._leader._transcript
+        run_id = self._leader._leader_run_id()
+        if transcript is not None and run_id is not None:
+            data = {
+                "changed_existing_paths": changed_existing,
+                "new_files_count": new_files_count,
+            }
+            if skipped:
+                data["snapshot_skipped"] = "project tree exceeds 50000 entries"
+            transcript.append(
+                "leader_shell_changes",
+                run_id=run_id,
+                agent_id=self._leader._agent_ref.agent_id,
+                turn_id=None,
+                data=data,
+            )
+        if changed_existing:
+            listed = ", ".join(changed_existing[:20])
+            if len(changed_existing) > 20:
+                listed += f", and {len(changed_existing) - 20} more"
+            suffix = f"This command changed existing project files: {listed}"
+            result = replace(result, content=f"{result.content}\n{suffix}" if result.content else suffix)
+        return result
+
 class Leader:
     """Digests a user goal, dispatching/reusing named subagents as needed.
 
@@ -1493,7 +1578,8 @@ class Leader:
         defined_leader = None if config.subagent_specs is None else config.subagent_specs.get("leader")
         is_loop_stage = defined_leader is not None and defined_leader.name != "leader"
         restrict_leader = not is_loop_stage
-        sandbox_available = _sandbox_available() if restrict_leader else True
+        self._leader_jobs = config.jobs or (JobManager() if restrict_leader else None)
+        self._owns_leader_jobs = restrict_leader and config.jobs is None
         leader_agent_policy = leader_policy
         self._leader_prompt = "\n\n".join(
             prompt for prompt in (
@@ -1580,38 +1666,26 @@ class Leader:
                 skills=(None if config.extensions is None else config.extensions.skills),
                 checkpoints=config.checkpoints,
                 lsp=config.lsp,
-                jobs=config.jobs,
+                jobs=self._leader_jobs if restrict_leader else config.jobs,
             ),
             config.extra_tools,
         )
         if restrict_leader:
             for name in ("write_file", "edit_file", "multi_edit_file"):
                 standard_tools.pop(name, None)
-            if sandbox_available:
-                # The sandbox itself exposes only temporary locations as writable.
-                leader_agent_policy = replace(
-                    leader_agent_policy,
-                    shell_sandbox=True,
-                    sandbox_write_scope=[],
-                )
-            else:
-                for name in ("run_shell", "job_output", "job_stop"):
-                    standard_tools.pop(name, None)
         leader_tools.update(standard_tools)
         leader_only_tools = dict(config.leader_tools or {})
         if restrict_leader:
             for name in ("write_file", "edit_file", "multi_edit_file"):
                 leader_only_tools.pop(name, None)
-            if not sandbox_available:
-                for name in ("run_shell", "job_output", "job_stop"):
-                    leader_only_tools.pop(name, None)
         leader_tools.update(leader_only_tools)
         if restrict_leader:
             for name in ("write_file", "edit_file", "multi_edit_file"):
                 leader_tools.pop(name, None)
-            if not sandbox_available:
-                for name in ("run_shell", "job_output", "job_stop"):
-                    leader_tools.pop(name, None)
+            if "run_shell" in leader_tools:
+                leader_tools["run_shell"] = _LeaderShellTool(
+                    leader_tools["run_shell"], root=Path(config.repo_root), leader=self,
+                )
         provider_name = getattr(config.leader_provider, "name", None) or "unknown"
         self._leader_spec = AgentSpec(
             name="leader",
@@ -2256,11 +2330,13 @@ class Leader:
         self._chat_messages.append(Message(role=Role.USER, content=text))
 
     def close(self) -> None:
-        if self._config.jobs is not None:
+        if self._owns_leader_jobs and self._leader_jobs is not None:
+            self._leader_jobs.close()
+        elif self._config.jobs is not None:
             self._config.jobs.close()
         if self._memory_extractor is not None:
             self._memory_extractor.close()
 
     @property
     def background_jobs(self) -> JobManager | None:
-        return self._config.jobs
+        return self._leader_jobs

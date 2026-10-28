@@ -267,6 +267,34 @@ def provider_prefixed_model_prices() -> None:
         fail(f"provider-prefixed model was not priced by its base name: {priced!r}")
 
 
+@check("bench.results_include_leader_shell_changes")
+def results_include_leader_shell_changes() -> None:
+    runner_spec = importlib.util.spec_from_file_location(
+        "terminal_bench_runner_leader_changes", Path(__file__).resolve().parents[1] / "bench.py"
+    )
+    if runner_spec is None or runner_spec.loader is None:
+        fail("could not load the runner for leader shell changes fixture")
+    runner = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(runner)
+    with tempfile.TemporaryDirectory() as temporary:
+        trial = Path(temporary)
+        transcript = trial / "agent" / "sessions" / "run.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps({
+            "type": "leader_shell_changes",
+            "data": {"changed_existing_paths": ["src/main.py", "README.md"]},
+        }) + "\n", encoding="utf-8")
+        rows = [{
+            "task": "fixture", "resolved": True, "wall_seconds": 1,
+            "trial_path": trial, "result": {"agent_result": {
+                "model_usage": {}, "metadata": {},
+            }},
+        }]
+        rendered = runner._usage_from_trials(rows)[0]
+    if rendered.get("leader_shell_changes") != ["src/main.py", "README.md"]:
+        fail(f"results row omitted recorded leader changes: {rendered!r}")
+
+
 @check("bench.claude_cache_write_lifetimes")
 def claude_cache_write_lifetimes() -> None:
     with tempfile.TemporaryDirectory() as temporary:

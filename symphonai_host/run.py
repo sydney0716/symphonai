@@ -328,6 +328,15 @@ class HostRun:
                     command for command in ALWAYS_DENY_COMMANDS
                     if " ".join(command) not in lifted
                 ))
+            policy = replace(
+                policy,
+                allow_uncheckable_shell=extensions.config.get(
+                    "always_deny.allow_uncheckable_shell", False
+                ),
+                allow_discarding_work=extensions.config.get(
+                    "always_deny.allow_discarding_work", False
+                ),
+            )
         self._provider = provider
         self._policy = policy
         self._repo_root = policy.repo_root

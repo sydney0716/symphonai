@@ -1,7 +1,7 @@
 """Deny-by-default permission policy gating all filesystem and shell access.
 
 Everything defaults closed: `read_file`/`list_files` are scoped to
-`repo_root` minus a denylist of secret/build/cache/dependency patterns;
+`repo_root` minus a denylist of secret-file patterns;
 `write_file` additionally requires an explicit allowed write scope, empty
 by default; `run_shell` is disabled by default and, even when enabled,
 only runs commands matching an explicit allowlist -- and a hardcoded
@@ -46,12 +46,6 @@ DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     "*.key",
     "id_rsa",
     "id_ed25519",
-    ".venv/",
-    "__pycache__/",
-    "*.egg-info/",
-    "node_modules/",
-    "dist/",
-    "build/",
 )
 DEFAULT_SHELL_OUTPUT_CHARS = 20_000
 MIN_SHELL_OUTPUT_CHARS = 1_000
@@ -388,6 +382,8 @@ class PermissionPolicy:
     approval_callback: ApprovalCallback | None = None
     sandbox_write_scope: list[Path] | None = None
     always_deny_commands: tuple[tuple[str, ...], ...] = ALWAYS_DENY_COMMANDS
+    allow_uncheckable_shell: bool = False
+    allow_discarding_work: bool = False
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
@@ -544,6 +540,8 @@ class PermissionPolicy:
                 self.forbidden_patterns, ceiling.forbidden_patterns
             ),
             always_deny_commands=self.always_deny_commands,
+            allow_uncheckable_shell=self.allow_uncheckable_shell,
+            allow_discarding_work=self.allow_discarding_work,
             shell_enabled=self.shell_enabled and ceiling.shell_enabled,
             shell_allowlist=_intersect_shell_allowlists(
                 self.shell_allowlist, ceiling.shell_allowlist
@@ -593,6 +591,8 @@ class PermissionPolicy:
             sandbox_write_scope=sandbox_write_scope,
             forbidden_patterns=self.forbidden_patterns,
             always_deny_commands=self.always_deny_commands,
+            allow_uncheckable_shell=self.allow_uncheckable_shell,
+            allow_discarding_work=self.allow_discarding_work,
             shell_enabled=self.shell_enabled,
             shell_allowlist=list(self.shell_allowlist),
             shell_sandbox=self.shell_sandbox,
@@ -754,6 +754,14 @@ class PermissionPolicy:
             )
         argv_tuple = tuple(argv)
         commands = commands_for_argv(argv)
+        if commands is None and not self.allow_uncheckable_shell and self.mode != "plan":
+            return self._deny(
+                "this command uses shell syntax that cannot be checked "
+                "(command or process substitution, a subshell, or a background job); "
+                "run it as simpler commands",
+                denial=DenialReason.UNCHECKABLE_COMMAND,
+                tool_name="run_shell",
+            )
         wrappers = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
         if commands is not None:
             current_directory = self.repo_root if cwd is None else Path(cwd).resolve()
@@ -804,10 +812,11 @@ class PermissionPolicy:
                         else (0,)
                     )
                     discarded = None
-                    for index in discard_starts:
-                        discarded = _discards_work(candidate[index:], self.repo_root, current_directory, indirect=indirect)
-                        if discarded is not None:
-                            break
+                    if not self.allow_discarding_work:
+                        for index in discard_starts:
+                            discarded = _discards_work(candidate[index:], self.repo_root, current_directory, indirect=indirect)
+                            if discarded is not None:
+                                break
                     if discarded is not None:
                         return self._deny(
                             f"this would discard uncommitted work ({discarded}); change the files with edits instead, or ask the person",
@@ -891,13 +900,7 @@ class PermissionPolicy:
                 tool_name="run_shell",
             )
         if commands is None:
-            return self._deny(
-                "this command uses shell syntax that cannot be checked "
-                "(command or process substitution, a subshell, or a background job); "
-                "run it as simpler commands",
-                denial=DenialReason.UNCHECKABLE_COMMAND,
-                tool_name="run_shell",
-            )
+            return PermissionDecision.allow()
         if all(
             (not command.writes and any(
                 command.argv[:len(prefix)] == prefix for prefix in self.shell_allowlist

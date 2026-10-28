@@ -382,8 +382,8 @@ def check_gitignore_respected() -> None:
             ToolCall(id="gitignore-glob-root", name="glob", arguments={"pattern": "**/*.py", "head_limit": 0}),
             policy,
         )
-        if set(root_glob.content.splitlines()) != {"src/a.py", "build/kept.py"}:
-            fail(f"root glob did not skip ignored untracked paths and keep the tracked file: {root_glob!r}")
+        if set(root_glob.content.splitlines()) != {"src/a.py"}:
+            fail(f"root glob did not skip ignored and generated paths: {root_glob!r}")
         root_grep = grep.execute(
             ToolCall(
                 id="gitignore-grep-root", name="grep",
@@ -391,7 +391,7 @@ def check_gitignore_respected() -> None:
             ),
             policy,
         )
-        if any(path in root_grep.content for path in ("build/b.py", "dist/c.py", "notes.log")):
+        if any(path in root_grep.content for path in ("build/b.py", "build/kept.py", "dist/c.py", "notes.log")):
             fail(f"root grep returned an ignored path: {root_grep!r}")
         build_glob = glob.execute(
             ToolCall(
@@ -401,4 +401,49 @@ def check_gitignore_respected() -> None:
             policy,
         )
         if set(build_glob.content.splitlines()) != {"build/b.py", "build/kept.py"}:
-            fail(f"a named ignored directory was filtered: {build_glob!r}")
+            fail(f"an explicitly named generated directory was filtered: {build_glob!r}")
+
+
+@check("search.generated_directories_are_skipped_by_default")
+def check_generated_directories_are_skipped_by_default() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "src").mkdir()
+        (root / "build").mkdir()
+        (root / "node_modules" / "pkg").mkdir(parents=True)
+        (root / "src" / "match.py").write_text("generated-search-marker\n", encoding="utf-8")
+        (root / "build" / "match.py").write_text("generated-search-marker\n", encoding="utf-8")
+        (root / "node_modules" / "pkg" / "match.py").write_text(
+            "generated-search-marker\n", encoding="utf-8",
+        )
+        policy = PermissionPolicy(repo_root=root)
+        glob = GlobTool()
+        grep = GrepTool()
+        root_glob = glob.execute(ToolCall(
+            "generated-root-glob", "glob", {"pattern": "**/*.py", "head_limit": 0},
+        ), policy)
+        root_grep = grep.execute(ToolCall(
+            "generated-root-grep", "grep", {
+                "pattern": "generated-search-marker", "head_limit": 0,
+            },
+        ), policy)
+        expected = {"src/match.py"}
+        if set(root_glob.content.splitlines()) != expected:
+            fail(f"root glob descended into generated directories: {root_glob!r}")
+        if set(root_grep.content.splitlines()) != expected:
+            fail(f"root grep descended into generated directories: {root_grep!r}")
+        for name, result in (
+            ("glob", glob.execute(ToolCall(
+                "generated-named-glob", "glob", {
+                    "path": "node_modules", "pattern": "**/*.py", "head_limit": 0,
+                },
+            ), policy)),
+            ("grep", grep.execute(ToolCall(
+                "generated-named-grep", "grep", {
+                    "path": "node_modules", "pattern": "generated-search-marker",
+                    "head_limit": 0,
+                },
+            ), policy)),
+        ):
+            if result.content != "node_modules/pkg/match.py":
+                fail(f"explicit {name} under node_modules was skipped: {result!r}")

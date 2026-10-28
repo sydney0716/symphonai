@@ -146,15 +146,6 @@ def _mac_sandbox_denial(output: str, pid: int | None = None) -> str | None:
     return None
 
 
-def _sandbox_denial_message(policy: PermissionPolicy, denial: str) -> str:
-    if policy.shell_sandbox and policy.sandbox_write_scope == []:
-        return (
-            "the leader's shell can write only to temporary directories; "
-            "changes go to an implementer with a spec"
-        )
-    return f"blocked by the sandbox: {denial}"
-
-
 def _terminate_process_group(proc: subprocess.Popen) -> None:
     try:
         if hasattr(os, "killpg"):
@@ -474,7 +465,7 @@ class RunShellTool(LocalTool):
         error = None
         if proc.returncode != 0:
             error = (
-                _sandbox_denial_message(policy, denial) + (f"\n{output}" if output else "")
+                f"blocked by the sandbox: {denial}" + (f"\n{output}" if output else "")
                 if denial else f"exit code {proc.returncode}"
             )
         return ToolResult(

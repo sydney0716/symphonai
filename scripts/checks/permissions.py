@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -179,6 +180,7 @@ def check_ceiling_without_config_is_copy() -> None:
                 "shell_enabled", "shell_allowlist", "shell_sandbox",
                 "sandbox_network", "fetch_enabled", "fetch_allowlist",
                 "mode", "shell_timeout_seconds", "shell_output_limit_chars",
+                "allow_uncheckable_shell", "allow_discarding_work",
             )
         ):
             fail(f"empty capability ceiling changed the policy: {bounded!r}")
@@ -293,7 +295,8 @@ def check_command_line_policy() -> None:
 
         requests: list[ToolApprovalRequest] = []
         ask = PermissionPolicy(
-            ws.root, mode="ask", approval_callback=lambda request: requests.append(request) or True,
+            ws.root, mode="ask", allow_uncheckable_shell=True,
+            approval_callback=lambda request: requests.append(request) or True,
         )
         if not ask.check_shell(["sh", "-c", "echo $(id)"]).allowed:
             fail("ask mode did not hand uncheckable syntax to its approval callback")
@@ -537,7 +540,6 @@ def check_forbidden_matching_ignores_case() -> None:
             "SUB/ID_RSA",
             "KEY.PEM",
             ".GIT/HEAD",
-            "Node_Modules/x.js",
         ):
             if policy.check_read(path).allowed:
                 fail(f"case-variant forbidden path was readable: {path!r}")
@@ -1281,13 +1283,8 @@ def check_narrow_never_widens() -> None:
             [],
         )
 
-        forbidden_parent = PermissionPolicy(repo_root=root)
-        try:
-            forbidden_parent.narrowed(PermissionPolicy(repo_root=root / "build"))
-        except ValueError:
-            pass
-        else:
-            fail("root narrowing through forbidden ground was accepted")
+        if parent.narrowed(PermissionPolicy(repo_root=root / "build")).repo_root != (root / "build").resolve():
+            fail("root narrowing through build was refused")
 
 
 @check("permissions.narrow_rejects_a_forbidden_root")
@@ -1295,7 +1292,7 @@ def check_narrow_rejects_a_forbidden_root() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         parent = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
-        patterns = (".git/", "build/", "dist/", "node_modules/", ".venv/", "__pycache__/", ".ssh/", "*.egg-info/")
+        patterns = (".git/", ".ssh/")
         for pattern in patterns:
             name = "anything.egg-info" if pattern == "*.egg-info/" else pattern.rstrip("/")
             ceiling_root = root / name
@@ -1309,13 +1306,8 @@ def check_narrow_rejects_a_forbidden_root() -> None:
                 fail(f"forbidden root was accepted: {ceiling_root!s}")
         nested = root / "a" / "build" / "b"
         nested.mkdir(parents=True)
-        try:
-            parent.narrowed(PermissionPolicy(repo_root=nested))
-        except ValueError as exc:
-            if "build/" not in str(exc):
-                fail(f"nested root named the wrong pattern: {exc!r}")
-        else:
-            fail("nested forbidden root was accepted")
+        if parent.narrowed(PermissionPolicy(repo_root=nested)).repo_root != nested.resolve():
+            fail("nested root under build was refused")
         for allowed in (root, root / "src", root / "src" / "nested"):
             allowed.mkdir(parents=True, exist_ok=True)
             if parent.narrowed(PermissionPolicy(repo_root=allowed)).repo_root != allowed.resolve():
@@ -1345,6 +1337,8 @@ def check_narrow_is_idempotent_and_composes() -> None:
             shell_allowlist=[("git",), ("echo",)],
             fetch_enabled=True,
             fetch_allowlist=["shared.example", "parent.example"],
+            allow_uncheckable_shell=True,
+            allow_discarding_work=True,
         )
         first_ceiling = PermissionPolicy(
             repo_root=root,
@@ -1365,6 +1359,10 @@ def check_narrow_is_idempotent_and_composes() -> None:
             fetch_allowlist=["shared.example"],
         )
         same = parent.narrowed(parent)
+        rerooted = parent.rerooted(root / "rerooted")
+        for policy in (same, rerooted):
+            if not policy.allow_uncheckable_shell or not policy.allow_discarding_work:
+                fail("policy-copy operation dropped an always_deny user override")
         for path in paths:
             for check_name in ("check_read", "check_list", "check_write"):
                 if getattr(same, check_name)(path).allowed != getattr(parent, check_name)(path).allowed:
@@ -1773,6 +1771,123 @@ def check_discarding_work_is_refused() -> None:
                         "git restore -Sq src/a.py", "git checkout release/1.2", "cd src && git checkout main"):
             if not policy.check_shell(["bash", "-c", command]).allowed:
                 fail(f"non-discarding command was refused: {command!r}")
+
+
+@check("permissions.uncheckable_shell_user_override")
+def check_uncheckable_shell_user_override() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "sub").mkdir()
+        commands = (
+            "export X=$(pwd) && echo $X",
+            "(cd sub && ls)",
+            "echo `date`",
+            "sleep 1 &",
+        )
+        default = PermissionPolicy(
+            root, shell_enabled=True, shell_allowlist=[()],
+        )
+        permissive = PermissionPolicy(
+            root, shell_enabled=True, shell_allowlist=[()],
+            allow_uncheckable_shell=True,
+        )
+        shell = RunShellTool()
+        for index, command in enumerate(commands):
+            denied = default.check_shell(["bash", "-c", command])
+            if denied.allowed or denied.denial is not DenialReason.UNCHECKABLE_COMMAND:
+                fail(f"uncheckable syntax ran without its opt-in: {command!r}: {denied!r}")
+            result = shell.execute(
+                ToolCall(f"uncheckable-{index}", "run_shell", {"command": command}),
+                permissive,
+            )
+            if not result.ok:
+                fail(f"enabled uncheckable command failed: {command!r}: {result!r}")
+        ask_requests: list[ToolApprovalRequest] = []
+        ask = PermissionPolicy(
+            root, mode="ask", allow_uncheckable_shell=True,
+            approval_callback=lambda request: ask_requests.append(request) or True,
+        )
+        if not ask.check_shell(["bash", "-c", commands[0]]).allowed:
+            fail("ask mode did not request approval for enabled uncheckable syntax")
+        if len(ask_requests) != 1 or commands[0] not in ask_requests[0].target:
+            fail(f"ask request omitted raw uncheckable command text: {ask_requests!r}")
+        plan = PermissionPolicy(root, mode="plan", allow_uncheckable_shell=True)
+        decision = plan.check_shell(["bash", "-c", commands[0]])
+        if decision.allowed or decision.denial is not DenialReason.UNCHECKABLE_COMMAND:
+            fail(f"plan mode allowed opted-in uncheckable syntax: {decision!r}")
+
+
+@check("permissions.generated_paths_are_editable")
+def check_generated_paths_are_editable() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        policy = PermissionPolicy(repo_root=root, allowed_write_scope=[root])
+        read = ReadFileTool(ReadLedger())
+        write = WriteFileTool(ReadLedger())
+        editable = (
+            "build/x", "dist/x", "node_modules/p/x", ".venv/x",
+            "__pycache__/x", "p.egg-info/x",
+        )
+        for index, relative in enumerate(editable):
+            result = write.execute(
+                ToolCall(f"generated-write-{index}", "write_file", {
+                    "path": relative, "content": "fixture\n",
+                }), policy,
+            )
+            if not result.ok:
+                fail(f"write_file refused generated path {relative!r}: {result!r}")
+            result = read.execute(
+                ToolCall(f"generated-read-{index}", "read_file", {"path": relative}),
+                policy,
+            )
+            if not result.ok:
+                fail(f"read_file refused generated path {relative!r}: {result!r}")
+        for relative in (".env", ".ssh/config", "k.pem", ".git/config"):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("secret\n", encoding="utf-8")
+            if policy.check_read(relative).allowed or policy.check_write(relative).allowed:
+                fail(f"secret path became readable or writable: {relative!r}")
+
+
+@check("permissions.discarding_work_user_override")
+def check_discarding_work_user_override() -> None:
+    if shutil.which("git") is None:
+        print("SKIP: git is unavailable")
+        return
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+        source = root / "a.c"
+        source.write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.c"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+        policy = PermissionPolicy(
+            root, shell_enabled=True, shell_allowlist=[()],
+            allow_discarding_work=True,
+        )
+        shell = RunShellTool()
+        source.write_text("changed\n", encoding="utf-8")
+        denied = PermissionPolicy(root, shell_enabled=True, shell_allowlist=[()])
+        for command in ("git checkout -- a.c", "git reset --hard"):
+            decision = denied.check_shell(["bash", "-c", command], cwd=root)
+            if decision.allowed or decision.denial is not DenialReason.ALWAYS_DENY:
+                fail(f"discard guard did not refuse by default: {command!r}: {decision!r}")
+        result = shell.execute(
+            ToolCall("checkout-discard", "run_shell", {"command": "git checkout -- a.c"}),
+            policy,
+        )
+        if not result.ok or source.read_text(encoding="utf-8") != "original\n":
+            fail(f"opted-in checkout did not run: {result!r}")
+        source.write_text("changed again\n", encoding="utf-8")
+        result = shell.execute(
+            ToolCall("reset-discard", "run_shell", {"command": "git reset --hard"}),
+            policy,
+        )
+        if not result.ok or source.read_text(encoding="utf-8") != "original\n":
+            fail(f"opted-in reset did not run: {result!r}")
 
 
 @check("permissions.plan_mode_runs_read_only_commands")

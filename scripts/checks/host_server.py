@@ -1348,19 +1348,19 @@ def check_tree_truncation() -> None:
 
 
 @check("host_server.files_prunes_forbidden_directories")
-def check_files_prunes_forbidden_directories() -> None:
+def check_files_prunes_secret_directories() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source = root / "src" / "parser.py"
         source.parent.mkdir()
         source.write_text("source", encoding="utf-8")
-        hidden = root / ".venv"
+        hidden = root / ".ssh"
         hidden.mkdir()
         for index in range(25_000):
             (hidden / f"file-{index:05}.py").touch()
         paths, truncated = repository_files(PermissionPolicy(repo_root=root), "parser", 20)
         if paths != ["src/parser.py"] or truncated:
-            fail(f"forbidden files consumed the search cap: {paths!r}, truncated={truncated}")
+            fail(f"secret files consumed the search cap: {paths!r}, truncated={truncated}")
 
 
 @check("host_server.files_breadth_first_cap")

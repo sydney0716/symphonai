@@ -18,6 +18,8 @@ def write_user_config(home: Path, roles: dict[str, dict[str, str]]) -> Path:
     lines = [
         "[always_deny]",
         f"lift = {json.dumps([' '.join(command) for command in ALWAYS_DENY_COMMANDS])}",
+        "allow_uncheckable_shell = true",
+        "allow_discarding_work = true",
         "",
         "[memory]",
         "extract = false",
@@ -50,6 +52,9 @@ def verify_user_config(
     expected_lifts = [" ".join(command) for command in ALWAYS_DENY_COMMANDS]
     if config.get("always_deny.lift") != expected_lifts:
         raise ValueError("always-deny lifts were not loaded as provided")
+    if (config.get("always_deny.allow_uncheckable_shell") is not True
+            or config.get("always_deny.allow_discarding_work") is not True):
+        raise ValueError("always-deny shell and discard overrides were not loaded as provided")
 
 
 def usage_summary(
@@ -313,6 +318,18 @@ def read_usage_files(root: Path) -> list[dict[str, Any]]:
         except OSError:
             continue
     return records
+
+
+def read_leader_shell_changes(root: Path) -> list[str]:
+    paths: list[str] = []
+    for record in read_usage_files(root):
+        if record.get("type") != "leader_shell_changes":
+            continue
+        data = record.get("data")
+        changed = data.get("changed_existing_paths") if isinstance(data, dict) else None
+        if isinstance(changed, list):
+            paths.extend(path for path in changed if isinstance(path, str))
+    return list(dict.fromkeys(paths))
 
 
 def _usage_dict(value: UsageTotals) -> dict[str, int]:
