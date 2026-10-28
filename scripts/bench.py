@@ -18,12 +18,12 @@ sys.dont_write_bytecode = True
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.bench import read_usage_files, usage_table_data  # noqa: E402
+from scripts.bench import price_agent_usage, read_usage_files, usage_table_data  # noqa: E402
 from symphonai_api.cost import load_price_table  # noqa: E402
 from symphonai_api.paths import symphonai_home  # noqa: E402
 
 
-DATASET = "terminal-bench/terminal-bench@4.0.0"
+DATASET = "terminal-bench/terminal-bench-2-1"
 AGENT_IMPORT = "scripts.bench.agent:SymphonaiAgent"
 TASKS_FILE = REPO_ROOT / "scripts" / "bench" / "terminal_bench_pilot.txt"
 SMOKE_ANTHROPIC_KEY = "symphonai-smoke-anthropic-key"
@@ -36,6 +36,24 @@ def _tasks() -> list[str]:
     if len(tasks) != 5 or len(set(tasks)) != 5:
         raise ValueError("terminal_bench_pilot.txt must contain exactly five unique task names")
     return tasks
+
+
+def _select_tasks(tasks: list[str], requested: list[str] | None) -> list[str]:
+    if not requested:
+        return tasks
+    unknown = [
+        name for name in requested
+        if not any(name == task or name == task.rsplit("/", 1)[-1] for task in tasks)
+    ]
+    if unknown:
+        raise ValueError(
+            f"unknown pilot task {unknown[0]!r}; choose from: {', '.join(tasks)}"
+        )
+    selected = set(requested)
+    return [
+        task for task in tasks
+        if task in selected or task.rsplit("/", 1)[-1] in selected
+    ]
 
 
 def _roles(arguments: argparse.Namespace) -> dict[str, dict[str, str]]:
@@ -81,6 +99,7 @@ def _harbor_command(
         _harbor_executable(), "run",
         "--dataset", DATASET,
         "--n-concurrent", str(arguments.n_concurrent),
+        "--n-attempts", str(arguments.attempts),
         "--jobs-dir", str(output / "harbor"),
         "--yes",
     ]
@@ -155,8 +174,10 @@ def _trial_rows(output: Path) -> list[dict[str, Any]]:
             "reward": reward,
             "wall_seconds": _duration(started, finished),
             "result": result,
+            "trial_path": result_path.parent,
+            "trial_name": trial_name,
         })
-    return sorted(rows, key=lambda row: row["task"])
+    return sorted(rows, key=lambda row: (row["task"], row["trial_name"]))
 
 
 def _reward(result: dict[str, Any]) -> float | None:
@@ -216,19 +237,40 @@ def _search_smoke_keys(output: Path) -> bool:
     return False
 
 
-def _usage_from_trials(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _usage_from_trials(
+    rows: list[dict[str, Any]], prices: Any = None,
+) -> list[dict[str, Any]]:
     rendered = []
     for row in rows:
         context = row["result"].get("agent_result", {})
+        reported_cost = context.get("cost_usd") if isinstance(context, dict) else None
+        model_usage = context.get("model_usage") if isinstance(context, dict) else None
+        if isinstance(model_usage, dict):
+            model_usage = {
+                model: {key: value for key, value in values.items() if key != "cost_usd"}
+                if isinstance(values, dict) else values
+                for model, values in model_usage.items()
+            }
         rendered_row = {
             "task": row["task"],
             "resolved": row["resolved"],
             "wall_seconds": row["wall_seconds"],
-            "model_usage": context.get("model_usage"),
+            "model_usage": model_usage,
             "metadata": context.get("metadata"),
+            "agent_reported_cost": reported_cost,
         }
         if "usage" in row:
             rendered_row["usage"] = row["usage"]
+        if prices is not None:
+            metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+            symphonai = metadata.get("symphonai_usage") if isinstance(metadata, dict) else None
+            rendered_row["cost"] = price_agent_usage(
+                context.get("model_usage") if isinstance(context, dict) else None,
+                prices,
+                symphonai_usage=symphonai,
+                trajectory_path=row["trial_path"] / "agent" / "trajectory.json",
+            )
+            row["cost"] = rendered_row["cost"]
         rendered.append(rendered_row)
     return rendered
 
@@ -258,8 +300,24 @@ def _print_table(rows: list[dict[str, Any]], *, smoke: bool = False, prices: boo
                 f"{json.dumps(agents, sort_keys=True)} | "
                 f"{table_data.get('largest_single_request', '-')}")
         if prices:
-            line += f" | {json.dumps(table_data.get('cost') or {}, sort_keys=True)}"
+            line += f" | {json.dumps(row.get('cost') or {}, sort_keys=True)}"
         print(line)
+
+
+def _attempt_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_task: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_task.setdefault(row["task"], []).append(row)
+    tasks = {
+        task: {"resolved": sum(row["resolved"] is True for row in attempts),
+               "attempts": len(attempts),
+               "resolved_rate": (sum(row["resolved"] is True for row in attempts) / len(attempts))}
+        for task, attempts in sorted(by_task.items())
+    }
+    total_attempts = sum(value["attempts"] for value in tasks.values())
+    resolved = sum(value["resolved"] for value in tasks.values())
+    return {"tasks": tasks, "resolved": resolved, "attempts": total_attempts,
+            "resolved_rate": resolved / total_attempts if total_attempts else 0.0}
 
 
 def main() -> int:
@@ -270,9 +328,12 @@ def main() -> int:
     parser.add_argument("--agent", choices=("symphonai", "claude-code", "codex"), default="symphonai")
     parser.add_argument("--model", help="Harbor provider/model string")
     parser.add_argument("--role", action="append", default=[], metavar="NAME=PROVIDER:MODEL")
+    parser.add_argument("--task", action="append", metavar="NAME",
+                        help="run a pilot task by full name or final path component (repeatable)")
     parser.add_argument("--effort")
     parser.add_argument("--prices")
     parser.add_argument("--n-concurrent", type=int, default=1)
+    parser.add_argument("--attempts", type=int, default=1)
     parser.add_argument("--out")
     arguments = parser.parse_args()
 
@@ -282,8 +343,10 @@ def main() -> int:
         parser.error("--role applies only to --agent symphonai")
     if arguments.n_concurrent < 1:
         parser.error("--n-concurrent must be at least 1")
+    if arguments.attempts < 1:
+        parser.error("--attempts must be at least 1")
     try:
-        task_names = _tasks()
+        task_names = _select_tasks(_tasks(), arguments.task)
         roles = _roles(arguments)
         if arguments.model:
             _parse_model(arguments.model)
@@ -321,28 +384,27 @@ def main() -> int:
     rows = _trial_rows(output)
     if arguments.agent == "symphonai" and not arguments.oracle:
         for row in rows:
-            matches = list((output / "harbor").glob(f"*/{row['task']}__*/agent/**/sessions"))
-            records = []
-            for match in matches:
-                records.extend(read_usage_files(match))
+            matches = list(row["trial_path"].glob("agent/**/sessions"))
+            records = [record for match in matches for record in read_usage_files(match)]
             if records:
                 from scripts.bench import usage_summary
                 prices = load_price_table(arguments.prices) if arguments.prices else None
                 row["usage"] = usage_summary(records, prices)
-    report_rows = _usage_from_trials(rows)
-    if not arguments.prices:
-        for result_row in report_rows:
-            model_usage = result_row.get("model_usage") or {}
-            for values in model_usage.values():
-                if isinstance(values, dict):
-                    values.pop("cost_usd", None)
-    (output / "results.json").write_text(json.dumps({
+    prices = load_price_table(arguments.prices) if arguments.prices else None
+    report_rows = _usage_from_trials(rows, prices)
+    report = {
         "dataset": DATASET, "agent": "oracle" if arguments.oracle else arguments.agent,
         "tasks": report_rows,
-    }, indent=2), encoding="utf-8")
+    }
+    if arguments.attempts > 1:
+        report["summary"] = _attempt_summary(report_rows)
+    (output / "results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     _print_table(rows, prices=bool(arguments.prices))
-    if len(rows) != len(task_names):
-        print(f"Harbor returned {len(rows)} of {len(task_names)} task results", file=sys.stderr)
+    if arguments.attempts > 1:
+        print(f"Attempts summary: {json.dumps(report['summary'], sort_keys=True)}")
+    expected_rows = len(task_names) * arguments.attempts
+    if len(rows) != expected_rows:
+        print(f"Harbor returned {len(rows)} of {expected_rows} task results", file=sys.stderr)
         return 1
     if arguments.oracle and not all(row["resolved"] for row in rows):
         return 1

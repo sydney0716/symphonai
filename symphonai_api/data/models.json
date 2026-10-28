@@ -343,6 +343,23 @@
       "wire_format": 1,
       "id": "gpt-6-luna",
       "context_window": 1050000,
+      "long_context_above": 272000,
+      "compact_at": 244800,
+      "efforts": [
+        {"id": "none", "value": "none"},
+        {"id": "low", "value": "low"},
+        {"id": "medium", "value": "medium"},
+        {"id": "high", "value": "high"},
+        {"id": "xhigh", "value": "xhigh"}
+      ]
+    },
+    {
+      "provider": "openai",
+      "wire_format": 1,
+      "id": "gpt-6.1-sol",
+      "context_window": 1050000,
+      "long_context_above": 272000,
+      "compact_at": 244800,
       "efforts": [
         {"id": "none", "value": "none"},
         {"id": "low", "value": "low"},

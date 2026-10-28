@@ -1248,14 +1248,14 @@ def check_stream_cache_usage_accounting() -> None:
     responses_stream = _LinesResponse(
         [
             b"event: response.completed\n",
-            b'data: {"response":{"status":"completed","output":[],"usage":{"input_tokens":1000,"output_tokens":10,"input_tokens_details":{"cached_tokens":800}}}}\n\n',
+            b'data: {"response":{"status":"completed","output":[],"usage":{"input_tokens":10000,"output_tokens":10,"input_tokens_details":{"cached_tokens":6000,"cache_write_tokens":3000}}}}\n\n',
         ]
     )
     with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "openai-responses-cache-key"}), mock.patch(
         "urllib.request.urlopen", return_value=responses_stream
     ):
         responses = _assemble(OpenAIProvider().create_response_stream(request))
-    if responses.usage != Usage(1000, 10, 800, 0):
+    if responses.usage != Usage(10000, 10, 6000, 3000):
         fail(f"streamed OpenAI Responses cache usage was wrong: {responses.usage!r}")
 
     deepseek_stream = _LinesResponse(

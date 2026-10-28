@@ -14,12 +14,182 @@ from unittest import mock
 
 from scripts.bench import (
     populate_agent_context,
+    price_agent_usage,
     usage_summary,
     usage_table_data,
     verify_user_config,
 )
 from scripts.checks.harness import check, fail
-from symphonai_api.cost import load_price_table
+from symphonai_api.cost import UsageTotals, load_price_table, total_cost
+
+
+@check("bench.pilot_task_selection")
+def pilot_task_selection() -> None:
+    runner_spec = importlib.util.spec_from_file_location(
+        "terminal_bench_runner", Path(__file__).resolve().parents[1] / "bench.py"
+    )
+    if runner_spec is None or runner_spec.loader is None:
+        fail("could not load the Terminal-Bench runner")
+    bench_module = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(bench_module)
+    tasks = bench_module._tasks()
+    selected = bench_module._select_tasks(tasks, ["regex-log"])
+    if selected != ["terminal-bench/regex-log"]:
+        fail(f"short task name selected the wrong pilot task: {selected!r}")
+    selected = bench_module._select_tasks(
+        tasks, ["regex-log", "chess-best-move"]
+    )
+    expected = [
+        "terminal-bench/chess-best-move",
+        "terminal-bench/regex-log",
+    ]
+    if selected != expected:
+        fail(f"task selection did not preserve pilot-file order: {selected!r}")
+    try:
+        bench_module._select_tasks(tasks, ["nope"])
+    except ValueError as exc:
+        if any(task not in str(exc) for task in tasks):
+            fail(f"unknown task error omitted pilot tasks: {exc!r}")
+    else:
+        fail("unknown pilot task was accepted")
+    arguments = SimpleNamespace(
+        n_concurrent=1, attempts=3, oracle=True, smoke=False, agent="symphonai",
+        model=None, effort=None, prices=None,
+    )
+    with mock.patch.object(bench_module, "_harbor_executable", return_value="harbor"):
+        command = bench_module._harbor_command(arguments, Path("/tmp/out"), selected, None)
+    if command[command.index("--n-attempts") + 1] != "3":
+        fail(f"Harbor attempts option was not forwarded: {command!r}")
+    summary = bench_module._attempt_summary([
+        {"task": "a", "resolved": True}, {"task": "a", "resolved": False},
+        {"task": "b", "resolved": True},
+    ])
+    if summary["tasks"]["a"]["resolved_rate"] != 0.5 or summary["resolved_rate"] != 2 / 3:
+        fail(f"attempt summary resolved rates are incorrect: {summary!r}")
+
+
+@check("bench.harbor_usage_cost_is_normalized")
+def harbor_usage_cost_is_normalized() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        price_file = root / "prices.json"
+        price_file.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
+            "model-a": {"input": 2, "output": 4, "cache_read": 1, "cache_write": 3},
+        }}), encoding="utf-8")
+        prices = load_price_table(price_file)
+        trial = root / "trial"
+        agent_logs = trial / "agent"
+        agent_logs.mkdir(parents=True)
+        (agent_logs / "trajectory.json").write_text(json.dumps({
+            "final_metrics": {"extra": {"total_cache_creation_input_tokens": 100}},
+        }), encoding="utf-8")
+        usage = price_agent_usage(
+            {"model-a": {"n_input_tokens": 1000, "n_cache_tokens": 200,
+                         "n_output_tokens": 100, "cost_usd": 99}},
+            prices, trajectory_path=agent_logs / "trajectory.json",
+        )
+        if usage["models"]["model-a"] != {
+            "input": 1000, "uncached_input": 700, "cache_read": 200,
+            "cache_write": 100, "output": 100,
+        }:
+            fail(f"Harbor token counts were not split exactly once: {usage!r}")
+        if usage["total"] != "0.0023" or usage["estimated"]:
+            fail(f"Harbor token cost was incorrect or marked estimated: {usage!r}")
+
+
+@check("bench.symphonai_and_agent_reported_cost")
+def symphonai_and_agent_reported_cost() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        price_file = root / "prices.json"
+        price_file.write_text(json.dumps({"version": 1, "currency": "USD", "models": {
+            "claude-opus-5-5": {"input": 4, "output": 20, "cache_read": 0.20,
+                                "cache_write": 5},
+            "gpt-6-luna": {"input": 0.10, "output": 0.50, "cache_read": 0.01,
+                           "cache_write": 0.125, "long_context": {
+                               "input": 0.20, "output": 0.75,
+                               "cache_read": 0.02, "cache_write": 0.25,
+                           }},
+            "model-a": {"input": 2, "output": 4, "cache_read": 1, "cache_write": 3},
+        }}), encoding="utf-8")
+        prices = load_price_table(price_file)
+        opus_record = {"type": "usage", "data": {
+            "model": "claude-opus-5-5", "input_tokens": 100000,
+            "output_tokens": 2000, "calls": 1, "cache_read_tokens": 95000,
+            "cache_write_tokens": 4000,
+        }}
+        opus_usage = UsageTotals(100000, 2000, 1, 95000, 4000)
+        opus_cost = total_cost({"claude-opus-5-5": opus_usage}, prices)
+        opus = usage_summary([opus_record], prices)
+        if (opus["cost"]["total"] != "0.083"
+                or opus["largest_single_request"] != 100000
+                or opus["context"]["n_input_tokens"] != 100000
+                or opus["context"]["n_cache_tokens"] != 95000):
+            fail(f"Opus whole-prompt usage was normalized incorrectly: {opus!r}")
+        if opus["cost"]["total"] != str(opus_cost):
+            fail(f"Opus bench cost differs from symphonai_api.cost: {opus!r}, {opus_cost!r}")
+        opus_report_cost = price_agent_usage(None, prices, symphonai_usage=opus)
+        if (opus_report_cost["total"] != "0.083"
+                or opus_report_cost["models"]["claude-opus-5-5"]["input"] != 100000):
+            fail(f"Opus displayed cost or prompt size was incorrect: {opus_report_cost!r}")
+
+        luna_record = {"type": "usage", "data": {
+            "model": "gpt-6-luna", "input_tokens": 300000,
+            "output_tokens": 1000, "calls": 1, "cache_read_tokens": 200000,
+            "cache_write_tokens": 50000, "long_context_input_tokens": 300000,
+            "long_context_output_tokens": 1000,
+            "long_context_cache_read_tokens": 200000,
+            "long_context_cache_write_tokens": 50000,
+        }}
+        luna_usage = UsageTotals(
+            300000, 1000, 1, 200000, 50000, 300000, 1000, 200000, 50000,
+        )
+        luna_cost = total_cost({"gpt-6-luna": luna_usage}, prices)
+        luna = usage_summary([luna_record], prices)
+        if luna["cost"]["total"] != "0.02725":
+            fail(f"Luna long-context cost was incorrect: {luna!r}")
+        if luna["cost"]["total"] != str(luna_cost):
+            fail(f"Luna bench cost differs from symphonai_api.cost: {luna!r}, {luna_cost!r}")
+        luna_report_cost = price_agent_usage(None, prices, symphonai_usage=luna)
+        if luna_report_cost["total"] != "0.02725":
+            fail(f"Luna report did not use long-context rates: {luna_report_cost!r}")
+
+        context = SimpleNamespace()
+        populate_agent_context(context, opus, prices)
+        if (context.n_input_tokens, context.n_cache_tokens, context.cost_usd) != (100000, 95000, 0.083):
+            fail(f"Opus Harbor context counts or cost were incorrect: {context!r}")
+        unknown = price_agent_usage(
+            {"unlisted": {"n_input_tokens": 100, "n_cache_tokens": 0,
+                           "n_output_tokens": 2, "cost_usd": 0}}, prices,
+        )
+        if unknown["total"] is not None or unknown["unknown_models"] != ["unlisted"]:
+            fail(f"unpriced model did not produce an empty cost: {unknown!r}")
+
+        runner_spec = importlib.util.spec_from_file_location(
+            "terminal_bench_runner_cost", Path(__file__).resolve().parents[1] / "bench.py"
+        )
+        if runner_spec is None or runner_spec.loader is None:
+            fail("could not load the Terminal-Bench runner for reported-cost check")
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+        agent_logs = root / "agent"
+        agent_logs.mkdir()
+        (agent_logs / "trajectory.json").write_text(json.dumps({
+            "final_metrics": {"extra": {"total_cache_write_input_tokens": 100}},
+        }), encoding="utf-8")
+        rows = [{"task": "fixture", "resolved": True, "wall_seconds": 1,
+                 "trial_path": root, "result": {"agent_result": {
+                     "cost_usd": 0.123,
+                     "model_usage": {"model-a": {"n_input_tokens": 1000,
+                         "n_cache_tokens": 200, "n_output_tokens": 100, "cost_usd": 99}},
+                 }}}]
+        rendered = runner._usage_from_trials(rows, prices)[0]
+        if rendered["agent_reported_cost"] != 0.123:
+            fail(f"agent-reported cost was not preserved separately: {rendered!r}")
+        if rendered["model_usage"]["model-a"].get("cost_usd") is not None:
+            fail(f"Harbor cost leaked into computed model usage: {rendered!r}")
+        if rendered["cost"]["total"] != "0.0023":
+            fail(f"agent-reported cost affected computed cost: {rendered!r}")
 
 
 def _agent_module_with_harbor_stubs():
@@ -104,7 +274,7 @@ def usage_populates_context_and_report() -> None:
         fail(f"per-model usage is incorrect: {summary['models']!r}")
     if summary["agents"]["worker"]["calls"] != 2 or summary["agents"]["explorer"]["input"] != 7:
         fail(f"per-agent usage is incorrect: {summary['agents']!r}")
-    if summary["largest_single_request"] != 27:
+    if summary["largest_single_request"] != 20:
         fail(f"largest single request is incorrect: {summary['largest_single_request']!r}")
 
     table_data = usage_table_data(summary)
@@ -115,9 +285,9 @@ def usage_populates_context_and_report() -> None:
 
     context = SimpleNamespace()
     populate_agent_context(context, summary)
-    if (context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens) != (48, 11, 9):
+    if (context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens) != (37, 8, 9):
         fail(f"Harbor context totals are incorrect: {context!r}")
-    if context.model_usage["model-a"]["n_input_tokens"] != 41 or context.cost_usd is not None:
+    if context.model_usage["model-a"]["n_input_tokens"] != 30 or context.cost_usd is not None:
         fail(f"Harbor model usage or optional cost is incorrect: {context!r}")
 
     with tempfile.TemporaryDirectory() as temporary:
@@ -182,9 +352,9 @@ def failed_and_cancelled_runs_keep_usage() -> None:
         return agent
 
     def check_context(context):
-        if (context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens) != (15, 3, 3):
+        if (context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens) != (12, 2, 3):
             fail(f"failed run usage totals were not copied to the agent context: {context!r}")
-        if context.model_usage["model-a"].n_input_tokens != 15:
+        if context.model_usage["model-a"].n_input_tokens != 12:
             fail(f"failed run model usage was not copied to the agent context: {context.model_usage!r}")
         if context.metadata["symphonai_usage"]["agents"]["leader"]["calls"] != 1:
             fail(f"failed run usage metadata was not retained: {context.metadata!r}")

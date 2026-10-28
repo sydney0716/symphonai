@@ -372,6 +372,11 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
         if isinstance(input_details, dict)
         else 0
     )
+    cache_write_tokens = _usage_count(
+        input_details.get("cache_write_tokens")
+        if isinstance(input_details, dict)
+        else 0
+    )
     status = data.get("status")
     incomplete = data.get("incomplete_details")
     stop_reason = "tool_calls" if tool_calls else (
@@ -388,6 +393,7 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
             input_tokens=_usage_count(usage_raw.get("input_tokens")) if isinstance(usage_raw, dict) else 0,
             output_tokens=_usage_count(usage_raw.get("output_tokens")) if isinstance(usage_raw, dict) else 0,
             cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         ),
         stop_reason=stop_reason,
     )

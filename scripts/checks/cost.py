@@ -58,6 +58,45 @@ def check_usage_totals_merge() -> None:
         fail(f"total_tokens ignored a token counter: {expected!r}")
 
 
+@check("cost.cache_write_rates")
+def check_cache_write_rates() -> None:
+    totals = UsageTotals.from_usage(Usage(10000, 0, 6000, 3000))
+    price = ModelPrice(
+        Decimal("0.10"), Decimal("0"), Decimal("0.01"), Decimal("0.125")
+    )
+    actual = PriceTable({"gpt-6-luna": price}, "USD").cost("gpt-6-luna", totals)
+    expected = (Decimal(1000) * Decimal("0.10") + Decimal(6000) * Decimal("0.01")
+                + Decimal(3000) * Decimal("0.125")) / Decimal(1_000_000)
+    if actual != expected:
+        fail(f"cache writes were not priced at their own rate: {actual!r}")
+
+
+@check("cost.long_context_tier")
+def check_long_context_tier() -> None:
+    usage = UsageTotals(400000, 20, 2, long_context_input_tokens=300000,
+                        long_context_output_tokens=10)
+    base = ModelPrice(Decimal("1"), Decimal("2"))
+    long = ModelPrice(Decimal("3"), Decimal("4"))
+    table = PriceTable({"gpt-6-luna": ModelPrice(
+        base.input_per_million, base.output_per_million, long_context=long
+    )}, "USD")
+    expected = (Decimal(100000) + Decimal(300000) * 3 + Decimal(10) * 2
+                + Decimal(10) * 4) / Decimal(1_000_000)
+    if table.cost("gpt-6-luna", usage) != expected:
+        fail("long-context usage was not split and priced across both tiers")
+
+
+@check("cost.long_context_missing_tier_is_estimated")
+def check_long_context_missing_tier_is_estimated() -> None:
+    usage = UsageTotals(300000, 10, 1, long_context_input_tokens=300000,
+                        long_context_output_tokens=10)
+    table = PriceTable({"gpt-6-luna": ModelPrice(Decimal("1"), Decimal("2"))}, "USD")
+    if table.cost("gpt-6-luna", usage) != Decimal("0.30002"):
+        fail("missing long-context tier did not fall back to base rates")
+    if not table.long_context_is_estimated("gpt-6-luna", usage):
+        fail("base-rate long-context cost was not marked as estimated")
+
+
 
 @check("cost.run_accumulates_usage")
 def check_run_accumulates_usage() -> None:

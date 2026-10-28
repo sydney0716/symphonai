@@ -73,7 +73,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles", "compaction")
 _VALID_MODES = {"ask", "plan", "allow"}
 _RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
 _BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
@@ -133,6 +133,13 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    compaction = _table(source, values, "compaction")
+    if compaction is not None:
+        _unknown_keys(source, "compaction", compaction, {"limit"})
+        if "limit" in compaction and (
+            type(compaction["limit"]) is not int or compaction["limit"] <= 0
+        ):
+            _raise(source, "compaction.limit", "must be a positive integer")
     permissions = _table(source, values, "permissions")
     if permissions is not None:
         _unknown_keys(source, "permissions", permissions, {"shell", "fetch"})

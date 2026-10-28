@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
-from symphonai_api.model_table import context_window_for_model
+from symphonai_api.model_table import compact_at_for_model, context_window_for_model
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 from symphonai_api.providers.base import tool_result_text
 
@@ -41,12 +41,20 @@ MODEL_SUMMARY_PROMPT = """You are summarizing the earlier part of a coding sessi
 Be specific: names, paths, values."""
 
 
-def budget_for_model(wire_format: int, model: str | None) -> int:
+def budget_for_model(
+    wire_format: int, model: str | None, limit: int | None = None,
+) -> int:
     """Derive the compaction budget from a known model window or the default."""
     context_window = context_window_for_model(wire_format, model)
     if context_window is None:
         context_window = DEFAULT_CONTEXT_WINDOW
-    return context_window - REPLY_RESERVE_TOKENS - COMPACTION_BUFFER_TOKENS
+    budget = context_window - REPLY_RESERVE_TOKENS - COMPACTION_BUFFER_TOKENS
+    model_limit = compact_at_for_model(wire_format, model)
+    if model_limit is not None:
+        budget = min(budget, model_limit)
+    if limit is not None:
+        budget = min(budget, limit)
+    return budget
 
 
 class ContextCompactionError(ValueError):

@@ -16,10 +16,26 @@ from symphonai_api.compaction import (
     recent_window_start,
     render_dropped_messages,
 )
+from symphonai_api.compaction import budget_for_model
 from symphonai_api.models import ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from scripts.checks.harness import check, fail
+
+
+@check("compaction.model_compaction_budgets")
+def check_model_compaction_budgets() -> None:
+    cases = (
+        (1, "gpt-6-luna", None, 244_800),
+        (1, "gpt-6.1-sol", None, 244_800),
+        (2, "claude-opus-5-5", None, 955_000),
+        (4, "unknown", None, 83_000),
+        (2, "claude-opus-5-5", 150_000, 150_000),
+    )
+    for wire_format, model, limit, expected in cases:
+        actual = budget_for_model(wire_format, model, limit)
+        if actual != expected:
+            fail(f"compaction budget for {model!r}: {actual}, expected {expected}")
 
 
 @check("compaction.assistant_turn_window_keeps_pairs")

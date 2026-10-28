@@ -1,5 +1,5 @@
-terminal-bench/payments-pipeline-fix
-terminal-bench/heat-pump-warranty
-terminal-bench/bun-sourcemap-leak
-terminal-bench/session-window-debug
-terminal-bench/rs-archive-clone
+terminal-bench/chess-best-move
+terminal-bench/log-summary-date-ranges
+terminal-bench/openssl-selfsigned-cert
+terminal-bench/regex-log
+terminal-bench/sqlite-db-truncate

@@ -21,6 +21,8 @@ class ModelCapability:
     model: str
     efforts: tuple[ModelEffort, ...]
     context_window: int | None = None
+    long_context_above: int | None = None
+    compact_at: int | None = None
 
 
 def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
@@ -41,6 +43,8 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
         model = raw_model.get("id")
         raw_efforts = raw_model.get("efforts")
         context_window = raw_model.get("context_window")
+        long_context_above = raw_model.get("long_context_above")
+        compact_at = raw_model.get("compact_at")
         if (
             not isinstance(provider, str)
             or not provider
@@ -56,6 +60,22 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
                     not isinstance(context_window, int)
                     or isinstance(context_window, bool)
                     or context_window <= 0
+                )
+            )
+            or (
+                "long_context_above" in raw_model
+                and (
+                    not isinstance(long_context_above, int)
+                    or isinstance(long_context_above, bool)
+                    or long_context_above <= 0
+                )
+            )
+            or (
+                "compact_at" in raw_model
+                and (
+                    not isinstance(compact_at, int)
+                    or isinstance(compact_at, bool)
+                    or compact_at <= 0
                 )
             )
             or (wire_format, model) in seen_models
@@ -83,7 +103,8 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
         seen_models.add((wire_format, model))
         models.append(
             ModelCapability(
-                provider, wire_format, model, tuple(efforts), context_window
+                provider, wire_format, model, tuple(efforts), context_window,
+                long_context_above, compact_at,
             )
         )
     return tuple(models)
@@ -158,3 +179,19 @@ def context_window_for_model(wire_format: int, model: str | None) -> int | None:
         return None
     capability = _capability_for_model(wire_format, model, model_capabilities())
     return None if capability is None else capability.context_window
+
+
+def long_context_threshold(wire_format: int, model: str | None) -> int | None:
+    """Return the listed long-context billing threshold, if known."""
+    if model is None:
+        return None
+    capability = _capability_for_model(wire_format, model, model_capabilities())
+    return None if capability is None else capability.long_context_above
+
+
+def compact_at_for_model(wire_format: int, model: str | None) -> int | None:
+    """Return a model's optional compaction limit, if listed."""
+    if model is None:
+        return None
+    capability = _capability_for_model(wire_format, model, model_capabilities())
+    return None if capability is None else capability.compact_at

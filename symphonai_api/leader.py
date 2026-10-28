@@ -465,6 +465,7 @@ class DispatchSubagentTool(LocalTool):
         subagent_tool_names: Sequence[str] | None = None,
         parent_agent_id: str | None = None,
         subagent_budget: RunBudget | None = None,
+        compaction_limit: int | None = None,
         max_consecutive_subagent_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
         session: SessionStore | None = None,
         subagent_specs: Mapping[str, AgentSpec] | None = None,
@@ -496,6 +497,7 @@ class DispatchSubagentTool(LocalTool):
         # Every child receives the same immutable limits but tracks its own
         # spend; sharing drawdown needs phase 07's cross-agent coordination.
         self._subagent_budget = subagent_budget
+        self._compaction_limit = compaction_limit
         self._max_consecutive_subagent_failures = max_consecutive_subagent_failures
         self._session = session
         self._subagent_specs = subagent_specs
@@ -921,6 +923,9 @@ class DispatchSubagentTool(LocalTool):
                     budget=spec.budget,
                     call_class=spec.call_class,
                     model_summary=self._model_summary,
+                    context_budget=lambda model: budget_for_model(
+                        child_provider.wire_format, model, self._compaction_limit,
+                    ),
                     transcript=(
                         None
                         if self._session is None
@@ -1203,6 +1208,7 @@ class LeaderConfig:
     permission_mode: PermissionMode = "allow"
     approval_callback: ApprovalCallback | None = None
     chat_token_budget: int | None = None
+    compaction_limit: int | None = None
     chat_recent_turns: int = DEFAULT_RECENT_TURNS
     events: EventSink | None = None
     max_consecutive_compaction_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
@@ -1366,6 +1372,7 @@ class Leader:
             subagent_tool_names=config.subagent_tool_names,
             parent_agent_id=self._agent_ref.agent_id,
             subagent_budget=config.subagent_budget,
+            compaction_limit=config.compaction_limit,
             max_consecutive_subagent_failures=(
                 config.max_consecutive_subagent_failures
             ),
@@ -1472,7 +1479,10 @@ class Leader:
             ),
             model_summary=config.model_summary,
             context_budget=lambda model: math.floor(
-                budget_for_model(config.leader_provider.wire_format, model)
+                budget_for_model(
+                    config.leader_provider.wire_format, model,
+                    config.compaction_limit,
+                )
                 / self._token_ratio
             ),
             context_overflow=self._record_context_overflow,
@@ -1520,8 +1530,11 @@ class Leader:
             else budget_for_model(
                 self._config.leader_provider.wire_format,
                 self._leader_spec.model.model,
+                self._config.compaction_limit,
             )
         )
+        if self._config.compaction_limit is not None:
+            base = min(base, self._config.compaction_limit)
         return math.floor(base / self._token_ratio)
 
     def _record_context_overflow(

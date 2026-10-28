@@ -62,6 +62,60 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+@check("config.compaction_limit_validation")
+def compaction_limit_validation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        repo_root, home = _roots(temporary)
+        user_path = _scope_path(Scope.USER, repo_root, home)
+        project_path = _scope_path(Scope.PROJECT, repo_root, home)
+        private_path = _scope_path(Scope.PRIVATE, repo_root, home)
+        _write(user_path, "[compaction]\nlimit = 150000\n")
+        configured = load_config(repo_root=repo_root, home=home)
+        if configured.get("compaction.limit") != 150000:
+            fail(f"user compaction limit did not load: {configured.values!r}")
+        if configured.scope_of("compaction.limit") is not Scope.USER:
+            fail("compaction limit lost its user-scope provenance")
+
+        for content, expected_key in (
+            ("[compaction]\nlimit = 0\n", "compaction.limit"),
+            ("[compaction]\nlimit = -1\n", "compaction.limit"),
+            ("[compaction]\nlimit = true\n", "compaction.limit"),
+            ("[compaction]\nother = 150000\n", "compaction.other"),
+        ):
+            _write(user_path, content)
+            try:
+                load_config(repo_root=repo_root, home=home)
+            except ConfigError as exc:
+                if expected_key not in str(exc):
+                    fail(f"invalid compaction setting error omitted {expected_key}: {exc!r}")
+            else:
+                fail(f"invalid compaction setting was accepted: {content!r}")
+
+        _write(user_path, "[compaction]\nlimit = 150000\n")
+        _write(project_path, "[compaction]\nlimit = 0\n")
+        _write(private_path, "[compaction]\nunknown = 1\n")
+        skipped = load_config(repo_root=repo_root, home=home)
+        if skipped.get("compaction.limit") != 150000:
+            fail("invalid project or private compaction settings replaced the user value")
+        for path, key in ((project_path, "compaction.limit"),
+                          (private_path, "compaction.unknown")):
+            if not any(str(path) in warning and key in warning for warning in skipped.warnings):
+                fail(f"skipped compaction warning omitted its source or key: {skipped.warnings!r}")
+
+        _write(project_path, "[compaction]\nlimit = 200000\n")
+        scoped = load_config(repo_root=repo_root, home=home)
+        if scoped.get("compaction.limit") != 200000 or scoped.scope_of("compaction.limit") is not Scope.PROJECT:
+            fail("valid project-scope compaction limit did not override the user value")
+
+        try:
+            load_config(repo_root=repo_root, home=home, session={"compaction": {"limit": 0}})
+        except ConfigError as exc:
+            if "compaction.limit" not in str(exc):
+                fail(f"session compaction error omitted its key: {exc!r}")
+        else:
+            fail("invalid session compaction limit was accepted")
+
+
 def _settings(value: str) -> str:
     return f'[agents]\ndirectory = "{value}"\n'
 

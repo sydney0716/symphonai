@@ -193,6 +193,12 @@ class _AnthropicFakeProvider(FakeModelProvider):
         return 2
 
 
+class _OpenAIFakeProvider(_RecordingFakeProvider):
+    @property
+    def wire_format(self) -> int:
+        return 1
+
+
 class _WindowCountingProvider(_AnthropicFakeProvider):
     def __init__(self, window: int = 200_000) -> None:
         super().__init__([ModelResponse(Message(Role.ASSISTANT, "recovered"))])
@@ -2327,6 +2333,73 @@ def check_model_window_budget_tracks_selection() -> None:
             fail(f"selected Haiku context budget was {leader.chat_token_budget}, expected 155000")
         if leader._agent is not agent:
             fail("changing the model to update the budget rebuilt the leader")
+
+
+@check("leader.compaction_limit_reaches_all_agents")
+def check_compaction_limit_reaches_all_agents() -> None:
+    with workspace() as ws:
+        for provider, model in (
+            (_AnthropicFakeProvider(), "claude-opus-5-5"),
+            (_OpenAIFakeProvider([]), "gpt-6-luna"),
+        ):
+            child_provider = type(provider)([
+                ModelResponse(Message(Role.ASSISTANT, "subagent complete"))
+            ])
+            leader_provider = type(provider)([
+                ModelResponse(Message(
+                    Role.ASSISTANT,
+                    tool_calls=[_dispatch("worker", "inspect context budget")],
+                )),
+                ModelResponse(Message(Role.ASSISTANT, "leader complete")),
+            ])
+            spec = _spec(ws.root, "worker", model=model, provider=child_provider.name)
+            leader = Leader(LeaderConfig(
+                leader_provider,
+                child_provider,
+                str(ws.root),
+                leader_model=model,
+                compaction_limit=150_000,
+                subagent_specs={"worker": spec},
+            ))
+            if leader.chat_token_budget != 150_000:
+                fail(f"leader chat budget for {model} ignored the cap: {leader.chat_token_budget}")
+            if leader._agent._context_budget(model) != 150_000:
+                fail(f"leader in-run budget for {model} ignored the cap")
+            result = leader.run("dispatch worker")
+            child = leader.subagents.get("worker")
+            if result.final_answer != "leader complete" or child is None:
+                fail(f"subagent budget fixture did not dispatch successfully: {result!r}")
+            if child.agent._context_budget(model) != 150_000:
+                fail(f"subagent in-run budget for {model} ignored the cap")
+
+        events = CollectingSink()
+        provider = _OpenAIFakeProvider([
+            ModelResponse(Message(Role.ASSISTANT, "completed after compaction"))
+        ])
+        leader = Leader(LeaderConfig(
+            provider,
+            _OpenAIFakeProvider([]),
+            str(ws.root),
+            leader_model="gpt-6-luna",
+            chat_token_budget=500_000,
+            chat_recent_turns=1,
+            events=events,
+        ))
+        leader.seed_chat([
+            Message(Role.USER, "first goal"),
+            Message(Role.ASSISTANT, "old detail " * 90_000),
+            Message(Role.USER, "follow-up"),
+            Message(Role.ASSISTANT, "old answer"),
+        ])
+        before = estimate_messages_tokens(leader._chat_messages + [Message(Role.USER, "current request")])
+        if not 244_800 < before < 500_000:
+            fail(f"in-run fixture did not cross only the model budget: {before}")
+        leader.chat("current request")
+        estimates = [estimate_messages_tokens(request.messages) for request in provider.requests]
+        if not estimates or max(estimates) > 244_800:
+            fail(f"in-run request exceeded the GPT compaction limit: {estimates!r}")
+        if not events.of_type(CompactionApplied):
+            fail("in-run GPT compaction did not occur before the request")
 
 
 @check("leader.context_overflow_compacts_and_recovers")

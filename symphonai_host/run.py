@@ -98,6 +98,10 @@ def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
         "cache_read_tokens", "cache_write_tokens",
     )
     values = [data.get(field) for field in fields]
+    values.extend(data.get(field, 0) for field in (
+        "long_context_input_tokens", "long_context_output_tokens",
+        "long_context_cache_read_tokens", "long_context_cache_write_tokens",
+    ))
     if any(type(value) is not int or value < 0 for value in values):
         return None
     agent_id = record.get("agent_id")
@@ -2964,6 +2968,10 @@ class HostRun:
                 max_leader_turns=self._max_turns,
                 leader_budget=self._leader_budget,
                 chat_token_budget=self._chat_token_budget,
+                compaction_limit=(
+                    None if self._extensions is None
+                    else self._extensions.config.get("compaction.limit")
+                ),
                 chat_recent_turns=self._chat_recent_turns,
                 permission_mode=self._policy.mode,
                 approval_callback=self.approvals.callback,
@@ -4029,12 +4037,20 @@ class HostRun:
                 "total_tokens": totals.total_tokens,
                 "cache_read_tokens": totals.cache_read_tokens,
                 "cache_write_tokens": totals.cache_write_tokens,
+                "long_context_input_tokens": totals.long_context_input_tokens,
+                "long_context_output_tokens": totals.long_context_output_tokens,
+                "long_context_cache_read_tokens": totals.long_context_cache_read_tokens,
+                "long_context_cache_write_tokens": totals.long_context_cache_write_tokens,
             }
             cost = total_cost(by_model, self._price_table)
             if cost is not None and self._price_table is not None:
                 fields["cost"] = {
                     "amount": str(cost),
                     "currency": self._price_table.currency,
+                    "estimated": any(
+                        self._price_table.long_context_is_estimated(model, usage)
+                        for model, usage in by_model.items()
+                    ),
                 }
             return fields
 

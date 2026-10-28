@@ -56,6 +56,7 @@ from symphonai_api.identity import (
     new_run_ref,
     new_turn_ref,
 )
+from symphonai_api.model_table import long_context_threshold
 from symphonai_api.hooks import HookRunner
 from symphonai_api.agent_run import AgentRun, PauseGate
 from symphonai_api.models import (
@@ -332,8 +333,12 @@ class ApiAgent:
                     if cancel is None
                     else self._provider.create_response(summary_request, cancel=cancel)
                 )
-                summary_usage = UsageTotals.from_usage(summary_response.usage)
                 summary_model = model or getattr(self._provider, "model", None) or "unknown"
+                threshold = long_context_threshold(self._provider.wire_format, summary_model)
+                summary_usage = UsageTotals.from_usage(
+                    summary_response.usage,
+                    long_context=threshold is not None and summary_response.usage.input_tokens > threshold,
+                )
                 usage_by_model[summary_model] = usage_by_model.get(
                     summary_model, UsageTotals()
                 ).merged(summary_usage)
@@ -348,6 +353,10 @@ class ApiAgent:
                         "calls": summary_usage.calls,
                         "cache_read_tokens": summary_usage.cache_read_tokens,
                         "cache_write_tokens": summary_usage.cache_write_tokens,
+                        "long_context_input_tokens": summary_usage.long_context_input_tokens,
+                        "long_context_output_tokens": summary_usage.long_context_output_tokens,
+                        "long_context_cache_read_tokens": summary_usage.long_context_cache_read_tokens,
+                        "long_context_cache_write_tokens": summary_usage.long_context_cache_write_tokens,
                     },
                 )
                 return summary_response.message.text
@@ -777,7 +786,11 @@ class ApiAgent:
                 else:
                     raise RuntimeError("request retry loop did not produce a response")
                 provider_calls += 1
-                usage = UsageTotals.from_usage(response.usage)
+                threshold = long_context_threshold(self._provider.wire_format, used_model)
+                usage = UsageTotals.from_usage(
+                    response.usage,
+                    long_context=threshold is not None and response.usage.input_tokens > threshold,
+                )
                 usage_by_model[used_model] = usage_by_model.get(
                     used_model, UsageTotals()
                 ).merged(usage)
@@ -792,6 +805,10 @@ class ApiAgent:
                         "calls": usage.calls,
                         "cache_read_tokens": usage.cache_read_tokens,
                         "cache_write_tokens": usage.cache_write_tokens,
+                        "long_context_input_tokens": usage.long_context_input_tokens,
+                        "long_context_output_tokens": usage.long_context_output_tokens,
+                        "long_context_cache_read_tokens": usage.long_context_cache_read_tokens,
+                        "long_context_cache_write_tokens": usage.long_context_cache_write_tokens,
                     },
                 )
                 # Stamp once and reuse, so the message in `conversation` and

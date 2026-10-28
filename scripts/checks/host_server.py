@@ -7052,7 +7052,7 @@ def check_conversation_cost_and_context() -> None:
             root.mkdir()
         priced = priced_payload(priced_root, "priced")
         unknown = priced_payload(unknown_root, "unpriced")
-        expected_cost = {"amount": "5", "currency": "USD"}
+        expected_cost = {"amount": "5", "currency": "USD", "estimated": False}
         if priced["usage"].get("cost") != expected_cost:
             fail(f"priced model cost was missing or inexact: {priced!r}")
         if "cost" in unknown["usage"] or any("cost" in agent for agent in unknown["agents"]):

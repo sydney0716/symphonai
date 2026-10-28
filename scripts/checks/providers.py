@@ -26,6 +26,7 @@ from symphonai_api.providers.anthropic_provider import (
     _parse_response as _parse_anthropic_response,
 )
 from symphonai_api.providers.base import ProviderError, tool_result_text
+from symphonai_api.model_table import long_context_threshold
 from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_API_KEY_ENV_VAR
 from symphonai_api.providers.gemini_provider import (
     GeminiProvider,
@@ -203,6 +204,10 @@ def check_model_table_schema() -> None:
     }
     if not required.issubset(indexed):
         fail(f"model effort table omitted required entries: {indexed!r}")
+    if long_context_threshold(1, "gpt-6-luna") != 272000 or long_context_threshold(
+        1, "gpt-6.1-sol"
+    ) != 272000:
+        fail("OpenAI long-context thresholds are missing or incorrect")
     gemini_efforts = {
         model: tuple(option.id for option in indexed[(3, model)].efforts)
         for model in (
@@ -296,6 +301,17 @@ def check_context_window_malformed_fails_closed() -> None:
         )
         if result != ():
             fail(f"invalid context_window {invalid!r} did not fail the table closed")
+    for invalid in (0, -1, "1000", True):
+        result = _models_from_json({
+            "schema_version": 1,
+            "notes": "invalid compact-at fixture",
+            "models": [{
+                "provider": "fixture", "wire_format": 2, "id": "fixture-model",
+                "compact_at": invalid, "efforts": [],
+            }],
+        })
+        if result != ():
+            fail(f"invalid compact_at {invalid!r} did not fail the table closed")
 
 
 @check("providers.new_anthropic_models_have_efforts")
@@ -522,9 +538,9 @@ def check_cache_usage_accounting() -> None:
                     "status": "completed",
                     "output": [],
                     "usage": {
-                        "input_tokens": 1000,
+                        "input_tokens": 10000,
                         "output_tokens": 10,
-                        "input_tokens_details": {"cached_tokens": 800},
+                        "input_tokens_details": {"cached_tokens": 6000, "cache_write_tokens": 3000},
                     },
                 }
             ).encode()
@@ -534,7 +550,7 @@ def check_cache_usage_accounting() -> None:
         "urllib.request.urlopen", side_effect=responses_urlopen
     ):
         responses = responses_provider.create_response(request)
-    if responses.usage != Usage(1000, 10, 800, 0):
+    if responses.usage != Usage(10000, 10, 6000, 3000):
         fail(f"OpenAI Responses cache usage was wrong: {responses.usage!r}")
 
     compatible_env = "SYMPHONAI_CACHE_COMPATIBLE_KEY"
