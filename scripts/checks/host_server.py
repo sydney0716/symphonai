@@ -12207,6 +12207,22 @@ def check_headless_reports_failures_and_files() -> None:
 
 @check("host_server.headless_exit_codes")
 def check_headless_exit_codes() -> None:
+    for category in ("cyber", None):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "project"
+            root.mkdir()
+            provider = FakeModelProvider([ModelResponse(
+                Message(Role.ASSISTANT, "partial"), stop_reason="refusal", refusal_category=category,
+            )])
+            code, output, _error, _sessions = _headless_invoke(
+                root, provider, ["run", "request", "--json", "--repo-root", str(root), "--provider", "openai"],
+            )
+            result = json.loads(output)
+            expected = "refused: cyber" if category else "refused"
+            if (code != 3 or result.get("status") != "stopped" or result.get("stopped_reason") != "refused"
+                    or result.get("error") != expected or result.get("result")):
+                fail(f"headless refusal was not reported: {code}, {result!r}")
+
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "project"
         root.mkdir()

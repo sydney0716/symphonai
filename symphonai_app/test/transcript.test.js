@@ -1177,3 +1177,14 @@ test("restored decision matching uses call ids across snapshot restore and rolls
   transcript.recordDecision({ type: "user-question", question: "Which database?", answer: "Skipped" }, "pending-call");
   assert.deepEqual(transcript.model.map((entry) => entry.answer), ["SQLite", "Skipped"]);
 });
+
+
+test("refused root run shows refused in the transcript", () => {
+  const transcript = applyAll([
+    event("RunStarted", { agent_id: "root" }),
+    event("PromptSubmitted", { agent_id: "root", text: "request" }),
+    event("RunFinished", { agent_id: "root", stopped_reason: "refused" }),
+  ]);
+  const time = transcript.model.find(({ type }) => type === "turn-time");
+  assert.match(time.text, /^Refused after /);
+});

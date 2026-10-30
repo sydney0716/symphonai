@@ -884,3 +884,63 @@ def check_diagnostics_keep_event_diff_clean() -> None:
     fields = _tool_result_event_fields(result)
     if fields["diff"] != diff:
         fail(f"ToolCallFinished diff included diagnostics text: {fields!r}")
+
+
+@check("agent_events.anthropic_refusal")
+def check_anthropic_refusal() -> None:
+    import io
+    import json
+    from symphonai_api.models import ModelRequest
+    from symphonai_api.providers.anthropic_provider import _parse_response, _anthropic_stream_chunks, _build_request_body
+    from symphonai_api.streaming import StreamAssembler
+    from symphonai_api.session import TranscriptWriter, read_records
+    for streamed in (False, True):
+        for details in ({"category": "cyber"}, None):
+            for partial in ("", "declined partial"):
+                payload = {"content": [{"type": "text", "text": partial},
+                            {"type": "tool_use", "id": "bad", "name": "write_file",
+                             "input": {"path": "must-not-exist", "content": "bad"}}],
+                           "stop_reason": "refusal", "stop_details": details}
+                if streamed:
+                    events = [("message_start", {"message": {"usage": {}}})]
+                    events.extend(("content_block_start", {"index": i, "content_block": b})
+                                  for i, b in enumerate(payload["content"]))
+                    events.extend([("message_delta", {"delta": {"stop_reason": "refusal", "stop_details": details}}),
+                                   ("message_stop", {})])
+                    lines = io.BytesIO("".join("event: " + kind + "\ndata: " + json.dumps(data) + "\n\n"
+                                             for kind, data in events).encode())
+                    assembler = StreamAssembler()
+                    for chunk in _anthropic_stream_chunks(lines, api_key="fake"):
+                        assembler.add(chunk)
+                    response = assembler.finish()
+                else:
+                    response = _parse_response(payload)
+                with workspace() as ws:
+                    writer = TranscriptWriter(ws.root / "refusal.jsonl")
+                    provider = FakeModelProvider([response, ModelResponse(Message(Role.ASSISTANT, "next answer"))])
+                    agent = ApiAgent(provider, ws.tools, ws.policy, transcript=writer)
+                    result = agent.run([Message(Role.USER, "request")])
+                    if (result.stopped_reason != "refused" or result.final_response.message.text
+                            or result.final_response.has_tool_calls or (ws.root / "must-not-exist").exists()
+                            or provider.call_count != 1):
+                        fail(f"refusal became an answer or ran a tool: {result!r}")
+                    if result.messages != [Message(Role.USER, "request")]:
+                        fail(f"refused assistant remained in conversation: {result.messages!r}")
+                    next_messages = [*result.messages, Message(Role.USER, "another prompt")]
+                    body = _build_request_body(ModelRequest(messages=next_messages), "test-model", 100)
+                    if (any(not message["content"] for message in body["messages"])
+                            or any(message["role"] == "assistant" for message in body["messages"])
+                            or [message.text for message in next_messages] != ["request", "another prompt"]):
+                        fail(f"refusal left an invalid next Anthropic request: {body!r}")
+                    refusal_turn = result.final_response.message.turn_id
+                    next_result = agent.run(next_messages)
+                    if next_result.stopped_reason != "final_response":
+                        fail("conversation could not continue after refusal")
+                    writer.close()
+                    records, _ = read_records(ws.root / "refusal.jsonl")
+                    if any(r["type"] == "message" and r.get("turn_id") == refusal_turn for r in records):
+                        fail("refused assistant was persisted as a message")
+                    refused = next(r["data"] for r in records if r["type"] == "run_finished")
+                    category = details["category"] if details else None
+                    if refused.get("stopped_reason") != "refused" or "refusal_category" not in refused or refused["refusal_category"] != category:
+                        fail(f"refusal category was not recorded: {refused!r}")

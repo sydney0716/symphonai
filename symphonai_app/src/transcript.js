@@ -61,7 +61,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       : seconds < 3600
         ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
         : `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-    const label = outcome === "failed" ? "Failed after" : outcome === "cancelled" ? "Stopped after" : "Worked for";
+    const label = outcome === "refused" ? "Refused after" : outcome === "failed" ? "Failed after" : outcome === "cancelled" ? "Stopped after" : "Worked for";
     const time = new Date(ended).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
     const entry = { type: "turn-time", text: `${label} ${duration} · ${time}` };
     model.push(entry);
@@ -572,7 +572,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
         appendTurnTime(
           currentPrompt,
           now(),
-          type === "RunFailed" ? "failed" : fields.stopped_reason === "cancelled" ? "cancelled" : "finished",
+          type === "RunFailed" ? "failed" : fields.stopped_reason === "cancelled" ? "cancelled" : fields.stopped_reason === "refused" ? "refused" : "finished",
           type === "RunFailed" ? fields.error : "",
         );
       }

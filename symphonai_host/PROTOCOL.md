@@ -367,7 +367,7 @@ the first request with `budget_cost_unpriced`. A subagent definition's own budge
 ceiling. There is no turn limit unless one is configured. The leader budget's
 `max_turns` takes precedence over the host's `--max-turns`; without a leader
 budget, the launch limit applies when set. Limits reset for each prompt.
-`RunFinished.stopped_reason` reports `max_turns`,
+`RunFinished.stopped_reason` reports `refused` when a model declines the request, or `max_turns`,
 `budget_wall_time`, `budget_tokens`, `budget_cost`, or
 `budget_cost_unpriced` when a limit ends a run;
 the conversation remains available for another prompt.

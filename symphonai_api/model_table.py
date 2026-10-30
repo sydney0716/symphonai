@@ -23,6 +23,7 @@ class ModelCapability:
     context_window: int | None = None
     long_context_above: int | None = None
     compact_at: int | None = None
+    server_fallback: bool = False
 
 
 def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
@@ -78,6 +79,7 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
                     or compact_at <= 0
                 )
             )
+            or ("server_fallback" in raw_model and type(raw_model["server_fallback"]) is not bool)
             or (wire_format, model) in seen_models
         ):
             return ()
@@ -104,7 +106,7 @@ def _models_from_json(payload: object) -> tuple[ModelCapability, ...]:
         models.append(
             ModelCapability(
                 provider, wire_format, model, tuple(efforts), context_window,
-                long_context_above, compact_at,
+                long_context_above, compact_at, raw_model.get("server_fallback", False),
             )
         )
     return tuple(models)
@@ -195,3 +197,9 @@ def compact_at_for_model(wire_format: int, model: str | None) -> int | None:
         return None
     capability = _capability_for_model(wire_format, model, model_capabilities())
     return None if capability is None else capability.compact_at
+
+
+def server_fallback_for_model(wire_format: int, model: str) -> bool:
+    """Whether the model accepts the vendor's default server fallback."""
+    capability = _capability_for_model(wire_format, model, model_capabilities())
+    return capability is not None and capability.server_fallback

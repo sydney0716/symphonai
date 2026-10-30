@@ -6,6 +6,7 @@
       "provider": "anthropic",
       "wire_format": 2,
       "id": "claude-fable-5-1",
+      "server_fallback": true,
       "context_window": 1000000,
       "efforts": [
         {"id": "low", "value": "low"},
@@ -19,6 +20,7 @@
       "provider": "anthropic",
       "wire_format": 2,
       "id": "claude-fable-5",
+      "server_fallback": true,
       "context_window": 1000000,
       "efforts": [
         {"id": "low", "value": "low"},
@@ -32,6 +34,7 @@
       "provider": "anthropic",
       "wire_format": 2,
       "id": "claude-mythos-5-1",
+      "server_fallback": true,
       "context_window": 1000000,
       "efforts": [
         {"id": "low", "value": "low"},
@@ -45,6 +48,7 @@
       "provider": "anthropic",
       "wire_format": 2,
       "id": "claude-opus-5",
+      "server_fallback": true,
       "context_window": 1000000,
       "efforts": [
         {"id": "low", "value": "low"},
@@ -58,6 +62,7 @@
       "provider": "anthropic",
       "wire_format": 2,
       "id": "claude-opus-5-5",
+      "server_fallback": true,
       "context_window": 1000000,
       "efforts": [
         {"id": "low", "value": "low"},
@@ -110,6 +115,7 @@
       "provider": "anthropic",
       "wire_format": 2,
       "id": "claude-sonnet-5-5",
+      "server_fallback": true,
       "context_window": 1000000,
       "efforts": [
         {"id": "low", "value": "low"},

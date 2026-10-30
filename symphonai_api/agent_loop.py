@@ -189,6 +189,7 @@ class ApiAgent:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns is not None and effective_max_turns < 1:
             raise ValueError(f"max_turns must be >= 1, got {effective_max_turns}")
+        self._previous_answering_model: str | None = None
         self._provider = provider
         self._tools = tools
         self._policy = policy
@@ -786,6 +787,20 @@ class ApiAgent:
                     break
                 else:
                     raise RuntimeError("request retry loop did not produce a response")
+                dated_suffix = (response.model or "").removeprefix(used_model + "-")
+                same_model = response.model == used_model or (
+                    response.model is not None and response.model.startswith(used_model + "-")
+                    and len(dated_suffix) == 8 and dated_suffix.isascii() and dated_suffix.isdigit()
+                )
+                if response.model and not same_model:
+                    if response.model != used_model and response.model != self._previous_answering_model:
+                        emit(event_sink, ModelFallback(
+                            agent_id=self._agent_ref.agent_id, run_id=run_ref.run_id,
+                            turn_id=turn_ref.turn_id, from_model=used_model,
+                            to_model=response.model, reason="refusal",
+                        ))
+                    used_model = response.model
+                self._previous_answering_model = used_model
                 provider_calls += 1
                 threshold = long_context_threshold(self._provider.wire_format, used_model)
                 usage = UsageTotals.from_usage(
@@ -813,18 +828,24 @@ class ApiAgent:
                         "long_context_cache_write_tokens": usage.long_context_cache_write_tokens,
                     },
                 )
+                refused = response.stop_reason == "refusal"
+                if refused:
+                    response = replace(response, message=replace(
+                        response.message, content="", tool_calls=[], reasoning="",
+                    ))
                 # Stamp once and reuse, so the message in `conversation` and
                 # `final_response` carry the same turn identity.
                 response = replace(
                     response, message=replace(response.message, turn_id=turn_ref.turn_id)
                 )
-                conversation.append(response.message)
-                append_record(
-                    "message",
-                    turn_id=turn_ref.turn_id,
-                    data=message_to_json(response.message),
-                )
-                self._persisted_digests.append(_message_digest(response.message))
+                if not refused:
+                    conversation.append(response.message)
+                    append_record(
+                        "message",
+                        turn_id=turn_ref.turn_id,
+                        data=message_to_json(response.message),
+                    )
+                    self._persisted_digests.append(_message_digest(response.message))
                 if cancel is not None:
                     cancel.raise_if_cancelled()
                 if not response.has_tool_calls:
@@ -840,7 +861,7 @@ class ApiAgent:
                             index=turn,
                         ),
                     )
-                    if run is not None and run.has_redirects():
+                    if not refused and run is not None and run.has_redirects():
                         run_limit = run.budget.max_turns
                         redirect_limit = (
                             run_limit if self._max_turns is None
@@ -854,7 +875,7 @@ class ApiAgent:
                         final_response=response,
                         messages=conversation,
                         turns_used=turn,
-                        stopped_reason="final_response",
+                        stopped_reason="refused" if refused else "final_response",
                         run=run_ref,
                         agent=self._agent_ref,
                         usage_by_model=usage_by_model,
@@ -865,13 +886,15 @@ class ApiAgent:
                             agent_id=self._agent_ref.agent_id,
                             run_id=run_ref.run_id,
                             agent_name=self._agent_ref.name,
-                            stopped_reason="final_response",
+                            stopped_reason="refused" if refused else "final_response",
                         ),
                     )
                     append_record(
                         "run_finished",
                         turn_id=None,
-                        data={"stopped_reason": "final_response", "turns_used": turn},
+                        data={"stopped_reason": "refused" if refused else "final_response",
+                              "turns_used": turn,
+                              **({"refusal_category": response.refusal_category} if refused else {})},
                     )
                     return result
                 cut_call = next(

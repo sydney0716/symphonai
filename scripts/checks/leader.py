@@ -698,6 +698,18 @@ def check_handoff_validation_uses_shell_policy() -> None:
 
 @check("leader.base_prompts_lead_their_agents")
 def base_prompts_lead_their_agents() -> None:
+    for category in ("cyber", None):
+        with workspace() as ws:
+            provider = FakeModelProvider([ModelResponse(
+                Message(Role.ASSISTANT, "partial"), stop_reason="refusal", refusal_category=category,
+            )])
+            dispatch = DispatchSubagentTool(provider, ws.policy)
+            result = dispatch.execute(_dispatch("implementer", "inspect"), ws.policy)
+            expected = ("subagent was refused (cyber) before a final answer" if category
+                        else "subagent was refused before a final answer")
+            if result.ok or expected not in (result.error or ""):
+                fail(f"refused dispatch did not explain refusal: {result!r}")
+
     leader_rule = (
         "You run existing commands to inspect, build and test, but you never write "
         "code, scripts or solution content yourself, not even in a temporary directory. "

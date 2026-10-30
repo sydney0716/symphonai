@@ -2044,3 +2044,32 @@ def check_gemini_url_has_no_key() -> None:
         f"{GeminiProvider().base_url}/models/{GeminiProvider().model}:streamGenerateContent?alt=sse"
     ] or key in captured[0]:
         fail(f"Gemini streaming URL was incorrect or exposed the API key: {captured!r}")
+
+
+@check("streaming.anthropic_mid_output_fallback")
+def check_anthropic_mid_output_fallback() -> None:
+    from symphonai_api.providers.anthropic_provider import _anthropic_stream_chunks, _build_request_body
+    events = [("message_start", {"message": {"model": "claude-opus-5-5"}})]
+    blocks = [
+        {"type": "text", "text": "partial"},
+        {"type": "thinking", "thinking": "declined", "signature": "old"},
+        {"type": "tool_use", "id": "old", "name": "bad", "input": {}},
+        {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
+        {"type": "text", "text": "answer"},
+        {"type": "tool_use", "id": "new", "name": "good", "input": {"x": 1}},
+    ]
+    events.extend(("content_block_start", {"index": i, "content_block": block})
+                  for i, block in enumerate(blocks))
+    events.append(("message_stop", {}))
+    lines = io.BytesIO("".join("event: " + kind + "\ndata: " + json.dumps(data) + "\n\n"
+                             for kind, data in events).encode())
+    response = _assemble(_anthropic_stream_chunks(lines, api_key="fake"))
+    if [call.vendor_id for call in response.message.tool_calls] != ["new"] or response.model != "claude-opus-4-8":
+        fail(f"declined tool survived fallback: {response!r}")
+    body = _build_request_body(ModelRequest(messages=[response.message]), "test-model", 100)
+    content = body["messages"][0]["content"]
+    marker = next(i for i, block in enumerate(content) if block["type"] == "fallback")
+    if any(b["type"] in {"tool_use", "thinking", "redacted_thinking"} for b in content[:marker]):
+        fail(f"declined blocks were echoed: {content!r}")
+    if [b.get("id") for b in content if b["type"] == "tool_use"] != ["new"]:
+        fail(f"answering tool missing from round trip: {content!r}")

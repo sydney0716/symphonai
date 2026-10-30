@@ -411,3 +411,93 @@ def check_leader_usage_per_agent() -> None:
         fail(f"reused subagent usage was not merged: {child_usage!r}")
     if record.usage_by_model != child_usage:
         fail(f"subagent record and leader result disagree: {record.usage_by_model!r}")
+
+
+@check("cost.anthropic_answering_model")
+def check_anthropic_answering_model() -> None:
+    from symphonai_api.events import CollectingSink, ModelFallback
+    from symphonai_api.providers.anthropic_provider import AnthropicProvider
+    from symphonai_api.session import TranscriptWriter, read_records
+    from unittest import mock
+    import io
+    import os
+    for streamed in (False, True):
+        with workspace() as ws:
+            payload = {"model": "claude-opus-4-8", "content": [{"type": "text", "text": "done"}],
+                       "usage": {"input_tokens": 10, "output_tokens": 2}}
+            def respond(request, timeout=None):
+                if streamed:
+                    return io.BytesIO((
+                        "event: message_start\ndata: " + json.dumps({"message": payload}) + "\n\n"
+                        + 'event: content_block_start\ndata: {"index":0,"content_block":{"type":"text","text":""}}\n\n'
+                        + 'event: content_block_delta\ndata: {"index":0,"delta":{"type":"text_delta","text":"done"}}\n\n'
+                        + 'event: message_delta\ndata: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n'
+                        + 'event: message_stop\ndata: {}\n\n').encode())
+                return io.BytesIO(json.dumps(payload).encode())
+            events = CollectingSink()
+            writer = TranscriptWriter(ws.root / "usage.jsonl")
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fake"}), mock.patch(
+                "urllib.request.urlopen", side_effect=respond
+            ):
+                agent = ApiAgent(AnthropicProvider(model="claude-opus-5-5"), {}, ws.policy,
+                                 events=events, stream=streamed, transcript=writer)
+                first = agent.run([Message(Role.USER, "first")])
+                first = agent.run([*first.messages, Message(Role.USER, "sticky prompt")])
+                # Two calls in one agent run exercise sticky fallback suppression.
+                payload["content"] = [{"type": "tool_use", "id": "missing", "name": "missing", "input": {}}]
+                if not streamed:
+                    count = 0
+                    def two_calls(request, timeout=None):
+                        nonlocal count
+                        count += 1
+                        value = dict(payload)
+                        if count > 1:
+                            value["content"] = [{"type": "text", "text": "done"}]
+                        return io.BytesIO(json.dumps(value).encode())
+                    events.events.clear()
+                    agent = ApiAgent(AnthropicProvider(model="claude-opus-5-5"), {}, ws.policy,
+                                     events=events, transcript=writer)
+                    with mock.patch("urllib.request.urlopen", side_effect=two_calls):
+                        first = agent.run([Message(Role.USER, "sticky")])
+            writer.close()
+            records, _ = read_records(ws.root / "usage.jsonl")
+            if set(first.usage_by_model) != {"claude-opus-4-8"}:
+                fail(f"usage charged to requested model: {first.usage_by_model!r}")
+            if any(r["data"]["model"] != "claude-opus-4-8" for r in records if r["type"] == "usage"):
+                fail("usage transcript used requested model")
+            prices = PriceTable({
+                "claude-opus-4-8": ModelPrice(Decimal("1"), Decimal("2")),
+                "claude-opus-5-5": ModelPrice(Decimal("100"), Decimal("200")),
+            }, "USD")
+            expected_calls = 1 if streamed else 2
+            if total_cost(first.usage_by_model, prices) != Decimal("0.000014") * expected_calls:
+                fail("fallback call was not priced at the answering model's rate")
+            fallback = events.of_type(ModelFallback)
+            if len(fallback) != 1 or fallback[0].reason != "refusal" or fallback[0].from_model != "claude-opus-5-5":
+                fail(f"fallback event was missing or repeated: {fallback!r}")
+
+    for streamed in (False, True):
+        with workspace() as ws:
+            events = CollectingSink()
+            writer = TranscriptWriter(ws.root / "dated.jsonl")
+            payload = {"model": "claude-haiku-4-5-20251001",
+                       "content": [{"type": "text", "text": "done"}],
+                       "usage": {"input_tokens": 10, "output_tokens": 2}}
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fake"}), mock.patch(
+                "urllib.request.urlopen", side_effect=respond,
+            ):
+                result = ApiAgent(AnthropicProvider(model="claude-haiku-4-5"), {}, ws.policy,
+                                  events=events, stream=streamed, transcript=writer).run([
+                                      Message(Role.USER, "alias request"),
+                                  ])
+            writer.close()
+            records, _ = read_records(ws.root / "dated.jsonl")
+            if result.usage_by_model != {"claude-haiku-4-5": UsageTotals(10, 2, 1)}:
+                fail(f"dated alias was treated as another model: {result.usage_by_model!r}")
+            if [r["data"]["model"] for r in records if r["type"] == "usage"] != ["claude-haiku-4-5"]:
+                fail("dated alias usage record did not retain requested model")
+            prices = PriceTable({"claude-haiku-4-5": ModelPrice(Decimal("1"), Decimal("2"))}, "USD")
+            if total_cost(result.usage_by_model, prices) != Decimal("0.000014"):
+                fail("dated alias cost did not use requested model price")
+            if events.of_type(ModelFallback):
+                fail("dated alias emitted a refusal fallback event")

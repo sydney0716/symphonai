@@ -1556,3 +1556,52 @@ def check_anthropic_thinks_with_effort() -> None:
         or any("thinking" in body for body in stream_bodies[1:])
     ):
         fail(f"Anthropic stream did not disable rejected thinking for later calls: {stream_bodies!r}")
+
+
+@check("providers.anthropic_server_fallback")
+def check_anthropic_server_fallback() -> None:
+    from symphonai_api.providers import anthropic_provider as module
+    flagged = {item.model for item in model_capabilities() if item.server_fallback}
+    if flagged != {"claude-opus-5", "claude-opus-5-5", "claude-sonnet-5-5",
+                   "claude-fable-5", "claude-fable-5-1", "claude-mythos-5-1"}:
+        fail(f"incorrect server fallback models: {flagged!r}")
+    invalid = {"schema_version": 1, "notes": "test", "models": [{
+        "provider": "anthropic", "wire_format": 2, "id": "x", "efforts": [],
+        "server_fallback": "true",
+    }]}
+    if _models_from_json(invalid):
+        fail("non-boolean server_fallback accepted")
+    request = ModelRequest(messages=[Message(Role.USER, "test")])
+    for streamed in (False, True):
+        captured = []
+        def respond(http_request, timeout=None):
+            body = json.loads(http_request.data)
+            captured.append((body, dict(http_request.header_items())))
+            if len(captured) == 1:
+                raise urllib.error.HTTPError(http_request.full_url, 400, "bad", {},
+                    io.BytesIO(b'{"error":{"message":"unsupported fallbacks"}}'))
+            if streamed:
+                return _FakeStreamResponse(_sse("message_start", {"message": {"usage": {}}})
+                                           + _sse("message_stop", {}))
+            return _FakeHttpResponse(b'{"content":[],"usage":{}}')
+        with mock.patch.object(module, "_FALLBACK_DISABLED", set()), mock.patch.dict(
+            os.environ, {ANTHROPIC_API_KEY_ENV_VAR: "fake"}
+        ), mock.patch("urllib.request.urlopen", side_effect=respond):
+            provider = AnthropicProvider(model="claude-opus-5-5")
+            for _ in range(2):
+                if streamed:
+                    list(provider.create_response_stream(request))
+                else:
+                    provider.create_response(request)
+        if len(captured) != 3:
+            fail(f"fallback rejection did not resend once and cache: {captured!r}")
+        for index, (body, headers) in enumerate(captured):
+            header = headers.get("Anthropic-beta")
+            if index == 0:
+                if body.get("fallbacks") != "default" or header != "server-side-fallback-2026-07-01":
+                    fail(f"missing fallback field/header: {captured!r}")
+            elif "fallbacks" in body or header is not None:
+                fail(f"fallback rejection was not cached: {captured!r}")
+    for model in ("claude-opus-4-8", "test-model"):
+        if "fallbacks" in _build_anthropic_body(request, model, 100):
+            fail(f"unsupported model received fallbacks: {model}")

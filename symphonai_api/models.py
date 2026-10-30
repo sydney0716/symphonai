@@ -241,6 +241,8 @@ class ModelResponse:
     usage: Usage = field(default_factory=Usage)
     stop_reason: str = "end_turn"
     cut_tool_call_id: str | None = None
+    model: str | None = None
+    refusal_category: str | None = None
 
     @property
     def has_tool_calls(self) -> bool:

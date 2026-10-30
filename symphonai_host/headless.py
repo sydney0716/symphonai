@@ -589,6 +589,18 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
                 if status_before.get(path) != status_after.get(path)
             )
         error = terminal.error if isinstance(terminal, RunFailed) else None
+        if isinstance(terminal, RunFinished) and terminal.stopped_reason == "refused":
+            session = SessionStore.open(runtime.run.sessions_root, session_id)
+            try:
+                from symphonai_api.session import read_records
+                records, _ = read_records(session.directory / "run.jsonl")
+                category = next((record.get("data", {}).get("refusal_category")
+                                 for record in reversed(records)
+                                 if record.get("type") == "run_finished"), None)
+            finally:
+                session.close()
+            error = f"refused: {category}" if category else "refused"
+            result_text = ""
         output_value = None
         if output_schema is not None and status == "finished":
             output_value, output_error = validate_output(

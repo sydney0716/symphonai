@@ -24,7 +24,7 @@ from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
-from symphonai_api.model_table import resolve_effort
+from symphonai_api.model_table import resolve_effort, server_fallback_for_model
 from symphonai_api.models import (
     DocumentBlock,
     ImageBlock,
@@ -67,6 +67,7 @@ _MAX_TOKENS_LIMIT_PATTERNS = (
     re.compile(r"\b(?:limit|maximum)(?:\s+output)?\s+tokens?\s*(?:is|of|:|=)?\s*(\d+)", re.IGNORECASE),
     re.compile(r"\blimit\s+(?:is|of|:|=)\s*(\d+)", re.IGNORECASE),
 )
+_FALLBACK_DISABLED: set[tuple[str, str]] = set()
 _THINKING_DISABLED: set[tuple[str, str]] = set()
 _MAX_TOKENS_LIMITS: dict[tuple[str, str], int] = {}
 _ANTHROPIC_CAPABILITIES_LOCK = threading.Lock()
@@ -228,6 +229,7 @@ def _build_request_body(
     *,
     max_tokens_override: int | None = None,
     include_thinking: bool = True,
+    include_fallback: bool = True,
 ) -> dict[str, Any]:
     reject_system_attachments(request.messages)
     id_map = wire_tool_call_ids(request.messages)
@@ -243,6 +245,8 @@ def _build_request_body(
         "messages": _anthropic_messages(non_system, id_map),
         "cache_control": {"type": "ephemeral"},
     }
+    if include_fallback and server_fallback_for_model(2, model):
+        body["fallbacks"] = "default"
     if system_parts:
         body["system"] = [{
             "type": "text",
@@ -318,6 +322,9 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             cache_write_1h_tokens=_usage_count(cache_creation.get("ephemeral_1h_input_tokens")),
         ),
         stop_reason=data.get("stop_reason") or "end_turn",
+        model=data.get("model") if isinstance(data.get("model"), str) else None,
+        refusal_category=(data["stop_details"].get("category")
+                          if isinstance(data.get("stop_details"), dict) else None),
     )
 
 
@@ -331,6 +338,9 @@ def _anthropic_stream_chunks(
     cache_write_1h_tokens = 0
     output_tokens = 0
     stop_reason = "end_turn"
+    answering_model = None
+    refusal_category = None
+    pending_tools: list[ToolCallDelta] = []
     content_blocks: dict[int, dict[str, Any]] = {}
     tool_input_fragments: dict[int, list[str]] = {}
     tool_indices: list[int] = []
@@ -348,6 +358,7 @@ def _anthropic_stream_chunks(
             raise StreamEventError(redact_secret(str(message), api_key), error.get("type") or error.get("code"), "anthropic")
         if event == "message_start":
             message = data.get("message", {})
+            answering_model = message.get("model") if isinstance(message, dict) else None
             usage = message.get("usage", {}) if isinstance(message, dict) else {}
             if isinstance(usage, dict):
                 input_tokens = _usage_count(usage.get("input_tokens"))
@@ -368,15 +379,21 @@ def _anthropic_stream_chunks(
             index = data["index"]
             if isinstance(block, dict):
                 content_blocks[index] = dict(block)
+                if block.get("type") == "fallback":
+                    answering_model = block.get("to", {}).get("model")
+                    pending_tools.clear()
+                    tool_indices.clear()
+                    content_blocks = {i: b for i, b in content_blocks.items()
+                                      if i >= index or b.get("type") not in {"thinking", "redacted_thinking", "tool_use"}}
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 tool_indices.append(index)
                 tool_input_fragments[index] = []
-                yield ToolCallDelta(
+                pending_tools.append(ToolCallDelta(
                     index,
                     id=block.get("id"),
                     name=block.get("name"),
                     vendor_id=block.get("id"),
-                )
+                ))
             continue
         if event == "content_block_delta":
             delta = data.get("delta", {})
@@ -404,25 +421,28 @@ def _anthropic_stream_chunks(
             elif delta.get("type") == "input_json_delta":
                 fragment = delta.get("partial_json", "")
                 tool_input_fragments.setdefault(data["index"], []).append(fragment)
-                yield ToolCallDelta(
+                pending_tools.append(ToolCallDelta(
                     data["index"], arguments_fragment=fragment
-                )
+                ))
             continue
         if event == "message_delta":
             delta = data.get("delta", {})
             usage = data.get("usage", {})
             if isinstance(delta, dict) and delta.get("stop_reason") is not None:
                 stop_reason = delta["stop_reason"]
+                details = delta.get("stop_details")
+                refusal_category = details.get("category") if isinstance(details, dict) else None
             if isinstance(usage, dict):
                 output_tokens = _usage_count(usage.get("output_tokens"))
             continue
         if event == "message_stop":
             content = [content_blocks[index] for index in sorted(content_blocks)]
+            yield from pending_tools
             has_thinking = any(
                 block.get("type") in {"thinking", "redacted_thinking"}
                 for block in content
             )
-            if has_thinking and tool_indices:
+            if (has_thinking or any(b.get("type") == "fallback" for b in content)) and tool_indices:
                 cut_index = (
                     max(tool_indices)
                     if stop_reason in {"max_tokens", "length", "MAX_TOKENS"}
@@ -465,6 +485,8 @@ def _anthropic_stream_chunks(
                         cache_write_1h_tokens=cache_write_1h_tokens,
                     ),
                     stop_reason=stop_reason,
+                    model=answering_model,
+                    refusal_category=refusal_category,
                 )
             )
             return
@@ -516,6 +538,8 @@ class AnthropicProvider(ModelProvider):
             and request.temperature is None
             and not _thinking_disabled(key)
         )
+        with _ANTHROPIC_CAPABILITIES_LOCK:
+            include_fallback = key not in _FALLBACK_DISABLED
         retried_max_tokens = False
         while True:
             body = _build_request_body(
@@ -524,6 +548,7 @@ class AnthropicProvider(ModelProvider):
                 self.max_tokens,
                 max_tokens_override=max_tokens_override,
                 include_thinking=include_thinking,
+                include_fallback=include_fallback,
             )
             http_request = urllib.request.Request(
                 f"{self.base_url}/messages",
@@ -533,6 +558,8 @@ class AnthropicProvider(ModelProvider):
                     "x-api-key": api_key,
                     "anthropic-version": ANTHROPIC_VERSION,
                     "content-type": "application/json",
+                    **({"anthropic-beta": "server-side-fallback-2026-07-01"}
+                       if "fallbacks" in body else {}),
                 },
             )
             try:
@@ -547,6 +574,12 @@ class AnthropicProvider(ModelProvider):
                     call_class=request.call_class,
                 )
             except ProviderError as exc:
+                if ("fallbacks" in body and "400" in str(exc)
+                        and any(name in str(exc).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback"))):
+                    with _ANTHROPIC_CAPABILITIES_LOCK:
+                        _FALLBACK_DISABLED.add(key)
+                    include_fallback = False
+                    continue
                 limit = _max_tokens_limit(exc)
                 sent_tokens = body["max_tokens"]
                 if (
@@ -585,6 +618,8 @@ class AnthropicProvider(ModelProvider):
             and request.temperature is None
             and not _thinking_disabled(key)
         )
+        with _ANTHROPIC_CAPABILITIES_LOCK:
+            include_fallback = key not in _FALLBACK_DISABLED
         retried_max_tokens = False
         while True:
             body = _build_request_body(
@@ -593,6 +628,7 @@ class AnthropicProvider(ModelProvider):
                 DEFAULT_STREAM_MAX_TOKENS,
                 max_tokens_override=max_tokens_override,
                 include_thinking=include_thinking,
+                include_fallback=include_fallback,
             )
             body["stream"] = True
             http_request = urllib.request.Request(
@@ -603,6 +639,8 @@ class AnthropicProvider(ModelProvider):
                     "x-api-key": api_key,
                     "anthropic-version": ANTHROPIC_VERSION,
                     "content-type": "application/json",
+                    **({"anthropic-beta": "server-side-fallback-2026-07-01"}
+                       if "fallbacks" in body else {}),
                 },
             )
 
@@ -633,6 +671,12 @@ class AnthropicProvider(ModelProvider):
             except ProviderError as exc:
                 if emitted:
                     raise
+                if ("fallbacks" in body and "400" in str(exc)
+                        and any(name in str(exc).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback"))):
+                    with _ANTHROPIC_CAPABILITIES_LOCK:
+                        _FALLBACK_DISABLED.add(key)
+                    include_fallback = False
+                    continue
                 limit = _max_tokens_limit(exc)
                 sent_tokens = body["max_tokens"]
                 if (

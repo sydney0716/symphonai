@@ -1269,6 +1269,10 @@ class DispatchSubagentTool(LocalTool):
             error = output_error
         elif succeeded:
             error = None
+        elif run_result.stopped_reason == "refused":
+            category = run_result.final_response.refusal_category
+            error = (f"subagent was refused ({category}) before a final answer"
+                     if category else "subagent was refused before a final answer")
         elif validation_commands and not validation_passed:
             last_failure = next(
                 (item for item in validation_evidence if item["exit"] != 0), None
