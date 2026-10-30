@@ -25,6 +25,10 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.client import HostAddress, HostClient, HostClientError
 from symphonai_host.protocol import decode_event
 from symphonai_host.server import HostServer
+from symphonai_host.projects import ProjectRuntime
+from symphonai_host.run import HostRun
+from symphonai_host.broker import EventBroker
+from symphonai_host.providers import provider as build_provider
 
 
 class _SmokeProvider(FakeModelProvider):
@@ -324,14 +328,20 @@ def _smoke_interpreter() -> None:
             ModelResponse(Message(Role.ASSISTANT, "file created")),
             ModelResponse(Message(Role.ASSISTANT, "done")),
         ])
-        host = HostServer(
+        broker = EventBroker()
+        run = HostRun(
             provider,
             PermissionPolicy(
                 repo_root=root, mode="ask", shell_enabled=True,
                 shell_allowlist=[()],
             ),
+            broker,
+            max_turns=20,
+            provider_factory=build_provider,
             sessions_root=root / "sessions",
+            publish_approval=lambda approval: host._publish_approval(approval),
         )
+        host = HostServer(provider, ProjectRuntime(root, run), broker=broker)
         host.start()
         client = HostClient(HostAddress(host.port, host.token))
         finished = threading.Event()

@@ -42,7 +42,7 @@ from symphonai_host.loops import LoopStore
 from symphonai_host.projects import build_project
 from symphonai_host.protocol import encode_event
 from symphonai_host.run import LoopChanged, ModeSelectionError, ProviderSelectionError, MissingAPIKeyError, RunActiveError
-from symphonai_host.server import PROVIDERS, _app_root, _provider, _provider_for_start
+from symphonai_host.providers import PROVIDERS, app_root as _app_root, provider as _provider, provider_for_start as _provider_for_start
 from symphonai_api.tools.shell import sandbox_available
 
 

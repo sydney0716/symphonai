@@ -137,13 +137,19 @@ def _linked_paths(path: Path) -> tuple[str, ...]:
     )
 
 
-def worktree_diff(path: Path) -> WorktreeDiff:
-    """Stage worktree changes in its own index and return paths plus patch."""
+def stage_worktree(path: Path) -> None:
+    """Stage project changes, excluding the worktree's shared symlinks."""
     path = Path(path).resolve()
     _git(path, "add", "-A")
     linked = _linked_paths(path)
     if linked:
         _git(path, "reset", "--quiet", "HEAD", "--", *linked)
+
+
+def worktree_diff(path: Path) -> WorktreeDiff:
+    """Stage worktree changes in its own index and return paths plus patch."""
+    path = Path(path).resolve()
+    stage_worktree(path)
     files = _git(
         path,
         "diff",

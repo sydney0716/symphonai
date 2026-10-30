@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import os
 import secrets
 import shlex
-import shutil
 import sys
-import subprocess
 import threading
 import time
 import tempfile
-import stat
 from datetime import datetime, timezone
 from collections.abc import Mapping
 from collections.abc import Callable
@@ -23,27 +22,23 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from symphonai_api.compaction import DEFAULT_RECENT_TURNS
-from symphonai_api.cost import PriceTable
 from symphonai_api.agent_memory import MemoryUnavailable
 from symphonai_api.agent_file import AgentFileError, load_agent_file
-from symphonai_api.extensions import Extensions
 from symphonai_api.events import Event
-from symphonai_api.lsp import LspManager
 from symphonai_api.model_discovery import list_models
 from symphonai_api.model_table import model_capabilities
-from symphonai_api.permissions import PermissionPolicy, _contains_path
+from symphonai_api.permissions import _contains_path
 from symphonai_api.providers.base import ModelProvider, ProviderError
-from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR, AnthropicProvider
-from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR, GeminiProvider
-from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
-from symphonai_api.provider_catalog import CATALOG, build_catalog_provider, catalog_keys
+from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR
+from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR
+from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR
 from symphonai_api.session import SessionError, SessionStore, TranscriptError
 from symphonai_api.paths import symphonai_home, write_atomic
 from symphonai_api.survey import survey_repository
-from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
 from symphonai_host.git import read_git_status
+from symphonai_host.git_actions import git_status, git_diff, git_commit, git_pull_request_info, create_pull_request
+from symphonai_host.providers import PROVIDERS, provider as build_provider, save_provider_selection, app_root as web_app_root
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.approvals import InvalidApprovalAnswer, PermissionGrantError
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
@@ -65,7 +60,7 @@ from symphonai_host.run import (
     HostRun,
     ModeSelectionError,
     NoConversationError,
-    ProviderSelectionError, MissingAPIKeyError,
+    ProviderSelectionError,
     RunActiveError,
     WorktreeApplyConflict,
 )
@@ -87,16 +82,6 @@ APP_CONTENT_TYPES = {
 }
 APP_HANDSHAKE_MARKER = "<!-- symphonai-handshake -->"
 APP_COOKIE_NAME = "symphonai_app"
-PULL_REQUEST_TIMEOUT_SECONDS = 120
-UNTRACKED_DIFF_READ_LIMIT = 1024 * 1024
-PROVIDERS = (
-    ("anthropic", ANTHROPIC_KEY_ENV_VAR, AnthropicProvider),
-    ("gemini", GEMINI_KEY_ENV_VAR, GeminiProvider),
-    ("openai", OPENAI_KEY_ENV_VAR, OpenAIProvider),
-) + tuple(
-    (key, CATALOG[key].api_key_env_var, None)
-    for key in catalog_keys()
-)
 
 
 def _working_tree_fingerprint(root: Path) -> dict[str, tuple[str, int, int, int, int, int]] | None:
@@ -132,299 +117,6 @@ def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> 
     ]
 
 
-def _pull_request_command(args: list[str], root: Path, name: str) -> subprocess.CompletedProcess:
-    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    environment.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
-    try:
-        return subprocess.run(
-            args, cwd=root, stdin=subprocess.DEVNULL, env=environment,
-            capture_output=True, check=False, timeout=PULL_REQUEST_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"{name} timed out after 120 s") from exc
-
-
-def _git_status(root: Path, *, diff_limit: int = 200) -> dict[str, Any]:
-    snapshot = read_git_status(root)
-    if snapshot is None:
-        return {"repo": False}
-    root = snapshot.root
-    branch_result = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=root,
-        capture_output=True, check=False,
-    )
-    branch = os.fsdecode(branch_result.stdout.strip()) if branch_result.returncode == 0 else None
-    records = []
-    for entry in snapshot.entries:
-        code, path, old_path = entry.code, entry.path, entry.old_path
-        if code == "??":
-            status = "untracked"
-        elif "R" in code or "C" in code:
-            status = "renamed"
-        elif "D" in code:
-            status = "deleted"
-        elif "A" in code:
-            status = "added"
-        else:
-            status = "modified"
-        record = {
-            "path": path,
-            "status": status,
-            "staged": code != "??" and code[0] != " ",
-        }
-        if old_path is not None:
-            record["old_path"] = old_path
-        records.append(record)
-    records.sort(key=lambda item: item["path"])
-    for record in records[:max(0, diff_limit)]:
-        diff, truncated = _git_diff_text(root, record)
-        record["diff"] = diff[:20_000]
-        record["diff_truncated"] = truncated
-    for record in records[max(0, diff_limit):]:
-        record["diff"] = None
-        record["diff_deferred"] = True
-    return {"repo": True, "branch": branch, "files": records}
-
-
-def _git_diff_text(root: Path, record: dict[str, Any]) -> tuple[str, bool]:
-    path = record["path"]
-    if record["status"] == "untracked":
-        file_path = root / path
-        try:
-            file_stat = file_path.lstat()
-        except OSError:
-            return "Not a regular file; diff omitted.", False
-        if stat.S_ISLNK(file_stat.st_mode):
-            try:
-                target = os.readlink(file_path)
-            except OSError:
-                return "Not a regular file; diff omitted.", False
-            diff = (
-                f"diff --git a/{path} b/{path}\n"
-                "new file mode 120000\n"
-                "--- /dev/null\n"
-                f"+++ b/{path}\n"
-                "@@ -0,0 +1 @@\n"
-                f"+{target}\n"
-                "\\ No newline at end of file\n"
-            )
-            return diff, len(diff) > 20_000
-        if not stat.S_ISREG(file_stat.st_mode):
-            return "Not a regular file; diff omitted.", False
-        no_follow = getattr(os, "O_NOFOLLOW", None)
-        if no_follow is None:
-            return "Not a regular file; diff omitted.", False
-        try:
-            descriptor = os.open(file_path, os.O_RDONLY | no_follow)
-            with os.fdopen(descriptor, "rb") as stream:
-                opened_stat = os.fstat(stream.fileno())
-                if not stat.S_ISREG(opened_stat.st_mode):
-                    return "Not a regular file; diff omitted.", False
-                content = stream.read(UNTRACKED_DIFF_READ_LIMIT)
-        except OSError:
-            return "Not a regular file; diff omitted.", False
-        input_truncated = file_stat.st_size > len(content)
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            return "Binary file; diff omitted.", False
-        if b"\0" in content:
-            return "Binary file; diff omitted.", False
-        lines = text.splitlines(keepends=True)
-        executable = file_stat.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        diff_lines = [
-            f"diff --git a/{path} b/{path}\n",
-            f"new file mode {'100755' if executable else '100644'}\n",
-            "--- /dev/null\n",
-            f"+++ b/{path}\n",
-        ]
-        if lines:
-            count = len(lines)
-            diff_lines.append(f"@@ -0,0 +1{f',{count}' if count != 1 else ''} @@\n")
-            for line in lines:
-                diff_lines.append(f"+{line}")
-                if not line.endswith(("\n", "\r")):
-                    diff_lines.append("\n\\ No newline at end of file\n")
-        diff = "".join(diff_lines)
-        return diff, input_truncated or len(diff) > 20_000
-    else:
-        paths = [path, *([record["old_path"]] if isinstance(record.get("old_path"), str) else [])]
-        result = subprocess.run(
-            ["git", "diff", "--no-ext-diff", "--no-color", "HEAD", "--", *paths],
-            cwd=root, capture_output=True, check=False,
-        )
-        diff = os.fsdecode(result.stdout)
-        if b"GIT binary patch" in result.stdout or b"Binary files " in result.stdout:
-            diff = "Binary file; diff omitted."
-    return diff, len(diff) > 20_000
-
-
-def _git_diff(root: Path, path: str) -> dict[str, Any] | None:
-    snapshot = read_git_status(root)
-    if snapshot is None:
-        return None
-    repository = snapshot.root
-    relative = Path(path)
-    if not path or relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("path must be inside the repository")
-    try:
-        (repository / relative).parent.resolve(strict=False).relative_to(repository)
-    except ValueError as exc:
-        raise ValueError("path must be inside the repository") from exc
-    entry = next((item for item in snapshot.entries if item.path == path), None)
-    if entry is None:
-        return None
-    record = {"path": entry.path, "status": "untracked" if entry.code == "??" else "modified"}
-    if entry.old_path is not None:
-        record["old_path"] = entry.old_path
-    diff, truncated = _git_diff_text(repository, record)
-    return {"path": path, "diff": diff[:20_000], "diff_truncated": truncated}
-
-
-def _git_commit(root: Path, message: str, paths: list[str]) -> dict[str, Any]:
-    snapshot = read_git_status(root)
-    if snapshot is None:
-        raise ValueError("not a git repository")
-    root = snapshot.root
-    changed = {path for entry in snapshot.entries
-               for path in (entry.path, entry.old_path) if path is not None}
-    selected = sorted(set(paths))
-    for path in selected:
-        relative = Path(path)
-        if (
-            not path or relative.is_absolute() or ".." in relative.parts
-            or path == "." or path.startswith(".git/") or path == ".git"
-        ):
-            raise ValueError(f"path is outside the repository: {path}")
-        try:
-            (root / relative).parent.resolve().relative_to(root.resolve())
-        except ValueError as exc:
-            raise ValueError(f"path is outside the repository: {path}") from exc
-        if path not in changed:
-            raise ValueError(f"no uncommitted change for path: {path}")
-
-    descriptor, index_name = tempfile.mkstemp(prefix="symphonai-git-index-")
-    os.close(descriptor)
-    os.unlink(index_name)
-    environment = {**os.environ, "GIT_INDEX_FILE": index_name}
-    try:
-        initialized = subprocess.run(
-            ["git", "read-tree", "HEAD"], cwd=root, env=environment,
-            capture_output=True, check=False,
-        )
-        if initialized.returncode:
-            output = (initialized.stderr or initialized.stdout).decode("utf-8", errors="replace")
-            raise RuntimeError(output[-4000:] or "could not prepare a temporary Git index")
-        added = subprocess.run(
-            ["git", "add", "--", *selected], cwd=root, env=environment,
-            capture_output=True, check=False,
-        )
-        if added.returncode:
-            output = (added.stderr or added.stdout).decode("utf-8", errors="replace")
-            raise RuntimeError(output[-4000:] or "git add failed")
-        committed = subprocess.run(
-            ["git", "commit", "-m", message], cwd=root, env=environment,
-            capture_output=True, check=False,
-        )
-        if committed.returncode:
-            output = committed.stdout + committed.stderr
-            raise RuntimeError(output.decode("utf-8", errors="replace")[-4000:] or "git commit failed")
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=False,
-        )
-        if commit.returncode:
-            output = (commit.stderr or commit.stdout).decode("utf-8", errors="replace")
-            raise RuntimeError(output[-4000:] or "could not read the new commit")
-        reset = subprocess.run(
-            ["git", "reset", "--quiet", "HEAD", "--", *selected], cwd=root,
-            capture_output=True, check=False,
-        )
-        if reset.returncode:
-            output = (reset.stderr or reset.stdout).decode("utf-8", errors="replace")
-            raise RuntimeError(output[-4000:] or "could not update the selected paths in the index")
-        return {"commit": os.fsdecode(commit.stdout.strip()), "paths": selected}
-    finally:
-        try:
-            os.unlink(index_name)
-        except FileNotFoundError:
-            pass
-
-
-def _git_pull_request_info(root: Path) -> dict[str, Any]:
-    gh = shutil.which("gh")
-    if gh is None:
-        return {"branch": None, "base": None, "title": "", "ahead": 0,
-                "problem": "The GitHub CLI (gh) is not installed."}
-    auth = _pull_request_command([gh, "auth", "status"], root, "gh auth status")
-    if auth.returncode:
-        return {"branch": None, "base": None, "title": "", "ahead": 0,
-                "problem": "gh is not signed in. Run gh auth login."}
-    origin = _pull_request_command(["git", "remote", "get-url", "origin"], root, "git remote get-url")
-    if origin.returncode:
-        return {"branch": None, "base": None, "title": "", "ahead": 0,
-                "problem": "This repository has no origin remote."}
-    current = _pull_request_command(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], root, "git symbolic-ref",
-    )
-    if current.returncode:
-        return {"branch": None, "base": None, "title": "", "ahead": 0,
-                "problem": "Check out a branch first."}
-    branch = os.fsdecode(current.stdout.strip())
-    remote_head = _pull_request_command(
-        ["git", "ls-remote", "--symref", "origin", "HEAD"], root, "git ls-remote",
-    )
-    base = None
-    if remote_head.returncode == 0:
-        for line in remote_head.stdout.splitlines():
-            if line.startswith(b"ref: refs/heads/") and line.endswith(b"\tHEAD"):
-                base = os.fsdecode(line[len(b"ref: refs/heads/"):-len(b"\tHEAD")])
-                break
-    if not base:
-        return {"branch": branch, "base": None, "title": "", "ahead": 0,
-                "problem": "Could not determine origin's default branch."}
-    title_result = _pull_request_command(
-        ["git", "log", "-1", "--format=%s", "HEAD"], root, "git log",
-    )
-    title = os.fsdecode(title_result.stdout.rstrip(b"\r\n")) if title_result.returncode == 0 else ""
-    if branch == base:
-        problem = f"Create a branch first; a pull request comes from a branch other than {base}."
-        return {"branch": branch, "base": base, "title": title, "ahead": 0, "problem": problem}
-    ahead_result = _pull_request_command(
-        ["git", "rev-list", "--count", f"origin/{base}..HEAD"], root, "git rev-list",
-    )
-    if ahead_result.returncode:
-        return {"branch": branch, "base": base, "title": title, "ahead": 0,
-                "problem": f"Could not compare {branch} with {base}."}
-    ahead = int(ahead_result.stdout.strip() or b"0")
-    problem = f"{branch} has no commits that {base} does not." if ahead == 0 else None
-    return {"branch": branch, "base": base, "title": title, "ahead": ahead, "problem": problem}
-
-
-def _create_pull_request(root: Path, title: str, body: str) -> dict[str, str]:
-    info = _git_pull_request_info(root)
-    if info["problem"]:
-        raise RuntimeError(info["problem"])
-    push = _pull_request_command(
-        ["git", "push", "-u", "origin", info["branch"]], root, "git push",
-    )
-    if push.returncode:
-        output = (push.stdout + push.stderr).decode("utf-8", errors="replace")
-        raise RuntimeError(output[-4000:] or "git push failed")
-    gh = shutil.which("gh")
-    created = _pull_request_command(
-        [gh, "pr", "create", "--title", title, "--body", body,
-         "--base", info["base"], "--head", info["branch"]],
-        root, "gh pr create",
-    )
-    if created.returncode:
-        output = (created.stdout + created.stderr).decode("utf-8", errors="replace")
-        raise RuntimeError(output[-4000:] or "gh pr create failed")
-    url = os.fsdecode(created.stdout.strip()).splitlines()[-1:]
-    if not url:
-        raise RuntimeError("gh pr create did not return a pull request URL")
-    return {"url": url[0]}
-
-
 def _model_listing(
     host: HostServer,
     provider: str,
@@ -456,76 +148,65 @@ def _memory_entry_reply(entry) -> dict[str, str]:  # noqa: ANN001
     }
 
 
-def _provider(name: str | None = None, model: str | None = None, base_url: str | None = None) -> ModelProvider | None:
-    if name is None:
-        name = next((vendor for vendor, key, _ in PROVIDERS if os.environ.get(key, "").strip()), None)
-        if name is None:
-            return None
-    if not isinstance(name, str) or not any(vendor == name for vendor, _, _ in PROVIDERS):
-        raise ProviderSelectionError("unknown provider")
-    if model is not None and (not isinstance(model, str) or not model.strip()):
-        raise ProviderSelectionError("model must be a non-empty string")
-    if base_url is not None and (not isinstance(base_url, str) or not base_url.strip()):
-        raise ProviderSelectionError("base_url must be a non-empty string")
-    vendor, key, provider_class = next(row for row in PROVIDERS if row[0] == name)
-    if not os.environ.get(key, "").strip():
-        raise MissingAPIKeyError(f"{vendor} has no API key")
-    if name in CATALOG:
-        if base_url is not None:
-            raise ProviderSelectionError(f"{name} uses its catalog base URL")
-        return build_catalog_provider(name, model)
-    options = {}
-    if model is not None:
-        options["model"] = model
-    if base_url is not None:
-        options["base_url"] = base_url
-    return provider_class(**options)
+@dataclass(frozen=True)
+class _Reply:
+    status: int
+    body: Any
 
 
-def _selection_path() -> Path:
-    return symphonai_home() / "selection.json"
+class _ReplyReady(Exception):
+    def __init__(self, reply: _Reply):
+        self.reply = reply
 
 
-def _load_provider_selection() -> dict[str, str] | None:
-    try:
-        with _selection_path().open("r", encoding="utf-8") as source:
-            choice = json.load(source)
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    if (
-        not isinstance(choice, dict)
-        or set(choice) - {"name", "model", "effort", "base_url"}
-        or not isinstance(choice.get("name"), str)
-        or not choice["name"]
-        or any(
-            key in choice and choice[key] is not None
-            and (not isinstance(choice[key], str) or not choice[key].strip())
-            for key in ("model", "effort", "base_url")
-        )
-    ):
-        return None
-    return choice
+@dataclass(frozen=True)
+class _StreamReply:
+    send: Callable[[], None]
 
 
-def _provider_for_start(provider_factory=_provider) -> tuple[ModelProvider | None, dict[str, str] | None]:
-    choice = _load_provider_selection()
-    if choice is None:
-        return provider_factory(), None
-    try:
-        provider = provider_factory(choice["name"], choice.get("model"), choice.get("base_url"))
-    except ProviderSelectionError:
-        return provider_factory(), None
-    return provider, choice
+@dataclass(frozen=True)
+class _Payload:
+    fields: Mapping[str, type | tuple[type, ...]]
+    required: tuple[str, ...]
+    extra: bool = False
+
+    def validate(self, payload: dict, path: str) -> None:
+        for key in self.required:
+            if key not in payload:
+                raise ProtocolError(f"{path} missing required key {key}")
+        for key, value in payload.items():
+            if key not in self.fields:
+                if not self.extra:
+                    raise ProtocolError(f"{path} unknown key {key}")
+                continue
+            declared = self.fields[key]
+            types = declared if isinstance(declared, tuple) else (declared,)
+            if not isinstance(value, types) or (isinstance(value, bool) and int in types and bool not in types):
+                names = " or ".join(kind.__name__ for kind in types)
+                raise ProtocolError(f"{path} requires {key} as {names}")
 
 
-def _save_provider_selection(choice: Mapping[str, str]) -> None:
-    target = _selection_path()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_atomic(target, json.dumps(dict(choice)), mode=0o600, fsync=True)
+@dataclass(frozen=True)
+class _Route:
+    method: str
+    path: str
+    handler: Callable
+    match: str = "path"
+    auth: bool = True
+    app_query: bool = False
+    app_cookie: bool = False
+    project_free: bool = False
+    payload: _Payload | None = None
+    # Each phase preserves the original catch boundary and exception order.
+    errors: tuple[tuple[tuple[type[Exception] | tuple[type[Exception], ...], str], ...], ...] = ()
+    helper_errors: Mapping[str, tuple] = field(default_factory=dict)
+    action: str = ""
 
+    def matches_path(self, path: str) -> bool:
+        return path.startswith(self.path[:-1]) if self.match == "prefix" else path == self.path
 
-def _app_root() -> Path:
-    return Path(__file__).resolve().parent.parent / "symphonai_app"
+    def matches(self, target: str) -> bool:
+        return target == self.path if self.match == "exact" else self.matches_path(urlsplit(target).path)
 
 
 class HostServer:
@@ -534,38 +215,20 @@ class HostServer:
     def __init__(
         self,
         provider: ModelProvider | None,
-        policy: PermissionPolicy | None,
+        runtime: ProjectRuntime | None,
         *,
         token: str | None = None,
         broker: EventBroker | None = None,
         keepalive_seconds: float = 15.0,
-        system_prompt: str | None = None,
-        base_prompt: str = "",
-        subagent_base_prompt: str = "",
-        working_dir: Path | None = None,
-        max_turns: int = 20,
-        model: str | None = None,
-        approval_timeout: float = 300.0,
-        sessions_root: Path | None = None,
-        memory_root: Path | None = None,
-        memory_extraction_enabled: bool | None = None,
         home: Path | None = None,
-        extensions: Extensions | None = None,
-        mcp_tools: Mapping[str, LocalTool] | None = None,
-        price_table: PriceTable | None = None,
-        chat_token_budget: int | None = None,
-        chat_recent_turns: int = DEFAULT_RECENT_TURNS,
-        lsp: LspManager | None = None,
         project_factory: Callable[[Path, EventBroker, Callable], ProjectRuntime] | None = None,
-        runtime: ProjectRuntime | None = None,
         provider_selection: Mapping[str, str] | None = None,
     ) -> None:
         if keepalive_seconds <= 0:
             raise ValueError("keepalive_seconds must be greater than 0")
         self.token = token or secrets.token_urlsafe(32)
         self._current_root = (
-            runtime.root.resolve() if runtime is not None else
-            policy.repo_root.resolve() if policy is not None else None
+            runtime.root.resolve() if runtime is not None else None
         )
         self._repo_root = self._current_root
         self._project_factory = project_factory
@@ -578,30 +241,7 @@ class HostServer:
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
         self._model_cache_lock = threading.Lock()
         self.broker = broker or EventBroker()
-        initial_runtime = runtime or (ProjectRuntime(self._current_root, HostRun(
-            provider,
-            policy,
-            self.broker,
-            system_prompt=system_prompt,
-            base_prompt=base_prompt,
-            subagent_base_prompt=subagent_base_prompt,
-            working_dir=working_dir,
-            max_turns=max_turns,
-            model=model,
-            provider_factory=lambda name, selected_model, base_url: _provider(name, selected_model, base_url),
-            publish_approval=self._publish_approval,
-            approval_timeout=approval_timeout,
-            sessions_root=sessions_root,
-            memory_root=memory_root,
-            memory_extraction_enabled=memory_extraction_enabled,
-            project_grants_root=self._home / "permissions",
-            extensions=extensions,
-            mcp_tools=mcp_tools,
-            price_table=price_table,
-            chat_token_budget=chat_token_budget,
-            chat_recent_turns=chat_recent_turns,
-            lsp=lsp,
-        )) if policy is not None else None)
+        initial_runtime = runtime
         initial_run = None if initial_runtime is None else initial_runtime.run
         self._runtimes: dict[Path, ProjectRuntime] = {}
         self._runtimes_lock = threading.RLock()
@@ -718,7 +358,7 @@ class HostServer:
                 "model": self._provider_selection.get("model"),
                 "effort": self._provider_selection.get("effort"),
             }
-            provider = current._provider if current is not None else self._default_provider
+            provider = current.provider if current is not None else self._default_provider
             runtime = self._project_factory(resolved, self.broker, self._publish_approval)
             with self._runtimes_lock:
                 self._runtimes[resolved] = runtime
@@ -885,6 +525,126 @@ class HostServer:
     def _handler_type(self) -> type[BaseHTTPRequestHandler]:
         host = self
 
+        def reply_bad_request(exc, name=None):
+            return _Reply(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
+
+        def reply_conflict_tail(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': str(exc)[-4000:]})
+
+        def reply_conflict(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': str(exc)})
+
+        def reply_invalid_roadmap(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': f'invalid roadmap: {exc}'})
+
+        def reply_model_unavailable(exc, name=None):
+            detail = str(exc)
+            variable = next((key for vendor, key, _ in PROVIDERS if vendor == name))
+            secret = os.environ.get(variable, '').strip()
+            if secret:
+                detail = detail.replace(secret, '[redacted]')
+            return _Reply(HTTPStatus.OK, {'provider': name, 'state': 'unknown', 'models': [], 'detail': detail, 'filter': _model_listing(host, name, [])[1]})
+
+        def reply_not_found(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+
+        def reply_unreadable_directory(exc, name=None):
+            return _Reply(HTTPStatus.FORBIDDEN, {'error': 'directory is not readable'})
+
+        def reply_unavailable(exc, name=None):
+            return _Reply(HTTPStatus.SERVICE_UNAVAILABLE, {'error': str(exc)})
+
+        def reply_unexportable_session(exc, name=None):
+            return _Reply(HTTPStatus.UNPROCESSABLE_ENTITY, {'error': 'session transcript cannot be exported'})
+
+        def reply_empty_unavailable(exc, name=None):
+            return _Reply(HTTPStatus.SERVICE_UNAVAILABLE, None)
+
+        def reply_active_run(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': str(exc), 'run_id': exc.run_id})
+
+        def reply_no_goal(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, {'error': 'no goal'})
+
+        def reply_definition_write_failed(exc, name=None):
+            return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': f'could not write definition: {exc}'})
+
+        def reply_no_running_turn(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': 'no turn is running'})
+
+        def reply_command_running(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': 'a command is already running'})
+
+        def reply_turn_running(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': 'wait for the turn to finish'})
+
+        def reply_changed_outside(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': str(exc), 'paths': exc.paths})
+
+        def reply_unknown_change(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown change'})
+
+        def reply_internal_error(exc, name=None):
+            return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': str(exc)})
+
+        def reply_unknown_worktree(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown worktree'})
+
+        def reply_credential_unavailable(exc, name=None):
+            return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': f'credential store unavailable for {name}'})
+
+        def reply_missing_session(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, {'error': str(exc)})
+
+        def reply_selection_unsaved(exc, name=None):
+            return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': 'provider selection could not be saved'})
+
+        def reply_command_finishing(exc, name=None):
+            return _Reply(HTTPStatus.CONFLICT, {'error': 'wait for the command to finish'})
+
+        def reply_session_not_found(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, {'error': 'session not found'})
+
+        def reply_empty_forbidden(exc, name=None):
+            return _Reply(HTTPStatus.FORBIDDEN, None)
+
+        def reply_empty_not_found(exc, name=None):
+            return _Reply(HTTPStatus.NOT_FOUND, None)
+
+        def reply_empty_unsupported(exc, name=None):
+            return _Reply(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, None)
+
+        error_replies = {
+            "empty_forbidden": reply_empty_forbidden,
+            "empty_not_found": reply_empty_not_found,
+            "empty_unsupported": reply_empty_unsupported,
+            'bad_request': reply_bad_request,
+            'conflict_tail': reply_conflict_tail,
+            'conflict': reply_conflict,
+            'invalid_roadmap': reply_invalid_roadmap,
+            'model_unavailable': reply_model_unavailable,
+            'not_found': reply_not_found,
+            'unreadable_directory': reply_unreadable_directory,
+            'unavailable': reply_unavailable,
+            'unexportable_session': reply_unexportable_session,
+            'empty_unavailable': reply_empty_unavailable,
+            'active_run': reply_active_run,
+            'no_goal': reply_no_goal,
+            'definition_write_failed': reply_definition_write_failed,
+            'no_running_turn': reply_no_running_turn,
+            'command_running': reply_command_running,
+            'turn_running': reply_turn_running,
+            'changed_outside': reply_changed_outside,
+            'unknown_change': reply_unknown_change,
+            'internal_error': reply_internal_error,
+            'unknown_worktree': reply_unknown_worktree,
+            'credential_unavailable': reply_credential_unavailable,
+            'missing_session': reply_missing_session,
+            'selection_unsaved': reply_selection_unsaved,
+            'command_finishing': reply_command_finishing,
+            'session_not_found': reply_session_not_found,
+        }
+
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
@@ -967,18 +727,15 @@ class HostServer:
                 if candidate.is_absolute():
                     self._empty(HTTPStatus.FORBIDDEN)
                     return None
-                app_root = _app_root()
+                app_root = web_app_root()
                 if not app_root.is_dir():
                     self._json(
                         HTTPStatus.NOT_FOUND,
                         {"error": "app is not installed"},
                     )
                     return None
-                try:
+                with self._errors('app_path'):
                     resolved = (app_root / candidate).resolve()
-                except (OSError, RuntimeError):
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return None
                 if not _contains_path(app_root, resolved):
                     self._empty(HTTPStatus.FORBIDDEN)
                     return None
@@ -988,11 +745,8 @@ class HostServer:
                 resolved = self._app_path("index.html")
                 if resolved is None:
                     return
-                try:
+                with self._errors('app_index'):
                     source = resolved.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    self._not_found()
-                    return
                 if source.count(APP_HANDSHAKE_MARKER) != 1:
                     self._not_found()
                     return
@@ -1018,32 +772,33 @@ class HostServer:
                 if content_type is None:
                     self._empty(HTTPStatus.FORBIDDEN)
                     return
-                try:
+                with self._errors('app_asset'):
                     body = resolved.read_bytes()
-                except OSError:
-                    self._not_found()
-                    return
                 self._bytes(HTTPStatus.OK, body, content_type)
 
-            def _serve_tree(self) -> None:
+            def _requested_path(self, *, directory: bool) -> tuple[str, Path] | None:
                 values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                 paths = values.get("path", [])
-                if len(paths) > 1:
+                if len(paths) > 1 or (not directory and not paths):
                     self._empty(HTTPStatus.FORBIDDEN)
-                    return
+                    return None
                 requested = paths[0] if paths else ""
                 candidate = Path(requested)
                 if candidate.is_absolute() or ".." in candidate.parts:
                     self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                try:
+                    return None
+                with self._errors('requested_path'):
                     resolved = (host._repo_root / candidate).resolve()
-                except (OSError, RuntimeError):
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
                 if not host.run.policy.check_read(resolved).allowed:
                     self._empty(HTTPStatus.FORBIDDEN)
+                    return None
+                return requested, resolved
+
+            def _serve_tree(self) -> None:
+                target = self._requested_path(directory=True)
+                if target is None:
                     return
+                requested, resolved = target
                 if not resolved.is_dir():
                     self._empty(HTTPStatus.NOT_FOUND)
                     return
@@ -1055,38 +810,18 @@ class HostServer:
                 })
 
             def _serve_source(self) -> None:
-                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-                paths = values.get("path", [])
-                if len(paths) != 1:
-                    self._empty(HTTPStatus.FORBIDDEN)
+                target = self._requested_path(directory=False)
+                if target is None:
                     return
-                requested = paths[0]
-                candidate = Path(requested)
-                if candidate.is_absolute() or ".." in candidate.parts:
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                try:
-                    resolved = (host._repo_root / candidate).resolve()
-                except (OSError, RuntimeError):
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                if not host.run.policy.check_read(resolved).allowed:
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return
-                try:
+                requested, resolved = target
+                with self._errors('source_read'):
                     with resolved.open("rb") as source:
                         data = source.read(MAX_FILE_BYTES + 1)
-                except (OSError, ValueError):
-                    self._empty(HTTPStatus.NOT_FOUND)
-                    return
                 if len(data) > MAX_FILE_BYTES:
                     self._empty(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                     return
-                try:
+                with self._errors('source_decode'):
                     text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-                    return
                 self._json(HTTPStatus.OK, {"path": requested, "text": text})
 
             def _definition_target(
@@ -1095,26 +830,26 @@ class HostServer:
                 scope: object,
             ) -> tuple[str, str, Path] | tuple[None, None, None]:
                 if not isinstance(name, str) or not name:
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must be a non-empty string"})
+                    raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must be a non-empty string'}))
                     return None, None, None
                 if not isinstance(scope, str) or scope not in ("project", "user"):
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "scope must be 'project' or 'user'"})
+                    raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': "scope must be 'project' or 'user'"}))
                     return None, None, None
                 if any(separator in name for separator in ("/", "\\")):
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must be a single segment"})
+                    raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must be a single segment'}))
                     return None, None, None
                 if name in (".", ".."):
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must not be a parent reference"})
+                    raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must not be a parent reference'}))
                     return None, None, None
                 if name.endswith(".toml"):
                     stem = name[:-5]
                 elif Path(name).suffix:
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must use the .toml extension"})
+                    raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must use the .toml extension'}))
                     return None, None, None
                 else:
                     stem = name
                 if not stem or stem in (".", "..") or Path(stem).name != stem:
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "name must be a single segment"})
+                    raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must be a single segment'}))
                     return None, None, None
                 filename = f"{stem}.toml"
                 directory = (
@@ -1122,7 +857,7 @@ class HostServer:
                     if scope == "project"
                     else host._home / "agents"
                 )
-                try:
+                with self._errors('definition_target'):
                     base = (
                         Path(host._repo_root).resolve()
                         if scope == "project"
@@ -1130,11 +865,8 @@ class HostServer:
                     )
                     root = directory.resolve()
                     target = (root / filename).resolve(strict=False)
-                except (OSError, RuntimeError):
-                    self._empty(HTTPStatus.FORBIDDEN)
-                    return None, None, None
                 if not _contains_path(base, root) or not _contains_path(root, target):
-                    self._empty(HTTPStatus.FORBIDDEN)
+                    raise _ReplyReady(_Reply(HTTPStatus.FORBIDDEN, None))
                     return None, None, None
                 return stem, scope, target
 
@@ -1190,16 +922,10 @@ class HostServer:
                         {"error": "repository not trusted for agents"},
                     )
                     return
-                try:
+                with self._errors('definition_read'):
                     data = target.read_bytes()
-                except OSError:
-                    self._not_found()
-                    return
-                try:
+                with self._errors('definition_decode'):
                     text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    self._empty(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-                    return
                 self._json(
                     HTTPStatus.OK,
                     {"name": stem, "scope": scope, "text": text},
@@ -1218,574 +944,6 @@ class HostServer:
             def _not_found(self) -> None:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
-            def do_GET(self) -> None:
-                request_url = urlsplit(self.path)
-                request_path = request_url.path
-                if host.run is None and request_path not in (
-                    "/health", "/events", "/project", "/projects", "/directories",
-                    "/settings", "/permissions", "/models", "/app", "/app/",
-                ) and not request_path.startswith("/app/"):
-                    if not self._authorized():
-                        return
-                    self._json(HTTPStatus.CONFLICT, {"error": "open a project first"})
-                    return
-                if self.path == "/health":
-                    if not self._authorized():
-                        return
-                    self._json(
-                        HTTPStatus.OK,
-                        {
-                            "protocol_version": PROTOCOL_VERSION,
-                            "state": "active" if host.run is not None and host.run.active else "idle",
-                            "run_id": None if host.run is None else host.run.active_run_id,
-                            "runtime_run_id": None if host.run is None else host.run.runtime_run_id,
-                        },
-                    )
-                    return
-                if self.path == "/conversation":
-                    if not self._authorized():
-                        return
-                    self._json(
-                        HTTPStatus.OK,
-                        {"conversation": host.run.conversation_stats()},
-                    )
-                    return
-                if request_path == "/git/status":
-                    if not self._authorized():
-                        return
-                    self._json(HTTPStatus.OK, _git_status(host.run.policy.repo_root))
-                    return
-                if request_path == "/git/diff":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True)
-                    path = values.get("path", [""])[0]
-                    try:
-                        result = _git_diff(host.run.policy.repo_root, path)
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if result is None:
-                        self._not_found()
-                        return
-                    self._json(HTTPStatus.OK, result)
-                    return
-                if request_path == "/jobs":
-                    if not self._authorized():
-                        return
-                    self._json(HTTPStatus.OK, {"jobs": host.run.list_jobs()})
-                    return
-                if request_path == "/git/pull-request":
-                    if not self._authorized():
-                        return
-                    try:
-                        info = _git_pull_request_info(host.run.policy.repo_root)
-                    except RuntimeError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)[-4000:]})
-                        return
-                    self._json(HTTPStatus.OK, info)
-                    return
-                if request_path == "/changes":
-                    if not self._authorized():
-                        return
-                    try:
-                        reply = host.run.changes()
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if request_path == "/memory":
-                    if not self._authorized():
-                        return
-                    memory = host.run.memory_store()
-                    if memory is None:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "memory is unavailable"})
-                        return
-                    reply = {}
-                    for scope in ("project", "global"):
-                        entries, unreadable = memory.read_status(scope)
-                        reply[scope] = (
-                            {"entries": [], "error": "unreadable"}
-                            if unreadable
-                            else {"entries": [_memory_entry_reply(entry) for entry in entries]}
-                        )
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if request_path == "/roadmap":
-                    if not self._authorized():
-                        return
-                    try:
-                        roadmap = RoadmapStore(host.run._repo_root).load()
-                        reply = RoadmapStore(host.run._repo_root).reply(roadmap)
-                    except InvalidRoadmap as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": f"invalid roadmap: {exc}"})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if request_path == "/models":
-                    if not self._authorized():
-                        return
-                    query = parse_qs(request_url.query, keep_blank_values=True)
-                    names = query.get("provider", [])
-                    base_urls = query.get("base_url", [])
-                    known = {name for name, _, _ in PROVIDERS}
-                    if (
-                        set(query) - {"provider", "base_url"}
-                        or len(names) != 1
-                        or names[0] not in known
-                        or len(base_urls) > 1
-                        or (base_urls and not base_urls[0].strip())
-                    ):
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid model listing request"})
-                        return
-                    name = names[0]
-                    base_url = base_urls[0] if base_urls else None
-                    cache_key = (name, base_url)
-                    with host._model_cache_lock:
-                        cached = host._model_cache.get(cache_key)
-                    if cached is not None:
-                        listed, model_filter = _model_listing(host, name, cached)
-                        self._json(HTTPStatus.OK, {
-                            "provider": name,
-                            "state": "available",
-                            "models": listed,
-                            "detail": "",
-                            "filter": model_filter,
-                        })
-                        return
-                    try:
-                        provider = _provider(name, None, base_url)
-                        if provider is None:
-                            raise ProviderSelectionError(f"{name} is unavailable")
-                        models = list_models(provider)
-                    except (ProviderSelectionError, ProviderError) as exc:
-                        detail = str(exc)
-                        variable = next(key for vendor, key, _ in PROVIDERS if vendor == name)
-                        secret = os.environ.get(variable, "").strip()
-                        if secret:
-                            detail = detail.replace(secret, "[redacted]")
-                        self._json(HTTPStatus.OK, {
-                            "provider": name,
-                            "state": "unknown",
-                            "models": [],
-                            "detail": detail,
-                            "filter": _model_listing(host, name, [])[1],
-                        })
-                        return
-                    with host._model_cache_lock:
-                        host._model_cache[cache_key] = tuple(models)
-                    listed, model_filter = _model_listing(host, name, models)
-                    self._json(HTTPStatus.OK, {
-                        "provider": name,
-                        "state": "available",
-                        "models": listed,
-                        "detail": "",
-                        "filter": model_filter,
-                    })
-                    return
-                if request_path == "/app":
-                    location = "/app/"
-                    if request_url.query:
-                        location = f"{location}?{request_url.query}"
-                    self.send_response(HTTPStatus.FOUND)
-                    self.send_header("Location", location)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                if request_path == "/app/":
-                    if not self._authorized(
-                        allow_app_query=True,
-                        allow_app_cookie=True,
-                    ):
-                        return
-                    self._serve_app_index()
-                    return
-                if request_path.startswith("/app/"):
-                    if not self._authorized(allow_app_cookie=True):
-                        return
-                    self._serve_app_asset(request_path.removeprefix("/app/"))
-                    return
-                if request_path == "/tree":
-                    if not self._authorized():
-                        return
-                    self._serve_tree()
-                    return
-                if request_path == "/source":
-                    if not self._authorized():
-                        return
-                    self._serve_source()
-                    return
-                if request_path == "/files":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True)
-                    query_values = values.get("query", [""])
-                    limit_values = values.get("limit", [])
-                    try:
-                        limit = 20 if not limit_values else int(limit_values[0])
-                    except ValueError:
-                        limit = 0
-                    if len(limit_values) > 1 or not 1 <= limit <= 50:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "limit must be from 1 to 50"})
-                        return
-                    files, truncated = repository_files(
-                        host.run.policy,
-                        query_values[0],
-                        limit,
-                    )
-                    self._json(HTTPStatus.OK, {"files": files, "truncated": truncated})
-                    return
-                if request_path == "/agent":
-                    if not self._authorized():
-                        return
-                    self._serve_definition()
-                    return
-                if request_path == "/session/agent":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True)
-                    session_ids = values.get("session_id", [])
-                    agent_ids = values.get("agent_id", [])
-                    if len(session_ids) != 1 or len(agent_ids) != 1:
-                        self._not_found()
-                        return
-                    try:
-                        reply = host.run.agent_history(session_ids[0], agent_ids[0])
-                    except TranscriptError:
-                        self._not_found()
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if request_path == "/survey":
-                    if not self._authorized():
-                        return
-                    survey = survey_repository(policy=host.run.policy)
-                    relative = lambda path: path.relative_to(  # noqa: E731
-                        survey.root
-                    ).as_posix()
-                    self._json(
-                        HTTPStatus.OK,
-                        {
-                            "survey": {
-                                "root": ".",
-                                "languages": survey.languages,
-                                "by_directory": survey.by_directory,
-                                "entry_points": [
-                                    relative(path) for path in survey.entry_points
-                                ],
-                                "docs": [relative(path) for path in survey.docs],
-                                "tests": [relative(path) for path in survey.tests],
-                                "tree_summary": survey.tree_summary,
-                                "truncated_directories": survey.truncated_directories,
-                                "stopped": survey.stopped,
-                                "file_count": survey.file_count,
-                            }
-                        },
-                    )
-                    return
-                if request_path == "/project":
-                    if not self._authorized():
-                        return
-                    if host._current_root is None:
-                        self._json(HTTPStatus.OK, {"repo_root": None, "name": None})
-                        return
-                    repo_root = host._repo_root.resolve()
-                    self._json(
-                        HTTPStatus.OK,
-                        {"repo_root": str(repo_root), "name": repo_root.name},
-                    )
-                    return
-                if request_path == "/projects":
-                    if not self._authorized():
-                        return
-                    current_root = host._current_root
-                    with host._runtimes_lock:
-                        runtimes = tuple(host._runtimes.items())
-                    open_projects = [
-                        {"repo_root": str(root), "name": root.name,
-                         "activity": "working" if any(state == "working" for state in runtime.run.session_activity().values()) else "waiting" if runtime.run.pending_approvals() else "idle"}
-                        for root, runtime in runtimes
-                    ]
-                    recent = recent_projects(host._home)
-                    self._json(HTTPStatus.OK, {
-                        "current": None if current_root is None else {"repo_root": str(current_root), "name": current_root.name},
-                        "open": open_projects,
-                        "recent": [{"repo_root": path, "name": Path(path).name,
-                                    "exists": Path(path).is_dir()} for path in recent if isinstance(path, str)],
-                    })
-                    return
-                if request_path == "/directories":
-                    if not self._authorized():
-                        return
-                    paths = parse_qs(request_url.query, keep_blank_values=True).get("path", [])
-                    if len(paths) > 1:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "path must be one absolute directory"})
-                        return
-                    target = Path(paths[0]).expanduser() if paths else Path.home()
-                    if not target.is_absolute():
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "path must be absolute"})
-                        return
-                    target = target.resolve()
-                    if not target.exists() or not target.is_dir():
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "directory not found"})
-                        return
-                    try:
-                        entries = sorted(
-                            ({"name": child.name, "path": str(child)} for child in target.iterdir()
-                             if not child.name.startswith(".") and child.is_dir()),
-                            key=lambda entry: entry["name"].casefold(),
-                        )
-                    except PermissionError:
-                        self._json(HTTPStatus.FORBIDDEN, {"error": "directory is not readable"})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        "path": str(target),
-                        "parent": None if target == Path("/") else str(target.parent),
-                        "entries": entries,
-                    })
-                    return
-                if request_path == "/settings":
-                    if not self._authorized():
-                        return
-                    if host.run is None:
-                        selection = host._provider_selection or None
-                        self._json(HTTPStatus.OK, {"settings": {
-                            "mode": "ask",
-                            "selection": None if selection is None else {
-                                "provider": selection.get("name"), "model": selection.get("model"), "effort": selection.get("effort")
-                            },
-                            "config": [], "ceiling": {}, "trust": [], "hooks": [],
-                            "mcp_servers": [], "agents": [], "skills": [], "plugins": [], "withheld": [],
-                            "providers": [{"name": name, "env_var": variable,
-                                           "key_present": bool(os.environ.get(variable, "").strip())}
-                                          for name, variable, _ in PROVIDERS],
-                            "search": [],
-                        }})
-                        return
-                    extensions = host.run.extensions
-                    root = host.run.policy.repo_root.resolve()
-
-                    def display_directory(directory: Path) -> str:
-                        resolved = directory.resolve()
-                        return (
-                            resolved.relative_to(root).as_posix()
-                            if resolved.is_relative_to(root)
-                            else str(resolved)
-                        )
-
-                    def roster(kind: str) -> list[dict[str, str]]:
-                        if extensions is None:
-                            return []
-                        members = getattr(extensions, kind)
-                        paths = getattr(members, "paths", {})
-                        return [
-                            {
-                                "name": name,
-                                "path": display_directory(source) if source is not None else "",
-                            }
-                            for name in sorted(members)
-                            for source in (paths.get(name, getattr(members[name], "path", None)),)
-                        ]
-
-                    ceiling = None if extensions is None else extensions.ceiling
-                    search_key = None if extensions is None else extensions.config.get("search.endpoint")
-                    configured_search = None if search_key is None else search_endpoint(search_key)
-                    settings = {
-                        "mode": host.run.starting_mode,
-                        "selection": host.run.selection(),
-                        "config": [] if extensions is None else [
-                            {
-                                "key": key,
-                                "value": value,
-                                "scope": extensions.config.provenance[key].scope.value,
-                            }
-                            for key, value in sorted(extensions.config.values.items())
-                        ],
-                        "ceiling": {
-                            "allowed_write_scope": None if ceiling is None or ceiling.allowed_write_scope is None else [str(path) for path in ceiling.allowed_write_scope],
-                            "shell_enabled": None if ceiling is None else ceiling.shell_enabled,
-                            "shell_allowlist": None if ceiling is None or ceiling.shell_allowlist is None else [list(command) for command in ceiling.shell_allowlist],
-                            "fetch_enabled": None if ceiling is None else ceiling.fetch_enabled,
-                            "fetch_allowlist": None if ceiling is None or ceiling.fetch_allowlist is None else list(ceiling.fetch_allowlist),
-                            "modes": None if ceiling is None or ceiling.modes is None else list(ceiling.modes),
-                        },
-                        "trust": [] if extensions is None else [
-                            {"root": str(entry.root), "allow": sorted(entry.allow)}
-                            for entry in sorted(extensions.trust.entries, key=lambda entry: str(entry.root))
-                        ],
-                        "hooks": [] if extensions is None else [
-                            {"event": event, "command": shlex.join(hook.command)}
-                            for hook in extensions.hooks
-                            for event in hook.events
-                        ],
-                        "mcp_servers": [] if extensions is None else [
-                            {"name": spec.name, "command": shlex.join(spec.command), "started": spec.enabled and host.run._mcp_tools is not None}
-                            for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)
-                        ],
-                        "agents": roster("agents"),
-                        "skills": roster("skills"),
-                        "plugins": roster("plugins"),
-                        "withheld": [] if extensions is None else [
-                            {
-                                "scope": offered.scope.value,
-                                "directory": display_directory(offered.directory),
-                                "names": sorted(offered.names),
-                                "reason": f"repository not trusted for {offered.directory.name}",
-                            }
-                            for offered in sorted(extensions.withheld, key=lambda offered: (offered.scope.value, str(offered.directory)))
-                        ],
-                        "providers": [
-                            {
-                                "name": name,
-                                "env_var": variable,
-                                "key_present": bool(os.environ.get(variable, "").strip()),
-                            }
-                            for name, variable, _ in PROVIDERS
-                        ],
-                        "search": [] if configured_search is None else [
-                            {
-                                "name": configured_search.key,
-                                "env_var": configured_search.api_key_env_var,
-                                "key_present": bool(os.environ.get(configured_search.api_key_env_var, "").strip()),
-                            }
-                        ],
-                    }
-                    config_warnings = [] if extensions is None else list(extensions.config.warnings)
-                    if config_warnings:
-                        settings["config_warnings"] = config_warnings
-                    self._json(HTTPStatus.OK, {"settings": settings})
-                    return
-                if self.path == "/approvals":
-                    if not self._authorized():
-                        return
-                    self._json(HTTPStatus.OK, {"pending": host.pending_approvals()})
-                    return
-                if self.path == "/permissions":
-                    if not self._authorized():
-                        return
-                    try:
-                        shell, fetch = (
-                            ((), ()) if host.run is None else host.run.project_permission_grants()
-                        )
-                    except PermissionGrantError as exc:
-                        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        "shell": [list(prefix) for prefix in shell], "fetch": list(fetch),
-                    })
-                    return
-                if request_path == "/sessions":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True).get("limit", [])
-                    queries = parse_qs(request_url.query, keep_blank_values=True).get("query", [])
-                    query = queries[0] if len(queries) == 1 else None
-                    archived_values = parse_qs(request_url.query, keep_blank_values=True).get("archived", [])
-                    archived = archived_values == ["1"]
-                    try:
-                        limit = int(values[0]) if len(values) == 1 else None
-                    except ValueError:
-                        limit = None
-                    if limit is not None and limit <= 0:
-                        limit = None
-                    self._json(HTTPStatus.OK, list_sessions(
-                        host.run.sessions_root, limit=limit, activity=host.session_activity(), query=query,
-                        archived=archived,
-                    ))
-                    return
-                if request_path == "/session/export":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True).get("id", [])
-                    if len(values) != 1 or not values[0]:
-                        self._not_found()
-                        return
-                    try:
-                        exported = host.run.export_session(values[0])
-                    except (KeyError, FileNotFoundError):
-                        self._not_found()
-                        return
-                    except (OSError, TranscriptError, ValueError, TypeError):
-                        self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "session transcript cannot be exported"})
-                        return
-                    self._json(HTTPStatus.OK, exported)
-                    return
-                if request_path == "/loops":
-                    if not self._authorized():
-                        return
-                    loops = LoopStore(host._repo_root).list()
-                    self._json(HTTPStatus.OK, {"loops": [
-                        {key: loop[key] for key in ("id", "goal", "state", "updated_at")}
-                        for loop in loops
-                    ]})
-                    return
-                if request_path == "/loop":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True).get("id", [])
-                    if len(values) != 1:
-                        self._not_found()
-                        return
-                    try:
-                        loop = LoopStore(host._repo_root).load(values[0])
-                    except (KeyError, ValueError):
-                        self._not_found()
-                        return
-                    loop["usage"] = host.run.loop_usage(loop)
-                    self._json(HTTPStatus.OK, {"loop": loop})
-                    return
-                if request_path == "/loop/card":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True)
-                    loop_ids, card_ids = values.get("loop", []), values.get("card", [])
-                    if len(loop_ids) != 1 or len(card_ids) != 1:
-                        self._not_found()
-                        return
-                    try:
-                        detail = host.run.loop_card_details(loop_ids[0], card_ids[0])
-                    except (KeyError, ValueError):
-                        self._not_found()
-                        return
-                    self._json(HTTPStatus.OK, detail)
-                    return
-                if request_path == "/history":
-                    if not self._authorized():
-                        return
-                    values = parse_qs(request_url.query, keep_blank_values=True).get("limit", [])
-                    try:
-                        limit = 100 if not values else int(values[0])
-                    except ValueError:
-                        limit = 0
-                    if len(values) > 1 or not 1 <= limit <= 500:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "limit must be from 1 to 500"})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        "prompts": prompt_history(
-                            host.run.sessions_root,
-                            host.run.policy.repo_root,
-                            limit=limit,
-                        ),
-                    })
-                    return
-                if self.path != "/events":
-                    self._not_found()
-                    return
-                if not self._authorized():
-                    return
-                subscription = host.broker.subscribe()
-                try:
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "keep-alive")
-                    self.end_headers()
-                    self._stream_events(subscription)
-                except OSError:
-                    return
-                finally:
-                    subscription.close()
 
             def _stream_events(self, subscription: Subscription) -> None:
                 while not subscription.closed:
@@ -1817,890 +975,1050 @@ class HostServer:
                 self.wfile.write(f"data: {frame}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
-            def do_POST(self) -> None:
-                credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact", "/agent", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
+
+            @contextmanager
+            def _errors(self, phase, **context):
+                try:
+                    yield
+                except Exception as exc:
+                    rules = (
+                        self._route.helper_errors[phase]
+                        if isinstance(phase, str) else self._route.errors[phase]
+                    )
+                    for exception_type, profile in rules:
+                        if isinstance(exc, exception_type):
+                            raise _ReplyReady(error_replies[profile](exc, **context)) from None
+                    raise
+
+            def _dispatch(self, method):
+                request_path = urlsplit(self.path).path
+                route = next((route for route in routes if route.method == method and route.matches(self.path)), None)
+                # GET's project gate historically precedes matching, including unknown paths.
+                project_free = any(route.method == method and route.project_free and route.matches_path(request_path) for route in routes)
+                if method == "GET" and host.run is None and not project_free:
+                    if self._authorized():
+                        self._json(HTTPStatus.CONFLICT, {"error": "open a project first"})
+                    return
+                # POST historically rejects unknown paths before authentication or project checks.
+                if route is None:
                     self._not_found()
                     return
-                if not self._authorized():
+                if route.auth and not self._authorized(allow_app_query=route.app_query, allow_app_cookie=route.app_cookie):
                     return
-                if host.run is None and self.path not in ("/project/open", "/credentials", "/provider"):
+                if method == "POST" and host.run is None and not (route.project_free and self.path == route.path):
                     self._json(HTTPStatus.CONFLICT, {"error": "open a project first"})
                     return
-                if self.path == "/project/open":
-                    try:
-                        payload = self._read_object()
-                        path = payload.get("path")
-                        if set(payload) != {"path"} or not isinstance(path, str):
-                            raise ProtocolError("project/open requires an absolute path")
-                        root = Path(path)
-                        if not root.is_absolute() or not root.is_dir() or root.resolve() == Path("/"):
-                            self._json(HTTPStatus.BAD_REQUEST, {"error": "path must be an existing project directory other than /"})
-                            return
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if host._project_factory is None:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "this host cannot open other projects"})
-                        return
-                    try:
-                        runtime, _created = host.open_project(root)
-                    except Exception as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    reply = {"repo_root": str(runtime.root), "name": runtime.root.name}
-                    extensions = runtime.run.extensions
-                    config_warnings = [] if extensions is None else list(extensions.config.warnings)
-                    if config_warnings:
-                        reply["config_warnings"] = config_warnings
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path == "/permissions/remove":
-                    try:
-                        payload = self._read_object()
-                        kind, value = payload.get("kind"), payload.get("value")
-                        if set(payload) != {"kind", "value"} or kind not in {"shell", "fetch"}:
-                            raise ProtocolError("permissions/remove requires kind and value")
-                        if (
-                            (kind == "shell" and (not isinstance(value, list) or not value or not all(isinstance(arg, str) for arg in value)))
-                            or (kind == "fetch" and (not isinstance(value, str) or not value))
-                        ):
-                            raise ProtocolError("permissions/remove value must be a shell prefix or fetch host")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        removed = host.run.remove_project_permission_grant(kind, value)
-                    except PermissionGrantError as exc:
-                        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"removed": removed})
-                    return
-                if self.path == "/git/commit":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"message", "paths"}:
-                            raise ProtocolError("git/commit requires message and paths")
-                        message = payload.get("message")
-                        paths = payload.get("paths")
-                        if not isinstance(message, str) or not message.strip():
-                            raise ProtocolError("message must be a non-blank string")
-                        if not isinstance(paths, list) or not paths or any(not isinstance(path, str) for path in paths):
-                            raise ProtocolError("paths must be a non-empty list of repository-relative paths")
-                        if any(state == "working" for state in host.run.session_activity().values()):
-                            self._json(HTTPStatus.CONFLICT, {"error": "wait for the turn to finish"})
-                            return
-                        result = _git_commit(host.run.policy.repo_root, message, paths)
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except RuntimeError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)[-4000:]})
-                        return
-                    self._json(HTTPStatus.OK, result)
-                    return
-                if self.path == "/jobs/start":
-                    try:
-                        payload = self._read_object()
-                        command = payload.get("command")
-                        if set(payload) != {"command"} or not isinstance(command, str) or not command.strip():
-                            raise ProtocolError("jobs/start requires a non-blank command")
-                        job_id = host.run.start_job(command)
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except RuntimeError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"id": job_id})
-                    return
-                if self.path == "/jobs/stop":
-                    try:
-                        payload = self._read_object()
-                        job_id = payload.get("id")
-                        if set(payload) != {"id"} or not isinstance(job_id, str) or not job_id:
-                            raise ProtocolError("jobs/stop requires an id")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    result = host.run.stop_job(job_id)
-                    if result is None:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown job id"})
-                        return
-                    self._json(HTTPStatus.OK, {"status": result["status"], "exit_code": result["exit_code"]})
-                    return
-                if self.path == "/git/pull-request":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"title", "body"}:
-                            raise ProtocolError("git/pull-request requires title and body")
-                        title = payload.get("title")
-                        body = payload.get("body")
-                        if not isinstance(title, str) or not title.strip() or not isinstance(body, str):
-                            raise ProtocolError("title must be non-blank and body must be a string")
-                        if any(state == "working" for state in host.run.session_activity().values()):
-                            self._json(HTTPStatus.CONFLICT, {"error": "wait for the turn to finish"})
-                            return
-                        result = _create_pull_request(host.run.policy.repo_root, title, body)
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except RuntimeError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)[-4000:]})
-                        return
-                    self._json(HTTPStatus.OK, result)
-                    return
-                if self.path == "/memory/update":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"id", "text"} or not all(
-                            isinstance(payload.get(key), str) for key in ("id", "text")
-                        ):
-                            raise ProtocolError("memory/update requires id and text")
-                        if not payload["text"].strip() or len(payload["text"]) > 500:
-                            raise ProtocolError("text must be non-blank and at most 500 characters")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    memory = host.run.memory_store()
-                    if memory is None:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "memory is unavailable"})
-                        return
-                    try:
-                        entry = memory.update(payload["id"], payload["text"])
-                    except MemoryUnavailable:
-                        self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
-                        self.send_header("Content-Length", "0")
-                        self.end_headers()
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if entry is None:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown memory id"})
-                        return
-                    self._json(HTTPStatus.OK, {"entry": _memory_entry_reply(entry)})
-                    return
-                if self.path == "/memory/delete":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"id"} or not isinstance(payload.get("id"), str):
-                            raise ProtocolError("memory/delete requires id")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    memory = host.run.memory_store()
-                    if memory is None:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "memory is unavailable"})
-                        return
-                    try:
-                        deleted = memory.delete(payload["id"])
-                    except MemoryUnavailable:
-                        self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
-                        self.send_header("Content-Length", "0")
-                        self.end_headers()
-                        return
-                    if not deleted:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown memory id"})
-                        return
-                    self._json(HTTPStatus.OK, {"deleted": payload["id"]})
-                    return
-                if self.path == "/loop/start":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"goal"} or not isinstance(payload.get("goal"), str):
-                            raise ProtocolError("loop/start requires goal")
-                        loop = host.run.start_loop(payload["goal"])
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        "loop": loop, "session_id": loop["planner_session_id"],
-                    })
-                    return
-                if self.path in ("/roadmap/add", "/roadmap/remove", "/roadmap/move"):
-                    try:
-                        payload = self._read_object()
-                        with host.run._lock:
-                            roadmap_store = RoadmapStore(host.run._repo_root)
-                            roadmap = roadmap_store.load()
-                            if self.path == "/roadmap/add":
-                                if set(payload) != {"goal"} or not isinstance(payload.get("goal"), str):
-                                    raise ProtocolError("roadmap/add requires goal")
-                                goal_text = payload["goal"].strip()
-                                if not goal_text:
-                                    raise ProtocolError("goal must not be blank")
-                                roadmap_store.add(roadmap, goal_text)
-                            else:
-                                expected = {"id"} if self.path == "/roadmap/remove" else {"id", "index"}
-                                if set(payload) != expected or not isinstance(payload.get("id"), str):
-                                    raise ProtocolError("invalid roadmap request")
-                                item = roadmap_store.find(roadmap, payload["id"])
-                                if item is None:
-                                    self._not_found()
-                                    return
-                                if self.path == "/roadmap/remove":
-                                    roadmap["goals"].remove(item)
-                                else:
-                                    index = payload.get("index")
-                                    if type(index) is not int or not 0 <= index < len(roadmap["goals"]):
-                                        raise ProtocolError("index must be between 0 and the last goal index")
-                                    roadmap["goals"].remove(item)
-                                    roadmap["goals"].insert(index, item)
-                            roadmap_store.save(roadmap)
-                            reply = roadmap_store.reply(roadmap)
-                    except InvalidRoadmap as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": f"invalid roadmap: {exc}"})
-                        return
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path == "/roadmap/start":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"id"} or not isinstance(payload.get("id"), str):
-                            raise ProtocolError("roadmap/start requires id")
-                        roadmap_reply, loop = host.run.start_roadmap_goal(payload["id"])
-                    except InvalidRoadmap as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": f"invalid roadmap: {exc}"})
-                        return
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except KeyError:
-                        self._not_found()
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        **roadmap_reply, "loop": loop, "session_id": loop["planner_session_id"],
-                    })
-                    return
-                if self.path == "/loop/plan":
-                    try:
-                        payload = self._read_object()
-                        loop_id, action = payload.get("loop_id"), payload.get("action")
-                        if not isinstance(loop_id, str) or not isinstance(action, str):
-                            raise ProtocolError("loop/plan requires loop_id and action")
-                        if action == "approve" and set(payload) == {"loop_id", "action"}:
-                            loop = host.run.approve_loop_plan(loop_id)
-                            reply = {"loop": loop}
-                        elif action == "drop" and set(payload) == {"loop_id", "action", "cards"}:
-                            cards = payload["cards"]
-                            if not isinstance(cards, list) or not all(isinstance(card, str) for card in cards):
-                                raise ProtocolError("loop/plan drop requires cards as string ids")
-                            loop = host.run.drop_loop_cards(loop_id, cards)
-                            reply = {"loop": loop}
-                        elif action == "revise" and set(payload) == {"loop_id", "action", "note"} and isinstance(payload.get("note"), str):
-                            loop = host.run.revise_loop_plan(loop_id, payload["note"])
-                            reply = {"loop": loop, "session_id": loop["planner_session_id"]}
-                        else:
-                            raise ProtocolError("loop/plan has an invalid action or body")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except KeyError:
-                        self._not_found()
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path == "/loop/cancel":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"loop_id"} or not isinstance(payload.get("loop_id"), str):
-                            raise ProtocolError("loop/cancel requires loop_id")
-                        loop = host.run.cancel_loop(payload["loop_id"])
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except KeyError:
-                        self._not_found()
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    self._json(HTTPStatus.OK, {"loop": loop})
-                    return
-                if self.path == "/loop/commit":
-                    try:
-                        payload = self._read_object()
-                        if (set(payload) != {"loop_id", "action"}
-                                or not isinstance(payload.get("loop_id"), str)
-                                or not isinstance(payload.get("action"), str)):
-                            raise ProtocolError("loop/commit requires loop_id and action")
-                        loop = host.run.commit_loop(payload["loop_id"], payload["action"])
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except KeyError:
-                        self._not_found()
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        "loop": loop, "branch": loop.get("branch"),
-                        "commits": loop.get("summary", {}).get("commits", []),
-                    })
-                    return
-                if self.path == "/loop/resume":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"loop_id"} or not isinstance(payload.get("loop_id"), str):
-                            raise ProtocolError("loop/resume requires loop_id")
-                        loop = host.run.resume_loop(payload["loop_id"])
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except KeyError:
-                        self._not_found()
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"loop": loop})
-                    return
-                if self.path == "/goal":
-                    try:
-                        payload = self._read_object()
-                        objective = payload.get("objective")
-                        check = payload.get("check", [])
-                        max_rounds = payload.get("max_rounds", 10)
-                        if (
-                            set(payload) - {"objective", "check", "max_rounds"}
-                            or not isinstance(objective, str)
-                            or not objective.strip()
-                            or not isinstance(check, list)
-                            or not all(isinstance(arg, str) and arg for arg in check)
-                            or type(max_rounds) is not int
-                            or not 1 <= max_rounds <= 100
-                        ):
-                            raise ProtocolError("goal requires a non-blank objective, optional check argv, and max_rounds from 1 to 100")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        run_id = host.run.start_goal(objective, tuple(check), max_rounds)
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ProviderSelectionError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {
-                        "accepted": True,
-                        "run_id": run_id,
-                        "goal": host.run.goal_snapshot(),
-                    })
-                    return
-                if self.path == "/goal/state":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"action"} or payload.get("action") not in ("pause", "resume", "clear"):
-                            raise ProtocolError("goal/state requires pause, resume, or clear")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        goal = host.run.goal_state(payload["action"])
-                    except KeyError:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "no goal"})
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"goal": goal})
-                    return
-                if self.path == "/agent":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"name", "scope", "text"}:
-                            raise ProtocolError("agent requires name, scope, and text")
-                        if not all(isinstance(payload[key], str) for key in ("name", "scope", "text")):
-                            raise ProtocolError("agent name, scope, and text must be strings")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    stem, scope, target = self._definition_target(
-                        payload["name"], payload["scope"]
-                    )
-                    if target is None:
-                        return
-                    if not self._definition_trusted(scope):
-                        self._json(
-                            HTTPStatus.FORBIDDEN,
-                            {"error": "repository not trusted for agents"},
-                        )
-                        return
-                    try:
-                        self._validate_definition(target, payload["text"])
-                    except AgentFileError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        self._write_definition(target, payload["text"])
-                    except OSError as exc:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"could not write definition: {exc}"})
-                        return
-                    self._json(
-                        HTTPStatus.OK,
-                        {
-                            "written": True,
-                            "name": stem,
-                            "scope": scope,
-                            "path": str(target),
-                            "message": "definition saved; it will take effect on the next run",
-                        },
-                    )
-                    return
-                if self.path == "/steer":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"text"} or not isinstance(payload.get("text"), str) or not payload["text"].strip():
-                            raise ProtocolError("steer requires one non-blank text string")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        host.run.steer(payload["text"])
-                    except RunActiveError:
-                        self._json(HTTPStatus.CONFLICT, {"error": "no turn is running"})
-                        return
-                    self._json(HTTPStatus.OK, {"steered": True})
-                    return
-                if self.path == "/command":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"command"} or not isinstance(payload.get("command"), str) or not payload["command"].strip():
-                            raise ProtocolError("command requires one non-blank command string")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        reply = host.run.run_user_command(payload["command"])
-                    except CommandActiveError:
-                        self._json(HTTPStatus.CONFLICT, {"error": "a command is already running"})
-                        return
-                    except RunActiveError:
-                        self._json(HTTPStatus.CONFLICT, {"error": "wait for the turn to finish"})
-                        return
-                    except ValueError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path == "/changes/revert":
-                    try:
-                        payload = self._read_object()
-                        fields = set(payload)
-                        if (
-                            "force" in payload and not isinstance(payload["force"], bool)
-                        ) or fields - {"path", "key", "force"}:
-                            raise ProtocolError("changes/revert accepts path or key and optional force")
-                        has_path = isinstance(payload.get("path"), str) and bool(payload["path"].strip())
-                        has_key = isinstance(payload.get("key"), str) and bool(payload["key"].strip())
-                        if has_path == has_key or ("path" in payload and not has_path) or ("key" in payload and not has_key):
-                            raise ProtocolError("changes/revert requires one non-empty path or key")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        reply = host.run.revert_changes(
-                            path=payload.get("path"),
-                            key=payload.get("key"),
-                            force=payload.get("force", False),
-                        )
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    except ChangedOutsideError as exc:
-                        self._json(
-                            HTTPStatus.CONFLICT,
-                            {"error": str(exc), "paths": exc.paths},
-                        )
-                        return
-                    except KeyError:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown change"})
-                        return
-                    except (OSError, ValueError) as exc:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path in ("/worktree/apply", "/worktree/discard"):
-                    try:
-                        payload = self._read_object()
-                        name = payload.get("name")
-                        if set(payload) != {"name"} or not isinstance(name, str) or not name.strip() or Path(name).name != name or name in (".", ".."):
-                            raise ProtocolError("worktree action requires one valid name")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        if self.path == "/worktree/apply":
-                            reply = host.run.apply_worktree(name)
-                        else:
-                            reply = host.run.discard_worktree(name)
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    except KeyError:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown worktree"})
-                        return
-                    except WorktreeApplyConflict as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    except (OSError, ValueError, RuntimeError) as exc:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if credential_route:
-                    try:
-                        payload = self._read_object()
-                    except ProtocolError:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid credential request"})
-                        return
-                    name = payload.get("name")
-                    value = payload.get("value")
-                    if name not in (
-                        ANTHROPIC_KEY_ENV_VAR,
-                        GEMINI_KEY_ENV_VAR,
-                        OPENAI_KEY_ENV_VAR,
-                        *(variable for _, variable, _ in PROVIDERS[3:]),
-                        *(endpoint.api_key_env_var for endpoint in search_endpoints()),
-                    ):
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "unknown credential name"})
-                        return
-                    if not isinstance(value, str):
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": f"invalid value for {name}"})
-                        return
-                    try:
-                        store(name, value)
-                    except CredentialError:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"credential store unavailable for {name}"})
-                        return
-                    if value:
-                        apply_to_environment(os.environ, {name: value})
-                    else:
-                        os.environ.pop(name, None)
-                    self._json(HTTPStatus.OK, {"stored": True, "name": name})
-                    return
-                if self.path == "/session/new":
-                    try:
-                        if self._read_object():
-                            raise ProtocolError("session/new takes an empty object")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        host.run.end_conversation()
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    self._json(HTTPStatus.OK, {"ended": True})
-                    return
-                if self.path == "/session/rename":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"run_id", "title"} or any(
-                            not isinstance(payload.get(key), str) for key in ("run_id", "title")
-                        ):
-                            raise ProtocolError("session/rename requires run_id and title strings")
-                        run_id = payload["run_id"]
-                        title = payload["title"].strip()
-                        if not run_id or run_id in (".", "..") or Path(run_id).name != run_id or not title or len(title) > 200:
-                            raise ProtocolError("title must be non-blank and at most 200 characters")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    from symphonai_api.session import SessionStore
-                    if not (host.run.sessions_root / run_id).is_dir():
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown session"})
-                        return
-                    if not host._session_belongs_here(run_id):
-                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
-                        return
-                    with host.run._lock:
-                        opened = host.run._open_conversations.get(run_id)
-                        session_store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, run_id)
-                        try:
-                            def change(meta):
-                                meta["title"] = title
-                            session_store.update_meta(change)
-                        finally:
-                            if opened is None:
-                                session_store.close()
-                    self._json(HTTPStatus.OK, {"renamed": True})
-                    return
-                if self.path == "/session/archive":
-                    try:
-                        payload = self._read_object()
-                        if (
-                            set(payload) != {"run_id", "archived"}
-                            or type(payload.get("run_id")) is not str
-                            or not payload["run_id"]
-                            or payload["run_id"] in (".", "..")
-                            or Path(payload["run_id"]).name != payload["run_id"]
-                            or type(payload.get("archived")) is not bool
-                        ):
-                            raise ProtocolError("session/archive requires run_id and archived")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if not (host.run.sessions_root / payload["run_id"]).is_dir():
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown session"})
-                        return
-                    if not host._session_belongs_here(payload["run_id"]):
-                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
-                        return
-                    try:
-                        updated = host.run.archive_session(payload["run_id"], payload["archived"])
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    self._json(
-                        HTTPStatus.OK if updated else HTTPStatus.NOT_FOUND,
-                        {"archived": payload["archived"]} if updated else {"archived": False},
-                    )
-                    return
-                if self.path == "/session/delete":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"run_id"} or not isinstance(payload.get("run_id"), str) or not payload["run_id"] or payload["run_id"] in (".", "..") or Path(payload["run_id"]).name != payload["run_id"]:
-                            raise ProtocolError("session/delete requires a run_id string")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if not host._session_belongs_here(payload["run_id"]):
-                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
-                        return
-                    try:
-                        deleted = host.run.delete_session(payload["run_id"])
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND, {"deleted": deleted})
-                    return
-                if self.path == "/session/fork":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) - {"run_id", "record_id", "force"} or any(
-                            type(payload[key]) is not str or not payload[key]
-                            for key in ("run_id", "record_id")
-                        ) or ("force" in payload and type(payload["force"]) is not bool):
-                            raise ProtocolError("session/fork requires run_id and record_id strings")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if not host._session_belongs_here(payload["run_id"]):
-                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
-                        return
-                    try:
-                        reply = host.run.fork_session(
-                            payload["run_id"], payload["record_id"],
-                            force=payload.get("force", False),
-                        )
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except ChangedOutsideError as exc:
-                        self._json(
-                            HTTPStatus.CONFLICT,
-                            {"error": str(exc), "paths": exc.paths},
-                        )
-                        return
-                    except SessionError as exc:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
-                        return
-                    except TranscriptError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except ProviderSelectionError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
-                if self.path == "/provider":
-                    try:
-                        choice = self._read_object()
-                        if not isinstance(choice.get("name"), str) or set(choice) - {"name", "model", "base_url", "effort"}:
-                            raise ProviderSelectionError("unknown provider option")
-                        effort = choice.get("effort")
-                        if effort is not None and (not isinstance(effort, str) or not effort.strip()):
-                            raise ProviderSelectionError("effort must be a non-empty string")
-                        provider = _provider(choice.get("name"), choice.get("model"), choice.get("base_url"))
-                        if provider is None:
-                            raise ProviderSelectionError("choose a provider")
-                    except (ProtocolError, ProviderSelectionError) as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    if host.run is not None:
-                        try:
-                            host.run.select_provider(
-                                provider,
-                                choice.get("model"),
-                                effort,
-                                choice,
-                            )
-                        except RunActiveError as exc:
-                            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                            return
-                    try:
-                        _save_provider_selection(choice)
-                    except OSError:
-                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "provider selection could not be saved"})
-                        return
-                    host._default_provider = provider
-                    host._provider_selection = dict(choice)
-                    self._json(HTTPStatus.OK, {"selected": True})
-                    return
-                if self.path == "/mode":
-                    try:
-                        payload = self._read_object()
-                        if set(payload) != {"mode"}:
-                            permitted = ", ".join(host.run.permitted_modes()) or "none"
-                            raise ModeSelectionError(f"permitted modes: {permitted}")
-                        mode = host.run.select_mode(payload["mode"])
-                    except (ProtocolError, ModeSelectionError) as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, {"mode": mode})
-                    return
-                if self.path == "/compact":
-                    try:
-                        payload = self._read_object()
-                        if (
-                            set(payload) - {"instructions"}
-                            or (
-                                "instructions" in payload
-                                and not isinstance(payload["instructions"], str)
-                            )
-                        ):
-                            raise ProtocolError(
-                                "compact accepts only an optional string instructions"
-                            )
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        result = host.run.compact(payload.get("instructions"))
-                    except RunActiveError as exc:
-                        self._json(
-                            HTTPStatus.CONFLICT,
-                            {"error": str(exc), "run_id": exc.run_id},
-                        )
-                        return
-                    except NoConversationError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(
-                        HTTPStatus.OK,
-                        {
-                            "changed": result.changed,
-                            "before_tokens": result.before_tokens,
-                            "after_tokens": result.after_tokens,
-                            "dropped_messages": result.dropped_messages,
-                        },
-                    )
-                    return
-                kind = self.path.removeprefix("/")
+                self._route = route
                 try:
-                    payload = self._read_object()
-                    remember_project = kind == "approval" and payload.get("remember") == "project"
+                    try:
+                        payload = self._read_object() if route.payload is not None else None
+                    except ProtocolError as exc:
+                        raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {"error": f"{route.path}: {exc}"})) from None
+                    if route.payload is not None:
+                        try:
+                            route.payload.validate(payload, route.path)
+                        except ProtocolError as exc:
+                            raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {"error": str(exc)})) from None
+                    reply = route.handler(self, payload)
+                    if isinstance(reply, _StreamReply):
+                        reply.send()
+                        reply = None
+                except _ReplyReady as ready:
+                    reply = ready.reply
+                if reply is not None:
+                    if reply.body is None:
+                        self._empty(reply.status)
+                    else:
+                        self._json(reply.status, reply.body)
+
+            def do_GET(self):
+                self._dispatch("GET")
+
+            def do_POST(self):
+                self._dispatch("POST")
+
+            def _get_health(self, payload):
+                return _Reply(HTTPStatus.OK, {'protocol_version': PROTOCOL_VERSION, 'state': 'active' if host.run is not None and host.run.active else 'idle', 'run_id': None if host.run is None else host.run.active_run_id, 'runtime_run_id': None if host.run is None else host.run.runtime_run_id})
+
+            def _get_conversation(self, payload):
+                return _Reply(HTTPStatus.OK, {'conversation': host.run.conversation_stats()})
+
+            def _get_git_status(self, payload):
+                return _Reply(HTTPStatus.OK, git_status(host.run.policy.repo_root))
+
+            def _get_git_diff(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True)
+                path = values.get('path', [''])[0]
+                with self._errors(0):
+                    result = git_diff(host.run.policy.repo_root, path)
+                if result is None:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                return _Reply(HTTPStatus.OK, result)
+
+            def _get_jobs(self, payload):
+                return _Reply(HTTPStatus.OK, {'jobs': host.run.list_jobs()})
+
+            def _get_git_pull_request(self, payload):
+                with self._errors(0):
+                    info = git_pull_request_info(host.run.policy.repo_root)
+                return _Reply(HTTPStatus.OK, info)
+
+            def _get_changes(self, payload):
+                with self._errors(0):
+                    reply = host.run.changes()
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _get_memory(self, payload):
+                memory = host.run.memory_store()
+                if memory is None:
+                    return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': 'memory is unavailable'})
+                reply = {}
+                for scope in ('project', 'global'):
+                    entries, unreadable = memory.read_status(scope)
+                    reply[scope] = {'entries': [], 'error': 'unreadable'} if unreadable else {'entries': [_memory_entry_reply(entry) for entry in entries]}
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _get_roadmap(self, payload):
+                with self._errors(0):
+                    roadmap = RoadmapStore(host.run._repo_root).load()
+                    reply = RoadmapStore(host.run._repo_root).reply(roadmap)
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _get_models(self, payload):
+                request_url = urlsplit(self.path)
+                query = parse_qs(request_url.query, keep_blank_values=True)
+                names = query.get('provider', [])
+                base_urls = query.get('base_url', [])
+                known = {name for name, _, _ in PROVIDERS}
+                if set(query) - {'provider', 'base_url'} or len(names) != 1 or names[0] not in known or (len(base_urls) > 1) or (base_urls and (not base_urls[0].strip())):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'invalid model listing request'})
+                name = names[0]
+                base_url = base_urls[0] if base_urls else None
+                cache_key = (name, base_url)
+                with host._model_cache_lock:
+                    cached = host._model_cache.get(cache_key)
+                if cached is not None:
+                    listed, model_filter = _model_listing(host, name, cached)
+                    return _Reply(HTTPStatus.OK, {'provider': name, 'state': 'available', 'models': listed, 'detail': '', 'filter': model_filter})
+                with self._errors(0, name=name):
+                    provider = build_provider(name, None, base_url)
+                    if provider is None:
+                        raise ProviderSelectionError(f'{name} is unavailable')
+                    models = list_models(provider)
+                with host._model_cache_lock:
+                    host._model_cache[cache_key] = tuple(models)
+                listed, model_filter = _model_listing(host, name, models)
+                return _Reply(HTTPStatus.OK, {'provider': name, 'state': 'available', 'models': listed, 'detail': '', 'filter': model_filter})
+
+            def _get_app_redirect(self, payload):
+                request_url = urlsplit(self.path)
+                location = '/app/'
+                if request_url.query:
+                    location = f'{location}?{request_url.query}'
+                return _StreamReply(lambda: self._redirect_app(location))
+
+            def _redirect_app(self, location):
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def _get_app_index(self, payload):
+                return _StreamReply(self._serve_app_index)
+
+            def _get_app_asset(self, payload):
+                request_url = urlsplit(self.path)
+                request_path = request_url.path
+                return _StreamReply(lambda: self._serve_app_asset(request_path.removeprefix('/app/')))
+
+            def _get_tree(self, payload):
+                return _StreamReply(self._serve_tree)
+
+            def _get_source(self, payload):
+                return _StreamReply(self._serve_source)
+
+            def _get_files(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True)
+                query_values = values.get('query', [''])
+                limit_values = values.get('limit', [])
+                try:
+                    limit = 20 if not limit_values else int(limit_values[0])
+                except ValueError:
+                    limit = 0
+                if len(limit_values) > 1 or not 1 <= limit <= 50:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'limit must be from 1 to 50'})
+                files, truncated = repository_files(host.run.policy, query_values[0], limit)
+                return _Reply(HTTPStatus.OK, {'files': files, 'truncated': truncated})
+
+            def _get_agent(self, payload):
+                return _StreamReply(self._serve_definition)
+
+            def _get_session_agent(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True)
+                session_ids = values.get('session_id', [])
+                agent_ids = values.get('agent_id', [])
+                if len(session_ids) != 1 or len(agent_ids) != 1:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                with self._errors(0):
+                    reply = host.run.agent_history(session_ids[0], agent_ids[0])
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _get_survey(self, payload):
+                survey = survey_repository(policy=host.run.policy)
+                relative = lambda path: path.relative_to(survey.root).as_posix()
+                return _Reply(HTTPStatus.OK, {'survey': {'root': '.', 'languages': survey.languages, 'by_directory': survey.by_directory, 'entry_points': [relative(path) for path in survey.entry_points], 'docs': [relative(path) for path in survey.docs], 'tests': [relative(path) for path in survey.tests], 'tree_summary': survey.tree_summary, 'truncated_directories': survey.truncated_directories, 'stopped': survey.stopped, 'file_count': survey.file_count}})
+
+            def _get_project(self, payload):
+                if host._current_root is None:
+                    return _Reply(HTTPStatus.OK, {'repo_root': None, 'name': None})
+                repo_root = host._repo_root.resolve()
+                return _Reply(HTTPStatus.OK, {'repo_root': str(repo_root), 'name': repo_root.name})
+
+            def _get_projects(self, payload):
+                current_root = host._current_root
+                with host._runtimes_lock:
+                    runtimes = tuple(host._runtimes.items())
+                open_projects = [{'repo_root': str(root), 'name': root.name, 'activity': 'working' if any((state == 'working' for state in runtime.run.session_activity().values())) else 'waiting' if runtime.run.pending_approvals() else 'idle'} for root, runtime in runtimes]
+                recent = recent_projects(host._home)
+                return _Reply(HTTPStatus.OK, {'current': None if current_root is None else {'repo_root': str(current_root), 'name': current_root.name}, 'open': open_projects, 'recent': [{'repo_root': path, 'name': Path(path).name, 'exists': Path(path).is_dir()} for path in recent if isinstance(path, str)]})
+
+            def _get_directories(self, payload):
+                request_url = urlsplit(self.path)
+                paths = parse_qs(request_url.query, keep_blank_values=True).get('path', [])
+                if len(paths) > 1:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'path must be one absolute directory'})
+                target = Path(paths[0]).expanduser() if paths else Path.home()
+                if not target.is_absolute():
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'path must be absolute'})
+                target = target.resolve()
+                if not target.exists() or not target.is_dir():
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'directory not found'})
+                with self._errors(0):
+                    entries = sorted(({'name': child.name, 'path': str(child)} for child in target.iterdir() if not child.name.startswith('.') and child.is_dir()), key=lambda entry: entry['name'].casefold())
+                return _Reply(HTTPStatus.OK, {'path': str(target), 'parent': None if target == Path('/') else str(target.parent), 'entries': entries})
+
+            def _get_settings(self, payload):
+                if host.run is None:
+                    selection = host._provider_selection or None
+                    return _Reply(HTTPStatus.OK, {'settings': {'mode': 'ask', 'selection': None if selection is None else {'provider': selection.get('name'), 'model': selection.get('model'), 'effort': selection.get('effort')}, 'config': [], 'ceiling': {}, 'trust': [], 'hooks': [], 'mcp_servers': [], 'agents': [], 'skills': [], 'plugins': [], 'withheld': [], 'providers': [{'name': name, 'env_var': variable, 'key_present': bool(os.environ.get(variable, '').strip())} for name, variable, _ in PROVIDERS], 'search': []}})
+                extensions = host.run.extensions
+                root = host.run.policy.repo_root.resolve()
+
+                def display_directory(directory: Path) -> str:
+                    resolved = directory.resolve()
+                    return resolved.relative_to(root).as_posix() if resolved.is_relative_to(root) else str(resolved)
+
+                def roster(kind: str) -> list[dict[str, str]]:
+                    if extensions is None:
+                        return []
+                    members = getattr(extensions, kind)
+                    paths = getattr(members, 'paths', {})
+                    return [{'name': name, 'path': display_directory(source) if source is not None else ''} for name in sorted(members) for source in (paths.get(name, getattr(members[name], 'path', None)),)]
+                ceiling = None if extensions is None else extensions.ceiling
+                search_key = None if extensions is None else extensions.config.get('search.endpoint')
+                configured_search = None if search_key is None else search_endpoint(search_key)
+                settings = {'mode': host.run.starting_mode, 'selection': host.run.selection(), 'config': [] if extensions is None else [{'key': key, 'value': value, 'scope': extensions.config.provenance[key].scope.value} for key, value in sorted(extensions.config.values.items())], 'ceiling': {'allowed_write_scope': None if ceiling is None or ceiling.allowed_write_scope is None else [str(path) for path in ceiling.allowed_write_scope], 'shell_enabled': None if ceiling is None else ceiling.shell_enabled, 'shell_allowlist': None if ceiling is None or ceiling.shell_allowlist is None else [list(command) for command in ceiling.shell_allowlist], 'fetch_enabled': None if ceiling is None else ceiling.fetch_enabled, 'fetch_allowlist': None if ceiling is None or ceiling.fetch_allowlist is None else list(ceiling.fetch_allowlist), 'modes': None if ceiling is None or ceiling.modes is None else list(ceiling.modes)}, 'trust': [] if extensions is None else [{'root': str(entry.root), 'allow': sorted(entry.allow)} for entry in sorted(extensions.trust.entries, key=lambda entry: str(entry.root))], 'hooks': [] if extensions is None else [{'event': event, 'command': shlex.join(hook.command)} for hook in extensions.hooks for event in hook.events], 'mcp_servers': [] if extensions is None else [{'name': spec.name, 'command': shlex.join(spec.command), 'started': spec.enabled and host.run._mcp_tools is not None} for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)], 'agents': roster('agents'), 'skills': roster('skills'), 'plugins': roster('plugins'), 'withheld': [] if extensions is None else [{'scope': offered.scope.value, 'directory': display_directory(offered.directory), 'names': sorted(offered.names), 'reason': f'repository not trusted for {offered.directory.name}'} for offered in sorted(extensions.withheld, key=lambda offered: (offered.scope.value, str(offered.directory)))], 'providers': [{'name': name, 'env_var': variable, 'key_present': bool(os.environ.get(variable, '').strip())} for name, variable, _ in PROVIDERS], 'search': [] if configured_search is None else [{'name': configured_search.key, 'env_var': configured_search.api_key_env_var, 'key_present': bool(os.environ.get(configured_search.api_key_env_var, '').strip())}]}
+                config_warnings = [] if extensions is None else list(extensions.config.warnings)
+                if config_warnings:
+                    settings['config_warnings'] = config_warnings
+                return _Reply(HTTPStatus.OK, {'settings': settings})
+
+            def _get_approvals(self, payload):
+                return _Reply(HTTPStatus.OK, {'pending': host.pending_approvals()})
+
+            def _get_permissions(self, payload):
+                with self._errors(0):
+                    shell, fetch = ((), ()) if host.run is None else host.run.project_permission_grants()
+                return _Reply(HTTPStatus.OK, {'shell': [list(prefix) for prefix in shell], 'fetch': list(fetch)})
+
+            def _get_sessions(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True).get('limit', [])
+                queries = parse_qs(request_url.query, keep_blank_values=True).get('query', [])
+                query = queries[0] if len(queries) == 1 else None
+                archived_values = parse_qs(request_url.query, keep_blank_values=True).get('archived', [])
+                archived = archived_values == ['1']
+                try:
+                    limit = int(values[0]) if len(values) == 1 else None
+                except ValueError:
+                    limit = None
+                if limit is not None and limit <= 0:
+                    limit = None
+                return _Reply(HTTPStatus.OK, list_sessions(host.run.sessions_root, limit=limit, activity=host.session_activity(), query=query, archived=archived))
+
+            def _get_session_export(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True).get('id', [])
+                if len(values) != 1 or not values[0]:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                with self._errors(0):
+                    exported = host.run.export_session(values[0])
+                return _Reply(HTTPStatus.OK, exported)
+
+            def _get_loops(self, payload):
+                loops = LoopStore(host._repo_root).list()
+                return _Reply(HTTPStatus.OK, {'loops': [{key: loop[key] for key in ('id', 'goal', 'state', 'updated_at')} for loop in loops]})
+
+            def _get_loop(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True).get('id', [])
+                if len(values) != 1:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                with self._errors(0):
+                    loop = LoopStore(host._repo_root).load(values[0])
+                loop['usage'] = host.run.loop_usage(loop)
+                return _Reply(HTTPStatus.OK, {'loop': loop})
+
+            def _get_loop_card(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True)
+                loop_ids, card_ids = (values.get('loop', []), values.get('card', []))
+                if len(loop_ids) != 1 or len(card_ids) != 1:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                with self._errors(0):
+                    detail = host.run.loop_card_details(loop_ids[0], card_ids[0])
+                return _Reply(HTTPStatus.OK, detail)
+
+            def _get_history(self, payload):
+                request_url = urlsplit(self.path)
+                values = parse_qs(request_url.query, keep_blank_values=True).get('limit', [])
+                try:
+                    limit = 100 if not values else int(values[0])
+                except ValueError:
+                    limit = 0
+                if len(values) > 1 or not 1 <= limit <= 500:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'limit must be from 1 to 500'})
+                return _Reply(HTTPStatus.OK, {'prompts': prompt_history(host.run.sessions_root, host.run.policy.repo_root, limit=limit)})
+
+            def _get_events(self, payload):
+                return _StreamReply(self._serve_events)
+
+            def _serve_events(self):
+                subscription = host.broker.subscribe()
+                try:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('Connection', 'keep-alive')
+                    self.end_headers()
+                    self._stream_events(subscription)
+                except OSError:
+                    return
+                finally:
+                    subscription.close()
+
+            def _post_project_open(self, payload):
+                with self._errors(0):
+                    path = payload.get('path')
+                    root = Path(path)
+                    if not root.is_absolute() or not root.is_dir() or root.resolve() == Path('/'):
+                        return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'path must be an existing project directory other than /'})
+                if host._project_factory is None:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'this host cannot open other projects'})
+                with self._errors(1):
+                    runtime, _created = host.open_project(root)
+                reply = {'repo_root': str(runtime.root), 'name': runtime.root.name}
+                extensions = runtime.run.extensions
+                config_warnings = [] if extensions is None else list(extensions.config.warnings)
+                if config_warnings:
+                    reply['config_warnings'] = config_warnings
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_permissions_remove(self, payload):
+                with self._errors(0):
+                    kind, value = (payload.get('kind'), payload.get('value'))
+                    if kind not in {'shell', 'fetch'}:
+                        raise ProtocolError('permissions/remove requires kind and value')
+                    if kind == 'shell' and (not isinstance(value, list) or not value or (not all((isinstance(arg, str) for arg in value)))) or (kind == 'fetch' and (not isinstance(value, str) or not value)):
+                        raise ProtocolError('permissions/remove value must be a shell prefix or fetch host')
+                with self._errors(1):
+                    removed = host.run.remove_project_permission_grant(kind, value)
+                return _Reply(HTTPStatus.OK, {'removed': removed})
+
+            def _post_git_commit(self, payload):
+                with self._errors(0):
+                    message = payload.get('message')
+                    paths = payload.get('paths')
+                    if not message.strip():
+                        raise ProtocolError('message must be a non-blank string')
+                    if not paths or any((not isinstance(path, str) for path in paths)):
+                        raise ProtocolError('paths must be a non-empty list of repository-relative paths')
+                    if any((state == 'working' for state in host.run.session_activity().values())):
+                        return _Reply(HTTPStatus.CONFLICT, {'error': 'wait for the turn to finish'})
+                    result = git_commit(host.run.policy.repo_root, message, paths)
+                return _Reply(HTTPStatus.OK, result)
+
+            def _post_jobs_start(self, payload):
+                with self._errors(0):
+                    command = payload.get('command')
+                    if not command.strip():
+                        raise ProtocolError('jobs/start requires a non-blank command')
+                    job_id = host.run.start_job(command)
+                return _Reply(HTTPStatus.OK, {'id': job_id})
+
+            def _post_jobs_stop(self, payload):
+                with self._errors(0):
+                    job_id = payload.get('id')
+                    if not job_id:
+                        raise ProtocolError('jobs/stop requires an id')
+                result = host.run.stop_job(job_id)
+                if result is None:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown job id'})
+                return _Reply(HTTPStatus.OK, {'status': result['status'], 'exit_code': result['exit_code']})
+
+            def _post_git_pull_request(self, payload):
+                with self._errors(0):
+                    title = payload.get('title')
+                    body = payload.get('body')
+                    if not title.strip():
+                        raise ProtocolError('title must be non-blank and body must be a string')
+                    if any((state == 'working' for state in host.run.session_activity().values())):
+                        return _Reply(HTTPStatus.CONFLICT, {'error': 'wait for the turn to finish'})
+                    result = create_pull_request(host.run.policy.repo_root, title, body)
+                return _Reply(HTTPStatus.OK, result)
+
+            def _post_memory_update(self, payload):
+                with self._errors(0):
+                    if not payload['text'].strip() or len(payload['text']) > 500:
+                        raise ProtocolError('text must be non-blank and at most 500 characters')
+                memory = host.run.memory_store()
+                if memory is None:
+                    return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': 'memory is unavailable'})
+                with self._errors(1):
+                    entry = memory.update(payload['id'], payload['text'])
+                if entry is None:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown memory id'})
+                return _Reply(HTTPStatus.OK, {'entry': _memory_entry_reply(entry)})
+
+            def _post_memory_delete(self, payload):
+                memory = host.run.memory_store()
+                if memory is None:
+                    return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': 'memory is unavailable'})
+                with self._errors(1):
+                    deleted = memory.delete(payload['id'])
+                if not deleted:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown memory id'})
+                return _Reply(HTTPStatus.OK, {'deleted': payload['id']})
+
+            def _post_loop_start(self, payload):
+                with self._errors(0):
+                    loop = host.run.start_loop(payload['goal'])
+                return _Reply(HTTPStatus.OK, {'loop': loop, 'session_id': loop['planner_session_id']})
+
+            def _post_roadmap_add(self, payload):
+                with self._errors(0):
+                    with host.run._lock:
+                        roadmap_store = RoadmapStore(host.run._repo_root)
+                        roadmap = roadmap_store.load()
+                        if self._route.action == 'add':
+                            goal_text = payload['goal'].strip()
+                            if not goal_text:
+                                raise ProtocolError('goal must not be blank')
+                            roadmap_store.add(roadmap, goal_text)
+                        else:
+                            item = roadmap_store.find(roadmap, payload['id'])
+                            if item is None:
+                                return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                            if self._route.action == 'remove':
+                                roadmap['goals'].remove(item)
+                            else:
+                                index = payload.get('index')
+                                if not 0 <= index < len(roadmap['goals']):
+                                    raise ProtocolError('index must be between 0 and the last goal index')
+                                roadmap['goals'].remove(item)
+                                roadmap['goals'].insert(index, item)
+                        roadmap_store.save(roadmap)
+                        reply = roadmap_store.reply(roadmap)
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_roadmap_start(self, payload):
+                with self._errors(0):
+                    roadmap_reply, loop = host.run.start_roadmap_goal(payload['id'])
+                return _Reply(HTTPStatus.OK, {**roadmap_reply, 'loop': loop, 'session_id': loop['planner_session_id']})
+
+            def _post_loop_plan(self, payload):
+                with self._errors(0):
+                    loop_id, action = (payload.get('loop_id'), payload.get('action'))
+                    if action == 'approve' and set(payload) == {'loop_id', 'action'}:
+                        loop = host.run.approve_loop_plan(loop_id)
+                        reply = {'loop': loop}
+                    elif action == 'drop' and set(payload) == {'loop_id', 'action', 'cards'}:
+                        cards = payload['cards']
+                        if not all((isinstance(card, str) for card in cards)):
+                            raise ProtocolError('loop/plan drop requires cards as string ids')
+                        loop = host.run.drop_loop_cards(loop_id, cards)
+                        reply = {'loop': loop}
+                    elif action == 'revise' and set(payload) == {'loop_id', 'action', 'note'}:
+                        loop = host.run.revise_loop_plan(loop_id, payload['note'])
+                        reply = {'loop': loop, 'session_id': loop['planner_session_id']}
+                    else:
+                        raise ProtocolError('loop/plan has an invalid action or body')
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_loop_cancel(self, payload):
+                with self._errors(0):
+                    loop = host.run.cancel_loop(payload['loop_id'])
+                return _Reply(HTTPStatus.OK, {'loop': loop})
+
+            def _post_loop_commit(self, payload):
+                with self._errors(0):
+                    loop = host.run.commit_loop(payload['loop_id'], payload['action'])
+                return _Reply(HTTPStatus.OK, {'loop': loop, 'branch': loop.get('branch'), 'commits': loop.get('summary', {}).get('commits', [])})
+
+            def _post_loop_resume(self, payload):
+                with self._errors(0):
+                    loop = host.run.resume_loop(payload['loop_id'])
+                return _Reply(HTTPStatus.OK, {'loop': loop})
+
+            def _post_goal(self, payload):
+                with self._errors(0):
+                    objective = payload.get('objective')
+                    check = payload.get('check', [])
+                    max_rounds = payload.get('max_rounds', 10)
+                    if not objective.strip() or not all((isinstance(arg, str) and arg for arg in check)) or (not 1 <= max_rounds <= 100):
+                        raise ProtocolError('goal requires a non-blank objective, optional check argv, and max_rounds from 1 to 100')
+                with self._errors(1):
+                    run_id = host.run.start_goal(objective, tuple(check), max_rounds)
+                return _Reply(HTTPStatus.OK, {'accepted': True, 'run_id': run_id, 'goal': host.run.goal_snapshot()})
+
+            def _post_goal_state(self, payload):
+                with self._errors(0):
+                    if payload.get('action') not in ('pause', 'resume', 'clear'):
+                        raise ProtocolError('goal/state requires pause, resume, or clear')
+                with self._errors(1):
+                    goal = host.run.goal_state(payload['action'])
+                return _Reply(HTTPStatus.OK, {'goal': goal})
+
+            def _post_agent(self, payload):
+                stem, scope, target = self._definition_target(payload['name'], payload['scope'])
+                if target is None:
+                    return
+                if not self._definition_trusted(scope):
+                    return _Reply(HTTPStatus.FORBIDDEN, {'error': 'repository not trusted for agents'})
+                with self._errors(1):
+                    self._validate_definition(target, payload['text'])
+                with self._errors(2):
+                    self._write_definition(target, payload['text'])
+                return _Reply(HTTPStatus.OK, {'written': True, 'name': stem, 'scope': scope, 'path': str(target), 'message': 'definition saved; it will take effect on the next run'})
+
+            def _post_steer(self, payload):
+                with self._errors(0):
+                    if not payload['text'].strip():
+                        raise ProtocolError('steer requires one non-blank text string')
+                with self._errors(1):
+                    host.run.steer(payload['text'])
+                return _Reply(HTTPStatus.OK, {'steered': True})
+
+            def _post_command(self, payload):
+                with self._errors(0):
+                    if not payload['command'].strip():
+                        raise ProtocolError('command requires one non-blank command string')
+                with self._errors(1):
+                    reply = host.run.run_user_command(payload['command'])
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_changes_revert(self, payload):
+                with self._errors(0):
+                    has_path = 'path' in payload and bool(payload['path'].strip())
+                    has_key = 'key' in payload and bool(payload['key'].strip())
+                    if has_path == has_key or ('path' in payload and (not has_path)) or ('key' in payload and (not has_key)):
+                        raise ProtocolError('changes/revert requires one non-empty path or key')
+                with self._errors(1):
+                    reply = host.run.revert_changes(path=payload.get('path'), key=payload.get('key'), force=payload.get('force', False))
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_worktree_apply(self, payload):
+                with self._errors(0):
+                    name = payload.get('name')
+                    if not name.strip() or Path(name).name != name or name in ('.', '..'):
+                        raise ProtocolError('worktree action requires one valid name')
+                with self._errors(1):
+                    if self._route.action == 'apply':
+                        reply = host.run.apply_worktree(name)
+                    else:
+                        reply = host.run.discard_worktree(name)
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_credentials(self, payload):
+                name = payload.get('name')
+                value = payload.get('value')
+                if name not in (ANTHROPIC_KEY_ENV_VAR, GEMINI_KEY_ENV_VAR, OPENAI_KEY_ENV_VAR, *(variable for _, variable, _ in PROVIDERS[3:]), *(endpoint.api_key_env_var for endpoint in search_endpoints())):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'unknown credential name'})
+                with self._errors(0, name=name):
+                    store(name, value)
+                if value:
+                    apply_to_environment(os.environ, {name: value})
+                else:
+                    os.environ.pop(name, None)
+                return _Reply(HTTPStatus.OK, {'stored': True, 'name': name})
+
+            def _post_session_new(self, payload):
+                with self._errors(1):
+                    host.run.end_conversation()
+                return _Reply(HTTPStatus.OK, {'ended': True})
+
+            def _post_session_rename(self, payload):
+                with self._errors(0):
+                    run_id = payload['run_id']
+                    title = payload['title'].strip()
+                    if not run_id or run_id in ('.', '..') or Path(run_id).name != run_id or (not title) or (len(title) > 200):
+                        raise ProtocolError('title must be non-blank and at most 200 characters')
+                from symphonai_api.session import SessionStore
+                if not (host.run.sessions_root / run_id).is_dir():
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown session'})
+                if not host._session_belongs_here(run_id):
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
+                with host.run._lock:
+                    opened = host.run._open_conversations.get(run_id)
+                    session_store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, run_id)
+                    try:
+
+                        def change(meta):
+                            meta['title'] = title
+                        session_store.update_meta(change)
+                    finally:
+                        if opened is None:
+                            session_store.close()
+                return _Reply(HTTPStatus.OK, {'renamed': True})
+
+            def _post_session_archive(self, payload):
+                with self._errors(0):
+                    if not payload['run_id'] or payload['run_id'] in ('.', '..') or Path(payload['run_id']).name != payload['run_id']:
+                        raise ProtocolError('session/archive requires run_id and archived')
+                if not (host.run.sessions_root / payload['run_id']).is_dir():
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown session'})
+                if not host._session_belongs_here(payload['run_id']):
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
+                with self._errors(1):
+                    updated = host.run.archive_session(payload['run_id'], payload['archived'])
+                return _Reply(HTTPStatus.OK if updated else HTTPStatus.NOT_FOUND, {'archived': payload['archived']} if updated else {'archived': False})
+
+            def _post_session_delete(self, payload):
+                with self._errors(0):
+                    if not payload['run_id'] or payload['run_id'] in ('.', '..') or Path(payload['run_id']).name != payload['run_id']:
+                        raise ProtocolError('session/delete requires a run_id string')
+                if not host._session_belongs_here(payload['run_id']):
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
+                with self._errors(1):
+                    deleted = host.run.delete_session(payload['run_id'])
+                return _Reply(HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND, {'deleted': deleted})
+
+            def _post_session_fork(self, payload):
+                with self._errors(0):
+                    if any((not payload[key] for key in ('run_id', 'record_id'))):
+                        raise ProtocolError('session/fork requires run_id and record_id strings')
+                if not host._session_belongs_here(payload['run_id']):
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
+                with self._errors(1):
+                    reply = host.run.fork_session(payload['run_id'], payload['record_id'], force=payload.get('force', False))
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_provider(self, payload):
+                with self._errors(0):
+                    choice = payload
+                    effort = choice.get('effort')
+                    if effort is not None and not effort.strip():
+                        raise ProviderSelectionError('effort must be a non-empty string')
+                    provider = build_provider(choice.get('name'), choice.get('model'), choice.get('base_url'))
+                    if provider is None:
+                        raise ProviderSelectionError('choose a provider')
+                if host.run is not None:
+                    with self._errors(1):
+                        host.run.select_provider(provider, choice.get('model'), effort, choice)
+                with self._errors(2):
+                    save_provider_selection(choice)
+                host._default_provider = provider
+                host._provider_selection = dict(choice)
+                return _Reply(HTTPStatus.OK, {'selected': True})
+
+            def _post_mode(self, payload):
+                with self._errors(0):
+                    mode = host.run.select_mode(payload['mode'])
+                return _Reply(HTTPStatus.OK, {'mode': mode})
+
+            def _post_compact(self, payload):
+                with self._errors(1):
+                    result = host.run.compact(payload.get('instructions'))
+                return _Reply(HTTPStatus.OK, {'changed': result.changed, 'before_tokens': result.before_tokens, 'after_tokens': result.after_tokens, 'dropped_messages': result.dropped_messages})
+
+            def _post_prompt(self, payload):
+                kind = 'prompt'
+                with self._errors(0):
+                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
                     if remember_project:
-                        payload = {**payload, "remember": False}
+                        payload = {**payload, 'remember': False}
                     request = decode_request(kind, payload)
                     if remember_project:
-                        request = ApprovalReply(
-                            request.approval_id, request.allowed, request.reason,
-                            "project", request.answer,
-                        )
-                except ProtocolError as exc:
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                    return
-                if kind == "prompt":
-                    try:
-                        run_id = host.run.start(request.prompt, attachments=request.attachments)
-                    except ProviderSelectionError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except CommandActiveError:
-                        self._json(HTTPStatus.CONFLICT, {"error": "wait for the command to finish"})
-                        return
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    self._json(HTTPStatus.OK, {"accepted": True, "run_id": run_id})
-                    return
-                if kind == "approval":
-                    try:
-                        resolved = host.resolve_approval(
-                            request.approval_id,
-                            allowed=request.allowed,
-                            reason=request.reason,
-                            remember=request.remember,
-                            answer=request.answer,
-                        )
-                    except InvalidApprovalAnswer as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except PermissionGrantError as exc:
-                        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
-                        return
-                    if not resolved:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "unknown approval id"})
-                        return
-                    self._json(HTTPStatus.OK, {"resolved": True})
-                    return
-                if kind == "session/open":
-                    if not host._session_belongs_here(request.run_id):
-                        self._json(HTTPStatus.CONFLICT, {"error": "that conversation belongs to another project"})
-                        return
-                    try:
-                        reply = host.run.open_session(request.run_id)
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc), "run_id": exc.run_id})
-                        return
-                    except SessionError:
-                        self._json(HTTPStatus.NOT_FOUND, {"error": "session not found"})
-                        return
-                    except TranscriptError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    except ProviderSelectionError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
+                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
+                with self._errors(1):
+                    run_id = host.run.start(request.prompt, attachments=request.attachments)
+                return _Reply(HTTPStatus.OK, {'accepted': True, 'run_id': run_id})
+
+            def _post_approval(self, payload):
+                kind = 'approval'
+                with self._errors(0):
+                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
+                    if remember_project:
+                        payload = {**payload, 'remember': False}
+                    request = decode_request(kind, payload)
+                    if remember_project:
+                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
+                with self._errors(1):
+                    resolved = host.resolve_approval(request.approval_id, allowed=request.allowed, reason=request.reason, remember=request.remember, answer=request.answer)
+                if not resolved:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown approval id'})
+                return _Reply(HTTPStatus.OK, {'resolved': True})
+
+            def _post_session_open(self, payload):
+                kind = 'session/open'
+                with self._errors(0):
+                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
+                    if remember_project:
+                        payload = {**payload, 'remember': False}
+                    request = decode_request(kind, payload)
+                    if remember_project:
+                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
+                if not host._session_belongs_here(request.run_id):
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
+                with self._errors(1):
+                    reply = host.run.open_session(request.run_id)
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_stop(self, payload):
+                kind = 'stop'
+                with self._errors(0):
+                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
+                    if remember_project:
+                        payload = {**payload, 'remember': False}
+                    request = decode_request(kind, payload)
+                    if remember_project:
+                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
                 host.run.stop()
-                self._json(HTTPStatus.OK, {"accepted": True})
+                return _Reply(HTTPStatus.OK, {'accepted': True})
+
+
+        routes = (
+            _Route('GET', '/health', Handler._get_health,
+                match='exact',
+                project_free=True,
+            ),
+            _Route('GET', '/conversation', Handler._get_conversation,
+                match='exact',
+            ),
+            _Route('GET', '/git/status', Handler._get_git_status,
+            ),
+            _Route('GET', '/git/diff', Handler._get_git_diff,
+                errors=(((ValueError, 'bad_request'),),),
+            ),
+            _Route('GET', '/jobs', Handler._get_jobs,
+            ),
+            _Route('GET', '/git/pull-request', Handler._get_git_pull_request,
+                errors=(((RuntimeError, 'conflict_tail'),),),
+            ),
+            _Route('GET', '/changes', Handler._get_changes,
+                errors=(((RunActiveError, 'conflict'),),),
+            ),
+            _Route('GET', '/memory', Handler._get_memory,
+            ),
+            _Route('GET', '/roadmap', Handler._get_roadmap,
+                errors=(((InvalidRoadmap, 'invalid_roadmap'),),),
+            ),
+            _Route('GET', '/models', Handler._get_models,
+                project_free=True,
+                errors=((((ProviderSelectionError, ProviderError), 'model_unavailable'),),),
+            ),
+            _Route('GET', '/app', Handler._get_app_redirect,
+                auth=False,
+                project_free=True,
+            ),
+            _Route('GET', '/app/', Handler._get_app_index,
+                app_query=True,
+                app_cookie=True,
+                project_free=True,
+                helper_errors={
+                    'app_path': (((OSError, RuntimeError), 'empty_forbidden'),),
+                    'app_index': (((OSError, UnicodeDecodeError), 'not_found'),),
+                },
+            ),
+            _Route('GET', '/app/*', Handler._get_app_asset,
+                match='prefix',
+                app_cookie=True,
+                project_free=True,
+                helper_errors={
+                    'app_path': (((OSError, RuntimeError), 'empty_forbidden'),),
+                    'app_asset': ((OSError, 'not_found'),),
+                },
+            ),
+            _Route('GET', '/tree', Handler._get_tree,
+                helper_errors={
+                    'requested_path': (((OSError, RuntimeError), 'empty_forbidden'),),
+                },
+            ),
+            _Route('GET', '/source', Handler._get_source,
+                helper_errors={
+                    'requested_path': (((OSError, RuntimeError), 'empty_forbidden'),),
+                    'source_read': (((OSError, ValueError), 'empty_not_found'),),
+                    'source_decode': ((UnicodeDecodeError, 'empty_unsupported'),),
+                },
+            ),
+            _Route('GET', '/files', Handler._get_files,
+            ),
+            _Route('GET', '/agent', Handler._get_agent,
+                helper_errors={
+                    'definition_target': (((OSError, RuntimeError), 'empty_forbidden'),),
+                    'definition_read': ((OSError, 'not_found'),),
+                    'definition_decode': ((UnicodeDecodeError, 'empty_unsupported'),),
+                },
+            ),
+            _Route('GET', '/session/agent', Handler._get_session_agent,
+                errors=(((TranscriptError, 'not_found'),),),
+            ),
+            _Route('GET', '/survey', Handler._get_survey,
+            ),
+            _Route('GET', '/project', Handler._get_project,
+                project_free=True,
+            ),
+            _Route('GET', '/projects', Handler._get_projects,
+                project_free=True,
+            ),
+            _Route('GET', '/directories', Handler._get_directories,
+                project_free=True,
+                errors=(((PermissionError, 'unreadable_directory'),),),
+            ),
+            _Route('GET', '/settings', Handler._get_settings,
+                project_free=True,
+            ),
+            _Route('GET', '/approvals', Handler._get_approvals,
+                match='exact',
+            ),
+            _Route('GET', '/permissions', Handler._get_permissions,
+                match='exact',
+                project_free=True,
+                errors=(((PermissionGrantError, 'unavailable'),),),
+            ),
+            _Route('GET', '/sessions', Handler._get_sessions,
+            ),
+            _Route('GET', '/session/export', Handler._get_session_export,
+                errors=((((KeyError, FileNotFoundError), 'not_found'), ((OSError, TranscriptError, ValueError, TypeError), 'unexportable_session')),),
+            ),
+            _Route('GET', '/loops', Handler._get_loops,
+            ),
+            _Route('GET', '/loop', Handler._get_loop,
+                errors=((((KeyError, ValueError), 'not_found'),),),
+            ),
+            _Route('GET', '/loop/card', Handler._get_loop_card,
+                errors=((((KeyError, ValueError), 'not_found'),),),
+            ),
+            _Route('GET', '/history', Handler._get_history,
+            ),
+            _Route('GET', '/events', Handler._get_events,
+                match='exact',
+                project_free=True,
+            ),
+            _Route('POST', '/project/open', Handler._post_project_open,
+                match='exact',
+                project_free=True,
+                payload=_Payload({'path': str}, ('path',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((Exception, 'bad_request'),)),
+            ),
+            _Route('POST', '/permissions/remove', Handler._post_permissions_remove,
+                match='exact',
+                payload=_Payload({'kind': str, 'value': (str, list)}, ('kind', 'value'), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((PermissionGrantError, 'unavailable'),)),
+            ),
+            _Route('POST', '/git/commit', Handler._post_git_commit,
+                match='exact',
+                payload=_Payload({'message': str, 'paths': list}, ('message', 'paths'), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (ValueError, 'bad_request'), (RuntimeError, 'conflict_tail')),),
+            ),
+            _Route('POST', '/jobs/start', Handler._post_jobs_start,
+                match='exact',
+                payload=_Payload({'command': str}, ('command',), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (RuntimeError, 'conflict')),),
+            ),
+            _Route('POST', '/jobs/stop', Handler._post_jobs_stop,
+                match='exact',
+                payload=_Payload({'id': str}, ('id',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),),),
+            ),
+            _Route('POST', '/git/pull-request', Handler._post_git_pull_request,
+                match='exact',
+                payload=_Payload({'title': str, 'body': str}, ('title', 'body'), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (RuntimeError, 'conflict_tail')),),
+            ),
+            _Route('POST', '/memory/update', Handler._post_memory_update,
+                match='exact',
+                payload=_Payload({'id': str, 'text': str}, ('id', 'text'), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((MemoryUnavailable, 'empty_unavailable'), (ValueError, 'bad_request'))),
+            ),
+            _Route('POST', '/memory/delete', Handler._post_memory_delete,
+                match='exact',
+                payload=_Payload({'id': str}, ('id',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((MemoryUnavailable, 'empty_unavailable'),)),
+            ),
+            _Route('POST', '/loop/start', Handler._post_loop_start,
+                match='exact',
+                payload=_Payload({'goal': str}, ('goal',), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
+            ),
+            _Route('POST', '/roadmap/add', Handler._post_roadmap_add,
+                match='exact',
+                payload=_Payload({'goal': str}, ('goal',), extra=False),
+                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request')),),
+                action='add',
+            ),
+            _Route('POST', '/roadmap/remove', Handler._post_roadmap_add,
+                match='exact',
+                payload=_Payload({'id': str}, ('id',), extra=False),
+                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request')),),
+                action='remove',
+            ),
+            _Route('POST', '/roadmap/move', Handler._post_roadmap_add,
+                match='exact',
+                payload=_Payload({'id': str, 'index': int}, ('id', 'index'), extra=False),
+                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request')),),
+                action='move',
+            ),
+            _Route('POST', '/roadmap/start', Handler._post_roadmap_start,
+                match='exact',
+                payload=_Payload({'id': str}, ('id',), extra=False),
+                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
+            ),
+            _Route('POST', '/loop/plan', Handler._post_loop_plan,
+                match='exact',
+                payload=_Payload({'loop_id': str, 'action': str, 'cards': list, 'note': str}, ('loop_id', 'action'), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
+            ),
+            _Route('POST', '/loop/cancel', Handler._post_loop_cancel,
+                match='exact',
+                payload=_Payload({'loop_id': str}, ('loop_id',), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run')),),
+            ),
+            _Route('POST', '/loop/commit', Handler._post_loop_commit,
+                match='exact',
+                payload=_Payload({'loop_id': str, 'action': str}, ('loop_id', 'action'), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
+            ),
+            _Route('POST', '/loop/resume', Handler._post_loop_resume,
+                match='exact',
+                payload=_Payload({'loop_id': str}, ('loop_id',), extra=False),
+                errors=(((ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
+            ),
+            _Route('POST', '/goal', Handler._post_goal,
+                match='exact',
+                payload=_Payload({'objective': str, 'check': list, 'max_rounds': int}, ('objective',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'), (ProviderSelectionError, 'bad_request'))),
+            ),
+            _Route('POST', '/goal/state', Handler._post_goal_state,
+                match='exact',
+                payload=_Payload({'action': str}, ('action',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((KeyError, 'no_goal'), (RunActiveError, 'conflict'))),
+            ),
+            _Route('POST', '/agent', Handler._post_agent,
+                match='exact',
+                payload=_Payload({'name': str, 'scope': str, 'text': str}, ('name', 'scope', 'text'), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((AgentFileError, 'bad_request'),), ((OSError, 'definition_write_failed'),)),
+                helper_errors={
+                    'definition_target': (((OSError, RuntimeError), 'empty_forbidden'),),
+                },
+            ),
+            _Route('POST', '/steer', Handler._post_steer,
+                match='exact',
+                payload=_Payload({'text': str}, ('text',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'no_running_turn'),)),
+            ),
+            _Route('POST', '/command', Handler._post_command,
+                match='exact',
+                payload=_Payload({'command': str}, ('command',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((CommandActiveError, 'command_running'), (RunActiveError, 'turn_running'), (ValueError, 'bad_request'))),
+            ),
+            _Route('POST', '/changes/revert', Handler._post_changes_revert,
+                match='exact',
+                payload=_Payload({'path': str, 'key': str, 'force': bool}, (), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'conflict'), (ChangedOutsideError, 'changed_outside'), (KeyError, 'unknown_change'), ((OSError, ValueError), 'internal_error'))),
+            ),
+            _Route('POST', '/worktree/apply', Handler._post_worktree_apply,
+                match='exact',
+                payload=_Payload({'name': str}, ('name',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'conflict'), (KeyError, 'unknown_worktree'), (WorktreeApplyConflict, 'conflict'), ((OSError, ValueError, RuntimeError), 'internal_error'))),
+                action='apply',
+            ),
+            _Route('POST', '/worktree/discard', Handler._post_worktree_apply,
+                match='exact',
+                payload=_Payload({'name': str}, ('name',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'conflict'), (KeyError, 'unknown_worktree'), (WorktreeApplyConflict, 'conflict'), ((OSError, ValueError, RuntimeError), 'internal_error'))),
+                action='discard',
+            ),
+            _Route('POST', '/credentials', Handler._post_credentials,
+                project_free=True,
+                payload=_Payload({'name': str, 'value': str}, ('name', 'value'), extra=True),
+                errors=(((CredentialError, 'credential_unavailable'),),),
+                action='credentials',
+            ),
+            _Route('POST', '/session/new', Handler._post_session_new,
+                match='exact',
+                payload=_Payload({}, (), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'),)),
+            ),
+            _Route('POST', '/session/rename', Handler._post_session_rename,
+                match='exact',
+                payload=_Payload({'run_id': str, 'title': str}, ('run_id', 'title'), extra=False),
+                errors=(((ProtocolError, 'bad_request'),),),
+            ),
+            _Route('POST', '/session/archive', Handler._post_session_archive,
+                match='exact',
+                payload=_Payload({'run_id': str, 'archived': bool}, ('run_id', 'archived'), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'conflict'),)),
+            ),
+            _Route('POST', '/session/delete', Handler._post_session_delete,
+                match='exact',
+                payload=_Payload({'run_id': str}, ('run_id',), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'conflict'),)),
+            ),
+            _Route('POST', '/session/fork', Handler._post_session_fork,
+                match='exact',
+                payload=_Payload({'run_id': str, 'record_id': str, 'force': bool}, ('run_id', 'record_id'), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'), (ChangedOutsideError, 'changed_outside'), (SessionError, 'missing_session'), (TranscriptError, 'bad_request'), (ProviderSelectionError, 'bad_request'))),
+            ),
+            _Route('POST', '/provider', Handler._post_provider,
+                match='exact',
+                project_free=True,
+                payload=_Payload({'name': str, 'model': (str, type(None)), 'base_url': (str, type(None)), 'effort': (str, type(None))}, ('name',), extra=False),
+                errors=((((ProtocolError, ProviderSelectionError), 'bad_request'),), ((RunActiveError, 'active_run'),), ((OSError, 'selection_unsaved'),)),
+            ),
+            _Route('POST', '/mode', Handler._post_mode,
+                match='exact',
+                payload=_Payload({'mode': object}, ('mode',), extra=False),
+                errors=((((ProtocolError, ModeSelectionError), 'bad_request'),),),
+            ),
+            _Route('POST', '/compact', Handler._post_compact,
+                match='exact',
+                payload=_Payload({'instructions': str}, (), extra=False),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'), (NoConversationError, 'bad_request'))),
+            ),
+            _Route('POST', '/prompt', Handler._post_prompt,
+                match='exact',
+                payload=_Payload({'prompt': str, 'attachments': list}, ('prompt',), extra=True),
+                errors=(((ProtocolError, 'bad_request'),), ((ProviderSelectionError, 'bad_request'), (CommandActiveError, 'command_finishing'), (RunActiveError, 'active_run'))),
+            ),
+            _Route('POST', '/approval', Handler._post_approval,
+                match='exact',
+                payload=_Payload({'approval_id': str, 'allowed': bool, 'reason': str, 'remember': (bool, str), 'answer': str}, ('approval_id', 'allowed'), extra=True),
+                errors=(((ProtocolError, 'bad_request'),), ((InvalidApprovalAnswer, 'bad_request'), (PermissionGrantError, 'unavailable'))),
+            ),
+            _Route('POST', '/session/open', Handler._post_session_open,
+                match='exact',
+                payload=_Payload({'run_id': str}, ('run_id',), extra=True),
+                errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'), (SessionError, 'session_not_found'), (TranscriptError, 'bad_request'), (ProviderSelectionError, 'bad_request'))),
+            ),
+            _Route('POST', '/stop', Handler._post_stop,
+                match='exact',
+                payload=_Payload({'reason': str}, (), extra=True),
+                errors=(((ProtocolError, 'bad_request'),),),
+            ),
+        )
 
         return Handler

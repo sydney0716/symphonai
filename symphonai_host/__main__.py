@@ -24,7 +24,9 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import default_sessions_root
-from symphonai_host.server import HostServer, _provider, _provider_for_start, symphonai_home
+from symphonai_host.server import HostServer
+from symphonai_api.paths import symphonai_home
+from symphonai_host.providers import provider as _provider, provider_for_start as _provider_for_start
 from symphonai_host.run import ModeSelectionError
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.sessions import DEFAULT_CLEANUP_PERIOD_DAYS, prune_sessions
@@ -120,15 +122,8 @@ def main(
                 pass
         host = HostServer(
             provider,
-            None if runtime is None else runtime.run._base_policy,
+            runtime,
             broker=broker,
-            base_prompt=LEADER_BASE_PROMPT,
-            subagent_base_prompt=SUBAGENT_BASE_PROMPT,
-            max_turns=arguments.max_turns,
-            extensions=None if runtime is None else runtime.run.extensions,
-            mcp_tools=None if runtime is None else runtime.run._mcp_tools,
-            lsp=None if runtime is None else runtime.lsp,
-            runtime=runtime,
             provider_selection=saved_selection,
             project_factory=lambda root, broker, publish_approval: build_project(
                 root,

@@ -25,6 +25,10 @@ from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.headless import main as headless_main
 from symphonai_host.loops import LoopStore
 from symphonai_host.server import HostServer
+from symphonai_host.run import HostRun
+from symphonai_host.projects import ProjectRuntime
+from symphonai_host.broker import EventBroker
+from symphonai_host.providers import provider as build_provider
 from scripts.checks.harness import check
 from scripts.checks.workspace import handoff_spec, workspace
 
@@ -81,11 +85,17 @@ def wait_for(function, predicate, seconds=10):
 
 @contextmanager
 def running_host(ws, provider=None, *, mode="allow", sessions=None, extensions=None):
-    host = HostServer(provider or FakeModelProvider([reply()]), replace(
+    provider = provider or FakeModelProvider([reply()])
+    broker = EventBroker()
+    home = ws.outside / "home"
+    run = HostRun(provider, replace(
         ws.policy, shell_enabled=True, shell_allowlist=[()],
-    ), sessions_root=sessions or ws.outside / "sessions", home=ws.outside / "home",
+    ), broker, max_turns=20, provider_factory=build_provider, sessions_root=sessions or ws.outside / "sessions",
         memory_root=ws.outside / "memory", memory_extraction_enabled=False,
-        extensions=extensions, keepalive_seconds=0.05)
+        project_grants_root=home / "permissions", extensions=extensions,
+        publish_approval=lambda approval: host._publish_approval(approval))
+    host = HostServer(provider, ProjectRuntime(ws.policy.repo_root, run), broker=broker,
+                      home=home, keepalive_seconds=0.05)
     host.start()
     try:
         post(host, "/mode", {"mode": mode})
