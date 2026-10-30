@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,10 +14,14 @@ from typing import TYPE_CHECKING, Callable
 
 from symphonai_api.events import EventSink, SessionEnded, SessionStarted, emit
 from symphonai_api.identity import SCHEMA_VERSION, new_id
-from symphonai_api.paths import ensure_private_directory, symphonai_home
+from symphonai_api.paths import ensure_private_directory, symphonai_home, write_atomic
 
 if TYPE_CHECKING:
     from symphonai_api.models import Message
+
+
+_META_LOCKS: dict[Path, threading.RLock] = {}
+_META_LOCKS_GUARD = threading.Lock()
 
 
 _RECORD_TYPES = frozenset(
@@ -218,6 +221,8 @@ class SessionStore:
         self._writers: dict[Path, TranscriptWriter] = {}
         self._writers_lock = threading.Lock()
         self._meta_lock = threading.Lock()
+        self._run_start_times_lock = threading.Lock()
+        self._run_start_times: dict[str, str] = {}
         if create:
             try:
                 ensure_private_directory(self._root)
@@ -246,6 +251,14 @@ class SessionStore:
                     "repo_root": "" if repo_root is None else str(Path(repo_root).resolve()),
                 }
             )
+        if not create:
+            for path in sorted(self._directory.glob("*.jsonl")):
+                try:
+                    records, _ = read_records(path)
+                except Exception:
+                    continue
+                for record in records:
+                    self._remember_run_start(record)
         emit(
             self._events,
             SessionStarted(
@@ -308,24 +321,34 @@ class SessionStore:
     def set_parent_session(self, parent_session_id: str) -> None:
         """Record which session directory this run descends from."""
 
-        meta = self.read_meta()
-        meta["parent_session_id"] = parent_session_id
-        meta["updated_at"] = _timestamp()
-        self.write_meta(meta)
+        def change(meta):
+            meta["parent_session_id"] = parent_session_id
+            meta["updated_at"] = _timestamp()
+        self.update_meta(change)
 
     def _record_appended(self, record: dict) -> None:
         if record["type"] not in {"run_started", "run_finished", "run_failed"}:
             return
-        meta = self.read_meta()
-        if record["type"] == "run_started":
-            meta["agent_id"] = record["agent_id"]
-            meta["parent_run_id"] = record["data"]["parent_run_id"]
-        elif record["type"] == "run_finished":
-            meta["stopped_reason"] = record["data"]["stopped_reason"]
-        else:
-            meta["stopped_reason"] = "failed"
-        meta["updated_at"] = _timestamp()
-        self.write_meta(meta)
+        def change(meta):
+            if record["type"] == "run_started":
+                meta["agent_id"] = record["agent_id"]
+                meta["parent_run_id"] = record["data"]["parent_run_id"]
+            elif record["type"] == "run_finished":
+                meta["stopped_reason"] = record["data"]["stopped_reason"]
+            else:
+                meta["stopped_reason"] = "failed"
+            meta["updated_at"] = _timestamp()
+        self.update_meta(change)
+
+    def _remember_run_start(self, record: dict) -> None:
+        if record.get("type") == "run_started" and isinstance(record.get("ts"), str):
+            with self._run_start_times_lock:
+                self._run_start_times.setdefault(record.get("run_id"), record["ts"])
+
+    def run_start_times(self) -> dict[str, str]:
+        """Snapshot the exact persisted start times, including subagent runs."""
+        with self._run_start_times_lock:
+            return dict(self._run_start_times)
 
     def writer_for(
         self, agent_id: str, *, is_root: bool = False
@@ -336,12 +359,27 @@ class SessionStore:
         with self._writers_lock:
             writer = self._writers.get(path)
             if writer is None:
-                writer = TranscriptWriter(
-                    path,
-                    _on_append=self._record_appended if is_root else None,
-                )
+                def appended(record):
+                    self._remember_run_start(record)
+                    if is_root:
+                        self._record_appended(record)
+
+                writer = TranscriptWriter(path, _on_append=appended)
                 self._writers[path] = writer
             return writer
+
+    def _metadata_lock(self):
+        key = self._directory.resolve()
+        with _META_LOCKS_GUARD:
+            return _META_LOCKS.setdefault(key, threading.RLock())
+
+    def update_meta(self, change: Callable[[dict], None]) -> dict:
+        """Read, change and atomically write metadata under the session's lock."""
+        with self._metadata_lock():
+            meta = self.read_meta()
+            change(meta)
+            self.write_meta(meta)
+            return meta
 
     def read_meta(self) -> dict:
         path = self._directory / "meta.json"
@@ -360,27 +398,11 @@ class SessionStore:
             encoded = json.dumps(meta, ensure_ascii=False, separators=(",", ":")) + "\n"
         except (TypeError, ValueError) as exc:
             raise TranscriptError(f"cannot serialize session metadata: {exc}") from exc
-        with self._meta_lock:
-            temporary_path: Path | None = None
+        with self._metadata_lock():
             try:
-                descriptor, temporary_name = tempfile.mkstemp(
-                    prefix=".meta-", dir=self._directory
-                )
-                temporary_path = Path(temporary_name)
-                os.chmod(temporary_path, 0o600)
-                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(encoded)
-                    handle.flush()
-                os.replace(temporary_path, path)
-                os.chmod(path, 0o600)
+                write_atomic(path, encoded, mode=0o600, fsync=False)
             except (OSError, UnicodeError) as exc:
                 raise TranscriptError(f"cannot write session metadata {path}: {exc}") from exc
-            finally:
-                if temporary_path is not None:
-                    try:
-                        temporary_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
 
     def close(self) -> None:
         with self._writers_lock:

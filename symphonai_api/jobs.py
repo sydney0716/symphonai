@@ -212,17 +212,9 @@ class JobOutputTool(LocalTool):
     @property
     def parameters(self) -> dict:
         return {"type": "object", "properties": {
-            "job_id": {"type": "string"},
+            "job_id": {"minLength": 1, "type": "string"},
             "since": {"type": "integer", "minimum": 0},
         }, "required": ["job_id"], "additionalProperties": False}
-
-    def validate(self, arguments: dict) -> str | None:
-        if not isinstance(arguments.get("job_id"), str) or not arguments["job_id"]:
-            return "missing or invalid required argument: job_id"
-        since = arguments.get("since", 0)
-        if isinstance(since, bool) or not isinstance(since, int) or since < 0:
-            return "invalid optional argument: since (must be a non-negative integer)"
-        return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
         return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=True, paths=None)
@@ -261,11 +253,8 @@ class JobStopTool(LocalTool):
     @property
     def parameters(self) -> dict:
         return {"type": "object", "properties": {
-            "job_id": {"type": "string"},
+            "job_id": {"minLength": 1, "type": "string"},
         }, "required": ["job_id"], "additionalProperties": False}
-
-    def validate(self, arguments: dict) -> str | None:
-        return None if isinstance(arguments.get("job_id"), str) and arguments["job_id"] else "missing or invalid required argument: job_id"
 
     def metadata(self, arguments: dict) -> ToolMetadata:
         return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=False, paths=None)

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import Enum
-import math
 from pathlib import Path
 from types import MappingProxyType
 import tomllib
@@ -16,6 +15,8 @@ from symphonai_api.cost import PriceTable, load_price_table
 from symphonai_api.model_table import model_capabilities, resolve_effort
 from symphonai_api.permissions import (
     ALWAYS_DENY_COMMANDS,
+    BUDGET_KEYS, RENAMED_MODES, SettingsParser,
+    DEFAULT_FORBIDDEN_PATTERNS,
     PermissionPolicy,
     _contains_path,
     _intersect_shell_allowlists,
@@ -75,9 +76,6 @@ _CEILING_KEYS = {
     "modes",
 }
 _SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles", "compaction", "always_deny")
-_VALID_MODES = {"ask", "plan", "allow"}
-_RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
-_BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
 _PROVIDER_NAMES = {
     "anthropic", "gemini", "openai", "deepseek", "grok", "groq", "kimi",
     "ollama", "openrouter", "qwen", "together",
@@ -115,22 +113,13 @@ def _table(
 
 
 def _string(source: Path | None, key: str, value: object) -> str:
-    if not isinstance(value, str):
-        _raise(source, key, "must be a string")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(source, field, detail)).string(key, value)
 
 def _boolean(source: Path | None, key: str, value: object) -> bool:
-    if type(value) is not bool:
-        _raise(source, key, "must be a boolean")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(source, field, detail)).boolean(key, value)
 
 def _strings(source: Path | None, key: str, value: object) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        _raise(source, key, "must be an array of strings")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(source, field, detail)).strings(key, value)
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
@@ -238,10 +227,14 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
                 _raise(source, "search.endpoint", f"unknown search endpoint {key!r}")
     sandbox = _table(source, values, "sandbox")
     if sandbox is not None:
-        _unknown_keys(source, "sandbox", sandbox, {"shell", "network"})
+        _unknown_keys(source, "sandbox", sandbox, {"shell", "network", "readable"})
         for key in ("shell", "network"):
             if key in sandbox:
                 _boolean(source, f"sandbox.{key}", sandbox[key])
+        if "readable" in sandbox:
+            for pattern in _strings(source, "sandbox.readable", sandbox["readable"]):
+                if pattern not in DEFAULT_FORBIDDEN_PATTERNS or pattern == ".git/":
+                    _raise(source, "sandbox.readable", f"not an eligible forbidden pattern: {pattern!r}")
     worktree = _table(source, values, "worktree")
     if worktree is not None:
         _unknown_keys(source, "worktree", worktree, {"symlink", "setup"})
@@ -268,24 +261,8 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
             if limits is None:
                 continue
             prefix = f"budgets.{role}"
-            _unknown_keys(source, prefix, limits, _BUDGET_KEYS)
-            for key in ("max_turns", "max_total_tokens"):
-                if key in limits and (type(limits[key]) is not int or limits[key] < 1):
-                    _raise(source, f"{prefix}.{key}", "must be a positive integer")
-            if "wall_seconds" in limits:
-                value = limits["wall_seconds"]
-                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-                    _raise(source, f"{prefix}.wall_seconds", "must be a positive finite number")
-            if "max_cost" in limits:
-                value = limits["max_cost"]
-                if not isinstance(value, str):
-                    _raise(source, f"{prefix}.max_cost", "must be a quoted non-negative decimal")
-                try:
-                    cost = Decimal(value)
-                except InvalidOperation:
-                    _raise(source, f"{prefix}.max_cost", "must be a quoted non-negative decimal")
-                if not cost.is_finite() or cost < 0:
-                    _raise(source, f"{prefix}.max_cost", "must be a quoted non-negative decimal")
+            _unknown_keys(source, prefix, limits, BUDGET_KEYS)
+            SettingsParser(lambda key, detail: _raise(source, f"{prefix}.{key}", detail)).budget(limits, config=True)
     sessions = _table(source, values, "sessions")
     if sessions is not None:
         _unknown_keys(source, "sessions", sessions, {"cleanup_period_days"})
@@ -303,35 +280,13 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     if ceiling is None:
         return
     _unknown_keys(source, "agents.ceiling", ceiling, _CEILING_KEYS)
-    for key in ("allowed_write_scope", "fetch_allowlist", "modes"):
+    parser = SettingsParser(lambda key, detail: _raise(source, f"agents.ceiling.{key}", detail))
+    for key, parse in (("allowed_write_scope", parser.scopes),
+                       ("fetch_allowlist", parser.hosts), ("modes", parser.modes),
+                       ("shell_enabled", parser.boolean), ("fetch_enabled", parser.boolean),
+                       ("shell_allowlist", parser.commands)):
         if key in ceiling:
-            entries = _strings(source, f"agents.ceiling.{key}", ceiling[key])
-            if key == "modes":
-                invalid = next((mode for mode in entries if mode not in _VALID_MODES), None)
-                if invalid is not None:
-                    replacement = _RENAMED_MODES.get(invalid)
-                    if replacement is not None:
-                        _raise(
-                            source,
-                            "agents.ceiling.modes",
-                            f"{invalid!r} was renamed; use {replacement!r} instead",
-                        )
-                    valid = ", ".join(sorted(_VALID_MODES))
-                    _raise(
-                        source,
-                        "agents.ceiling.modes",
-                        f"must contain only: {valid}",
-                    )
-    for key in ("shell_enabled", "fetch_enabled"):
-        if key in ceiling:
-            _boolean(source, f"agents.ceiling.{key}", ceiling[key])
-    if "shell_allowlist" in ceiling:
-        value = ceiling["shell_allowlist"]
-        full_key = "agents.ceiling.shell_allowlist"
-        if not isinstance(value, list):
-            _raise(source, full_key, "must be an array of command arrays")
-        for command in value:
-            _strings(source, full_key, command)
+            parse(key, ceiling[key])
 
 
 def _read_toml(path: Path) -> Mapping[str, object] | None:
@@ -424,6 +379,11 @@ def load_config(
                         f"{source}: always_deny: settings are accepted only from user config; section skipped"
                     )
                     continue
+                if section == "sandbox" and isinstance(value, Mapping) and "readable" in value:
+                    warnings.append(
+                        f"{source}: sandbox.readable: accepted only from user config; key skipped"
+                    )
+                    value = {key: item for key, item in value.items() if key != "readable"}
                 try:
                     _validate(source, {section: value})
                 except ConfigError as exc:
@@ -437,6 +397,8 @@ def load_config(
             _raise(source, "roles", "role models are supported only in user config")
         if "always_deny" in values and scope is Scope.SESSION:
             _raise(source, "always_deny", "rule lifts are supported only in user config")
+        if scope is Scope.SESSION and isinstance(values.get("sandbox"), Mapping) and "readable" in values["sandbox"]:
+            _raise(source, "sandbox.readable", "supported only in user config")
         if scope not in {Scope.PROJECT, Scope.PRIVATE}:
             _validate(source, values)
         flattened = _flatten(values)
@@ -669,79 +631,21 @@ class CapabilityCeiling:
         def value(key: str) -> object | None:
             return values.get(prefix + key)
 
-        def boolean(key: str) -> bool | None:
-            raw = value(key)
-            if raw is None:
-                return None
-            return _boolean(source, prefix + key, raw)
-
-        modes: tuple[str, ...] | None = None
-        raw_modes = value("modes")
-        if raw_modes is not None:
-            parsed_modes = tuple(_strings(source, prefix + "modes", raw_modes))
-            invalid = next((mode for mode in parsed_modes if mode not in _VALID_MODES), None)
-            if invalid is not None:
-                replacement = _RENAMED_MODES.get(invalid)
-                if replacement is not None:
-                    _raise(
-                        source,
-                        prefix + "modes",
-                        f"{invalid!r} was renamed; use {replacement!r} instead",
-                    )
-                valid = ", ".join(sorted(_VALID_MODES))
-                _raise(source, prefix + "modes", f"must contain only: {valid}")
-            modes = parsed_modes
-
-        write_scope: tuple[Path, ...] | None = None
-        raw_write_scope = value("allowed_write_scope")
-        if raw_write_scope is not None:
-            entries = _strings(
-                source,
-                prefix + "allowed_write_scope",
-                raw_write_scope,
-            )
-            root = Path(repo_root)
-            write_scope = tuple((root / entry).resolve() for entry in entries)
-
-        shell_allowlist: tuple[tuple[str, ...], ...] | None = None
-        raw_shell_allowlist = value("shell_allowlist")
-        if raw_shell_allowlist is not None:
-            if not isinstance(raw_shell_allowlist, list):
-                _raise(
-                    source,
-                    prefix + "shell_allowlist",
-                    "must be an array of command arrays",
-                )
-            shell_allowlist = tuple(
-                tuple(
-                    _strings(
-                        source,
-                        prefix + "shell_allowlist",
-                        command,
-                    )
-                )
-                for command in raw_shell_allowlist
-            )
-
-        fetch_allowlist: tuple[str, ...] | None = None
-        raw_fetch_allowlist = value("fetch_allowlist")
-        if raw_fetch_allowlist is not None:
-            fetch_allowlist = tuple(
-                host.casefold().rstrip(".")
-                for host in _strings(
-                    source,
-                    prefix + "fetch_allowlist",
-                    raw_fetch_allowlist,
-                )
-            )
-
+        write_scope = value("allowed_write_scope")
+        shell_allowlist = value("shell_allowlist")
+        fetch_allowlist = value("fetch_allowlist")
+        modes = value("modes")
         return cls(
-            allowed_write_scope=write_scope,
-            shell_enabled=boolean("shell_enabled"),
-            shell_allowlist=shell_allowlist,
-            fetch_enabled=boolean("fetch_enabled"),
-            fetch_allowlist=fetch_allowlist,
-            modes=modes,
+            allowed_write_scope=(None if write_scope is None else tuple(
+                (Path(repo_root) / entry).resolve() for entry in write_scope
+            )),
+            shell_enabled=value("shell_enabled"),
+            shell_allowlist=(None if shell_allowlist is None else tuple(map(tuple, shell_allowlist))),
+            fetch_enabled=value("fetch_enabled"),
+            fetch_allowlist=(None if fetch_allowlist is None else tuple(
+                host.casefold().rstrip(".") for host in fetch_allowlist
+            )),
+            modes=None if modes is None else tuple(modes),
         )
 
     def refuse(self, policy: PermissionPolicy, *, source: Path) -> None:

@@ -1,4 +1,4 @@
-"""Minimal stdio MCP client and LocalTool adapter."""
+"""Stdio and HTTP MCP clients and LocalTool adapter."""
 
 from __future__ import annotations
 

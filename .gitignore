@@ -1,7 +1,3 @@
-# Generated reports -- rendered from docs/*.json, never edited by hand
-/docs/roadmap.html
-/roadmap.html
-
 # Python
 __pycache__/
 *.pyc
@@ -33,6 +29,4 @@ ref/
 /docs/
 /CLAUDE.md
 /AGENTS.md
-/scripts/roadmap.py
-/scripts/spec_claims.sh
 /configs/agents.example.yaml

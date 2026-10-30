@@ -17,7 +17,6 @@ from symphonai_api.session import SessionStore, read_records
 class RunPhase(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
-    PAUSED = "paused"
     FINISHED = "finished"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -67,7 +66,7 @@ class AgentRun:
     @property
     def quiet_seconds(self) -> float | None:
         if (
-            self.phase not in (RunPhase.RUNNING, RunPhase.PAUSED)
+            self.phase is not RunPhase.RUNNING
             or self.last_heartbeat_monotonic is None
         ):
             return None
@@ -87,23 +86,16 @@ class AgentRun:
         self.token = token
 
     def heartbeat(self) -> None:
-        self._require("heartbeat", RunPhase.RUNNING, RunPhase.PAUSED)
+        self._require("heartbeat", RunPhase.RUNNING)
         self.last_heartbeat_monotonic = time.monotonic()
 
-    def pause(self) -> None:
-        self._require("pause", RunPhase.RUNNING)
-        self.phase = RunPhase.PAUSED
 
-    def resume(self) -> None:
-        self._require("resume", RunPhase.PAUSED)
-        self.phase = RunPhase.RUNNING
 
     def cap_budget(self, **changes: object) -> None:
         self._require(
             "cap_budget",
             RunPhase.PENDING,
             RunPhase.RUNNING,
-            RunPhase.PAUSED,
         )
         while True:
             with self._control_lock:
@@ -119,11 +111,11 @@ class AgentRun:
             raise ValueError("redirect text must not be blank")
         with self._control_lock:
             if self._redirects_closed or self.phase not in (
-                RunPhase.PENDING, RunPhase.RUNNING, RunPhase.PAUSED,
+                RunPhase.PENDING, RunPhase.RUNNING,
             ):
                 current = RunPhase.FINISHED.value if self._redirects_closed else self.phase.value
                 raise ValueError(
-                    "redirect requires pending or running or paused; "
+                    "redirect requires pending or running; "
                     f"current phase is {current}"
                 )
             self._redirects.append(text)
@@ -163,7 +155,7 @@ class AgentRun:
     def fail(self, error: str) -> None:
         try:
             with self._control_lock:
-                self._require("fail", RunPhase.RUNNING, RunPhase.PAUSED)
+                self._require("fail", RunPhase.RUNNING)
                 self._redirects_closed = True
                 self.error = error
                 self.finished_monotonic = time.monotonic()
@@ -175,7 +167,7 @@ class AgentRun:
     def cancel(self) -> None:
         try:
             with self._control_lock:
-                self._require("cancel", RunPhase.PENDING, RunPhase.RUNNING, RunPhase.PAUSED)
+                self._require("cancel", RunPhase.PENDING, RunPhase.RUNNING)
                 self._redirects_closed = True
                 if self.token is not None:
                     self.token.cancel()
@@ -184,43 +176,6 @@ class AgentRun:
         finally:
             if self.token is not None:
                 self.token.close()
-
-
-class PauseGate:
-    """A reversible turn-boundary gate, independent of cancellation."""
-
-    def __init__(self) -> None:
-        self._resumed = threading.Event()
-        self._resumed.set()
-
-    def pause(self) -> None:
-        self._resumed.clear()
-
-    def resume(self) -> None:
-        self._resumed.set()
-
-    @property
-    def paused(self) -> bool:
-        return not self._resumed.is_set()
-
-    def wait_while_paused(
-        self,
-        cancel: CancellationToken | None = None,
-    ) -> None:
-        if not self.paused:
-            return
-        if cancel is not None:
-            cancel.raise_if_cancelled()
-        unsubscribe = (
-            None if cancel is None else cancel.on_cancel(self._resumed.set)
-        )
-        try:
-            self._resumed.wait()
-            if cancel is not None:
-                cancel.raise_if_cancelled()
-        finally:
-            if unsubscribe is not None:
-                unsubscribe()
 
 
 def new_agent_run(spec: AgentSpec, *, parent: AgentRun | None = None) -> AgentRun:

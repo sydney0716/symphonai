@@ -27,33 +27,29 @@ from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.paths import symphonai_home
 from symphonai_api.role_prompts import load_role_additions
 from symphonai_api.providers.base import ProviderError
+from symphonai_api.roles import REVIEW_PROMPT, review_command_prompt
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
     IMPLEMENTER_PROMPT, LEADER_BASE_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT,
     ROLE_GUIDANCE, SUBAGENT_BASE_PROMPT, WORKER_PROMPT,
 )
 from symphonai_api.session import SessionError, SessionStore, default_sessions_root, load_run
+from symphonai_host.git import read_git_status
 from symphonai_host.broker import EventBroker
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.__main__ import main as _host_main
 from symphonai_host.loops import LoopStore
 from symphonai_host.projects import build_project
 from symphonai_host.protocol import encode_event
-from symphonai_host.run import LoopChanged, ModeSelectionError, ProviderSelectionError, RunActiveError
+from symphonai_host.run import LoopChanged, ModeSelectionError, ProviderSelectionError, MissingAPIKeyError, RunActiveError
 from symphonai_host.server import PROVIDERS, _app_root, _provider, _provider_for_start
-from symphonai_api.tools.shell import _sandbox_available
+from symphonai_api.tools.shell import sandbox_available
 
 
 class _UsageError(ValueError):
     pass
 
 
-REVIEW_PROMPT = """Review the uncommitted changes in this repository. Do not change any file.
-
-1. Read them with `git status` and `git diff HEAD`, and read every untracked file that is not ignored.
-2. Read the code each change depends on, and run the narrowest tests that exercise it.
-3. Report findings, most severe first. For each: the file and line, what is wrong, and the input or situation that shows it. Leave out style preferences.
-4. If nothing is worth fixing, say so in one line."""
 
 
 class _HeadlessKeyError(ValueError):
@@ -75,12 +71,6 @@ class _StatusCapturingProvider:
             self._capture_status(exc)
             raise
 
-    def stream_response(self, request, *, cancel=None):  # noqa: ANN001
-        try:
-            yield from self._provider.stream_response(request, cancel=cancel)
-        except ProviderError as exc:
-            self._capture_status(exc)
-            raise
 
     def create_response_stream(self, request, *, cancel=None):  # noqa: ANN001
         try:
@@ -240,7 +230,7 @@ def _run_doctor(arguments) -> int:  # noqa: ANN001
         "ok" if present_keys else "fail",
         "available: " + ", ".join(sorted(present_keys)) if present_keys else "none found",
     )
-    sandbox = _sandbox_available()
+    sandbox = sandbox_available()
     add("Sandbox", "ok" if sandbox else "warn", "available" if sandbox else "unavailable (allow mode runs unsandboxed)")
     app_root = _app_root()
     add("App", "ok" if app_root.is_dir() else "fail", "installed" if app_root.is_dir() else f"missing: {app_root}")
@@ -323,16 +313,7 @@ def _agent_definition_path(name: str, root: Path, spec) -> str | None:  # noqa: 
 
 
 def _review_task(arguments) -> str:  # noqa: ANN001
-    prompt = REVIEW_PROMPT
-    if arguments.base is not None:
-        prompt = prompt.replace(
-            "Review the uncommitted changes in this repository.",
-            f"Review the changes between {arguments.base} and the working tree (git diff {arguments.base}).",
-            1,
-        )
-    if arguments.focus is not None:
-        prompt += f"\n\nFocus on: {arguments.focus}"
-    return prompt
+    return review_command_prompt(arguments.base, arguments.focus)
 
 
 def _load_output_schema(path: Path | None) -> dict | None:
@@ -359,13 +340,12 @@ def _select_provider(arguments):  # noqa: ANN001
     if arguments.provider is not None:
         try:
             provider = _provider(arguments.provider, arguments.model)
-        except ProviderSelectionError as exc:
-            if str(exc) == f"{arguments.provider} has no API key":
-                env_var = next((variable for name, variable, _ in PROVIDERS if name == arguments.provider), None)
-                if env_var is not None:
-                    raise _HeadlessKeyError(
-                        f"no API key found; set {env_var} in the environment"
-                    ) from None
+        except MissingAPIKeyError:
+            env_var = next((variable for name, variable, _ in PROVIDERS if name == arguments.provider), None)
+            if env_var is not None:
+                raise _HeadlessKeyError(
+                    f"no API key found; set {env_var} in the environment"
+                ) from None
             raise
         choice = {"name": arguments.provider}
     else:
@@ -383,7 +363,7 @@ def _select_provider(arguments):  # noqa: ANN001
     model = arguments.model if arguments.model is not None else choice.get("model")
     if arguments.model is not None:
         choice["model"] = arguments.model
-    elif getattr(provider, "model", None) is not None:
+    elif provider.model is not None:
         model = provider.model
     effort = arguments.effort if arguments.effort is not None else choice.get("effort")
     if effort is not None:
@@ -453,33 +433,11 @@ def _files_changed(run, previous_keys: set[str]) -> list[str]:  # noqa: ANN001
 
 
 def _git_status(root: Path) -> dict[str, str] | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain", "-z"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
+    snapshot = read_git_status(root, all_untracked=False)
+    if snapshot is None:
         return None
-    if result.returncode != 0:
-        return None
-    fields = result.stdout.split(b"\0")
-    status: dict[str, str] = {}
-    index = 0
-    while index < len(fields):
-        entry = fields[index]
-        index += 1
-        if not entry:
-            continue
-        state = os.fsdecode(entry[:2])
-        path = os.fsdecode(entry[3:])
-        status[path] = state
-        if "R" in state or "C" in state:
-            if index < len(fields):
-                status[os.fsdecode(fields[index])] = state
-                index += 1
-    return status
+    return {path: entry.code for entry in snapshot.entries
+            for path in (entry.path, entry.old_path) if path is not None}
 
 
 def _execute(arguments, task: str) -> int:  # noqa: ANN001
@@ -546,9 +504,9 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             previous_keys = {turn["key"] for turn in previous.get("turns", [])}
             session = SessionStore.open(runtime.run.sessions_root, arguments.resume)
             try:
-                metadata = session.read_meta()
-                metadata["headless"] = True
-                session.write_meta(metadata)
+                def change(metadata):
+                    metadata["headless"] = True
+                session.update_meta(change)
             finally:
                 session.close()
             loaded_session = SessionStore.open(runtime.run.sessions_root, arguments.resume)

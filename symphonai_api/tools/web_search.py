@@ -34,6 +34,7 @@ class WebSearchTool(LocalTool):
             "type": "object",
             "properties": {
                 "query": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "The web search query.",
                 },
@@ -45,15 +46,6 @@ class WebSearchTool(LocalTool):
             },
             "required": ["query"],
         }
-
-    def validate(self, arguments: dict) -> str | None:
-        query = arguments.get("query")
-        if not isinstance(query, str) or not query:
-            return "query must be a non-empty string"
-        limit = arguments.get("limit", DEFAULT_SEARCH_LIMIT)
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            return "limit must be an integer"
-        return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
         return ToolMetadata(

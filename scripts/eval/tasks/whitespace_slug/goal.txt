@@ -1,1 +1,0 @@
-Update normalize_name() so runs of whitespace between words become a single hyphen, while preserving its lowercase, trimming behaviour. Do not edit tests. Validate with `python3 -m unittest`.

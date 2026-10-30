@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,66 +88,25 @@ def create_worktree(repo_root: Path, path: Path, start: str = "HEAD") -> Path:
     if isinstance(setup, str):
         from symphonai_api.tools.shell import shell_environment
 
-        try:
-            process = subprocess.Popen(
-                ["/bin/sh", "-c", setup],
-                cwd=worktree_root,
-                env=shell_environment(worktree_root, for_agent=True),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
-            try:
-                output, _ = process.communicate(
-                    timeout=WORKTREE_SETUP_TIMEOUT_SECONDS
-                )
-            except subprocess.TimeoutExpired as exc:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                output, _ = process.communicate()
-                if not output:
-                    output = exc.stdout or ""
-                    if isinstance(output, bytes):
-                        output = output.decode("utf-8", errors="replace")
-                try:
-                    remove_worktree(repo_root, path)
-                except WorktreeError as cleanup_error:
-                    raise WorktreeError(
-                        f"worktree setup command {setup!r} timed out after 1800 seconds; "
-                        f"output: {output[-4000:]}; cleanup failed: {cleanup_error}"
-                    ) from exc
-                raise WorktreeError(
-                    f"worktree setup command {setup!r} timed out after 1800 seconds; "
-                    f"output: {output[-4000:]}"
-                ) from exc
-        except OSError as exc:
+        from symphonai_api.process import run_process
+        result = run_process(
+            ["/bin/sh", "-c", setup], worktree_root,
+            env=shell_environment(worktree_root, for_agent=True),
+            timeout=WORKTREE_SETUP_TIMEOUT_SECONDS, output_limit=None,
+        )
+        output = result.stdout.decode("utf-8", errors="replace")
+        if result.error is not None or result.timed_out or result.exit_code != 0:
+            if result.error is not None:
+                message = f"worktree setup command {setup!r} could not start: {result.error}"
+            elif result.timed_out:
+                message = f"worktree setup command {setup!r} timed out after 1800 seconds; output: {output[-4000:]}"
+            else:
+                message = f"worktree setup command {setup!r} exited with code {result.exit_code}; output: {output[-4000:]}"
             try:
                 remove_worktree(repo_root, path)
             except WorktreeError as cleanup_error:
-                raise WorktreeError(
-                    f"worktree setup command {setup!r} could not start: {exc}; "
-                    f"cleanup failed: {cleanup_error}"
-                ) from exc
-            raise WorktreeError(
-                f"worktree setup command {setup!r} could not start: {exc}"
-            ) from exc
-        if process.returncode != 0:
-            try:
-                remove_worktree(repo_root, path)
-            except WorktreeError as cleanup_error:
-                raise WorktreeError(
-                    f"worktree setup command {setup!r} exited with code {process.returncode}; "
-                    f"output: {output[-4000:]}; cleanup failed: {cleanup_error}"
-                )
-            raise WorktreeError(
-                f"worktree setup command {setup!r} exited with code {process.returncode}; "
-                f"output: {output[-4000:]}"
-            )
+                raise WorktreeError(f"{message}; cleanup failed: {cleanup_error}") from result.error
+            raise WorktreeError(message) from result.error
     return worktree_root
 
 

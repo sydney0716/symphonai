@@ -36,11 +36,6 @@ class UseSkillTool(LocalTool):
             "required": ["name"],
         }
 
-    def validate(self, arguments: dict) -> str | None:
-        if not isinstance(arguments.get("name"), str):
-            return "missing or invalid required argument: name (must be a string)"
-        return None
-
     def metadata(self, arguments: dict) -> ToolMetadata:
         return ToolMetadata(
             effect=ToolEffect.READ_ONLY,

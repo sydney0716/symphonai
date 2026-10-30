@@ -8,8 +8,6 @@ import threading
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 
 
-class CircuitOpen(RuntimeError):
-    """Raised when a repair loop has failed too many times in a row."""
 
 
 class ConsecutiveFailureBreaker:

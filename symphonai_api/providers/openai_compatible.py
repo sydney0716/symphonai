@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
 from symphonai_api.cancellation import CancellationToken
@@ -52,7 +52,7 @@ class OpenAICompatibleProvider(ModelProvider):
     """
 
     api_key_env_var: str
-    base_url: str
+    base_url: str = field()
     model: str = DEFAULT_MODEL
     provider_label: str = "openai-compatible"
     timeout_seconds: float = 600.0
@@ -95,7 +95,7 @@ class OpenAICompatibleProvider(ModelProvider):
             max_attempts=self.max_attempts,
             api_key=api_key,
             operation=f"{self.provider_label} API",
-            fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+            fallback_configured=bool(self.fallback_models),
             cancel=cancel,
             call_class=request.call_class,
         )
@@ -126,12 +126,12 @@ class OpenAICompatibleProvider(ModelProvider):
         )
         operation = f"{self.provider_label} API"
         def attempt(remaining):
-            lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
+            lines = open_stream_with_retry(http_request, timeout=remaining,
                 api_key=api_key, operation=operation,
-                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+
                 cancel=cancel)
             return _openai_stream_chunks(lines, operation=operation, api_key=api_key)
         yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
                                        max_attempts=self.max_attempts,
-                                       fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
-                                       cancel=cancel)
+                                       fallback_configured=bool(self.fallback_models),
+                                       cancel=cancel, call_class=request.call_class, operation=operation)

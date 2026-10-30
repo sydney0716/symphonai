@@ -155,20 +155,6 @@ def _walk_candidates(
             )
 
 
-def _validate_search_arguments(arguments: dict) -> str | None:
-    if not isinstance(arguments.get("pattern"), str):
-        return "missing required argument: pattern"
-    if "path" in arguments and not isinstance(arguments["path"], str):
-        return "path must be a string"
-    for name, minimum in (("head_limit", 0), ("offset", 0)):
-        value = arguments.get(name)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-            return f"{name} must be an integer"
-        if value is not None and value < minimum:
-            return f"{name} must be >= {minimum}"
-    return None
-
-
 def _bounded_content(items: list[str], limit: int | None, offset: int) -> str:
     page, applied_limit = apply_head_limit(items, limit, offset)
     if not page:
@@ -208,10 +194,12 @@ class GlobTool(LocalTool):
                     "default": ".",
                 },
                 "head_limit": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": "Maximum results; 0 returns all results.",
                 },
                 "offset": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": "Number of ordered results to skip.",
                     "default": 0,
@@ -228,9 +216,6 @@ class GlobTool(LocalTool):
             paths=(path,) if isinstance(path, str) else None,
             result_hint=ResultHint.FILE_LIST,
         )
-
-    def validate(self, arguments: dict) -> str | None:
-        return _validate_search_arguments(arguments)
 
     def _execute(
         self,
@@ -306,10 +291,12 @@ class GrepTool(LocalTool):
                     "default": "files_with_matches",
                 },
                 "head_limit": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": "Maximum matching files or lines; 0 returns all.",
                 },
                 "offset": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": "Number of ordered results to skip.",
                     "default": 0,
@@ -333,19 +320,7 @@ class GrepTool(LocalTool):
         )
 
     def validate(self, arguments: dict) -> str | None:
-        error = _validate_search_arguments(arguments)
-        if error is not None:
-            return error
-        glob_pattern = arguments.get("glob")
-        if glob_pattern is not None and not isinstance(glob_pattern, str):
-            return "glob must be a string"
-        case_insensitive = arguments.get("case_insensitive", False)
-        if not isinstance(case_insensitive, bool):
-            return "case_insensitive must be a boolean"
-        output_mode = arguments.get("output_mode", "files_with_matches")
-        if output_mode not in ("files_with_matches", "content"):
-            return "output_mode must be 'files_with_matches' or 'content'"
-        flags = re.IGNORECASE if case_insensitive else 0
+        flags = re.IGNORECASE if arguments.get("case_insensitive", False) else 0
         try:
             re.compile(arguments["pattern"], flags)
         except re.error as exc:

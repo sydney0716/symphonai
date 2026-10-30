@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +16,7 @@ from symphonai_api.permissions import (
     ToolApprovalRequest,
     shell_grant_prefix,
 )
-from symphonai_api.paths import ensure_private_directory
+from symphonai_api.paths import ensure_private_directory, write_atomic
 
 
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300.0
@@ -140,19 +138,10 @@ def write_project_permission_grants(
     }
     try:
         ensure_private_directory(path.parent)
-        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        temporary = Path(temporary_name)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
+        write_atomic(
+            path, json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            mode=0o600, fsync=True,
+        )
     except OSError as exc:
         raise PermissionGrantError(f"could not write project permission grants at {path}: {exc}") from exc
 
@@ -329,10 +318,6 @@ class ApprovalBroker:
             self._granted_shell_prefixes.clear()
             self._granted_fetch_hosts.clear()
 
-    def pending_approval(self, approval_id: str) -> PendingApproval | None:
-        with self._lock:
-            pending = self._pending.get(approval_id)
-            return None if pending is None or pending.decision is not None else pending.approval
 
     def pending_grant(
         self, approval_id: str,

@@ -1,1 +1,0 @@
-Rename format_name() to display_name(), retain format_name() as a deprecated alias, and update project callers to use display_name(). Do not edit tests. Validate with `python3 -m unittest`.

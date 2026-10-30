@@ -58,7 +58,7 @@ from symphonai_api.identity import (
 )
 from symphonai_api.model_table import long_context_threshold
 from symphonai_api.hooks import HookRunner
-from symphonai_api.agent_run import AgentRun, PauseGate
+from symphonai_api.agent_run import AgentRun
 from symphonai_api.models import (
     Message,
     ModelRequest,
@@ -272,7 +272,6 @@ class ApiAgent:
         effort: str | None = None,
         parent_run_id: str | None = None,
         cancel: CancellationToken | None = None,
-        pause: PauseGate | None = None,
         run: AgentRun | None = None,
         events: EventSink | None = None,
         hooks: HookRunner | None = None,
@@ -287,9 +286,9 @@ class ApiAgent:
             if self._budget is not None or run is not None
             else None
         )
-        requested_model = model or getattr(self._provider, "model", None) or "unknown"
+        requested_model = model or self._provider.model or "unknown"
         fallback_models = tuple(
-            getattr(self._provider, "_symphonai_fallback_models", ())
+            self._provider.fallback_models
         )
         turn = 0
         provider_calls = 0
@@ -309,6 +308,59 @@ class ApiAgent:
                     turn_id=turn_id,
                     data=data,
                 )
+
+        def record_message(message: Message, *, turn_id: str | None) -> None:
+            append_record("message", turn_id=turn_id, data=message_to_json(message))
+
+        def persist_message(message: Message, *, turn_id: str | None) -> None:
+            record_message(message, turn_id=turn_id)
+            self._persisted_digests.append(_message_digest(message))
+
+        def append_message(message: Message) -> None:
+            conversation.append(message)
+            persist_message(message, turn_id=message.turn_id)
+
+        def persist_messages(items: list[Message], *, rewritten: bool = False) -> None:
+            digests = [_message_digest(message) for message in items]
+            kept = 0
+            for old, new in zip(self._persisted_digests, digests):
+                if old != new:
+                    break
+                kept += 1
+            if rewritten or kept < len(self._persisted_digests):
+                append_record(
+                    "conversation_rewritten", turn_id=None,
+                    data={"kept_prefix": kept, "replaced": len(self._persisted_digests) - kept},
+                )
+            for message in items[kept:]:
+                record_message(message, turn_id=message.turn_id)
+            self._persisted_digests = digests
+
+        def record_usage(model: str, usage: UsageTotals, *, turn_id: str | None) -> None:
+            append_record(
+                "usage", turn_id=turn_id,
+                data={"model": model, "agent_name": self._agent_ref.name, **usage.to_record()},
+            )
+
+        def finish_run(final_response: ModelResponse, stopped_reason: str, turns_used: int) -> AgentRunResult:
+            result = AgentRunResult(
+                final_response=final_response, messages=conversation, turns_used=turns_used,
+                stopped_reason=stopped_reason, run=run_ref, agent=self._agent_ref,
+                usage_by_model=usage_by_model,
+            )
+            try:
+                emit(event_sink, RunFinished(
+                    agent_id=self._agent_ref.agent_id, run_id=run_ref.run_id,
+                    agent_name=self._agent_ref.name, stopped_reason=stopped_reason,
+                ))
+            except OperationCancelled:
+                if stopped_reason != "cancelled":
+                    raise
+            data = {"stopped_reason": stopped_reason, "turns_used": turns_used}
+            if stopped_reason == "refused":
+                data["refusal_category"] = final_response.refusal_category
+            append_record("run_finished", turn_id=None, data=data)
+            return result
 
         def compact_conversation(
             budget: int, *, recent_turns: int | None = None, turn_id: str | None
@@ -330,11 +382,9 @@ class ApiAgent:
                     call_class=self._call_class,
                 )
                 summary_response = (
-                    self._provider.create_response(summary_request)
-                    if cancel is None
-                    else self._provider.create_response(summary_request, cancel=cancel)
+                    self._provider.create_response(summary_request, cancel=cancel)
                 )
-                summary_model = model or getattr(self._provider, "model", None) or "unknown"
+                summary_model = model or self._provider.model or "unknown"
                 threshold = long_context_threshold(self._provider.wire_format, summary_model)
                 summary_usage = UsageTotals.from_usage(
                     summary_response.usage,
@@ -343,24 +393,7 @@ class ApiAgent:
                 usage_by_model[summary_model] = usage_by_model.get(
                     summary_model, UsageTotals()
                 ).merged(summary_usage)
-                append_record(
-                    "usage",
-                    turn_id=turn_id,
-                    data={
-                        "model": summary_model,
-                        "agent_name": self._agent_ref.name,
-                        "input_tokens": summary_usage.input_tokens,
-                        "output_tokens": summary_usage.output_tokens,
-                        "calls": summary_usage.calls,
-                        "cache_read_tokens": summary_usage.cache_read_tokens,
-                        "cache_write_tokens": summary_usage.cache_write_tokens,
-                        "cache_write_1h_tokens": summary_usage.cache_write_1h_tokens,
-                        "long_context_input_tokens": summary_usage.long_context_input_tokens,
-                        "long_context_output_tokens": summary_usage.long_context_output_tokens,
-                        "long_context_cache_read_tokens": summary_usage.long_context_cache_read_tokens,
-                        "long_context_cache_write_tokens": summary_usage.long_context_cache_write_tokens,
-                    },
-                )
+                record_usage(summary_model, summary_usage, turn_id=turn_id)
                 return summary_response.message.text
 
             errors: list[ContextCompactionError] = []
@@ -398,25 +431,7 @@ class ApiAgent:
                     replace(message, tool_calls=calls)
                     if calls != message.tool_calls else message
                 )
-            kept_prefix = 0
-            new_digests = [_message_digest(message) for message in rewritten]
-            for old, new in zip(self._persisted_digests, new_digests):
-                if old != new:
-                    break
-                kept_prefix += 1
-            append_record(
-                "conversation_rewritten",
-                turn_id=None,
-                data={
-                    "kept_prefix": kept_prefix,
-                    "replaced": len(self._persisted_digests) - kept_prefix,
-                },
-            )
-            for message in rewritten[kept_prefix:]:
-                append_record(
-                    "message", turn_id=message.turn_id, data=message_to_json(message)
-                )
-            self._persisted_digests = new_digests
+            persist_messages(rewritten, rewritten=True)
             conversation[:] = rewritten
             append_record(
                 "compaction",
@@ -439,18 +454,13 @@ class ApiAgent:
             )
             return True
 
-        def append_unread_redirects() -> None:
+        def append_redirects(*, close: bool = False) -> None:
             if run is None:
                 return
-            for text in run.close_redirects():
+            redirects = run.close_redirects() if close else run.take_redirects()
+            for text in redirects:
                 redirect = Message(role=Role.USER, content=text)
-                conversation.append(redirect)
-                append_record(
-                    "message",
-                    turn_id=redirect.turn_id,
-                    data=message_to_json(redirect),
-                )
-                self._persisted_digests.append(_message_digest(redirect))
+                append_message(redirect)
 
         def append_outside_change_notice() -> None:
             if self._read_ledger is None:
@@ -477,53 +487,21 @@ class ApiAgent:
                 + ". Read them again before relying on or editing them."
             )
             message = Message(role=Role.USER, content=notice)
-            conversation.append(message)
-            append_record(
-                "message", turn_id=message.turn_id, data=message_to_json(message)
-            )
-            self._persisted_digests.append(_message_digest(message))
+            append_message(message)
             reported_changes.update(changed)
 
         def append_repaired_tool_results(
             tool_call_ids: list[str], turn_id: str | None
         ) -> None:
             for repaired_message in conversation[-len(tool_call_ids):] if tool_call_ids else ():
-                append_record(
-                    "message",
-                    turn_id=turn_id,
-                    data=message_to_json(repaired_message),
-                )
-                self._persisted_digests.append(_message_digest(repaired_message))
+                persist_message(repaired_message, turn_id=turn_id)
 
         def finish_for_budget(stopped_reason: str) -> AgentRunResult:
-            append_unread_redirects()
+            append_redirects(close=True)
             final_response = response or ModelResponse(
                 message=Message(role=Role.ASSISTANT), stop_reason=stopped_reason
             )
-            result = AgentRunResult(
-                final_response=final_response,
-                messages=conversation,
-                turns_used=provider_calls,
-                stopped_reason=stopped_reason,
-                run=run_ref,
-                agent=self._agent_ref,
-                usage_by_model=usage_by_model,
-            )
-            emit(
-                event_sink,
-                RunFinished(
-                    agent_id=self._agent_ref.agent_id,
-                    run_id=run_ref.run_id,
-                    agent_name=self._agent_ref.name,
-                    stopped_reason=stopped_reason,
-                ),
-            )
-            append_record(
-                "run_finished",
-                turn_id=None,
-                data={"stopped_reason": stopped_reason, "turns_used": provider_calls},
-            )
-            return result
+            return finish_run(final_response, stopped_reason, provider_calls)
 
         def exceeded_budget(budget: RunBudget | None = None) -> str | None:
             effective_budget = self._budget if budget is None else budget
@@ -531,7 +509,433 @@ class ApiAgent:
                 return None
             return budget_state.exceeded(effective_budget, requested_model)
 
-        try:
+        def compact_for_request(turn_ref: TurnRef) -> None:
+            context_budget = (
+                self._context_budget(model)
+                if self._context_budget is not None
+                else budget_for_model(self._provider.wire_format, model)
+            )
+            if estimate_messages_tokens(conversation) > context_budget:
+                compact_conversation(context_budget, turn_id=turn_ref.turn_id)
+
+        def request_response(turn_ref: TurnRef) -> str:
+            nonlocal response, model, effort
+            for request_attempt in range(2):
+                compact_for_request(turn_ref)
+                request = ModelRequest(
+                    messages=list(conversation),
+                    model=model,
+                    tools=self._tool_schemas,
+                    effort=effort,
+                    call_class=self._call_class,
+                )
+                append_record(
+                    "request",
+                    turn_id=turn_ref.turn_id,
+                    data={
+                        "model": model,
+                        "message_count": len(request.messages),
+                        "tool_names": sorted(self._tools),
+                    },
+                )
+                try:
+                    primary_model = request.model or self._provider.model
+                    fallback_chain = list(fallback_models)
+                    if primary_model in fallback_chain:
+                        fallback_chain = fallback_chain[fallback_chain.index(primary_model) + 1:]
+                    attempted_model = primary_model
+                    candidate_models = [request.model, *(
+                        candidate for candidate in fallback_chain
+                        if candidate != primary_model
+                    )]
+                    unavailable: ProviderUnavailableError | None = None
+                    used_model = primary_model or "unknown"
+                    for candidate_model in candidate_models:
+                        candidate_request = request
+                        candidate_effective_model = candidate_model or primary_model
+                        if candidate_model is not None and candidate_model != request.model:
+                            fallback_messages = [
+                                replace(
+                                    message,
+                                    tool_calls=[
+                                        replace(call, provider_metadata={}, vendor_id=None)
+                                        for call in message.tool_calls
+                                    ],
+                                ) if message.tool_calls else message
+                                for message in request.messages
+                            ]
+                            from symphonai_api.model_table import model_capabilities
+
+                            capability = next((
+                                item for item in model_capabilities()
+                                if item.wire_format == self._provider.wire_format
+                                and item.model == candidate_model
+                            ), None)
+                            effort = request.effort
+                            if capability is None or not any(
+                                option.id == effort for option in capability.efforts
+                            ):
+                                effort = None
+                            candidate_request = replace(
+                                request,
+                                model=candidate_model,
+                                messages=fallback_messages,
+                                effort=effort,
+                            )
+                        try:
+                            if self._stream:
+                                assembler = StreamAssembler()
+                                chunks = (
+                                    self._provider.create_response_stream(candidate_request, cancel=cancel)
+                                )
+                                for chunk in chunks:
+                                    if cancel is not None:
+                                        cancel.raise_if_cancelled()
+                                    if isinstance(chunk, TextDelta):
+                                        emit(
+                                            event_sink,
+                                            AssistantTextDelta(
+                                                agent_id=self._agent_ref.agent_id,
+                                                run_id=run_ref.run_id,
+                                                turn_id=turn_ref.turn_id,
+                                                text=chunk.text,
+                                            ),
+                                        )
+                                    elif isinstance(chunk, ReasoningDelta):
+                                        emit(
+                                            event_sink,
+                                            AssistantReasoningDelta(
+                                                agent_id=self._agent_ref.agent_id,
+                                                run_id=run_ref.run_id,
+                                                turn_id=turn_ref.turn_id,
+                                                text=chunk.text,
+                                            ),
+                                        )
+                                    assembler.add(chunk)
+                                response = assembler.finish()
+                            else:
+                                response = self._provider.create_response(
+                                    candidate_request, cancel=cancel
+                                )
+                        except ProviderUnavailableError as exc:
+                            unavailable = exc
+                            attempted_model = candidate_effective_model
+                            continue
+                        used_model = candidate_effective_model or "unknown"
+                        if candidate_effective_model != primary_model:
+                            emit(
+                                event_sink,
+                                ModelFallback(
+                                    agent_id=self._agent_ref.agent_id,
+                                    run_id=run_ref.run_id,
+                                    turn_id=turn_ref.turn_id,
+                                    from_model=attempted_model or "unknown",
+                                    to_model=used_model,
+                                    reason=(
+                                        "network" if unavailable.status is None
+                                        else str(unavailable.status)
+                                    ),
+                                ),
+                            )
+                            model = candidate_effective_model
+                        break
+                    else:
+                        if unavailable is not None:
+                            raise unavailable
+                except ContextLengthExceededError as exc:
+                    request_tokens = estimate_messages_tokens(request.messages)
+                    exc.request_tokens = request_tokens
+                    if self._context_overflow is not None:
+                        self._context_overflow(request_tokens, exc.actual_tokens)
+                    if request_attempt:
+                        raise
+                    budget = (
+                        self._context_budget(model)
+                        if self._context_budget is not None
+                        else budget_for_model(self._provider.wire_format, model)
+                    )
+                    forced_budget = min(
+                        budget,
+                        max(1, request_tokens - 1)
+                        if exc.actual_tokens is not None
+                        else max(1, request_tokens * 3 // 4),
+                    )
+                    try:
+                        changed = compact_conversation(
+                            forced_budget, turn_id=turn_ref.turn_id
+                        )
+                    except ContextCompactionError:
+                        raise exc from None
+                    if not changed:
+                        raise
+                    continue
+                break
+            else:
+                raise RuntimeError("request retry loop did not produce a response")
+            return used_model
+
+        def record_response_usage(turn_ref: TurnRef, used_model: str) -> None:
+            nonlocal provider_calls
+            dated_suffix = (response.model or "").removeprefix(used_model + "-")
+            same_model = response.model == used_model or (
+                response.model is not None and response.model.startswith(used_model + "-")
+                and len(dated_suffix) == 8 and dated_suffix.isascii() and dated_suffix.isdigit()
+            )
+            if response.model and not same_model:
+                if response.model != used_model and response.model != self._previous_answering_model:
+                    emit(event_sink, ModelFallback(
+                        agent_id=self._agent_ref.agent_id, run_id=run_ref.run_id,
+                        turn_id=turn_ref.turn_id, from_model=used_model,
+                        to_model=response.model, reason="refusal",
+                    ))
+                used_model = response.model
+            self._previous_answering_model = used_model
+            provider_calls += 1
+            threshold = long_context_threshold(self._provider.wire_format, used_model)
+            usage = UsageTotals.from_usage(
+                response.usage,
+                long_context=threshold is not None and response.usage.input_tokens > threshold,
+            )
+            usage_by_model[used_model] = usage_by_model.get(
+                used_model, UsageTotals()
+            ).merged(usage)
+            record_usage(used_model, usage, turn_id=turn_ref.turn_id)
+
+        def handle_response(turn_ref: TurnRef) -> bool:
+            nonlocal response
+            refused = response.stop_reason == "refusal"
+            if refused:
+                response = replace(response, message=replace(
+                    response.message, content="", tool_calls=[], reasoning="",
+                ))
+            # Stamp once and reuse, so the message in `conversation` and
+            # `final_response` carry the same turn identity.
+            response = replace(
+                response, message=replace(response.message, turn_id=turn_ref.turn_id)
+            )
+            if not refused:
+                append_message(response.message)
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            return refused
+
+        def run_tools(turn_ref: TurnRef) -> None:
+            nonlocal last_failure, repeated_failures
+            cut_call = next(
+                (
+                    call
+                    for call in response.message.tool_calls
+                    if call.id == response.cut_tool_call_id
+                ),
+                None,
+            )
+            executable_calls = [
+                call
+                for call in response.message.tool_calls
+                if call.id != response.cut_tool_call_id
+            ]
+            batches = partition_tool_calls(executable_calls, self._tools)
+            if cut_call is not None:
+                batches.append([cut_call])
+            for batch in batches:
+                for tool_call in batch:
+                    append_record(
+                        "tool_started",
+                        turn_id=turn_ref.turn_id,
+                        data={
+                            "tool_call_id": tool_call.id,
+                            "tool_name": tool_call.name,
+                        },
+                    )
+                    emit(
+                        event_sink,
+                        ToolCallStarted(
+                            agent_id=self._agent_ref.agent_id,
+                            run_id=run_ref.run_id,
+                            turn_id=turn_ref.turn_id,
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                            target=call_target(
+                                tool_call.name,
+                                tool_call.arguments,
+                            ),
+                        ),
+                    )
+
+                cancelled = False
+                results: dict[int, ToolResult] = {}
+                if batch[0].id == response.cut_tool_call_id:
+                    results[0] = ToolResult(
+                        tool_call_id=batch[0].id,
+                        ok=False,
+                        error=_CUT_TOOL_CALL_ERROR,
+                    )
+                elif len(batch) == 1:
+                    tool_call = batch[0]
+                    results[0] = self._execute_tool_call(
+                        tool_call,
+                        cancel,
+                        event_sink,
+                        run_ref.run_id,
+                        turn_ref.turn_id,
+                        hooks,
+                        catch_exceptions=False,
+                    )
+                else:
+                    executor = ThreadPoolExecutor(
+                        max_workers=min(len(batch), MAX_TOOL_CONCURRENCY)
+                    )
+                    futures = {
+                        executor.submit(
+                            self._execute_tool_call,
+                            tool_call,
+                            cancel,
+                            event_sink,
+                            run_ref.run_id,
+                            turn_ref.turn_id,
+                            hooks,
+                        ): index
+                        for index, tool_call in enumerate(batch)
+                    }
+                    try:
+                        for future in as_completed(futures):
+                            index = futures[future]
+                            try:
+                                results[index] = future.result()
+                            except OperationCancelled:
+                                cancelled = True
+                                for pending in futures:
+                                    pending.cancel()
+                            except CancelledError:
+                                pass
+                    finally:
+                        executor.shutdown(wait=True, cancel_futures=cancelled)
+
+                for index, tool_call in enumerate(batch):
+                    tool_result = results.get(index)
+                    if tool_result is None:
+                        continue
+                    if tool_result.ok:
+                        last_failure = None
+                        repeated_failures = 0
+                    else:
+                        failure = (tool_call.name, tool_result.error)
+                        repeated_failures = (
+                            repeated_failures + 1 if failure == last_failure else 1
+                        )
+                        last_failure = failure
+                        if repeated_failures >= 3:
+                            tool_result = replace(
+                                tool_result,
+                                error=(
+                                    f"{tool_result.error or ''} This has now failed "
+                                    f"{repeated_failures} times in a row with the same error. "
+                                    "Do not send it again; change approach, or tell the "
+                                    "person what is blocking you."
+                                ),
+                            )
+                    tool_result = mask_tool_result(tool_result)
+                    if self._result_store is not None:
+                        tool_result = offload_tool_result(
+                            tool_result,
+                            tool_name=tool_call.name,
+                            store=self._result_store,
+                        )
+                    tool_message = Message(
+                        role=Role.TOOL,
+                        tool_result=tool_result,
+                        turn_id=turn_ref.turn_id,
+                    )
+                    append_message(tool_message)
+                    emit(
+                        event_sink,
+                        ToolCallFinished(
+                            agent_id=self._agent_ref.agent_id,
+                            run_id=run_ref.run_id,
+                            turn_id=turn_ref.turn_id,
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                            ok=tool_result.ok,
+                            **_tool_result_event_fields(tool_result, tool_call.name),
+                        ),
+                    )
+                    if not tool_result.ok:
+                        emit(
+                            event_sink,
+                            ToolCallFailed(
+                                agent_id=self._agent_ref.agent_id,
+                                run_id=run_ref.run_id,
+                                turn_id=turn_ref.turn_id,
+                                tool_name=tool_call.name,
+                                tool_call_id=tool_call.id,
+                                error=tool_result.error or "tool call failed",
+                            ),
+                        )
+                    append_record(
+                        "tool_result",
+                        turn_id=turn_ref.turn_id,
+                        data={
+                            "tool_call_id": tool_call.id,
+                            "tool_name": tool_call.name,
+                            "ok": tool_result.ok,
+                            "cancelled": tool_result.cancelled,
+                            "offloaded_id": (
+                                None
+                                if tool_result.offloaded is None
+                                else tool_result.offloaded.id
+                            ),
+                        },
+                    )
+                if cancelled:
+                    raise OperationCancelled
+
+        def finish_turn(turn_ref: TurnRef) -> None:
+            append_record(
+                "turn_finished", turn_id=turn_ref.turn_id, data={"index": turn}
+            )
+            emit(
+                event_sink,
+                TurnFinished(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    turn_id=turn_ref.turn_id,
+                    index=turn,
+                ),
+            )
+
+        def start_turn() -> TurnRef:
+            nonlocal current_turn_ref
+            turn_ref = new_turn_ref(run_ref.run_id, turn)
+            current_turn_ref = turn_ref
+            append_record(
+                "turn_started", turn_id=turn_ref.turn_id, data={"index": turn}
+            )
+            emit(
+                event_sink,
+                TurnStarted(
+                    agent_id=self._agent_ref.agent_id,
+                    run_id=run_ref.run_id,
+                    turn_id=turn_ref.turn_id,
+                    index=turn,
+                ),
+            )
+            return turn_ref
+
+        def take_redirects_and_check_budget() -> str | None:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            boundary_budget = self._budget
+            if run is not None:
+                append_redirects()
+                boundary_budget = run.budget
+                if boundary_budget.max_turns is not None and boundary_budget.max_turns <= provider_calls:
+                    return "budget_turns"
+            budget_reason = exceeded_budget(boundary_budget)
+            if budget_reason is not None:
+                return budget_reason
+            return None
+
+        def start_run() -> None:
             append_record(
                 "run_started",
                 turn_id=None,
@@ -541,30 +945,7 @@ class ApiAgent:
                     "model": requested_model,
                 },
             )
-            message_digests = [_message_digest(message) for message in messages]
-            kept = 0
-            for persisted, current in zip(
-                self._persisted_digests, message_digests
-            ):
-                if persisted != current:
-                    break
-                kept += 1
-            if kept < len(self._persisted_digests):
-                append_record(
-                    "conversation_rewritten",
-                    turn_id=None,
-                    data={
-                        "kept_prefix": kept,
-                        "replaced": len(self._persisted_digests) - kept,
-                    },
-                )
-            for seed_message in messages[kept:]:
-                append_record(
-                    "message",
-                    turn_id=seed_message.turn_id,
-                    data=message_to_json(seed_message),
-                )
-            self._persisted_digests = message_digests
+            persist_messages(messages)
             emit(
                 event_sink,
                 RunStarted(
@@ -583,284 +964,23 @@ class ApiAgent:
                     message_count=max(len(messages) - 1, 0),
                 ),
             )
+
+        try:
+            start_run()
             turn = 0
             while self._max_turns is None or turn < self._max_turns:
                 turn += 1
-                turn_ref = new_turn_ref(run_ref.run_id, turn)
-                current_turn_ref = turn_ref
-                append_record(
-                    "turn_started", turn_id=turn_ref.turn_id, data={"index": turn}
-                )
-                emit(
-                    event_sink,
-                    TurnStarted(
-                        agent_id=self._agent_ref.agent_id,
-                        run_id=run_ref.run_id,
-                        turn_id=turn_ref.turn_id,
-                        index=turn,
-                    ),
-                )
-                if cancel is not None:
-                    cancel.raise_if_cancelled()
-                if pause is not None:
-                    pause.wait_while_paused(cancel)
-                boundary_budget = self._budget
-                if run is not None:
-                    for text in run.take_redirects():
-                        redirect = Message(role=Role.USER, content=text)
-                        conversation.append(redirect)
-                        append_record(
-                            "message",
-                            turn_id=redirect.turn_id,
-                            data=message_to_json(redirect),
-                        )
-                        self._persisted_digests.append(_message_digest(redirect))
-                    boundary_budget = run.budget
-                    if boundary_budget.max_turns is not None and boundary_budget.max_turns <= provider_calls:
-                        return finish_for_budget("budget_turns")
-                budget_reason = exceeded_budget(boundary_budget)
+                turn_ref = start_turn()
+                budget_reason = take_redirects_and_check_budget()
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)
                 if provider_calls > 0:
                     append_outside_change_notice()
-                for request_attempt in range(2):
-                    context_budget = (
-                        self._context_budget(model)
-                        if self._context_budget is not None
-                        else budget_for_model(self._provider.wire_format, model)
-                    )
-                    if estimate_messages_tokens(conversation) > context_budget:
-                        compact_conversation(context_budget, turn_id=turn_ref.turn_id)
-                    request = ModelRequest(
-                        messages=list(conversation),
-                        model=model,
-                        tools=self._tool_schemas,
-                        effort=effort,
-                        call_class=self._call_class,
-                    )
-                    append_record(
-                        "request",
-                        turn_id=turn_ref.turn_id,
-                        data={
-                            "model": model,
-                            "message_count": len(request.messages),
-                            "tool_names": sorted(self._tools),
-                        },
-                    )
-                    try:
-                        primary_model = request.model or getattr(self._provider, "model", None)
-                        fallback_chain = list(fallback_models)
-                        if primary_model in fallback_chain:
-                            fallback_chain = fallback_chain[fallback_chain.index(primary_model) + 1:]
-                        attempted_model = primary_model
-                        candidate_models = [request.model, *(
-                            candidate for candidate in fallback_chain
-                            if candidate != primary_model
-                        )]
-                        unavailable: ProviderUnavailableError | None = None
-                        used_model = primary_model or "unknown"
-                        for candidate_model in candidate_models:
-                            candidate_request = request
-                            candidate_effective_model = candidate_model or primary_model
-                            if candidate_model is not None and candidate_model != request.model:
-                                fallback_messages = [
-                                    replace(
-                                        message,
-                                        tool_calls=[
-                                            replace(call, provider_metadata={}, vendor_id=None)
-                                            for call in message.tool_calls
-                                        ],
-                                    ) if message.tool_calls else message
-                                    for message in request.messages
-                                ]
-                                from symphonai_api.model_table import model_capabilities
-
-                                capability = next((
-                                    item for item in model_capabilities()
-                                    if item.wire_format == self._provider.wire_format
-                                    and item.model == candidate_model
-                                ), None)
-                                effort = request.effort
-                                if capability is None or not any(
-                                    option.id == effort for option in capability.efforts
-                                ):
-                                    effort = None
-                                candidate_request = replace(
-                                    request,
-                                    model=candidate_model,
-                                    messages=fallback_messages,
-                                    effort=effort,
-                                )
-                            try:
-                                if self._stream:
-                                    assembler = StreamAssembler()
-                                    chunks = (
-                                        self._provider.create_response_stream(candidate_request)
-                                        if cancel is None
-                                        else self._provider.create_response_stream(
-                                            candidate_request, cancel=cancel
-                                        )
-                                    )
-                                    for chunk in chunks:
-                                        if cancel is not None:
-                                            cancel.raise_if_cancelled()
-                                        if isinstance(chunk, TextDelta):
-                                            emit(
-                                                event_sink,
-                                                AssistantTextDelta(
-                                                    agent_id=self._agent_ref.agent_id,
-                                                    run_id=run_ref.run_id,
-                                                    turn_id=turn_ref.turn_id,
-                                                    text=chunk.text,
-                                                ),
-                                            )
-                                        elif isinstance(chunk, ReasoningDelta):
-                                            emit(
-                                                event_sink,
-                                                AssistantReasoningDelta(
-                                                    agent_id=self._agent_ref.agent_id,
-                                                    run_id=run_ref.run_id,
-                                                    turn_id=turn_ref.turn_id,
-                                                    text=chunk.text,
-                                                ),
-                                            )
-                                        assembler.add(chunk)
-                                    response = assembler.finish()
-                                elif cancel is None:
-                                    response = self._provider.create_response(candidate_request)
-                                else:
-                                    response = self._provider.create_response(
-                                        candidate_request, cancel=cancel
-                                    )
-                            except ProviderUnavailableError as exc:
-                                unavailable = exc
-                                attempted_model = candidate_effective_model
-                                continue
-                            used_model = candidate_effective_model or "unknown"
-                            if candidate_effective_model != primary_model:
-                                emit(
-                                    event_sink,
-                                    ModelFallback(
-                                        agent_id=self._agent_ref.agent_id,
-                                        run_id=run_ref.run_id,
-                                        turn_id=turn_ref.turn_id,
-                                        from_model=attempted_model or "unknown",
-                                        to_model=used_model,
-                                        reason=(
-                                            "network" if unavailable.status is None
-                                            else str(unavailable.status)
-                                        ),
-                                    ),
-                                )
-                                model = candidate_effective_model
-                            break
-                        else:
-                            if unavailable is not None:
-                                raise unavailable
-                    except ContextLengthExceededError as exc:
-                        request_tokens = estimate_messages_tokens(request.messages)
-                        exc.request_tokens = request_tokens
-                        if self._context_overflow is not None:
-                            self._context_overflow(request_tokens, exc.actual_tokens)
-                        if request_attempt:
-                            raise
-                        budget = (
-                            self._context_budget(model)
-                            if self._context_budget is not None
-                            else budget_for_model(self._provider.wire_format, model)
-                        )
-                        forced_budget = min(
-                            budget,
-                            max(1, request_tokens - 1)
-                            if exc.actual_tokens is not None
-                            else max(1, request_tokens * 3 // 4),
-                        )
-                        try:
-                            changed = compact_conversation(
-                                forced_budget, turn_id=turn_ref.turn_id
-                            )
-                        except ContextCompactionError:
-                            raise exc from None
-                        if not changed:
-                            raise
-                        continue
-                    break
-                else:
-                    raise RuntimeError("request retry loop did not produce a response")
-                dated_suffix = (response.model or "").removeprefix(used_model + "-")
-                same_model = response.model == used_model or (
-                    response.model is not None and response.model.startswith(used_model + "-")
-                    and len(dated_suffix) == 8 and dated_suffix.isascii() and dated_suffix.isdigit()
-                )
-                if response.model and not same_model:
-                    if response.model != used_model and response.model != self._previous_answering_model:
-                        emit(event_sink, ModelFallback(
-                            agent_id=self._agent_ref.agent_id, run_id=run_ref.run_id,
-                            turn_id=turn_ref.turn_id, from_model=used_model,
-                            to_model=response.model, reason="refusal",
-                        ))
-                    used_model = response.model
-                self._previous_answering_model = used_model
-                provider_calls += 1
-                threshold = long_context_threshold(self._provider.wire_format, used_model)
-                usage = UsageTotals.from_usage(
-                    response.usage,
-                    long_context=threshold is not None and response.usage.input_tokens > threshold,
-                )
-                usage_by_model[used_model] = usage_by_model.get(
-                    used_model, UsageTotals()
-                ).merged(usage)
-                append_record(
-                    "usage",
-                    turn_id=turn_ref.turn_id,
-                    data={
-                        "model": used_model,
-                        "agent_name": self._agent_ref.name,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "calls": usage.calls,
-                        "cache_read_tokens": usage.cache_read_tokens,
-                        "cache_write_tokens": usage.cache_write_tokens,
-                        "cache_write_1h_tokens": usage.cache_write_1h_tokens,
-                        "long_context_input_tokens": usage.long_context_input_tokens,
-                        "long_context_output_tokens": usage.long_context_output_tokens,
-                        "long_context_cache_read_tokens": usage.long_context_cache_read_tokens,
-                        "long_context_cache_write_tokens": usage.long_context_cache_write_tokens,
-                    },
-                )
-                refused = response.stop_reason == "refusal"
-                if refused:
-                    response = replace(response, message=replace(
-                        response.message, content="", tool_calls=[], reasoning="",
-                    ))
-                # Stamp once and reuse, so the message in `conversation` and
-                # `final_response` carry the same turn identity.
-                response = replace(
-                    response, message=replace(response.message, turn_id=turn_ref.turn_id)
-                )
-                if not refused:
-                    conversation.append(response.message)
-                    append_record(
-                        "message",
-                        turn_id=turn_ref.turn_id,
-                        data=message_to_json(response.message),
-                    )
-                    self._persisted_digests.append(_message_digest(response.message))
-                if cancel is not None:
-                    cancel.raise_if_cancelled()
+                used_model = request_response(turn_ref)
+                record_response_usage(turn_ref, used_model)
+                refused = handle_response(turn_ref)
                 if not response.has_tool_calls:
-                    append_record(
-                        "turn_finished", turn_id=turn_ref.turn_id, data={"index": turn}
-                    )
-                    emit(
-                        event_sink,
-                        TurnFinished(
-                            agent_id=self._agent_ref.agent_id,
-                            run_id=run_ref.run_id,
-                            turn_id=turn_ref.turn_id,
-                            index=turn,
-                        ),
-                    )
+                    finish_turn(turn_ref)
                     if not refused and run is not None and run.has_redirects():
                         run_limit = run.budget.max_turns
                         redirect_limit = (
@@ -870,206 +990,9 @@ class ApiAgent:
                         )
                         if redirect_limit is None or turn < redirect_limit:
                             continue
-                    append_unread_redirects()
-                    result = AgentRunResult(
-                        final_response=response,
-                        messages=conversation,
-                        turns_used=turn,
-                        stopped_reason="refused" if refused else "final_response",
-                        run=run_ref,
-                        agent=self._agent_ref,
-                        usage_by_model=usage_by_model,
-                    )
-                    emit(
-                        event_sink,
-                        RunFinished(
-                            agent_id=self._agent_ref.agent_id,
-                            run_id=run_ref.run_id,
-                            agent_name=self._agent_ref.name,
-                            stopped_reason="refused" if refused else "final_response",
-                        ),
-                    )
-                    append_record(
-                        "run_finished",
-                        turn_id=None,
-                        data={"stopped_reason": "refused" if refused else "final_response",
-                              "turns_used": turn,
-                              **({"refusal_category": response.refusal_category} if refused else {})},
-                    )
-                    return result
-                cut_call = next(
-                    (
-                        call
-                        for call in response.message.tool_calls
-                        if call.id == response.cut_tool_call_id
-                    ),
-                    None,
-                )
-                executable_calls = [
-                    call
-                    for call in response.message.tool_calls
-                    if call.id != response.cut_tool_call_id
-                ]
-                batches = partition_tool_calls(executable_calls, self._tools)
-                if cut_call is not None:
-                    batches.append([cut_call])
-                for batch in batches:
-                    for tool_call in batch:
-                        append_record(
-                            "tool_started",
-                            turn_id=turn_ref.turn_id,
-                            data={
-                                "tool_call_id": tool_call.id,
-                                "tool_name": tool_call.name,
-                            },
-                        )
-                        emit(
-                            event_sink,
-                            ToolCallStarted(
-                                agent_id=self._agent_ref.agent_id,
-                                run_id=run_ref.run_id,
-                                turn_id=turn_ref.turn_id,
-                                tool_name=tool_call.name,
-                                tool_call_id=tool_call.id,
-                                target=call_target(
-                                    tool_call.name,
-                                    tool_call.arguments,
-                                ),
-                            ),
-                        )
-
-                    cancelled = False
-                    results: dict[int, ToolResult] = {}
-                    if batch[0].id == response.cut_tool_call_id:
-                        results[0] = ToolResult(
-                            tool_call_id=batch[0].id,
-                            ok=False,
-                            error=_CUT_TOOL_CALL_ERROR,
-                        )
-                    elif len(batch) == 1:
-                        tool_call = batch[0]
-                        results[0] = self._execute_tool_call(
-                            tool_call,
-                            cancel,
-                            event_sink,
-                            run_ref.run_id,
-                            turn_ref.turn_id,
-                            hooks,
-                            catch_exceptions=False,
-                        )
-                    else:
-                        executor = ThreadPoolExecutor(
-                            max_workers=min(len(batch), MAX_TOOL_CONCURRENCY)
-                        )
-                        futures = {
-                            executor.submit(
-                                self._execute_tool_call,
-                                tool_call,
-                                cancel,
-                                event_sink,
-                                run_ref.run_id,
-                                turn_ref.turn_id,
-                                hooks,
-                            ): index
-                            for index, tool_call in enumerate(batch)
-                        }
-                        try:
-                            for future in as_completed(futures):
-                                index = futures[future]
-                                try:
-                                    results[index] = future.result()
-                                except OperationCancelled:
-                                    cancelled = True
-                                    for pending in futures:
-                                        pending.cancel()
-                                except CancelledError:
-                                    pass
-                        finally:
-                            executor.shutdown(wait=True, cancel_futures=cancelled)
-
-                    for index, tool_call in enumerate(batch):
-                        tool_result = results.get(index)
-                        if tool_result is None:
-                            continue
-                        if tool_result.ok:
-                            last_failure = None
-                            repeated_failures = 0
-                        else:
-                            failure = (tool_call.name, tool_result.error)
-                            repeated_failures = (
-                                repeated_failures + 1 if failure == last_failure else 1
-                            )
-                            last_failure = failure
-                            if repeated_failures >= 3:
-                                tool_result = replace(
-                                    tool_result,
-                                    error=(
-                                        f"{tool_result.error or ''} This has now failed "
-                                        f"{repeated_failures} times in a row with the same error. "
-                                        "Do not send it again; change approach, or tell the "
-                                        "person what is blocking you."
-                                    ),
-                                )
-                        tool_result = mask_tool_result(tool_result)
-                        if self._result_store is not None:
-                            tool_result = offload_tool_result(
-                                tool_result,
-                                tool_name=tool_call.name,
-                                store=self._result_store,
-                            )
-                        tool_message = Message(
-                            role=Role.TOOL,
-                            tool_result=tool_result,
-                            turn_id=turn_ref.turn_id,
-                        )
-                        conversation.append(tool_message)
-                        append_record(
-                            "message",
-                            turn_id=turn_ref.turn_id,
-                            data=message_to_json(tool_message),
-                        )
-                        self._persisted_digests.append(_message_digest(tool_message))
-                        emit(
-                            event_sink,
-                            ToolCallFinished(
-                                agent_id=self._agent_ref.agent_id,
-                                run_id=run_ref.run_id,
-                                turn_id=turn_ref.turn_id,
-                                tool_name=tool_call.name,
-                                tool_call_id=tool_call.id,
-                                ok=tool_result.ok,
-                                **_tool_result_event_fields(tool_result, tool_call.name),
-                            ),
-                        )
-                        if not tool_result.ok:
-                            emit(
-                                event_sink,
-                                ToolCallFailed(
-                                    agent_id=self._agent_ref.agent_id,
-                                    run_id=run_ref.run_id,
-                                    turn_id=turn_ref.turn_id,
-                                    tool_name=tool_call.name,
-                                    tool_call_id=tool_call.id,
-                                    error=tool_result.error or "tool call failed",
-                                ),
-                            )
-                        append_record(
-                            "tool_result",
-                            turn_id=turn_ref.turn_id,
-                            data={
-                                "tool_call_id": tool_call.id,
-                                "tool_name": tool_call.name,
-                                "ok": tool_result.ok,
-                                "cancelled": tool_result.cancelled,
-                                "offloaded_id": (
-                                    None
-                                    if tool_result.offloaded is None
-                                    else tool_result.offloaded.id
-                                ),
-                            },
-                        )
-                    if cancelled:
-                        raise OperationCancelled
+                    append_redirects(close=True)
+                    return finish_run(response, "refused" if refused else "final_response", turn)
+                run_tools(turn_ref)
                 # Checked once every batch of this turn has been answered, not
                 # between batches: a stop with a tool call still outstanding
                 # would return a conversation no provider will accept, and
@@ -1080,44 +1003,10 @@ class ApiAgent:
                 budget_reason = exceeded_budget()
                 if budget_reason is not None:
                     return finish_for_budget(budget_reason)
-                append_record(
-                    "turn_finished", turn_id=turn_ref.turn_id, data={"index": turn}
-                )
-                emit(
-                    event_sink,
-                    TurnFinished(
-                        agent_id=self._agent_ref.agent_id,
-                        run_id=run_ref.run_id,
-                        turn_id=turn_ref.turn_id,
-                        index=turn,
-                    ),
-                )
+                finish_turn(turn_ref)
             assert response is not None and self._max_turns is not None
-            append_unread_redirects()
-            result = AgentRunResult(
-                final_response=response,
-                messages=conversation,
-                turns_used=turn,
-                stopped_reason="max_turns",
-                run=run_ref,
-                agent=self._agent_ref,
-                usage_by_model=usage_by_model,
-            )
-            emit(
-                event_sink,
-                RunFinished(
-                    agent_id=self._agent_ref.agent_id,
-                    run_id=run_ref.run_id,
-                    agent_name=self._agent_ref.name,
-                    stopped_reason="max_turns",
-                ),
-            )
-            append_record(
-                "run_finished",
-                turn_id=None,
-                data={"stopped_reason": "max_turns", "turns_used": turn},
-            )
-            return result
+            append_redirects(close=True)
+            return finish_run(response, "max_turns", turn)
         except OperationCancelled:
             repair_turn_id = (
                 None if current_turn_ref is None else current_turn_ref.turn_id
@@ -1129,7 +1018,7 @@ class ApiAgent:
                 turn_id=repair_turn_id,
             )
             append_repaired_tool_results(repaired_tool_call_ids, repair_turn_id)
-            append_unread_redirects()
+            append_redirects(close=True)
             append_record(
                 "cancellation",
                 turn_id=(
@@ -1140,33 +1029,7 @@ class ApiAgent:
             cancelled_response = response or ModelResponse(
                 message=Message(role=Role.ASSISTANT), stop_reason="cancelled"
             )
-            result = AgentRunResult(
-                final_response=cancelled_response,
-                messages=conversation,
-                turns_used=max(turn, 1),
-                stopped_reason="cancelled",
-                run=run_ref,
-                agent=self._agent_ref,
-                usage_by_model=usage_by_model,
-            )
-            try:
-                emit(
-                    event_sink,
-                    RunFinished(
-                        agent_id=self._agent_ref.agent_id,
-                        run_id=run_ref.run_id,
-                        agent_name=self._agent_ref.name,
-                        stopped_reason="cancelled",
-                    ),
-                )
-            except OperationCancelled:
-                pass
-            append_record(
-                "run_finished",
-                turn_id=None,
-                data={"stopped_reason": "cancelled", "turns_used": max(turn, 1)},
-            )
-            return result
+            return finish_run(cancelled_response, "cancelled", max(turn, 1))
         except Exception as exc:
             repair_turn_id = (
                 None if current_turn_ref is None else current_turn_ref.turn_id
@@ -1178,7 +1041,7 @@ class ApiAgent:
                 turn_id=repair_turn_id,
             )
             append_repaired_tool_results(repaired_tool_call_ids, repair_turn_id)
-            append_unread_redirects()
+            append_redirects(close=True)
             append_record(
                 "run_failed", turn_id=None, data={"error": str(exc)}
             )

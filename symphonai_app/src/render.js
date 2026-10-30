@@ -1,3 +1,14 @@
+export function button(document, text, onClick, options = {}) {
+  const control = element(document, "button", { text, ...options });
+  control.type = options.type ?? "button";
+  onClick && listen(control, "click", onClick);
+  return control;
+}
+
+export function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function element(document, tagName, { className = "", text = "" } = {}) {
   const value = document.createElement(tagName);
   value.className = className;
@@ -273,8 +284,7 @@ function renderCodeBlock(document, block, actions) {
       className: `syntax-${token.kind}`,
       text: token.text,
     })));
-  const copy = element(document, "button", { className: "code-copy" });
-  copy.type = "button";
+  const copy = button(document, "", null, { className: "code-copy" });
   copy.setAttribute("aria-label", "Copy code");
   copy.setAttribute("title", "Copy code");
   copy.addEventListener("click", async () => {
@@ -522,13 +532,10 @@ function renderEditCard(document, entry, _parseMarkdown, actions) {
     element(document, "strong", { text: `Edited ${entry.files.length} ${entry.files.length === 1 ? "file" : "files"}` }),
     element(document, "span", { text: `+${entry.added} −${entry.removed}` }),
   );
-  const undo = element(document, "button", { text: "Undo" });
-  undo.type = "button";
+  const undo = button(document, "Undo");
   undo.disabled = entry.undoing === true;
   undo.addEventListener("click", () => actions?.onUndo?.(entry));
-  const view = element(document, "button", { text: "View changes" });
-  view.type = "button";
-  view.addEventListener("click", () => actions?.onViewChanges?.());
+  const view = button(document, "View changes", () => actions?.onViewChanges?.());
   append(heading,
     ...(entry.undone ? [element(document, "span", { text: "Undone" })] : []),
     ...(!entry.undone && entry.canUndo && actions?.onUndo ? [undo] : []),
@@ -541,21 +548,14 @@ function renderEditCard(document, entry, _parseMarkdown, actions) {
     append(rows, element(document, "li", { text: `${file.path}  +${file.added} −${file.removed}` }));
   }
   append(card, rows);
-  const more = element(document, "button", {
-    className: "edit-card-more",
-    text: entry.expanded ? "Show fewer files" : `Show ${entry.files.length - 3} more files`,
-  });
-  more.type = "button";
-  more.addEventListener("click", () => {
+  const more = button(document, entry.expanded ? "Show fewer files" : `Show ${entry.files.length - 3} more files`, () => {
     entry.expanded = !entry.expanded;
     actions?.rerender?.();
-  });
+  }, { className: "edit-card-more" });
   append(card, ...(entry.files.length > 3 ? [more] : []));
   const conflicts = element(document, "ul");
   for (const path of entry.conflicts ?? []) append(conflicts, element(document, "li", { text: path }));
-  const force = element(document, "button", { text: "Revert anyway" });
-  force.type = "button";
-  force.addEventListener("click", () => actions?.onUndo?.(entry, true));
+  const force = button(document, "Revert anyway", () => actions?.onUndo?.(entry, true));
   append(card,
     ...(entry.conflicts?.length ? [
       element(document, "p", { text: "These files changed outside the agent:" }), conflicts, force,
@@ -593,13 +593,10 @@ function renderCommitCard(document, entry, _parseMarkdown, actions) {
     entry.message = message.value;
     commit.disabled = !entry.message.trim() || !entry.files.some((item) => item.checked);
   });
-  const commit = element(document, "button", { text: "Commit" });
-  commit.type = "button";
+  const commit = button(document, "Commit");
   commit.disabled = !entry.message.trim() || !entry.files.some((item) => item.checked);
   commit.addEventListener("click", () => actions?.onCommit?.(entry));
-  const cancel = element(document, "button", { text: "Cancel" });
-  cancel.type = "button";
-  cancel.addEventListener("click", () => actions?.onCancelCommit?.(entry));
+  const cancel = button(document, "Cancel", () => actions?.onCancelCommit?.(entry));
   append(card, files, message, commit, cancel);
   append(card, ...(entry.error ? [element(document, "p", { className: "error", text: entry.error })] : []));
   return card;
@@ -607,9 +604,7 @@ function renderCommitCard(document, entry, _parseMarkdown, actions) {
 
 function renderPullRequestCard(document, entry, _parseMarkdown, actions) {
   const card = element(document, "section", { className: "pull-request-card" });
-  const close = element(document, "button", { text: entry.problem ? "Close" : "Cancel" });
-  close.type = "button";
-  close.addEventListener("click", () => actions?.onClosePullRequest?.(entry));
+  const close = button(document, entry.problem ? "Close" : "Cancel", () => actions?.onClosePullRequest?.(entry));
   const problem = entry.problem
     ? [element(document, "p", { className: "error", text: entry.problem }), close]
     : [];
@@ -625,8 +620,7 @@ function renderPullRequestCard(document, entry, _parseMarkdown, actions) {
   body.value = entry.body;
   body.setAttribute("aria-label", "Pull request body");
   body.addEventListener("input", () => { entry.body = body.value; });
-  const submit = element(document, "button", { text: "Push and open pull request" });
-  submit.type = "button";
+  const submit = button(document, "Push and open pull request");
   submit.disabled = !entry.title.trim();
   submit.addEventListener("click", () => actions?.onOpenPullRequest?.(entry));
   const form = entry.problem

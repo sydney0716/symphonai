@@ -5,14 +5,14 @@ import { parseMarkdown } from "./markdown.js";
 import { highlight } from "./highlight.js";
 import { resolveHost } from "./host_handle.js";
 import { decodeEvent, FILES_CHANGED_EVENT_TYPE } from "./protocol.js";
-import { append, element, listen, renderDiff, renderMarkdownBlocks, renderSplitDiff, renderTranscript, replace } from "./render.js";
+import { button as makeButton, errorText, append, element, listen, renderDiff, renderMarkdownBlocks, renderSplitDiff, renderTranscript, replace } from "./render.js";
 import { splitDiff } from "./diff_split.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
 import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
 import { lookup, mergeKeymap, parseKeymap } from "./keys.js";
 import { createPicker } from "./picker.js";
-import { agentRows, ceilingRows, composeAgentText, generalRows, hookRows, inventoryRows, modelRows, parseAgentText, permissionRows, rosterRows, serverRows, trustRows } from "./settings.js";
+import { renderSettingsSection, renderMemorySettings, renderPermissionSettings } from "./settings.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
@@ -119,32 +119,11 @@ function clientFor(global, supplied) {
     return supplied;
   }
   const handshake = resolveHost(global);
-  const client = createClient({
+  return createClient({
     port: handshake.port,
     token: handshake.token,
     fetch: global.fetch.bind(global),
   });
-  async function request(path, options = {}) {
-    const { headers: extraHeaders = {}, ...requestOptions } = options;
-    const response = await global.fetch(`http://127.0.0.1:${handshake.port}${path}`, {
-      ...requestOptions,
-      headers: {
-        Authorization: `Bearer ${handshake.token}`,
-        ...extraHeaders,
-      },
-    });
-    if (!response || response.status < 200 || response.status >= 300) {
-      throw new Error(`host request failed with status ${response?.status}`);
-    }
-    return response.json();
-  }
-  client.newSession = () => request("/session/new", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
-  client.conversationStats = () => request("/conversation");
-  return client;
 }
 
 const ROUTE_KEY = "symphonai.route";
@@ -359,7 +338,7 @@ export async function start({ global, document, client }) {
       const reply = await boundary.roadmap();
       return { goals: Array.isArray(reply?.goals) ? reply.goals : [], error: "" };
     } catch (error) {
-      return { goals: [], error: error?.message || String(error) };
+      return { goals: [], error: errorText(error) };
     }
   };
   let project = await boundary.project();
@@ -593,132 +572,7 @@ export async function start({ global, document, client }) {
   }
 
   function renderMemoryContent() {
-    const children = [
-      element(document, "h2", { text: "Memory" }),
-      element(document, "p", {
-        text: "What the agent remembered from your conversations. It reads these at the start of each new conversation.",
-      }),
-    ];
-    if (memoryLoading) {
-      children.push(element(document, "p", { text: "Loading memory…" }));
-    } else if (memoryLoadError) {
-      const retry = element(document, "button", { text: "Retry" });
-      retry.type = "button";
-      listen(retry, "click", () => loadMemory());
-      children.push(
-        element(document, "p", { className: "memory-load-error", text: "Couldn't load memory." }),
-        retry,
-      );
-    } else if (memoryReply) {
-      for (const [scope, label] of [["project", "Project"], ["global", "Global"]]) {
-        const group = element(document, "section", { className: "memory-group" });
-        append(group, element(document, "h3", { text: label }));
-        const memorySet = memoryReply[scope] ?? {};
-        const entries = memorySet.entries ?? [];
-        if (memorySet.error === "unreadable") {
-          append(group, element(document, "p", {
-            className: "memory-load-error",
-            text: "This memory file couldn't be read, so nothing in it was changed.",
-          }));
-        } else if (entries.length === 0) {
-          append(group, element(document, "p", { className: "memory-empty", text: "Nothing remembered yet." }));
-        }
-        for (const entry of memorySet.error === "unreadable" ? [] : entries) {
-          const row = element(document, "article", { className: "memory-entry" });
-          if (entry.id === editingMemoryId) {
-            const textarea = element(document, "textarea", { className: "memory-edit-input" });
-            textarea.value = entry.text;
-            const save = element(document, "button", { text: "Save" });
-            save.type = "button";
-            const cancel = element(document, "button", { text: "Cancel" });
-            cancel.type = "button";
-            listen(save, "click", async () => {
-              try {
-                const reply = await boundary.updateMemory(entry.id, textarea.value);
-                memoryReply[scope].entries = entries.map((item) =>
-                  item.id === entry.id ? reply.entry : item
-                );
-                editingMemoryId = null;
-                memoryEditError = "";
-              } catch (error) {
-                memoryEditError = error instanceof Error ? error.message : String(error);
-              }
-              if (route?.page === "settings" && route.section === "memory") {
-                renderMemoryContent();
-              }
-            });
-            listen(cancel, "click", () => {
-              editingMemoryId = null;
-              memoryEditError = "";
-              renderMemoryContent();
-            });
-            append(row, textarea, save, cancel);
-            if (memoryEditError) {
-              append(row, element(document, "p", {
-                className: "memory-edit-error",
-                text: memoryEditError,
-              }));
-            }
-          } else if (entry.id === confirmingMemoryDeleteId) {
-            const confirm = element(document, "p", { text: "Delete this memory?" });
-            const remove = element(document, "button", { text: "Delete" });
-            remove.type = "button";
-            const cancel = element(document, "button", { text: "Cancel" });
-            cancel.type = "button";
-            listen(remove, "click", async () => {
-              try {
-                await boundary.deleteMemory(entry.id);
-                memoryReply[scope].entries = entries.filter((item) => item.id !== entry.id);
-                confirmingMemoryDeleteId = null;
-              } catch (error) {
-                memoryEditError = error instanceof Error ? error.message : String(error);
-              }
-              renderMemoryContent();
-            });
-            listen(cancel, "click", () => {
-              confirmingMemoryDeleteId = null;
-              memoryEditError = "";
-              renderMemoryContent();
-            });
-            append(row, element(document, "p", { className: "memory-entry-text", text: entry.text }), confirm, remove, cancel);
-            if (memoryEditError) {
-              append(row, element(document, "p", {
-                className: "memory-edit-error",
-                text: memoryEditError,
-              }));
-            }
-          } else {
-            const date = typeof entry.written_at === "string"
-              ? new Date(entry.written_at).toLocaleDateString()
-              : "";
-            const metadata = [date, entry.agent_name].filter(Boolean).join(" · ");
-            const edit = element(document, "button", { text: "Edit" });
-            edit.type = "button";
-            const remove = element(document, "button", { text: "Delete" });
-            remove.type = "button";
-            listen(edit, "click", () => {
-              editingMemoryId = entry.id;
-              memoryEditError = "";
-              renderMemoryContent();
-            });
-            listen(remove, "click", () => {
-              confirmingMemoryDeleteId = entry.id;
-              memoryEditError = "";
-              renderMemoryContent();
-            });
-            append(
-              row,
-              element(document, "p", { className: "memory-entry-text", text: entry.text }),
-              element(document, "p", { className: "memory-entry-meta", text: metadata }),
-              append(element(document, "div", { className: "memory-entry-actions" }), edit, remove),
-            );
-          }
-          append(group, row);
-        }
-        children.push(group);
-      }
-    }
-    replace(settingsContent, ...children);
+    renderMemorySettings(settingsContext());
   }
 
   async function loadMemory() {
@@ -741,52 +595,7 @@ export async function start({ global, document, client }) {
   }
 
   function renderPermissionsContent() {
-    const children = [element(document, "h2", { text: "Permissions" })];
-    if (permissionsLoading) {
-      children.push(element(document, "p", { text: "Loading permissions…" }));
-    } else if (permissionsReply === null) {
-      children.push(element(document, "p", { className: "permissions-error", text: permissionsError }));
-    } else {
-      const rows = permissionRows(permissionsReply);
-      if (permissionsError) {
-        children.push(element(document, "p", { className: "permissions-error", text: permissionsError }));
-      }
-      if (rows.length === 0) {
-        children.push(element(document, "p", { text: "No saved permissions." }));
-      } else {
-        for (const permission of rows) {
-          const row = element(document, "div", { className: "permission-row" });
-          const remove = element(document, "button", { text: "Remove" });
-          remove.type = "button";
-          listen(remove, "click", async () => {
-            permissionsError = "";
-            try {
-              await boundary.removePermission(permission.kind, permission.value);
-              permissionsReply = {
-                ...permissionsReply,
-                [permission.kind]: permissionsReply[permission.kind].filter((value) => (
-                  Array.isArray(permission.value)
-                    ? JSON.stringify(value) !== JSON.stringify(permission.value)
-                    : value !== permission.value
-                )),
-              };
-            } catch (error) {
-              const detail = error instanceof Error ? error.message.trim() : String(error);
-              permissionsError = detail ? `Could not remove permission: ${detail}` : "Could not remove permission.";
-            }
-            renderPermissionsContent();
-          });
-          append(
-            row,
-            element(document, "span", { text: permission.kind === "shell" ? "Command" : "Host" }),
-            element(document, "code", { text: permission.label }),
-            remove,
-          );
-          children.push(row);
-        }
-      }
-    }
-    replace(settingsContent, ...children);
+    renderPermissionSettings(settingsContext());
   }
 
   async function loadPermissions() {
@@ -797,7 +606,7 @@ export async function start({ global, document, client }) {
     try {
       permissionsReply = await boundary.permissions();
     } catch (error) {
-      const detail = error instanceof Error ? error.message.trim() : String(error);
+      const detail = errorText(error).trim();
       permissionsError = detail ? `Could not load permissions: ${detail}` : "Could not load permissions.";
     }
     permissionsLoading = false;
@@ -806,378 +615,57 @@ export async function start({ global, document, client }) {
     }
   }
 
-  function showSettings(section) {
-    if (section === "permissions") {
-      void loadPermissions();
-      return;
-    }
-    if (section === "memory") {
-      void loadMemory();
-      return;
-    }
-    if (section === "models") {
-      const models = modelRows(settingsReply);
-      const rows = models.map(({ name, envVar, present }) => [
-        name, envVar, present ? "present" : "absent",
-      ]);
-      const table = settingsTable(["Provider", "Environment variable", "Status"], rows);
-      const controls = element(document, "div", { className: "credential-controls" });
-      for (const [index, { envVar }] of models.entries()) {
-        const row = element(document, "div");
-        const label = element(document, "label", { text: `${envVar}: ` });
-        const input = element(document, "input");
-        input.type = "password";
-        input.autocomplete = "off";
-        const save = element(document, "button", { text: "Save" });
-        save.type = "button";
-        const remove = element(document, "button", { text: "Remove" });
-        remove.type = "button";
-        const notice = element(document, "span");
-        async function write(value) {
-          input.value = "";
-          try {
-            await boundary.storeCredential(envVar, value);
-            table.children[index + 1].children[2].textContent = value ? "present" : "absent";
-            const providerRow = providerRows.find((item) => item.env_var === envVar);
-            if (providerRow) providerRow.key_present = Boolean(value);
-            notice.textContent = value ? "Key stored." : "Key removed.";
-          } catch (error) {
-            const detail = typeof error?.message === "string" ? error.message.trim() : "";
-            notice.textContent = detail ? `Could not save the key: ${detail}` : "Could not save the key.";
-          }
-        }
-        listen(save, "click", () => write(input.value));
-        listen(remove, "click", () => write(""));
-        append(label, input);
-        append(row, label, save, remove, notice);
-        append(controls, row);
-      }
-      replace(
-        settingsContent,
-        element(document, "h2", { text: "Models" }),
-        table,
-        controls,
-      );
-      return;
-    }
-    if (section === "mcp") {
-      const rows = serverRows(settingsReply).map(({ name, command, started }) => [
-        name, command, started ? "started" : "not started",
-      ]);
-      replace(
-        settingsContent,
-        element(document, "h2", { text: "MCP servers" }),
-        settingsTable(["Server", "Command", "Started"], rows),
-      );
-      return;
-    }
-    if (section === "skills" || section === "plugins" || section === "agents") {
-      if (section === "agents") {
-        const tableRoot = element(document, "div");
-        const editorRoot = element(document, "div", { className: "agent-editor" });
-        const newAgent = element(document, "button", { text: "New agent" });
-        newAgent.type = "button";
-
-        function renderAgentRows() {
-          const rows = agentRows(settingsReply);
-          const table = element(document, "table", { className: "settings-table" });
-          const heading = element(document, "tr");
-          append(heading, ...["Name", "Scope", "Path", "Reason", "Action"].map((text) =>
-            element(document, "th", { text })
-          ));
-          append(table, heading);
-          for (const rowData of rows) {
-            const row = element(document, "tr", { className: "settings-row" });
-            const action = element(document, "td");
-            if (rowData.editable) {
-              const open = element(document, "button", { text: "Open" });
-              open.type = "button";
-              listen(open, "click", () => openAgent(rowData));
-              append(action, open);
-            } else if (rowData.reason) {
-              const withheld = element(document, "button", { text: "Withheld" });
-              withheld.type = "button";
-              withheld.disabled = true;
-              append(action, withheld);
-            }
-            append(
-              row,
-              element(document, "td", { text: rowData.name }),
-              element(document, "td", { text: rowData.scope }),
-              element(document, "td", { text: rowData.path }),
-              element(document, "td", { text: rowData.reason }),
-              action,
-            );
-            append(table, row);
-          }
-          replace(tableRoot, table);
-        }
-
-        function field(document, tagName, className, value) {
-          const control = element(document, tagName, { className });
-          control.value = value;
-          control.name = {
-            "agent-name": "name",
-            "agent-scope": "scope",
-            "agent-prompt": "prompt",
-            "agent-provider": "provider",
-            "agent-model": "model",
-            "agent-effort": "effort",
-            "agent-tools": "tools",
-            "agent-deny-tools": "deny_tools",
-          }[className] ?? className;
-          return control;
-        }
-
-        function renderEditor(values, identity = null, original = "", message = "") {
-          const form = element(document, "form", { className: "agent-form" });
-          const name = field(document, "input", "agent-name", identity?.name ?? "");
-          const scope = field(document, "select", "agent-scope", identity?.scope ?? "project");
-          replace(scope, ...["project", "user"].map((value) => {
-            const option = element(document, "option", { text: value });
-            option.value = value;
-            return option;
-          }));
-          scope.value = identity?.scope ?? "project";
-          name.disabled = Boolean(identity);
-          scope.disabled = Boolean(identity);
-          const prompt = field(document, "textarea", "agent-prompt", values.prompt);
-          const provider = field(document, "input", "agent-provider", values.provider);
-          const model = field(document, "input", "agent-model", values.model);
-          const effort = field(document, "input", "agent-effort", values.effort);
-          const tools = field(document, "textarea", "agent-tools", values.tools.join("\n"));
-          const denyTools = field(document, "textarea", "agent-deny-tools", values.denyTools.join("\n"));
-          const status = element(document, "p", { className: "agent-status", text: message });
-          const save = element(document, "button", { className: "agent-save primary", text: "Save" });
-          save.type = "submit";
-          const labels = [
-            ["Name", name], ["Scope", scope], ["Prompt", prompt],
-            ["Model provider", provider], ["Model id", model], ["Model effort", effort],
-            ["Allowed tools", tools], ["Denied tools", denyTools],
-          ];
-          for (const [labelText, control] of labels) {
-            const label = element(document, "label", { text: labelText });
-            append(label, control);
-            append(form, label);
-          }
-          append(form, save, status);
-          listen(form, "submit", async (event) => {
-            event.preventDefault();
-            const currentName = name.value.trim();
-            const currentScope = scope.value;
-            const text = composeAgentText({
-              prompt: prompt.value,
-              provider: provider.value.trim(),
-              model: model.value.trim(),
-              effort: effort.value.trim(),
-              tools: tools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
-              denyTools: denyTools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
-            }, original);
-            try {
-              const reply = await boundary.saveAgent(currentName, currentScope, text);
-              settingsReply = await boundary.settings();
-              skillCommands = getSkillCommands(settingsReply);
-              renderAgentRows();
-              status.textContent = reply?.message || "definition saved; it will take effect on the next run";
-            } catch (error) {
-              status.textContent = error instanceof Error ? error.message : String(error);
-            }
-          });
-          replace(editorRoot, form);
-        }
-
-        async function openAgent(rowData) {
-          const status = findAgentStatus();
-          if (status) status.textContent = "Loading definition…";
-          try {
-            const reply = await boundary.agent(rowData.name, rowData.scope);
-            const original = typeof reply?.text === "string" ? reply.text : "";
-            renderEditor(parseAgentText(original), rowData, original);
-          } catch (error) {
-            if (status) status.textContent = error instanceof Error ? error.message : String(error);
-          }
-        }
-
-        function findAgentStatus() {
-          const form = editorRoot.children[0];
-          for (const child of form?.children ?? []) {
-            if (child.className === "agent-status") return child;
-          }
-          return null;
-        }
-
-        listen(newAgent, "click", () => renderEditor(parseAgentText(""), null, ""));
-        renderAgentRows();
-        replace(
-          settingsContent,
-          element(document, "h2", { text: "Agents" }),
-          newAgent,
-          tableRoot,
-          editorRoot,
-        );
-        return;
-      }
-      const rows = rosterRows(settingsReply, section);
-      const table = settingsTable(["Name", "Path"], rows.map(({ name, path }) => [name, path]));
-      for (const [index, { path }] of rows.entries()) {
-        if (path) {
-          const copy = element(document, "button", { text: "Copy" });
-          copy.type = "button";
-          listen(copy, "click", () => global.navigator?.clipboard?.writeText?.(path));
-          append(table.children[index + 1].children[1], copy);
-        }
-      }
-      replace(
-        settingsContent,
-        element(document, "h2", { text: section[0].toUpperCase() + section.slice(1) }),
-        table,
-      );
-      return;
-    }
-    if (section === "hooks") {
-      const rows = hookRows(settingsReply).map(({ event, command }) => [event, command]);
-      replace(
-        settingsContent,
-        element(document, "h2", { text: "Hooks" }),
-        rows.length === 0
-          ? element(document, "p", { text: "No hooks are configured." })
-          : settingsTable(["Event", "Command"], rows),
-      );
-      return;
-    }
-    if (section === "ceiling") {
-      const rows = ceilingRows(settingsReply).map(({ capability, value }) => [capability, value]);
-      replace(
-        settingsContent,
-        element(document, "h2", { text: "Ceiling" }),
-        element(document, "p", { text: 'The most any agent may be granted. "not set" means the ceiling does not limit this.' }),
-        settingsTable(["Capability", "Value"], rows),
-      );
-      return;
-    }
-    if (section === "trust") {
-      const rows = trustRows(settingsReply).map(({ root, allow }) => [
-        root, allow.length === 0 ? "nothing" : allow.join(", "),
-      ]);
-      replace(
-        settingsContent,
-        element(document, "h2", { text: "Trust" }),
-        rows.length === 0
-          ? element(document, "p", { text: "No directories are trusted." })
-          : settingsTable(["Root", "Allows"], rows),
-      );
-      return;
-    }
-    if (section === "inventory") {
-      const rows = inventoryRows(settingsReply).map(({ scope, directory, names, reason }) => [
-        scope, directory, names.join(", "), reason,
-      ]);
-      replace(
-        settingsContent,
-        element(document, "h2", { text: "Inventory" }),
-        rows.length === 0
-          ? element(document, "p", { text: "Nothing was withheld." })
-          : settingsTable(["Scope", "Directory", "Names", "Reason"], rows),
-      );
-      return;
-    }
-    const rows = generalRows(settingsReply).map(({ key, value, scope }) => [
-      key, value, scope,
-    ]);
-    let theme = "system";
-    try {
-      const storedTheme = global.localStorage?.getItem("symphonai.theme");
-      if (storedTheme === "light" || storedTheme === "dark") theme = storedTheme;
-    } catch {
-      // Storage is optional in embedded and privacy-restricted browsers.
-    }
-    const themeSelect = document.createElement("select");
-    themeSelect.setAttribute("aria-label", "Theme");
-    for (const [value, label] of [["system", "System"], ["light", "Light"], ["dark", "Dark"]]) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = label;
-      themeSelect.append(option);
-    }
-    themeSelect.value = theme;
-    listen(themeSelect, "change", () => {
-      const selected = ["light", "dark"].includes(themeSelect.value)
-        ? themeSelect.value
-        : "system";
-      try {
-        global.localStorage?.setItem("symphonai.theme", selected);
-      } catch {
-        // Storage is optional in embedded and privacy-restricted browsers.
-      }
-      if (selected === "system") {
-        document.documentElement.removeAttribute("data-theme");
-      } else {
-        document.documentElement.setAttribute("data-theme", selected);
-      }
-    });
-    const statusOptions = [
-      ["provider", "Provider"], ["model", "Model"], ["effort", "Effort"],
-      ["mode", "Mode"], ["goal", "Goal"], ["context", "Context"], ["usage", "Usage"],
-    ];
-    const statusGroup = element(document, "section", { className: "status-line-settings" });
-    append(statusGroup, element(document, "h3", { text: "Status line" }));
-    for (const [key, label] of statusOptions) {
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = statusFields[key];
-      checkbox.setAttribute("aria-label", label);
-      listen(checkbox, "change", () => {
-        statusFields[key] = checkbox.checked;
-        saveStatusFields(global, statusFields);
-        showConversationUsage();
-      });
-      append(statusGroup, append(element(document, "label"), checkbox, element(document, "span", { text: label })));
-    }
-    const notificationGroup = element(document, "section", { className: "notification-settings" });
-    append(notificationGroup, element(document, "h3", { text: "Notifications" }));
-    const notificationCheckbox = document.createElement("input");
-    notificationCheckbox.type = "checkbox";
-    notificationCheckbox.checked = notificationsEnabled;
-    notificationCheckbox.setAttribute("aria-label", "Notifications");
-    const notificationNotice = element(document, "p", {
-      className: "notification-settings-message",
-      text: notificationMessage,
-    });
-    listen(notificationCheckbox, "change", async () => {
-      notificationMessage = "";
-      if (!notificationCheckbox.checked) {
-        notificationsEnabled = false;
-      } else {
-        try {
-          if (typeof global.Notification !== "function" || typeof global.Notification.requestPermission !== "function") {
-            throw new Error("notifications unavailable");
-          }
-          const permission = await global.Notification.requestPermission();
-          if (permission !== "granted") throw new Error("notifications unavailable");
-          notificationsEnabled = true;
-        } catch {
-          notificationsEnabled = false;
-          notificationCheckbox.checked = false;
-          notificationMessage = "Notifications are not available here.";
-        }
-      }
-      try {
-        global.localStorage?.setItem(NOTIFICATIONS_KEY, String(notificationsEnabled));
-      } catch {
-        // Storage is optional in embedded and privacy-restricted browsers.
-      }
-      notificationNotice.textContent = notificationMessage;
-    });
-    append(notificationGroup, append(element(document, "label"), notificationCheckbox, element(document, "span", { text: "Notifications" })), notificationNotice);
-    replace(
+  function settingsContext() {
+    return {
+      document,
+      NOTIFICATIONS_KEY,
+      renderMemoryContent,
+      renderPermissionsContent,
+      global,
+      boundary,
       settingsContent,
-      element(document, "h2", { text: "General" }),
-      element(document, "h3", { text: "Appearance" }),
-      themeSelect,
-      statusGroup,
-      notificationGroup,
-      settingsTable(["Setting", "Value", "Scope"], rows),
-    );
+      settingsTable,
+      loadPermissions,
+      loadMemory,
+      providerRows,
+      getSkillCommands,
+      statusFields,
+      saveStatusFields,
+      showConversationUsage,
+      get settingsReply() { return settingsReply; },
+      set settingsReply(value) { settingsReply = value; },
+      get skillCommands() { return skillCommands; },
+      set skillCommands(value) { skillCommands = value; },
+      get notificationsEnabled() { return notificationsEnabled; },
+      set notificationsEnabled(value) { notificationsEnabled = value; },
+      get notificationMessage() { return notificationMessage; },
+      set notificationMessage(value) { notificationMessage = value; },
+
+      get memoryLoading() { return memoryLoading; },
+      set memoryLoading(value) { memoryLoading = value; },
+      get memoryLoadError() { return memoryLoadError; },
+      set memoryLoadError(value) { memoryLoadError = value; },
+      get memoryReply() { return memoryReply; },
+      set memoryReply(value) { memoryReply = value; },
+      get editingMemoryId() { return editingMemoryId; },
+      set editingMemoryId(value) { editingMemoryId = value; },
+      get memoryEditError() { return memoryEditError; },
+      set memoryEditError(value) { memoryEditError = value; },
+      get confirmingMemoryDeleteId() { return confirmingMemoryDeleteId; },
+      set confirmingMemoryDeleteId(value) { confirmingMemoryDeleteId = value; },
+      get permissionsLoading() { return permissionsLoading; },
+      set permissionsLoading(value) { permissionsLoading = value; },
+      get permissionsReply() { return permissionsReply; },
+      set permissionsReply(value) { permissionsReply = value; },
+      get permissionsError() { return permissionsError; },
+      set permissionsError(value) { permissionsError = value; },
+      get route() { return route; },
+      set route(value) { route = value; },
+    };
+  }
+
+  function showSettings(section) {
+    renderSettingsSection(section, settingsContext());
   }
 
   let pageNavLinks = [];
@@ -1204,9 +692,7 @@ export async function start({ global, document, client }) {
         element(document, "p", { text: "These files changed outside the agent:" }),
         list,
       );
-      const force = element(document, "button", { text: "Revert anyway" });
-      force.type = "button";
-      listen(force, "click", async () => {
+      const force = makeButton(document, "Revert anyway", async () => {
         try {
           await boundary.revertChanges({ ...payload, force: true });
           await showChanges();
@@ -1218,7 +704,7 @@ export async function start({ global, document, client }) {
               warning,
               element(document, "p", {
                 className: "error",
-                text: error instanceof Error ? error.message : String(error),
+                text: errorText(error),
               }),
             );
           }
@@ -1238,7 +724,7 @@ export async function start({ global, document, client }) {
         } else {
           changesRoot.append(element(document, "p", {
             className: "error",
-            text: error instanceof Error ? error.message : String(error),
+            text: errorText(error),
           }));
         }
       }
@@ -1251,7 +737,7 @@ export async function start({ global, document, client }) {
       } catch (error) {
         row.append(element(document, "p", {
           className: "error",
-          text: error instanceof Error ? error.message : String(error),
+          text: errorText(error),
         }));
       }
     }
@@ -1267,11 +753,7 @@ export async function start({ global, document, client }) {
       append(view, unified, renderSplitDiff(document, diff, { splitDiff }));
       return view;
     }
-    const modeToggle = element(document, "button", {
-      className: "changes-diff-toggle",
-      text: diffMode === "side-by-side" ? "Unified" : "Side by side",
-    });
-    modeToggle.type = "button";
+    const modeToggle = makeButton(document, diffMode === "side-by-side" ? "Unified" : "Side by side", null, { className: "changes-diff-toggle" });
     modeToggle.setAttribute("aria-pressed", String(diffMode === "side-by-side"));
     listen(modeToggle, "click", () => {
       diffMode = diffMode === "side-by-side" ? "unified" : "side-by-side";
@@ -1286,7 +768,7 @@ export async function start({ global, document, client }) {
     if (gitResult.status === "rejected") {
       append(workingTree, element(document, "p", {
         className: "error",
-        text: gitResult.reason instanceof Error ? gitResult.reason.message : String(gitResult.reason),
+        text: errorText(gitResult.reason),
       }));
     } else if (gitReply?.repo === false) {
       append(workingTree, element(document, "p", { text: "Not a git repository." }));
@@ -1318,7 +800,7 @@ export async function start({ global, document, client }) {
             diffLoaded = true;
             row.replaceChildren(summary, diffView(result.diff ?? ""));
           } catch (error) {
-            diff.textContent = error instanceof Error ? error.message : String(error);
+            diff.textContent = errorText(error);
             diff.className = "diff error";
           } finally {
             diffLoading = false;
@@ -1332,9 +814,7 @@ export async function start({ global, document, client }) {
     if (conversationResult.status === "rejected") {
       children.push(element(document, "p", {
         className: "error",
-        text: conversationResult.reason instanceof Error
-          ? conversationResult.reason.message
-          : String(conversationResult.reason),
+        text: errorText(conversationResult.reason),
       }));
     }
     if (conversationResult.status === "fulfilled" && files.length === 0 && worktrees.length === 0) {
@@ -1354,12 +834,8 @@ export async function start({ global, document, client }) {
           text: "Not applied — these changes are in the worktree, not your files.",
         }));
         append(row, diffView(worktree.diff ?? ""));
-        const apply = element(document, "button", { text: "Apply worktree" });
-        apply.type = "button";
-        listen(apply, "click", () => worktreeAction(worktree.name, "applyWorktree", row));
-        const discard = element(document, "button", { text: "Discard worktree" });
-        discard.type = "button";
-        listen(discard, "click", () => worktreeAction(worktree.name, "discardWorktree", row));
+        const apply = makeButton(document, "Apply worktree", () => worktreeAction(worktree.name, "applyWorktree", row));
+        const discard = makeButton(document, "Discard worktree", () => worktreeAction(worktree.name, "discardWorktree", row));
         append(row, apply, discard);
         children.push(row);
       }
@@ -1376,9 +852,7 @@ export async function start({ global, document, client }) {
           }));
         }
         append(row, diffView(file.diff ?? ""));
-        const button = element(document, "button", { text: "Revert" });
-        button.type = "button";
-        listen(button, "click", () => revert({ path: file.path }));
+        const button = makeButton(document, "Revert", () => revert({ path: file.path }));
         append(row, button);
         children.push(row);
       }
@@ -1392,9 +866,7 @@ export async function start({ global, document, client }) {
           className: "changes-paths",
           text: Array.isArray(turn.paths) ? turn.paths.join(", ") : "",
         }));
-        const button = element(document, "button", { text: "Revert this prompt and later" });
-        button.type = "button";
-        listen(button, "click", () => revert({ key: turn.key }));
+        const button = makeButton(document, "Revert this prompt and later", () => revert({ key: turn.key }));
         append(row, button);
         children.push(row);
       }
@@ -1431,7 +903,7 @@ export async function start({ global, document, client }) {
       updateJobsPolling([]);
       append(jobsRoot, element(document, "p", {
         className: "error",
-        text: error instanceof Error ? error.message : String(error),
+        text: errorText(error),
       }));
       return;
     }
@@ -1442,8 +914,7 @@ export async function start({ global, document, client }) {
     command.setAttribute("placeholder", "Command to run in the background");
     command.value = jobsCommandDraft;
     command.setAttribute("aria-label", "Background command");
-    const run = element(document, "button", { text: "Run in background" });
-    run.type = "button";
+    const run = makeButton(document, "Run in background");
     run.disabled = !command.value.trim();
     listen(command, "input", () => {
       jobsCommandDraft = command.value;
@@ -1461,7 +932,7 @@ export async function start({ global, document, client }) {
         run.disabled = false;
         append(jobsRoot, element(document, "p", {
           className: "error",
-          text: error instanceof Error ? error.message : String(error),
+          text: errorText(error),
         }));
       }
     });
@@ -1488,16 +959,14 @@ export async function start({ global, document, client }) {
         element(document, "span", { text: elapsed }),
       );
       if (job.status === "running") {
-        const stop = element(document, "button", { text: "Stop" });
-        stop.type = "button";
-        listen(stop, "click", async () => {
+        const stop = makeButton(document, "Stop", async () => {
           try {
             await boundary.stopJob(job.id);
             await showJobs();
           } catch (error) {
             append(row, element(document, "p", {
               className: "error",
-              text: error instanceof Error ? error.message : String(error),
+              text: errorText(error),
             }));
           }
         });
@@ -1603,7 +1072,7 @@ export async function start({ global, document, client }) {
       global.location?.reload?.();
       return true;
     } catch (error) {
-      projectActionError = error instanceof Error ? error.message : String(error);
+      projectActionError = errorText(error);
       if (folderPicker) renderFolderPicker();
       else if (projectless) renderProjectStart();
       showProjects();
@@ -1626,25 +1095,19 @@ export async function start({ global, document, client }) {
     const heading = element(document, "h2", { text: "Open a project folder" });
     heading.id = "folder-picker-title";
     const path = element(document, "p", { className: "folder-picker-path", text: folderPicker.listing?.path ?? "Loading folders…" });
-    const up = element(document, "button", { text: "Up" });
-    up.type = "button";
+    const up = makeButton(document, "Up");
     up.disabled = !folderPicker.listing?.parent;
     listen(up, "click", () => folderPicker.listing?.parent && loadDirectories(folderPicker.listing.parent));
     const entries = element(document, "div", { className: "folder-picker-entries" });
     for (const entry of folderPicker.listing?.entries ?? []) {
-      const button = element(document, "button", { text: entry.name });
-      button.type = "button";
-      listen(button, "click", () => loadDirectories(entry.path));
+      const button = makeButton(document, entry.name, () => loadDirectories(entry.path));
       append(entries, button);
     }
     const error = element(document, "p", { className: "project-action-error", text: folderPicker.error || projectActionError });
-    const open = element(document, "button", { className: "primary", text: "Open this folder" });
-    open.type = "button";
+    const open = makeButton(document, "Open this folder", null, { className: "primary" });
     open.disabled = !folderPicker.listing?.path;
     listen(open, "click", () => folderPicker.listing?.path && openProjectAt(folderPicker.listing.path));
-    const cancel = element(document, "button", { text: "Cancel" });
-    cancel.type = "button";
-    listen(cancel, "click", closeFolderPicker);
+    const cancel = makeButton(document, "Cancel", closeFolderPicker);
     append(dialog, heading, path, up, entries, error, open, cancel);
     replace(projectless ? pageRoot : pickerHost, dialog);
     (folderPicker.listing?.entries?.[0] ? entries.children[0] : open).focus?.();
@@ -1656,7 +1119,7 @@ export async function start({ global, document, client }) {
       folderPicker.listing = await boundary.directories(path);
       folderPicker.error = "";
     } catch (error) {
-      folderPicker.error = error instanceof Error ? error.message : String(error);
+      folderPicker.error = errorText(error);
     }
     renderFolderPicker();
   }
@@ -1678,8 +1141,7 @@ export async function start({ global, document, client }) {
       const row = element(document, "div", { className: "project-start-row" });
       const label = `${item.name || projectName(item.repo_root)}${item.exists ? "" : " · missing"}`;
       if (item.exists) {
-        const button = element(document, "button", { text: label });
-        button.type = "button";
+        const button = makeButton(document, label);
         button.setAttribute("title", item.repo_root);
         listen(button, "click", () => openProjectAt(item.repo_root));
         append(row, button);
@@ -1688,9 +1150,7 @@ export async function start({ global, document, client }) {
       }
       append(list, row);
     }
-    const openFolder = element(document, "button", { className: "primary", text: "Open folder…" });
-    openFolder.type = "button";
-    listen(openFolder, "click", showFolderPicker);
+    const openFolder = makeButton(document, "Open folder…", showFolderPicker, { className: "primary" });
     append(projectStartScreen, list, openFolder,
       element(document, "p", { className: "project-action-error", text: projectActionError }));
     replace(pageRoot, projectStartScreen);
@@ -1713,8 +1173,7 @@ export async function start({ global, document, client }) {
   findInput.type = "search";
   findInput.setAttribute("aria-label", "Find in conversation");
   const findCount = element(document, "span", { className: "transcript-find-count", text: "0 of 0" });
-  const findClose = element(document, "button", { text: "Close" });
-  findClose.type = "button";
+  const findClose = makeButton(document, "Close");
   chatRoot.before(findBar);
   append(findBar, findInput, findCount, findClose);
   let findReplacements = [];
@@ -1841,7 +1300,7 @@ export async function start({ global, document, client }) {
           showTranscript();
           await showChanges();
         } catch (error) {
-          entry.error = error instanceof Error ? error.message : String(error);
+          entry.error = errorText(error);
           showTranscript();
         }
       },
@@ -1857,7 +1316,7 @@ export async function start({ global, document, client }) {
           entry.url = result.url;
           showTranscript();
         } catch (error) {
-          entry.error = error instanceof Error ? error.message : String(error);
+          entry.error = errorText(error);
           showTranscript();
         }
       },
@@ -1880,7 +1339,7 @@ export async function start({ global, document, client }) {
           if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
             entry.conflicts = error.paths;
           } else {
-            entry.error = error instanceof Error ? error.message : String(error);
+            entry.error = errorText(error);
           }
         } finally {
           entry.undoing = false;
@@ -1935,12 +1394,7 @@ export async function start({ global, document, client }) {
       form.hidden = false;
       return;
     }
-    const back = element(document, "button", {
-      className: "agent-conversation-back",
-      text: "Back to conversation",
-    });
-    back.type = "button";
-    listen(back, "click", closeAgentView);
+    const back = makeButton(document, "Back to conversation", closeAgentView, { className: "agent-conversation-back" });
     replace(
       agentViewHeader,
       element(document, "h2", { className: "agent-conversation-title", text: agentView.name }),
@@ -1992,7 +1446,7 @@ export async function start({ global, document, client }) {
     } catch (error) {
       if (generation !== agentViewGeneration || !agentView) return;
       agentView.loading = false;
-      agentView.error = error instanceof Error ? error.message : String(error);
+      agentView.error = errorText(error);
       showTranscript();
     }
   }
@@ -2086,9 +1540,7 @@ export async function start({ global, document, client }) {
       : [activeSearch.selectionStart, activeSearch.selectionEnd];
     let nextSearch = null;
     let nextRename = null;
-    const openFolder = element(document, "button", { className: "project-open-folder", text: "Open folder…" });
-    openFolder.type = "button";
-    listen(openFolder, "click", showFolderPicker);
+    const openFolder = makeButton(document, "Open folder…", showFolderPicker, { className: "project-open-folder" });
     groups.push(openFolder);
     projectActionError && groups.push(element(document, "p", { className: "project-action-error", text: projectActionError }));
     for (const group of projectGroups(sessions, project.repo_root)) {
@@ -2103,13 +1555,11 @@ export async function start({ global, document, client }) {
       });
       append(section, heading);
       if (group.root && !current) {
-        const openProject = element(document, "button", { className: "project-open-action", text: "Open project" });
-        openProject.type = "button";
-        listen(openProject, "click", (event) => {
+        const openProject = makeButton(document, "Open project", (event) => {
           event.preventDefault();
           event.stopPropagation();
           openProjectAt(group.root);
-        });
+        }, { className: "project-open-action" });
         append(heading, openProject);
       }
       if (current) {
@@ -2130,7 +1580,7 @@ export async function start({ global, document, client }) {
             archivedSessions = archivedResults;
             showProjects();
           } catch (error) {
-            sessionRowError = error instanceof Error ? error.message : String(error);
+            sessionRowError = errorText(error);
             showProjects();
           }
         });
@@ -2163,15 +1613,12 @@ export async function start({ global, document, client }) {
           continue;
         }
         const row = element(document, "div", { className: "session-row" });
-        const button = element(document, "button", {
-          className: "session-link",
-          text: label,
-        });
+        const button = makeButton(document, label, null, { className: "session-link" });
         if (session.run_id === currentSessionId) {
           button.setAttribute("aria-current", "true");
         }
         button.setAttribute("title", label);
-        button.type = "button";
+
         listen(button, "click", async () => openSession(session.run_id));
         append(row, button);
         if (editingSessionId === session.run_id) {
@@ -2196,16 +1643,13 @@ export async function start({ global, document, client }) {
           });
           append(row, field);
         } else {
-          const rename = element(document, "button", { className: "session-row-action icon-pencil" });
-          rename.type = "button";
+          const rename = makeButton(document, "", null, { className: "session-row-action icon-pencil" });
           rename.setAttribute("aria-label", "Rename");
           rename.setAttribute("title", "Rename");
-          const remove = element(document, "button", { className: "session-row-action icon-trash" });
-          remove.type = "button";
+          const remove = makeButton(document, "", null, { className: "session-row-action icon-trash" });
           remove.setAttribute("aria-label", "Delete");
           remove.setAttribute("title", "Delete");
-          const archive = element(document, "button", { className: "session-row-action icon-archive", text: "Archive" });
-          archive.type = "button";
+          const archive = makeButton(document, "Archive", null, { className: "session-row-action icon-archive" });
           archive.setAttribute("aria-label", "Archive");
           archive.setAttribute("title", "Archive");
           listen(archive, "click", () => updateSessionArchive(session.run_id, true));
@@ -2227,10 +1671,8 @@ export async function start({ global, document, client }) {
           if (confirmingSessionId === session.run_id) {
             const confirmation = element(document, "div", { className: "session-delete-confirmation" });
             append(confirmation, element(document, "span", { text: "Delete this conversation? This cannot be undone." }));
-            const confirm = element(document, "button", { text: "Delete" });
-            confirm.type = "button";
-            const cancel = element(document, "button", { text: "Cancel" });
-            cancel.type = "button";
+            const confirm = makeButton(document, "Delete");
+            const cancel = makeButton(document, "Cancel");
             listen(confirm, "click", () => deleteSession(session.run_id));
             listen(cancel, "click", () => {
               confirmingSessionId = null;
@@ -2253,24 +1695,15 @@ export async function start({ global, document, client }) {
           append(archived, element(document, "summary", { text: `Archived (${projectArchived.length})` }));
           for (const session of projectArchived) {
             const row = element(document, "div", { className: "session-row archived-session-row" });
-            const link = element(document, "button", {
-              className: "session-link",
-              text: session.title || session.run_id,
-            });
-            link.type = "button";
+            const link = makeButton(document, session.title || session.run_id, null, { className: "session-link" });
             link.setAttribute("title", session.title || session.run_id);
             if (session.run_id === currentSessionId) link.setAttribute("aria-current", "true");
             listen(link, "click", () => openSession(session.run_id));
-            const unarchive = element(document, "button", {
-              className: "session-row-action icon-archive",
-              text: "Unarchive",
-            });
-            unarchive.type = "button";
+            const unarchive = makeButton(document, "Unarchive", null, { className: "session-row-action icon-archive" });
             unarchive.setAttribute("aria-label", "Unarchive");
             unarchive.setAttribute("title", "Unarchive");
             listen(unarchive, "click", () => updateSessionArchive(session.run_id, false));
-            const remove = element(document, "button", { className: "session-row-action icon-trash" });
-            remove.type = "button";
+            const remove = makeButton(document, "", null, { className: "session-row-action icon-trash" });
             remove.setAttribute("aria-label", "Delete");
             remove.setAttribute("title", "Delete");
             listen(remove, "click", () => {
@@ -2282,10 +1715,8 @@ export async function start({ global, document, client }) {
             if (confirmingSessionId === session.run_id) {
               const confirmation = element(document, "div", { className: "session-delete-confirmation" });
               append(confirmation, element(document, "span", { text: "Delete this conversation? This cannot be undone." }));
-              const confirm = element(document, "button", { text: "Delete" });
-              confirm.type = "button";
-              const cancel = element(document, "button", { text: "Cancel" });
-              cancel.type = "button";
+              const confirm = makeButton(document, "Delete");
+              const cancel = makeButton(document, "Cancel");
               listen(confirm, "click", () => deleteSession(session.run_id));
               listen(cancel, "click", () => {
                 confirmingSessionId = null;
@@ -2335,7 +1766,7 @@ export async function start({ global, document, client }) {
       sessionRowError = "";
       await refreshSessionLists();
     } catch (error) {
-      sessionRowError = error instanceof Error ? error.message : String(error);
+      sessionRowError = errorText(error);
     }
     showProjects();
   }
@@ -2359,7 +1790,7 @@ export async function start({ global, document, client }) {
       showProjects();
       showTranscript();
     } catch (error) {
-      sessionRowError = error instanceof Error ? error.message : String(error);
+      sessionRowError = errorText(error);
       showProjects();
     }
   }
@@ -2371,7 +1802,7 @@ export async function start({ global, document, client }) {
       sessionArchiveError = "";
       confirmingSessionId = null;
     } catch (error) {
-      sessionArchiveError = error instanceof Error ? error.message : String(error);
+      sessionArchiveError = errorText(error);
     }
     showProjects();
   }
@@ -2397,9 +1828,9 @@ export async function start({ global, document, client }) {
       promptFailure = "";
       showPromptError();
       navigate({ page: "chat", section: "" });
-    } catch {
+    } catch (error) {
       await refreshConversation();
-      promptFailure = "Could not start a new chat.";
+      promptFailure = errorText(error);
       showPromptError();
     }
   }
@@ -2616,12 +2047,8 @@ export async function start({ global, document, client }) {
   }
 
   function showEditConflict(paths, text, recordId) {
-    const force = element(document, "button", { text: "Fork anyway" });
-    force.type = "button";
-    listen(force, "click", () => forkEditedPrompt(text, recordId, true));
-    const cancel = element(document, "button", { text: "Cancel edit" });
-    cancel.type = "button";
-    listen(cancel, "click", cancelPreviousMessageEdit);
+    const force = makeButton(document, "Fork anyway", () => forkEditedPrompt(text, recordId, true));
+    const cancel = makeButton(document, "Cancel edit", cancelPreviousMessageEdit);
     const list = element(document, "ul");
     for (const path of paths) append(list, element(document, "li", { text: path }));
     replace(
@@ -2649,7 +2076,7 @@ export async function start({ global, document, client }) {
       if (error?.status === 409 && Array.isArray(error.paths) && error.paths.length > 0) {
         showEditConflict(error.paths, text, recordId);
       } else {
-        promptFailure = error instanceof Error ? error.message : String(error);
+        promptFailure = errorText(error);
         showPromptError();
       }
     }
@@ -2684,9 +2111,7 @@ export async function start({ global, document, client }) {
         className: "attachment-chip",
         text: `${file.name || "image"} · ${file.size}`,
       });
-      const remove = element(document, "button", { text: "Remove" });
-      remove.type = "button";
-      listen(remove, "click", () => {
+      const remove = makeButton(document, "Remove", () => {
         pendingFiles.splice(index, 1);
         showPendingAttachments();
       });
@@ -2699,15 +2124,11 @@ export async function start({ global, document, client }) {
       const label = element(document, "span", {
         text: `Pasted text #${paste.id} · ${paste.lines} lines`,
       });
-      const expand = element(document, "button", { text: paste.expanded ? "Hide" : "Expand" });
-      expand.type = "button";
-      listen(expand, "click", () => {
+      const expand = makeButton(document, paste.expanded ? "Hide" : "Expand", () => {
         paste.expanded = !paste.expanded;
         showPendingAttachments();
       });
-      const remove = element(document, "button", { text: "Remove" });
-      remove.type = "button";
-      listen(remove, "click", () => {
+      const remove = makeButton(document, "Remove", () => {
         input.value = input.value.replace(paste.placeholder, "");
         pastedTextChips.splice(pastedTextChips.indexOf(paste), 1);
         showPendingAttachments();
@@ -2797,7 +2218,7 @@ export async function start({ global, document, client }) {
         await openRailTool("Loop");
       }
     } catch (error) {
-      roadmapError = error instanceof Error ? error.message : String(error);
+      roadmapError = errorText(error);
     } finally {
       roadmapPending = false;
       renderRoadmapUI();
@@ -2827,7 +2248,7 @@ export async function start({ global, document, client }) {
       roadmapDraft = field.value;
       add.disabled = roadmapPending || !roadmapDraft.trim();
     });
-    const add = element(document, "button", { text: "Add goal" });
+    const add = makeButton(document, "Add goal");
     add.type = "submit";
     add.disabled = roadmapPending || !roadmapDraft.trim();
     listen(form, "submit", (event) => {
@@ -2843,8 +2264,7 @@ export async function start({ global, document, client }) {
       const row = element(document, "li", { className: "roadmap-goal" });
       const detail = element(document, "div", { className: "roadmap-goal-detail" });
       if (typeof goal.loop_id === "string" && goal.loop_id) {
-        const link = element(document, "button", { className: "roadmap-goal-link", text: goal.goal });
-        link.type = "button";
+        const link = makeButton(document, goal.goal, null, { className: "roadmap-goal-link" });
         link.setAttribute("title", "Open loop");
         listen(link, "click", () => {
           selectedLoopId = goal.loop_id;
@@ -2857,20 +2277,17 @@ export async function start({ global, document, client }) {
       append(detail, element(document, "span", { className: "roadmap-goal-state", text: stateLabel(goal.state) }));
       const actions = element(document, "div", { className: "roadmap-goal-actions" });
       for (const [label, delta] of [["Move up", -1], ["Move down", 1]]) {
-        const button = element(document, "button", { text: label });
-        button.type = "button";
+        const button = makeButton(document, label);
         button.disabled = roadmapPending || index + delta < 0 || index + delta >= roadmapGoals.length;
         listen(button, "click", () => saveRoadmapAction(() => boundary.moveRoadmapGoal(goal.id, index + delta)));
         append(actions, button);
       }
-      const remove = element(document, "button", { text: "Remove" });
-      remove.type = "button";
+      const remove = makeButton(document, "Remove");
       remove.disabled = roadmapPending;
       listen(remove, "click", () => saveRoadmapAction(() => boundary.removeRoadmapGoal(goal.id)));
       append(actions, remove);
       if (["not_started", "cancelled"].includes(goal.state)) {
-        const start = element(document, "button", { text: "Start" });
-        start.type = "button";
+        const start = makeButton(document, "Start");
         start.disabled = roadmapPending;
         listen(start, "click", () => saveRoadmapAction(() => boundary.startRoadmapGoal(goal.id)));
         append(actions, start);
@@ -2899,15 +2316,13 @@ export async function start({ global, document, client }) {
 
   function renderFiles() {
     if (selectedFilePath !== null) {
-      const back = element(document, "button", { className: "files-back", text: "Back" });
-      back.type = "button";
-      listen(back, "click", () => {
+      const back = makeButton(document, "Back", () => {
         selectedFilePath = null;
         fileSourceText = null;
         fileSourceError = null;
         fileSourceLoading = false;
         renderFiles();
-      });
+      }, { className: "files-back" });
       const header = element(document, "div", { className: "files-viewer-header" });
       append(header, back, element(document, "strong", {
         className: "files-viewer-path",
@@ -2949,10 +2364,7 @@ export async function start({ global, document, client }) {
       for (const entry of listing.entries ?? []) {
         const childPath = path ? `${path}/${entry.name}` : entry.name;
         const isDirectory = entry.kind === "dir";
-        const row = element(document, "button", {
-          className: `files-tree-row${isDirectory ? " files-directory" : " files-file"}`,
-        });
-        row.type = "button";
+        const row = makeButton(document, "", null, { className: `files-tree-row${isDirectory ? " files-directory" : " files-file"}` });
         row.setAttribute("style", `padding-left: calc(var(--space-4) * ${depth})`);
         if (isDirectory) {
           const expanded = expandedFileDirectories.has(childPath);
@@ -3049,9 +2461,7 @@ export async function start({ global, document, client }) {
 
   function renderLoopCardDetails() {
     const details = element(document, "section", { className: "loop-card-details" });
-    const back = element(document, "button", { text: "Back to the board" });
-    back.type = "button";
-    listen(back, "click", returnToLoopBoard);
+    const back = makeButton(document, "Back to the board", returnToLoopBoard);
     append(details, back);
     if (cardDetailLoading) {
       append(details, element(document, "p", { text: "Loading card…" }));
@@ -3098,9 +2508,7 @@ export async function start({ global, document, client }) {
       for (const followUp of followUps) {
         const id = typeof followUp === "string" ? followUp : followUp?.id;
         if (typeof id !== "string") continue;
-        const button = element(document, "button", { className: "loop-follow-up", text: id });
-        button.type = "button";
-        listen(button, "click", () => loadLoopCard(id));
+        const button = makeButton(document, id, () => loadLoopCard(id), { className: "loop-follow-up" });
         const item = element(document, "li");
         append(item, button);
         append(list, item);
@@ -3110,9 +2518,7 @@ export async function start({ global, document, client }) {
     append(details, reviewSection);
 
     if (typeof cardDetail.session_id === "string" && cardDetail.session_id) {
-      const open = element(document, "button", { text: "Open conversation" });
-      open.type = "button";
-      listen(open, "click", () => openSession(cardDetail.session_id));
+      const open = makeButton(document, "Open conversation", () => openSession(cardDetail.session_id));
       append(details, open);
     }
     return details;
@@ -3162,8 +2568,7 @@ export async function start({ global, document, client }) {
       append(section, element(document, "p", { text: "Merge this branch with git." }));
     }
     if (selectedLoop.state === "awaiting_commit") {
-      const keep = element(document, "button", { className: "primary", text: "Keep the branch" });
-      keep.type = "button";
+      const keep = makeButton(document, "Keep the branch", null, { className: "primary" });
       keep.disabled = loopCommitPending;
       listen(keep, "click", () => runLoopCommit("approve"));
       append(section, keep);
@@ -3172,12 +2577,10 @@ export async function start({ global, document, client }) {
           className: "loop-discard-prompt",
           text: `Discard this work and delete ${selectedLoop.branch ?? ""}?`,
         }));
-        const discard = element(document, "button", { text: "Discard" });
-        discard.type = "button";
+        const discard = makeButton(document, "Discard");
         discard.disabled = loopCommitPending;
         listen(discard, "click", () => runLoopCommit("decline"));
-        const keep = element(document, "button", { text: "Keep" });
-        keep.type = "button";
+        const keep = makeButton(document, "Keep");
         keep.disabled = loopCommitPending;
         listen(keep, "click", () => {
           loopDiscardConfirm = false;
@@ -3185,8 +2588,7 @@ export async function start({ global, document, client }) {
         });
         append(section, discard, keep);
       } else {
-        const discard = element(document, "button", { text: "Discard" });
-        discard.type = "button";
+        const discard = makeButton(document, "Discard");
         discard.disabled = loopCommitPending;
         listen(discard, "click", () => {
           loopDiscardConfirm = true;
@@ -3218,7 +2620,7 @@ export async function start({ global, document, client }) {
     try {
       cardDetail = await boundary.loopCard(selectedLoopId, cardId);
     } catch (error) {
-      cardDetailError = error instanceof Error ? error.message : String(error);
+      cardDetailError = errorText(error);
     } finally {
       cardDetailLoading = false;
       renderLoops();
@@ -3238,7 +2640,7 @@ export async function start({ global, document, client }) {
         ? `Kept on branch ${reply?.branch ?? selectedLoop.branch ?? ""}`
         : "";
     } catch (error) {
-      loopCommitError = error instanceof Error ? error.message : String(error);
+      loopCommitError = errorText(error);
     } finally {
       loopCommitPending = false;
       renderLoops();
@@ -3259,11 +2661,7 @@ export async function start({ global, document, client }) {
       children.push(element(document, "p", { text: "No spec loops yet." }));
     }
     for (const loop of ordered) {
-      const button = element(document, "button", {
-        className: "loop-list-item",
-        text: `${loop.goal ?? loop.id} · ${stateLabel(loop.state)}`,
-      });
-      button.type = "button";
+      const button = makeButton(document, `${loop.goal ?? loop.id} · ${stateLabel(loop.state)}`, null, { className: "loop-list-item" });
       button.setAttribute("aria-selected", String(loop.id === selectedLoopId));
       listen(button, "click", () => loadLoop(loop.id));
       append(list, button);
@@ -3288,16 +2686,10 @@ export async function start({ global, document, client }) {
           const cardElement = element(document, "article", {
             className: `loop-card${card.state === "dropped" ? " loop-card-dimmed" : ""}`,
           });
-          const open = element(document, "button", {
-            className: "loop-card-open",
-            text: `${card.id} · ${card.title ?? ""} · ${stateLabel(card.state)}`,
-          });
-          open.type = "button";
-          listen(open, "click", () => loadLoopCard(card.id));
+          const open = makeButton(document, `${card.id} · ${card.title ?? ""} · ${stateLabel(card.state)}`, () => loadLoopCard(card.id), { className: "loop-card-open" });
           append(cardElement, open);
           if (selectedLoop.state === "awaiting_plan" && card.state !== "dropped") {
-            const drop = element(document, "button", { text: "Drop" });
-            drop.type = "button";
+            const drop = makeButton(document, "Drop");
             drop.disabled = loopActionPending;
             listen(drop, "click", () => runLoopAction(() => boundary.loopPlan(
               selectedLoopId,
@@ -3313,8 +2705,7 @@ export async function start({ global, document, client }) {
       append(detail, lanes);
       const actions = element(document, "div", { className: "loop-actions" });
       if (selectedLoop.state === "awaiting_plan") {
-        const approve = element(document, "button", { text: "Approve plan" });
-        approve.type = "button";
+        const approve = makeButton(document, "Approve plan");
         approve.disabled = loopActionPending;
         listen(approve, "click", () => runLoopAction(() => boundary.loopPlan(selectedLoopId, "approve")));
         append(actions, approve);
@@ -3327,8 +2718,7 @@ export async function start({ global, document, client }) {
         note.setAttribute("placeholder", "Note for the planner");
         note.disabled = loopActionPending;
         listen(note, "input", () => { loopReviseNote = note.value; });
-        const reviseButton = element(document, "button", { text: "Revise…" });
-        reviseButton.type = "button";
+        const reviseButton = makeButton(document, "Revise…");
         reviseButton.disabled = loopActionPending;
         listen(reviseButton, "click", () => runLoopAction(() => boundary.loopPlan(
           selectedLoopId,
@@ -3344,12 +2734,10 @@ export async function start({ global, document, client }) {
             className: "loop-cancel-prompt",
             text: "Cancel this loop? Its branch and work will be removed.",
           }));
-          const confirm = element(document, "button", { text: "Cancel loop" });
-          confirm.type = "button";
+          const confirm = makeButton(document, "Cancel loop");
           confirm.disabled = loopActionPending;
           listen(confirm, "click", () => runLoopAction(() => boundary.loopCancel(selectedLoopId)));
-          const keep = element(document, "button", { text: "Keep running" });
-          keep.type = "button";
+          const keep = makeButton(document, "Keep running");
           keep.disabled = loopActionPending;
           listen(keep, "click", () => {
             loopCancelConfirm = false;
@@ -3357,8 +2745,7 @@ export async function start({ global, document, client }) {
           });
           append(actions, confirm, keep);
         } else {
-          const cancel = element(document, "button", { text: "Cancel loop" });
-          cancel.type = "button";
+          const cancel = makeButton(document, "Cancel loop");
           cancel.disabled = loopActionPending;
           listen(cancel, "click", () => {
             loopCancelConfirm = true;
@@ -3368,8 +2755,7 @@ export async function start({ global, document, client }) {
         }
       }
       if (selectedLoop.state === "needs_attention") {
-        const resume = element(document, "button", { text: "Resume" });
-        resume.type = "button";
+        const resume = makeButton(document, "Resume");
         resume.disabled = loopActionPending;
         listen(resume, "click", () => runLoopAction(() => boundary.loopResume(selectedLoopId)));
         append(actions, resume);
@@ -3410,7 +2796,7 @@ export async function start({ global, document, client }) {
       const reply = await boundary.loop(id);
       selectedLoop = reply.loop;
     } catch (error) {
-      loopError = error instanceof Error ? error.message : String(error);
+      loopError = errorText(error);
     }
     renderLoops();
   }
@@ -3426,7 +2812,7 @@ export async function start({ global, document, client }) {
       loopCancelConfirm = false;
       loopReviseNote = "";
     } catch (error) {
-      loopActionError = error instanceof Error ? error.message : String(error);
+      loopActionError = errorText(error);
     } finally {
       loopActionPending = false;
       renderLoops();
@@ -3448,7 +2834,7 @@ export async function start({ global, document, client }) {
         renderLoops();
       }
     } catch (error) {
-      loopError = error instanceof Error ? error.message : String(error);
+      loopError = errorText(error);
       renderLoops();
     }
   }
@@ -3458,11 +2844,7 @@ export async function start({ global, document, client }) {
       const selected = name === selectedRailTool;
       const wrapper = element(document, "div", { className: "rail-tab-item" });
       wrapper.setAttribute("aria-selected", String(selected));
-      const tab = element(document, "button", {
-        className: `rail-tab ${RAIL_TOOL_ICONS[name]}`,
-        text: selected ? name : "",
-      });
-      tab.type = "button";
+      const tab = makeButton(document, selected ? name : "", null, { className: `rail-tab ${RAIL_TOOL_ICONS[name]}` });
       tab.setAttribute("role", "tab");
       tab.setAttribute("aria-selected", String(selected));
       tab.setAttribute("aria-label", name);
@@ -3470,8 +2852,7 @@ export async function start({ global, document, client }) {
       listen(tab, "click", () => selectRailTool(name));
       append(wrapper, tab);
       if (selected) {
-        const close = element(document, "button", { className: "rail-tab-close", text: "×" });
-        close.type = "button";
+        const close = makeButton(document, "×", null, { className: "rail-tab-close" });
         close.setAttribute("aria-label", `Close ${name}`);
         close.setAttribute("title", `Close ${name}`);
         listen(close, "click", () => closeRailTool(name));
@@ -3479,8 +2860,7 @@ export async function start({ global, document, client }) {
       }
       return wrapper;
     });
-    const add = element(document, "button", { className: "rail-tab-add", text: "+" });
-    add.type = "button";
+    const add = makeButton(document, "+", null, { className: "rail-tab-add" });
     add.setAttribute("aria-label", "Open a tool");
     listen(add, "click", () => {
       showRailTools = !showRailTools;
@@ -3489,9 +2869,7 @@ export async function start({ global, document, client }) {
     replace(railTabsRoot, ...tabs, add);
 
     const tools = RAIL_TOOL_NAMES.map((name) => {
-      const row = element(document, "button", { className: "rail-tool", text: name });
-      row.type = "button";
-      listen(row, "click", () => openRailTool(name));
+      const row = makeButton(document, name, () => openRailTool(name), { className: "rail-tool" });
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
@@ -3660,7 +3038,6 @@ export async function start({ global, document, client }) {
     const stateWords = {
       running: "running",
       waiting: "waiting for approval",
-      paused: "paused",
       stopping: "stopping",
       finished: "finished",
       failed: "failed",
@@ -3809,9 +3186,7 @@ export async function start({ global, document, client }) {
           className: "approval-session",
           text: session?.title || question.session_id,
         }));
-        const open = element(document, "button", { text: "Open" });
-        open.type = "button";
-        listen(open, "click", () => openSession(question.session_id));
+        const open = makeButton(document, "Open", () => openSession(question.session_id));
         append(row, open);
       }
       if (question.kind === "question") {
@@ -3834,24 +3209,18 @@ export async function start({ global, document, client }) {
             showApprovals();
           };
           for (const option of question.options ?? []) {
-            const button = element(document, "button", { text: option });
-            button.type = "button";
-            listen(button, "click", () => recordAnswer(true, option));
+            const button = makeButton(document, option, () => recordAnswer(true, option));
             append(row, button);
           }
           const answerInput = element(document, "textarea");
           answerInput.setAttribute("aria-label", "Your answer");
-          const answerButton = element(document, "button", { text: "Answer" });
-          answerButton.type = "button";
-          listen(answerButton, "click", () => {
+          const answerButton = makeButton(document, "Answer", () => {
             const answer = answerInput.value.trim();
             if (answer) void recordAnswer(true, answer);
           });
           const answerLabel = element(document, "label", { text: "Your answer" });
           append(answerLabel, answerInput);
-          const skip = element(document, "button", { text: "Skip" });
-          skip.type = "button";
-          listen(skip, "click", () => recordAnswer(false));
+          const skip = makeButton(document, "Skip", () => recordAnswer(false));
           append(row, answerLabel, answerButton, skip);
         }
         children.push(row);
@@ -3862,9 +3231,7 @@ export async function start({ global, document, client }) {
         if (question.state === "open") {
           for (const [mode, label] of [["ask", "Approve, ask before changes"], ["allow", "Approve, allow changes"]]) {
             if (!(question.options ?? []).includes(mode)) continue;
-            const approve = element(document, "button", { text: label });
-            approve.type = "button";
-            listen(approve, "click", async () => {
+            const approve = makeButton(document, label, async () => {
               const removeRecord = recordDecisionAtCurrentPosition({
                 type: "user-plan", plan: question.target,
                 outcome: mode === "ask" ? "Approved — ask before changes" : "Approved — allow changes",
@@ -3893,9 +3260,7 @@ export async function start({ global, document, client }) {
           feedback.setAttribute("aria-label", "Feedback");
           const feedbackLabel = element(document, "label", { text: "Feedback" });
           append(feedbackLabel, feedback);
-          const keep = element(document, "button", { text: "Keep planning" });
-          keep.type = "button";
-          listen(keep, "click", async () => {
+          const keep = makeButton(document, "Keep planning", async () => {
             const reason = feedback.value.trim();
             const removeRecord = recordDecisionAtCurrentPosition({
               type: "user-plan", plan: question.target,
@@ -3943,46 +3308,40 @@ export async function start({ global, document, client }) {
         };
         append(diffRoot, renderDiff(lines.slice(0, 20)));
         if (lines.length > 20) {
-          const expand = element(document, "button", { text: `Show all ${lines.length} lines` });
-          expand.type = "button";
-          listen(expand, "click", () => replace(diffRoot, renderDiff(lines)));
+          const expand = makeButton(document, `Show all ${lines.length} lines`, () => replace(diffRoot, renderDiff(lines)));
           append(diffRoot, expand);
         }
         append(row, diffRoot);
       }
       if (question.state === "open") {
         const allow = listen(
-          element(document, "button", { text: "Allow" }),
+          makeButton(document, "Allow"),
           "click",
           async () => {
             await approvals.answer(id, true, "");
             showApprovals();
           },
         );
-        allow.type = "button";
+
         if (question.remember) {
           const remember = listen(
-            element(document, "button", {
-              text: `Allow, and don't ask again for ${question.remember} in this chat`,
-            }),
+            makeButton(document, `Allow, and don't ask again for ${question.remember} in this chat`),
             "click",
             async () => {
               await approvals.answer(id, true, "", true);
               showApprovals();
             },
           );
-          remember.type = "button";
+
           const always = listen(
-            element(document, "button", {
-              text: `Always allow ${question.remember} in this project`,
-            }),
+            makeButton(document, `Always allow ${question.remember} in this project`),
             "click",
             async () => {
               await approvals.answer(id, true, "", "project");
               showApprovals();
             },
           );
-          always.type = "button";
+
           append(row, allow, remember, always);
         } else {
           append(row, allow);
@@ -4012,11 +3371,11 @@ export async function start({ global, document, client }) {
           }
         });
         const deny = listen(
-          element(document, "button", { text: "Deny" }),
+          makeButton(document, "Deny"),
           "click",
           denyWithNote,
         );
-        deny.type = "button";
+
         append(row, denyNote, deny);
       }
       children.push(row);
@@ -4271,7 +3630,7 @@ export async function start({ global, document, client }) {
       transcript.model.push({
         type: "command",
         command: "",
-        output: [error instanceof Error ? error.message : String(error)],
+        output: [errorText(error)],
       });
       showTranscript();
     }
@@ -4327,10 +3686,7 @@ export async function start({ global, document, client }) {
         const path = typeof file === "string" ? file : file.path;
         const name = path.split("/").at(-1);
         const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "Project root";
-        const row = element(document, "button", {
-          className: `quick-open-result${index === selected ? " focused" : ""}`,
-        });
-        row.type = "button";
+        const row = makeButton(document, "", null, { className: `quick-open-result${index === selected ? " focused" : ""}` });
         row.setAttribute("role", "option");
         row.setAttribute("aria-selected", String(index === selected));
         append(row,
@@ -4370,7 +3726,7 @@ export async function start({ global, document, client }) {
           if (!quickOpenState || version !== quickOpenVersion) return;
           rows = [];
           renderResults();
-          message.textContent = error instanceof Error ? error.message : String(error);
+          message.textContent = errorText(error);
         }
       }, 120);
     }
@@ -4422,7 +3778,7 @@ export async function start({ global, document, client }) {
       await refreshConversation();
     } catch (error) {
       closePicker();
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
     }
   }
 
@@ -4460,7 +3816,7 @@ export async function start({ global, document, client }) {
     try {
       listed = await boundary.sessions();
     } catch (error) {
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
       return;
     }
     let matches = (Array.isArray(listed) ? listed : [])
@@ -4479,7 +3835,7 @@ export async function start({ global, document, client }) {
         try {
           await openSession(matches[0].run_id);
         } catch (error) {
-          answerCommand(error instanceof Error ? error.message : String(error));
+          answerCommand(errorText(error));
         }
         return;
       }
@@ -4506,7 +3862,7 @@ export async function start({ global, document, client }) {
         try {
           await openSession(row.id);
         } catch (error) {
-          answerCommand(error instanceof Error ? error.message : String(error));
+          answerCommand(errorText(error));
         }
       },
       onCancel: () => {
@@ -4527,10 +3883,6 @@ export async function start({ global, document, client }) {
   }
 
   async function showCost(args) {
-    if (args.length > 0) {
-      answerCommand("Usage: /cost");
-      return;
-    }
     try {
       const reply = await boundary.conversationStats();
       const current = reply?.conversation;
@@ -4547,15 +3899,11 @@ export async function start({ global, document, client }) {
       lines.push(usageLine("Total", current.usage));
       answerCommand(lines.join("\n"));
     } catch (error) {
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
     }
   }
 
   async function showContext(args) {
-    if (args.length > 0) {
-      answerCommand("Usage: /context");
-      return;
-    }
     try {
       const reply = await boundary.conversationStats();
       const current = reply?.conversation;
@@ -4599,7 +3947,7 @@ export async function start({ global, document, client }) {
       );
       answerCommand(lines.join("\n"));
     } catch (error) {
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
     }
   }
 
@@ -4645,7 +3993,7 @@ export async function start({ global, document, client }) {
       await refreshConversation();
     } catch (error) {
       closePicker();
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
     }
   }
 
@@ -4671,7 +4019,7 @@ export async function start({ global, document, client }) {
           : `Model set to ${provider} / ${model}.`);
       await refreshConversation();
     } catch (error) {
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
     }
   }
 
@@ -4686,15 +4034,11 @@ export async function start({ global, document, client }) {
       await refreshConversation();
     } catch (error) {
       closePicker();
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
     }
   }
 
   async function runEffort(args) {
-    if (args.length > 1) {
-      answerCommand("Usage: /effort [<value>]");
-      return;
-    }
     const provider = conversation?.provider ?? selection.provider;
     const model = conversation?.model ?? selection.model;
     if (!provider || !model) {
@@ -4706,7 +4050,7 @@ export async function start({ global, document, client }) {
     try {
       reply = await boundary.models(provider);
     } catch (error) {
-      answerCommand(error instanceof Error ? error.message : String(error));
+      answerCommand(errorText(error));
       return;
     }
     if (reply?.state !== "available" || !Array.isArray(reply.models)) {
@@ -4789,7 +4133,7 @@ export async function start({ global, document, client }) {
     } catch (error) {
       showPicker({
         title: `Models · ${provider}`,
-        message: error instanceof Error ? error.message : String(error),
+        message: errorText(error),
         onCancel: cancel,
       });
     }
@@ -4863,11 +4207,7 @@ export async function start({ global, document, client }) {
 
   function renderFileRows() {
     const rows = fileMatches.map((path, index) => {
-      const button = element(document, "button", {
-        className: `file-suggestion${index === highlightedFile ? " focused" : ""}`,
-        text: path,
-      });
-      button.type = "button";
+      const button = makeButton(document, path, null, { className: `file-suggestion${index === highlightedFile ? " focused" : ""}` });
       button.setAttribute?.("role", "option");
       button.setAttribute?.("aria-selected", String(index === highlightedFile));
       listen(button, "mousedown", (event) => event.preventDefault());
@@ -4914,18 +4254,14 @@ export async function start({ global, document, client }) {
       if (serial !== fileSearchSerial) return;
       fileMatches = [];
       replace(fileMenu, element(document, "div", {
-        text: error instanceof Error ? error.message : String(error),
+        text: errorText(error),
       }));
     }
   }
 
   function renderCommandMenuRows() {
     const rows = commandMatches.map((command, index) => {
-      const button = element(document, "button", {
-        className: `command-suggestion${index === highlightedCommand ? " focused" : ""}`,
-        text: `/${command.name}  ${command.argumentHint}  ${command.description}`,
-      });
-      button.type = "button";
+      const button = makeButton(document, `/${command.name}  ${command.argumentHint}  ${command.description}`, null, { className: `command-suggestion${index === highlightedCommand ? " focused" : ""}` });
       button.setAttribute?.("role", "option");
       button.setAttribute?.("aria-selected", String(index === highlightedCommand));
       listen(button, "mousedown", (event) => event.preventDefault());
@@ -5136,329 +4472,53 @@ export async function start({ global, document, client }) {
       answerCommand(`Unknown command: ${typedName}. Type / to see commands.`);
       return;
     }
-    if (entry.name === "mode") {
-      closePicker();
-      if (args.length > 0) {
-        answerCommand("Usage: /mode");
-        return;
-      }
-      openModePicker();
+    const usage = `Usage: /${entry.name}${entry.argumentHint ? ` ${entry.argumentHint}` : ""}`;
+    if (entry.name === "mode" || entry.name === "model") closePicker();
+    if (args.length < (entry.minArgs ?? 0) || args.length > (entry.maxArgs ?? Infinity)) {
+      answerCommand(usage);
       return;
     }
-    if (entry.name === "model") {
-      closePicker();
-      if (args.length === 0) {
-        await openDefaultModelPicker();
-        return;
-      }
-      if (args.length === 1) {
-        await openModelPicker(args[0]);
-        return;
-      }
-      if (args.length === 2) {
-        const [provider, model] = args;
-        let listing;
-        try {
-          listing = await boundary.models(provider);
-        } catch (error) {
-          answerCommand(error instanceof Error ? error.message : String(error));
-          return;
-        }
-        if (listing?.state === "unknown") {
-          await chooseTypedModel(provider, model);
-          return;
-        }
-        if (
-          listing?.state === "available"
-          && Array.isArray(listing.models)
-          && !listing.models.some((row) => row.id === model)
-        ) {
-          await chooseTypedModel(provider, model);
-          return;
-        }
-        if (listing?.state === "available" && Array.isArray(listing.models)) {
-          await chooseTypedModel(provider, model, listing.models.find((row) => row.id === model)?.efforts);
-        } else {
-          await openModelPicker(provider, model);
-        }
-        return;
-      }
-      answerCommand("Usage: /model [<provider> [<id>]]");
-      return;
-    }
-    if (entry.name === "effort") {
-      await runEffort(args);
-      return;
-    }
-    if (entry.name === "help") {
-      if (args.length > 0) {
-        answerCommand("Usage: /help");
-        return;
-      }
-      const lines = COMMANDS.map(({ name, aliases, description, argumentHint }) => (
-        `/${name}${argumentHint ? ` ${argumentHint}` : ""} — ${description}`
-        + (aliases.length > 0 ? ` (also ${aliases.map((alias) => `/${alias}`).join(", ")})` : "")
-      ));
-      if (skillCommands.length > 0) {
-        lines.push("Skills:", ...skillCommands.map(({ name, argumentHint, description }) => (
-          `/${name} ${argumentHint} — ${description}`
-        )));
-      }
-      answerCommand(lines.join("\n"));
-      return;
-    }
-    if (entry.name === "new") {
-      if (args.length > 0) {
-        answerCommand("Usage: /new");
-        return;
-      }
-      await startNewChat();
-      return;
-    }
-    if (entry.name === "rename") {
-      const title = command.slice(typedName.length).trim();
-      if (!currentSessionId || !title) {
-        answerCommand("Usage: /rename <title>");
-        return;
-      }
-      try {
-        await boundary.renameSession(currentSessionId, title);
-        await refreshSessionLists();
-        showProjects();
-        answerCommand("Conversation renamed.");
-      } catch (error) {
-        answerCommand(error instanceof Error ? error.message : String(error));
-      }
-      return;
-    }
-    if (entry.name === "copy") {
-      if (args.length > 0) {
-        answerCommand("Usage: /copy");
-        return;
-      }
-      const latest = [...transcript.model].reverse().find((item) => item.type === "text" && typeof item.text === "string");
-      if (!latest) {
-        answerCommand("Nothing to copy yet.");
-        return;
-      }
-      try {
-        const clipboard = global.navigator?.clipboard;
-        if (typeof clipboard?.writeText !== "function") throw new Error("clipboard is unavailable");
-        await clipboard.writeText(latest.text);
-        answerCommand("Copied the last reply.");
-      } catch (error) {
-        answerCommand(`Could not copy: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      return;
-    }
-    if (entry.name === "export") {
-      if (args.length > 0) {
-        answerCommand("Usage: /export");
-        return;
-      }
-      if (!currentSessionId) {
-        answerCommand("There is nothing to export.");
-        return;
-      }
-      try {
-        const exported = await boundary.exportSession(currentSessionId);
-        const url = global.URL.createObjectURL(new global.Blob([exported.markdown], {
-          type: "text/markdown;charset=utf-8",
-        }));
-        const link = element(document, "a");
-        link.href = url;
-        link.download = exported.filename;
-        link.click();
-        global.URL.revokeObjectURL(url);
-        answerCommand("Conversation exported.");
-      } catch (error) {
-        answerCommand(`Could not export: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      return;
-    }
-    if (entry.name === "plan") {
-      if (args.length > 0) {
-        answerCommand("Usage: /plan");
-        return;
-      }
-      await togglePlanMode();
-      return;
-    }
-    if (entry.name === "spec") {
-      if (args.length > 0) {
-        answerCommand("Usage: /spec");
-        return;
-      }
-      specMode = !specMode;
-      showConversationUsage();
-      answerCommand(specMode
-        ? "Spec mode on: each message starts a spec loop."
-        : "Spec mode off.");
-      return;
-    }
-    if (entry.name === "resume") {
-      await resumeConversation(args);
-      return;
-    }
-    if (entry.name === "cost") {
-      await showCost(args);
-      return;
-    }
-    if (entry.name === "context") {
-      await showContext(args);
-      return;
-    }
-    if (entry.name === "compact") {
-      answerCommand("Compacting…");
-      try {
-        const instructions = command.slice(typedName.length).trim();
-        const result = await boundary.compact(instructions || undefined);
-        answerCommand(result.changed
-          ? `Compacted: ${result.before_tokens} → ${result.after_tokens} tokens, ${result.dropped_messages} messages summarized.`
-          : "Nothing to compact yet.");
-      } catch (error) {
-        answerCommand(error instanceof Error ? error.message : String(error));
-      }
-      await refreshConversation();
-      return;
-    }
-    if (entry.name === "goal") {
-      const usage = "Usage: /goal [<objective> [-- <check command>] | pause | resume | clear]";
-      if (args.length === 0) {
-        try {
-          const reply = await boundary.conversationStats();
-          const goal = reply?.conversation?.goal;
-          if (!goal) {
-            answerCommand("No goal. Set one with /goal <objective> [-- <check command>].");
-            return;
-          }
-          const lines = [
-            goal.objective,
-            `Check: ${goal.check?.length ? goal.check.join(" ") : "none (the agent reports completion)"}`,
-            `${goal.phase} · round ${goal.rounds} of ${goal.max_rounds}${goal.reason ? ` · ${goal.reason}` : ""}`,
-          ];
-          if (goal.last_check) {
-            lines.push(goal.last_check.ok
-              ? "Last check: passed"
-              : goal.last_check.exit === null
-                ? "Last check: timed out"
-                : `Last check: exit ${goal.last_check.exit}`);
-            if (goal.last_check.output) lines.push(goal.last_check.output);
-          }
-          answerCommand(lines.join("\n"));
-        } catch (error) {
-          answerCommand(error instanceof Error ? error.message : String(error));
-        }
-        return;
-      }
-      const action = args[0];
-      if (["pause", "resume", "clear"].includes(action)) {
-        if (args.length !== 1) {
-          answerCommand(usage);
-          return;
-        }
-        try {
-          const reply = await boundary.goalState(action);
-          conversation = { ...(conversation ?? {}), goal: reply.goal };
-          showConversationUsage();
-          answerCommand({ pause: "Goal paused.", resume: "Goal resumed.", clear: "Goal cleared." }[action]);
-        } catch (error) {
-          answerCommand(error instanceof Error ? error.message : String(error));
-        }
-        return;
-      }
-      const freeText = command.slice(typedName.length).trim();
-      const separator = freeText.indexOf(" -- ");
-      if (separator < 0 && (freeText === "--" || freeText.startsWith("-- ") || freeText.endsWith(" --"))) {
-        answerCommand(usage);
-        return;
-      }
-      const objective = (separator < 0 ? freeText : freeText.slice(0, separator)).trim();
-      const checkText = separator < 0 ? "" : freeText.slice(separator + 4).trim();
-      if (!objective || (separator >= 0 && !checkText)) {
-        answerCommand(usage);
-        return;
-      }
-      try {
-        const reply = await boundary.setGoal(objective, checkText ? checkText.split(/\s+/) : []);
-        conversation = { ...(conversation ?? {}), goal: reply.goal };
-        showConversationUsage();
-        answerCommand(`Goal set. Round 1 of ${reply.goal?.max_rounds ?? 10} started.`);
-      } catch (error) {
-        answerCommand(error?.status === 409
-          ? "A run is active. Wait for it to finish, then set the goal."
-          : error instanceof Error ? error.message : String(error));
-      }
-      return;
-    }
-    if (entry.name === "init") {
-      if (args.length > 0) {
-        answerCommand("Usage: /init");
-        return;
-      }
-      if ((conversation?.mode ?? currentMode) === "plan") {
-        answerCommand("Plan mode cannot write files. Switch with /plan, then run /init.");
-        return;
-      }
-      promptFailure = "";
-      showPromptError();
-      await submitCommandPrompt(INIT_PROMPT);
-      return;
-    }
-    if (entry.name === "review") {
-      const focus = command.slice(typedName.length).trim();
-      promptFailure = "";
-      showPromptError();
-      await submitCommandPrompt(`${REVIEW_PROMPT}${focus ? `\n\nFocus on: ${focus}` : ""}`);
-      return;
-    }
-    if (entry.name === "commit") {
-      let status;
-      try {
-        status = await boundary.gitStatus();
-      } catch (error) {
-        answerCommand(error instanceof Error ? error.message : String(error));
-        return;
-      }
-      if (status?.repo === false) {
-        answerCommand("Not a git repository.");
-        return;
-      }
-      const files = Array.isArray(status?.files) ? status.files : [];
-      if (files.length === 0) {
-        answerCommand("Nothing to commit.");
-        return;
-      }
-      commandEntry.type = "commit-card";
-      commandEntry.message = command.slice(typedName.length).trim();
-      commandEntry.files = files.map((file) => ({
-        ...file,
-        checked: true,
-        paths: [...new Set([file.old_path, file.path].filter((path) => typeof path === "string"))],
-      }));
-      commandEntry.error = "";
-      showTranscript();
-      return;
-    }
-    if (entry.name === "pr") {
-      if (args.length > 0) {
-        answerCommand("Usage: /pr");
-        return;
-      }
-      try {
-        const info = await boundary.pullRequestInfo();
-        commandEntry.type = "pull-request-card";
-        commandEntry.problem = info.problem || "";
-        commandEntry.branch = info.branch || "";
-        commandEntry.base = info.base || "";
-        commandEntry.title = info.title || "";
-        commandEntry.body = "";
-        commandEntry.error = "";
-        showTranscript();
-      } catch (error) {
-        answerCommand(error instanceof Error ? error.message : String(error));
-      }
-    }
+    await entry.handler({
+      closePicker,
+      openModePicker,
+      openDefaultModelPicker,
+      openModelPicker,
+      boundary,
+      chooseTypedModel,
+      runEffort,
+      answerCommand,
+      startNewChat,
+      refreshSessionLists,
+      showProjects,
+      transcript,
+      global,
+      togglePlanMode,
+      showConversationUsage,
+      resumeConversation,
+      showCost,
+      showContext,
+      showPromptError,
+      submitCommandPrompt,
+      INIT_PROMPT,
+      REVIEW_PROMPT,
+      showTranscript,
+      document,
+      refreshConversation,
+      get currentSessionId() { return currentSessionId; },
+      set currentSessionId(value) { currentSessionId = value; },
+      get specMode() { return specMode; },
+      set specMode(value) { specMode = value; },
+      get conversation() { return conversation; },
+      set conversation(value) { conversation = value; },
+      get currentMode() { return currentMode; },
+      set currentMode(value) { currentMode = value; },
+      get promptFailure() { return promptFailure; },
+      set promptFailure(value) { promptFailure = value; },
+      get commandEntry() { return commandEntry; },
+      set commandEntry(value) { commandEntry = value; },
+      get skillCommands() { return skillCommands; },
+      set skillCommands(value) { skillCommands = value; },
+    }, { args, command, typedName, usage });
   }
 
   async function runUserCommand(command, submittedText) {
@@ -5477,7 +4537,7 @@ export async function start({ global, document, client }) {
       else if (reply.timed_out) commandEntry.output.push("timed out");
       else if (reply.exit_code !== 0) commandEntry.output.push(`exit ${reply.exit_code}`);
     } catch (error) {
-      commandEntry.output.push(error instanceof Error ? error.message : String(error));
+      commandEntry.output.push(errorText(error));
     } finally {
       userCommandPending = false;
     }

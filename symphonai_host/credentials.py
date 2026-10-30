@@ -5,12 +5,11 @@ from __future__ import annotations
 import json
 import os
 import stat
-import tempfile
 import threading
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
-from symphonai_api.paths import ensure_private_directory, symphonai_home
+from symphonai_api.paths import ensure_private_directory, symphonai_home, write_atomic
 
 
 class CredentialError(ValueError):
@@ -77,16 +76,7 @@ def store(name: str, value: str, path: Path | None = None) -> None:
                 keys[name] = value
             else:
                 keys.pop(name, None)
-            descriptor, temporary = tempfile.mkstemp(dir=target.parent, prefix=".credentials-")
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                    json.dump({"version": 1, "keys": keys}, output)
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.replace(temporary, target)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            write_atomic(target, json.dumps({"version": 1, "keys": keys}), mode=0o600, fsync=True)
         except OSError:
             raise CredentialError("credentials file cannot be written") from None
 

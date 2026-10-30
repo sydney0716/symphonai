@@ -60,6 +60,7 @@ class MemoryTool(LocalTool):
                     "description": "Use global only for preferences that hold in every repository.",
                 },
                 "replaces": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "The id of an existing memory to update.",
                 },
@@ -68,20 +69,8 @@ class MemoryTool(LocalTool):
         }
 
     def validate(self, arguments: dict) -> str | None:
-        text = arguments.get("text")
-        if not isinstance(text, str) or not text.strip():
+        if not arguments["text"].strip():
             return "text must be a non-blank string"
-        if len(text) > MAX_ENTRY_CHARS:
-            return (
-                f"MAX_ENTRY_CHARS is {MAX_ENTRY_CHARS}; "
-                f"actual length is {len(text)}"
-            )
-        replaces = arguments.get("replaces")
-        if replaces is not None and (not isinstance(replaces, str) or not replaces):
-            return "replaces must be a non-blank memory id"
-        scope = arguments.get("scope", "project")
-        if replaces is None and scope not in ("project", "global"):
-            return "scope must be 'project' or 'global'"
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
@@ -164,7 +153,7 @@ class ForgetMemoryTool(LocalTool):
         return {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "The saved memory id."},
+                "id": {"minLength": 1, "type": "string", "description": "The saved memory id."},
                 "text": {
                     "type": "string",
                     "description": "The memory's current text, copied exactly from its seed.",
@@ -174,9 +163,7 @@ class ForgetMemoryTool(LocalTool):
         }
 
     def validate(self, arguments: dict) -> str | None:
-        if not isinstance(arguments.get("id"), str) or not arguments["id"]:
-            return "id must be a non-blank string"
-        if not isinstance(arguments.get("text"), str) or not arguments["text"].strip():
+        if not arguments["text"].strip():
             return "text must be a non-blank string"
         return None
 

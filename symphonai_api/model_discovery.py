@@ -193,7 +193,7 @@ def _read_api_key(provider: ModelProvider, default_env_var: str) -> tuple[str, s
 
 
 def _base_url(provider: ModelProvider) -> str:
-    base_url = getattr(provider, "base_url", None)
+    base_url = provider.base_url
     if not isinstance(base_url, str) or not base_url.strip():
         raise ProviderError(f"{provider.name} does not expose a base_url")
     return base_url.rstrip("/")

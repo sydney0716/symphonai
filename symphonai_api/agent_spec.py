@@ -18,6 +18,7 @@ from symphonai_api.budgets import RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.identity import SCHEMA_VERSION
 from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.schema_validation import validate_schema as _validate
 
 
 def _frozen(value: object) -> object:
@@ -119,41 +120,6 @@ def validate_input(contract: IOContract, text: str) -> tuple[object | None, str 
     except Exception as exc:
         return None, f"input must be valid JSON matching the contract: {exc}"
 
-
-def _validate(value: object, schema: Mapping[str, object], path: str) -> str | None:
-    expected = schema.get("type")
-    valid = {
-        "object": isinstance(value, dict), "array": isinstance(value, list),
-        "string": isinstance(value, str), "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-        "integer": isinstance(value, int) and not isinstance(value, bool),
-        "boolean": isinstance(value, bool), "null": value is None,
-    }
-    if expected in valid and not valid[expected]:
-        return f"{path} must be {expected}"
-    enum = schema.get("enum")
-    if isinstance(enum, (list, tuple)) and value not in enum:
-        return f"{path} must be one of the allowed enum values"
-    if expected == "object" and isinstance(value, dict):
-        required = schema.get("required", ())
-        if isinstance(required, (list, tuple)):
-            for key in required:
-                if isinstance(key, str) and key not in value:
-                    return f"{path} is missing required property {key!r}"
-        properties = schema.get("properties", {})
-        if isinstance(properties, Mapping):
-            for key, child in properties.items():
-                if key in value and isinstance(child, Mapping):
-                    error = _validate(value[key], child, f"{path}.{key}")
-                    if error:
-                        return error
-    if expected == "array" and isinstance(value, list) and isinstance(schema.get("items"), Mapping):
-        for index, item in enumerate(value):
-            error = _validate(item, schema["items"], f"{path}[{index}]")
-            if error:
-                return error
-    return None
-
-
 @dataclass(frozen=True)
 class AgentSpec:
     name: str
@@ -169,7 +135,6 @@ class AgentSpec:
     io: IOContract = IOContract()
     memory: MemorySettings = MemorySettings()
     call_class: CallClass = CallClass.BACKGROUND
-    max_depth: int = 0
     schema_version: int = SCHEMA_VERSION
     description: str | None = None
 
@@ -185,8 +150,6 @@ class AgentSpec:
                 raise ValueError("tool_names must not contain duplicates")
         if self.deadline_seconds is not None and not self.deadline_seconds > 0:
             raise ValueError("deadline_seconds must be positive")
-        if self.max_depth < 0:
-            raise ValueError("max_depth must be non-negative")
 
     def with_overrides(self, **changes: object) -> "AgentSpec":
         return replace(self, **changes)

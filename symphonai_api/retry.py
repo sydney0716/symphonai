@@ -107,13 +107,13 @@ def read_with_retry(
                 return body
         except urllib.error.HTTPError as exc:
             raw_detail = exc.read()
-            detail = _redacted_error_detail(raw_detail, api_key)
+            detail = redacted_error_detail(raw_detail, api_key)
             if (
                 400 <= exc.code <= 499
                 and exc.code not in RETRYABLE_STATUS_CODES
-                and _is_context_length_error(raw_detail)
+                and is_context_length_error(raw_detail)
             ):
-                actual_tokens, limit_tokens = _context_token_counts(raw_detail)
+                actual_tokens, limit_tokens = context_token_counts(raw_detail)
                 raise ContextLengthExceededError(
                     f"{operation} returned HTTP {exc.code}: "
                     "request exceeded the model context window",
@@ -128,11 +128,11 @@ def read_with_retry(
                     f"{operation} returned HTTP {exc.code} on {attempt_text} "
                     "and did not retry: background calls do not retry provider overload"
                 ) from None
-            retryable_status = _is_retryable_status(exc.code)
+            retryable_status = is_retryable_status(exc.code)
             retry_attempts = max_attempts
             if fallback_configured and exc.code in OVERLOAD_STATUS_CODES:
                 retry_attempts = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
-            if retryable_status and _wait_before_retry(
+            if retryable_status and wait_before_retry(
                 attempt=attempt,
                 max_attempts=retry_attempts,
                 deadline=deadline,
@@ -149,8 +149,8 @@ def read_with_retry(
             raise ProviderError(message) from None
         except urllib.error.URLError as exc:
             reason = redact_secret(str(exc.reason), api_key)
-            retryable_network = _is_retryable_url_error(exc)
-            if retryable_network and _wait_before_retry(
+            retryable_network = is_retryable_url_error(exc)
+            if retryable_network and wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -163,7 +163,7 @@ def read_with_retry(
                 raise ProviderUnavailableError(message, status=None) from None
             raise ProviderError(message) from None
         except TimeoutError:
-            if _wait_before_retry(
+            if wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -178,7 +178,7 @@ def read_with_retry(
             ) from None
         except http.client.IncompleteRead as exc:
             reason = redact_secret(str(exc), api_key)
-            if _wait_before_retry(
+            if wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -192,7 +192,7 @@ def read_with_retry(
             ) from None
         except ConnectionError as exc:
             reason = redact_secret(str(exc), api_key)
-            if _wait_before_retry(
+            if wait_before_retry(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 deadline=deadline,
@@ -208,13 +208,13 @@ def read_with_retry(
     raise AssertionError("retry loop exhausted without returning or raising")
 
 
-def _redacted_error_detail(raw: bytes, api_key: str) -> str:
+def redacted_error_detail(raw: bytes, api_key: str) -> str:
     redacted = redact_secret(raw.decode("utf-8", errors="replace"), api_key)
     truncated = redacted.encode("utf-8")[:MAX_ERROR_DETAIL_BYTES]
     return truncated.decode("utf-8", errors="ignore")
 
 
-def _is_context_length_error(raw: bytes) -> bool:
+def is_context_length_error(raw: bytes) -> bool:
     detail = raw.decode("utf-8", errors="replace")
     lowered = detail.casefold()
     return any(marker in lowered for marker in _CONTEXT_LENGTH_MARKERS) or bool(
@@ -222,7 +222,7 @@ def _is_context_length_error(raw: bytes) -> bool:
     )
 
 
-def _context_token_counts(raw: bytes) -> tuple[int | None, int | None]:
+def context_token_counts(raw: bytes) -> tuple[int | None, int | None]:
     """Extract input and limit counts from supported vendor overflow errors."""
     detail = raw.decode("utf-8", errors="replace")
     for pattern in (_ANTHROPIC_CONTEXT_COUNTS, _GEMINI_CONTEXT_COUNTS):
@@ -232,13 +232,13 @@ def _context_token_counts(raw: bytes) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _is_retryable_status(status: int) -> bool:
+def is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUS_CODES or (
         500 <= status <= 599 and status not in NON_RETRYABLE_SERVER_STATUS_CODES
     )
 
 
-def _is_retryable_url_error(exc: urllib.error.URLError) -> bool:
+def is_retryable_url_error(exc: urllib.error.URLError) -> bool:
     reason = exc.reason
     if isinstance(reason, (ssl.SSLCertVerificationError, ssl.CertificateError, ValueError, TypeError)):
         return False
@@ -251,7 +251,7 @@ def _is_retryable_url_error(exc: urllib.error.URLError) -> bool:
     return True
 
 
-def _wait_before_retry(
+def wait_before_retry(
     *,
     attempt: int,
     max_attempts: int,

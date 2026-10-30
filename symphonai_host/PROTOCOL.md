@@ -643,15 +643,6 @@ preserve the loader's file-and-key message. A successful write returns
 message explaining that the definition applies on the next run. Both routes
 require the ordinary bearer token.
 
-Authenticated `POST /agent/control` takes
-`{"agent_id": <id>, "action": <pause|resume|redirect|stop>, "text"?: <text>}`.
-Pause and resume take effect at the agent's next turn boundary; redirect queues
-text as the next user message. Stop on a subagent cancels only that subagent,
-while stop on the leader uses the ordinary host stop path. Success returns
-`{"agent_id": <id>, "state": <paused|running|stopping>}`. Invalid requests
-receive `400`, an absent active run or invalid transition receives `409`, and
-an unknown or finished agent receives `404`.
-
 Authenticated `GET /git/status` returns the current project's working-tree
 changes as `{"repo": true, "branch": str | null, "files": [...]}`. Each
 file has its repository-relative `path`, `status` (`modified`, `added`,

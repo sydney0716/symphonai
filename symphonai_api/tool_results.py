@@ -8,14 +8,13 @@ directory so its content-addressed handles survive process restarts.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from symphonai_api.paths import write_atomic
 
 from symphonai_api.models import OffloadedResult, ToolResult
 from symphonai_api.session import TranscriptError
@@ -141,35 +140,10 @@ class ToolResultStore:
         path = self._directory / result_id
         if path.is_file():
             return
-        temporary_path: Path | None = None
-        descriptor: int | None = None
         try:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{result_id}-",
-                dir=self._directory,
-            )
-            temporary_path = Path(temporary_name)
-            os.fchmod(descriptor, 0o600)
-            handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
-            descriptor = None
-            with handle:
-                handle.write(content)
-                handle.flush()
-            os.replace(temporary_path, path)
-            os.chmod(path, 0o600)
+            write_atomic(path, content, mode=0o600, fsync=False)
         except (OSError, UnicodeError) as exc:
             raise TranscriptError(f"cannot write tool result {result_id}: {exc}") from exc
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     def _read_persisted(self, result_id: str) -> str | None:
         directories = (self._directory, *self._fallback_directories)

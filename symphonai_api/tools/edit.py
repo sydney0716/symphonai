@@ -15,18 +15,8 @@ from symphonai_api.tools.read_ledger import ReadLedger
 
 
 def _edit_validation_error(arguments: dict) -> str | None:
-    old_string = arguments.get("old_string")
-    new_string = arguments.get("new_string")
-    if not isinstance(old_string, str):
-        return "missing required argument: old_string"
-    if not isinstance(new_string, str):
-        return "missing required argument: new_string"
-    if old_string == "":
-        return "old_string must not be empty; use write_file to create a file"
-    if old_string == new_string:
+    if arguments["old_string"] == arguments["new_string"]:
         return "old_string and new_string are identical"
-    if "replace_all" in arguments and not isinstance(arguments["replace_all"], bool):
-        return "replace_all must be a boolean"
     return None
 
 
@@ -129,10 +119,11 @@ class EditFileTool(LocalTool):
             "type": "object",
             "properties": {
                 "path": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "Path to the file to edit, relative to the allowed root.",
                 },
-                "old_string": {"type": "string", "description": "Exact text to replace."},
+                "old_string": {"minLength": 1, "type": "string", "description": "Exact text to replace."},
                 "new_string": {"type": "string", "description": "Replacement text."},
                 "replace_all": {
                     "type": "boolean",
@@ -153,9 +144,6 @@ class EditFileTool(LocalTool):
         )
 
     def validate(self, arguments: dict) -> str | None:
-        path = arguments.get("path")
-        if not isinstance(path, str) or not path:
-            return "missing required argument: path"
         return _edit_validation_error(arguments)
 
     def _execute(
@@ -239,7 +227,7 @@ class MultiEditFileTool(EditFileTool):
     @property
     def parameters(self) -> dict:
         edit_properties = {
-            "old_string": {"type": "string", "description": "Exact text to replace."},
+            "old_string": {"minLength": 1, "type": "string", "description": "Exact text to replace."},
             "new_string": {"type": "string", "description": "Replacement text."},
             "replace_all": {
                 "type": "boolean",
@@ -251,10 +239,12 @@ class MultiEditFileTool(EditFileTool):
             "type": "object",
             "properties": {
                 "path": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "Path to the file to edit, relative to the allowed root.",
                 },
                 "edits": {
+                    "minItems": 1,
                     "type": "array",
                     "description": "Ordered exact-text replacements.",
                     "items": {
@@ -268,15 +258,7 @@ class MultiEditFileTool(EditFileTool):
         }
 
     def validate(self, arguments: dict) -> str | None:
-        path = arguments.get("path")
-        if not isinstance(path, str) or not path:
-            return "missing required argument: path"
-        edits = arguments.get("edits")
-        if not isinstance(edits, list) or not edits or any(
-            not isinstance(edit, dict) for edit in edits
-        ):
-            return "missing required argument: edits"
-        for index, edit in enumerate(edits, start=1):
+        for index, edit in enumerate(arguments["edits"], start=1):
             error = _edit_validation_error(edit)
             if error is not None:
                 return f"edit {index}: {error}"

@@ -1,3 +1,5 @@
+import { button as makeButton, errorText, append, element, listen, replace } from "./render.js";
+
 export class SettingsError extends Error {
   constructor(message) {
     super(message);
@@ -352,4 +354,572 @@ export function hookRows(reply) {
     .sort((left, right) =>
       left.event.localeCompare(right.event) || left.command.localeCompare(right.command)
     );
+}
+
+function renderPermissions(section, context) {
+  const { loadPermissions } = context;
+  void loadPermissions();
+  return;
+}
+
+function renderMemory(section, context) {
+  const { loadMemory } = context;
+  void loadMemory();
+  return;
+}
+
+function renderModels(section, context) {
+  const { document, boundary, settingsContent, settingsTable, providerRows } = context;
+  const models = modelRows(context.settingsReply);
+  const rows = models.map(({ name, envVar, present }) => [
+    name, envVar, present ? "present" : "absent",
+  ]);
+  const table = settingsTable(["Provider", "Environment variable", "Status"], rows);
+  const controls = element(document, "div", { className: "credential-controls" });
+  for (const [index, { envVar }] of models.entries()) {
+    const row = element(document, "div");
+    const label = element(document, "label", { text: `${envVar}: ` });
+    const input = element(document, "input");
+    input.type = "password";
+    input.autocomplete = "off";
+    const save = makeButton(document, "Save");
+    const remove = makeButton(document, "Remove");
+    const notice = element(document, "span");
+    async function write(value) {
+      input.value = "";
+      try {
+        await boundary.storeCredential(envVar, value);
+        table.children[index + 1].children[2].textContent = value ? "present" : "absent";
+        const providerRow = providerRows.find((item) => item.env_var === envVar);
+        if (providerRow) providerRow.key_present = Boolean(value);
+        notice.textContent = value ? "Key stored." : "Key removed.";
+      } catch (error) {
+        const detail = errorText(error).trim();
+        notice.textContent = detail ? `Could not save the key: ${detail}` : "Could not save the key.";
+      }
+    }
+    listen(save, "click", () => write(input.value));
+    listen(remove, "click", () => write(""));
+    append(label, input);
+    append(row, label, save, remove, notice);
+    append(controls, row);
+  }
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "Models" }),
+    table,
+    controls,
+  );
+  return;
+}
+
+function renderMcp(section, context) {
+  const { document, settingsContent, settingsTable } = context;
+  const rows = serverRows(context.settingsReply).map(({ name, command, started }) => [
+    name, command, started ? "started" : "not started",
+  ]);
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "MCP servers" }),
+    settingsTable(["Server", "Command", "Started"], rows),
+  );
+  return;
+}
+
+function renderRoster(section, context) {
+  const { document, global, boundary, settingsContent, settingsTable, getSkillCommands } = context;
+
+  const rows = rosterRows(context.settingsReply, section);
+  const table = settingsTable(["Name", "Path"], rows.map(({ name, path }) => [name, path]));
+  for (const [index, { path }] of rows.entries()) {
+    if (path) {
+      const copy = makeButton(document, "Copy", () => global.navigator?.clipboard?.writeText?.(path));
+      append(table.children[index + 1].children[1], copy);
+    }
+  }
+  replace(
+    settingsContent,
+    element(document, "h2", { text: section[0].toUpperCase() + section.slice(1) }),
+    table,
+  );
+  return;
+}
+
+function renderHooks(section, context) {
+  const { document, settingsContent, settingsTable } = context;
+  const rows = hookRows(context.settingsReply).map(({ event, command }) => [event, command]);
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "Hooks" }),
+    rows.length === 0
+      ? element(document, "p", { text: "No hooks are configured." })
+      : settingsTable(["Event", "Command"], rows),
+  );
+  return;
+}
+
+function renderCeiling(section, context) {
+  const { document, settingsContent, settingsTable } = context;
+  const rows = ceilingRows(context.settingsReply).map(({ capability, value }) => [capability, value]);
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "Ceiling" }),
+    element(document, "p", { text: 'The most any agent may be granted. "not set" means the ceiling does not limit this.' }),
+    settingsTable(["Capability", "Value"], rows),
+  );
+  return;
+}
+
+function renderTrust(section, context) {
+  const { document, settingsContent, settingsTable } = context;
+  const rows = trustRows(context.settingsReply).map(({ root, allow }) => [
+    root, allow.length === 0 ? "nothing" : allow.join(", "),
+  ]);
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "Trust" }),
+    rows.length === 0
+      ? element(document, "p", { text: "No directories are trusted." })
+      : settingsTable(["Root", "Allows"], rows),
+  );
+  return;
+}
+
+function renderInventory(section, context) {
+  const { document, settingsContent, settingsTable } = context;
+  const rows = inventoryRows(context.settingsReply).map(({ scope, directory, names, reason }) => [
+    scope, directory, names.join(", "), reason,
+  ]);
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "Inventory" }),
+    rows.length === 0
+      ? element(document, "p", { text: "Nothing was withheld." })
+      : settingsTable(["Scope", "Directory", "Names", "Reason"], rows),
+  );
+  return;
+}
+
+function renderGeneral(section, context) {
+  const { document, global, settingsContent, settingsTable, statusFields, saveStatusFields, showConversationUsage, NOTIFICATIONS_KEY } = context;
+  const rows = generalRows(context.settingsReply).map(({ key, value, scope }) => [
+    key, value, scope,
+  ]);
+  let theme = "system";
+  try {
+    const storedTheme = global.localStorage?.getItem("symphonai.theme");
+    if (storedTheme === "light" || storedTheme === "dark") theme = storedTheme;
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
+  }
+  const themeSelect = document.createElement("select");
+  themeSelect.setAttribute("aria-label", "Theme");
+  for (const [value, label] of [["system", "System"], ["light", "Light"], ["dark", "Dark"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    themeSelect.append(option);
+  }
+  themeSelect.value = theme;
+  listen(themeSelect, "change", () => {
+    const selected = ["light", "dark"].includes(themeSelect.value)
+      ? themeSelect.value
+      : "system";
+    try {
+      global.localStorage?.setItem("symphonai.theme", selected);
+    } catch {
+      // Storage is optional in embedded and privacy-restricted browsers.
+    }
+    if (selected === "system") {
+      document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.setAttribute("data-theme", selected);
+    }
+  });
+  const statusOptions = [
+    ["provider", "Provider"], ["model", "Model"], ["effort", "Effort"],
+    ["mode", "Mode"], ["goal", "Goal"], ["context", "Context"], ["usage", "Usage"],
+  ];
+  const statusGroup = element(document, "section", { className: "status-line-settings" });
+  append(statusGroup, element(document, "h3", { text: "Status line" }));
+  for (const [key, label] of statusOptions) {
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = statusFields[key];
+    checkbox.setAttribute("aria-label", label);
+    listen(checkbox, "change", () => {
+      statusFields[key] = checkbox.checked;
+      saveStatusFields(global, statusFields);
+      showConversationUsage();
+    });
+    append(statusGroup, append(element(document, "label"), checkbox, element(document, "span", { text: label })));
+  }
+  const notificationGroup = element(document, "section", { className: "notification-settings" });
+  append(notificationGroup, element(document, "h3", { text: "Notifications" }));
+  const notificationCheckbox = document.createElement("input");
+  notificationCheckbox.type = "checkbox";
+  notificationCheckbox.checked = context.notificationsEnabled;
+  notificationCheckbox.setAttribute("aria-label", "Notifications");
+  const notificationNotice = element(document, "p", {
+    className: "notification-settings-message",
+    text: context.notificationMessage,
+  });
+  listen(notificationCheckbox, "change", async () => {
+    context.notificationMessage = "";
+    if (!notificationCheckbox.checked) {
+      context.notificationsEnabled = false;
+    } else {
+      try {
+        if (typeof global.Notification !== "function" || typeof global.Notification.requestPermission !== "function") {
+          throw new Error("notifications unavailable");
+        }
+        const permission = await global.Notification.requestPermission();
+        if (permission !== "granted") throw new Error("notifications unavailable");
+        context.notificationsEnabled = true;
+      } catch {
+        context.notificationsEnabled = false;
+        notificationCheckbox.checked = false;
+        context.notificationMessage = "Notifications are not available here.";
+      }
+    }
+    try {
+      global.localStorage?.setItem(NOTIFICATIONS_KEY, String(context.notificationsEnabled));
+    } catch {
+      // Storage is optional in embedded and privacy-restricted browsers.
+    }
+    notificationNotice.textContent = context.notificationMessage;
+  });
+  append(notificationGroup, append(element(document, "label"), notificationCheckbox, element(document, "span", { text: "Notifications" })), notificationNotice);
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "General" }),
+    element(document, "h3", { text: "Appearance" }),
+    themeSelect,
+    statusGroup,
+    notificationGroup,
+    settingsTable(["Setting", "Value", "Scope"], rows),
+  );
+}
+
+const SETTINGS_RENDERERS = Object.freeze({
+  permissions: renderPermissions, memory: renderMemory, models: renderModels,
+  mcp: renderMcp, skills: renderRoster, plugins: renderRoster, agents: renderAgents,
+  hooks: renderHooks, ceiling: renderCeiling, trust: renderTrust, inventory: renderInventory,
+});
+
+export function renderSettingsSection(section, context) {
+  return (SETTINGS_RENDERERS[section] ?? renderGeneral)(section, context);
+}
+
+export function renderMemorySettings(context) {
+  const { document, boundary, settingsContent, loadMemory, renderMemoryContent } = context;
+  const children = [
+    element(document, "h2", { text: "Memory" }),
+    element(document, "p", {
+      text: "What the agent remembered from your conversations. It reads these at the start of each new conversation.",
+    }),
+  ];
+  if (context.memoryLoading) {
+    children.push(element(document, "p", { text: "Loading memory…" }));
+  } else if (context.memoryLoadError) {
+    const retry = makeButton(document, "Retry", () => loadMemory());
+    children.push(
+      element(document, "p", { className: "memory-load-error", text: "Couldn't load memory." }),
+      retry,
+    );
+  } else if (context.memoryReply) {
+    for (const [scope, label] of [["project", "Project"], ["global", "Global"]]) {
+      const group = element(document, "section", { className: "memory-group" });
+      append(group, element(document, "h3", { text: label }));
+      const memorySet = context.memoryReply[scope] ?? {};
+      const entries = memorySet.entries ?? [];
+      if (memorySet.error === "unreadable") {
+        append(group, element(document, "p", {
+          className: "memory-load-error",
+          text: "This memory file couldn't be read, so nothing in it was changed.",
+        }));
+      } else if (entries.length === 0) {
+        append(group, element(document, "p", { className: "memory-empty", text: "Nothing remembered yet." }));
+      }
+      for (const entry of memorySet.error === "unreadable" ? [] : entries) {
+        const row = element(document, "article", { className: "memory-entry" });
+        if (entry.id === context.editingMemoryId) {
+          const textarea = element(document, "textarea", { className: "memory-edit-input" });
+          textarea.value = entry.text;
+          const save = makeButton(document, "Save");
+          const cancel = makeButton(document, "Cancel");
+          listen(save, "click", async () => {
+            try {
+              const reply = await boundary.updateMemory(entry.id, textarea.value);
+              context.memoryReply[scope].entries = entries.map((item) =>
+                item.id === entry.id ? reply.entry : item
+              );
+              context.editingMemoryId = null;
+              context.memoryEditError = "";
+            } catch (error) {
+              context.memoryEditError = errorText(error);
+            }
+            if (context.route?.page === "settings" && context.route.section === "memory") {
+              renderMemoryContent();
+            }
+          });
+          listen(cancel, "click", () => {
+            context.editingMemoryId = null;
+            context.memoryEditError = "";
+            renderMemoryContent();
+          });
+          append(row, textarea, save, cancel);
+          if (context.memoryEditError) {
+            append(row, element(document, "p", {
+              className: "memory-edit-error",
+              text: context.memoryEditError,
+            }));
+          }
+        } else if (entry.id === context.confirmingMemoryDeleteId) {
+          const confirm = element(document, "p", { text: "Delete this memory?" });
+          const remove = makeButton(document, "Delete");
+          const cancel = makeButton(document, "Cancel");
+          listen(remove, "click", async () => {
+            try {
+              await boundary.deleteMemory(entry.id);
+              context.memoryReply[scope].entries = entries.filter((item) => item.id !== entry.id);
+              context.confirmingMemoryDeleteId = null;
+            } catch (error) {
+              context.memoryEditError = errorText(error);
+            }
+            renderMemoryContent();
+          });
+          listen(cancel, "click", () => {
+            context.confirmingMemoryDeleteId = null;
+            context.memoryEditError = "";
+            renderMemoryContent();
+          });
+          append(row, element(document, "p", { className: "memory-entry-text", text: entry.text }), confirm, remove, cancel);
+          if (context.memoryEditError) {
+            append(row, element(document, "p", {
+              className: "memory-edit-error",
+              text: context.memoryEditError,
+            }));
+          }
+        } else {
+          const date = typeof entry.written_at === "string"
+            ? new Date(entry.written_at).toLocaleDateString()
+            : "";
+          const metadata = [date, entry.agent_name].filter(Boolean).join(" · ");
+          const edit = makeButton(document, "Edit");
+          const remove = makeButton(document, "Delete");
+          listen(edit, "click", () => {
+            context.editingMemoryId = entry.id;
+            context.memoryEditError = "";
+            renderMemoryContent();
+          });
+          listen(remove, "click", () => {
+            context.confirmingMemoryDeleteId = entry.id;
+            context.memoryEditError = "";
+            renderMemoryContent();
+          });
+          append(
+            row,
+            element(document, "p", { className: "memory-entry-text", text: entry.text }),
+            element(document, "p", { className: "memory-entry-meta", text: metadata }),
+            append(element(document, "div", { className: "memory-entry-actions" }), edit, remove),
+          );
+        }
+        append(group, row);
+      }
+      children.push(group);
+    }
+  }
+  replace(settingsContent, ...children);
+}
+
+export function renderPermissionSettings(context) {
+  const { document, boundary, settingsContent, renderPermissionsContent } = context;
+  const children = [element(document, "h2", { text: "Permissions" })];
+  if (context.permissionsLoading) {
+    children.push(element(document, "p", { text: "Loading permissions…" }));
+  } else if (context.permissionsReply === null) {
+    children.push(element(document, "p", { className: "permissions-error", text: context.permissionsError }));
+  } else {
+    const rows = permissionRows(context.permissionsReply);
+    if (context.permissionsError) {
+      children.push(element(document, "p", { className: "permissions-error", text: context.permissionsError }));
+    }
+    if (rows.length === 0) {
+      children.push(element(document, "p", { text: "No saved permissions." }));
+    } else {
+      for (const permission of rows) {
+        const row = element(document, "div", { className: "permission-row" });
+        const remove = makeButton(document, "Remove", async () => {
+          context.permissionsError = "";
+          try {
+            await boundary.removePermission(permission.kind, permission.value);
+            context.permissionsReply = {
+              ...context.permissionsReply,
+              [permission.kind]: context.permissionsReply[permission.kind].filter((value) => (
+                Array.isArray(permission.value)
+                  ? JSON.stringify(value) !== JSON.stringify(permission.value)
+                  : value !== permission.value
+              )),
+            };
+          } catch (error) {
+            const detail = errorText(error).trim();
+            context.permissionsError = detail ? `Could not remove permission: ${detail}` : "Could not remove permission.";
+          }
+          renderPermissionsContent();
+        });
+        append(
+          row,
+          element(document, "span", { text: permission.kind === "shell" ? "Command" : "Host" }),
+          element(document, "code", { text: permission.label }),
+          remove,
+        );
+        children.push(row);
+      }
+    }
+  }
+  replace(settingsContent, ...children);
+}
+
+function renderAgents(section, context) {
+  const { document, boundary, settingsContent, getSkillCommands } = context;
+  const tableRoot = element(document, "div");
+  const editorRoot = element(document, "div", { className: "agent-editor" });
+  const newAgent = makeButton(document, "New agent");
+
+  function renderAgentRows() {
+    const rows = agentRows(context.settingsReply);
+    const table = element(document, "table", { className: "settings-table" });
+    const heading = element(document, "tr");
+    append(heading, ...["Name", "Scope", "Path", "Reason", "Action"].map((text) =>
+      element(document, "th", { text })
+    ));
+    append(table, heading);
+    for (const rowData of rows) {
+      const row = element(document, "tr", { className: "settings-row" });
+      const action = element(document, "td");
+      if (rowData.editable) {
+        const open = makeButton(document, "Open", () => openAgent(rowData));
+        append(action, open);
+      } else if (rowData.reason) {
+        const withheld = makeButton(document, "Withheld");
+        withheld.disabled = true;
+        append(action, withheld);
+      }
+      append(
+        row,
+        element(document, "td", { text: rowData.name }),
+        element(document, "td", { text: rowData.scope }),
+        element(document, "td", { text: rowData.path }),
+        element(document, "td", { text: rowData.reason }),
+        action,
+      );
+      append(table, row);
+    }
+    replace(tableRoot, table);
+  }
+
+  function field(document, tagName, className, value) {
+    const control = element(document, tagName, { className });
+    control.value = value;
+    control.name = {
+      "agent-name": "name",
+      "agent-scope": "scope",
+      "agent-prompt": "prompt",
+      "agent-provider": "provider",
+      "agent-model": "model",
+      "agent-effort": "effort",
+      "agent-tools": "tools",
+      "agent-deny-tools": "deny_tools",
+    }[className] ?? className;
+    return control;
+  }
+
+  function renderEditor(values, identity = null, original = "", message = "") {
+    const form = element(document, "form", { className: "agent-form" });
+    const name = field(document, "input", "agent-name", identity?.name ?? "");
+    const scope = field(document, "select", "agent-scope", identity?.scope ?? "project");
+    replace(scope, ...["project", "user"].map((value) => {
+      const option = element(document, "option", { text: value });
+      option.value = value;
+      return option;
+    }));
+    scope.value = identity?.scope ?? "project";
+    name.disabled = Boolean(identity);
+    scope.disabled = Boolean(identity);
+    const prompt = field(document, "textarea", "agent-prompt", values.prompt);
+    const provider = field(document, "input", "agent-provider", values.provider);
+    const model = field(document, "input", "agent-model", values.model);
+    const effort = field(document, "input", "agent-effort", values.effort);
+    const tools = field(document, "textarea", "agent-tools", values.tools.join("\n"));
+    const denyTools = field(document, "textarea", "agent-deny-tools", values.denyTools.join("\n"));
+    const status = element(document, "p", { className: "agent-status", text: message });
+    const save = makeButton(document, "Save", null, { className: "agent-save primary" });
+    save.type = "submit";
+    const labels = [
+      ["Name", name], ["Scope", scope], ["Prompt", prompt],
+      ["Model provider", provider], ["Model id", model], ["Model effort", effort],
+      ["Allowed tools", tools], ["Denied tools", denyTools],
+    ];
+    for (const [labelText, control] of labels) {
+      const label = element(document, "label", { text: labelText });
+      append(label, control);
+      append(form, label);
+    }
+    append(form, save, status);
+    listen(form, "submit", async (event) => {
+      event.preventDefault();
+      const currentName = name.value.trim();
+      const currentScope = scope.value;
+      const text = composeAgentText({
+        prompt: prompt.value,
+        provider: provider.value.trim(),
+        model: model.value.trim(),
+        effort: effort.value.trim(),
+        tools: tools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+        denyTools: denyTools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+      }, original);
+      try {
+        const reply = await boundary.saveAgent(currentName, currentScope, text);
+        context.settingsReply = await boundary.settings();
+        context.skillCommands = getSkillCommands(context.settingsReply);
+        renderAgentRows();
+        status.textContent = reply?.message || "definition saved; it will take effect on the next run";
+      } catch (error) {
+        status.textContent = errorText(error);
+      }
+    });
+    replace(editorRoot, form);
+  }
+
+  async function openAgent(rowData) {
+    const status = findAgentStatus();
+    if (status) status.textContent = "Loading definition…";
+    try {
+      const reply = await boundary.agent(rowData.name, rowData.scope);
+      const original = typeof reply?.text === "string" ? reply.text : "";
+      renderEditor(parseAgentText(original), rowData, original);
+    } catch (error) {
+      if (status) status.textContent = errorText(error);
+    }
+  }
+
+  function findAgentStatus() {
+    const form = editorRoot.children[0];
+    for (const child of form?.children ?? []) {
+      if (child.className === "agent-status") return child;
+    }
+    return null;
+  }
+
+  listen(newAgent, "click", () => renderEditor(parseAgentText(""), null, ""));
+  renderAgentRows();
+  replace(
+    settingsContent,
+    element(document, "h2", { text: "Agents" }),
+    newAgent,
+    tableRoot,
+    editorRoot,
+  );
+  return;
 }

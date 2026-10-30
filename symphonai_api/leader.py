@@ -18,6 +18,7 @@ Subagent pool state lives only in memory for the duration of one
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import math
 import os
 import re
@@ -30,7 +31,6 @@ from symphonai_api.agent_loop import ApiAgent, _message_digest
 from symphonai_api.agent_memory import AgentMemory, MemoryEntry, MemorySettings
 from symphonai_api.agent_run import (
     AgentRun,
-    PauseGate,
     RunNode,
     RunPhase,
     new_agent_run,
@@ -58,7 +58,6 @@ from symphonai_api.compaction import (
     ContextCompactionError,
     budget_for_model,
     compact_messages_for_budget,
-    estimate_messages_tokens,
     render_dropped_messages,
 )
 from symphonai_api.gemini_schema import sanitize_for_gemini
@@ -86,17 +85,14 @@ from symphonai_api.providers.base import ContextLengthExceededError, ModelProvid
 from symphonai_api.providers.anthropic_provider import (
     DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL,
     AnthropicProvider,
-    ROUTINE_MODEL as ANTHROPIC_ROUTINE_MODEL,
 )
 from symphonai_api.providers.gemini_provider import (
     DEFAULT_MODEL as GEMINI_DEFAULT_MODEL,
     GeminiProvider,
-    ROUTINE_MODEL as GEMINI_ROUTINE_MODEL,
 )
 from symphonai_api.providers.openai_provider import (
     DEFAULT_MODEL as OPENAI_DEFAULT_MODEL,
     OpenAIProvider,
-    ROUTINE_MODEL as OPENAI_ROUTINE_MODEL,
 )
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.spec_text import spec_validation
@@ -240,19 +236,17 @@ def builtin_subagent_specs(
     role_selectors: Mapping[str, ModelSelector] | None = None,
 ) -> dict[str, AgentSpec]:
     job_tools = ("job_output", "job_stop") if jobs is not None else ()
-    provider_name = getattr(provider, "name", None) or "unknown"
+    provider_name = provider.name or "unknown"
 
     def selector(name: str) -> ModelSelector:
         configured = None if role_selectors is None else role_selectors.get(name)
         if configured is not None:
             return configured
-        model = model_override or getattr(provider, "model", None)
+        model = model_override or provider.model
         if model_override is None and use_routine_model and name in {
             "worker", "explorer", "implementer", "reviewer",
         }:
-            routine_model = getattr(provider, "ROUTINE_MODEL", None)
-            if routine_model is None:
-                routine_model = _provider_routine_model(provider)
+            routine_model = provider.routine_model
             model = routine_model or model
         return ModelSelector(provider=provider_name, model=model)
 
@@ -302,16 +296,6 @@ def builtin_subagent_specs(
         ),
     })
     return specs
-
-
-def _provider_routine_model(provider: ModelProvider) -> str | None:
-    if isinstance(provider, AnthropicProvider):
-        return ANTHROPIC_ROUTINE_MODEL
-    if isinstance(provider, OpenAIProvider):
-        return OPENAI_ROUTINE_MODEL
-    if isinstance(provider, GeminiProvider):
-        return GEMINI_ROUTINE_MODEL
-    return None
 
 
 def _provider_default_model(provider: ModelProvider) -> str | None:
@@ -384,6 +368,7 @@ def _dispatch_description(subagents: Mapping[str, AgentSpec] | None = None) -> s
     return _DISPATCH_DESCRIPTION + " Available subagents: " + "; ".join(available) + "."
 _DISPATCH_PROPERTIES = {
     "subagent_name": {
+        "minLength": 1,
         "type": "string",
         "description": (
             "A short, stable identifier for this subagent, e.g. "
@@ -392,6 +377,7 @@ _DISPATCH_PROPERTIES = {
         ),
     },
     "task": {
+        "minLength": 1,
         "type": "string",
         "description": "The task or follow-up message to give this subagent.",
     },
@@ -464,7 +450,6 @@ class SubagentRecord:
     turns_used: int = 0
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
     runs: list[AgentRun] = field(default_factory=list)
-    pause_gate: PauseGate | None = None
     worktree_path: Path | None = None
     worktree_admin_path: Path | None = None
     running: bool = False
@@ -496,7 +481,6 @@ class DispatchSubagentTool(LocalTool):
         subagent_specs: Mapping[str, AgentSpec] | None = None,
         leases: WorkspaceLeases | None = None,
         parent_run: AgentRun | None = None,
-        dispatching_depth: int = -1,
         hooks: HookRunner | None = None,
         stream: bool = False,
         result_store: ToolResultStore | None = None,
@@ -529,7 +513,6 @@ class DispatchSubagentTool(LocalTool):
         self._leases = leases or WorkspaceLeases(leader_policy.repo_root)
         self._parent_run = parent_run
         self._parent_messages: list[Message] = []
-        self._dispatching_depth = dispatching_depth
         self._hooks = hooks
         self._stream = stream
         self._result_store = result_store
@@ -561,12 +544,9 @@ class DispatchSubagentTool(LocalTool):
         self,
         run: AgentRun,
         messages: list[Message],
-        *,
-        depth: int = -1,
     ) -> None:
         self._parent_run = run
         self._parent_messages = messages
-        self._dispatching_depth = depth
 
     def observe_event(self, event: Event) -> None:
         if isinstance(event, RunStarted):
@@ -628,25 +608,18 @@ class DispatchSubagentTool(LocalTool):
             paths=None,
         )
 
-    def validate(self, arguments: dict) -> str | None:
-        if not arguments.get("subagent_name") or not arguments.get("task"):
-            return "missing required argument: subagent_name and/or task"
-        if arguments.get("isolation") not in (None, "worktree"):
-            return "isolation must be 'worktree' when provided"
-        return None
 
     def _spec_for(self, subagent_name: str) -> AgentSpec | None:
         if self._subagent_specs is not None:
             return self._subagent_specs.get(subagent_name)
-        provider_name = getattr(self._subagent_provider, "name", None) or "unknown"
-        model = getattr(self._subagent_provider, "model", None)
+        provider_name = self._subagent_provider.name or "unknown"
+        model = self._subagent_provider.model
         if (
             subagent_name in {"worker", "explorer", "implementer", "reviewer"}
             and model == _provider_default_model(self._subagent_provider)
         ):
             model = (
-                getattr(self._subagent_provider, "ROUTINE_MODEL", None)
-                or _provider_routine_model(self._subagent_provider)
+                self._subagent_provider.routine_model
                 or model
             )
         return AgentSpec(
@@ -661,7 +634,6 @@ class DispatchSubagentTool(LocalTool):
             budget=self._subagent_budget,
             isolation=Isolation(),
             call_class=CallClass.BACKGROUND,
-            max_depth=0,
         )
 
     def _new_run(self, spec: AgentSpec, agent_ref: AgentRef) -> AgentRun:
@@ -741,7 +713,7 @@ class DispatchSubagentTool(LocalTool):
                 if name not in spec.denied_mcp_tool_names
             }
         child_provider = self._subagent_provider
-        if spec.model.provider != getattr(self._subagent_provider, "name", None):
+        if spec.model.provider != self._subagent_provider.name:
             child_provider = (
                 None if self._provider_for is None
                 else self._provider_for(spec.model.provider, spec.model.model)
@@ -772,15 +744,6 @@ class DispatchSubagentTool(LocalTool):
                 tool_call_id=tool_call.id,
                 ok=False,
                 error=f"subagent {subagent_name!r} cannot use lsp: no language server is configured",
-            )
-        if self._dispatching_depth >= spec.max_depth:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error=(
-                    f"subagent {subagent_name!r} cannot dispatch at depth "
-                    f"{self._dispatching_depth}; max_depth is {spec.max_depth}"
-                ),
             )
         try:
             effective_policy = self._leader_policy.narrowed(spec.policy_ceiling)
@@ -996,110 +959,30 @@ class DispatchSubagentTool(LocalTool):
             # the meet again for every dispatch instead of retaining authority.
             record.agent._policy = effective_policy
 
-        child_run = self._new_run(spec, record.agent_ref)
-        record.runs.append(child_run)
-        token = (
-            cancel.child(deadline_seconds=spec.deadline_seconds)
-            if cancel is not None
-            else CancellationToken(deadline_seconds=spec.deadline_seconds)
-        )
-        child_run.start(token)
-        pause_gate = PauseGate()
-        record.pause_gate = pause_gate
-        if record.messages:
-            record.messages.append(Message(role=Role.USER, content=task))
-        else:
-            memory, unreadable_memory = _memory_seed(self._memory, spec)
-            record.messages = seed_messages(
-                spec,
-                task,
-                parent_messages=self._parent_messages,
-                memory=memory,
-                memory_available=self._memory is not None,
-                unreadable_memory=unreadable_memory,
-            )
-        if self._events is not None:
-            if self._event_run_id is None:
-                raise RuntimeError("dispatch event context was never set")
-            emit(
-                self._events,
-                SubagentSpawned(
-                    agent_id=self._event_agent_id,
-                    run_id=self._event_run_id,
-                    turn_id=self._event_turn_id,
-                    subagent_name=subagent_name,
-                    subagent_agent_id=record.agent_ref.agent_id,
-                ),
-            )
-        run_result = None
-        failure: str | None = None
-        execution_error: Exception | None = None
-        with self._active_runs_lock:
-            self._active_runs[record.agent_ref.agent_id] = child_run
-        try:
-            if record.worktree_path is not None:
-                run_result = record.agent.run(
-                    record.messages,
-                    model=spec.model.model,
-                    effort=spec.model.effort,
-                    parent_run_id=(
-                        None
-                        if self._parent_run is None
-                        else self._parent_run.run.run_id
-                    ),
-                    cancel=token,
-                    run=child_run,
-                    pause=pause_gate,
-                    hooks=self._hooks,
-                )
+        def new_child_run() -> AgentRun:
+            child_run = self._new_run(spec, record.agent_ref)
+            record.runs.append(child_run)
+            return child_run
+
+        def prepare_child() -> None:
+            if record.messages:
+                record.messages.append(Message(role=Role.USER, content=task))
             else:
-                with self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix):
-                    run_result = record.agent.run(
-                        record.messages,
-                        model=spec.model.model,
-                        effort=spec.model.effort,
-                        parent_run_id=(
-                            None
-                            if self._parent_run is None
-                            else self._parent_run.run.run_id
-                        ),
-                        cancel=token,
-                        run=child_run,
-                        pause=pause_gate,
-                        hooks=self._hooks,
-                    )
-        except LeaseConflict as exc:
-            failure = str(exc)
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
-        except Exception as exc:
-            failure = str(exc)
-            if record.worktree_path is None:
-                raise
-            execution_error = exc
-        finally:
-            with self._active_runs_lock:
-                if self._active_runs.get(record.agent_ref.agent_id) is child_run:
-                    self._active_runs.pop(record.agent_ref.agent_id, None)
-            if record.worktree_path is None and not validation_commands:
-                with self._pool_lock:
-                    record.running = False
-            if child_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
-                if run_result is None:
-                    if token.cancelled:
-                        child_run.cancel()
-                    else:
-                        child_run.fail(failure or "subagent dispatch failed")
-                elif run_result.stopped_reason == "cancelled":
-                    child_run.cancel()
-                else:
-                    if child_run.phase is RunPhase.PAUSED:
-                        child_run.resume()
-                        pause_gate.resume()
-                    child_run.finish(run_result)
-            if self._event_run_id is not None:
+                memory, unreadable_memory = _memory_seed(self._memory, spec)
+                record.messages = seed_messages(
+                    spec,
+                    task,
+                    parent_messages=self._parent_messages,
+                    memory=memory,
+                    memory_available=self._memory is not None,
+                    unreadable_memory=unreadable_memory,
+                )
+            if self._events is not None:
+                if self._event_run_id is None:
+                    raise RuntimeError("dispatch event context was never set")
                 emit(
                     self._events,
-                    SubagentStopped(
+                    SubagentSpawned(
                         agent_id=self._event_agent_id,
                         run_id=self._event_run_id,
                         turn_id=self._event_turn_id,
@@ -1107,6 +990,81 @@ class DispatchSubagentTool(LocalTool):
                         subagent_agent_id=record.agent_ref.agent_id,
                     ),
                 )
+
+        def run_child(
+            child_run: AgentRun, *, initial: bool = False,
+        ) -> tuple[AgentRunResult | None, str | None, Exception | None]:
+            child_run.start(token)
+            if initial:
+                prepare_child()
+            result = None
+            failure = None
+            execution_error = None
+            with self._active_runs_lock:
+                self._active_runs[record.agent_ref.agent_id] = child_run
+            try:
+                lease = (
+                    nullcontext() if record.worktree_path is not None
+                    else self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix)
+                )
+                with lease:
+                    result = record.agent.run(
+                        record.messages, model=spec.model.model, effort=spec.model.effort,
+                        parent_run_id=None if self._parent_run is None else self._parent_run.run.run_id,
+                        cancel=token, run=child_run, hooks=self._hooks,
+                    )
+            except LeaseConflict as exc:
+                failure = str(exc)
+                if not initial and record.worktree_path is None:
+                    raise
+                execution_error = exc
+            except Exception as exc:
+                failure = str(exc)
+                if record.worktree_path is None:
+                    raise
+                execution_error = exc
+            finally:
+                with self._active_runs_lock:
+                    if self._active_runs.get(record.agent_ref.agent_id) is child_run:
+                        self._active_runs.pop(record.agent_ref.agent_id, None)
+                if initial and record.worktree_path is None and not validation_commands:
+                    with self._pool_lock:
+                        record.running = False
+                if child_run.phase is RunPhase.RUNNING:
+                    if result is None:
+                        if token.cancelled:
+                            child_run.cancel()
+                        else:
+                            child_run.fail(failure or "subagent dispatch failed")
+                    elif result.stopped_reason == "cancelled":
+                        child_run.cancel()
+                    else:
+                        child_run.finish(result)
+                if initial and self._event_run_id is not None:
+                    emit(self._events, SubagentStopped(
+                        agent_id=self._event_agent_id, run_id=self._event_run_id,
+                        turn_id=self._event_turn_id, subagent_name=subagent_name,
+                        subagent_agent_id=record.agent_ref.agent_id,
+                    ))
+            return result, failure, execution_error
+
+        def record_child_result(result: AgentRunResult) -> None:
+            record.messages = result.messages
+            record.turns_used += result.turns_used
+            for model, usage in result.usage_by_model.items():
+                record.usage_by_model[model] = record.usage_by_model.get(
+                    model, UsageTotals()
+                ).merged(usage)
+
+        child_run = new_child_run()
+        token = (
+            cancel.child(deadline_seconds=spec.deadline_seconds)
+            if cancel is not None
+            else CancellationToken(deadline_seconds=spec.deadline_seconds)
+        )
+        run_result, failure, execution_error = run_child(child_run, initial=True)
+        if isinstance(execution_error, LeaseConflict):
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
         if run_result is None:
             try:
                 content, payload = self._worktree_output(subagent_name, record, "")
@@ -1120,12 +1078,7 @@ class DispatchSubagentTool(LocalTool):
                 error=failure or str(execution_error) or "subagent dispatch failed",
                 payload=payload,
             )
-        record.messages = run_result.messages
-        record.turns_used += run_result.turns_used
-        for model, usage in run_result.usage_by_model.items():
-            record.usage_by_model[model] = record.usage_by_model.get(
-                model, UsageTotals()
-            ).merged(usage)
+        record_child_result(run_result)
         validation_passed = not validation_commands
         validation_evidence: list[dict[str, object]] = []
         validation_round = 1
@@ -1154,78 +1107,13 @@ class DispatchSubagentTool(LocalTool):
                 ),
             ))
             validation_round += 1
-            child_run = self._new_run(spec, record.agent_ref)
-            record.runs.append(child_run)
-            child_run.start(token)
-            pause_gate = PauseGate()
-            record.pause_gate = pause_gate
-            with self._active_runs_lock:
-                self._active_runs[record.agent_ref.agent_id] = child_run
-            retry_result = None
-            retry_failure: str | None = None
-            try:
-                if record.worktree_path is not None:
-                    retry_result = record.agent.run(
-                        record.messages,
-                        model=spec.model.model,
-                        effort=spec.model.effort,
-                        parent_run_id=(
-                            None if self._parent_run is None
-                            else self._parent_run.run.run_id
-                        ),
-                        cancel=token,
-                        run=child_run,
-                        pause=pause_gate,
-                        hooks=self._hooks,
-                    )
-                else:
-                    with self._leases.held(
-                        child_run.run.run_id, spec.isolation.workspace_prefix
-                    ):
-                        retry_result = record.agent.run(
-                            record.messages,
-                            model=spec.model.model,
-                            effort=spec.model.effort,
-                            parent_run_id=(
-                                None if self._parent_run is None
-                                else self._parent_run.run.run_id
-                            ),
-                            cancel=token,
-                            run=child_run,
-                            pause=pause_gate,
-                            hooks=self._hooks,
-                        )
-            except Exception as exc:
-                retry_failure = str(exc)
-                if record.worktree_path is None:
-                    raise
-            finally:
-                with self._active_runs_lock:
-                    if self._active_runs.get(record.agent_ref.agent_id) is child_run:
-                        self._active_runs.pop(record.agent_ref.agent_id, None)
-                if child_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
-                    if retry_result is None:
-                        if token.cancelled:
-                            child_run.cancel()
-                        else:
-                            child_run.fail(retry_failure or "subagent dispatch failed")
-                    elif retry_result.stopped_reason == "cancelled":
-                        child_run.cancel()
-                    else:
-                        if child_run.phase is RunPhase.PAUSED:
-                            child_run.resume()
-                            pause_gate.resume()
-                        child_run.finish(retry_result)
+            child_run = new_child_run()
+            retry_result, retry_failure, _ = run_child(child_run)
             if retry_result is None:
                 failure = retry_failure or "validation retry failed"
                 break
             run_result = retry_result
-            record.messages = run_result.messages
-            record.turns_used += run_result.turns_used
-            for model, usage in run_result.usage_by_model.items():
-                record.usage_by_model[model] = record.usage_by_model.get(
-                    model, UsageTotals()
-                ).merged(usage)
+            record_child_result(run_result)
         with self._pool_lock:
             record.running = False
         if run_result.stopped_reason == "cancelled":
@@ -1597,7 +1485,7 @@ class Leader:
                 "" if defined_leader is None else defined_leader.prompt,
             ) if prompt
         )
-        leader_provider_name = getattr(config.leader_provider, "name", None) or "unknown"
+        leader_provider_name = config.leader_provider.name or "unknown"
         self._leader_model_locked = bool(
             defined_leader is not None
             and (
@@ -1619,7 +1507,6 @@ class Leader:
             else defined_leader.model.effort
         )
         self._leader_run: AgentRun | None = None
-        self._leader_pause_gate: PauseGate | None = None
         self._control_lock = threading.RLock()
         self._dispatch_tool = DispatchSubagentTool(
             subagent_provider=config.subagent_provider,
@@ -1696,7 +1583,7 @@ class Leader:
                 leader_tools["run_shell"] = _LeaderShellTool(
                     leader_tools["run_shell"], root=Path(config.repo_root), leader=self,
                 )
-        provider_name = getattr(config.leader_provider, "name", None) or "unknown"
+        provider_name = config.leader_provider.name or "unknown"
         self._leader_spec = AgentSpec(
             name="leader",
             prompt=self._leader_prompt,
@@ -1705,7 +1592,7 @@ class Leader:
                 model=(
                     self._leader_model
                     if self._leader_model is not None
-                    else getattr(config.leader_provider, "model", None)
+                    else config.leader_provider.model
                 ),
                 effort=self._leader_effort,
             ),
@@ -1718,7 +1605,6 @@ class Leader:
                 else MemorySettings(enabled=True)
             ),
             call_class=CallClass.FOREGROUND,
-            max_depth=0,
         )
         self._agent = ApiAgent(
             provider=config.leader_provider,
@@ -1841,7 +1727,7 @@ class Leader:
             self._leader_effort = effort
         actual_model = self._leader_model
         if actual_model is None:
-            actual_model = getattr(self._config.leader_provider, "model", None)
+            actual_model = self._config.leader_provider.model
         self._leader_spec = replace(
             self._leader_spec,
             model=replace(
@@ -1878,10 +1764,8 @@ class Leader:
             agent_id=self._agent_ref.agent_id,
         )
         leader_token = cancel if cancel is not None else CancellationToken()
-        leader_pause_gate = PauseGate()
         leader_run.start(leader_token)
         self._leader_run = leader_run
-        self._leader_pause_gate = leader_pause_gate
         self._dispatch_tool.set_parent_context(leader_run, list(messages))
         try:
             result = self._agent.run(
@@ -1890,23 +1774,19 @@ class Leader:
                 effort=self._leader_effort,
                 cancel=leader_token,
                 run=leader_run,
-                pause=leader_pause_gate,
                 hooks=self._hook_runner,
             )
         except OperationCancelled:
-            if leader_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
+            if leader_run.phase is RunPhase.RUNNING:
                 leader_run.cancel()
             raise
         except Exception as exc:
             leader_run.fail(str(exc))
             raise
         if result.stopped_reason == "cancelled":
-            if leader_run.phase in (RunPhase.RUNNING, RunPhase.PAUSED):
+            if leader_run.phase is RunPhase.RUNNING:
                 leader_run.cancel()
         else:
-            if leader_run.phase is RunPhase.PAUSED:
-                leader_run.resume()
-                leader_pause_gate.resume()
             leader_run.finish(result)
         leader_run.run = result.run
         self._last_run_id = result.run.run_id
@@ -1936,54 +1816,18 @@ class Leader:
         if self._transcript is not None:
             self._transcript.begin_checkpoint(key)
 
-    def control_agent(self, agent_id: str, action: str, text: str | None = None) -> str:
-        """Control one currently live run by its stable agent id."""
-        if action not in ("pause", "resume", "redirect", "stop"):
-            raise ValueError(f"unknown agent action {action!r}")
-        if action == "redirect" and (not isinstance(text, str) or not text.strip()):
+    def redirect(self, text: str) -> None:
+        """Queue steering for the root agent's live run."""
+        if not isinstance(text, str) or not text.strip():
             raise ValueError("redirect text must not be blank")
         with self._control_lock:
-            run = None
-            gate = None
-            if agent_id == self._agent_ref.agent_id:
-                run, gate = self._leader_run, self._leader_pause_gate
-            else:
-                with self._dispatch_tool._pool_lock:
-                    for record in self._dispatch_tool.pool.values():
-                        if record.agent_ref.agent_id == agent_id:
-                            run = record.runs[-1] if record.runs else None
-                            gate = record.pause_gate
-                            break
-            if run is None or run.phase not in (RunPhase.RUNNING, RunPhase.PAUSED):
-                raise AgentControlError(f"agent {agent_id!r} is not running", status=404)
-            if action == "pause":
-                if run.phase is RunPhase.PAUSED:
-                    raise AgentControlError(f"agent {agent_id!r} is already paused")
-                assert gate is not None
-                gate.pause()
-                try:
-                    run.pause()
-                except ValueError as exc:
-                    gate.resume()
-                    raise AgentControlError(str(exc)) from exc
-                return "paused"
-            if action == "resume":
-                if run.phase is not RunPhase.PAUSED:
-                    raise AgentControlError(f"agent {agent_id!r} is not paused")
-                assert gate is not None
-                run.resume()
-                gate.resume()
-                return "running"
-            if action == "redirect":
-                try:
-                    run.redirect(text or "")
-                except ValueError as exc:
-                    raise AgentControlError(str(exc)) from exc
-                return run.phase.value
-            run.cancel()
-            assert gate is not None
-            gate.resume()
-            return "stopping"
+            run = self._leader_run
+            if run is None or run.phase is not RunPhase.RUNNING:
+                raise AgentControlError("no turn is running", status=404)
+            try:
+                run.redirect(text)
+            except ValueError as exc:
+                raise AgentControlError(str(exc)) from exc
 
     def run_graph(self) -> tuple[RunNode, ...]:
         """The run graph of this leader's session, or () without a session."""
@@ -2008,20 +1852,6 @@ class Leader:
         messages.append(Message(role=Role.USER, content=goal))
         return self._run_messages(messages, cancel=cancel)
 
-    def clear_chat(self) -> int:
-        """Clear the persisted chat state and subagent pool.
-
-        Returns how many subagents were cleared, so a caller that wants to
-        report it does not have to call `clear_subagents()` separately and
-        thereby clear the pool twice.
-        """
-
-        self._chat_messages = self._initial_leader_messages()
-        if self._memory_extractor is not None:
-            self._memory_extractor.set_cursor([])
-        self._automatic_compaction_breaker.reset()
-        self._context_overflow_repair_failed = False
-        return self.clear_subagents()
 
     def seed_chat(self, messages: Sequence[Message], *, persisted: bool = False) -> None:
         """Set the history used by the next chat without changing subagents."""
@@ -2061,32 +1891,23 @@ class Leader:
     def _remember_forgotten_subagents(self, names: set[str]) -> None:
         if self._session is None or not names:
             return
-        meta = self._session.read_meta()
-        forgotten = meta.get("forgotten_subagents")
-        if not isinstance(forgotten, dict):
-            forgotten = {}
-        transcripts = _session_subagent_transcripts(self._session)
-        for name in names:
-            agent_ids = {agent_id for _, agent_id, _ in transcripts.get(name, ())}
-            record = self._dispatch_tool.pool.get(name)
-            if record is not None:
-                agent_ids.add(record.agent_ref.agent_id)
-            previous = forgotten.get(name, ())
-            if isinstance(previous, list):
-                agent_ids.update(item for item in previous if isinstance(item, str))
-            forgotten[name] = sorted(agent_ids)
-        meta["forgotten_subagents"] = forgotten
-        self._session.write_meta(meta)
+        def change(meta):
+            forgotten = meta.get("forgotten_subagents")
+            if not isinstance(forgotten, dict):
+                forgotten = {}
+            transcripts = _session_subagent_transcripts(self._session)
+            for name in names:
+                agent_ids = {agent_id for _, agent_id, _ in transcripts.get(name, ())}
+                record = self._dispatch_tool.pool.get(name)
+                if record is not None:
+                    agent_ids.add(record.agent_ref.agent_id)
+                previous = forgotten.get(name, ())
+                if isinstance(previous, list):
+                    agent_ids.update(item for item in previous if isinstance(item, str))
+                forgotten[name] = sorted(agent_ids)
+            meta["forgotten_subagents"] = forgotten
+        self._session.update_meta(change)
 
-    def compact_chat(self, *, cancel: CancellationToken | None = None) -> CompactionResult:
-        """Apply context compaction to the persisted multi-turn chat state."""
-
-        result = self._compact_chat_to_budget(
-            self.chat_token_budget,
-            cancel=cancel,
-        )
-        self._context_overflow_repair_failed = False
-        return result
 
     def force_compact_chat(
         self,
@@ -2134,23 +1955,17 @@ class Leader:
         )
         if self._config.stream:
             chunks = (
-                self._config.leader_provider.create_response_stream(request)
-                if cancel is None
-                else self._config.leader_provider.create_response_stream(
-                    request, cancel=cancel
-                )
+                self._config.leader_provider.create_response_stream(request, cancel=cancel)
             )
             assembler = StreamAssembler()
             for chunk in chunks:
                 assembler.add(chunk)
             response = assembler.finish()
-        elif cancel is None:
-            response = self._config.leader_provider.create_response(request)
         else:
             response = self._config.leader_provider.create_response(
                 request, cancel=cancel
             )
-        model_key = model or getattr(self._config.leader_provider, "model", None) or "unknown"
+        model_key = model or self._config.leader_provider.model or "unknown"
         totals = UsageTotals.from_usage(response.usage)
         self._compaction_usage_by_model[model_key] = self._compaction_usage_by_model.get(
             model_key, UsageTotals()
@@ -2230,43 +2045,6 @@ class Leader:
             )
         return result
 
-    def _compact_after_context_overflow(
-        self,
-        overflow: ContextLengthExceededError,
-        *,
-        cancel: CancellationToken | None = None,
-    ) -> bool:
-        before_tokens = estimate_messages_tokens(self._chat_messages)
-        if overflow.actual_tokens is not None:
-            forced_budget = min(
-                self.chat_token_budget,
-                max(1, before_tokens - 1),
-            )
-        else:
-            forced_budget = min(
-                self.chat_token_budget,
-                max(1, before_tokens * 3 // 4),
-            )
-        user_turns = sum(
-            message.role is Role.USER for message in self._chat_messages
-        )
-        starting_recent_turns = min(
-            self._config.chat_recent_turns,
-            max(1, user_turns),
-        )
-        last_error: ContextCompactionError | None = None
-        for recent_turns in range(starting_recent_turns, 0, -1):
-            try:
-                return self._compact_chat_to_budget(
-                    forced_budget,
-                    cancel=cancel,
-                    record_success=False,
-                    recent_turns=recent_turns,
-                ).changed
-            except ContextCompactionError as exc:
-                last_error = exc
-        assert last_error is not None
-        raise last_error
 
     def _automatic_compact_chat(
         self, *, cancel: CancellationToken | None = None

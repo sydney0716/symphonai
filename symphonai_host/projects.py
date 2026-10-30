@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-import os
 from pathlib import Path
 from collections.abc import Callable, Mapping
 
 from symphonai_api.extensions import load_extensions
 from symphonai_api.lsp import LspManager
 from symphonai_api.mcp_pool import McpPool
-from symphonai_api.paths import ensure_private_directory
+from symphonai_api.paths import ensure_private_directory, write_atomic
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_host.run import HostRun
@@ -108,20 +107,9 @@ def record_recent_project(home: Path, root: Path) -> None:
     recent = [root_string, *(item for item in recent if item != root_string)][:20]
     try:
         ensure_private_directory(home)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(recent, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
+        write_atomic(path, json.dumps(recent), mode=0o600, fsync=True)
     except OSError:
         return
-    finally:
-        if "temporary" in locals():
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def recent_projects(home: Path) -> list[str]:

@@ -14,6 +14,14 @@ class CheckFailed(Exception):
     """One check's assertion failed. Caught by the driver, not by a check."""
 
 
+class CheckSkipped(Exception):
+    """A check cannot run in the current environment."""
+
+
+def skip(reason: str) -> NoReturn:
+    raise CheckSkipped(reason)
+
+
 REGISTRY: dict[str, Callable[[], None]] = {}
 NEEDS_REPOSITORY: set[str] = set()
 _CURRENT_LABELS: list[str] | None = None
@@ -122,6 +130,7 @@ def run(selector: str | None = None) -> int:
                 labels: list[str] = []
                 _CURRENT_LABELS = labels
                 failure: str | None = None
+                skip_reason: str | None = None
                 previous_handler = None
                 previous_alarm = 0
                 try:
@@ -131,6 +140,8 @@ def run(selector: str | None = None) -> int:
                     function()
                 except _CheckTimedOut:
                     failure = f"timed out after {timeout_seconds}s"
+                except CheckSkipped as exc:
+                    skip_reason = str(exc)
                 except CheckFailed as exc:
                     failure = str(exc)
                 except Exception as exc:
@@ -144,7 +155,10 @@ def run(selector: str | None = None) -> int:
                             signal.alarm(previous_alarm)
                     _CURRENT_LABELS = None
 
-                if failure is None:
+                if skip_reason is not None:
+                    skipped += 1
+                    print(f"SKIP  {name}: {skip_reason}")
+                elif failure is None:
                     passed += 1
                     print(f"PASS  {name}")
                 else:

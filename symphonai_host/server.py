@@ -39,10 +39,11 @@ from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KE
 from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR, OpenAIProvider
 from symphonai_api.provider_catalog import CATALOG, build_catalog_provider, catalog_keys
 from symphonai_api.session import SessionError, SessionStore, TranscriptError
-from symphonai_api.paths import symphonai_home
+from symphonai_api.paths import symphonai_home, write_atomic
 from symphonai_api.survey import survey_repository
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.web_search import search_endpoint, search_endpoints
+from symphonai_host.git import read_git_status
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.approvals import InvalidApprovalAnswer, PermissionGrantError
 from symphonai_host.credentials import CredentialError, apply_to_environment, store
@@ -59,13 +60,12 @@ from symphonai_host.protocol import (
     encode_frame,
 )
 from symphonai_host.run import (
-    AgentControlError,
     ChangedOutsideError,
     CommandActiveError,
     HostRun,
     ModeSelectionError,
     NoConversationError,
-    ProviderSelectionError,
+    ProviderSelectionError, MissingAPIKeyError,
     RunActiveError,
     WorktreeApplyConflict,
 )
@@ -100,26 +100,12 @@ PROVIDERS = (
 
 
 def _working_tree_fingerprint(root: Path) -> dict[str, tuple[str, int, int, int, int, int]] | None:
-    result = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        cwd=root, capture_output=True, check=False,
-    )
-    if result.returncode != 0:
+    snapshot = read_git_status(root)
+    if snapshot is None:
         return None
-    entries = result.stdout.split(b"\0")
-    paths: list[tuple[str, str]] = []
-    index = 0
-    while index < len(entries):
-        entry = entries[index]
-        index += 1
-        if len(entry) < 4:
-            continue
-        status = os.fsdecode(entry[:2])
-        paths.append((os.fsdecode(entry[3:]), status))
-        if "R" in status or "C" in status:
-            if index < len(entries):
-                paths.append((os.fsdecode(entries[index]), status))
-                index += 1
+    root = snapshot.root
+    paths = [(path, entry.code) for entry in snapshot.entries
+             for path in (entry.path, entry.old_path) if path is not None]
     fingerprint = {}
     for relative, status in paths:
         try:
@@ -159,38 +145,18 @@ def _pull_request_command(args: list[str], root: Path, name: str) -> subprocess.
 
 
 def _git_status(root: Path, *, diff_limit: int = 200) -> dict[str, Any]:
-    top = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], cwd=root,
-        capture_output=True, check=False,
-    )
-    if top.returncode:
+    snapshot = read_git_status(root)
+    if snapshot is None:
         return {"repo": False}
-    root = Path(os.fsdecode(top.stdout.strip())).resolve()
+    root = snapshot.root
     branch_result = subprocess.run(
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=root,
         capture_output=True, check=False,
     )
     branch = os.fsdecode(branch_result.stdout.strip()) if branch_result.returncode == 0 else None
-    status_result = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, capture_output=True, check=False,
-    )
-    if status_result.returncode:
-        return {"repo": False}
-
     records = []
-    fields = status_result.stdout.split(b"\0")
-    index = 0
-    while index < len(fields) and fields[index]:
-        entry = fields[index]
-        index += 1
-        code = os.fsdecode(entry[:2])
-        path = os.fsdecode(entry[3:])
-        old_path = None
-        if "R" in code or "C" in code:
-            if index < len(fields):
-                old_path = os.fsdecode(fields[index])
-                index += 1
+    for entry in snapshot.entries:
+        code, path, old_path = entry.code, entry.path, entry.old_path
         if code == "??":
             status = "untracked"
         elif "R" in code or "C" in code:
@@ -294,13 +260,10 @@ def _git_diff_text(root: Path, record: dict[str, Any]) -> tuple[str, bool]:
 
 
 def _git_diff(root: Path, path: str) -> dict[str, Any] | None:
-    top = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], cwd=root,
-        capture_output=True, check=False,
-    )
-    if top.returncode:
+    snapshot = read_git_status(root)
+    if snapshot is None:
         return None
-    repository = Path(os.fsdecode(top.stdout.strip())).resolve()
+    repository = snapshot.root
     relative = Path(path)
     if not path or relative.is_absolute() or ".." in relative.parts:
         raise ValueError("path must be inside the repository")
@@ -308,33 +271,23 @@ def _git_diff(root: Path, path: str) -> dict[str, Any] | None:
         (repository / relative).parent.resolve(strict=False).relative_to(repository)
     except ValueError as exc:
         raise ValueError("path must be inside the repository") from exc
-    status = _git_status(repository, diff_limit=0)
-    if not status.get("repo"):
+    entry = next((item for item in snapshot.entries if item.path == path), None)
+    if entry is None:
         return None
-    record = next((item for item in status["files"] if item["path"] == path), None)
-    if record is None:
-        return None
+    record = {"path": entry.path, "status": "untracked" if entry.code == "??" else "modified"}
+    if entry.old_path is not None:
+        record["old_path"] = entry.old_path
     diff, truncated = _git_diff_text(repository, record)
     return {"path": path, "diff": diff[:20_000], "diff_truncated": truncated}
 
 
 def _git_commit(root: Path, message: str, paths: list[str]) -> dict[str, Any]:
-    top = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], cwd=root,
-        capture_output=True, check=False,
-    )
-    if top.returncode:
+    snapshot = read_git_status(root)
+    if snapshot is None:
         raise ValueError("not a git repository")
-    root = Path(os.fsdecode(top.stdout.strip())).resolve()
-    status = _git_status(root)
-    if not status["repo"]:
-        raise ValueError("not a git repository")
-    changed = {
-        path
-        for entry in status["files"]
-        for path in (entry["path"], entry.get("old_path"))
-        if isinstance(path, str)
-    }
+    root = snapshot.root
+    changed = {path for entry in snapshot.entries
+               for path in (entry.path, entry.old_path) if path is not None}
     selected = sorted(set(paths))
     for path in selected:
         relative = Path(path)
@@ -516,7 +469,7 @@ def _provider(name: str | None = None, model: str | None = None, base_url: str |
         raise ProviderSelectionError("base_url must be a non-empty string")
     vendor, key, provider_class = next(row for row in PROVIDERS if row[0] == name)
     if not os.environ.get(key, "").strip():
-        raise ProviderSelectionError(f"{vendor} has no API key")
+        raise MissingAPIKeyError(f"{vendor} has no API key")
     if name in CATALOG:
         if base_url is not None:
             raise ProviderSelectionError(f"{name} uses its catalog base URL")
@@ -568,23 +521,7 @@ def _provider_for_start(provider_factory=_provider) -> tuple[ModelProvider | Non
 def _save_provider_selection(choice: Mapping[str, str]) -> None:
     target = _selection_path()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary_name = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=target.parent,
-            prefix=".selection-", suffix=".tmp", delete=False,
-        ) as temporary:
-            temporary_name = temporary.name
-            json.dump(dict(choice), temporary)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, target)
-    finally:
-        if temporary_name is not None:
-            try:
-                Path(temporary_name).unlink()
-            except FileNotFoundError:
-                pass
+    write_atomic(target, json.dumps(dict(choice)), mode=0o600, fsync=True)
 
 
 def _app_root() -> Path:
@@ -635,7 +572,7 @@ class HostServer:
         self._default_provider = provider
         self._provider_selection = dict(provider_selection or ({
             "name": provider.name,
-            **({"model": provider.model} if getattr(provider, "model", None) else {}),
+            **({"model": provider.model} if provider.model else {}),
         } if provider is not None else {}))
         self._home = symphonai_home(home)
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
@@ -666,7 +603,6 @@ class HostServer:
             lsp=lsp,
         )) if policy is not None else None)
         initial_run = None if initial_runtime is None else initial_runtime.run
-        self.run = initial_run
         self._runtimes: dict[Path, ProjectRuntime] = {}
         self._runtimes_lock = threading.RLock()
         self._event_session_ids: dict[str, str] = {}
@@ -769,9 +705,6 @@ class HostServer:
         with self._runtimes_lock:
             return None if self._current_root is None else self._runtimes[self._current_root].run
 
-    @run.setter
-    def run(self, value: HostRun | None) -> None:
-        self._initial_run = value
 
     def open_project(self, root: Path) -> tuple[ProjectRuntime | None, bool]:
         resolved = root.resolve()
@@ -1237,27 +1170,7 @@ class HostServer:
 
             def _write_definition(self, target: Path, text: str) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                temporary_name: str | None = None
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        mode="w",
-                        encoding="utf-8",
-                        dir=target.parent,
-                        prefix=f".{target.name}.",
-                        suffix=".tmp",
-                        delete=False,
-                    ) as temporary:
-                        temporary_name = temporary.name
-                        temporary.write(text)
-                        temporary.flush()
-                        os.fsync(temporary.fileno())
-                    os.replace(temporary_name, target)
-                finally:
-                    if temporary_name is not None:
-                        try:
-                            Path(temporary_name).unlink()
-                        except FileNotFoundError:
-                            pass
+                write_atomic(target, text, mode=0o600, fsync=True)
 
             def _serve_definition(self) -> None:
                 values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
@@ -1317,6 +1230,8 @@ class HostServer:
                     self._json(HTTPStatus.CONFLICT, {"error": "open a project first"})
                     return
                 if self.path == "/health":
+                    if not self._authorized():
+                        return
                     self._json(
                         HTTPStatus.OK,
                         {
@@ -1904,7 +1819,7 @@ class HostServer:
 
             def do_POST(self) -> None:
                 credential_route = urlsplit(self.path).path == "/credentials"
-                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact", "/agent", "/agent/control", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
+                if self.path not in ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt", "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new", "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact", "/agent", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard", "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit", "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start", "/memory/update", "/memory/delete") and not credential_route:
                     self._not_found()
                     return
                 if not self._authorized():
@@ -2365,33 +2280,6 @@ class HostServer:
                         },
                     )
                     return
-                if self.path == "/agent/control":
-                    try:
-                        payload = self._read_object()
-                        if (
-                            set(payload) - {"agent_id", "action", "text"}
-                            or not isinstance(payload.get("agent_id"), str)
-                            or not payload["agent_id"]
-                            or payload.get("action") not in ("pause", "resume", "redirect", "stop")
-                            or ("text" in payload and not isinstance(payload["text"], str))
-                            or (payload.get("action") == "redirect" and not str(payload.get("text", "")).strip())
-                        ):
-                            raise ProtocolError("agent/control requires agent_id, a valid action, and redirect text")
-                    except ProtocolError as exc:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                        return
-                    try:
-                        reply = host.run.control_agent(
-                            payload["agent_id"], payload["action"], payload.get("text")
-                        )
-                    except RunActiveError as exc:
-                        self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-                        return
-                    except AgentControlError as exc:
-                        self._json(HTTPStatus(exc.status), {"error": str(exc)})
-                        return
-                    self._json(HTTPStatus.OK, reply)
-                    return
                 if self.path == "/steer":
                     try:
                         payload = self._read_object()
@@ -2564,9 +2452,9 @@ class HostServer:
                         opened = host.run._open_conversations.get(run_id)
                         session_store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, run_id)
                         try:
-                            meta = session_store.read_meta()
-                            meta["title"] = title
-                            session_store.write_meta(meta)
+                            def change(meta):
+                                meta["title"] = title
+                            session_store.update_meta(change)
                         finally:
                             if opened is None:
                                 session_store.close()

@@ -492,6 +492,80 @@ def _anthropic_stream_chunks(
             return
 
 
+class _AnthropicRequest:
+    """Per-call request construction and remembered parameter rejections."""
+
+    def __init__(self, provider, request: ModelRequest, api_key: str, *, stream: bool):
+        self.request = request
+        self.api_key = api_key
+        self.base_url = provider.base_url
+        self.model = request.model if request.model is not None else provider.model
+        self.key = _model_key(self.base_url, self.model)
+        self.default_max_tokens = DEFAULT_STREAM_MAX_TOKENS if stream else provider.max_tokens
+        self.stream = stream
+        self.max_tokens_override = _cached_max_tokens(self.key) if request.max_tokens is None else None
+        effort = resolve_effort(2, self.model, request.effort)
+        self.include_thinking = (
+            effort is not None
+            and request.temperature is None
+            and not _thinking_disabled(self.key)
+        )
+        with _ANTHROPIC_CAPABILITIES_LOCK:
+            self.include_fallback = self.key not in _FALLBACK_DISABLED
+        self.retried_max_tokens = False
+
+    def build(self):
+        body = _build_request_body(
+            self.request,
+            self.model,
+            self.default_max_tokens,
+            max_tokens_override=self.max_tokens_override,
+            include_thinking=self.include_thinking,
+            include_fallback=self.include_fallback,
+        )
+        if self.stream:
+            body["stream"] = True
+        http_request = urllib.request.Request(
+            f"{self.base_url}/messages",
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+                **({"anthropic-beta": "server-side-fallback-2026-07-01"}
+                   if "fallbacks" in body else {}),
+            },
+        )
+        return body, http_request
+
+    def resend(self, exc: ProviderError, body: dict[str, Any]) -> bool:
+        if ("fallbacks" in body and "400" in str(exc)
+                and any(name in str(exc).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback"))):
+            with _ANTHROPIC_CAPABILITIES_LOCK:
+                _FALLBACK_DISABLED.add(self.key)
+            self.include_fallback = False
+            return True
+        limit = _max_tokens_limit(exc)
+        sent_tokens = body["max_tokens"]
+        if (
+            not self.retried_max_tokens
+            and limit is not None
+            and sent_tokens > limit
+        ):
+            with _ANTHROPIC_CAPABILITIES_LOCK:
+                _MAX_TOKENS_LIMITS[self.key] = limit
+            self.max_tokens_override = limit
+            self.retried_max_tokens = True
+            return True
+        if self.include_thinking and _thinking_parameter_rejected(exc):
+            with _ANTHROPIC_CAPABILITIES_LOCK:
+                _THINKING_DISABLED.add(self.key)
+            self.include_thinking = False
+            return True
+        return False
+
+
 @dataclass
 class AnthropicProvider(ModelProvider):
     """Calls the real Anthropic Messages API.
@@ -500,6 +574,8 @@ class AnthropicProvider(ModelProvider):
     this object -- it is read from `ANTHROPIC_API_KEY` fresh on every call,
     never logged, and never included in any error message.
     """
+
+    routine_model = ROUTINE_MODEL
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
@@ -527,41 +603,9 @@ class AnthropicProvider(ModelProvider):
         if not api_key:
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
-        model = request.model if request.model is not None else self.model
-        key = _model_key(self.base_url, model)
-        max_tokens_override = (
-            _cached_max_tokens(key) if request.max_tokens is None else None
-        )
-        effort = resolve_effort(2, model, request.effort)
-        include_thinking = (
-            effort is not None
-            and request.temperature is None
-            and not _thinking_disabled(key)
-        )
-        with _ANTHROPIC_CAPABILITIES_LOCK:
-            include_fallback = key not in _FALLBACK_DISABLED
-        retried_max_tokens = False
+        state = _AnthropicRequest(self, request, api_key, stream=False)
         while True:
-            body = _build_request_body(
-                request,
-                model,
-                self.max_tokens,
-                max_tokens_override=max_tokens_override,
-                include_thinking=include_thinking,
-                include_fallback=include_fallback,
-            )
-            http_request = urllib.request.Request(
-                f"{self.base_url}/messages",
-                data=json.dumps(body).encode("utf-8"),
-                method="POST",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": ANTHROPIC_VERSION,
-                    "content-type": "application/json",
-                    **({"anthropic-beta": "server-side-fallback-2026-07-01"}
-                       if "fallbacks" in body else {}),
-                },
-            )
+            body, http_request = state.build()
             try:
                 raw = read_with_retry(
                     http_request,
@@ -569,33 +613,12 @@ class AnthropicProvider(ModelProvider):
                     max_attempts=self.max_attempts,
                     api_key=api_key,
                     operation="Anthropic API",
-                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+                    fallback_configured=bool(self.fallback_models),
                     cancel=cancel,
                     call_class=request.call_class,
                 )
             except ProviderError as exc:
-                if ("fallbacks" in body and "400" in str(exc)
-                        and any(name in str(exc).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback"))):
-                    with _ANTHROPIC_CAPABILITIES_LOCK:
-                        _FALLBACK_DISABLED.add(key)
-                    include_fallback = False
-                    continue
-                limit = _max_tokens_limit(exc)
-                sent_tokens = body["max_tokens"]
-                if (
-                    not retried_max_tokens
-                    and limit is not None
-                    and sent_tokens > limit
-                ):
-                    with _ANTHROPIC_CAPABILITIES_LOCK:
-                        _MAX_TOKENS_LIMITS[key] = limit
-                    max_tokens_override = limit
-                    retried_max_tokens = True
-                    continue
-                if include_thinking and _thinking_parameter_rejected(exc):
-                    with _ANTHROPIC_CAPABILITIES_LOCK:
-                        _THINKING_DISABLED.add(key)
-                    include_thinking = False
+                if state.resend(exc, body):
                     continue
                 raise
             return _parse_response(parse_json_object(raw, "Anthropic API"))
@@ -607,51 +630,18 @@ class AnthropicProvider(ModelProvider):
         if not api_key:
             raise ProviderError(f"{API_KEY_ENV_VAR} is not set")
 
-        model = request.model if request.model is not None else self.model
-        key = _model_key(self.base_url, model)
-        max_tokens_override = (
-            _cached_max_tokens(key) if request.max_tokens is None else None
-        )
-        effort = resolve_effort(2, model, request.effort)
-        include_thinking = (
-            effort is not None
-            and request.temperature is None
-            and not _thinking_disabled(key)
-        )
-        with _ANTHROPIC_CAPABILITIES_LOCK:
-            include_fallback = key not in _FALLBACK_DISABLED
-        retried_max_tokens = False
+        state = _AnthropicRequest(self, request, api_key, stream=True)
         while True:
-            body = _build_request_body(
-                request,
-                model,
-                DEFAULT_STREAM_MAX_TOKENS,
-                max_tokens_override=max_tokens_override,
-                include_thinking=include_thinking,
-                include_fallback=include_fallback,
-            )
-            body["stream"] = True
-            http_request = urllib.request.Request(
-                f"{self.base_url}/messages",
-                data=json.dumps(body).encode("utf-8"),
-                method="POST",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": ANTHROPIC_VERSION,
-                    "content-type": "application/json",
-                    **({"anthropic-beta": "server-side-fallback-2026-07-01"}
-                       if "fallbacks" in body else {}),
-                },
-            )
+            body, http_request = state.build()
 
             def attempt(remaining):
                 lines = open_stream_with_retry(
                     http_request,
                     timeout=remaining,
-                    max_attempts=1,
+
                     api_key=api_key,
                     operation="Anthropic API",
-                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+
                     cancel=cancel,
                 )
                 return _anthropic_stream_chunks(lines, api_key=api_key)
@@ -662,8 +652,8 @@ class AnthropicProvider(ModelProvider):
                     attempt,
                     timeout=self.timeout_seconds,
                     max_attempts=self.max_attempts,
-                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
-                    cancel=cancel,
+                    fallback_configured=bool(self.fallback_models),
+                    cancel=cancel, call_class=request.call_class, operation="Anthropic API",
                 ):
                     emitted = True
                     yield chunk
@@ -671,27 +661,6 @@ class AnthropicProvider(ModelProvider):
             except ProviderError as exc:
                 if emitted:
                     raise
-                if ("fallbacks" in body and "400" in str(exc)
-                        and any(name in str(exc).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback"))):
-                    with _ANTHROPIC_CAPABILITIES_LOCK:
-                        _FALLBACK_DISABLED.add(key)
-                    include_fallback = False
-                    continue
-                limit = _max_tokens_limit(exc)
-                sent_tokens = body["max_tokens"]
-                if (
-                    not retried_max_tokens
-                    and limit is not None
-                    and sent_tokens > limit
-                ):
-                    with _ANTHROPIC_CAPABILITIES_LOCK:
-                        _MAX_TOKENS_LIMITS[key] = limit
-                    max_tokens_override = limit
-                    retried_max_tokens = True
-                    continue
-                if include_thinking and _thinking_parameter_rejected(exc):
-                    with _ANTHROPIC_CAPABILITIES_LOCK:
-                        _THINKING_DISABLED.add(key)
-                    include_thinking = False
+                if state.resend(exc, body):
                     continue
                 raise

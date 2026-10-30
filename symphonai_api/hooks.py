@@ -5,9 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
-import signal
-import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,7 +16,6 @@ from symphonai_api.trust import TrustList
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TIMEOUT_SECONDS = 30.0
-CLEANUP_TIMEOUT_SECONDS = 1.0
 
 _LOG = logging.getLogger(__name__)
 
@@ -183,40 +179,8 @@ def hooks_from_config(
     return tuple(parsed)
 
 
-def _signal_group(proc: subprocess.Popen[bytes], signal_number: int) -> None:
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(proc.pid, signal_number)
-        elif signal_number == signal.SIGTERM:
-            proc.terminate()
-        else:
-            proc.kill()
-    except (OSError, ProcessLookupError, PermissionError):
-        pass
 
 
-def _stop_process_group(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
-    _signal_group(proc, signal.SIGTERM)
-    try:
-        return proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _signal_group(proc, signal.SIGKILL)
-        try:
-            return proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired as exc:
-            proc.kill()
-            try:
-                return proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                if proc.stdout is not None:
-                    proc.stdout.close()
-                if proc.stderr is not None:
-                    proc.stderr.close()
-                try:
-                    proc.wait(timeout=CLEANUP_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    pass
-                return exc.output or b"", exc.stderr or b""
 
 
 class HookRunner:
@@ -230,45 +194,25 @@ class HookRunner:
         payload: Mapping[str, object],
     ) -> tuple[HookOutcome, str | None]:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        try:
-            proc = subprocess.Popen(
-                hook.command,
-                shell=False,
-                cwd=self._cwd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-        except (OSError, ValueError) as exc:
-            outcome = HookOutcome(False, None, False, "", str(exc))
-            mode = "missing executable" if isinstance(exc, FileNotFoundError) else "could not start"
-            return outcome, mode
-
-        try:
-            raw_stdout, raw_stderr = proc.communicate(
-                input=encoded,
-                timeout=hook.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            raw_stdout, raw_stderr = _stop_process_group(proc)
-            stdout = raw_stdout.decode("utf-8", errors="replace")
-            stderr = raw_stderr.decode("utf-8", errors="replace")
-            return HookOutcome(False, None, True, stdout, stderr), "timeout"
-
-        try:
-            stdout = raw_stdout.decode("utf-8", errors="strict")
-            stderr = raw_stderr.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            return HookOutcome(False, proc.returncode, False, "", ""), "unparseable output"
-        outcome = HookOutcome(
-            ok=proc.returncode == 0,
-            exit_code=proc.returncode,
-            timed_out=False,
-            stdout=stdout,
-            stderr=stderr,
+        from symphonai_api.process import run_process
+        result = run_process(
+            hook.command, self._cwd, input=encoded, timeout=hook.timeout_seconds,
+            merge_stderr=False, output_limit=None,
         )
-        return outcome, None
+        if result.error is not None:
+            outcome = HookOutcome(False, None, False, "", str(result.error))
+            mode = "missing executable" if isinstance(result.error, FileNotFoundError) else "could not start"
+            return outcome, mode
+        if result.timed_out:
+            return HookOutcome(False, None, True,
+                               result.stdout.decode("utf-8", errors="replace"),
+                               result.stderr.decode("utf-8", errors="replace")), "timeout"
+        try:
+            stdout = result.stdout.decode("utf-8", errors="strict")
+            stderr = result.stderr.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return HookOutcome(False, result.exit_code, False, "", ""), "unparseable output"
+        return HookOutcome(result.exit_code == 0, result.exit_code, False, stdout, stderr), None
 
     def __call__(self, event: Event) -> None:
         event_name = type(event).__name__

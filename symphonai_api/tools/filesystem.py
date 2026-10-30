@@ -103,15 +103,18 @@ class ReadFileTool(LocalTool):
             "type": "object",
             "properties": {
                 "path": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "Path to the file to read, relative to the allowed root.",
                 },
                 "offset": {
+                    "minimum": 1,
                     "type": "integer",
                     "description": "1-based first line to read.",
                     "default": 1,
                 },
                 "limit": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": f"Maximum lines to read; 0 reads to end of file. Defaults to {MAX_READ_LINES}.",
                     "default": MAX_READ_LINES,
@@ -127,21 +130,6 @@ class ReadFileTool(LocalTool):
             concurrency_safe=True,
             paths=(path,) if isinstance(path, str) else None,
         )
-
-    def validate(self, arguments: dict) -> str | None:
-        if not arguments.get("path"):
-            return "missing required argument: path"
-        offset = arguments.get("offset", 1)
-        if isinstance(offset, bool) or not isinstance(offset, int):
-            return "offset must be an integer"
-        if offset < 1:
-            return "offset must be >= 1"
-        limit = arguments.get("limit", MAX_READ_LINES)
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            return "limit must be an integer"
-        if limit < 0:
-            return "limit must be >= 0"
-        return None
 
     def _execute(
         self,
@@ -289,6 +277,7 @@ class WriteFileTool(LocalTool):
             "type": "object",
             "properties": {
                 "path": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "Path to the file to write, relative to the allowed root.",
                 },
@@ -308,13 +297,6 @@ class WriteFileTool(LocalTool):
             concurrency_safe=False,
             paths=(path,) if isinstance(path, str) else None,
         )
-
-    def validate(self, arguments: dict) -> str | None:
-        if not arguments.get("path"):
-            return "missing required argument: path"
-        if arguments.get("content") is None:
-            return "missing required argument: content"
-        return None
 
     def _execute(
         self,

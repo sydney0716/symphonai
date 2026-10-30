@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import re
 import secrets
-import tempfile
+from symphonai_api.paths import write_atomic
 
 
 _ID_PATTERN = re.compile(r"loop_[0-9a-f]{12}\Z")
@@ -112,27 +111,18 @@ class LoopStore:
         folder = self._folder(loop.get("id"))
         folder.mkdir(parents=True, exist_ok=True)
         loop["updated_at"] = _timestamp()
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=folder,
-                prefix=".loop.json.", suffix=".tmp", delete=False,
-            ) as output:
-                temporary = Path(output.name)
-                json.dump(loop, output, ensure_ascii=False, indent=2)
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, folder / "loop.json")
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        write_atomic(
+            folder / "loop.json", json.dumps(loop, ensure_ascii=False, indent=2) + "\n",
+            mode=0o600, fsync=True,
+        )
 
     def set_state(self, loop: dict, state: str, reason: str = "") -> dict:
         current = loop.get("state")
         allowed = _LOOP_TRANSITIONS.get(current, set()) if isinstance(current, str) else set()
         if not isinstance(state, str) or state not in allowed:
             raise ValueError(f"invalid loop state transition: {current!r} -> {state!r}")
+        if state != "needs_attention":
+            loop.pop("failure_stage", None)
         loop["state"] = state
         loop["reason"] = reason
         self.save(loop)

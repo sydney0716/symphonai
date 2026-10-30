@@ -10,6 +10,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import Iterable, Iterator
 
+from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.identity import new_id
 from symphonai_api.models import ModelResponse, ToolCall
@@ -21,12 +22,12 @@ from symphonai_api.providers.base import (
 from symphonai_api.retry import (
     FALLBACK_OVERLOAD_MAX_ATTEMPTS,
     OVERLOAD_STATUS_CODES,
-    _context_token_counts,
-    _is_context_length_error,
-    _is_retryable_status,
-    _is_retryable_url_error,
-    _redacted_error_detail,
-    _wait_before_retry,
+    context_token_counts,
+    is_context_length_error,
+    is_retryable_status,
+    is_retryable_url_error,
+    redacted_error_detail,
+    wait_before_retry,
     redact_secret,
 )
 
@@ -78,58 +79,73 @@ def retry_stream_chunks(
     factory, *, timeout: float, max_attempts: int,
     fallback_configured: bool = False,
     cancel: CancellationToken | None = None,
+    call_class: CallClass = CallClass.FOREGROUND,
+    operation: str = "stream",
 ):
     """Retry transient stream failures until answer text has been yielded."""
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than 0")
+    permanent_codes = {
+        "openai": {"invalid_request_error", "context_length_exceeded", "invalid_prompt"},
+        "anthropic": {"invalid_request_error", "authentication_error", "permission_error",
+                      "not_found_error", "request_too_large"},
+        "gemini": {"INVALID_ARGUMENT", "FAILED_PRECONDITION", "PERMISSION_DENIED",
+                   "NOT_FOUND", "UNAUTHENTICATED"},
+    }
+    overload_codes = {
+        "anthropic": {"overloaded_error": 529, "rate_limit_error": 429},
+        "openai": {"rate_limit_exceeded": 429},
+        "gemini": {"RESOURCE_EXHAUSTED": 429},
+    }
     deadline = time.monotonic() + timeout
     for attempt in range(1, max_attempts + 1):
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProviderError(f"stream exceeded its {timeout}s overall timeout")
         chunks: list[StreamChunk] = []
         output_yielded = False
         try:
-            for chunk in factory(remaining):
-                if isinstance(chunk, (TextDelta, ReasoningDelta)):
-                    if not output_yielded:
-                        yield from chunks
-                        chunks.clear()
-                        output_yielded = True
-                    yield chunk
-                elif output_yielded:
-                    yield chunk
-                else:
-                    chunks.append(chunk)
-            if not output_yielded:
-                yield from chunks
-            return
-        except StreamEventError as exc:
-            if output_yielded:
-                yield from chunks
-            permanent_codes = (
-                {"invalid_request_error", "context_length_exceeded", "invalid_prompt"}
-                if exc.vendor == "openai"
-                else {"invalid_request_error", "authentication_error", "permission_error",
-                      "not_found_error", "request_too_large"}
-            )
-            permanent = exc.code in permanent_codes
-            if output_yielded or permanent:
-                raise ProviderError(str(exc)) from None
-            if _wait_before_retry(attempt=attempt, max_attempts=max_attempts,
-                                  deadline=deadline, retry_after=None, cancel=cancel):
-                continue
-            raise ProviderUnavailableError(str(exc), status=None) from None
+            try:
+                for chunk in factory(remaining):
+                    if isinstance(chunk, (TextDelta, ReasoningDelta)):
+                        if not output_yielded:
+                            yield from chunks
+                            chunks.clear()
+                            output_yielded = True
+                        yield chunk
+                    elif output_yielded:
+                        yield chunk
+                    else:
+                        chunks.append(chunk)
+                if not output_yielded:
+                    yield from chunks
+                return
+            except StreamEventError as exc:
+                if exc.code in permanent_codes.get(exc.vendor, permanent_codes["anthropic"]):
+                    chunks.clear()
+                    raise ProviderError(str(exc)) from None
+                status = overload_codes.get(exc.vendor, {}).get(exc.code)
+                raise _StreamUnavailableError(str(exc), status=status) from None
         except ProviderUnavailableError as exc:
             if output_yielded:
                 yield from chunks
                 raise ProviderError(str(exc)) from None
-            retry_after = getattr(exc, "retry_after", None)
+            if exc.status in OVERLOAD_STATUS_CODES and call_class is CallClass.BACKGROUND:
+                attempt_text = "the first attempt" if attempt == 1 else f"attempt {attempt}"
+                raise ProviderError(
+                    f"{operation} returned HTTP {exc.status} on {attempt_text} "
+                    "and did not retry: background calls do not retry provider overload"
+                ) from None
             attempt_limit = max_attempts
             if fallback_configured and exc.status in OVERLOAD_STATUS_CODES:
                 attempt_limit = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
-            if _wait_before_retry(attempt=attempt, max_attempts=attempt_limit,
-                                  deadline=deadline, retry_after=retry_after, cancel=cancel):
+            if wait_before_retry(attempt=attempt, max_attempts=attempt_limit,
+                                 deadline=deadline, retry_after=getattr(exc, "retry_after", None),
+                                 cancel=cancel):
                 continue
             raise ProviderUnavailableError(str(exc), status=exc.status) from None
         except ProviderError:
@@ -241,105 +257,60 @@ def open_stream_with_retry(
     request: urllib.request.Request,
     *,
     timeout: float,
-    max_attempts: int,
+    max_attempts: int = 1,
     api_key: str,
     operation: str,
     fallback_configured: bool = False,
     cancel: CancellationToken | None = None,
 ) -> Iterator[bytes]:
-    """Yield response lines, retrying only before the first yielded line."""
+    """Yield one attempt; legacy retry keywords remain accepted for callers.
 
+    Only retry_stream_chunks applies the retry budget and fallback policy.
+    """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     if timeout <= 0:
         raise ValueError("timeout must be greater than 0")
-    deadline = time.monotonic() + timeout
-    yielded = False
-    for attempt in range(1, max_attempts + 1):
-        if cancel is not None:
-            cancel.raise_if_cancelled()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ProviderError(
-                f"{operation} exceeded its {timeout}s overall timeout"
-            )
+    if cancel is not None:
+        cancel.raise_if_cancelled()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for line in response:
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                yield line
+    except urllib.error.HTTPError as exc:
         try:
-            with urllib.request.urlopen(request, timeout=remaining) as response:
-                for line in response:
-                    if cancel is not None:
-                        cancel.raise_if_cancelled()
-                    yielded = True
-                    yield line
-                return
-        except urllib.error.HTTPError as exc:
-            try:
-                raw_detail = exc.read()
-                if raw_detail:
-                    raw_detail.decode("utf-8")
-                detail = _redacted_error_detail(raw_detail, api_key) if raw_detail else ""
-            except Exception:
-                raw_detail = b""
-                detail = ""
-            reason = detail or redact_secret(str(exc), api_key)
-            if (
-                400 <= exc.code <= 499
-                and not _is_retryable_status(exc.code)
-                and _is_context_length_error(raw_detail)
-            ):
-                actual_tokens, limit_tokens = _context_token_counts(raw_detail)
-                raise ContextLengthExceededError(
-                    f"{operation} stream returned HTTP {exc.code}: "
-                    "request exceeded the model context window",
-                    actual_tokens=actual_tokens,
-                    limit_tokens=limit_tokens,
-                ) from None
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            retryable_status = _is_retryable_status(exc.code)
-            attempt_limit = max_attempts
-            if fallback_configured and exc.code in OVERLOAD_STATUS_CODES:
-                attempt_limit = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
-            if not yielded and retryable_status and _wait_before_retry(
-                attempt=attempt,
-                max_attempts=attempt_limit,
-                deadline=deadline,
-                retry_after=retry_after,
-                cancel=cancel,
-            ):
-                continue
-            message = f"{operation} stream returned HTTP {exc.code}: {reason}"
-            if not yielded and retryable_status:
-                raise _StreamUnavailableError(message, status=exc.code, retry_after=retry_after) from None
-            raise ProviderError(message) from None
-        except urllib.error.URLError as exc:
-            reason = redact_secret(str(exc.reason), api_key)
-            retryable_network = _is_retryable_url_error(exc)
-            if not yielded and retryable_network and _wait_before_retry(
-                attempt=attempt,
-                max_attempts=max_attempts,
-                deadline=deadline,
-                retry_after=None,
-                cancel=cancel,
-            ):
-                continue
-            message = f"{operation} stream request failed: {reason}"
-            if not yielded and retryable_network:
-                raise ProviderUnavailableError(message, status=None) from None
-            raise ProviderError(message) from None
-        except (TimeoutError, http.client.IncompleteRead, ConnectionError) as exc:
-            reason = redact_secret(str(exc), api_key)
-            if not yielded and _wait_before_retry(
-                attempt=attempt,
-                max_attempts=max_attempts,
-                deadline=deadline,
-                retry_after=None,
-                cancel=cancel,
-            ):
-                continue
-            message = f"{operation} stream failed: {reason}"
-            if not yielded:
-                raise ProviderUnavailableError(message, status=None) from None
-            raise ProviderError(message) from None
-    raise AssertionError("stream retry loop exhausted without returning or raising")
+            raw_detail = exc.read()
+            if raw_detail:
+                raw_detail.decode("utf-8")
+            detail = redacted_error_detail(raw_detail, api_key) if raw_detail else ""
+        except Exception:
+            raw_detail = b""
+            detail = ""
+        reason = detail or redact_secret(str(exc), api_key)
+        if 400 <= exc.code <= 499 and not is_retryable_status(exc.code) and is_context_length_error(raw_detail):
+            actual_tokens, limit_tokens = context_token_counts(raw_detail)
+            raise ContextLengthExceededError(
+                f"{operation} stream returned HTTP {exc.code}: request exceeded the model context window",
+                actual_tokens=actual_tokens, limit_tokens=limit_tokens,
+            ) from None
+        message = f"{operation} stream returned HTTP {exc.code}: {reason}"
+        if is_retryable_status(exc.code):
+            raise _StreamUnavailableError(
+                message, status=exc.code,
+                retry_after=exc.headers.get("Retry-After") if exc.headers else None,
+            ) from None
+        raise ProviderError(message) from None
+    except urllib.error.URLError as exc:
+        message = f"{operation} stream request failed: {redact_secret(str(exc.reason), api_key)}"
+        if is_retryable_url_error(exc):
+            raise ProviderUnavailableError(message, status=None) from None
+        raise ProviderError(message) from None
+    except (TimeoutError, http.client.IncompleteRead, ConnectionError) as exc:
+        raise ProviderUnavailableError(
+            f"{operation} stream failed: {redact_secret(str(exc), api_key)}", status=None,
+        ) from None
 
 
 def sse_events(lines: Iterable[bytes]) -> Iterator[tuple[str, str]]:

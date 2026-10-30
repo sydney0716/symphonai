@@ -1,10 +1,7 @@
 """Per-run turn, wall-time, token, and cost ceilings.
 
-Wall time is checked at the agent loop's existing decision points. It does not
-interrupt an in-flight provider request: providers already bound each request,
-and interrupting one while preserving a distinct budget stop reason requires a
-child cancellation token. That parent/child cancellation design belongs to
-phase 07, so this module deliberately creates no deadline thread.
+Wall time is checked at the agent loop's decision points; it does not interrupt
+an in-flight provider request, which has its own timeout and cancellation.
 """
 
 from __future__ import annotations

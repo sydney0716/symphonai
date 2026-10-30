@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import re
 import secrets
-import tempfile
+from symphonai_api.paths import write_atomic
 
 
 _ID_PATTERN = re.compile(r"goal_[0-9a-f]{12}\Z")
@@ -57,21 +56,10 @@ class RoadmapStore:
 
     def save(self, roadmap: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=self.path.parent,
-                prefix=".roadmap.json.", suffix=".tmp", delete=False,
-            ) as output:
-                temporary = Path(output.name)
-                json.dump(roadmap, output, ensure_ascii=False, indent=2)
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        write_atomic(
+            self.path, json.dumps(roadmap, ensure_ascii=False, indent=2) + "\n",
+            mode=0o600, fsync=True,
+        )
 
     @staticmethod
     def add(roadmap: dict, goal: str) -> dict:

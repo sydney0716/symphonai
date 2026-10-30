@@ -565,8 +565,12 @@ export function createClient({
       );
     },
 
+    newSession() {
+      return request("POST", "/session/new", {}, readReply, { detailOnError: true });
+    },
+
     conversationStats() {
-      return request("GET", "/conversation", undefined, readReply);
+      return request("GET", "/conversation", undefined, readReply, { detailOnError: true });
     },
 
     storeCredential(name, value) {

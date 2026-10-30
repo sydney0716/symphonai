@@ -1,8 +1,0 @@
-diff --git a/sample.py b/sample.py
-index 0000000..0000000 100644
---- a/sample.py
-+++ b/sample.py
-@@ -1,2 +1,2 @@
- def middle(items):
--    return items[len(items) // 2 + 1]
-+    return items[(len(items) - 1) // 2]

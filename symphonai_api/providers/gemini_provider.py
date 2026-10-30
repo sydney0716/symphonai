@@ -56,6 +56,8 @@ from symphonai_api.streaming import (
     TextDelta,
     ToolCallDelta,
     open_stream_with_retry,
+    retry_stream_chunks,
+    StreamEventError,
     sse_events,
 )
 
@@ -264,6 +266,15 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
         raise ProviderError(f"Gemini returned no candidates (promptFeedback: {feedback})")
 
     candidate = candidates[0]
+    finish_reason = candidate.get("finishReason")
+    refusal_category = None
+    if finish_reason is not None:
+        if finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+                      "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION",
+                      "ESCALATION", "PUP_LIMITED_DISABLED"}:
+            refusal_category = finish_reason.lower()
+        elif finish_reason not in {"STOP", "MAX_TOKENS"}:
+            raise ProviderError(f"Gemini stopped generating: {finish_reason}")
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -304,7 +315,8 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             output_tokens=_usage_count(usage_raw.get("candidatesTokenCount")),
             cache_read_tokens=cache_read_tokens,
         ),
-        stop_reason=candidate.get("finishReason") or "STOP",
+        stop_reason="refusal" if refusal_category else finish_reason or "STOP",
+        refusal_category=refusal_category,
     )
 
 
@@ -314,6 +326,7 @@ def _gemini_stream_chunks(
     """Map Gemini streamGenerateContent SSE payloads to runtime chunks."""
     usage = Usage()
     finish_reason = "STOP"
+    refusal_category = None
     function_call_index = 0
     for _, payload in sse_events(lines):
         try:
@@ -331,7 +344,11 @@ def _gemini_stream_chunks(
                 detail = serialized_error
             elif "includethoughts" in serialized_error.casefold() and "includethoughts" not in detail.casefold():
                 detail = f"{detail} ({serialized_error})"
-            raise ProviderError(redact_secret(detail, api_key))
+            raise StreamEventError(
+                redact_secret(detail, api_key),
+                code=error.get("status") if isinstance(error.get("status"), str) else None,
+                vendor="gemini",
+            )
 
         feedback = data.get("promptFeedback")
         if isinstance(feedback, dict) and feedback.get("blockReason") is not None:
@@ -355,6 +372,12 @@ def _gemini_stream_chunks(
             raise ProviderError("Gemini API stream returned invalid candidate")
         if candidate.get("finishReason") is not None:
             finish_reason = candidate["finishReason"]
+            if finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+                      "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION",
+                      "ESCALATION", "PUP_LIMITED_DISABLED"}:
+                refusal_category = finish_reason.lower()
+            elif finish_reason not in {"STOP", "MAX_TOKENS"}:
+                raise ProviderError(f"Gemini stopped generating: {finish_reason}")
         content = candidate.get("content", {})
         parts = content.get("parts", []) if isinstance(content, dict) else []
         if not isinstance(parts, list):
@@ -390,7 +413,9 @@ def _gemini_stream_chunks(
             function_call_index += 1
     yield StreamCompleted(
         ModelResponse(
-            Message(role=Role.ASSISTANT), usage=usage, stop_reason=finish_reason
+            Message(role=Role.ASSISTANT), usage=usage,
+            stop_reason="refusal" if refusal_category else finish_reason,
+            refusal_category=refusal_category,
         )
     )
 
@@ -405,6 +430,8 @@ class GeminiProvider(ModelProvider):
     where it could leak into logs), never logged, and never included in
     any error message.
     """
+
+    routine_model = ROUTINE_MODEL
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
@@ -452,7 +479,7 @@ class GeminiProvider(ModelProvider):
                 max_attempts=self.max_attempts,
                 api_key=api_key,
                 operation="Gemini API",
-                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+                fallback_configured=bool(self.fallback_models),
                 cancel=cancel,
                 call_class=request.call_class,
             )
@@ -489,16 +516,18 @@ class GeminiProvider(ModelProvider):
                     "content-type": "application/json",
                 },
             )
-            lines = open_stream_with_retry(
-                http_request,
-                timeout=self.timeout_seconds,
-                max_attempts=self.max_attempts,
-                api_key=api_key,
-                operation="Gemini API",
-                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
-                cancel=cancel,
+            def attempt(remaining):
+                lines = open_stream_with_retry(
+                    http_request, timeout=remaining, api_key=api_key,
+                    operation="Gemini API", cancel=cancel,
+                )
+                return _gemini_stream_chunks(lines, api_key=api_key)
+
+            yield from retry_stream_chunks(
+                attempt, timeout=self.timeout_seconds, max_attempts=self.max_attempts,
+                fallback_configured=bool(self.fallback_models), cancel=cancel,
+                call_class=request.call_class, operation="Gemini API",
             )
-            yield from _gemini_stream_chunks(lines, api_key=api_key)
 
         if not include_thoughts:
             yield from stream(False)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -68,15 +69,10 @@ def usage_summary(
         data = record.get("data") if record.get("type") == "usage" else None
         if not isinstance(data, dict) or not isinstance(data.get("model"), str):
             continue
-        values = [data.get(key, 0) for key in (
-            "input_tokens", "output_tokens", "calls", "cache_read_tokens", "cache_write_tokens",
-            "long_context_input_tokens", "long_context_output_tokens",
-            "long_context_cache_read_tokens", "long_context_cache_write_tokens",
-            "cache_write_1h_tokens",
-        )]
-        if any(type(value) is not int or value < 0 for value in values):
+        values = {field.name: data.get(field.name, 0) for field in fields(UsageTotals)}
+        if any(type(value) is not int or value < 0 for value in values.values()):
             continue
-        usage = UsageTotals(*values)
+        usage = UsageTotals(**values)
         model = data["model"]
         agent = data.get("agent_name")
         agent = agent if isinstance(agent, str) and agent else str(record.get("agent_id") or "leader")

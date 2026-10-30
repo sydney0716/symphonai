@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation
+from dataclasses import replace
 from pathlib import Path
 import tomllib
 
@@ -18,7 +18,7 @@ from symphonai_api.agent_memory import MAX_ENTRIES, MemorySettings
 from symphonai_api.budgets import PriceTable, RunBudget
 from symphonai_api.call_class import CallClass
 from symphonai_api.config import CapabilityCeiling, ConfigError
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import BUDGET_KEYS, PermissionPolicy, SettingsParser
 
 
 class AgentFileError(ValueError):
@@ -38,13 +38,12 @@ _TOP_LEVEL_KEYS = {
     "io",
     "deadline_seconds",
     "call_class",
-    "max_depth",
 }
 _TABLE_KEYS = {
     "memory": {"enabled", "max_entries"},
     "model": {"provider", "model", "effort"},
     "isolation": {"inherit", "inherit_tail", "workspace_prefix"},
-    "budget": {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"},
+    "budget": BUDGET_KEYS,
     "policy": {
         "allowed_write_scope",
         "forbidden_patterns",
@@ -119,34 +118,19 @@ def _read_toml(path: Path) -> dict[str, object]:
 
 
 def _string(path: Path, key: str, value: object) -> str:
-    if not isinstance(value, str):
-        _raise(path, key, "must be a string")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(path, field, detail)).string(key, value)
 
 def _integer(path: Path, key: str, value: object) -> int:
-    if type(value) is not int:
-        _raise(path, key, "must be an integer")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(path, field, detail)).integer(key, value)
 
 def _number(path: Path, key: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        _raise(path, key, "must be a number")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(path, field, detail)).number(key, value)
 
 def _boolean(path: Path, key: str, value: object) -> bool:
-    if type(value) is not bool:
-        _raise(path, key, "must be a boolean")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(path, field, detail)).boolean(key, value)
 
 def _strings(path: Path, key: str, value: object) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        _raise(path, key, "must be an array of strings")
-    return value
-
+    return SettingsParser(lambda field, detail: _raise(path, field, detail)).strings(key, value)
 
 def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | None:
     tools_present = "tools" in values
@@ -265,14 +249,13 @@ def _isolation(path: Path, table: Mapping[str, object] | None) -> Isolation:
     if "workspace_prefix" in table:
         workspace_prefix = _string(path, "workspace_prefix", table["workspace_prefix"])
     try:
-        return Isolation(
-            inherit=inherit,
-            inherit_tail=inherit_tail,
-            workspace_prefix=workspace_prefix,
-        )
+        isolation = Isolation(inherit=inherit, inherit_tail=inherit_tail)
     except ValueError as exc:
-        key = "workspace_prefix" if "workspace_prefix" in str(exc) else "inherit_tail"
-        _raise(path, key, str(exc))
+        _raise(path, "inherit_tail", str(exc))
+    try:
+        return replace(isolation, workspace_prefix=workspace_prefix)
+    except ValueError as exc:
+        _raise(path, "workspace_prefix", str(exc))
 
 
 def _budget(
@@ -282,34 +265,12 @@ def _budget(
 ) -> RunBudget | None:
     if table is None:
         return None
-    values: dict[str, object] = {}
-    for key in ("max_turns", "max_total_tokens"):
-        if key in table:
-            values[key] = _integer(path, key, table[key])
-    if "wall_seconds" in table:
-        values["wall_seconds"] = _number(path, "wall_seconds", table["wall_seconds"])
-    if "max_cost" in table:
-        raw_cost = table["max_cost"]
-        if not isinstance(raw_cost, str):
-            _raise(path, "max_cost", "must be quoted as a string")
-        if price_table is None:
-            _raise(path, "max_cost", "requires a price table supplied to the loader")
-        try:
-            cost = Decimal(raw_cost)
-        except InvalidOperation:
-            _raise(path, "max_cost", "must be a decimal string")
-        if not cost.is_finite():
-            _raise(path, "max_cost", "must be a finite decimal string")
-        values["max_cost"] = cost
+    values = SettingsParser(lambda key, detail: _raise(path, key, detail)).budget(
+        table, priced=price_table is not None,
+    )
     if price_table is not None:
         values["price_table"] = price_table
-    try:
-        return RunBudget(**values)
-    except ValueError as exc:
-        for key in ("max_turns", "wall_seconds", "max_total_tokens", "max_cost"):
-            if key in str(exc):
-                _raise(path, key, str(exc))
-        _raise(path, "budget", str(exc))
+    return RunBudget(**values)
 
 
 def _policy(
@@ -326,52 +287,26 @@ def _policy(
             sandbox_network=True,
             fetch_enabled=True,
         )
+    parser = SettingsParser(lambda key, detail: _raise(path, key, detail))
     values: dict[str, object] = {"repo_root": repo_root}
     if "allowed_write_scope" in table:
-        scopes = _strings(path, "allowed_write_scope", table["allowed_write_scope"])
-        values["allowed_write_scope"] = [
-            (repo_root / scope).resolve() for scope in scopes
-        ]
+        values["allowed_write_scope"] = parser.scopes("allowed_write_scope", table["allowed_write_scope"], repo_root)
     if "forbidden_patterns" in table:
-        values["forbidden_patterns"] = tuple(
-            _strings(path, "forbidden_patterns", table["forbidden_patterns"])
-        )
+        values["forbidden_patterns"] = tuple(parser.strings("forbidden_patterns", table["forbidden_patterns"]))
     for key in ("shell_enabled", "fetch_enabled"):
         if key in table:
-            values[key] = _boolean(path, key, table[key])
+            values[key] = parser.boolean(key, table[key])
     if "shell_allowlist" in table:
-        allowlist = table["shell_allowlist"]
-        if not isinstance(allowlist, list):
-            _raise(path, "shell_allowlist", "must be an array of command arrays")
-        commands: list[tuple[str, ...]] = []
-        for command in allowlist:
-            commands.append(tuple(_strings(path, "shell_allowlist", command)))
-        values["shell_allowlist"] = commands
+        values["shell_allowlist"] = parser.commands("shell_allowlist", table["shell_allowlist"])
     if "fetch_allowlist" in table:
-        values["fetch_allowlist"] = _strings(
-            path,
-            "fetch_allowlist",
-            table["fetch_allowlist"],
-        )
+        values["fetch_allowlist"] = parser.hosts("fetch_allowlist", table["fetch_allowlist"])
     if "shell_timeout_seconds" in table:
-        values["shell_timeout_seconds"] = _number(
-            path,
-            "shell_timeout_seconds",
-            table["shell_timeout_seconds"],
-        )
+        values["shell_timeout_seconds"] = parser.number("shell_timeout_seconds", table["shell_timeout_seconds"])
     if "shell_output_limit_chars" in table:
-        values["shell_output_limit_chars"] = _integer(
-            path,
-            "shell_output_limit_chars",
-            table["shell_output_limit_chars"],
-        )
+        values["shell_output_limit_chars"] = parser.integer("shell_output_limit_chars", table["shell_output_limit_chars"])
     if "mode" in table:
-        values["mode"] = _string(path, "mode", table["mode"])
-    try:
-        return PermissionPolicy(**values)
-    except ValueError as exc:
-        key = "mode" if "mode" in str(exc) else "policy"
-        _raise(path, key, str(exc))
+        values["mode"] = parser.mode("mode", table["mode"])
+    return PermissionPolicy(**values)
 
 
 def _io(path: Path, table: Mapping[str, object] | None) -> IOContract:
@@ -382,11 +317,12 @@ def _io(path: Path, table: Mapping[str, object] | None) -> IOContract:
         for key in ("input_schema", "output_schema")
         if key in table
     }
-    try:
-        return IOContract(**values)
-    except ValueError as exc:
-        key = "input_schema" if "input_schema" in str(exc) else "output_schema"
-        _raise(path, key, str(exc))
+    for key, value in values.items():
+        try:
+            IOContract(**{key: value})
+        except ValueError as exc:
+            _raise(path, key, str(exc))
+    return IOContract(**values)
 
 
 def load_agent_file(
@@ -443,14 +379,13 @@ def load_agent_file(
         except ValueError:
             valid = ", ".join(value.value for value in CallClass)
             _raise(source, "call_class", f"must be one of: {valid}")
-    if "max_depth" in data:
-        values["max_depth"] = _integer(source, "max_depth", data["max_depth"])
     try:
         spec = AgentSpec(**values)
     except ValueError as exc:
-        for key in ("name", "deadline_seconds", "max_depth"):
-            if key in str(exc):
-                _raise(source, key, str(exc))
+        if not values["name"] or values["name"] != values["name"].strip():
+            _raise(source, "name", str(exc))
+        if values.get("deadline_seconds") is not None and not values["deadline_seconds"] > 0:
+            _raise(source, "deadline_seconds", str(exc))
         _raise(source, "agent", str(exc))
     if ceiling is not None and policy_table is not None:
         try:

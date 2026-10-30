@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import json
-import signal
 import subprocess
 import threading
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -211,14 +208,6 @@ class GoalCheck:
     process: subprocess.Popen | None = None
 
 
-def _kill_group(process: subprocess.Popen) -> None:
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
-    except (OSError, ProcessLookupError, PermissionError):
-        pass
 
 
 def run_check(
@@ -232,64 +221,20 @@ def run_check(
     sandboxed: bool = False,
 ) -> dict:
     """Run one configured argv and return its bounded result."""
+    from symphonai_api.process import run_process
     command = list(argv)
     if sandboxed and policy is not None:
-        from symphonai_api.tools.shell import (
-            SANDBOX_EXEC, _sandbox_available, _seatbelt_profile,
-        )
-
-        available = _sandbox_available()
-        if policy.shell_sandbox and not available:
-            return {
-                "exit": None,
-                "ok": False,
-                "output": "sandbox requested but unavailable on this platform",
-            }
-        if available:
-            command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *command]
+        from symphonai_api.tools.shell import sandbox_command
+        try:
+            command = sandbox_command(replace(policy, mode="allow"), command, cwd)
+        except ValueError as exc:
+            return {"exit": None, "ok": False, "output": str(exc)}
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            shell=False,
-            start_new_session=True,
+        result = run_process(
+            command, cwd, timeout=GOAL_CHECK_TIMEOUT_SECONDS if timeout is None else timeout,
+            cancel=cancelled.is_set, output_limit=None, on_start=set_process,
         )
-    except OSError as exc:
-        return {"exit": None, "ok": False, "output": str(exc)[-GOAL_OUTPUT_LIMIT:]}
-    set_process(process)
-    deadline = time.monotonic() + (GOAL_CHECK_TIMEOUT_SECONDS if timeout is None else timeout)
-    timed_out = False
-    output = ""
-    completed = False
-    try:
-        while True:
-            if cancelled.is_set():
-                _kill_group(process)
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                _kill_group(process)
-                break
-            try:
-                output, _ = process.communicate(timeout=min(0.05, remaining))
-                completed = True
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        if not completed:
-            try:
-                output, _ = process.communicate(timeout=1)
-            except subprocess.TimeoutExpired:
-                _kill_group(process)
-                output, _ = process.communicate()
     finally:
         set_process(None)
-    code = None if timed_out or cancelled.is_set() else process.returncode
-    output = (output or "")[-GOAL_OUTPUT_LIMIT:]
-    return {"exit": code, "ok": code == 0, "output": output}
+    output = str(result.error) if result.error is not None else result.stdout.decode("utf-8", errors="replace")
+    return {"exit": result.exit_code, "ok": result.exit_code == 0, "output": output[-GOAL_OUTPUT_LIMIT:]}

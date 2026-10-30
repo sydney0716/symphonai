@@ -1,5 +1,8 @@
 """Prompts for SymphonAI's fixed spec workflow roles."""
 
+import json
+from pathlib import Path
+
 ROLE_GUIDANCE = {
     "explorer": "Read-only. Answers one specific question about the code, with path:line evidence. Ask one well-scoped question per explorer, and dispatch several at once for independent questions. Rely on what it reports reading; check yourself only what your change depends on.",
     "worker": "Makes one well-defined change and verifies it. Name the files it owns and the outcome you need, and tell it when other agents are editing nearby. Give it work that can proceed on its own; a small edit is faster to make yourself.",
@@ -82,3 +85,63 @@ REVIEWER_PROMPT = """You are a reviewer. Your job is to find what is wrong with 
 - Before you report a finding, make sure it is real: not handled elsewhere, and not behaviour the spec asked for.
 - Never edit the tree. Turn each finding into a follow-up spec named <id>F-<slug>.md, then <id>F2-<slug>.md, in the same directory.
 - End with a verdict: pass, or list the follow-up specs written. Never commit."""
+
+
+def loop_planner_prompt(
+    goal: str, folder: Path, commands_available: bool, *,
+    note: str | None = None, current_plan: dict | None = None,
+) -> str:
+    revision = ""
+    if note is not None:
+        revision = (
+            f"\n\nRevision note from the person:\n{note}\n\n"
+            "Current plan to revise:\n"
+            + json.dumps(current_plan or {}, ensure_ascii=False, indent=2)
+        )
+    prompt = (
+        f"Plan this goal: {goal}\n\n"
+        f"Write one Markdown spec per card at {folder / 'specs'}/<id>-<slug>.md. Use as few cards as the goal needs: "
+        "one card is right for a small change. Split only where a card can be implemented and reviewed on its own. "
+        "Use ids starting at a in order, with at most 8 cards. "
+        "Each spec must have Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report sections. "
+        "The Validation section must hold one fenced `sh` block with one shell command per line, "
+        "run from the project root; nothing else in that section is run. "
+        "Inspect the project before making claims. Group specs whose Scope paths overlap or that depend "
+        "on each other into the same lane, with at most 3 lanes. Write plan.json last at "
+        f"{folder / 'plan.json'} as {{\"cards\":[{{\"id\":\"a\",\"title\":\"Short title\","
+        "\"spec\":\"specs/a-short-title.md\",\"lane\":1,\"after\":[]}]}}. "
+        "A card whose work documents, tests, or builds on another card's change lists that card in `after`, "
+        "whether or not they share a lane. A card starts from the work of the cards before it and sees nothing else. "
+        "Write plan.json last."
+        + (
+            " commands are unavailable in this environment; inspect files with the read tools."
+            if not commands_available else
+            ""
+        ) + revision
+    )
+    return prompt
+
+
+def spec_reviewer_prompt(spec: str, report: str, patch: str, spec_folder: Path) -> str:
+    prompt = (
+        f"Review this spec:\n\n{spec}\n\nReport:\n\n{report}\n\n"
+        f"Patch:\n\n{patch}\n\nReview the implementation and report. You may write follow-up specs under {spec_folder}/. "
+        "Any follow-up spec's Validation section must hold one fenced `sh` block with one shell command "
+        "per line, run from the project root; nothing else in that section is run. "
+        "End the final answer with a last line `Verdict: pass` or `Verdict: follow-ups: <path>, <path>`."
+    )
+    return prompt
+
+
+def review_command_prompt(base_ref: str | None = None, focus: str | None = None) -> str:
+    subject = (
+        f"Review the changes between {base_ref} and the working tree (git diff {base_ref})."
+        if base_ref is not None else "Review the uncommitted changes in this repository."
+    )
+    prompt = subject + ' Do not change any file.\n\n1. Read them with `git status` and `git diff HEAD`, and read every untracked file that is not ignored.\n2. Read the code each change depends on, and run the narrowest tests that exercise it.\n3. Report findings, most severe first. For each: the file and line, what is wrong, and the input or situation that shows it. Leave out style preferences.\n4. If nothing is worth fixing, say so in one line.'
+    if focus is not None:
+        prompt += f"\n\nFocus on: {focus}"
+    return prompt
+
+
+REVIEW_PROMPT = review_command_prompt()

@@ -65,6 +65,8 @@ def shell_environment(
 
 
 def _seatbelt_profile(policy: PermissionPolicy) -> str:
+    from symphonai_api.tools.search import DEFAULT_SKIP_DIRECTORIES
+
     def quote_path(path: str) -> str:
         return '"' + path.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
 
@@ -93,10 +95,61 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
             '(allow network-inbound (local ip "localhost:*"))',
             '(allow network-outbound (remote ip "localhost:*"))',
         ))
+    def component_regex(pattern: str) -> str:
+        import fnmatch
+
+        pattern = pattern.rstrip("/").casefold()
+        result = ""
+        index = 0
+        while index < len(pattern):
+            char = pattern[index]
+            if char == "*":
+                result += "[^/]*"
+            elif char == "?":
+                result += "[^/]"
+            elif char == "[":
+                end = index + 1
+                if end < len(pattern) and pattern[end] == "!":
+                    end += 1
+                if end < len(pattern) and pattern[end] == "]":
+                    end += 1
+                end = pattern.find("]", end)
+                if end == -1:
+                    result += r"\["
+                else:
+                    fragment = fnmatch.translate(pattern[index:end + 1])[4:-3]
+                    if fragment.startswith("["):
+                        negated = fragment.startswith("[^")
+                        body = fragment[2 if negated else 1:-1]
+                        result += "[" + ("^/" if negated else "") + body + body.upper() + "]"
+                    else:
+                        result += fragment
+                    index = end
+            elif char.isascii() and char.isalpha():
+                result += f"[{char}{char.upper()}]"
+            else:
+                result += re.escape(char)
+            index += 1
+        return result
+
+    def regex_filter(expression: str) -> str:
+        return f"(regex {quote_path(expression)})"
+
+    prefix = "^" + re.escape(str(policy.repo_root.resolve()).rstrip("/")) + "/([^/]+/)*"
+    skipped = "|".join(re.escape(name) for name in sorted(DEFAULT_SKIP_DIRECTORIES))
+    excluded = regex_filter(prefix + "(" + skipped + r"|[^/]*\.egg-info|\.[gG][iI][tT])(/|$)")
+    for pattern in policy.forbidden_patterns:
+        if pattern.rstrip("/").casefold() == ".git" or pattern in policy.sandbox_readable:
+            continue
+        denied = regex_filter(prefix + component_regex(pattern) + "(/|$)")
+        rules.append(f"(deny file-read* (require-all {denied} (require-not {excluded})))")
     return "\n".join(rules)
 
 
-def _mac_sandbox_denial(output: str, pid: int | None = None) -> str | None:
+def _mac_sandbox_denial(
+    output: str, pid: int | None = None, *,
+    policy: PermissionPolicy | None = None, cwd: Path | None = None,
+) -> str | None:
     """Return a Seatbelt denial that explains a permission failure, if available."""
     if sys.platform != "darwin":
         return None
@@ -106,6 +159,43 @@ def _mac_sandbox_denial(output: str, pid: int | None = None) -> str | None:
         for marker in ("operation not permitted", "eperm", "permission denied", "read-only file system")
     ):
         return None
+
+    def read_denial(resource: str) -> str | None:
+        if policy is None:
+            return None
+        from symphonai_api.permissions import _matching_forbidden_component
+        from symphonai_api.tools.search import _default_skipped_directory
+
+        path = Path(resource)
+        if not path.is_absolute():
+            path = (cwd or policy.repo_root) / path
+        try:
+            path = path.resolve()
+        except (OSError, ValueError, RuntimeError):
+            return None
+        if not path.is_relative_to(policy.repo_root):
+            return None
+        parts = path.relative_to(policy.repo_root).parts
+        if any(part.casefold() == ".git" for part in parts):
+            return None
+        directories = parts if path.is_dir() else parts[:-1]
+        if any(_default_skipped_directory(part) for part in directories):
+            return None
+        patterns = tuple(
+            pattern for pattern in policy.forbidden_patterns
+            if pattern.rstrip("/").casefold() != ".git" and pattern not in policy.sandbox_readable
+        )
+        if any(_matching_forbidden_component(part, patterns) for part in parts):
+            return f"read of {path} denied; the person can allow it with [sandbox] readable in user config"
+        return None
+
+    for line in output.splitlines():
+        if not any(marker in line.casefold() for marker in ("operation not permitted", "permission denied", "eperm")):
+            continue
+        for candidate in line.split(":"):
+            denial = read_denial(candidate.strip().strip("\"'"))
+            if denial:
+                return denial
     try:
         report = subprocess.run(
             [
@@ -123,10 +213,15 @@ def _mac_sandbox_denial(output: str, pid: int | None = None) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     for line in report.stdout.splitlines():
-        match = re.search(r"\(\d+\) deny\(1\) (file-write\S*|network\S*)\s*(.*)$", line)
+        match = re.search(r"\(\d+\) deny\(1\) (file-read\S*|file-write\S*|network\S*)\s*(.*)$", line)
         if not match:
             continue
         operation, resource = match.groups()
+        if operation.startswith("file-read"):
+            denial = read_denial(resource.strip())
+            if denial and (resource.strip() in output or (pid is not None and f"({pid})" in line)):
+                return denial
+            continue
         if operation.startswith("network"):
             resource = resource.strip()
             port = re.search(r":(\d+)(?:\s|$)", resource)
@@ -199,6 +294,9 @@ def _sandbox_available() -> bool:
 
 
 def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None = None) -> list[str]:
+    from symphonai_api.permissions import _matching_forbidden_component
+    from symphonai_api.tools.search import _default_skipped_directory
+
     root = str(policy.repo_root.resolve())
     working_directory = root if cwd is None else str(cwd.resolve())
     temporary = os.path.realpath(os.environ.get("TMPDIR", tempfile.gettempdir()))
@@ -216,11 +314,49 @@ def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None =
             continue
         command.extend(("--bind", path, path))
     command.extend(("--bind", temporary, temporary, "--bind", "/tmp", "/tmp"))
+    patterns = tuple(
+        pattern for pattern in policy.forbidden_patterns
+        if pattern.rstrip("/").casefold() != ".git" and pattern not in policy.sandbox_readable
+    )
+
+    def walk_error(error: OSError) -> None:
+        raise error
+
+    if Path(root).is_dir():
+        for directory, directories, files in os.walk(root, onerror=walk_error):
+            for name in list(directories):
+                path = Path(directory) / name
+                if name.casefold() == ".git" or _default_skipped_directory(name) or path.is_symlink():
+                    directories.remove(name)
+                elif _matching_forbidden_component(name, patterns):
+                    command.extend(("--tmpfs", str(path)))
+                    directories.remove(name)
+            for name in files:
+                path = Path(directory) / name
+                if not path.is_symlink() and _matching_forbidden_component(name, patterns):
+                    command.extend(("--ro-bind", "/dev/null", str(path)))
     if not policy.sandbox_network:
         # Each call gets its own loopback; only server and client in one command can connect.
         command.append("--unshare-net")
     command.extend(("--die-with-parent", "--chdir", working_directory, "--", *argv))
     return command
+
+
+def sandbox_available() -> bool:
+    """Whether this platform's sandbox can execute commands."""
+    return _sandbox_available()
+
+
+def sandbox_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None = None) -> list[str]:
+    """Wrap argv for the policy's platform sandbox, failing closed if required."""
+    available = sandbox_available()
+    if policy.shell_sandbox and not available:
+        raise ValueError("sandbox requested but unavailable on this platform")
+    if available and (policy.shell_sandbox or policy.mode == "allow"):
+        if sys.platform == "linux":
+            return _bwrap_command(policy, argv, cwd)
+        return [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
+    return argv
 
 
 class RunShellTool(LocalTool):
@@ -247,6 +383,7 @@ class RunShellTool(LocalTool):
             "type": "object",
             "properties": {
                 "argv": {
+                    "minItems": 1,
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
@@ -255,6 +392,7 @@ class RunShellTool(LocalTool):
                     ),
                 },
                 "command": {
+                    "minLength": 1,
                     "type": "string",
                     "description": (
                         "A shell command line where pipes, &&, ;, || and redirects work."
@@ -298,34 +436,10 @@ class RunShellTool(LocalTool):
         )
 
     def validate(self, arguments: dict) -> str | None:
-        has_argv = "argv" in arguments
-        has_command = "command" in arguments
-        if has_argv and has_command:
+        if "argv" in arguments and "command" in arguments:
             return "pass either argv or command, not both"
-        if has_argv:
-            argv = arguments.get("argv")
-            if not isinstance(argv, list) or not argv or not all(
-                isinstance(argument, str) for argument in argv
-            ):
-                return (
-                    "missing or invalid required argument: argv "
-                    "(must be a non-empty list of strings)"
-                )
-        elif has_command:
-            command = arguments.get("command")
-            if not isinstance(command, str) or not command:
-                return "missing or invalid required argument: command (must be a non-empty string)"
-        else:
+        if "argv" not in arguments and "command" not in arguments:
             return "missing required argument: command or argv"
-        timeout_seconds = arguments.get("timeout_seconds")
-        if "timeout_seconds" in arguments and (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, (int, float))
-            or not timeout_seconds > 0
-        ):
-            return "invalid optional argument: timeout_seconds (must be a number greater than 0)"
-        if "background" in arguments and not isinstance(arguments["background"], bool):
-            return "invalid optional argument: background (must be a boolean)"
         return None
 
     def _execute(
@@ -361,19 +475,12 @@ class RunShellTool(LocalTool):
                 shell_executable(), "-c",
                 f"{command_line}\n__symphonai_status=$?; printf '{cwd_marker}%s\\037' \"$PWD\"; exit \"$__symphonai_status\"",
             ]
-        sandbox_available = _sandbox_available()
-        if policy.shell_sandbox and not sandbox_available:
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error="sandbox requested but unavailable on this platform",
-            )
-        sandboxed = policy.shell_sandbox or (policy.mode == "allow" and sandbox_available)
-        if sandboxed:
-            if sys.platform == "linux":
-                command = _bwrap_command(policy, command, cwd)
-            else:
-                command = [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *command]
+        unwrapped = command
+        try:
+            command = sandbox_command(policy, command, cwd)
+        except ValueError as exc:
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
+        sandboxed = command is not unwrapped
         env = shell_environment(policy.repo_root, for_agent=True)
         if tool_call.arguments.get("background") is True:
             if self._jobs is None:
@@ -451,7 +558,7 @@ class RunShellTool(LocalTool):
             self._cwd = root
             reset_message = "Shell working directory reset to the project root."
         output = stdout + (stderr or "")
-        denial = _mac_sandbox_denial(output, proc.pid) if sandboxed and proc.returncode != 0 else None
+        denial = _mac_sandbox_denial(output, proc.pid, policy=policy, cwd=cwd) if sandboxed and proc.returncode != 0 else None
         if self._cwd != root:
             output = f"(in {self._cwd.relative_to(root)})\n" + output
         limit = policy.shell_output_limit_chars

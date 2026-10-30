@@ -34,11 +34,13 @@ class ReadToolResultTool(LocalTool):
                     "description": "Stored result id from an offload marker.",
                 },
                 "offset": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": "Zero-based character offset.",
                     "default": 0,
                 },
                 "limit": {
+                    "minimum": 0,
                     "type": "integer",
                     "description": "Maximum characters to return.",
                     "default": MAX_RESULT_SLICE_CHARS,
@@ -46,17 +48,6 @@ class ReadToolResultTool(LocalTool):
             },
             "required": ["id"],
         }
-
-    def validate(self, arguments: dict) -> str | None:
-        if not isinstance(arguments.get("id"), str):
-            return "missing or invalid required argument: id (must be a string)"
-        for name, default in (("offset", 0), ("limit", MAX_RESULT_SLICE_CHARS)):
-            value = arguments.get(name, default)
-            if isinstance(value, bool) or not isinstance(value, int):
-                return f"{name} must be an integer"
-            if value < 0:
-                return f"{name} must be >= 0"
-        return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
         return ToolMetadata(

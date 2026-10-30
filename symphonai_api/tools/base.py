@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 from symphonai_api.models import ToolCall, ToolResult
+from symphonai_api.schema_validation import validate_schema
 from symphonai_api.tools.metadata import ToolMetadata
 
 if TYPE_CHECKING:
@@ -48,13 +49,15 @@ class LocalTool(ABC):
     ) -> ToolResult:
         """Run the fixed stages, then this tool's work.
 
-        cancel -> validate -> the tool's own `_execute`, which is where
+        cancel -> schema -> validate -> the tool's own `_execute`, which is where
         `PermissionPolicy` is consulted. Permissions are never reached by a
         call that failed validation.
         """
         if cancel is not None:
             cancel.raise_if_cancelled()
-        error = self.validate(tool_call.arguments)
+        error = validate_schema(tool_call.arguments, self.parameters, "arguments")
+        if error is None:
+            error = self.validate(tool_call.arguments)
         if error is not None:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=error)
         return self._execute(tool_call, policy, cancel=cancel)
@@ -64,8 +67,8 @@ class LocalTool(ABC):
 
         Returns an error message, or None when the arguments are usable.
         Must be pure: no filesystem, no subprocess, no network. Checking
-        *shape* only -- whether a path is allowed is `PermissionPolicy`'s
-        answer, not this one.
+        rules not expressed by parameters; path permissions are
+        `PermissionPolicy`'s answer, not this one.
         """
         return None
 

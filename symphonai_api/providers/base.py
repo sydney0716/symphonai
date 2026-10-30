@@ -82,6 +82,11 @@ def parse_json_object(raw: bytes, operation: str) -> dict[str, Any]:
 class ModelProvider(ABC):
     """Abstract contract for calling a language model to get its next turn."""
 
+    model: str | None = None
+    base_url: str | None = None
+    routine_model: str | None = None
+    fallback_models: tuple[str, ...] = ()
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -105,8 +110,5 @@ class ModelProvider(ABC):
 
         from symphonai_api.streaming import StreamCompleted
 
-        if cancel is None:
-            response = self.create_response(request)
-        else:
-            response = self.create_response(request, cancel=cancel)
+        response = self.create_response(request, cancel=cancel)
         yield StreamCompleted(response)

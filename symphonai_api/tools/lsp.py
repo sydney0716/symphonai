@@ -39,7 +39,7 @@ class LspTool(LocalTool):
             "type": "object",
             "properties": {
                 "operation": {"type": "string", "enum": sorted(_OPERATIONS)},
-                "path": {"type": "string"},
+                "path": {"minLength": 1, "type": "string"},
                 "line": {"type": "integer", "minimum": 1},
                 "column": {"type": "integer", "minimum": 1},
                 "query": {"type": "string"},
@@ -48,19 +48,15 @@ class LspTool(LocalTool):
         }
 
     def validate(self, arguments: dict) -> str | None:
-        operation = arguments.get("operation")
-        if operation not in _OPERATIONS:
-            return "operation must be definition, references, hover, document_symbols, or workspace_symbols"
+        operation = arguments["operation"]
         if operation == "workspace_symbols":
-            if not isinstance(arguments.get("query"), str):
-                return "query must be a string for workspace_symbols"
-            return None
-        if not isinstance(arguments.get("path"), str) or not arguments["path"]:
-            return "path must be a non-empty string"
+            return None if "query" in arguments else "query is required for workspace_symbols"
+        if "path" not in arguments:
+            return "path is required for this operation"
         if operation in ("definition", "references", "hover"):
             for key in ("line", "column"):
-                if type(arguments.get(key)) is not int or arguments[key] < 1:
-                    return f"{key} must be a positive 1-based integer"
+                if key not in arguments:
+                    return f"{key} is required for {operation}"
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:

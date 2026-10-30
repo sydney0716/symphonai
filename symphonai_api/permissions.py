@@ -16,12 +16,14 @@ from __future__ import annotations
 import fnmatch
 import difflib
 import ipaddress
+import math
 import os
 import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal
@@ -315,7 +317,122 @@ def approval_diff(current: str | None, updated: str, path: str) -> str:
     return "\n".join(lines)
 
 _MODE_ORDER = {"plan": 0, "ask": 1, "allow": 2}
-_RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
+RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
+BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
+
+
+def permission_mode(value: object) -> PermissionMode:
+    if not isinstance(value, str) or value not in _MODE_ORDER:
+        replacement = RENAMED_MODES.get(value) if isinstance(value, str) else None
+        if replacement is not None:
+            raise ValueError(f"unknown permission mode {value!r}; use {replacement!r} instead")
+        raise ValueError(f"unknown permission mode {value!r}; expected 'ask', 'plan', or 'allow'")
+    return value
+
+
+class SettingsParser:
+    """Shared field parsing; the caller supplies source/key error formatting."""
+
+    def __init__(self, error: Callable[[str, str], None]) -> None:
+        self.error = error
+
+    def string(self, key: str, value: object) -> str:
+        if not isinstance(value, str):
+            self.error(key, "must be a string")
+        return value
+
+    def boolean(self, key: str, value: object) -> bool:
+        if type(value) is not bool:
+            self.error(key, "must be a boolean")
+        return value
+
+    def integer(self, key: str, value: object) -> int:
+        if type(value) is not int:
+            self.error(key, "must be an integer")
+        return value
+
+    def number(self, key: str, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            self.error(key, "must be a number")
+        return value
+
+    def strings(self, key: str, value: object) -> list[str]:
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            self.error(key, "must be an array of strings")
+        return value
+
+    def scopes(self, key: str, value: object, root: Path | None = None) -> list:
+        entries = self.strings(key, value)
+        return entries if root is None else [(root / entry).resolve() for entry in entries]
+
+    def commands(self, key: str, value: object) -> list[tuple[str, ...]]:
+        if not isinstance(value, list):
+            self.error(key, "must be an array of command arrays")
+        return [tuple(self.strings(key, command)) for command in value]
+
+    def hosts(self, key: str, value: object) -> list[str]:
+        return [host.casefold().rstrip(".") for host in self.strings(key, value)]
+
+    def mode(self, key: str, value: object) -> PermissionMode:
+        value = self.string(key, value)
+        try:
+            return permission_mode(value)
+        except ValueError as exc:
+            self.error(key, str(exc))
+
+    def modes(self, key: str, value: object) -> list[str]:
+        entries = self.strings(key, value)
+        invalid = next((mode for mode in entries if mode not in _MODE_ORDER), None)
+        if invalid is not None:
+            replacement = RENAMED_MODES.get(invalid)
+            if replacement is not None:
+                self.error(key, f"{invalid!r} was renamed; use {replacement!r} instead")
+            self.error(key, "must contain only: " + ", ".join(sorted(_MODE_ORDER)))
+        return entries
+
+    def budget(self, table: dict, *, config: bool = False, priced: bool = False) -> dict:
+        values = {}
+        for key in ("max_turns", "max_total_tokens"):
+            if key in table:
+                value = table[key]
+                if config:
+                    if type(value) is not int or value < 1:
+                        self.error(key, "must be a positive integer")
+                else:
+                    value = self.integer(key, value)
+                values[key] = value
+        if "wall_seconds" in table:
+            value = table["wall_seconds"]
+            if config:
+                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                    self.error("wall_seconds", "must be a positive finite number")
+            else:
+                value = self.number("wall_seconds", value)
+            values["wall_seconds"] = value
+        if "max_cost" in table:
+            raw = table["max_cost"]
+            config_error = "must be a quoted non-negative decimal"
+            if not isinstance(raw, str):
+                self.error("max_cost", config_error if config else "must be quoted as a string")
+            if not config and not priced:
+                self.error("max_cost", "requires a price table supplied to the loader")
+            try:
+                cost = Decimal(raw)
+            except InvalidOperation:
+                self.error("max_cost", config_error if config else "must be a decimal string")
+            if not cost.is_finite():
+                self.error("max_cost", config_error if config else "must be a finite decimal string")
+            if config and cost < 0:
+                self.error("max_cost", config_error)
+            values["max_cost"] = cost
+        if not config:
+            for key, message in (("max_turns", "max_turns must be >= 1"),
+                                 ("wall_seconds", "wall_seconds must be positive"),
+                                 ("max_total_tokens", "max_total_tokens must be positive"),
+                                 ("max_cost", "max_cost must be non-negative")):
+                if key in values and (values[key] < 1 if key == "max_turns" else values[key] <= 0 if key != "max_cost" else values[key] < 0):
+                    self.error(key, message)
+        return values
 
 
 def shell_grant_prefix(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -384,6 +501,7 @@ class PermissionPolicy:
     always_deny_commands: tuple[tuple[str, ...], ...] = ALWAYS_DENY_COMMANDS
     allow_uncheckable_shell: bool = False
     allow_discarding_work: bool = False
+    sandbox_readable: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
@@ -397,18 +515,7 @@ class PermissionPolicy:
             MIN_SHELL_OUTPUT_CHARS,
             min(MAX_SHELL_OUTPUT_CHARS, int(self.shell_output_limit_chars)),
         )
-        if not isinstance(self.mode, str) or self.mode not in _MODE_ORDER:
-            replacement = (
-                _RENAMED_MODES.get(self.mode) if isinstance(self.mode, str) else None
-            )
-            if replacement is not None:
-                raise ValueError(
-                    f"unknown permission mode {self.mode!r}; use {replacement!r} instead"
-                )
-            raise ValueError(
-                f"unknown permission mode {self.mode!r}; expected "
-                "'ask', 'plan', or 'allow'"
-            )
+        self.mode = permission_mode(self.mode)
         self._approval_lock = threading.Lock()
         self._event_sink: EventSink | None = None
         self._event_agent_id = ""
@@ -539,6 +646,10 @@ class PermissionPolicy:
             forbidden_patterns=_ordered_union(
                 self.forbidden_patterns, ceiling.forbidden_patterns
             ),
+            sandbox_readable=tuple(
+                pattern for pattern in self.sandbox_readable
+                if pattern in ceiling.sandbox_readable
+            ),
             always_deny_commands=self.always_deny_commands,
             allow_uncheckable_shell=self.allow_uncheckable_shell,
             allow_discarding_work=self.allow_discarding_work,
@@ -585,24 +696,11 @@ class PermissionPolicy:
                 except ValueError:
                     continue
                 sandbox_write_scope.append(new_root / relative)
-        return PermissionPolicy(
+        return replace(
+            self,
             repo_root=new_root,
             allowed_write_scope=write_scope,
             sandbox_write_scope=sandbox_write_scope,
-            forbidden_patterns=self.forbidden_patterns,
-            always_deny_commands=self.always_deny_commands,
-            allow_uncheckable_shell=self.allow_uncheckable_shell,
-            allow_discarding_work=self.allow_discarding_work,
-            shell_enabled=self.shell_enabled,
-            shell_allowlist=list(self.shell_allowlist),
-            shell_sandbox=self.shell_sandbox,
-            sandbox_network=self.sandbox_network,
-            fetch_enabled=self.fetch_enabled,
-            fetch_allowlist=list(self.fetch_allowlist),
-            shell_timeout_seconds=self.shell_timeout_seconds,
-            shell_output_limit_chars=self.shell_output_limit_chars,
-            mode=self.mode,
-            approval_callback=self.approval_callback,
         )
 
     # -- path checks ------------------------------------------------------

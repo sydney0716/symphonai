@@ -1,0 +1,507 @@
+"""Core host flows over HTTP/SSE and the app's public module boundary."""
+
+from __future__ import annotations
+
+import http.client
+import io
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import threading
+import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
+from pathlib import Path
+from unittest import mock
+from urllib.error import HTTPError
+
+from symphonai_api.extensions import load_extensions
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.providers.base import ProviderError
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_host.headless import main as headless_main
+from symphonai_host.loops import LoopStore
+from symphonai_host.server import HostServer
+from scripts.checks.harness import check
+from scripts.checks.workspace import handoff_spec, workspace
+
+
+def reply(text="core reply", *calls):
+    return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)), usage=Usage(5, 2))
+
+
+def tool(name, **arguments):
+    return ToolCall(f"core-{os.urandom(5).hex()}", name, arguments)
+
+
+def request(host, path, body=None, *, authenticated=True, headers=None):
+    connection = http.client.HTTPConnection("127.0.0.1", host.port, timeout=10)
+    supplied = {"Authorization": f"Bearer {host.token}"} if authenticated else {}
+    supplied.update(headers or {})
+    if body is not None:
+        supplied["Content-Type"] = "application/json"
+    connection.request("GET" if body is None else "POST", path,
+                       body=None if body is None else json.dumps(body), headers=supplied)
+    response = connection.getresponse()
+    raw = response.read()
+    status, response_headers = response.status, dict(response.getheaders())
+    connection.close()
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        value = raw
+    return status, value, response_headers
+
+
+def get(host, path):
+    status, value, _ = request(host, path)
+    assert status == 200, (path, status, value)
+    return value
+
+
+def post(host, path, body):
+    status, value, _ = request(host, path, body)
+    assert status == 200, (path, status, value)
+    return value
+
+
+def wait_for(function, predicate, seconds=10):
+    deadline = time.monotonic() + seconds
+    last = None
+    while time.monotonic() < deadline:
+        last = function()
+        if predicate(last):
+            return last
+        threading.Event().wait(0.01)
+    raise AssertionError(f"condition did not become true; last value: {last!r}")
+
+
+@contextmanager
+def running_host(ws, provider=None, *, mode="allow", sessions=None, extensions=None):
+    host = HostServer(provider or FakeModelProvider([reply()]), replace(
+        ws.policy, shell_enabled=True, shell_allowlist=[()],
+    ), sessions_root=sessions or ws.outside / "sessions", home=ws.outside / "home",
+        memory_root=ws.outside / "memory", memory_extraction_enabled=False,
+        extensions=extensions, keepalive_seconds=0.05)
+    host.start()
+    try:
+        post(host, "/mode", {"mode": mode})
+        yield host
+    finally:
+        host.close()
+
+
+class Stream:
+    def __init__(self, host):
+        self.connection = http.client.HTTPConnection("127.0.0.1", host.port, timeout=15)
+        self.connection.request("GET", "/events", headers={"Authorization": f"Bearer {host.token}"})
+        self.response = self.connection.getresponse()
+        assert self.response.status == 200
+        self.frames = []
+        self.queue = queue.Queue()
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.read, daemon=True)
+        self.thread.start()
+
+    def read(self):
+        try:
+            while not self.done.is_set():
+                line = self.response.readline()
+                if not line:
+                    return
+                if line.startswith(b"data: "):
+                    frame = json.loads(line[6:])
+                    self.frames.append(frame)
+                    self.queue.put(frame)
+        except (OSError, ValueError):
+            return
+
+    def until(self, predicate, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                frame = self.queue.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if predicate(frame):
+                return frame
+        raise AssertionError(f"event not received; got {[f.get('payload', {}).get('type', f.get('kind')) for f in self.frames]}")
+
+    def close(self):
+        self.done.set()
+        self.connection.close()
+
+
+def prompt(host, text="core prompt"):
+    accepted = post(host, "/prompt", {"prompt": text})
+    assert accepted["accepted"] and accepted["run_id"]
+    wait_for(lambda: get(host, "/health"), lambda health: health["state"] == "idle")
+    return get(host, "/conversation")["conversation"]["session_id"]
+
+
+@check("host.routes_require_the_token")
+def routes_require_the_token():
+    gets = ("/health", "/events", "/conversation", "/git/status", "/git/diff", "/git/pull-request",
+            "/jobs", "/changes", "/memory", "/roadmap", "/models", "/tree", "/source", "/files",
+            "/agent", "/session/agent", "/survey", "/project", "/projects", "/directories",
+            "/settings", "/approvals", "/permissions", "/sessions", "/session/export", "/loops",
+            "/loop", "/loop/card", "/history", "/app/", "/app/src/app.js")
+    posts = ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt",
+             "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new",
+             "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact",
+             "/agent", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard",
+             "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit",
+             "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start",
+             "/memory/update", "/memory/delete", "/credentials")
+    with workspace() as ws, running_host(ws) as host:
+        exposed = {}
+        for method, paths in (("GET", gets), ("POST", posts)):
+            for path in paths:
+                status, _, _ = request(host, path, {} if method == "POST" else None, authenticated=False)
+                if status != 401:
+                    exposed[f"{method} {path}"] = status
+        assert not exposed, f"routes accessible without a token: {exposed}"
+
+
+@check("host.app_page_and_assets_require_the_page_token_or_cookie")
+def app_page_and_assets_require_the_page_token_or_cookie():
+    with workspace() as ws, running_host(ws) as host:
+        assert request(host, "/app/", authenticated=False)[0] == 401
+        status, page, headers = request(host, f"/app/?token={host.token}", authenticated=False)
+        assert status == 200 and b"<html" in page.lower()
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, source, _ = request(host, "/app/src/app.js", authenticated=False, headers={"Cookie": cookie})
+        assert status == 200 and source
+        assert request(host, "/app/src/app.js", authenticated=False)[0] == 401
+
+
+@check("host.prompt_streams_ordered_run_and_tool_events")
+def prompt_streams_ordered_run_and_tool_events():
+    provider = FakeModelProvider([reply("", tool("read_file", path="existing.txt")), reply("streamed answer")])
+    with workspace() as ws, running_host(ws, provider) as host:
+        stream = Stream(host)
+        try:
+            accepted = post(host, "/prompt", {"prompt": "read the fixture"})
+            terminal = stream.until(lambda f: f.get("payload", {}).get("type") == "RunFinished")
+            events = [f["payload"] for f in stream.frames if f["kind"] == "event"]
+            types = [e["type"] for e in events]
+            assert accepted["run_id"]
+            assert types.index("RunStarted") < types.index("ToolCallStarted") < types.index("ToolCallFinished") < types.index("RunFinished")
+            started = next(e for e in events if e["type"] == "RunStarted")
+            assert started["run_id"] == terminal["payload"]["run_id"], events
+            wait_for(lambda: get(host, "/health"), lambda value: value["state"] == "idle")
+            session = get(host, "/conversation")["conversation"]["session_id"]
+            assert "streamed answer" in get(host, f"/session/export?id={session}")["markdown"]
+        finally:
+            stream.close()
+
+
+def approval_flow(allowed):
+    provider = FakeModelProvider([reply("", tool("run_shell", command="printf allowed > approved.txt")), reply()])
+    with workspace() as ws, running_host(ws, provider, mode="ask") as host:
+        stream = Stream(host)
+        try:
+            post(host, "/prompt", {"prompt": "run the command"})
+            frame = stream.until(lambda f: f["kind"] == "approval_requested")
+            approval = frame["payload"]
+            assert approval["approval_id"] and approval["operation"] == "run_shell"
+            assert post(host, "/approval", {"approval_id": approval["approval_id"], "allowed": allowed})["resolved"]
+            stream.until(lambda f: f.get("payload", {}).get("type") == "RunFinished")
+            assert (ws.root / "approved.txt").exists() is allowed
+        finally:
+            stream.close()
+
+
+@check("host.approval_answer_allows_the_call")
+def approval_answer_allows_the_call():
+    approval_flow(True)
+
+
+@check("host.approval_rejection_prevents_the_call")
+def approval_rejection_prevents_the_call():
+    approval_flow(False)
+
+
+@check("host.session_lifecycle_preserves_the_conversation")
+def session_lifecycle_preserves_the_conversation():
+    with workspace() as ws, running_host(ws) as host:
+        session = prompt(host, "remember this conversation")
+        post(host, "/session/rename", {"run_id": session, "title": "Core conversation"})
+        post(host, "/session/new", {})
+        assert get(host, "/conversation")["conversation"] is None
+        post(host, "/session/open", {"run_id": session})
+        exported = get(host, f"/session/export?id={session}")["markdown"]
+        assert "remember this conversation" in exported and "core reply" in exported
+        post(host, "/session/archive", {"run_id": session, "archived": True})
+        assert any(item["run_id"] == session and item["title"] == "Core conversation" for item in get(host, "/sessions?archived=1"))
+        post(host, "/session/archive", {"run_id": session, "archived": False})
+        assert any(item["run_id"] == session for item in get(host, "/sessions"))
+        post(host, "/session/open", {"run_id": session})
+        restored = get(host, f"/session/export?id={session}")["markdown"]
+        assert "remember this conversation" in restored and "core reply" in restored
+        post(host, "/session/new", {})
+        assert post(host, "/session/delete", {"run_id": session})["deleted"]
+        assert not any(item["run_id"] == session for item in get(host, "/sessions"))
+
+
+@check("host.session_from_another_project_is_refused")
+def session_from_another_project_is_refused():
+    with workspace() as first, workspace() as other:
+        shared = first.outside / "sessions"
+        with running_host(other, sessions=shared) as host:
+            session = prompt(host)
+        with running_host(first, sessions=shared) as host:
+            status, value, _ = request(host, "/session/open", {"run_id": session})
+            assert status == 409 and "error" in value
+            assert get(host, "/conversation")["conversation"] is None
+
+
+def git(root, *arguments):
+    return subprocess.run(["git", *arguments], cwd=root, check=True, capture_output=True).stdout
+
+
+def init_git(ws):
+    git(ws.root, "init", "--quiet")
+    git(ws.root, "config", "user.email", "core@example.invalid")
+    git(ws.root, "config", "user.name", "Core checks")
+    git(ws.root, "add", "existing.txt")
+    git(ws.root, "commit", "--quiet", "-m", "fixture")
+
+
+def editing_provider():
+    return FakeModelProvider([
+        reply("", tool("dispatch_subagent", subagent_name="implementer", task=handoff_spec("create changed.txt", "test -f changed.txt"))),
+        reply("", tool("write_file", path="changed.txt", content="agent change\n")),
+        reply("implemented"), reply("complete"),
+    ])
+
+
+@check("host.changes_show_the_agent_edit_and_diff")
+def changes_show_the_agent_edit_and_diff():
+    with workspace() as ws:
+        init_git(ws)
+        with running_host(ws, editing_provider()) as host:
+            prompt(host)
+            changes = get(host, "/changes")
+            assert any("changed.txt" in turn["paths"] for turn in changes["turns"])
+            assert "agent change" in json.dumps(changes) and "changed.txt" in json.dumps(changes)
+
+
+@check("host.commit_includes_only_selected_paths")
+def commit_includes_only_selected_paths():
+    with workspace() as ws:
+        init_git(ws)
+        (ws.root / "selected.txt").write_text("selected")
+        (ws.root / "other.txt").write_text("leave this alone")
+        with running_host(ws) as host:
+            post(host, "/git/commit", {"message": "selected only", "paths": ["selected.txt"]})
+            assert git(ws.root, "show", "--format=", "--name-only", "HEAD").decode().splitlines() == ["selected.txt"]
+            assert b"other.txt" in git(ws.root, "ls-files", "--others", "--exclude-standard")
+
+
+@check("host.revert_restores_the_turn_files")
+def revert_restores_the_turn_files():
+    with workspace() as ws:
+        init_git(ws)
+        with running_host(ws, editing_provider()) as host:
+            prompt(host)
+            (ws.root / "outside.txt").write_text("outside change")
+            turn = next(t for t in get(host, "/changes")["turns"] if "changed.txt" in t["paths"])
+            post(host, "/changes/revert", {"key": turn["key"]})
+            assert not (ws.root / "changed.txt").exists()
+            assert (ws.root / "outside.txt").read_text() == "outside change"
+
+
+class LoopScript(FakeModelProvider):
+    @property
+    def name(self):
+        return "openai"
+
+    def __init__(self, root, *, cards=3, fail=False, hold=False):
+        super().__init__()
+        self.root, self.card_count, self.fail, self.hold = root, cards, fail, hold
+        self.started = threading.Event()
+        self.parallel = threading.Barrier(2) if cards == 3 else None
+        self.log = []
+        self.lock = threading.Lock()
+
+    def create_response(self, request, *, cancel=None):
+        stage = request.model
+        if stage == "core-planner":
+            if any(m.tool_result for m in request.messages):
+                return reply("plan ready")
+            loop = LoopStore(self.root).list()[0]
+            folder = LoopStore(self.root).path(loop["id"], ".")
+            cards = []
+            calls = []
+            for index, card in enumerate("abc"[:self.card_count]):
+                lane, after = (1, ["a"]) if card == "b" else (index + 1 if card == "c" else 1, [])
+                validation = f"test -f {card}.txt" + (" && test -f a.txt" if card == "b" else "")
+                spec = (f"## Goal\ncore-card-{card}\n\n## Scope\n{card}.txt\n\n## Context\nTemporary core fixture\n\n"
+                        f"## Contract\nCreate {card}.txt\n\n## Acceptance criteria\nFile exists\n\n## Validation\n```sh\n{validation}\n```\n\n## Report\nReport the result\n")
+                calls.append(tool("write_file", path=str(folder / "specs" / f"{card}-core.md"), content=spec))
+                cards.append({"id": card, "title": f"Card {card}", "spec": f"specs/{card}-core.md", "lane": lane, "after": after})
+            calls.append(tool("write_file", path=str(folder / "plan.json"), content=json.dumps({"cards": cards})))
+            return reply("", *calls)
+        task = next(m.text for m in request.messages if m.role is Role.USER)
+        card = re.search(r"core-card-([abc])", task)[1]
+        if stage == "core-reviewer":
+            with self.lock:
+                self.log.append(("review", card))
+            return reply("Verdict: pass")
+        assert stage == "core-implementer", f"unexpected scripted stage: {stage}"
+        if any(m.tool_result for m in request.messages):
+            return reply("implemented")
+        with self.lock:
+            self.log.append(("implement", card))
+        self.started.set()
+        if self.hold:
+            assert cancel is not None and cancel.wait(10)
+            cancel.raise_if_cancelled()
+        if self.fail:
+            raise ProviderError("fixture implementation failure")
+        if self.parallel and card in "ac":
+            self.parallel.wait(timeout=5)
+        return reply("", tool("write_file", path=f"{card}.txt", content=f"card {card}\n"))
+
+
+@contextmanager
+def loop_host(ws, **options):
+    init_git(ws)
+    home = ws.outside / "home"
+    config = home / ".symphonai" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('[memory]\nextract = false\n' + "\n".join(
+        f'[roles.{role}]\nprovider = "openai"\nmodel = "core-{role}"\n'
+        for role in ("planner", "implementer", "reviewer")
+    ))
+    extensions = load_extensions(repo_root=ws.root, home=home)
+    provider = LoopScript(ws.root, **options)
+    with running_host(ws, provider, extensions=extensions) as host:
+        yield host, provider
+
+
+def loop_state(host, loop_id, state):
+    return wait_for(lambda: get(host, f"/loop?id={loop_id}")["loop"], lambda loop: loop["state"] == state, seconds=20)
+
+
+def start_and_approve(host):
+    loop = post(host, "/loop/start", {"goal": "build core fixture cards"})["loop"]
+    loop_state(host, loop["id"], "awaiting_plan")
+    return post(host, "/loop/plan", {"loop_id": loop["id"], "action": "approve"})["loop"]["id"]
+
+
+@check("host.spec_loop_plans_runs_lanes_reviews_validates_and_commits")
+def spec_loop_plans_runs_lanes_reviews_validates_and_commits():
+    with workspace() as ws, loop_host(ws) as (host, provider):
+        loop_id = start_and_approve(host)
+        loop = loop_state(host, loop_id, "awaiting_commit")
+        assert all(card["state"] == "done" for card in loop["cards"])
+        assert provider.log.index(("review", "a")) < provider.log.index(("implement", "b"))
+        assert not provider.parallel.broken
+        branch = loop["branch"]
+        for card in "abc":
+            assert git(ws.root, "show", f"{branch}:{card}.txt").decode() == f"card {card}\n"
+        assert all(not (ws.root / f"{card}.txt").exists() for card in "abc")
+        committed = post(host, "/loop/commit", {"loop_id": loop_id, "action": "approve"})
+        assert committed["loop"]["state"] == "done" and committed["commits"]
+
+
+@check("host.failed_loop_card_can_be_resumed")
+def failed_loop_card_can_be_resumed():
+    with workspace() as ws, loop_host(ws, cards=1, fail=True) as (host, provider):
+        loop_id = start_and_approve(host)
+        loop = loop_state(host, loop_id, "needs_attention")
+        assert loop["cards"][0]["state"] != "done"
+        provider.fail = False
+        post(host, "/loop/resume", {"loop_id": loop_id})
+        loop = loop_state(host, loop_id, "awaiting_commit")
+        assert loop["cards"][0]["state"] == "done"
+
+
+@check("host.cancelling_a_loop_removes_its_worktrees_and_branch")
+def cancelling_a_loop_removes_its_worktrees_and_branch():
+    with workspace() as ws, loop_host(ws, cards=1, hold=True) as (host, provider):
+        loop_id = start_and_approve(host)
+        assert provider.started.wait(5)
+        branch = get(host, f"/loop?id={loop_id}")["loop"]["branch"]
+        post(host, "/loop/cancel", {"loop_id": loop_id})
+        loop_state(host, loop_id, "cancelled")
+        wait_for(lambda: git(ws.root, "worktree", "list", "--porcelain").decode().count("worktree "), lambda count: count == 1)
+        assert branch not in git(ws.root, "branch", "--format=%(refname:short)").decode().splitlines()
+
+
+class HTTPFixture(io.BytesIO):
+    status = 200
+    headers = {}
+
+    def __init__(self, response):
+        super().__init__(("event: response.completed\ndata: " + json.dumps({"type": "response.completed", "response": response}) + "\n\n").encode())
+
+
+def headless_case(kind):
+    with workspace() as ws:
+        home = ws.outside / "home"
+        home.mkdir()
+        config = home / "config.toml"
+        config.write_text('[memory]\nextract = false\n')
+        base_response = {"id": "core-response", "status": "completed", "model": "core-model",
+                         "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "CLI result"}]}],
+                         "usage": {"input_tokens": 2, "output_tokens": 3}}
+        if kind == "stopped":
+            base_response["output"] = [{"type": "function_call", "call_id": "call-core", "name": "list_files", "arguments": "{}"}]
+        elif kind == "refused":
+            base_response["output"][0]["content"] = [{"type": "refusal", "refusal": "fixture refusal"}]
+        def respond(request, **options):
+            if kind == "failed":
+                raise HTTPError(request.full_url, 400, "fixture", {}, io.BytesIO(b'{"error":{"message":"fixture error"}}'))
+            return HTTPFixture(base_response)
+        output = io.StringIO()
+        environment = {"SYMPHONAI_HOME": str(home), "SYMPHONAI_SESSIONS_DIR": str(ws.outside / "cli-sessions"), "OPENAI_API_KEY": "core-inert-key"}
+        with mock.patch.dict(os.environ, environment), mock.patch("urllib.request.urlopen", side_effect=respond), redirect_stdout(output), redirect_stderr(io.StringIO()):
+            code = headless_main(["run", "core task", "--repo-root", str(ws.root), "--provider", "openai", "--model", "core-model", "--mode", "allow", "--max-turns", "1", "--json"])
+        result = json.loads(output.getvalue().splitlines()[-1])
+        assert {"status", "stopped_reason", "error", "usage", "files_changed"} <= result.keys()
+        assert isinstance(result["usage"], dict) and isinstance(result["files_changed"], list)
+        expected = {"finished": (0, "finished"), "stopped": (3, "stopped"), "refused": (3, "stopped"), "failed": (1, "failed")}
+        assert (code, result["status"]) == expected[kind], (code, result)
+        if kind == "finished":
+            assert result["result"] == "CLI result" and result["usage"]["total_tokens"] == 5
+        if kind == "refused":
+            assert result["stopped_reason"] == "refused" and result["error"]
+        if kind == "failed":
+            assert result["error"]
+
+
+@check("host.headless_finished_run_exits_zero_with_json")
+def headless_finished_run_exits_zero_with_json():
+    headless_case("finished")
+
+
+@check("host.headless_stopped_run_exits_three_with_json")
+def headless_stopped_run_exits_three_with_json():
+    headless_case("stopped")
+
+
+@check("host.headless_refusal_exits_three_with_json")
+def headless_refusal_exits_three_with_json():
+    headless_case("refused")
+
+
+@check("host.headless_failed_run_exits_nonzero_with_json")
+def headless_failed_run_exits_nonzero_with_json():
+    headless_case("failed")
+
+
+@check("host.app_core")
+def app_core():
+    node = shutil.which("node")
+    assert node is not None, "Node 18 or later is required"
+    version = subprocess.run([node, "--version"], capture_output=True, text=True, check=True).stdout
+    assert int(version.lstrip("v").split(".")[0]) >= 18
+    result = subprocess.run([node, "--experimental-default-type=module", "--test", "symphonai_app/test/core.test.js"],
+                            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr

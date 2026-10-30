@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from symphonai_api.roles import loop_planner_prompt, spec_reviewer_prompt
 from symphonai_api.agent_memory import AgentMemory
 from symphonai_api.checkpoints import CheckpointEntry, CheckpointStore
 from symphonai_api.agent_spec import AgentSpec, ModelSelector
@@ -112,15 +113,24 @@ def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
     return agent_id, name if isinstance(name, str) else agent_id, UsageTotals(*values)
 
 
-class RunActiveError(RuntimeError):
-    """A client attempted to start a second run while one is active."""
+MAX_ACTIVE_CONVERSATIONS = 4
 
-    def __init__(self, run_id: str) -> None:
-        super().__init__(
-            run_id if run_id == "4 conversations are already running"
-            else f"run already active: {run_id}"
-        )
-        self.run_id = run_id
+
+class RunActiveError(RuntimeError):
+    """A run or another named activity prevents the requested operation."""
+
+    def __init__(self, run_id: str | None = None, *, description: str | None = None) -> None:
+        super().__init__(description if description is not None else f"run already active: {run_id}")
+        self.run_id = run_id if run_id is not None else description
+        self.description = description
+
+
+class LoopStateError(RunActiveError):
+    """A loop operation needs a different state."""
+
+    def __init__(self, loop_id: str, state: str, expected: str) -> None:
+        self.loop_id, self.state, self.expected = loop_id, state, expected
+        super().__init__(state, description=f"loop {loop_id} is {state}; this needs {expected}")
 
 
 class CommandActiveError(RuntimeError):
@@ -160,6 +170,10 @@ def _unchecked_goal_prompt(goal: Goal) -> str:
         'If it is done, call update_goal with status "complete"; '
         'if you cannot finish it, call update_goal with status "blocked".'
     )
+
+
+class MissingAPIKeyError(ProviderSelectionError):
+    """The selected provider has no configured API key."""
 
 
 class ModeSelectionError(ValueError):
@@ -209,7 +223,7 @@ def _provider_identity(provider: ModelProvider) -> tuple[str, int, str | None]:
     return (
         provider.name,
         provider.wire_format,
-        getattr(provider, "base_url", None),
+        provider.base_url,
     )
 
 
@@ -331,6 +345,7 @@ class HostRun:
                 ))
             policy = replace(
                 policy,
+                sandbox_readable=tuple(extensions.config.get("sandbox.readable", policy.sandbox_readable)),
                 allow_uncheckable_shell=extensions.config.get(
                     "always_deny.allow_uncheckable_shell", False
                 ),
@@ -426,7 +441,7 @@ class HostRun:
                 )
                 self._memory_extraction_enabled = False
         self._provider_choice = (
-            {"name": provider.name, "model": model, "base_url": getattr(provider, "base_url", None)}
+            {"name": provider.name, "model": model, "base_url": provider.base_url}
             if provider is not None and provider.name in ("anthropic", "gemini", "openai")
             else None
         )
@@ -569,18 +584,18 @@ class HostRun:
                     self._open_conversations[session.run_id] = self._conversation
                 else:
                     leader.select_model(
-                        model if model is not None else getattr(provider, "model", None),
+                        model if model is not None else provider.model,
                         effort,
                     )
-                metadata = session.read_meta()
-                metadata["provider_choice"] = (
-                    choice
-                    if choice is not None
-                    else {"name": provider.name, "model": model, "effort": effort}
-                )
-                if provider_changed:
-                    metadata["provider_state_reset"] = True
-                session.write_meta(metadata)
+                def change(metadata):
+                    metadata["provider_choice"] = (
+                        choice
+                        if choice is not None
+                        else {"name": provider.name, "model": model, "effort": effort}
+                    )
+                    if provider_changed:
+                        metadata["provider_state_reset"] = True
+                session.update_meta(change)
             except Exception:
                 self._provider, self._model, self._effort, self._provider_choice = previous
                 self._conversation = conversation
@@ -594,7 +609,7 @@ class HostRun:
                 return None
             return {
                 "provider": self._provider.name,
-                "model": self._model if self._model is not None else getattr(self._provider, "model", None),
+                "model": self._model if self._model is not None else self._provider.model,
                 "effort": self._effort,
             }
 
@@ -624,12 +639,12 @@ class HostRun:
             store = SessionStore.open(self._sessions_root, session_id)
             close = True
         try:
-            metadata = store.read_meta()
-            if goal is None:
-                metadata.pop("goal", None)
-            else:
-                metadata["goal"] = goal.payload()
-            store.write_meta(metadata)
+            def change(metadata):
+                if goal is None:
+                    metadata.pop("goal", None)
+                else:
+                    metadata["goal"] = goal.payload()
+            store.update_meta(change)
         finally:
             if close:
                 store.close()
@@ -662,9 +677,9 @@ class HostRun:
             store = SessionStore.open(self._sessions_root, session_id)
             close = True
         try:
-            metadata = store.read_meta()
-            metadata["plan"] = plan
-            store.write_meta(metadata)
+            def change(metadata):
+                metadata["plan"] = plan
+            store.update_meta(change)
         finally:
             if close:
                 store.close()
@@ -701,8 +716,8 @@ class HostRun:
     def start_spec_run(self, spec: dict) -> tuple[str, str]:
         """Start an isolated implementation conversation for a parsed spec."""
         with self._lock:
-            if len(self._active_by_session) >= 4:
-                raise RunActiveError("4 conversations are already running")
+            if len(self._active_by_session) >= MAX_ACTIVE_CONVERSATIONS:
+                raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
             previous = (self._conversation, self._policy, self._active)
             self._conversation = None
             self._active = None
@@ -773,13 +788,7 @@ class HostRun:
                 report_path = worktree / info["report"]
             report = report_path.read_text(encoding="utf-8") if report_path.is_file() else "No report was written."
             patch = diff.patch[:MAX_READ_BYTES]
-            prompt = (
-                f"Review this spec:\n\n{spec['text']}\n\nReport:\n\n{report}\n\n"
-                f"Patch:\n\n{patch}\n\nReview the implementation and report. You may write follow-up specs under {Path(info['spec']).parent}/. "
-                "Any follow-up spec's Validation section must hold one fenced `sh` block with one shell command "
-                "per line, run from the project root; nothing else in that section is run. "
-                "End the final answer with a last line `Verdict: pass` or `Verdict: follow-ups: <path>, <path>`."
-            )
+            prompt = spec_reviewer_prompt(spec["text"], report, patch, Path(info["spec"]).parent)
             previous = (self._conversation, self._policy, self._active)
             self._conversation = None
             self._active = None
@@ -803,9 +812,9 @@ class HostRun:
                 review_id = self._conversation[1].run_id
                 source = SessionStore.open(self._sessions_root, session_id)
                 try:
-                    source_meta = source.read_meta()
-                    source_meta["review"] = {"session_id": review_id, "verdict": "running", "follow_ups": [], "not_copied": []}
-                    source.write_meta(source_meta)
+                    def change(source_meta):
+                        source_meta["review"] = {"session_id": review_id, "verdict": "running", "follow_ups": [], "not_copied": []}
+                    source.update_meta(change)
                 finally:
                     source.close()
                 return review_id, run_id
@@ -885,56 +894,29 @@ class HostRun:
         self, loop: dict, change: str, *, note: str | None = None,
         current_plan: dict | None = None,
     ) -> dict:
-        from symphonai_api.tools.shell import _sandbox_available
+        from symphonai_api.tools.shell import sandbox_available
 
         store = LoopStore(self._repo_root)
         folder = store.path(loop["id"], ".")
         specs_folder = folder / "specs"
         plan_path = folder / "plan.json"
-        sandbox_available = _sandbox_available()
+        has_sandbox = sandbox_available()
         specs_folder.mkdir(parents=True, exist_ok=True)
-        revision = ""
-        if note is not None:
-            revision = (
-                f"\n\nRevision note from the person:\n{note}\n\n"
-                "Current plan to revise:\n"
-                + json.dumps(current_plan or {}, ensure_ascii=False, indent=2)
-            )
-        prompt = (
-            f"Plan this goal: {loop['goal']}\n\n"
-            f"Write one Markdown spec per card at {folder / 'specs'}/<id>-<slug>.md. Use as few cards as the goal needs: "
-            "one card is right for a small change. Split only where a card can be implemented and reviewed on its own. "
-            "Use ids starting at a in order, with at most 8 cards. "
-            "Each spec must have Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report sections. "
-            "The Validation section must hold one fenced `sh` block with one shell command per line, "
-            "run from the project root; nothing else in that section is run. "
-            "Inspect the project before making claims. Group specs whose Scope paths overlap or that depend "
-            "on each other into the same lane, with at most 3 lanes. Write plan.json last at "
-            f"{folder / 'plan.json'} as {{\"cards\":[{{\"id\":\"a\",\"title\":\"Short title\","
-            "\"spec\":\"specs/a-short-title.md\",\"lane\":1,\"after\":[]}]}}. "
-            "A card whose work documents, tests, or builds on another card's change lists that card in `after`, "
-            "whether or not they share a lane. A card starts from the work of the cards before it and sees nothing else. "
-            "Write plan.json last."
-            + (
-                " commands are unavailable in this environment; inspect files with the read tools."
-                if not sandbox_available else
-                ""
-            ) + revision
-        )
+        prompt = loop_planner_prompt(loop["goal"], folder, has_sandbox, note=note, current_plan=current_plan)
         with self._lock:
-            if len(self._active_by_session) >= 4:
-                raise RunActiveError("4 conversations are already running")
+            if len(self._active_by_session) >= MAX_ACTIVE_CONVERSATIONS:
+                raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
             previous = (self._conversation, self._policy, self._active)
             self._conversation = None
             self._active = None
             self._policy = replace(self._base_policy, repo_root=self._repo_root)
             self._policy.allowed_write_scope = [specs_folder, plan_path]
             self._policy.sandbox_write_scope = [specs_folder, plan_path]
-            self._policy.shell_enabled = sandbox_available
-            self._policy.shell_allowlist = [()] if sandbox_available else []
+            self._policy.shell_enabled = has_sandbox
+            self._policy.shell_allowlist = [()] if has_sandbox else []
             self._policy.mode = "allow"
             previous_restriction = self._restricted_tool_names
-            if not sandbox_available:
+            if not has_sandbox:
                 self._restricted_tool_names = frozenset(
                     set(self.available_tool_names()) - {"run_shell"}
                 )
@@ -973,7 +955,7 @@ class HostRun:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop["state"] != "awaiting_plan":
-                raise RunActiveError(loop["state"])
+                raise LoopStateError(loop_id, loop["state"], "awaiting_plan")
             if not any(card.get("state") != "dropped" for card in loop.get("cards", [])):
                 raise ValueError("nothing left to run")
             branch_prefix = f"symphonai/{loop['slug']}"
@@ -1044,7 +1026,7 @@ class HostRun:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop["state"] != "awaiting_plan":
-                raise RunActiveError(loop["state"])
+                raise LoopStateError(loop_id, loop["state"], "awaiting_plan")
             cards = loop.get("cards", [])
             known = {card.get("id") for card in cards}
             unknown = sorted(set(card_ids) - known)
@@ -1070,9 +1052,9 @@ class HostRun:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop["state"] != "awaiting_plan":
-                raise RunActiveError(loop["state"])
-            if len(self._active_by_session) >= 4:
-                raise RunActiveError("4 conversations are already running")
+                raise LoopStateError(loop_id, loop["state"], "awaiting_plan")
+            if len(self._active_by_session) >= MAX_ACTIVE_CONVERSATIONS:
+                raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
             current_plan = {"lanes": loop.get("lanes", []), "cards": loop.get("cards", [])}
             plan_path = store.path(loop_id, "plan.json")
             previous_plan = plan_path.read_bytes() if plan_path.is_file() else None
@@ -1097,7 +1079,7 @@ class HostRun:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop["state"] in ("done", "cancelled"):
-                raise RunActiveError(loop["state"])
+                raise LoopStateError(loop_id, loop["state"], "a non-terminal state")
             if isinstance(loop.get("planner_session_id"), str):
                 session_ids.add(loop["planner_session_id"])
             for card in loop.get("cards", []):
@@ -1252,7 +1234,7 @@ class HostRun:
             lane_order = [lane.get("id", lane.get("lane", index + 1)) for index, lane in enumerate(lanes)]
             cards = loop.get("cards", [])
             for card in cards:
-                if active_count >= 4:
+                if active_count >= MAX_ACTIVE_CONVERSATIONS:
                     break
                 if card.get("state") != "review" or not card.get("session_id"):
                     continue
@@ -1272,7 +1254,7 @@ class HostRun:
                     self._loop_attention(loop, f"card {card['id']} review could not start: {exc}", card)
                     return
             for lane_id in lane_order:
-                if active_count >= 4:
+                if active_count >= MAX_ACTIVE_CONVERSATIONS:
                     break
                 lane_cards = [card for card in cards if card.get("lane") == lane_id]
                 if any(card.get("state") in ("running", "review") for card in lane_cards):
@@ -1446,56 +1428,24 @@ class HostRun:
     def _run_loop_validation_command(
         self, loop_id: str, command: str, cwd: Path, cancelled: threading.Event,
     ) -> dict:
-        from symphonai_api.tools.shell import (
-            SANDBOX_EXEC, _bwrap_command, _sandbox_available, _seatbelt_profile,
-        )
-
+        from symphonai_api.process import run_process
+        from symphonai_api.tools.shell import sandbox_command
         policy = replace(self._base_policy, repo_root=cwd)
         policy.mode = "allow"
-        argv = [shell_executable(), "-c", command]
-        available = _sandbox_available()
-        if policy.shell_sandbox and not available:
-            return {"command": command, "exit": None, "output": "sandbox requested but unavailable on this platform"}
-        if available:
-            argv = (
-                _bwrap_command(policy, argv, cwd)
-                if sys.platform == "linux"
-                else [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
-            )
         try:
-            with tempfile.TemporaryFile() as output_file:
-                process = subprocess.Popen(
-                    argv, cwd=cwd, env=shell_environment(cwd, for_agent=True),
-                    stdin=subprocess.DEVNULL, stdout=output_file, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                with self._lock:
-                    self._loop_validation_processes[loop_id] = process
-                deadline = time.monotonic() + 600
-                timed_out = False
-                while process.poll() is None:
-                    if cancelled.is_set():
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except (OSError, ProcessLookupError):
-                            process.kill()
-                        break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        timed_out = True
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except (OSError, ProcessLookupError):
-                            process.kill()
-                        break
-                    time.sleep(min(0.05, remaining))
-                process.wait()
-                output_file.seek(max(0, os.fstat(output_file.fileno()).st_size - 4000))
-                output = output_file.read()[-4000:].decode("utf-8", errors="replace")
-                code = None if timed_out or cancelled.is_set() else process.returncode
-                return {"command": command, "exit": code, "output": output}
-        except OSError as exc:
-            return {"command": command, "exit": None, "output": str(exc)[-4000:]}
+            argv = sandbox_command(policy, [shell_executable(), "-c", command], cwd)
+        except ValueError as exc:
+            return {"command": command, "exit": None, "output": str(exc)}
+        def started(process):
+            with self._lock:
+                self._loop_validation_processes[loop_id] = process
+        try:
+            result = run_process(
+                argv, cwd, env=shell_environment(cwd, for_agent=True), timeout=600,
+                cancel=cancelled.is_set, output_limit=4000, on_start=started,
+            )
+            output = str(result.error) if result.error is not None else result.stdout.decode("utf-8", errors="replace")
+            return {"command": command, "exit": result.exit_code, "output": output[-4000:]}
         finally:
             with self._lock:
                 self._loop_validation_processes.pop(loop_id, None)
@@ -1548,6 +1498,7 @@ class HostRun:
                 if failed is None:
                     store.set_state(loop, "awaiting_commit")
                 else:
+                    loop["failure_stage"] = "validation"
                     store.set_state(loop, "needs_attention", f"validation failed: {failed['command']}")
                 self._loop_changed(loop, "state")
         except (OSError, KeyError, ValueError, RuntimeError) as exc:
@@ -1555,6 +1506,7 @@ class HostRun:
                 try:
                     loop = store.load(loop_id)
                     if loop.get("state") == "validating":
+                        loop["failure_stage"] = "validation"
                         store.set_state(loop, "needs_attention", f"validation failed: {exc}")
                         self._loop_changed(loop, "state")
                 except (KeyError, ValueError, OSError):
@@ -1568,7 +1520,7 @@ class HostRun:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop.get("state") != "awaiting_commit":
-                raise RunActiveError(loop.get("state", "unknown"))
+                raise LoopStateError(loop_id, loop.get("state", "unknown"), "awaiting_commit")
             if action not in ("approve", "decline"):
                 raise ValueError("loop commit action must be approve or decline")
             integration_admin = self._sessions_root / "loops" / loop_id / "integration"
@@ -1604,7 +1556,7 @@ class HostRun:
             store = LoopStore(self._repo_root)
             loop = store.load(loop_id)
             if loop.get("state") != "needs_attention":
-                raise RunActiveError(loop.get("state", "unknown"))
+                raise LoopStateError(loop_id, loop.get("state", "unknown"), "needs_attention")
             if runner_pid is not None:
                 loop["runner_pid"] = runner_pid
             if runner_lock:
@@ -1628,7 +1580,10 @@ class HostRun:
                         previous_sessions.append(session_id)
                 card.update(state="planned", session_id=None)
                 self._loop_card_changed(loop, card)
-            if str(loop.get("reason", "")).startswith("validation failed:"):
+            validation_failed = loop.get("failure_stage") == "validation"
+            if "failure_stage" not in loop:
+                validation_failed = str(loop.get("reason", "")).startswith("validation failed:")
+            if validation_failed:
                 store.set_state(loop, "validating", "")
                 self._loop_changed(loop, "state")
                 self._start_loop_validation(loop_id)
@@ -2590,8 +2545,8 @@ class HostRun:
                 raise CommandActiveError("wait for the command to finish")
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
-            if len(self._active_by_session) >= 4:
-                raise RunActiveError("4 conversations are already running")
+            if len(self._active_by_session) >= MAX_ACTIVE_CONVERSATIONS:
+                raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
             run_id = new_id("run")
             cancel = CancellationToken()
             if self._conversation is None:
@@ -2623,9 +2578,9 @@ class HostRun:
                     ),
                 )
                 if _session_meta:
-                    meta = session.read_meta()
-                    meta.update(_session_meta)
-                    session.write_meta(meta)
+                    def change(meta):
+                        meta.update(_session_meta)
+                    session.update_meta(change)
                 try:
                     leader = self._new_leader(session)
                 except Exception:
@@ -2667,20 +2622,20 @@ class HostRun:
                         content=f"MCP servers' instructions:\n\n{sections}",
                     ))
                 leader.seed_chat(seeded)
-                meta = session.read_meta()
-                attachment_title = (
-                    attachments[0].filename
-                    if attachments and isinstance(attachments[0], DocumentBlock)
-                    else None
-                )
-                meta["title"] = _title or _conversation_title(prompt) or attachment_title or (
-                    "Attachment" if attachments else ""
-                )
-                if _session_meta:
-                    meta.update(_session_meta)
-                if self._provider_choice is not None:
-                    meta["provider_choice"] = self._provider_choice
-                session.write_meta(meta)
+                def change(meta):
+                    attachment_title = (
+                        attachments[0].filename
+                        if attachments and isinstance(attachments[0], DocumentBlock)
+                        else None
+                    )
+                    meta["title"] = _title or _conversation_title(prompt) or attachment_title or (
+                        "Attachment" if attachments else ""
+                    )
+                    if _session_meta:
+                        meta.update(_session_meta)
+                    if self._provider_choice is not None:
+                        meta["provider_choice"] = self._provider_choice
+                session.update_meta(change)
                 self._conversation = (leader, session)
                 self._open_conversations[session.run_id] = self._conversation
                 self._policy_by_session[session.run_id] = self._policy
@@ -2941,7 +2896,7 @@ class HostRun:
         leader_model = self._model
         def configure_fallback(provider: ModelProvider | None) -> ModelProvider | None:
             if provider is not None:
-                provider._symphonai_fallback_models = tuple(
+                provider.fallback_models = tuple(
                     () if self._extensions is None else
                     self._extensions.config.get(f"fallback.{provider.name}", ())
                 )
@@ -3244,8 +3199,7 @@ class HostRun:
                 if reopened_goal:
                     goal.phase = "paused"
                     goal.reason = "reopened"
-                    metadata["goal"] = goal.payload()
-                    store.write_meta(metadata)
+                    store.update_meta(lambda meta: meta.update({"goal": goal.payload()}))
             except Exception:
                 self._provider, self._model, self._effort, self._provider_choice = previous_provider
                 self._policy.mode = previous_mode
@@ -3431,11 +3385,11 @@ class HostRun:
                 )
                 try:
                     fork_run(source, through_record_id=record_id, new_store=destination)
-                    meta = destination.read_meta()
-                    meta["title"] = source_meta.get("title")
-                    if "provider_choice" in source_meta:
-                        meta["provider_choice"] = source_meta["provider_choice"]
-                    destination.write_meta(meta)
+                    def change(meta):
+                        meta["title"] = source_meta.get("title")
+                        if "provider_choice" in source_meta:
+                            meta["provider_choice"] = source_meta["provider_choice"]
+                    destination.update_meta(change)
                     if checkpoints is not None:
                         destination_checkpoints = CheckpointStore(
                             destination.directory / "checkpoints", self._policy.repo_root,
@@ -3593,9 +3547,9 @@ class HostRun:
             opened = self._open_conversations.get(session_id)
             store = opened[1] if opened is not None else SessionStore.open(self._sessions_root, session_id)
             try:
-                meta = store.read_meta()
-                meta["archived"] = archived
-                store.write_meta(meta)
+                def change(meta):
+                    meta["archived"] = archived
+                store.update_meta(change)
             finally:
                 if opened is None:
                     store.close()
@@ -3666,24 +3620,6 @@ class HostRun:
             goal_check.cancel.set()
         self.approvals.cancel_all(reason="stopped")
 
-    def control_agent(self, agent_id: str, action: str, text: str | None = None) -> dict:
-        """Control one agent in the active conversation run."""
-        with self._lock:
-            active = self._active
-            conversation = self._conversation
-            if active is None:
-                raise RunActiveError("none")
-            if conversation is None:
-                raise AgentControlError(f"agent {agent_id!r} is not running", status=404)
-            leader = conversation[0]
-            if agent_id == active.root_agent_id and action == "stop":
-                self.stop()
-                return {"agent_id": agent_id, "state": "stopping"}
-        try:
-            state = leader.control_agent(agent_id, action, text)
-        except AgentControlError:
-            raise
-        return {"agent_id": agent_id, "state": state}
 
     def steer(self, text: str) -> None:
         if not isinstance(text, str) or not text.strip():
@@ -3694,9 +3630,8 @@ class HostRun:
             if active is None or conversation is None:
                 raise RunActiveError("no turn is running")
             leader = conversation[0]
-            agent_id = active.root_agent_id
         try:
-            leader.control_agent(agent_id, "redirect", text)
+            leader.redirect(text)
         except AgentControlError as exc:
             raise RunActiveError("no turn is running") from exc
 
@@ -3712,55 +3647,22 @@ class HostRun:
             repo_root = self._repo_root if conversation is None else self._policy.repo_root
             running = _UserCommand()
             self._user_command = running
-        process = None
         try:
-            process = subprocess.Popen(
-                [shell_executable(), "-c", command],
-                cwd=repo_root,
-                env=shell_environment(repo_root),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
-            with self._lock:
-                running.process = process
-                should_stop = running.stop_requested
-            if should_stop:
-                self._kill_user_command(process)
-            deadline = time.monotonic() + 120
-            timed_out = False
-            stopped = False
-            while True:
+            from symphonai_api.process import run_process
+            def started(process):
                 with self._lock:
-                    stopped = running.stop_requested
-                if stopped:
+                    running.process = process
+                    should_stop = running.stop_requested
+                if should_stop:
                     self._kill_user_command(process)
-                    try:
-                        output, _ = process.communicate(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        output = ""
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    self._kill_user_command(process)
-                    try:
-                        output, _ = process.communicate(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        output = ""
-                    break
-                try:
-                    output, _ = process.communicate(timeout=min(0.05, remaining))
-                    with self._lock:
-                        stopped = running.stop_requested
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
-            output = output or ""
-            exit_code = None if timed_out or stopped else process.returncode
+            result = run_process(
+                [shell_executable(), "-c", command], repo_root, env=shell_environment(repo_root),
+                timeout=120, cancel=lambda: running.stop_requested, output_limit=None, on_start=started,
+            )
+            if result.error is not None:
+                raise result.error
+            output = result.stdout.decode("utf-8", errors="replace")
+            timed_out, stopped, exit_code = result.timed_out, result.cancelled, result.exit_code
             limit = self._policy.shell_output_limit_chars
             if len(output) > limit:
                 output = output[:limit] + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
@@ -4006,7 +3908,7 @@ class HostRun:
             if conversation is None:
                 return None
             session_id = conversation[1].run_id
-            graph = conversation[0].run_graph()
+            graph_cache = getattr(self, "_stats_graph_cache", None)
             leader = conversation[0]
             active = self._active_by_session.get(session_id)
             active_root_agent_id = active.root_agent_id if active is not None else None
@@ -4016,22 +3918,6 @@ class HostRun:
                 "model": leader._leader_spec.model.model,
                 "effort": leader._leader_spec.model.effort,
             }
-            started_at = {}
-            try:
-                paths = sorted(conversation[1].directory.glob("*.jsonl"))
-            except OSError:
-                paths = []
-            for path in paths:
-                try:
-                    records, _ = read_records(path)
-                except Exception:
-                    continue
-                for record in records:
-                    if (
-                        record.get("type") == "run_started"
-                        and isinstance(record.get("ts"), str)
-                    ):
-                        started_at.setdefault(record.get("run_id"), record["ts"])
             report = self._context_by_session.get(session_id, self._context_report)
             policy = self._policy_by_session.get(session_id, self._policy)
             mode = policy.mode
@@ -4040,6 +3926,13 @@ class HostRun:
                 if self._goal is not None and self._goal_session_id == conversation[1].run_id
                 else None
             )
+            plan = self._plans_by_session.get(session_id)
+            instruction_warnings = list(self._instruction_warnings_by_session.get(session_id, []))
+            config_warnings = (
+                list(self._extensions.config.warnings) if self._extensions is not None else []
+            )
+            window_format = leader._config.leader_provider.wire_format
+            price_table = self._price_table
             usage_by_agent = {
                 agent_id: (name, dict(by_model))
                 for agent_id, (name, by_model) in self._usage_by_session.get(
@@ -4047,31 +3940,37 @@ class HostRun:
                 ).items()
             }
 
+        store = conversation[1]
+        started_at = store.run_start_times()
+        # Graph construction also parses transcripts. Reuse it while their files
+        # are unchanged, and do all filesystem work outside the host lock.
+        try:
+            signature = tuple(
+                (path, stat.st_mtime_ns, stat.st_size)
+                for path in sorted(store.directory.glob("*.jsonl"))
+                for stat in (path.stat(),)
+            )
+        except OSError:
+            signature = None
+        if signature is not None and graph_cache is not None and graph_cache[:2] == (leader, signature):
+            graph = graph_cache[2]
+        else:
+            graph = leader.run_graph()
+            self._stats_graph_cache = (leader, signature, graph)
+
         def usage_fields(by_model: Mapping[str, UsageTotals]) -> dict:
             totals = UsageTotals()
             for usage in by_model.values():
                 totals = totals.merged(usage)
-            fields = {
-                "input_tokens": totals.input_tokens,
-                "output_tokens": totals.output_tokens,
-                "calls": totals.calls,
-                "total_tokens": totals.total_tokens,
-                "cache_read_tokens": totals.cache_read_tokens,
-                "cache_write_tokens": totals.cache_write_tokens,
-                "cache_write_1h_tokens": totals.cache_write_1h_tokens,
-                "long_context_input_tokens": totals.long_context_input_tokens,
-                "long_context_output_tokens": totals.long_context_output_tokens,
-                "long_context_cache_read_tokens": totals.long_context_cache_read_tokens,
-                "long_context_cache_write_tokens": totals.long_context_cache_write_tokens,
-            }
-            cost = total_cost(by_model, self._price_table)
-            if cost is not None and self._price_table is not None:
+            fields = {**totals.to_record(), "total_tokens": totals.total_tokens}
+            cost = total_cost(by_model, price_table)
+            if cost is not None and price_table is not None:
                 fields["cost"] = {
                     "amount": str(cost),
-                    "currency": self._price_table.currency,
+                    "currency": price_table.currency,
                     "estimated": any(
-                        self._price_table.long_context_is_estimated(model, usage)
-                        or self._price_table.cache_write_1h_is_estimated(model, usage)
+                        price_table.long_context_is_estimated(model, usage)
+                        or price_table.cache_write_1h_is_estimated(model, usage)
                         for model, usage in by_model.items()
                     ),
                 }
@@ -4183,14 +4082,12 @@ class HostRun:
             "agents": agents,
             "mode": mode,
             "goal": goal_payload,
-            "plan": self._plans_by_session.get(conversation[1].run_id),
-            "instruction_warnings": self._instruction_warnings_by_session.get(
-                conversation[1].run_id, []
-            ),
+            "plan": plan,
+            "instruction_warnings": instruction_warnings,
             **selection,
         }
-        if self._extensions is not None and self._extensions.config.warnings:
-            result["config_warnings"] = list(self._extensions.config.warnings)
+        if config_warnings:
+            result["config_warnings"] = config_warnings
         all_models: dict[str, UsageTotals] = {}
         for _, by_model in usage_by_agent.values():
             all_models = self._merge_usage(all_models, by_model)
@@ -4202,8 +4099,7 @@ class HostRun:
             "budget_tokens": report.budget,
             "remaining_tokens": report.remaining_tokens,
             "window_tokens": context_window_for_model(
-                leader._config.leader_provider.wire_format,
-                leader._leader_spec.model.model,
+                window_format, selection["model"],
             ),
             "by_source": {
                 source.value: tokens for source, tokens in report.by_source().items()
@@ -4436,16 +4332,16 @@ class HostRun:
                 )
                 checkpoints.restore(entry.path, content)
             if key is not None:
-                metadata = session.read_meta()
-                undone_keys = metadata.get("undone_checkpoint_keys", [])
-                if not isinstance(undone_keys, list):
-                    undone_keys = []
-                first_index = checkpoints.keys().index(key)
-                for reverted_key in checkpoints.keys()[first_index:]:
-                    if reverted_key not in undone_keys:
-                        undone_keys.append(reverted_key)
-                metadata["undone_checkpoint_keys"] = undone_keys
-                session.write_meta(metadata)
+                def change(metadata):
+                    undone_keys = metadata.get("undone_checkpoint_keys", [])
+                    if not isinstance(undone_keys, list):
+                        undone_keys = []
+                    first_index = checkpoints.keys().index(key)
+                    for reverted_key in checkpoints.keys()[first_index:]:
+                        if reverted_key not in undone_keys:
+                            undone_keys.append(reverted_key)
+                    metadata["undone_checkpoint_keys"] = undone_keys
+                session.update_meta(change)
             return {"reverted": [entry.path for entry in targets]}
 
     def _publish(self, host_run_id: str, event: Event, *, session_id: str | None = None) -> None:
@@ -4605,12 +4501,14 @@ class HostRun:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, target)
                         copied = True
-                info.update({
-                    "state": {"complete": "finished", "blocked": "blocked", "paused": "stopped"}.get(phase, "stopped"),
-                    "report_copied": copied,
-                })
-                meta["spec_run"] = info
-                store.write_meta(meta)
+                def change(meta):
+                    info = meta.get("spec_run", {})
+                    info.update({
+                        "state": {"complete": "finished", "blocked": "blocked", "paused": "stopped"}.get(phase, "stopped"),
+                        "report_copied": copied,
+                    })
+                    meta["spec_run"] = info
+                store.update_meta(change)
             finally:
                 store.close()
         except (OSError, SessionError, ValueError):
@@ -4691,8 +4589,7 @@ class HostRun:
                 review["stopped_reason"] = terminal_event.stopped_reason
             elif isinstance(terminal_event, RunFailed):
                 review["error"] = terminal_event.error
-            source_meta["review"] = review
-            source.write_meta(source_meta)
+            source.update_meta(lambda meta: meta.update({"review": review}))
         finally:
             source.close()
         if isinstance(review_info, dict):

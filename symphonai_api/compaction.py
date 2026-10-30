@@ -80,18 +80,7 @@ class CompactionResult:
         return max(0, self.before_tokens - self.after_tokens)
 
 
-@dataclass(frozen=True)
-class MicrocompactionResult:
-    """Result of clearing old, re-derivable tool-result content."""
-
-    messages: list[Message]
-    before_tokens: int
-    after_tokens: int
-    budget: int
-    changed: bool
-    cleared_tool_results: int = 0
-    recent_turns: int = DEFAULT_RECENT_TURNS
-
+MicrocompactionResult = CompactionResult
 
 def estimate_text_tokens(text: str) -> int:
     """Estimate token cost from text length.
@@ -264,146 +253,97 @@ def compact_messages_for_budget(
 
     original = list(messages)
     before_tokens = estimate_messages_tokens(original)
-    if before_tokens <= budget and not force:
-        return CompactionResult(
-            messages=original,
-            before_tokens=before_tokens,
-            after_tokens=before_tokens,
-            budget=budget,
-            changed=False,
-            recent_turns=recent_turns,
-        )
-
-    microcompacted = (
-        MicrocompactionResult(
-            messages=original,
-            before_tokens=before_tokens,
-            after_tokens=before_tokens,
-            budget=budget,
-            changed=False,
-            recent_turns=recent_turns,
-        )
-        if force
-        else microcompact_messages(
-            original,
-            budget=budget,
-            recent_turns=recent_turns,
-            assistant_turn_window=assistant_turn_window,
-            cancel=cancel,
-        )
-    )
-    if not force and microcompacted.after_tokens <= budget:
-        return CompactionResult(
-            messages=microcompacted.messages,
-            before_tokens=before_tokens,
-            after_tokens=microcompacted.after_tokens,
-            budget=budget,
-            changed=True,
-            cleared_tool_results=microcompacted.cleared_tool_results,
-            recent_turns=recent_turns,
-        )
-
-    working = microcompacted.messages
-    assistant_window = (
-        sum(message.role == Role.USER for message in working) < recent_turns
-        if assistant_turn_window is None
-        else assistant_turn_window
-    )
-    recent_start = recent_window_start(
-        working, recent_turns, assistant_turn_window=assistant_window
-    )
-    prefix_indices = _preserved_prefix_indices(
-        working, recent_start, assistant_window
-    )
-    recent_indices = set(range(recent_start, len(working)))
-    dropped_indices = [
-        index
-        for index in range(len(working))
-        if index not in prefix_indices and index not in recent_indices
-    ]
-    if not dropped_indices:
-        if force:
-            return CompactionResult(
-                messages=original,
-                before_tokens=before_tokens,
-                after_tokens=before_tokens,
-                budget=budget,
-                changed=False,
-                recent_turns=recent_turns,
+    compacted = original
+    after_tokens = before_tokens
+    cleared_tool_results = 0
+    dropped_messages = 0
+    summary_messages = 0
+    if before_tokens > budget or force:
+        if not force:
+            microcompacted = microcompact_messages(
+                original, budget=budget, recent_turns=recent_turns,
+                assistant_turn_window=assistant_turn_window, cancel=cancel,
             )
-        raise _impossible_error(before_tokens, budget, recent_turns)
-
-    prefix = [working[index] for index in sorted(prefix_indices)]
-    recent = [working[index] for index in range(recent_start, len(working))]
-    # Summarize from the *uncleared* messages. Clearing preserves list
-    # positions, so the indices still line up, and the summary is the only
-    # surviving trace of what was dropped -- excerpting a clearing marker
-    # would spend that trace describing bookkeeping instead of content.
-    dropped = [original[index] for index in dropped_indices]
-
-    if summarize is not None:
-        try:
-            summary_text = summarize(dropped)
-        except OperationCancelled:
-            raise
-        except Exception:
-            summary_text = ""
-        if isinstance(summary_text, str) and summary_text.strip():
-            summarized = [
-                *prefix,
-                Message(
-                    role=Role.SYSTEM,
-                    content=(
-                        "Summary of the earlier conversation, written when it was compacted:\n\n"
-                        + summary_text
-                    ),
-                ),
-                *recent,
+            compacted = microcompacted.messages
+            after_tokens = microcompacted.after_tokens
+            cleared_tool_results = microcompacted.cleared_tool_results
+        if force or after_tokens > budget:
+            assistant_window = (
+                sum(message.role == Role.USER for message in compacted) < recent_turns
+                if assistant_turn_window is None else assistant_turn_window
+            )
+            recent_start = recent_window_start(
+                compacted, recent_turns, assistant_turn_window=assistant_window,
+            )
+            prefix_indices = _preserved_prefix_indices(
+                compacted, recent_start, assistant_window,
+            )
+            recent_indices = set(range(recent_start, len(compacted)))
+            dropped_indices = [
+                index for index in range(len(compacted))
+                if index not in prefix_indices and index not in recent_indices
             ]
-            after_tokens = estimate_messages_tokens(summarized)
-            if after_tokens <= budget:
-                return CompactionResult(
-                    messages=summarized,
-                    before_tokens=before_tokens,
-                    after_tokens=after_tokens,
-                    budget=budget,
-                    changed=True,
-                    dropped_messages=len(dropped),
-                    summary_messages=1,
-                    cleared_tool_results=microcompacted.cleared_tool_results,
-                    recent_turns=recent_turns,
-                )
+            if not dropped_indices:
+                if not force:
+                    raise _impossible_error(before_tokens, budget, recent_turns)
+            else:
+                prefix = [compacted[index] for index in sorted(prefix_indices)]
+                recent = [compacted[index] for index in range(recent_start, len(compacted))]
+                # Summaries retain the original content, before microcompaction clears it.
+                dropped = [original[index] for index in dropped_indices]
+                selected = None
+                if summarize is not None:
+                    try:
+                        summary_text = summarize(dropped)
+                    except OperationCancelled:
+                        raise
+                    except Exception:
+                        summary_text = ""
+                    if isinstance(summary_text, str) and summary_text.strip():
+                        candidate = [
+                            *prefix,
+                            Message(
+                                role=Role.SYSTEM,
+                                content=(
+                                    "Summary of the earlier conversation, written when it was compacted:\n\n"
+                                    + summary_text
+                                ),
+                            ),
+                            *recent,
+                        ]
+                        if estimate_messages_tokens(candidate) <= budget:
+                            selected = candidate
+                            summary_messages = 1
+                if selected is None:
+                    for max_summary_chars in (800, 320, 120, 0):
+                        candidate = list(prefix)
+                        if max_summary_chars > 0:
+                            candidate.append(Message(
+                                role=Role.SYSTEM,
+                                content=_summarize_dropped_messages(dropped, max_chars=max_summary_chars),
+                            ))
+                        candidate.extend(recent)
+                        if estimate_messages_tokens(candidate) <= budget:
+                            selected = candidate
+                            summary_messages = int(max_summary_chars > 0)
+                            break
+                if selected is None:
+                    raise _impossible_error(before_tokens, budget, recent_turns)
+                compacted = selected
+                after_tokens = estimate_messages_tokens(compacted)
+                dropped_messages = len(dropped)
 
-    for max_summary_chars in (800, 320, 120, 0):
-        compacted = list(prefix)
-        summary_messages = 0
-        if max_summary_chars > 0:
-            compacted.append(
-                Message(
-                    role=Role.SYSTEM,
-                    content=_summarize_dropped_messages(
-                        dropped,
-                        max_chars=max_summary_chars,
-                    ),
-                )
-            )
-            summary_messages = 1
-        compacted.extend(recent)
-        after_tokens = estimate_messages_tokens(compacted)
-        if after_tokens <= budget:
-            return CompactionResult(
-                messages=compacted,
-                before_tokens=before_tokens,
-                after_tokens=after_tokens,
-                budget=budget,
-                changed=True,
-                dropped_messages=len(dropped),
-                summary_messages=summary_messages,
-                cleared_tool_results=microcompacted.cleared_tool_results,
-                recent_turns=recent_turns,
-            )
-
-    raise _impossible_error(before_tokens, budget, recent_turns)
+    return CompactionResult(
+        messages=compacted,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        budget=budget,
+        changed=cleared_tool_results > 0 or dropped_messages > 0,
+        dropped_messages=dropped_messages,
+        summary_messages=summary_messages,
+        cleared_tool_results=cleared_tool_results,
+        recent_turns=recent_turns,
+    )
 
 
 def render_dropped_messages(messages: list[Message]) -> str:
@@ -427,34 +367,6 @@ def render_dropped_messages(messages: list[Message]) -> str:
     return "\n\n".join(transcript)
 
 
-def describe_compaction(result: CompactionResult) -> str:
-    """Return a short human-readable description of a compaction result."""
-
-    if not result.changed:
-        return (
-            "No compaction needed: "
-            f"estimated {result.before_tokens} tokens within budget {result.budget}."
-        )
-    if result.cleared_tool_results and not result.dropped_messages:
-        summary_part = "no summary needed"
-    else:
-        summary_part = (
-            f"inserted {result.summary_messages} summary message"
-            if result.summary_messages
-            else "no summary fit"
-        )
-    cleared_part = (
-        f"cleared {result.cleared_tool_results} old tool "
-        f"result{'s' if result.cleared_tool_results != 1 else ''}, "
-        if result.cleared_tool_results
-        else ""
-    )
-    return (
-        "Compacted conversation: "
-        f"{cleared_part}dropped {result.dropped_messages} older messages, {summary_part}, "
-        f"reclaimed about {result.reclaimed_tokens} tokens "
-        f"({result.before_tokens} -> {result.after_tokens}; budget {result.budget})."
-    )
 
 
 def _tool_call_text(tool_call: ToolCall) -> str:

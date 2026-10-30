@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -31,33 +31,27 @@ class UsageTotals:
         return self.input_tokens + self.output_tokens
 
     def merged(self, other: "UsageTotals") -> "UsageTotals":
-        return UsageTotals(
-            input_tokens=self.input_tokens + other.input_tokens,
-            output_tokens=self.output_tokens + other.output_tokens,
-            calls=self.calls + other.calls,
-            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
-            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
-            long_context_input_tokens=self.long_context_input_tokens + other.long_context_input_tokens,
-            long_context_output_tokens=self.long_context_output_tokens + other.long_context_output_tokens,
-            long_context_cache_read_tokens=self.long_context_cache_read_tokens + other.long_context_cache_read_tokens,
-            long_context_cache_write_tokens=self.long_context_cache_write_tokens + other.long_context_cache_write_tokens,
-            cache_write_1h_tokens=self.cache_write_1h_tokens + other.cache_write_1h_tokens,
-        )
+        return type(self)(**{
+            field.name: getattr(self, field.name) + getattr(other, field.name)
+            for field in fields(self)
+        })
 
     @classmethod
     def from_usage(cls, usage: Usage, *, long_context: bool = False) -> "UsageTotals":
-        return cls(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            calls=1,
-            cache_read_tokens=usage.cache_read_tokens,
-            cache_write_tokens=usage.cache_write_tokens,
-            long_context_input_tokens=usage.input_tokens if long_context else 0,
-            long_context_output_tokens=usage.output_tokens if long_context else 0,
-            long_context_cache_read_tokens=usage.cache_read_tokens if long_context else 0,
-            long_context_cache_write_tokens=usage.cache_write_tokens if long_context else 0,
-            cache_write_1h_tokens=usage.cache_write_1h_tokens,
-        )
+        values = {}
+        for field in fields(cls):
+            name = field.name
+            if name == "calls":
+                values[name] = 1
+            elif name.startswith("long_context_"):
+                values[name] = getattr(usage, name.removeprefix("long_context_"), 0) if long_context else 0
+            else:
+                values[name] = getattr(usage, name, 0)
+        return cls(**values)
+
+    def to_record(self) -> dict[str, int]:
+        """Return the usage counters written to transcripts and stats replies."""
+        return {field.name: getattr(self, field.name) for field in fields(self)}
 
 
 @dataclass(frozen=True)

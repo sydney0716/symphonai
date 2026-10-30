@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import re
 import threading
 from collections.abc import Callable, Sequence
 
@@ -27,6 +26,7 @@ from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelReques
 from symphonai_api.model_table import model_capabilities
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, tool_result_text
+from symphonai_api.secrets import mask_secrets as redact_secrets
 from symphonai_api.serialization import message_to_json
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tools.memory import MemoryTool
@@ -36,18 +36,6 @@ from symphonai_api.tools.metadata import call_target
 EVIDENCE_TOKEN_BUDGET = 24_000
 MAX_ROW_BYTES = 10_000
 TOOL_OUTPUT_TOKENS = 2_000
-_REDACT_PATTERNS = (
-    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[REDACTED_SECRET]"),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_SECRET]"),
-    (
-        re.compile(r"(?i:\bBearer)[ \t]+[A-Za-z0-9._~+/-]{16,}=*"),
-        "Bearer [REDACTED_SECRET]",
-    ),
-    (
-        re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\b(\s*[:=]\s*)([\"']?)[^\s\"']{8,}"),
-        r"\1\2[REDACTED_SECRET]",
-    ),
-)
 MEMORY_TOOLS_LINE = (
     "Only `remember` and `forget` will run; every other tool call is refused."
 )
@@ -65,12 +53,6 @@ turns."""
 class EvidenceRow:
     tier: int
     text: str
-
-
-def redact_secrets(text: str) -> str:
-    for pattern, replacement in _REDACT_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
 
 
 def _limit_bytes(text: str, limit: int = MAX_ROW_BYTES) -> str:
@@ -351,8 +333,8 @@ class MemoryExtractor:
             return True
         memories = _memory_list(self._store, self._spec)
         target_provider = memory_provider or leader_provider
-        target_model = memory_model or getattr(target_provider, "model", None)
-        effective_leader_model = leader_model or getattr(leader_provider, "model", None)
+        target_model = memory_model or target_provider.model
+        effective_leader_model = leader_model or leader_provider.model
         fork = (
             target_provider.name == leader_provider.name
             and target_provider.wire_format == leader_provider.wire_format
@@ -372,7 +354,7 @@ class MemoryExtractor:
             ]
         else:
             provider = target_provider
-            model = memory_model or getattr(provider, "model", None)
+            model = memory_model or provider.model
             capabilities = next(
                 (
                     capability
@@ -414,7 +396,7 @@ class MemoryExtractor:
             response = provider.create_response(request, cancel=cancel)
             calls += 1
             if self._usage_callback is not None:
-                model_key = model or getattr(provider, "model", None) or "unknown"
+                model_key = model or provider.model or "unknown"
                 self._usage_callback(model_key, UsageTotals.from_usage(response.usage))
             request_messages.append(response.message)
             if not response.message.tool_calls:

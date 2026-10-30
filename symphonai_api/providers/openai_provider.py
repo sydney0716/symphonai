@@ -53,7 +53,7 @@ from symphonai_api.streaming import (
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-6.1-sol"
-ROUTINE_MODEL = "gpt-5.5"
+ROUTINE_MODEL = "gpt-6.1-sol"
 
 _ROLE_TO_OPENAI = {
     Role.SYSTEM: "system",
@@ -300,7 +300,9 @@ def _parse_response(data: dict[str, Any]) -> ModelResponse:
             output_tokens=_usage_count(usage_raw.get("completion_tokens")),
             cache_read_tokens=cache_read_tokens,
         ),
-        stop_reason=choices[0].get("finish_reason") or "stop",
+        stop_reason=("refusal" if message_raw.get("refusal") or choices[0].get("finish_reason") == "content_filter"
+                     else choices[0].get("finish_reason") or "stop"),
+        refusal_category="content_filter" if choices[0].get("finish_reason") == "content_filter" else None,
     )
 
 
@@ -321,6 +323,7 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
     output = data.get("output") or []
     if not isinstance(output, list):
         raise ProviderError("OpenAI API response contained invalid output")
+    refused = False
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     reasoning_items: list[dict[str, Any]] = []
@@ -337,6 +340,8 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
                         reasoning_parts.append(text)
         elif item.get("type") == "message":
             for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "refusal":
+                    refused = True
                 if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
                     if isinstance(part.get("text"), str):
                         text_parts.append(part["text"])
@@ -382,6 +387,9 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
     stop_reason = "tool_calls" if tool_calls else (
         "length" if status == "incomplete" or isinstance(incomplete, dict) else "stop"
     )
+    category = "content_filter" if isinstance(incomplete, dict) and incomplete.get("reason") == "content_filter" else None
+    if refused or category:
+        stop_reason = "refusal"
     return ModelResponse(
         message=Message(
             role=Role.ASSISTANT,
@@ -396,6 +404,7 @@ def _parse_responses_response(data: dict[str, Any]) -> ModelResponse:
             cache_write_tokens=cache_write_tokens,
         ),
         stop_reason=stop_reason,
+        refusal_category=category,
     )
 
 
@@ -458,13 +467,15 @@ def _openai_stream_chunks(
     """Map OpenAI SSE payloads to chunks, ignoring valid usage-only choices."""
     usage = Usage()
     finish_reason = "stop"
+    refused = False
     for _, payload in sse_events(lines):
         if payload == "[DONE]":
             yield StreamCompleted(
                 ModelResponse(
                     Message(role=Role.ASSISTANT),
                     usage=usage,
-                    stop_reason=finish_reason,
+                    stop_reason="refusal" if refused or finish_reason == "content_filter" else finish_reason,
+                    refusal_category="content_filter" if finish_reason == "content_filter" else None,
                 )
             )
             return
@@ -503,6 +514,8 @@ def _openai_stream_chunks(
         delta = choice.get("delta", {})
         if not isinstance(delta, dict):
             continue
+        if delta.get("refusal"):
+            refused = True
         if isinstance(delta.get("content"), str):
             yield TextDelta(delta["content"])
         tool_calls = delta.get("tool_calls") or []
@@ -536,6 +549,8 @@ class OpenAIProvider(ModelProvider):
     this object -- it is read from `OPENAI_API_KEY` fresh on every call,
     never logged, and never included in any error message.
     """
+
+    routine_model = ROUTINE_MODEL
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
@@ -585,7 +600,7 @@ class OpenAIProvider(ModelProvider):
                 max_attempts=self.max_attempts,
                 api_key=api_key,
                 operation="OpenAI API",
-                fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+                fallback_configured=bool(self.fallback_models),
                 cancel=cancel,
                 call_class=request.call_class,
             )
@@ -627,16 +642,16 @@ class OpenAIProvider(ModelProvider):
             )
 
             def attempt(remaining):
-                lines = open_stream_with_retry(http_request, timeout=remaining, max_attempts=1,
+                lines = open_stream_with_retry(http_request, timeout=remaining,
                     api_key=api_key, operation="OpenAI API",
-                    fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
+
                     cancel=cancel)
                 return _responses_stream_chunks(lines, operation="OpenAI API", api_key=api_key)
 
             yield from retry_stream_chunks(attempt, timeout=self.timeout_seconds,
                                            max_attempts=self.max_attempts,
-                                           fallback_configured=bool(getattr(self, "_symphonai_fallback_models", ())),
-                                           cancel=cancel)
+                                           fallback_configured=bool(self.fallback_models),
+                                           cancel=cancel, call_class=request.call_class, operation="OpenAI API")
 
         if not include_summary:
             yield from stream(False)

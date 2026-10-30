@@ -25,18 +25,13 @@ class WebFetchTool(LocalTool):
             "type": "object",
             "properties": {
                 "url": {
+                    "minLength": 1,
                     "type": "string",
                     "description": "The absolute HTTP or HTTPS URL to fetch.",
                 }
             },
             "required": ["url"],
         }
-
-    def validate(self, arguments: dict) -> str | None:
-        url = arguments.get("url")
-        if not isinstance(url, str) or not url:
-            return "url must be a non-empty string"
-        return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
         return ToolMetadata(
