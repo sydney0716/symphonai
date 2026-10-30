@@ -32,13 +32,12 @@ temporary `SYMPHONAI_SESSIONS_DIR`, local socket access — name it.>
 
 ## Acceptance Criteria
 
-1. <Met or not met, and the assertion that carries it. For a criterion that
-   names an assertion which would fail without the change, say where that
-   assertion lives.>
+1. <Met or not met, and what shows it: the code that does it, the command
+   output, or — only when the spec added one — the check that protects it.>
 2. ...
 
 <Answer every numbered criterion in the spec's order, including the ones that
-were not met. "Met" without saying what makes it met cannot be checked.>
+were not met. "Met" without saying what shows it cannot be checked.>
 
 ## Risks & Notes
 

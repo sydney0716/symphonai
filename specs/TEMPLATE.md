@@ -14,9 +14,11 @@ Edit only:
 
 Do not touch: <anything adjacent that could plausibly be dragged in>.
 
-<Registry delta: the checks the acceptance criteria need, usually one per
-criterion that names new behaviour; `0` is fine. Never "at least +N": a minimum
-invites checks written for the count.>
+<Registry delta: usually 0. Add a check only for behaviour that is easy to
+break by accident and would hurt if broken — permissions and secrets, saved
+history, what a vendor needs sent back, the core loop, the host's safety — and
+put it in its core area (`access.`, `history.`, `vendors.`, `turns.`, `host.`).
+Never "at least +N".>
 
 ## Context
 
@@ -31,20 +33,21 @@ could differ.>
 
 ## Acceptance criteria
 
-1. <A property, naming what would fail without the change.>
+1. <A property of the finished change, stated so the reviewer can confirm it.>
 2. ...
 
-## Tests
+## Checks
 
-<What to add, and to which file.>
+<Only if Registry delta is not 0: the behaviour the new check protects, and its
+core area. A check tests what a caller sees and fails only when that behaviour
+breaks — no prose pins, no patching private names, no reading source or docs,
+no snapshots of earlier output. Omit this section otherwise.>
 
 ## Validation
 
-- `python3 scripts/check.py --only <area>.` — the selectors for the checks
-  this change adds or touches, each ending with a dot. Never the full suite:
-  the reviewer runs it once on the final tree.
-- `python3 scripts/checks/_selfcheck.py` — only when this change edits
-  `scripts/check.py` or `scripts/checks/harness.py`. Once.
+- `python3 scripts/check.py --only <area>.` — the core areas the change
+  touches, each ending with a dot. Never the full suite: the reviewer runs it
+  once on the final tree.
 - `.venv/bin/python scripts/smoke_host.py` — only when the host changed.
 - `git status --porcelain` and `git diff --check` — always. Paste the first
   verbatim.
