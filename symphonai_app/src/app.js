@@ -3007,12 +3007,18 @@ export async function start({ global, document, client }) {
   function showAgents() {
     const rows = [...board.rows];
     for (const agent of conversation?.agents ?? []) {
+      const replayed = rows.find((row) => row.noticeOnly && row.name === agent.name);
+      if (replayed) Object.assign(replayed, {
+        agentId: agent.agent_id, parentAgentId: agent.parent_agent_id ?? null,
+        state: agent.state === "cancelled" && agent.parent_agent_id ? "closed" : agent.state,
+        noticeOnly: false,
+      });
       if (!rows.some((row) => row.agentId === agent.agent_id)) {
         rows.push({
           agentId: agent.agent_id,
           parentAgentId: agent.parent_agent_id ?? null,
           name: agent.name,
-          state: agent.state,
+          state: agent.state === "cancelled" && agent.parent_agent_id ? "closed" : agent.state,
           tool: "",
         });
       }
@@ -3042,6 +3048,7 @@ export async function start({ global, document, client }) {
       finished: "finished",
       failed: "failed",
       stopped: "stopped",
+      closed: "closed",
     };
     const displayState = (state) => state === "pending" ? "running"
       : state === "cancelled" ? "stopped"
@@ -3051,7 +3058,7 @@ export async function start({ global, document, client }) {
       return;
     }
     const byId = new Map(rows.map((row) => [row.agentId, row]));
-    const nodes = new Map(rows.map(({ agentId, parentAgentId, name, state, tool, target }) => {
+    const nodes = new Map(rows.map(({ agentId, parentAgentId, name, state, tool, target, progress, question }) => {
       const status = displayState(state);
       const activity = status === "running"
         ? (tool ? description(tool, target) : "thinking")
@@ -3086,6 +3093,12 @@ export async function start({ global, document, client }) {
           text: detail,
         }));
       }
+      if (progress) append(row, element(document, "span", {
+        className: "agent-detail", text: progress,
+      }));
+      if (question) append(row, element(document, "span", {
+        className: "agent-detail", text: `Asks: ${question}`,
+      }));
       return [agentId, row];
     }));
     const children = new Map();

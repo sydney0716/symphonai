@@ -679,6 +679,24 @@ def _loop_retry_target(reason: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _unanswered_loop_question(root: Path, approval) -> bool:
+    """Keep an unattended failure-review question as the loop's stop reason."""
+    if approval.kind != "question" or not approval.session_id:
+        return False
+    source = SessionStore.open(default_sessions_root(), approval.session_id)
+    try:
+        info = source.read_meta().get("spec_run", {})
+    finally:
+        source.close()
+    if info.get("failure") is None or not info.get("loop_id"):
+        return False
+    store = LoopStore(root)
+    current = store.load(info["loop_id"])
+    if current["state"] == "running":
+        store.set_state(current, "needs_attention", approval.target)
+    return True
+
+
 def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
     apply_to_environment(os.environ, load())
     root = arguments.repo_root.expanduser().resolve()
@@ -690,6 +708,13 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
     subscription = None
     original_threading_excepthook = threading.excepthook
     threading.excepthook = lambda _args: None
+    unanswered_failure_question = False
+
+    def unanswered_question(approval):
+        nonlocal unanswered_failure_question
+        unanswered_failure_question = _unanswered_loop_question(root, approval) or unanswered_failure_question
+        return False
+
     loop = None
     approval_error = None
     retries = []
@@ -699,7 +724,7 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
             root,
             broker,
             None,
-            publish_approval=lambda _approval: False,
+            publish_approval=unanswered_question,
             base_prompt=LEADER_BASE_PROMPT,
             subagent_base_prompt=SUBAGENT_BASE_PROMPT,
             sessions_root=default_sessions_root(),
@@ -769,6 +794,9 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                     loop = current
                     break
             elif current.get("state") == "needs_attention":
+                if unanswered_failure_question:
+                    loop = current
+                    break
                 reason = str(current.get("reason", ""))
                 stage, card_id = _loop_retry_target(reason)
                 key = ("planner", None) if stage == "planner" else ("card", card_id)

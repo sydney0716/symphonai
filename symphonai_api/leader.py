@@ -23,8 +23,9 @@ import math
 import os
 import re
 import threading
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from symphonai_api.agent_loop import ApiAgent, _message_digest
@@ -68,6 +69,7 @@ from symphonai_api.events import (
     RunStarted,
     SubagentSpawned,
     SubagentStopped,
+    SubagentNotice,
     ToolCallStarted,
     emit,
     fan_out,
@@ -106,6 +108,7 @@ from symphonai_api.roles import (
     WORKER_PROMPT,
 )
 from symphonai_api.session import SessionStore, TranscriptError, load_run, read_records
+from symphonai_api.secrets import mask_secrets, mask_tool_result
 from symphonai_api.skills import Skill
 from symphonai_api.streaming import StreamAssembler
 from symphonai_api.tool_schema import tool_registry_schemas
@@ -366,7 +369,20 @@ def _dispatch_description(subagents: Mapping[str, AgentSpec] | None = None) -> s
             entry += f" (task must be JSON matching {schema})"
         available.append(entry)
     return _DISPATCH_DESCRIPTION + " Available subagents: " + "; ".join(available) + "."
+SUBAGENT_FINISHED_PREFIX = "[subagent {name} finished]"
+SUBAGENT_PROGRESS_PREFIX = "[subagent {name} progress]"
+SUBAGENT_QUESTION_PREFIX = "[subagent {name} asks]"
+LEADER_MESSAGE_PREFIX = "[message from the leader]"
+SUBAGENT_NOTICE_PATTERN = re.compile(
+    r"^(?:\[subagent .+ (?:finished|progress|asks)\]|"
+    + re.escape(LEADER_MESSAGE_PREFIX) + r")(?:\n|$)"
+)
+
 _DISPATCH_PROPERTIES = {
+    "background": {
+        "type": "boolean",
+        "description": "Start in the background and collect the result with wait_subagents.",
+    },
     "subagent_name": {
         "minLength": 1,
         "type": "string",
@@ -453,6 +469,13 @@ class SubagentRecord:
     worktree_path: Path | None = None
     worktree_admin_path: Path | None = None
     running: bool = False
+    state: str = "idle"
+    background: bool = False
+    result: ToolResult | None = None
+    delivered: bool = False
+    token: CancellationToken | None = None
+    thread: threading.Thread | None = None
+    current_run: AgentRun | None = None
 
 
 class DispatchSubagentTool(LocalTool):
@@ -527,6 +550,10 @@ class DispatchSubagentTool(LocalTool):
         self._model_summary = model_summary
         self._pool_lock = threading.RLock()
         self._reserved_names: set[str] = set()
+        self._background_names: set[str] = set()
+        self._progress: dict[str, str] = {}
+        self._questions: list[dict] = []
+        self._changed = threading.Condition(self._pool_lock)
         self._active_runs_lock = threading.Lock()
         self._active_runs: dict[str, AgentRun] = {}
         self._events: EventSink | None = None
@@ -534,6 +561,112 @@ class DispatchSubagentTool(LocalTool):
         self._event_run_id: str | None = None
         self._event_turn_id: str | None = None
         self.pool: dict[str, SubagentRecord] = {}
+
+    def _notice(self, name: str, record: SubagentRecord, kind: str, text: str) -> None:
+        parent = self._parent_run
+        if parent is not None:
+            emit(self._events, SubagentNotice(
+                agent_id=parent.agent.agent_id, run_id=parent.run.run_id,
+                subagent_name=name, subagent_agent_id=record.agent_ref.agent_id,
+                kind=kind, text=mask_secrets(text),
+            ))
+
+    def _collect(self, name: str, record: SubagentRecord) -> dict | None:
+        # Called under _changed, including by deferred redirect delivery.
+        if record.delivered or record.state == "closed" or record.result is None:
+            return None
+        record.delivered = True
+        result = asdict(mask_tool_result(record.result))
+        self._notice(name, record, "finished", json.dumps(result))
+        return result
+
+    def _deliver_result(self, name: str, record: SubagentRecord) -> str | None:
+        with self._changed:
+            result = self._collect(name, record)
+            if result is None:
+                return None
+            return SUBAGENT_FINISHED_PREFIX.format(name=name) + "\n" + json.dumps(result)
+
+    def wait_for_background(self, budget_exceeded) -> None:
+        with self._changed:
+            while self._background_names:
+                if budget_exceeded():
+                    return
+                parent = self._parent_run
+                if parent is not None and parent.token is not None:
+                    parent.token.raise_if_cancelled()
+                if parent is not None and parent.has_redirects():
+                    return
+                if any(r.result is not None and not r.delivered and r.state != "closed"
+                       for r in self.pool.values() if r.background):
+                    return
+                self._changed.wait(0.05)
+
+    def wait_subagents(self, names=None, timeout_seconds=600, *, cancel=None) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        with self._changed:
+            selected = list(names) if names is not None else [
+                name for name, record in self.pool.items()
+                if record.background and (record.state == "running" or not record.delivered)
+            ]
+            unknown = [name for name in selected if name not in self.pool]
+            if unknown:
+                raise ValueError("unknown subagents: " + ", ".join(unknown))
+            while True:
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                finished = {}
+                for name in selected:
+                    result = self._collect(name, self.pool[name])
+                    if result is not None:
+                        finished[name] = result
+                questions = [item for item in self._questions
+                             if item["name"] in selected and not item["delivered"] and not item["waited"]]
+                for item in questions:
+                    item["waited"] = True
+                running = [name for name in selected if name in self._background_names]
+                if questions:
+                    return {"finished": finished, "running": running,
+                            "questions": [{"name": item["name"], "text": item["text"]}
+                                          for item in questions]}
+                parent = self._parent_run
+                wall_limit = None if parent is None else parent.budget.wall_seconds
+                budget_elapsed = (wall_limit is not None and parent.started_monotonic is not None
+                                  and time.monotonic() - parent.started_monotonic >= wall_limit)
+                if finished or not running or time.monotonic() >= deadline or budget_elapsed:
+                    return {"finished": finished, "running": running}
+                self._changed.wait(min(0.05, max(0, deadline - time.monotonic())))
+
+    def list_subagents(self) -> dict:
+        with self._changed:
+            return {"subagents": [
+                {"name": name, "role": record.current_run.spec.name if record.current_run else record.agent_ref.name,
+                 "state": record.state, "background": record.background,
+                 "turns_used": record.turns_used,
+                 "progress": self._progress.get(name, "")}
+                for name, record in self.pool.items()
+            ]}
+
+    def close_subagent(self, name: str) -> dict:
+        with self._changed:
+            record = self.pool.get(name)
+            if record is None:
+                raise ValueError(f"unknown subagent {name}")
+            record.state = "closed"
+            record.delivered = True
+            if record.token is not None:
+                record.token.cancel()
+            thread = record.thread
+            self._changed.notify_all()
+        if thread is not None:
+            thread.join()
+        return {"name": name, "state": "closed"}
+
+    def cancel_background(self) -> None:
+        with self._changed:
+            names = list(self._background_names)
+        for name in names:
+            self.close_subagent(name)
 
     def _active_run_id(self, agent_id: str) -> str | None:
         with self._active_runs_lock:
@@ -547,6 +680,7 @@ class DispatchSubagentTool(LocalTool):
     ) -> None:
         self._parent_run = run
         self._parent_messages = messages
+        run.wait_for_background = self.wait_for_background
 
     def observe_event(self, event: Event) -> None:
         if isinstance(event, RunStarted):
@@ -654,6 +788,7 @@ class DispatchSubagentTool(LocalTool):
         policy: PermissionPolicy,
         cancel: CancellationToken | None = None,
     ) -> ToolResult:
+        background = tool_call.arguments.get("background", False)
         subagent_name = tool_call.arguments.get("subagent_name")
         task = tool_call.arguments.get("task")
 
@@ -772,7 +907,7 @@ class DispatchSubagentTool(LocalTool):
 
         with self._pool_lock:
             record = self.pool.get(subagent_name)
-            if subagent_name in self._reserved_names or (record is not None and record.running):
+            if subagent_name in self._reserved_names or subagent_name in self._background_names or (record is not None and record.running):
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     ok=False,
@@ -781,6 +916,10 @@ class DispatchSubagentTool(LocalTool):
                         "dispatch it again after it finishes"
                     ),
                 )
+            if background and len(self._background_names) >= 4:
+                return ToolResult(tool_call.id, ok=False, error=(
+                    "at most 4 background subagents; running: "
+                    + ", ".join(sorted(self._background_names))))
             if record is not None and record.breaker.is_open:
                 return ToolResult(
                     tool_call_id=tool_call.id,
@@ -913,6 +1052,7 @@ class DispatchSubagentTool(LocalTool):
                 standard_tools,
                 selected_extra,
             )
+            subagent_tools["message_leader"] = _MessageLeaderTool(self, subagent_name)
             record = SubagentRecord(
                 agent=ApiAgent(
                     provider=child_provider,
@@ -959,9 +1099,31 @@ class DispatchSubagentTool(LocalTool):
             # the meet again for every dispatch instead of retaining authority.
             record.agent._policy = effective_policy
 
+        with self._changed:
+            if background and len(self._background_names) >= 4:
+                record.running = False
+                return ToolResult(tool_call.id, ok=False, error=(
+                    "at most 4 background subagents; running: "
+                    + ", ".join(sorted(self._background_names))))
+            # Keep a previous dispatch's deferred delivery attached to that dispatch.
+            if record.background:
+                record = replace(record)
+                self.pool[subagent_name] = record
+            record.background = background
+            record.state = "running"
+            record.result = None
+            record.delivered = False
+            if background:
+                self._background_names.add(subagent_name)
+
+        event_run_id = self._event_run_id
+        event_agent_id = self._event_agent_id
+        event_turn_id = self._event_turn_id
+
         def new_child_run() -> AgentRun:
             child_run = self._new_run(spec, record.agent_ref)
             record.runs.append(child_run)
+            record.current_run = child_run
             return child_run
 
         def prepare_child() -> None:
@@ -978,14 +1140,14 @@ class DispatchSubagentTool(LocalTool):
                     unreadable_memory=unreadable_memory,
                 )
             if self._events is not None:
-                if self._event_run_id is None:
+                if event_run_id is None:
                     raise RuntimeError("dispatch event context was never set")
                 emit(
                     self._events,
                     SubagentSpawned(
-                        agent_id=self._event_agent_id,
-                        run_id=self._event_run_id,
-                        turn_id=self._event_turn_id,
+                        agent_id=event_agent_id,
+                        run_id=event_run_id,
+                        turn_id=event_turn_id,
                         subagent_name=subagent_name,
                         subagent_agent_id=record.agent_ref.agent_id,
                     ),
@@ -995,7 +1157,7 @@ class DispatchSubagentTool(LocalTool):
             child_run: AgentRun, *, initial: bool = False,
         ) -> tuple[AgentRunResult | None, str | None, Exception | None]:
             child_run.start(token)
-            if initial:
+            if initial and not background:
                 prepare_child()
             result = None
             failure = None
@@ -1004,7 +1166,7 @@ class DispatchSubagentTool(LocalTool):
                 self._active_runs[record.agent_ref.agent_id] = child_run
             try:
                 lease = (
-                    nullcontext() if record.worktree_path is not None
+                    nullcontext() if record.worktree_path is not None or background
                     else self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix)
                 )
                 with lease:
@@ -1040,10 +1202,10 @@ class DispatchSubagentTool(LocalTool):
                         child_run.cancel()
                     else:
                         child_run.finish(result)
-                if initial and self._event_run_id is not None:
+                if initial and event_run_id is not None:
                     emit(self._events, SubagentStopped(
-                        agent_id=self._event_agent_id, run_id=self._event_run_id,
-                        turn_id=self._event_turn_id, subagent_name=subagent_name,
+                        agent_id=event_agent_id, run_id=event_run_id,
+                        turn_id=event_turn_id, subagent_name=subagent_name,
                         subagent_agent_id=record.agent_ref.agent_id,
                     ))
             return result, failure, execution_error
@@ -1062,148 +1224,207 @@ class DispatchSubagentTool(LocalTool):
             if cancel is not None
             else CancellationToken(deadline_seconds=spec.deadline_seconds)
         )
-        run_result, failure, execution_error = run_child(child_run, initial=True)
-        if isinstance(execution_error, LeaseConflict):
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
-        if run_result is None:
-            try:
-                content, payload = self._worktree_output(subagent_name, record, "")
-            finally:
-                with self._pool_lock:
-                    record.running = False
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                content=content,
-                error=failure or str(execution_error) or "subagent dispatch failed",
-                payload=payload,
-            )
-        record_child_result(run_result)
-        validation_passed = not validation_commands
-        validation_evidence: list[dict[str, object]] = []
-        validation_round = 1
-        while (
-            validation_commands
-            and run_result.stopped_reason == "final_response"
-        ):
-            validation_evidence = _run_handoff_validation(
-                validation_commands, effective_policy
-            )
-            failed_check = next(
-                (item for item in validation_evidence if item["exit"] != 0), None
-            )
-            if failed_check is None:
-                validation_passed = True
-                break
-            if validation_round == 5:
-                break
-            record.messages.append(Message(
-                role=Role.USER,
-                content=(
-                    f"Validation failed (round {validation_round} of 5): "
-                    f"{failed_check['command']} exited {failed_check['exit']}\n"
-                    f"{str(failed_check['output'])[-4000:]}\n"
-                    "Fix the cause and finish again; do not edit the spec."
-                ),
-            ))
-            validation_round += 1
-            child_run = new_child_run()
-            retry_result, retry_failure, _ = run_child(child_run)
-            if retry_result is None:
-                failure = retry_failure or "validation retry failed"
-                break
-            run_result = retry_result
+        record.token = token
+
+        def execute_dispatch() -> ToolResult:
+            nonlocal child_run
+            run_result, failure, execution_error = run_child(child_run, initial=True)
+            if isinstance(execution_error, LeaseConflict):
+                return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
+            if run_result is None:
+                try:
+                    content, payload = self._worktree_output(subagent_name, record, "")
+                finally:
+                    with self._pool_lock:
+                        record.running = False
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    content=content,
+                    error=failure or str(execution_error) or "subagent dispatch failed",
+                    payload=payload,
+                )
             record_child_result(run_result)
-        with self._pool_lock:
-            record.running = False
-        if run_result.stopped_reason == "cancelled":
-            if token.reason is CancelReason.PARENT:
-                with self._pool_lock:
-                    record.running = False
-                raise OperationCancelled
-            record.breaker.record_failure()
-            if token.reason is CancelReason.DEADLINE:
-                error = "subagent deadline elapsed before a final answer"
+            validation_passed = not validation_commands
+            validation_evidence: list[dict[str, object]] = []
+            validation_round = 1
+            while (
+                validation_commands
+                and run_result.stopped_reason == "final_response"
+            ):
+                validation_evidence = _run_handoff_validation(
+                    validation_commands, effective_policy
+                )
+                failed_check = next(
+                    (item for item in validation_evidence if item["exit"] != 0), None
+                )
+                if failed_check is None:
+                    validation_passed = True
+                    break
+                if validation_round == 5:
+                    break
+                record.messages.append(Message(
+                    role=Role.USER,
+                    content=(
+                        f"Validation failed (round {validation_round} of 5): "
+                        f"{failed_check['command']} exited {failed_check['exit']}\n"
+                        f"{str(failed_check['output'])[-4000:]}\n"
+                        "Fix the cause and finish again; do not edit the spec."
+                    ),
+                ))
+                validation_round += 1
+                child_run = new_child_run()
+                retry_result, retry_failure, _ = run_child(child_run)
+                if retry_result is None:
+                    failure = retry_failure or "validation retry failed"
+                    break
+                run_result = retry_result
+                record_child_result(run_result)
+            with self._pool_lock:
+                record.running = False
+            if run_result.stopped_reason == "cancelled":
+                if token.reason is CancelReason.PARENT:
+                    with self._pool_lock:
+                        record.running = False
+                    raise OperationCancelled
+                record.breaker.record_failure()
+                if token.reason is CancelReason.DEADLINE:
+                    error = "subagent deadline elapsed before a final answer"
+                else:
+                    error = "subagent was cancelled explicitly before a final answer"
+                try:
+                    content, payload = self._worktree_output(
+                        subagent_name, record, run_result.final_response.message.text
+                    )
+                finally:
+                    with self._pool_lock:
+                        record.running = False
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    ok=False,
+                    content=content,
+                    error=error,
+                    payload=payload,
+                )
+
+            succeeded = run_result.stopped_reason == "final_response" and validation_passed
+            output_error = None
+            if succeeded and spec.io.output_schema is not None:
+                _, output_error = validate_output(
+                    spec.io,
+                    run_result.final_response.message.text,
+                )
+                succeeded = output_error is None
+            if succeeded:
+                record.breaker.record_success()
             else:
-                error = "subagent was cancelled explicitly before a final answer"
+                record.breaker.record_failure()
+            if output_error is not None:
+                error = output_error
+            elif succeeded:
+                error = None
+            elif run_result.stopped_reason == "refused":
+                category = run_result.final_response.refusal_category
+                error = (f"subagent was refused ({category}) before a final answer"
+                         if category else "subagent was refused before a final answer")
+            elif validation_commands and not validation_passed:
+                last_failure = next(
+                    (item for item in validation_evidence if item["exit"] != 0), None
+                )
+                error = (
+                    "validation failed after 5 rounds"
+                    if last_failure is not None and validation_round == 5
+                    else failure or "validation retry failed"
+                )
+            elif run_result.stopped_reason == "max_turns":
+                error = "subagent reached max_turns without a final answer"
+            else:
+                error = (
+                    f"subagent stopped because {run_result.stopped_reason} "
+                    "before a final answer"
+                )
             try:
                 content, payload = self._worktree_output(
                     subagent_name, record, run_result.final_response.message.text
                 )
             finally:
-                with self._pool_lock:
-                    record.running = False
+                if record.worktree_path is not None:
+                    with self._pool_lock:
+                        record.running = False
+            if validation_commands:
+                evidence_text = "\n".join(
+                    f"{item['command']} exited {item['exit']}\n{item['output']}"
+                    for item in validation_evidence
+                )
+                content = f"{content}\n\nValidation:\n{evidence_text}"
+                if succeeded:
+                    content += (
+                        "\nThe host ran these Validation commands after the subagent "
+                        "finished, and all passed. Do not run them again, or any "
+                        "equivalent of them; read the diff instead."
+                    )
             return ToolResult(
                 tool_call_id=tool_call.id,
-                ok=False,
+                ok=succeeded,
                 content=content,
                 error=error,
                 payload=payload,
             )
 
-        succeeded = run_result.stopped_reason == "final_response" and validation_passed
-        output_error = None
-        if succeeded and spec.io.output_schema is not None:
-            _, output_error = validate_output(
-                spec.io,
-                run_result.final_response.message.text,
-            )
-            succeeded = output_error is None
-        if succeeded:
-            record.breaker.record_success()
-        else:
-            record.breaker.record_failure()
-        if output_error is not None:
-            error = output_error
-        elif succeeded:
-            error = None
-        elif run_result.stopped_reason == "refused":
-            category = run_result.final_response.refusal_category
-            error = (f"subagent was refused ({category}) before a final answer"
-                     if category else "subagent was refused before a final answer")
-        elif validation_commands and not validation_passed:
-            last_failure = next(
-                (item for item in validation_evidence if item["exit"] != 0), None
-            )
-            error = (
-                "validation failed after 5 rounds"
-                if last_failure is not None and validation_round == 5
-                else failure or "validation retry failed"
-            )
-        elif run_result.stopped_reason == "max_turns":
-            error = "subagent reached max_turns without a final answer"
-        else:
-            error = (
-                f"subagent stopped because {run_result.stopped_reason} "
-                "before a final answer"
-            )
+        if not background:
+            try:
+                outcome = execute_dispatch()
+                record.state = "idle" if outcome.ok else "failed"
+                return outcome
+            except Exception:
+                record.state = "failed"
+                raise
+            finally:
+                record.running = False
+
+        # Acquire the shared-tree lease before acknowledging the background start.
+        lease = None
         try:
-            content, payload = self._worktree_output(
-                subagent_name, record, run_result.final_response.message.text
-            )
-        finally:
-            if record.worktree_path is not None:
-                with self._pool_lock:
-                    record.running = False
-        if validation_commands:
-            evidence_text = "\n".join(
-                f"{item['command']} exited {item['exit']}\n{item['output']}"
-                for item in validation_evidence
-            )
-            content = f"{content}\n\nValidation:\n{evidence_text}"
-            if succeeded:
-                content += (
-                    "\nThe host ran these Validation commands after the subagent "
-                    "finished, and all passed. Do not run them again, or any "
-                    "equivalent of them; read the diff instead."
-                )
-        return ToolResult(
-            tool_call_id=tool_call.id,
-            ok=succeeded,
-            content=content,
-            error=error,
-            payload=payload,
-        )
+            if record.worktree_path is None:
+                lease = self._leases.acquire(child_run.run.run_id, spec.isolation.workspace_prefix)
+            prepare_child()
+        except Exception as exc:
+            if lease is not None:
+                self._leases.release(lease)
+            token.close()
+            with self._changed:
+                record.running = False
+                record.state = "failed"
+                self._background_names.discard(subagent_name)
+                self._changed.notify_all()
+            return ToolResult(tool_call.id, ok=False, error=str(exc))
+
+        def worker() -> None:
+            try:
+                outcome = execute_dispatch()
+            except OperationCancelled:
+                outcome = ToolResult(tool_call.id, ok=False, cancelled=True, error="subagent was cancelled")
+            except Exception as exc:
+                outcome = ToolResult(tool_call.id, ok=False, error=str(exc))
+            finally:
+                if lease is not None:
+                    self._leases.release(lease)
+                token.close()
+            with self._changed:
+                record.running = False
+                if record.state != "closed":
+                    record.result = outcome
+                    record.state = "finished" if outcome.ok else "failed"
+                    if self._parent_run is not None:
+                        self._parent_run.redirect_deferred(
+                            lambda: self._deliver_result(subagent_name, record))
+                self._background_names.discard(subagent_name)
+                self._changed.notify_all()
+
+        record.thread = threading.Thread(target=worker, name=f"subagent-{subagent_name}", daemon=True)
+        record.thread.start()
+        return ToolResult(tool_call.id, ok=True, content=f"subagent {subagent_name} is running",
+                          payload={"name": subagent_name, "state": "running", "background": True})
 
     @staticmethod
     def _worktree_output(
@@ -1432,6 +1653,102 @@ class _LeaderShellTool(LocalTool):
             result = replace(result, content=f"{result.content}\n{suffix}" if result.content else suffix)
         return result
 
+class _SubagentControlTool(LocalTool):
+    def __init__(self, dispatch, name, properties, required, description):
+        self.dispatch = dispatch
+        self._name = name
+        self._description = description
+        self._parameters = {"type": "object", "properties": properties, "required": required}
+
+    name = property(lambda self: self._name)
+    description = property(lambda self: self._description)
+    parameters = property(lambda self: self._parameters)
+
+    def metadata(self, arguments):
+        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+
+    def _execute(self, tool_call, policy, cancel=None):
+        try:
+            arguments = dict(tool_call.arguments)
+            if self.name == "wait_subagents":
+                timeout = arguments.get("timeout_seconds", 600)
+                if isinstance(timeout, bool) or not math.isfinite(timeout) or not 0 <= timeout <= 3600:
+                    raise ValueError("timeout_seconds must be between 0 and 3600")
+                arguments["cancel"] = cancel
+            if self.name == "message_subagent":
+                name, text = arguments["name"], arguments["text"]
+                if not text.strip():
+                    raise ValueError("message text must not be blank")
+                with self.dispatch._changed:
+                    record = self.dispatch.pool.get(name)
+                    state = "unknown" if record is None else record.state
+                    if record is None or state != "running" or record.current_run is None:
+                        raise ValueError(f"subagent {name} is {state}")
+                    notice = LEADER_MESSAGE_PREFIX + "\n" + text
+                    try:
+                        record.current_run.redirect(notice)
+                    except ValueError:
+                        raise ValueError(f"subagent {name} is no longer running") from None
+                    # Keep the recipient in the root transcript for notice replay.
+                    if self.dispatch._parent_run is not None:
+                        self.dispatch._parent_run.redirect(
+                            LEADER_MESSAGE_PREFIX + f"\nTo {name}: " + text)
+                    self.dispatch._notice(name, record, "message", text)
+                    payload = {"name": name, "sent": True}
+            else:
+                payload = getattr(self.dispatch, self.name)(**arguments)
+            return ToolResult(tool_call.id, ok=True, content=json.dumps(payload), payload=payload)
+        except ValueError as exc:
+            return ToolResult(tool_call.id, ok=False, error=str(exc))
+
+
+class _MessageLeaderTool(LocalTool):
+    name = "message_leader"
+    description = "Send the leader a progress note or question, then keep working."
+    parameters = {"type": "object", "properties": {
+        "text": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "enum": ["progress", "question"]},
+    }, "required": ["text", "kind"]}
+
+    def __init__(self, dispatch, name):
+        self.dispatch = dispatch
+        self.subagent_name = name
+
+    def metadata(self, arguments):
+        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+
+    def _execute(self, tool_call, policy, cancel=None):
+        text, kind = tool_call.arguments["text"], tool_call.arguments["kind"]
+        if not text.strip():
+            return ToolResult(tool_call.id, ok=False, error="message text must not be blank")
+        dispatch = self.dispatch
+        with dispatch._changed:
+            record = dispatch.pool[self.subagent_name]
+            parent = dispatch._parent_run
+            if record.state == "closed" or parent is None or parent.phase is not RunPhase.RUNNING:
+                return ToolResult(tool_call.id, ok=False, error="the leader is no longer running")
+            prefix = SUBAGENT_QUESTION_PREFIX if kind == "question" else SUBAGENT_PROGRESS_PREFIX
+            notice = prefix.format(name=self.subagent_name) + "\n" + text
+            if kind == "progress":
+                dispatch._progress[self.subagent_name] = text
+                parent.redirect(notice)
+            else:
+                question = {"name": self.subagent_name, "text": text, "delivered": False, "waited": False}
+                dispatch._questions.append(question)
+
+                def deliver():
+                    with dispatch._changed:
+                        if question["delivered"] or record.state == "closed":
+                            return None
+                        question["delivered"] = True
+                        return notice
+
+                parent.redirect_deferred(deliver)
+            dispatch._notice(self.subagent_name, record, kind, text)
+            dispatch._changed.notify_all()
+        return ToolResult(tool_call.id, ok=True, content="message sent to the leader")
+
+
 class Leader:
     """Digests a user goal, dispatching/reusing named subagents as needed.
 
@@ -1538,7 +1855,19 @@ class Leader:
             model_summary=config.model_summary,
         )
         self._event_sink.bind_dispatch_tool(self._dispatch_tool)
-        leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool}
+        control_tools = {
+            name: _SubagentControlTool(self._dispatch_tool, name, properties, required, description)
+            for name, properties, required, description in (
+                ("wait_subagents", {"names": {"type": "array", "items": {"type": "string"}},
+                                    "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 3600}},
+                 [], "Wait for a background subagent to finish, or until the timeout."),
+                ("message_subagent", {"name": {"type": "string"}, "text": {"type": "string", "minLength": 1}},
+                 ["name", "text"], "Send input to a running subagent at its next turn boundary."),
+                ("list_subagents", {}, [], "List this leader's subagents and their states."),
+                ("close_subagent", {"name": {"type": "string"}}, ["name"], "Cancel and close a subagent."),
+            )
+        }
+        leader_tools = {DISPATCH_TOOL_NAME: self._dispatch_tool, **control_tools}
         tool_names = None if defined_leader is None else defined_leader.tool_names
         if tool_names is not None and config.result_store is not None:
             tool_names = (*tool_names, "read_tool_result")
@@ -1616,6 +1945,7 @@ class Leader:
                 dispatch_subagent_tool_schema(
                     config.leader_provider.wire_format, config.subagent_specs,
                 ),
+                *tool_registry_schemas(control_tools, config.leader_provider.wire_format),
                 *tool_registry_schemas(
                     standard_tools,
                     config.leader_provider.wire_format,
@@ -1783,6 +2113,8 @@ class Leader:
         except Exception as exc:
             leader_run.fail(str(exc))
             raise
+        finally:
+            self._dispatch_tool.cancel_background()
         if result.stopped_reason == "cancelled":
             if leader_run.phase is RunPhase.RUNNING:
                 leader_run.cancel()

@@ -242,3 +242,66 @@ test("the real client preserves host errors for conversation and session creatio
     app.subscription.close();
   }
 });
+
+test("subagent notices render equally live and replayed, with rail progress and questions", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  await start({ global: browser(), document, client: script.client });
+  await script.emit("RunStarted");
+  await script.emit("SubagentSpawned", { subagent_name: "worker", subagent_agent_id: "child" });
+  await script.emit("RunStarted", { agent_id: "child", agent_name: "worker", run_id: "child-run" });
+  const rail = document.getElementById("agents");
+  assert.match(rail.textContent, /worker.*running/);
+  const kinds = ["progress", "question", "message", "finished"];
+  const texts = ["Reading existing.txt\nMore progress", "Which file?\nQuestion details", "Use existing.txt\nMessage details",
+    JSON.stringify({ ok: true, content: "Complete result\nValidation: passed", error: null })];
+  for (const [index, kind] of kinds.entries()) {
+    await script.emit("SubagentNotice", {
+      subagent_name: "worker", subagent_agent_id: "child", kind, text: texts[index],
+    });
+    if (kind === "progress") assert.match(rail.textContent, /Reading existing.txt/);
+    if (kind === "question") assert.match(rail.textContent, /Asks: Which file\?/);
+    if (kind === "message") assert.ok(!rail.textContent.includes("Asks: Which file?"));
+  }
+  const chat = document.getElementById("chat");
+  const notices = () => chat.children.filter((node) => node.className.split(" ").includes("subagent-notice"));
+  const expected = ["worker: Reading existing.txt", "worker asks: Which file?", "To worker: Use existing.txt", "worker finished"];
+  assert.deepEqual(notices().map((node) => node.children[0].textContent), expected);
+  assert.equal(chat.children.filter((node) => node.className === "prompt").length, 0);
+  assert.ok(!chat.textContent.includes("Complete result"));
+  const lastToggle = notices().at(-1);
+  assert.equal(lastToggle.getAttribute("aria-expanded"), "false");
+  await lastToggle.dispatch("click");
+  assert.match(chat.textContent, /Complete result\nValidation: passed/);
+  assert.equal(notices().at(-1).getAttribute("aria-expanded"), "true");
+  assert.match(rail.textContent, /finished/);
+
+  await script.emit("SubagentSpawned", { subagent_name: "stopped-worker", subagent_agent_id: "closed-child" });
+  await script.emit("RunFinished", { agent_id: "closed-child", run_id: "closed-run", stopped_reason: "cancelled" });
+  await script.emit("SubagentStopped", { subagent_name: "stopped-worker", subagent_agent_id: "closed-child" });
+  assert.match(rail.textContent, /stopped-worker.*closed/);
+  await script.emit("SubagentSpawned", { subagent_name: "failed-worker", subagent_agent_id: "failed-child" });
+  await script.emit("RunFailed", { agent_id: "failed-child", run_id: "failed-run" });
+  await script.emit("SubagentStopped", { subagent_name: "failed-worker", subagent_agent_id: "failed-child" });
+  assert.match(rail.textContent, /failed-worker.*failed/);
+  assert.equal(find(rail, (node) => node.tagName === "BUTTON"), null);
+
+  const replayDocument = new Document();
+  const replay = scriptedClient();
+  await start({ global: browser(), document: replayDocument, client: replay.client });
+  const headers = ["[subagent worker progress]", "[subagent worker asks]", "[message from the leader]", "[subagent worker finished]"];
+  for (const [index, header] of headers.entries()) {
+    await replay.emit("HistoryMessage", {
+      role: "user", notice: true, text: `${header}\n${index === 2 ? "To worker: " : ""}${texts[index]}`,
+      tool_calls: [],
+    });
+  }
+  const replayChat = replayDocument.getElementById("chat");
+  const replayNotices = replayChat.children.filter((node) => node.className.split(" ").includes("subagent-notice"));
+  assert.deepEqual(replayNotices.map((node) => node.children[0].textContent), expected);
+  assert.equal(replayChat.children.filter((node) => node.className === "prompt").length, 0);
+  await replayNotices.at(-1).dispatch("keydown", { key: "Enter" });
+  assert.match(replayChat.textContent, /Complete result\nValidation: passed/);
+  await replay.emit("HistoryMessage", { role: "user", notice: false, text: "A person's real prompt", tool_calls: [] });
+  assert.equal(replayChat.children.filter((node) => node.className === "prompt").length, 1);
+});

@@ -48,8 +48,8 @@ def answer(text="finished", *calls, usage=None):
     return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)), usage=usage or Usage())
 
 
-def call(name, **arguments):
-    return ToolCall(f"{name}-{os.urandom(4).hex()}", name, arguments)
+def call(tool_name, /, **arguments):
+    return ToolCall(f"{tool_name}-{os.urandom(4).hex()}", tool_name, arguments)
 
 
 def results(run):
@@ -414,3 +414,220 @@ def outside_file_changes_are_announced():
             answer("", call("fixture_action")), answer()], extra={"fixture_action": Action(change)})
         notices = [m for m in provider.requests[-1].messages if m.role is Role.USER]
         assert any("existing.txt" in m.text and "chang" in m.text.lower() for m in notices)
+
+
+class BackgroundScript(FakeModelProvider):
+    """Route scripted child requests by their configured model, with real gates."""
+    def __init__(self, respond):
+        super().__init__()
+        self.respond = respond
+        self.requests = {}
+        self.lock = threading.Lock()
+
+    def create_response(self, request, *, cancel=None):
+        with self.lock:
+            requests = self.requests.setdefault(request.model, [])
+            requests.append(request)
+            count = len(requests)
+        return self.respond(request, count, cancel)
+
+
+def await_background_gate(gate, cancel):
+    deadline = time.monotonic() + 5
+    while not gate.wait(0.01):
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        assert time.monotonic() < deadline, "background fixture gate did not open"
+    if cancel is not None:
+        cancel.raise_if_cancelled()
+
+
+def background_leader(ws, provider, children, *, names=("first",), events=None,
+                      leader_tools=None, extra_tools=None, editable=False):
+    from symphonai_api.agent_spec import AgentSpec, Isolation, ModelSelector
+    policy = replace(ws.policy, shell_enabled=True, shell_allowlist=[()])
+    specs = {name: AgentSpec(
+        name=name, prompt="", model=ModelSelector(provider="fake", model=name),
+        policy_ceiling=policy, tool_names=("write_file",) if editable else ("read_file",),
+        isolation=Isolation(workspace_prefix=name),
+    ) for name in names}
+    return Leader(LeaderConfig(
+        provider, children, str(ws.root), leader_policy=policy,
+        subagent_specs=specs, events=events, leader_tools=leader_tools,
+        extra_tools=extra_tools, memory_extraction_enabled=False,
+    ))
+
+
+@check("turns.background_dispatch_keeps_working_and_waits_for_blocking_results")
+def background_dispatch_keeps_working_and_waits_for_blocking_results():
+    import json
+    gate = threading.Event()
+    started = {name: threading.Event() for name in ("first", "second")}
+    def respond(request, count, cancel):
+        started[request.model].set()
+        await_background_gate(gate, cancel)
+        return answer(f"{request.model} result")
+    children = BackgroundScript(respond)
+    task = handoff_spec("Return the scripted result")
+    with workspace() as ws:
+        def working(request, count):
+            if count == 2:
+                assert all(event.wait(5) for event in started.values())
+                assert not gate.is_set(), "dispatch blocked instead of returning"
+        provider = Script([
+            answer("", call("dispatch_subagent", subagent_name="first", task=task, background=True),
+                   call("dispatch_subagent", subagent_name="second", task=task, background=True)),
+            answer("The leader keeps working", call("fixture_action"),
+                   call("wait_subagents", names=["first"], timeout_seconds=5),
+                   call("wait_subagents", names=["second"], timeout_seconds=5)),
+            answer(),
+        ], working)
+        leader = background_leader(ws, provider, children, names=("first", "second"), editable=True,
+                                   leader_tools={"fixture_action": Action(lambda _: gate.set())})
+        try:
+            run = leader.run("Start both workers")
+        finally:
+            gate.set()
+        collected = {}
+        for result in results(run):
+            if result.payload and "finished" in result.payload:
+                collected.update(result.payload["finished"])
+        assert set(collected) == {"first", "second"}
+        for name, finished in collected.items():
+            blocking = background_leader(ws, Script([
+                answer("", call("dispatch_subagent", subagent_name=name, task=task)), answer(),
+            ]), BackgroundScript(lambda *_: answer(f"{name} result")), names=(name,), editable=True)
+            expected = results(blocking.run("Run the same worker"))[0]
+            assert finished["ok"] == expected.ok
+            assert finished["content"] == expected.content and "Validation:" in expected.content
+            assert finished["error"] == expected.error and finished["payload"] == expected.payload
+        assert not any(m.text.startswith("[subagent ") for m in run.leader_messages if m.role is Role.USER)
+        assert all(result.ok for result in results(run)), json.dumps([r.error for r in results(run)])
+
+
+@check("turns.background_results_continue_the_leader_and_cancellation_stops_children")
+def background_results_continue_the_leader_and_cancellation_stops_children():
+    gate, started = threading.Event(), threading.Event()
+    def respond(request, count, cancel):
+        started.set()
+        await_background_gate(gate, cancel)
+        return answer("child result")
+    with workspace() as ws:
+        def working(request, count):
+            if count == 2:
+                assert started.wait(5)
+                gate.set()
+            if count == 3:
+                assert any(m.text.startswith("[subagent first finished]") for m in request.messages)
+        provider = Script([
+            answer("", call("dispatch_subagent", subagent_name="first", task="Read", background=True)),
+            answer("My initial answer"), answer("Answer after the child"),
+        ], working)
+        run = background_leader(ws, provider, BackgroundScript(respond)).run("Start a worker")
+        assert run.final_answer == "Answer after the child" and len(provider.requests) == 3
+
+        token, exited = CancellationToken(), threading.Event()
+        def cancelled_child(request, count, cancel):
+            try:
+                token.cancel()
+                await_background_gate(threading.Event(), cancel)
+            finally:
+                exited.set()
+        provider = Script([answer("", call("dispatch_subagent", subagent_name="first", task="Read", background=True)), answer()])
+        run = background_leader(ws, provider, BackgroundScript(cancelled_child)).run("Cancel", cancel=token)
+        assert run.stopped_reason == "cancelled" and exited.wait(5)
+
+
+@check("turns.closing_background_agents_suppresses_delivery_and_enforces_the_cap")
+def closing_background_agents_suppresses_delivery_and_enforces_the_cap():
+    names = ("first", "second", "third", "fourth", "fifth")
+    exited = {name: threading.Event() for name in names[:4]}
+    started = {name: threading.Event() for name in names[:4]}
+    def respond(request, count, cancel):
+        started[request.model].set()
+        try:
+            await_background_gate(threading.Event(), cancel)
+        finally:
+            exited[request.model].set()
+    with workspace() as ws:
+        def all_started(request, count):
+            if count == 2:
+                assert all(event.wait(5) for event in started.values())
+        provider = Script([
+            answer("", *(call("dispatch_subagent", subagent_name=name, task="Read", background=True) for name in names[:4])),
+            answer("", call("dispatch_subagent", subagent_name="first", task="Read", background=True),
+                   call("dispatch_subagent", subagent_name="fifth", task="Read", background=True),
+                   *(call("close_subagent", name=name) for name in names[:4]), call("list_subagents")),
+            answer(),
+        ], all_started)
+        notices = []
+        run = background_leader(ws, provider, BackgroundScript(respond), names=names, events=notices.append).run("Start and close workers")
+        tool_results = results(run)
+        assert "first" in tool_results[4].error and "already running" in tool_results[4].error
+        assert all(name in tool_results[5].error for name in names[:4])
+        assert all(event.is_set() for event in exited.values())
+        rows = tool_results[-1].payload["subagents"]
+        assert len(rows) == 4 and all(row["state"] == "closed" for row in rows)
+        assert all(r.payload["state"] == "closed" for r in tool_results[6:10])
+        assert not any(getattr(event, "kind", None) == "finished" for event in notices)
+        assert not any(m.text.startswith("[subagent ") for m in run.leader_messages if m.role is Role.USER)
+
+
+@check("turns.messages_reach_running_subagents_and_finished_agents_refuse_them")
+def messages_reach_running_subagents_and_finished_agents_refuse_them():
+    release = threading.Event()
+    def respond(request, count, cancel):
+        if count == 1:
+            return answer("", call("fixture_action"))
+        assert any(m.text.startswith("[message from the leader]\nNew input") for m in request.messages)
+        return answer("Received input")
+    with workspace() as ws:
+        provider = Script([
+            answer("", call("dispatch_subagent", subagent_name="first", task="Read", background=True)),
+            answer("", call("message_subagent", name="first", text="New input"), call("fixture_action"),
+                   call("wait_subagents", names=["first"], timeout_seconds=5)),
+            answer("", call("message_subagent", name="first", text="Too late")), answer(),
+        ])
+        run = background_leader(ws, provider, BackgroundScript(respond),
+            leader_tools={"fixture_action": Action(lambda _: release.set())},
+            extra_tools={"fixture_action": Action(lambda cancel: await_background_gate(release, cancel))}).run("Send input")
+        sent = [r for r in results(run) if r.payload and r.payload.get("sent")]
+        assert len(sent) == 1
+        refusal = results(run)[-1]
+        assert not refusal.ok and "first" in refusal.error and "finished" in refusal.error
+
+
+@check("turns.subagent_questions_wake_waits_and_progress_is_listed")
+def subagent_questions_wake_waits_and_progress_is_listed():
+    release_question, release_answer = threading.Event(), threading.Event()
+    def respond(request, count, cancel):
+        if count == 1:
+            return answer("", call("fixture_action"),
+                          call("message_leader", text="Reading the files", kind="progress"),
+                          call("message_leader", text="Which file?", kind="question"))
+        if count == 2:
+            return answer("", call("fixture_action"))
+        assert any(m.text.startswith("[message from the leader]\nUse existing.txt") for m in request.messages)
+        return answer()
+    child_actions = iter((release_question, release_answer))
+    with workspace() as ws:
+        provider = Script([
+            answer("", call("dispatch_subagent", subagent_name="first", task="Read", background=True)),
+            answer("", call("fixture_action"), call("wait_subagents", names=["first"], timeout_seconds=5),
+                   call("list_subagents"), call("message_subagent", name="first", text="Use existing.txt"),
+                   call("fixture_action")),
+            answer(), answer(),
+        ])
+        leader_actions = iter((release_question, release_answer))
+        notices = []
+        run = background_leader(ws, provider, BackgroundScript(respond), events=notices.append,
+            leader_tools={"fixture_action": Action(lambda _: next(leader_actions).set())},
+            extra_tools={"fixture_action": Action(lambda cancel: await_background_gate(next(child_actions), cancel))}).run("Ask a question")
+        waits = [r.payload for r in results(run) if r.payload and "questions" in r.payload]
+        assert waits and waits[0]["questions"] == [{"name": "first", "text": "Which file?"}]
+        assert waits[0]["running"] == ["first"]
+        listed = next(r.payload["subagents"] for r in results(run) if r.payload and "subagents" in r.payload)
+        assert listed[0]["progress"] == "Reading the files"
+        assert any(m.text.startswith("[subagent first progress]") for m in provider.requests[-1].messages)
+        assert any(m.text.startswith("[subagent first asks]") for m in provider.requests[-1].messages)
+        assert {getattr(event, "kind", None) for event in notices} >= {"progress", "question", "message"}

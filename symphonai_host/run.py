@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import logging
 import os
 import re
@@ -35,7 +36,7 @@ from symphonai_api.instructions import load_instructions
 from symphonai_api.lsp import LspManager
 from symphonai_api.leader import (
     AgentControlError, Leader, LeaderConfig, LeaderRunResult,
-    builtin_subagent_specs,
+    builtin_subagent_specs, SUBAGENT_NOTICE_PATTERN, SUBAGENT_FINISHED_PREFIX,
 )
 from symphonai_api.leases import WorkspaceLeases
 from symphonai_api.model_table import context_window_for_model
@@ -595,6 +596,23 @@ class HostRun:
                 "model": self._model if self._model is not None else self._provider.model,
                 "effort": self._effort,
             }
+
+    def draft_agent(self, description: str) -> str:
+        """Make one tool-free call using the currently selected model."""
+        from symphonai_api.models import ModelRequest
+        from symphonai_api.roles import agent_drafting_prompt
+
+        with self._lock:
+            provider = self._provider
+            model = self._model
+            effort = self._effort
+            tools = sorted(self.available_tool_names())
+        if provider is None:
+            raise ProviderSelectionError("no provider selected")
+        return provider.create_response(ModelRequest(
+            messages=[Message(Role.USER, agent_drafting_prompt(description, tools))],
+            model=model, effort=effort,
+        )).message.text
 
     def permitted_modes(self) -> tuple[str, ...]:
         ceiling = None if self._extensions is None else getattr(self._extensions, "ceiling", None)
@@ -1929,6 +1947,19 @@ class HostRun:
         elif session_id is not None and isinstance(event_run_id, str):
             self._publish(event_run_id, event, session_id=session_id)
 
+    @staticmethod
+    def _waited_subagent_notices(message: Message, wait_ids: set[str], session_id: str):
+        """Replay collected results without delivering them to the model again."""
+        result = message.tool_result
+        if result is None or result.tool_call_id not in wait_ids or not isinstance(result.payload, dict):
+            return
+        for name, finished in result.payload.get("finished", {}).items():
+            yield HistoryMessage(
+                role="user", notice=True,
+                text=SUBAGENT_FINISHED_PREFIX.format(name=name) + "\n" + json.dumps(finished),
+                tool_calls=[], turn_id=message.turn_id, session_id=session_id,
+            )
+
     def open_session(self, run_id: str) -> dict:
         """Load and replay a finished transcript without ever rewriting it."""
         with self._lock:
@@ -1994,11 +2025,14 @@ class HostRun:
                     self._plans_by_session[run_id] = saved_plan
                 if self._goal is not None:
                     self._goals_by_session[run_id] = self._goal
+                wait_ids = {call.id for saved in loaded.messages for call in saved.tool_calls
+                            if call.name == "wait_subagents"}
                 for message, record_id in zip(loaded.messages, loaded.record_ids):
                     checkpoint_key = checkpoint_keys.get(record_id)
                     self._broker.publish(ForkableHistoryMessage(
                         role=message.role.value,
                         text=message.text,
+                        notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
                         reasoning=message.reasoning,
                         tool_calls=self._replay_tool_calls(message, tool_results),
                         turn_id=message.turn_id, record_id=record_id,
@@ -2017,6 +2051,8 @@ class HostRun:
                         session_id=run_id,
                         **replay_turns.get(record_id, {}),
                     ))
+                    for notice in self._waited_subagent_notices(message, wait_ids, run_id):
+                        self._broker.publish(notice)
                 self._close_idle_conversations_locked()
                 return {
                     "run_id": loaded.run_id, "state": diagnosis.state.value,
@@ -2099,11 +2135,14 @@ class HostRun:
             self._close_idle_conversations_locked()
         if reopened_goal:
             self._goal_event("pause", goal, agent_id=goal_agent_id)
+        wait_ids = {call.id for saved in loaded.messages for call in saved.tool_calls
+                    if call.name == "wait_subagents"}
         for message, record_id in zip(loaded.messages, loaded.record_ids):
             checkpoint_key = checkpoint_keys.get(record_id)
             self._broker.publish(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
+                notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
                 reasoning=message.reasoning,
                 tool_calls=self._replay_tool_calls(message, tool_results),
                 turn_id=message.turn_id,
@@ -2123,6 +2162,8 @@ class HostRun:
                 session_id=run_id,
                 **replay_turns.get(record_id, {}),
             ))
+            for notice in self._waited_subagent_notices(message, wait_ids, run_id):
+                self._broker.publish(notice)
         return {
             "run_id": loaded.run_id,
             "state": diagnosis.state.value,
@@ -2146,11 +2187,14 @@ class HostRun:
             tool_results = self._replay_tool_results(loaded.messages)
             replay_turns = self._turn_replay_data(records)
             messages = []
+            wait_ids = {call.id for saved in loaded.messages for call in saved.tool_calls
+                        if call.name == "wait_subagents"}
             for message, record_id in zip(loaded.messages, loaded.record_ids):
                 turn = replay_turns.get(record_id, {})
                 messages.append(HistoryMessage(
                     role=message.role.value,
                     text=message.text,
+                    notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
                     reasoning=message.reasoning,
                     tool_calls=self._replay_tool_calls(message, tool_results),
                     turn_id=message.turn_id,
@@ -2168,6 +2212,8 @@ class HostRun:
                     turn_ended_at=turn.get("turn_ended_at"),
                     turn_outcome=turn.get("turn_outcome"),
                 ).payload())
+                messages.extend(notice.payload() for notice in
+                                self._waited_subagent_notices(message, wait_ids, session_id))
             return {
                 "session_id": session_id,
                 "agent_id": agent_id,

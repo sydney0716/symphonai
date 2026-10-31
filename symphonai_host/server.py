@@ -1492,6 +1492,43 @@ class HostServer:
                     goal = host.run.goal_state(payload['action'])
                 return _Reply(HTTPStatus.OK, {'goal': goal})
 
+            def _post_agent_draft(self, payload):
+                description = payload['description']
+                if not description.strip() or len(description) > 2000:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'description must be non-blank and at most 2000 characters'})
+                try:
+                    text = host.run.draft_agent(description)
+                except ProviderSelectionError:
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'no provider selected'})
+                except Exception:
+                    return _Reply(HTTPStatus.BAD_GATEWAY, {'error': 'agent draft model request failed'})
+                try:
+                    draft = json.loads(text)
+                except (ValueError, TypeError):
+                    return _Reply(HTTPStatus.BAD_GATEWAY, {'error': 'agent draft must be a JSON object'})
+                if (not isinstance(draft, dict)
+                    or not isinstance(draft.get('name'), str)
+                    or not isinstance(draft.get('prompt'), str) or not draft['prompt'].strip()
+                    or any(not isinstance(draft.get(key), list)
+                           or any(not isinstance(value, str) for value in draft[key])
+                           for key in ('tools', 'deny_tools'))
+                    or any(key in draft and not isinstance(draft[key], str)
+                           for key in ('provider', 'model', 'effort'))):
+                    return _Reply(HTTPStatus.BAD_GATEWAY, {'error': 'agent draft has invalid fields'})
+                try:
+                    name, _, _ = self._definition_target(draft['name'], 'project')
+                except _ReplyReady:
+                    return _Reply(HTTPStatus.BAD_GATEWAY, {'error': 'agent draft has an invalid name'})
+                available = host.run.available_tool_names()
+                checked = {key: draft[key] for key in ('prompt', 'provider', 'model', 'effort') if key in draft}
+                checked['name'] = name
+                dropped = []
+                for key in ('tools', 'deny_tools'):
+                    checked[key] = list(dict.fromkeys(value for value in draft[key] if value in available))
+                    dropped.extend(value for value in draft[key] if value not in available)
+                checked['dropped'] = list(dict.fromkeys(dropped))
+                return _Reply(HTTPStatus.OK, checked)
+
             def _post_agent(self, payload):
                 stem, scope, target = self._definition_target(payload['name'], payload['scope'])
                 if target is None:
@@ -1916,6 +1953,13 @@ class HostServer:
                 match='exact',
                 payload=_Payload({'action': str}, ('action',), extra=False),
                 errors=(((ProtocolError, 'bad_request'),), ((KeyError, 'no_goal'), (RunActiveError, 'conflict'))),
+            ),
+            _Route('POST', '/agent/draft', Handler._post_agent_draft,
+                match='exact',
+                payload=_Payload({'description': str}, ('description',), extra=False),
+                helper_errors={
+                    'definition_target': (((OSError, RuntimeError), 'empty_forbidden'),),
+                },
             ),
             _Route('POST', '/agent', Handler._post_agent,
                 match='exact',

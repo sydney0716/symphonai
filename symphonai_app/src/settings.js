@@ -837,7 +837,7 @@ function renderAgents(section, context) {
 
   function renderEditor(values, identity = null, original = "", message = "") {
     const form = element(document, "form", { className: "agent-form" });
-    const name = field(document, "input", "agent-name", identity?.name ?? "");
+    const name = field(document, "input", "agent-name", identity?.name ?? values.name ?? "");
     const scope = field(document, "select", "agent-scope", identity?.scope ?? "project");
     replace(scope, ...["project", "user"].map((value) => {
       const option = element(document, "option", { text: value });
@@ -912,12 +912,42 @@ function renderAgents(section, context) {
     return null;
   }
 
+  const description = element(document, "textarea", { className: "agent-description" });
+  description.maxLength = 2000;
+  description.name = "description";
+  const descriptionLabel = element(document, "label", { text: "Describe an agent" });
+  append(descriptionLabel, description);
+  const draftStatus = element(document, "p", { className: "agent-status" });
+  draftStatus.setAttribute("role", "status");
+  const draftButton = makeButton(document, "Draft", async () => {
+    if (draftButton.disabled) return;
+    draftButton.disabled = true;
+    draftButton.textContent = "Drafting…";
+    draftStatus.textContent = "";
+    try {
+      const latest = await boundary.settings();
+      const selection = latest?.settings?.selection;
+      draftButton.textContent = `Drafting with ${selection?.model || selection?.provider || "selected model"}…`;
+      const draft = await boundary.draftAgent(description.value);
+      renderEditor({
+        ...emptyAgentFields(), ...draft, denyTools: draft.deny_tools ?? [],
+      }, null, "", `Draft · not saved${draft.dropped?.length ? ` · Dropped tools: ${draft.dropped.join(", ")}` : ""}`);
+    } catch (error) {
+      draftStatus.textContent = errorText(error);
+    } finally {
+      draftButton.disabled = false;
+      draftButton.textContent = "Draft";
+    }
+  });
+  const draftControls = element(document, "div");
+  append(draftControls, descriptionLabel, draftButton, draftStatus);
   listen(newAgent, "click", () => renderEditor(parseAgentText(""), null, ""));
   renderAgentRows();
   replace(
     settingsContent,
     element(document, "h2", { text: "Agents" }),
     newAgent,
+    draftControls,
     tableRoot,
     editorRoot,
   );

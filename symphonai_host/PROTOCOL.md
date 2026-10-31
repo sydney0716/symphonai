@@ -48,6 +48,7 @@ fields on a known event are ignored for forward compatibility.
 | `SessionEnded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_run_id: str` |
 | `SubagentSpawned` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
+| `SubagentNotice` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str`, `kind: "finished" | "progress" | "question" | "message"`, `text: str` (finished: the delivered blocking result as JSON; otherwise the message text) |
 | `CompactionApplied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `before_tokens: int`, `after_tokens: int`, `dropped_messages: int` |
 | `GoalChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `change: str` (`set`, `check`, `pause`, `resume`, `clear`, `update`, or `round`), `phase: str`, `rounds: int`, `max_rounds: int`, `reason: str`, `last_check: dict | null`, `session_id: str` |
 | `PlanChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `steps: list`, `explanation: str`, `session_id: str` |
@@ -724,3 +725,14 @@ the repository selected by `--repo-root`. If that sibling `symphonai_app/`
 directory is absent, `/app/` returns `404` with
 `{"error": "app is not installed"}` and never falls back to a directory in the
 user's repository.
+
+### POST /agent/draft
+
+Takes `{"description": "…"}`: a non-blank string of at most 2,000 characters.
+Makes one tool-free model request using the current provider, model and effort.
+Returns 200 with `name`, `prompt`, `tools`, `deny_tools`, optional `provider`,
+`model`, `effort`, and `dropped` (unknown tool names removed from either list).
+Other model fields are omitted. Name rules match saved agent definitions.
+The draft is unsaved; POST /agent remains the save operation.
+Invalid descriptions return 400, no selected provider returns 409, and invalid
+model replies or provider failures return 502 with a short, credential-free reason.

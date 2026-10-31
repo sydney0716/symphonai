@@ -657,6 +657,43 @@ function renderQuestion(document, entry) {
   });
 }
 
+function renderSubagentNotice(document, entry, _parseMarkdown, actions) {
+  let fullText = entry.text;
+  if (entry.kind === "finished") {
+    try {
+      const result = JSON.parse(fullText);
+      fullText = [result.content, result.error].filter(Boolean).join("\n");
+    } catch { /* A peer may send the result as plain text. */ }
+  }
+  const preview = String(fullText).split("\n")[0].slice(0, 160);
+  const label = entry.kind === "finished" ? `${entry.name} finished`
+    : entry.kind === "progress" ? `${entry.name}: ${preview}`
+      : entry.kind === "question" ? `${entry.name} asks: ${preview}`
+        : entry.name ? `To ${entry.name}: ${preview}` : `From the leader: ${preview}`;
+  const notice = element(document, "div", { className: "activity subagent-notice" });
+  notice.tabIndex = 0;
+  notice.setAttribute("role", "button");
+  notice.setAttribute("aria-label", label);
+  notice.setAttribute("aria-expanded", String(entry.expanded === true));
+  const expand = () => {
+    entry.expanded = entry.expanded !== true;
+    actions?.rerender?.();
+  };
+  notice.addEventListener("click", expand);
+  notice.addEventListener("keydown", (event) => {
+    if (!["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    expand();
+  });
+  append(notice, element(document, "span", { className: "activity-text", text: label }));
+  if (entry.expanded) {
+    const output = element(document, "section", { className: "activity-output" });
+    append(output, element(document, "pre", { text: fullText }));
+    append(notice, output);
+  }
+  return notice;
+}
+
 function renderCompaction(document, entry) {
   return element(document, "p", {
     className: "compaction",
@@ -680,6 +717,7 @@ function renderUnknown(document, entry) {
 
 const TRANSCRIPT_RENDERERS = Object.freeze({
   prompt: renderPrompt,
+  "subagent-notice": renderSubagentNotice,
   steer: renderSteer,
   text: renderText,
   thought: renderThought,

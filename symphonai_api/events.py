@@ -143,6 +143,14 @@ class SubagentStopped(Event):
 
 
 @dataclass(frozen=True)
+class SubagentNotice(Event):
+    subagent_name: str = ""
+    subagent_agent_id: str = ""
+    kind: str = ""
+    text: str = ""
+
+
+@dataclass(frozen=True)
 class JobChanged(Event):
     job_id: str = ""
     status: str = ""

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, get_args, get_origin, get_type_hints
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import RunFailed, RunFinished
 from symphonai_api.models import Role
-from symphonai_api.roles import loop_planner_prompt, spec_reviewer_prompt
+from symphonai_api.roles import failure_reviewer_prompt, loop_planner_prompt, spec_reviewer_prompt
 from symphonai_api.session import SessionError, SessionStore, TranscriptError, load_run
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.shell import shell_environment, shell_executable
@@ -287,7 +287,7 @@ class LoopController:
             return run_id, run_id
 
 
-    def start_spec_review(self, session_id: str) -> tuple[str, str]:
+    def start_spec_review(self, session_id: str, *, failure: str | None = None) -> tuple[str, str]:
         from symphonai_host.run import RunActiveError
 
         from symphonai_host.spec_run import patch_digest
@@ -332,6 +332,11 @@ class LoopController:
             report = report_path.read_text(encoding="utf-8") if report_path.is_file() else "No report was written."
             patch = diff.patch[:MAX_READ_BYTES]
             prompt = spec_reviewer_prompt(spec["text"], report, patch, Path(info["spec"]).parent)
+            if failure is not None:
+                prompt = failure_reviewer_prompt(
+                    spec["text"], report, (source_meta.get("goal") or {}).get("last_check"),
+                    failure, patch, Path(info["spec"]).parent,
+                )
             policy = replace(self.host._base_policy, repo_root=worktree)
             review_scope = worktree / Path(info["spec"]).parent
             policy.allowed_write_scope = [review_scope]
@@ -341,6 +346,7 @@ class LoopController:
                 "of": session_id, "worktree_path": str(worktree),
                 "baseline": patch_digest(diff.patch), "baseline_files": baseline_files,
                 "role": "reviewer",
+                **({"failure": failure} if failure is not None else {}),
                 **({"loop_id": info["loop_id"], "card_id": info.get("card_id")}
                    if info.get("loop_id") else {}),
             }
@@ -805,24 +811,32 @@ class LoopController:
                         source.close()
                     if isinstance(review, dict) and review.get("session_id"):
                         continue
-                    self.start_spec_review(card.session_id)
+                    self.start_spec_review(card.session_id, failure=card.to_payload().get("failure"))
                     active_count += 1
                 except RunActiveError:
                     break
                 except Exception as exc:
                     self._loop_attention(loop, f"card {card.id} review could not start: {exc}", card)
                     return
+            def dependency_done(dep_id, current):
+                dependency = next((item for item in cards if item.id == dep_id), None)
+                if dependency is None or dependency.state not in ("done", "failed"):
+                    return False
+                replacements = [item for item in cards if item.follow_up_of and dep_id in item.after]
+                if dependency.state == "failed" and not replacements:
+                    return False
+                return all((current is not None and item.id == current.id)
+                           or dependency_done(item.id, current) for item in replacements)
+
             for lane_id in lane_order:
                 if active_count >= MAX_ACTIVE_CONVERSATIONS:
                     break
                 lane_cards = [card for card in cards if card.lane == lane_id]
                 if any(card.state in ("running", "review") for card in lane_cards):
                     continue
-                card = next((item for item in lane_cards if item.get("state") == "planned"), None)
-                if card is None or any(
-                    next((dep.state for dep in cards if dep.id == dep_id), None) != "done"
-                    for dep_id in card.after
-                ):
+                card = next((item for item in lane_cards if item.state == "planned"
+                             and all(dependency_done(dep_id, item) for dep_id in item.after)), None)
+                if card is None:
                     continue
                 spec_value = card.spec
                 try:
@@ -855,7 +869,7 @@ class LoopController:
                 self._loop_card_changed(loop, card)
                 active_count += 1
             non_dropped = [card for card in cards if card.state != "dropped"]
-            if non_dropped and all(card.state == "done" for card in non_dropped):
+            if non_dropped and all(dependency_done(card.id, None) for card in non_dropped):
                 store.set_state(loop, "validating")
                 self._loop_changed(loop, "state")
                 self._start_loop_validation(loop_id)
@@ -881,12 +895,16 @@ class LoopController:
                     return
                 card = next(item for item in loop.cards if item.get("id") == card_id)
                 if state == "finished":
+                    card.pop("failure", None)
                     card.state = "review"
                     self._loop_card_changed(loop, card)
                     self._advance_loop(loop_id)
                     return
                 cause = error or goal_reason or state
-                self._loop_attention(loop, f"card {card_id} could not finish: {cause}", card)
+                card["failure"] = f"card {card_id} could not finish: {cause}"
+                card.state = "review"
+                self._loop_card_changed(loop, card)
+                self._advance_loop(loop_id)
         except (OSError, KeyError, ValueError, SessionError) as exc:
             if isinstance(info, dict) and info.get("loop_id"):
                 with self.host._lock:
@@ -902,6 +920,8 @@ class LoopController:
             store = self.store
             loop = store.load_record(loop_id)
             if loop.state == "cancelled":
+                return
+            if review_info.get("failure") is not None and loop.state == "needs_attention":
                 return
             card = next(item for item in loop.cards if item.get("id") == card_id)
             source = SessionStore.open(self.host._sessions_root, review_info["of"])
@@ -922,27 +942,43 @@ class LoopController:
                     reason = f"card {card_id} review did not pass"
                 self._loop_attention(loop, reason, card)
                 return
-            try:
-                card_worktree = self.host._sessions_root / review_info["of"] / "worktree"
-                commit = self.integrate(loop, card, card_worktree)
-            except (OSError, RuntimeError) as exc:
-                self._loop_attention(loop, str(exc), card)
+            failure = review_info.get("failure")
+            if failure is not None and verdict != "follow-ups":
+                self._loop_attention(loop, f"card {card_id} failure review passed a failed card", card)
                 return
+            card_worktree = self.host._sessions_root / review_info["of"] / "worktree"
+            commit = ""
+            if failure is None:
+                try:
+                    commit = self.integrate(loop, card, card_worktree)
+                except (OSError, RuntimeError) as exc:
+                    card["failure"] = str(exc)
+                    self._loop_card_changed(loop, card)
+                    try:
+                        self.start_spec_review(review_info["of"], failure=str(exc))
+                    except Exception as review_error:
+                        self._loop_attention(loop, f"card {card_id} failure review could not start: {review_error}", card)
+                    self._advance_loop(loop_id)
+                    return
             if card_worktree.exists():
                 remove_worktree(self.host._repo_root, card_worktree)
             if commit:
                 card.commit = commit
-            card.state = "done"
+            card.state = "failed" if failure is not None else "done"
             self._loop_card_changed(loop, card)
             if verdict == "follow-ups":
                 original_id = card.follow_up_of or card_id
                 rounds = int(card.rounds) + 1
                 if rounds > 2:
-                    self._loop_attention(
-                        loop, f"card {original_id} still has findings after 2 follow-up rounds",
+                    reason = (
+                        f"card {original_id} still fails after 2 follow-up rounds"
+                        if failure is not None else
+                        f"card {original_id} still has findings after 2 follow-up rounds"
                     )
+                    self._loop_attention(loop, reason)
                     return
                 follow_ups = result.get("follow_ups", [])
+                added = False
                 for follow_path in follow_ups:
                     relative = Path(follow_path)
                     prefix = f".symphonai/loops/{loop_id}/"
@@ -964,7 +1000,11 @@ class LoopController:
                     })
                     loop.cards.append(follow)
                     self._loop_card_changed(loop, follow)
+                    added = True
                     break
+                if failure is not None and not added:
+                    self._loop_attention(loop, f"card {card_id} failure review supplied no usable follow-up")
+                    return
             self._advance_loop(loop_id)
 
 
@@ -1134,7 +1174,9 @@ class LoopController:
             if runner_pid is not None or runner_lock:
                 store.save(loop)
             for card in loop.cards:
-                if card.state != "failed":
+                if card.state != "failed" or any(
+                    item.follow_up_of and card.id in item.after for item in loop.cards
+                ):
                     continue
                 session_id = card.session_id
                 if isinstance(session_id, str):
@@ -1353,7 +1395,36 @@ class LoopController:
             else:
                 reason = self._loop_plan_problem(store, loop_id, plan)
                 if not reason:
-                    cards = plan["cards"]
+                    templates = plan["cards"]
+                    expanded_ids = {
+                        card["id"]: ([f"{card['id']}{index}" for index in range(1, len(card["items"]) + 1)]
+                                     if "items" in card else [card["id"]])
+                        for card in templates
+                    }
+                    cards = []
+                    next_lane = 4
+                    for template in templates:
+                        after = [value for parent in template["after"] for value in expanded_ids[parent]]
+                        if "items" not in template:
+                            cards.append({**template, "after": after})
+                            continue
+                        path = store.path(loop_id, template["spec"])
+                        text = path.read_text(encoding="utf-8")
+                        for index, item in enumerate(template["items"], 1):
+                            expanded_path = path.with_name(f"{path.stem}-{index}{path.suffix}")
+                            try:
+                                expanded_path.write_text(text.replace("{item}", item), encoding="utf-8")
+                            except OSError as exc:
+                                store.set_state(loop, "needs_attention", f"item spec could not be written: {exc}")
+                                self._loop_changed(loop, "state")
+                                return
+                            cards.append({
+                                **template, "id": f"{template['id']}{index}",
+                                "title": f"{template['title']}: {item}",
+                                "spec": expanded_path.relative_to(store.path(loop_id, ".")).as_posix(),
+                                "lane": next_lane, "after": after,
+                            })
+                            next_lane += 1
                     loop.cards = [
                         Card.from_payload({
                             "id": card["id"],
@@ -1401,6 +1472,12 @@ class LoopController:
             if card_id in ids:
                 return f"duplicate card id: {card_id}"
             ids.append(card_id)
+            if "items" in card:
+                items = card["items"]
+                if (not isinstance(items, list) or not 1 <= len(items) <= 50
+                    or any(not isinstance(item, str) or not item.strip() or len(item) > 200 for item in items)
+                    or len(set(items)) != len(items)):
+                    return f"card {card_id} items must contain 1 to 50 distinct non-blank strings of at most 200 characters"
             if not isinstance(card.get("title"), str) or not card["title"].strip():
                 return f"card {card_id} has no title"
             if not isinstance(card.get("spec"), str):
@@ -1427,6 +1504,15 @@ class LoopController:
             from symphonai_api.spec_text import spec_validation
             if not spec_validation(path.read_text(encoding="utf-8")):
                 return f"card {card_id} has no Validation commands"
+        template_paths = {store.path(loop_id, card["spec"]) for card in cards}
+        generated_paths = set()
+        for card in cards:
+            path = store.path(loop_id, card["spec"])
+            for index in range(1, len(card.get("items", [])) + 1):
+                expanded_path = path.with_name(f"{path.stem}-{index}{path.suffix}")
+                if expanded_path in template_paths or expanded_path in generated_paths or expanded_path.is_symlink():
+                    return f"card {card['id']} expanded spec path already exists"
+                generated_paths.add(expanded_path)
         visiting: set[str] = set()
         visited: set[str] = set()
 
@@ -1598,6 +1684,8 @@ class LoopController:
             current = worktree_diff(worktree)
             answer = next((message.text for message in reversed(leader._chat_messages) if message.role == Role.ASSISTANT and message.text.strip()), "")
             verdict, follow_ups = review_verdict(answer)
+            if not isinstance(terminal_event, RunFinished) or terminal_event.stopped_reason != "final_response":
+                verdict, follow_ups = "no-verdict", []
             baseline_files = review_info.get("baseline_files", {})
             unchanged = isinstance(baseline_files, dict) and all(
                 (

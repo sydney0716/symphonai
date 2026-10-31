@@ -1,3 +1,25 @@
+// History is marked by the host using the runtime's prefix definitions.
+export function subagentNotice(fields) {
+  if (fields.type === "SubagentNotice") {
+    return { type: "subagent-notice", name: fields.subagent_name,
+      kind: fields.kind, text: fields.text ?? "" };
+  }
+  if (fields.notice !== true || fields.role !== "user") return null;
+  const text = fields.text ?? "";
+  const child = /^\[subagent (.+) (finished|progress|asks)\](?:\n|$)/.exec(text);
+  if (child) return { type: "subagent-notice", name: child[1],
+    kind: child[2] === "asks" ? "question" : child[2], text: text.slice(child[0].length) };
+  const leader = /^\[message from the leader\](?:\n|$)/.exec(text);
+  if (leader) {
+    const body = text.slice(leader[0].length);
+    const recipient = /^To ([^\n]+?): /.exec(body);
+    return { type: "subagent-notice", name: recipient?.[1] ?? null,
+      kind: "message", text: recipient ? body.slice(recipient[0].length) : body };
+  }
+  // A marked message must never become a person's prompt, even from a newer peer.
+  return { type: "subagent-notice", name: null, kind: "message", text };
+}
+
 function eventFrame(type, fields) {
   return { type, fields };
 }
@@ -245,6 +267,11 @@ export function createTranscript({ now = () => Date.now() } = {}) {
 
   function applyEvent(event) {
     const { type, fields } = event;
+    const notice = subagentNotice({ type, ...fields });
+    if (notice !== null) {
+      model.push(notice);
+      return;
+    }
     if (type === "HistoryMessage") {
       if (!fields.text && !fields.reasoning && !fields.attachments?.length && !fields.tool_calls?.length && !fields.turn_ended_at) {
         return;

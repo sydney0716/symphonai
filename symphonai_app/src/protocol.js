@@ -23,6 +23,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "SessionEnded",
   "SubagentSpawned",
   "SubagentStopped",
+  "SubagentNotice",
   "CompactionApplied",
   "GoalChanged",
   "PlanChanged",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -37,7 +38,8 @@ class AgentRun:
     error: str | None = None
     token: CancellationToken | None = None
     _budget: RunBudget = field(init=False, repr=False, compare=False)
-    _redirects: list[str] = field(
+    wait_for_background: Callable[[Callable[[], bool]], None] | None = field(default=None, repr=False)
+    _redirects: list[str | Callable[[], str | None]] = field(
         default_factory=list,
         init=False,
         repr=False,
@@ -120,19 +122,30 @@ class AgentRun:
                 )
             self._redirects.append(text)
 
+    def redirect_deferred(self, delivery: Callable[[], str | None]) -> None:
+        """Queue a notice whose delivery can instead be claimed by a waiting tool."""
+        with self._control_lock:
+            if not self._redirects_closed:
+                self._redirects.append(delivery)
+
+    @staticmethod
+    def _resolve_redirects(redirects) -> tuple[str, ...]:
+        return tuple(text for item in redirects
+                     if (text := item() if callable(item) else item) is not None)
+
     def close_redirects(self) -> tuple[str, ...]:
         """Atomically refuse new redirects and return any the loop did not read."""
         with self._control_lock:
             self._redirects_closed = True
             redirects = tuple(self._redirects)
             self._redirects.clear()
-            return redirects
+        return self._resolve_redirects(redirects)
 
     def take_redirects(self) -> tuple[str, ...]:
         with self._control_lock:
             redirects = tuple(self._redirects)
             self._redirects.clear()
-            return redirects
+        return self._resolve_redirects(redirects)
 
     def has_redirects(self) -> bool:
         with self._control_lock:

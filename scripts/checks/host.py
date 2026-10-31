@@ -515,3 +515,109 @@ def app_core():
     result = subprocess.run([node, "--experimental-default-type=module", "--test", "symphonai_app/test/core.test.js"],
                             cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+class FailureFollowUpScript(LoopScript):
+    def __init__(self, root):
+        super().__init__(root)
+        self.parallel = None
+        self.failure_review = threading.Event()
+
+    def create_response(self, request, *, cancel=None):
+        task = next((m.text for m in request.messages if m.role is Role.USER), "")
+        if request.model == "core-reviewer" and task.startswith("Review this failed card"):
+            self.failure_review.set()
+            if any(m.tool_result for m in request.messages):
+                return reply(f"Verdict: follow-ups: {self.follow_path}")
+            loop = LoopStore(self.root).list()[0]
+            self.follow_path = f".symphonai/loops/{loop['id']}/specs/a-fix.md"
+            spec = ("## Goal\ncore-card-a failure-followup\n\n## Scope\na.txt\n\n"
+                    "## Contract\nCreate a.txt\n\n## Validation\n```sh\ntest -f a.txt\n```\n")
+            return reply("", tool("write_file", path=self.follow_path, content=spec))
+        if request.model == "core-implementer":
+            card = re.search(r"core-card-([abc])", task)[1]
+            if card == "a" and "failure-followup" not in task:
+                self.log.append(("failed-validation", "a"))
+                return reply("implementation stopped without creating the required file")
+            if card == "c" and not any(m.tool_result for m in request.messages):
+                self.log.append(("independent-started", "c"))
+                assert self.failure_review.wait(10), "independent card did not survive failure review"
+            if card == "a" and "failure-followup" in task:
+                self.log.append(("replacement", "a"))
+        return super().create_response(request, cancel=cancel)
+
+
+@check("host.failed_card_follow_up_unblocks_dependents")
+def failed_card_follow_up_unblocks_dependents():
+    with workspace() as ws, loop_host(ws) as (host, provider):
+        script = FailureFollowUpScript(ws.root)
+        provider.create_response = script.create_response
+        loop_id = start_and_approve(host)
+        loop = loop_state(host, loop_id, "awaiting_commit")
+        assert {card["id"]: card["state"] for card in loop["cards"]} == {
+            "a": "failed", "aF": "done", "b": "done", "c": "done",
+        }
+        assert {card["id"] for card in loop["cards"]} == {"a", "b", "c", "aF"}
+        assert ("independent-started", "c") in script.log
+        assert script.log.index(("replacement", "a")) < script.log.index(("implement", "b"))
+        assert loop.get("reason", "") == ""
+
+
+class ItemLoopScript(LoopScript):
+    def __init__(self, root):
+        super().__init__(root)
+        self.parallel = None
+        self.items_ready = threading.Event()
+        self.items_started = set()
+        self.items_reviewed = set()
+
+    def create_response(self, request, *, cancel=None):
+        task = next((m.text for m in request.messages if m.role is Role.USER), "")
+        if request.model == "core-planner":
+            if any(m.tool_result for m in request.messages):
+                return reply("plan ready")
+            loop = LoopStore(self.root).list()[0]
+            folder = LoopStore(self.root).path(loop["id"], ".")
+            template = "## Goal\ncore-item-{item}\n\n## Scope\n{item}.txt\n\n## Validation\n```sh\ntest -f {item}.txt\n```\n"
+            dependent = "## Goal\ncore-card-b\n\n## Scope\nb.txt\n\n## Validation\n```sh\ntest -f b.txt\n```\n"
+            cards = [
+                {"id": "a", "title": "Each target", "spec": "specs/a-items.md", "lane": 1, "after": [], "items": ["x", "y", "z"]},
+                {"id": "b", "title": "Dependent", "spec": "specs/b-dependent.md", "lane": 1, "after": ["a"]},
+            ]
+            return reply("", tool("write_file", path=str(folder / "specs/a-items.md"), content=template),
+                         tool("write_file", path=str(folder / "specs/b-dependent.md"), content=dependent),
+                         tool("write_file", path=str(folder / "plan.json"), content=json.dumps({"cards": cards})))
+        match = re.search(r"core-item-([xyz])", task)
+        if match:
+            item = match[1]
+            if request.model == "core-reviewer":
+                self.items_reviewed.add(item)
+                return reply("Verdict: pass")
+            if any(m.tool_result for m in request.messages):
+                return reply("implemented")
+            with self.lock:
+                self.items_started.add(item)
+                if len(self.items_started) == 3:
+                    self.items_ready.set()
+            assert self.items_ready.wait(10), "three item implementations were not concurrent"
+            return reply("", tool("write_file", path=f"{item}.txt", content=item))
+        if request.model == "core-implementer":
+            assert self.items_reviewed == {"x", "y", "z"}, "dependent started before all item reviews"
+        return super().create_response(request, cancel=cancel)
+
+
+@check("host.loop_expands_items_and_waits_for_all")
+def loop_expands_items_and_waits_for_all():
+    with workspace() as ws, loop_host(ws) as (host, provider):
+        script = ItemLoopScript(ws.root)
+        provider.create_response = script.create_response
+        loop_id = post(host, "/loop/start", {"goal": "Apply one change to three targets"})["loop"]["id"]
+        planned = loop_state(host, loop_id, "awaiting_plan")
+        assert {card["id"] for card in planned["cards"]} == {"a1", "a2", "a3", "b"}
+        assert len({card["lane"] for card in planned["cards"] if card["id"].startswith("a")}) == 3
+        dependent = next(card for card in planned["cards"] if card["id"] == "b")
+        assert dependent["after"] == ["a1", "a2", "a3"]
+        post(host, "/loop/plan", {"loop_id": loop_id, "action": "approve"})
+        finished = loop_state(host, loop_id, "awaiting_commit")
+        assert all(card["state"] == "done" for card in finished["cards"])
+        assert script.items_started == {"x", "y", "z"}

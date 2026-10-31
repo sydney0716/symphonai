@@ -72,7 +72,7 @@ IMPLEMENTER_PROMPT = """You are an implementer. You carry out one spec exactly.
 - The spec is the contract. Edit only files in its Scope, and never edit the spec you were given, wherever it lives.
 - Read the spec's Context and the code it names before you change anything.
 - Use the Validation commands while you work, when running them tells you something new. Do not re-run them only to report: the host runs them when you finish, the work does not pass until they succeed, and its result is the record.
-- If the spec is wrong, contradicts the code, or needs a file outside its Scope, stop and explain what you found instead of working around it.
+- If the spec is wrong, contradicts the code, or needs a file outside its Scope, stop and explain what you found instead of working around it. Write the failure report even when Validation cannot pass: what you tried, the failing output, and the likely cause.
 - If the task names a report file, write it with Summary, Changed Files, Validation (the last result you saw for each command; do not re-run a command to fill this in), Acceptance Criteria (one verdict per criterion, with its evidence), and Notes sections, and include git status --porcelain verbatim when the project is a git repository; otherwise put those sections in your final message. Report what happened, including what did not work, and claim nothing you did not run."""
 
 REVIEWER_PROMPT = """You are a reviewer. Your job is to find what is wrong with the change, not to confirm it.
@@ -112,6 +112,11 @@ def loop_planner_prompt(
         "\"spec\":\"specs/a-short-title.md\",\"lane\":1,\"after\":[]}]}}. "
         "A card whose work documents, tests, or builds on another card's change lists that card in `after`, "
         "whether or not they share a lane. A card starts from the work of the cards before it and sees nothing else. "
+        "For the same change applied to independent targets, put an items list on one template card: "
+        "1 to 50 distinct non-blank strings, each at most 200 characters. Use {item} in its spec "
+        "where the target belongs. The host substitutes each item and creates separately approved cards "
+        "in independent lanes. The template counts as one of the eight cards and keeps the normal id/lane rules. "
+        "A card after the template waits for every item and any replacement follow-up. "
         "Write plan.json last."
         + (
             " commands are unavailable in this environment; inspect files with the read tools."
@@ -133,6 +138,20 @@ def spec_reviewer_prompt(spec: str, report: str, patch: str, spec_folder: Path) 
     return prompt
 
 
+def failure_reviewer_prompt(spec: str, report: str, evidence: object, error: str, patch: str, spec_folder: Path) -> str:
+    return (
+        f"Review this failed card.\n\nSpec:\n{spec}\n\nReport:\n{report}\n\n"
+        f"Last Validation evidence:\n{json.dumps(evidence, ensure_ascii=False)}\n\n"
+        f"Error or merge conflict:\n{error}\n\nDiff:\n{patch}\n\n"
+        "Never pass a failed card. When the cause and fix are clear from this evidence and the spec, "
+        f"write one follow-up spec under {spec_folder}. Its Validation must contain a fenced sh block. "
+        "If the goal or spec is ambiguous, or a fix changes what the person asked for, call ask_user "
+        "and write the follow-up from their answer. Do not guess. If the question cannot be answered, stop. "
+        "The failed changes will be discarded: the follow-up starts from the loop branch, "
+        "so include all work still needed. End with Verdict: follow-ups: <path>."
+    )
+
+
 def review_command_prompt(base_ref: str | None = None, focus: str | None = None) -> str:
     subject = (
         f"Review the changes between {base_ref} and the working tree (git diff {base_ref})."
@@ -145,3 +164,15 @@ def review_command_prompt(base_ref: str | None = None, focus: str | None = None)
 
 
 REVIEW_PROMPT = review_command_prompt()
+
+
+def agent_drafting_prompt(description: str, tool_names: list[str]) -> str:
+    return (
+        "Draft an agent definition from the person's description. Return only one JSON object with "
+        "name (one filename segment), prompt, tools (a list), deny_tools (a list), and optionally "
+        "provider, model and effort (strings). Choose the fewest tools the description needs, "
+        "using only the available names. Write prompt as instructions addressed to that agent. "
+        "Do not save files or add other fields.\nAvailable tools:\n"
+        + json.dumps(tool_names, ensure_ascii=False)
+        + "\nDescription:\n" + description
+    )

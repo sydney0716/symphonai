@@ -981,7 +981,7 @@ class ApiAgent:
                 refused = handle_response(turn_ref)
                 if not response.has_tool_calls:
                     finish_turn(turn_ref)
-                    if not refused and run is not None and run.has_redirects():
+                    if not refused and run is not None:
                         run_limit = run.budget.max_turns
                         redirect_limit = (
                             run_limit if self._max_turns is None
@@ -989,7 +989,13 @@ class ApiAgent:
                             else min(self._max_turns, run_limit)
                         )
                         if redirect_limit is None or turn < redirect_limit:
-                            continue
+                            if run.wait_for_background is not None and exceeded_budget() is None:
+                                run.wait_for_background(lambda: exceeded_budget() is not None)
+                                budget_reason = exceeded_budget()
+                                if budget_reason is not None:
+                                    return finish_for_budget(budget_reason)
+                            if run.has_redirects():
+                                continue
                     append_redirects(close=True)
                     return finish_run(response, "refused" if refused else "final_response", turn)
                 run_tools(turn_ref)

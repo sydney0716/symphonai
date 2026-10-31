@@ -507,6 +507,10 @@ export function createClient({
       return request("GET", `/agent?${query}`);
     },
 
+    draftAgent(description) {
+      return request("POST", "/agent/draft", { description }, readReply, { detailOnError: true });
+    },
+
     saveAgent(name, scope, text) {
       return request(
         "POST",
