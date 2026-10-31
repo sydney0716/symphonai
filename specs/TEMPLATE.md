@@ -45,12 +45,9 @@ no snapshots of earlier output. Omit this section otherwise.>
 
 ## Validation
 
-- `python3 scripts/check.py --only <area>.` — the core areas the change
-  touches, each ending with a dot. Never the full suite: the reviewer runs it
-  once on the final tree.
-- `.venv/bin/python scripts/smoke_host.py` — only when the host changed.
 - `git status --porcelain` and `git diff --check` — always. Paste the first
-  verbatim.
+  verbatim. Codex runs no checks; the reviewer runs the suite and the smoke
+  test after the change lands.
 
 ## Report
 
