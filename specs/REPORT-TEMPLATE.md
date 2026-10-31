@@ -20,15 +20,12 @@ belongs in `Risks & Notes` as well.>
 
 ## Validation
 
-- `<command>`: <its real result — counts, pass/fail, the actual output line>
-
-<Every command the spec's `Validation` listed, each with what it really
-returned. A command whose result is not written down did not happen. Say which
-commands you did not run and why. When a command needs an environment — a
-temporary `SYMPHONAI_SESSIONS_DIR`, local socket access — name it.>
-
 - `git status --porcelain`: <verbatim, in a fenced block>
 - `git diff --check`: <result>
+
+<Run no checks or smoke test; the reviewer runs them after the change lands. If
+you tried something in a scratch run to show a criterion is met, say what you
+ran and what it returned.>
 
 ## Acceptance Criteria
 
