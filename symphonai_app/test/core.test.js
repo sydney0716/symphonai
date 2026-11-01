@@ -172,6 +172,95 @@ async function submit(document, text) {
   await document.getElementById("prompt-form").dispatch("submit");
 }
 
+test("Terminal reattaches after two reloads, restores output and closes its shell", async () => {
+  const global = browser();
+  const script = scriptedClient();
+  let starts = 0;
+  let shell = null;
+  const inputs = [], stopped = [];
+  Object.assign(script.client, {
+    terminals: async () => ({ terminals: shell ? [shell] : [] }),
+    terminalStart: async () => {
+      starts++;
+      shell = { id: "shell", exited: false, output: "" };
+      return { id: shell.id };
+    },
+    terminalInput: async (id, data) => { inputs.push([id, data]); },
+    terminalResize: async () => ({}),
+    terminalStop: async (id) => { stopped.push(id); shell = null; },
+  });
+  let document = new Document();
+  await start({ global, document, client: script.client });
+  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Open a tool").click();
+  await find(document.getElementById("rail-tools"), (node) => node.textContent === "Terminal").click();
+  shell.output = "earlier output\r\n";
+  await script.emit("TerminalOutput", { terminal_id: shell.id, data: shell.output, exited: false });
+  for (let reload = 0; reload < 2; reload++) {
+    document = new Document();
+    await start({ global, document, client: script.client });
+    await new Promise((resolve) => setImmediate(resolve));
+    const screen = find(document.body, (node) => node.className === "terminal-screen");
+    assert.equal(screen.textContent, "earlier output\n");
+    await screen.dispatch("keydown", { key: "x" });
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(starts, 1);
+  assert.deepEqual(inputs, [["shell", "x"], ["shell", "x"]]);
+  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Close Terminal").click();
+  assert.deepEqual(stopped, ["shell"]);
+});
+
+test("Terminal wraps at measured columns and erases physical rows during shell redraws", async () => {
+  const document = new Document();
+  const createElement = document.createElement.bind(document);
+  document.createElement = (tag) => {
+    const node = createElement(tag);
+    if (tag === "pre") node.clientWidth = 326;
+    if (tag === "span") node.getBoundingClientRect = () => ({ width: node.textContent.length * 10, height: 20 });
+    return node;
+  };
+  const global = browser();
+  const resize = [];
+  global.addEventListener = (type, callback) => { if (type === "resize") resize.push(callback); };
+  global.getComputedStyle = () => ({ paddingLeft: "8px", paddingRight: "8px", paddingTop: "8px", paddingBottom: "8px" });
+  const script = scriptedClient();
+  const sizes = [];
+  Object.assign(script.client, {
+    terminals: async () => ({ terminals: [] }),
+    terminalStart: async () => ({ id: "grid" }),
+    terminalResize: async (id, cols, rows) => { sizes.push({ id, cols, rows }); },
+  });
+  await start({ global, document, client: script.client });
+  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Open a tool").click();
+  await find(document.getElementById("rail-tools"), (node) => node.textContent === "Terminal").click();
+  const screen = find(document.body, (node) => node.className === "terminal-screen");
+  const output = (data) => script.emit("TerminalOutput", { terminal_id: "grid", data, exited: false });
+  assert.equal(sizes.at(-1).cols, 31);
+  assert.equal(screen.getAttribute("data-columns"), "31");
+  assert.match(screen.getAttribute("style"), /white-space: pre;/);
+  const command = `echo ${"x".repeat(65)}`;
+  await output(command.slice(0, 31));
+  assert.equal(screen.textContent, command.slice(0, 31), "wrapping waits for the next printable character");
+  await output(command.slice(31) + "\r\n" + "x".repeat(65) + "\r\n$ ");
+  assert.equal(screen.textContent, [command.slice(0, 31), command.slice(31, 62), command.slice(62),
+    "x".repeat(31), "x".repeat(31), "xxx", "$ "].join("\n"));
+  // A shell redraw clears the bottom row, moves up, and clears the old rows.
+  await output("y".repeat(70));
+  await output("\r\x1b[K\x1b[A\r\x1b[K\x1b[A\r\x1b[K$ ");
+  assert.ok(screen.textContent.endsWith("xxx\n$ \n\n"));
+  assert.ok(!screen.textContent.includes("y"));
+  await output("abc\b \b\b \b\b \b");
+  assert.ok(screen.textContent.endsWith("xxx\n$    \n\n"), "backspace overwrites stay within the prompt row");
+  screen.clientWidth = 216;
+  for (const callback of resize) callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sizes.at(-1).cols, 20);
+  assert.equal(screen.getAttribute("data-columns"), "20");
+  assert.ok(screen.textContent.split("\n").every((line) => line.length <= 20));
+  assert.equal(screen.textContent.split("\n").join("").split("x").length - 1, 130,
+    "narrowing retains finished output");
+});
+
 test("page starts against the scripted client", async () => {
   const document = new Document();
   const script = scriptedClient();

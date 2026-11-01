@@ -781,3 +781,75 @@ def session_notes_compaction_requires_coverage_of_every_dropped_message():
                 assert len(provider.notes_requests) == 1
             finally:
                 chat.close()
+
+
+@check("turns.deferred_mcp_tools_load_execute_and_survive_compaction")
+def deferred_mcp_tools_load_execute_and_survive_compaction():
+    from contextlib import closing
+    from symphonai_api.session import SessionStore, load_run
+    from symphonai_api.tool_schema import tool_registry_schemas
+
+    class McpFixture(LocalTool):
+        parameters = {"type": "object", "properties": {}}
+
+        def __init__(self, name):
+            self._name = name
+            self._description = "Create an issue" if name == "github_create_issue" else "An unrelated MCP operation"
+            self.calls = 0
+
+        @property
+        def name(self):
+            return self._name
+
+        @property
+        def description(self):
+            return self._description
+
+        def metadata(self, arguments):
+            return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=True, paths=())
+
+        def _execute(self, tool_call, policy, cancel=None):
+            self.calls += 1
+            return ToolResult(tool_call.id, ok=True, content="issue created")
+
+    with workspace() as ws, closing(SessionStore(ws.outside / "sessions", "mcp-loading")) as store:
+        tools = {name: McpFixture(name) for name in ["github_create_issue", *[f"other_{i}" for i in range(59)]]}
+        provider = Script([
+            answer("", call("other_0")),
+            answer("", call("search_tools", query="issue")),
+            answer("", call("github_create_issue")),
+            answer("first run finished"), answer("continued after compaction"),
+        ])
+        budget = [100000]
+        agent = ApiAgent(provider, tools, ws.policy,
+                         tool_schemas=tool_registry_schemas(tools, provider.wire_format),
+                         deferrable_tools=tuple(tools), context_budget=lambda model: budget[0],
+                         context_recent_turns=1, transcript=store.writer_for("mcp-agent", is_root=True))
+        first = agent.run([Message(Role.SYSTEM, "Preserve instructions"), Message(Role.USER, "Original goal")])
+        names = lambda request: {schema.get("function", schema)["name"] for schema in request.tools}
+        assert names(provider.requests[0]) == {"search_tools"}
+        refused = next(message.tool_result for message in first.messages
+                       if message.tool_result is not None and not message.tool_result.ok)
+        assert "search_tools" in refused.error and tools["other_0"].calls == 0
+        assert "github_create_issue" in names(provider.requests[2])
+        assert tools["github_create_issue"].calls == 1
+        budget[0] = 600
+        agent.run([*first.messages, Message(Role.ASSISTANT, "old detail " * 2000),
+                            Message(Role.USER, "Continue with the recent request")])
+        assert "github_create_issue" in names(provider.requests[-1])
+        assert not any(message.tool_result is not None and isinstance(message.tool_result.payload, dict)
+                       and message.tool_result.payload.get("kind") == "tool_search"
+                       for message in provider.requests[-1].messages), "compaction did not drop the search result"
+        resumed_provider = Script([answer("", call("github_create_issue")), answer()])
+        resumed = ApiAgent(resumed_provider, tools, ws.policy,
+                           tool_schemas=tool_registry_schemas(tools, resumed_provider.wire_format),
+                           deferrable_tools=tuple(tools), transcript=store.writer_for("mcp-agent", is_root=True))
+        resumed.run(load_run(store).messages + [Message(Role.USER, "Use the previously loaded tool")])
+        assert "github_create_issue" in names(resumed_provider.requests[0])
+        assert tools["github_create_issue"].calls == 2
+        small_tools = dict(list(tools.items())[:5])
+        small_provider = Script([answer()])
+        ApiAgent(small_provider, small_tools, ws.policy,
+                 tool_schemas=tool_registry_schemas(small_tools, small_provider.wire_format),
+                 deferrable_tools=tuple(small_tools)).run([Message(Role.USER, "A small MCP set")])
+        assert names(small_provider.requests[0]) == set(small_tools)

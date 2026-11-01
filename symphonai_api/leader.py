@@ -105,7 +105,7 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.memory import MemoryTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, ToolEffect, ToolMetadata
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
@@ -810,7 +810,7 @@ class DispatchSubagentTool(LocalTool):
         selected_tool_names = (
             spec.tool_names if spec.tool_names is not None else self._subagent_tool_names
         )
-        editable_tools = {"write_file", "edit_file", "multi_edit_file"}
+        editable_tools = FILE_EDIT_TOOLS
         can_edit = selected_tool_names is None or bool(
             editable_tools.intersection(selected_tool_names)
         )
@@ -1053,6 +1053,7 @@ class DispatchSubagentTool(LocalTool):
                     policy=effective_policy,
                     max_turns=self._subagent_max_turns,
                     tool_schemas=tool_registry_schemas(subagent_tools, child_provider.wire_format),
+                    deferrable_tools=tuple(selected_extra),
                     agent_ref=agent_ref,
                     events=self._events,
                     stream=self._stream,
@@ -1896,16 +1897,16 @@ class Leader:
             config.extra_tools,
         )
         if restrict_leader:
-            for name in ("write_file", "edit_file", "multi_edit_file"):
+            for name in FILE_EDIT_TOOLS:
                 standard_tools.pop(name, None)
         leader_tools.update(standard_tools)
         leader_only_tools = dict(config.leader_tools or {})
         if restrict_leader:
-            for name in ("write_file", "edit_file", "multi_edit_file"):
+            for name in FILE_EDIT_TOOLS:
                 leader_only_tools.pop(name, None)
         leader_tools.update(leader_only_tools)
         if restrict_leader:
-            for name in ("write_file", "edit_file", "multi_edit_file"):
+            for name in FILE_EDIT_TOOLS:
                 leader_tools.pop(name, None)
             if "run_shell" in leader_tools:
                 leader_tools["run_shell"] = _LeaderShellTool(
@@ -1954,6 +1955,8 @@ class Leader:
                     config.leader_provider.wire_format,
                 ),
             ],
+            deferrable_tools=tuple(config.extra_tools or {}),
+            tool_history=None if session is None else session.directory / "run.jsonl",
             agent_ref=self._agent_ref,
             events=self._event_sink,
             stream=config.stream,

@@ -630,6 +630,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       || type === "SubagentStopped"
       || type === "BackgroundUsageRecorded"
       || type === "LoopChanged"
+      || type === "TerminalOutput"
     ) {
       return;
     }

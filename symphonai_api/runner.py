@@ -30,6 +30,8 @@ from symphonai_api.skills import Skill
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.apply_patch import ApplyPatchTool, DiagnosticsAfterPatch
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS
 from symphonai_api.tools.edit import EditFileTool, MultiEditFileTool
 from symphonai_api.tools.diagnostics import DiagnosticsAfterWrite
 from symphonai_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
@@ -68,6 +70,7 @@ def standard_tool_registry(
         ReadFileTool(ledger),
         WriteFileTool(ledger, checkpoints),
         EditFileTool(ledger, checkpoints),
+        ApplyPatchTool(ledger, checkpoints),
         MultiEditFileTool(ledger, checkpoints),
         ListFilesTool(),
         GlobTool(),
@@ -77,8 +80,8 @@ def standard_tool_registry(
     ]
     if lsp is not None and lsp.has_enabled_servers:
         tools = [
-            DiagnosticsAfterWrite(tool, lsp)
-            if tool.name in {"write_file", "edit_file", "multi_edit_file"}
+            (DiagnosticsAfterPatch(tool, lsp) if tool.name == "apply_patch" else DiagnosticsAfterWrite(tool, lsp))
+            if tool.name in FILE_EDIT_TOOLS
             else tool
             for tool in tools
         ]
@@ -103,6 +106,8 @@ def standard_tool_registry(
             if name not in known_names:
                 raise ValueError(f"unknown tool name: {name!r}")
         requested_names = set(names)
+        if requested_names.intersection({"edit_file", "multi_edit_file"}):
+            requested_names.add("apply_patch")
     else:
         requested_names = None
     registry = {

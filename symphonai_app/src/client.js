@@ -301,6 +301,12 @@ export function createClient({
       return post("session/open", { run_id: runId });
     },
 
+    terminals() { return request("GET", "/terminals"); },
+    terminalStart() { return request("POST", "/terminal/start", {}); },
+    terminalInput(id, data) { return request("POST", "/terminal/input", { id, data }); },
+    terminalResize(id, cols, rows) { return request("POST", "/terminal/resize", { id, cols, rows }); },
+    terminalStop(id) { return request("POST", "/terminal/stop", { id }); },
+
     sessionNotes(sessionId) {
       const query = new URLSearchParams({ session_id: sessionId });
       return request("GET", `/session/notes?${query}`);

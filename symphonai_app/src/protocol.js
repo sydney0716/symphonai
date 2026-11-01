@@ -31,6 +31,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze([
   "BackgroundUsageRecorded",
   "JobChanged",
   "LoopChanged",
+  "TerminalOutput",
   "FilesChanged",
 ]);
 

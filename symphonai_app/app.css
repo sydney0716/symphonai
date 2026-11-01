@@ -2629,3 +2629,25 @@ button.session-link {
 .loop-commit-error {
   margin: 0;
 }
+
+
+.terminal-screen {
+  min-height: 18rem;
+  max-height: 65vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: var(--space-2);
+  font: 0.8125rem/1.4 var(--font-code);
+  color: var(--ui-text);
+  background: var(--ui-inset);
+  border: 1px solid var(--ui-control-border);
+}
+.terminal-screen:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.terminal-bold { font-weight: 600; }
+.terminal-color-30, .terminal-color-90 { color: var(--ui-text-secondary); }
+.terminal-color-31, .terminal-color-91, .terminal-color-35, .terminal-color-95 { color: var(--ui-danger); }
+.terminal-color-32, .terminal-color-92 { color: var(--ui-success); }
+.terminal-color-33, .terminal-color-93 { color: var(--ui-warning); }
+.terminal-color-34, .terminal-color-94, .terminal-color-36, .terminal-color-96 { color: var(--ui-accent); }
+.terminal-color-37, .terminal-color-97 { color: var(--ui-text); }

@@ -65,8 +65,7 @@ def check_providers_live_openai_tools_and_model_override() -> None:
             expected_tool_names = {
                 "read_file",
                 "write_file",
-                "edit_file",
-                "multi_edit_file",
+                "apply_patch",
                 "list_files",
                 "glob",
                 "grep",

@@ -15,6 +15,17 @@ if TYPE_CHECKING:
     from symphonai_api.tools.base import LocalTool
 
 
+FILE_EDIT_TOOLS = frozenset({"write_file", "edit_file", "multi_edit_file", "apply_patch"})
+
+
+def patch_paths(value: object) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    prefixes = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
+    return list(dict.fromkeys(line[len(prefix):] for line in value.splitlines()
+                             for prefix in prefixes if line.startswith(prefix)))
+
+
 TARGET_LIMIT = 200
 
 
@@ -49,9 +60,8 @@ def _url_origin(url: object) -> str:
 
 _TARGET_KEYS = {
     "read_file": ("path", _plain_target),
-    "write_file": ("path", _plain_target),
-    "edit_file": ("path", _plain_target),
-    "multi_edit_file": ("path", _plain_target),
+    **{name: ("path", _plain_target) for name in FILE_EDIT_TOOLS if name != "apply_patch"},
+    "apply_patch": ("input", lambda value: next(iter(patch_paths(value)), "")),
     "list_files": ("path", _plain_target),
     "glob": ("pattern", _plain_target),
     "grep": ("pattern", _plain_target),

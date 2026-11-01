@@ -152,6 +152,34 @@ def prompt(host, text="core prompt"):
     return get(host, "/conversation")["conversation"]["session_id"]
 
 
+@check("host.terminal_input_streams_ordered_output")
+def terminal_input_streams_ordered_output():
+    with workspace() as ws, mock.patch.dict(os.environ, {"SHELL": "/bin/sh"}), running_host(ws) as host:
+        stream = Stream(host)
+        identifier = None
+        output = []
+        try:
+            identifier = post(host, "/terminal/start", {})["id"]
+            post(host, "/terminal/input", {"id": identifier, "data": "echo hello-probe\r"})
+
+            def echoed(frame):
+                event = frame.get("payload", {})
+                if event.get("type") != "TerminalOutput" or event.get("terminal_id") != identifier:
+                    return False
+                assert event["agent_id"] == event["run_id"] == ""
+                output.append(event["data"])
+                text = "".join(output)
+                return "echo hello-probe" in text and text.count("hello-probe\r\n") >= 2
+
+            stream.until(echoed)
+            text = "".join(output)
+            assert text.index("echo hello-probe") < text.rindex("hello-probe\r\n"), text
+        finally:
+            if identifier is not None:
+                post(host, "/terminal/stop", {"id": identifier})
+            stream.close()
+
+
 @check("host.routes_require_the_token")
 def routes_require_the_token():
     gets = ("/health", "/events", "/conversation", "/git/status", "/git/diff", "/git/pull-request",

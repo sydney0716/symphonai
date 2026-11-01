@@ -63,7 +63,7 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import _diff_result
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
-from symphonai_api.tools.metadata import call_target
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, call_target
 from symphonai_api.tools.shell import shell_environment, shell_executable
 from symphonai_api.worktree import remove_worktree, worktree_diff
 from symphonai_api.worktree import create_worktree
@@ -150,6 +150,14 @@ class LoopChanged(Event):
     change: str = ""
     card_id: str = ""
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class TerminalOutput(Event):
+    terminal_id: str = ""
+    data: str = ""
+    exited: bool = False
+    exit_code: int | None = None
 
 
 class NoConversationError(RuntimeError):
@@ -1128,7 +1136,7 @@ class HostRun:
                     )
         hidden_output_tools = {
             "dispatch_subagent", "update_plan", "ask_user", "propose_plan",
-            "write_file", "edit_file", "multi_edit_file",
+            *FILE_EDIT_TOOLS,
         }
         if call.name not in hidden_output_tools:
             replay["target"] = call_target(call.name, call.arguments)
@@ -2498,6 +2506,8 @@ class HostRun:
         return True
 
     def close(self) -> None:
+        from symphonai_host.terminal import close_host
+        close_host(self)
         self._closing = True
         self._release_sleep_prevention()
         with self._lock:

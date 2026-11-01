@@ -536,6 +536,27 @@ function renderGeneral(section, context) {
       document.documentElement.setAttribute("data-theme", selected);
     }
   });
+  const editorSelect = document.createElement("select");
+  editorSelect.setAttribute("aria-label", "Editor");
+  const editors = [["none", "None"], ["vscode", "VS Code"], ["cursor", "Cursor"], ["zed", "Zed"]];
+  for (const [value, label] of editors) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    editorSelect.append(option);
+  }
+  let editor = "none";
+  try {
+    const stored = global.localStorage?.getItem("symphonai.editor");
+    if (editors.some(([value]) => value === stored)) editor = stored;
+  } catch { /* Storage is optional. */ }
+  editorSelect.value = editor;
+  listen(editorSelect, "change", () => {
+    const chosen = editors.some(([value]) => value === editorSelect.value) ? editorSelect.value : "none";
+    try { global.localStorage?.setItem("symphonai.editor", chosen); }
+    catch { /* Storage is optional. */ }
+    global.dispatchEvent?.(new (global.Event ?? Event)("symphonai.editor"));
+  });
   const statusOptions = [
     ["provider", "Provider"], ["model", "Model"], ["effort", "Effort"],
     ["mode", "Mode"], ["goal", "Goal"], ["context", "Context"], ["usage", "Usage"],
@@ -595,6 +616,8 @@ function renderGeneral(section, context) {
     element(document, "h2", { text: "General" }),
     element(document, "h3", { text: "Appearance" }),
     themeSelect,
+    element(document, "h3", { text: "Editor" }),
+    editorSelect,
     statusGroup,
     notificationGroup,
     settingsTable(["Setting", "Value", "Scope"], rows),

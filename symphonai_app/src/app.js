@@ -80,6 +80,15 @@ function promptCommand(text) {
   if (typeof text === "string" && text.startsWith(focusPrefix)) {
     return `/review ${text.slice(focusPrefix.length)}`;
   }
+  if (typeof text === "string") {
+    const mentioned = /^((?:Use the [^\n]+ skill\.\n)+)\n([\s\S]*)$/.exec(text);
+    if (mentioned) {
+      const names = [...mentioned[1].matchAll(/Use the (.+) skill\./g)].map((match) => match[1].toLowerCase());
+      const tokens = [...mentioned[2].matchAll(/(?:^|\s)@([^\s]+)/g)]
+        .map((match) => match[1].replace(/[.,;:!?)}\]]+$/, "").toLowerCase());
+      if (names.every((name) => tokens.includes(name))) return mentioned[2];
+    }
+  }
   const skill = typeof text === "string" && /^Use the (\S+) skill\.(?:\n\n([\s\S]*))?$/.exec(text);
   return skill ? `/${skill[1]}${skill[2] ? ` ${skill[2]}` : ""}` : text;
 }
@@ -130,7 +139,7 @@ const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
 const DIFF_MODE_KEY = "symphonai.diff-mode";
 const SIDEBAR_SESSION_LIMIT = 200;
-const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop", "Notes"];
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop", "Notes", "Terminal"];
 const RAIL_TOOL_ICONS = Object.freeze({
   Agents: "icon-tool-agents",
   Roadmap: "icon-tool-roadmap",
@@ -139,6 +148,7 @@ const RAIL_TOOL_ICONS = Object.freeze({
   Jobs: "icon-tool-jobs",
   Loop: "icon-tool-loop",
   Notes: "icon-tool-notes",
+  Terminal: "icon-tool-jobs",
 });
 
 function storedRail(global) {
@@ -216,6 +226,9 @@ export async function start({ global, document, client }) {
   const jobsRoot = element(document, "div", { className: "rail-pane jobs-pane" });
   jobsRoot.setAttribute("role", "tabpanel");
   jobsRoot.hidden = true;
+  const terminalRoot = element(document, "div", { className: "rail-pane terminal-pane" });
+  terminalRoot.setAttribute("role", "tabpanel");
+  terminalRoot.hidden = true;
   const notesRoot = element(document, "div", { className: "rail-pane notes-pane" });
   notesRoot.setAttribute("role", "tabpanel");
   notesRoot.hidden = true;
@@ -224,7 +237,7 @@ export async function start({ global, document, client }) {
   loopsRoot.hidden = true;
   const railTabsRoot = document.getElementById("rail-tabs");
   const railToolsRoot = document.getElementById("rail-tools");
-  railToolsRoot.before(jobsRoot, loopsRoot, notesRoot);
+  railToolsRoot.before(jobsRoot, loopsRoot, notesRoot, terminalRoot);
   let { open: openRailTools, selected: selectedRailTool } = storedRail(global);
   let loops = [];
   let selectedLoopId = "";
@@ -674,6 +687,40 @@ export async function start({ global, document, client }) {
 
   let pageNavLinks = [];
   let changesDirty = false;
+  function editorFileLink(path, line = 1) {
+    let scheme;
+    try { scheme = global.localStorage?.getItem("symphonai.editor"); }
+    catch { return null; }
+    const label = new Map([["vscode", "VS Code"], ["cursor", "Cursor"], ["zed", "Zed"]]).get(scheme);
+    if (!label || typeof project?.repo_root !== "string") return null;
+    const absolute = `${project.repo_root.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
+    const encoded = absolute.split("/").map((part) => encodeURIComponent(part)).join("/");
+    const link = element(document, "a", { text: `Open in ${label}` });
+    link.href = `${scheme}://file${encoded}:${line}:1`;
+    link.setAttribute("role", "button");
+    listen(link, "keydown", (event) => {
+      if (event.key === " ") { event.preventDefault(); link.click(); }
+    });
+    return link;
+  }
+
+  global.addEventListener?.("symphonai.editor", () => {
+    renderFiles();
+    if (selectedRailTool === "Changes" || route.page === "changes") void showChanges();
+  });
+
+  function firstChangedLine(diff) {
+    let line = null;
+    for (const text of diff.split("\n")) {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+      if (hunk) { line = Number(hunk[1]); continue; }
+      if (line === null) continue;
+      if (text.startsWith("+") || text.startsWith("-")) return Math.max(1, line);
+      if (text.startsWith(" ")) line++;
+    }
+    return 1;
+  }
+
   async function showChanges() {
     replace(
       changesRoot,
@@ -789,26 +836,36 @@ export async function start({ global, document, client }) {
         const row = element(document, "details", { className: "changes-working-file" });
         const summary = element(document, "summary");
         append(summary, element(document, "span", { text: `${file.path} · ${file.status}` }));
+        const editorLink = editorFileLink(file.path, firstChangedLine(file.diff ?? ""));
+        if (editorLink) append(summary, " ", editorLink);
         if (file.staged) append(summary, element(document, "span", { className: "changes-staged", text: "Staged" }));
         let diffLoaded = file.diff_deferred !== true;
-        let diffLoading = false;
+        let loadingDiff = null;
         const diff = file.diff_deferred === true
           ? renderDiff(document, "")
           : diffView(file.diff ?? "");
-        listen(row, "toggle", async () => {
-          if (!row.open || diffLoaded || diffLoading) return;
-          diffLoading = true;
+        function loadDiff() {
+          if (diffLoaded) return Promise.resolve(true);
+          if (loadingDiff) return loadingDiff;
           diff.textContent = "Loading diff…";
-          try {
-            const result = await boundary.gitDiff(file.path);
+          loadingDiff = Promise.resolve().then(() => boundary.gitDiff(file.path)).then((result) => {
+            if (editorLink) editorLink.href = editorLink.href.replace(/:\d+:1$/, `:${firstChangedLine(result.diff ?? "")}:1`);
             diffLoaded = true;
             row.replaceChildren(summary, diffView(result.diff ?? ""));
-          } catch (error) {
+            return true;
+          }).catch((error) => {
             diff.textContent = errorText(error);
             diff.className = "diff error";
-          } finally {
-            diffLoading = false;
-          }
+            return false;
+          }).finally(() => { loadingDiff = null; });
+          return loadingDiff;
+        }
+        listen(row, "toggle", () => { if (row.open) void loadDiff(); });
+        if (editorLink) listen(editorLink, "click", async (event) => {
+          if (diffLoaded) return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (await loadDiff()) editorLink.click();
         });
         append(row, summary, diff);
         append(workingTree, row);
@@ -848,7 +905,10 @@ export async function start({ global, document, client }) {
       children.push(element(document, "h2", { text: "Files" }));
       for (const file of files) {
         const row = element(document, "section", { className: "changes-file" });
-        append(row, element(document, "h3", { text: `${file.path} · ${file.status}` }));
+        const header = element(document, "h3", { text: `${file.path} · ${file.status}` });
+        const editorLink = editorFileLink(file.path, firstChangedLine(file.diff ?? ""));
+        if (editorLink) append(header, " ", editorLink);
+        append(row, header);
         if (file.changed_outside) {
           append(row, element(document, "p", {
             className: "changes-outside",
@@ -936,6 +996,301 @@ export async function start({ global, document, client }) {
       append(notesRoot, element(document, "p", {
         className: "error", text: `Could not load notes: ${errorText(error)}`,
       }));
+    }
+  }
+
+  let terminalId = null;
+  let terminalStarting = false;
+  let terminalExited = false;
+  let terminalError = "";
+  let terminalGeneration = 0;
+  let terminalWrites = Promise.resolve();
+  const terminalPending = new Map();
+  const terminalScreen = element(document, "pre", { className: "terminal-screen" });
+  terminalScreen.setAttribute("style", "white-space: pre; overflow-wrap: normal;");
+  terminalScreen.tabIndex = 0;
+  terminalScreen.setAttribute("role", "textbox");
+  terminalScreen.setAttribute("aria-label", "Project terminal");
+  terminalScreen.setAttribute("aria-multiline", "true");
+  let terminalCols = 80, terminalRows = 24, terminalWrap = false;
+  let terminalLines = [new Array(terminalCols).fill(null)], terminalRow = 0, terminalColumn = 0;
+  let terminalColor = 0, terminalBold = false, terminalEscape = "", terminalSequence = "";
+
+  function terminalWrite(data) {
+    if (!terminalId || terminalExited) return;
+    const id = terminalId, generation = terminalGeneration;
+    terminalWrites = terminalWrites.then(() => boundary.terminalInput(id, data)).catch((error) => {
+      if (generation !== terminalGeneration) return;
+      terminalError = errorText(error);
+      renderTerminal();
+    });
+  }
+
+  listen(terminalScreen, "keydown", (event) => {
+    if (event.isComposing || event.keyCode === 229 || event.metaKey) return;
+    const keys = { Enter: "\r", Backspace: "\x7f", Tab: "\t", ArrowUp: "\x1b[A", ArrowDown: "\x1b[B",
+      ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D", Home: "\x1b[H", End: "\x1b[F", Delete: "\x1b[3~" };
+    let data = keys[event.key];
+    if (event.ctrlKey && /^[a-z]$/i.test(event.key)) data = String.fromCharCode(event.key.toUpperCase().charCodeAt(0) - 64);
+    else if (!event.ctrlKey && event.key?.length === 1) data = `${event.altKey ? "\x1b" : ""}${event.key}`;
+    if (data === undefined) return;
+    event.preventDefault();
+    event.stopPropagation();
+    terminalWrite(data);
+  });
+  listen(terminalScreen, "paste", (event) => {
+    event.preventDefault();
+    terminalWrite(event.clipboardData?.getData("text/plain") ?? "");
+  });
+  listen(terminalScreen, "compositionend", (event) => { if (event.data) terminalWrite(event.data); });
+
+  function feedTerminal(text) {
+    for (const character of text) {
+      if (terminalEscape === "osc") {
+        if (character === "\x07" || character === "\x9c" || (terminalSequence === "\x1b" && character === "\\")) terminalEscape = "";
+        terminalSequence = character === "\x1b" ? character : "";
+        continue;
+      }
+      if (terminalEscape === "charset") { terminalEscape = ""; continue; }
+      if (terminalEscape === "escape") {
+        terminalEscape = character === "[" ? "csi" : ["]", "P", "_", "^", "X"].includes(character) ? "osc"
+          : ["(", ")", "*", "+", "#", "%", " "].includes(character) ? "charset" : "";
+        terminalSequence = "";
+        continue;
+      }
+      if (terminalEscape === "csi" || terminalEscape === "discard") {
+        if (/[@-~]/.test(character)) {
+          if (terminalEscape === "csi") {
+            const values = terminalSequence.split(";").map((value) => Number(value) || 0);
+            if (character === "m") for (const value of values) {
+              if (value === 0) { terminalColor = 0; terminalBold = false; }
+              else if (value === 1) terminalBold = true;
+              else if (value === 22) terminalBold = false;
+              else if (value === 39) terminalColor = 0;
+              else if ((value >= 30 && value <= 37) || (value >= 90 && value <= 97)) terminalColor = value;
+            }
+            const line = terminalLines[terminalRow] ?? (terminalLines[terminalRow] = new Array(terminalCols).fill(null));
+            if (character === "K") {
+              if (values[0] === 2) line.fill(null);
+              else if (values[0] === 1) line.fill(null, 0, terminalColumn + 1);
+              else line.fill(null, terminalColumn);
+            }
+            if (character === "J") {
+              if (values[0] === 2 || values[0] === 3) { terminalLines = [new Array(terminalCols).fill(null)]; terminalRow = 0; terminalColumn = 0; }
+              else if (values[0] === 0) { line.fill(null, terminalColumn); terminalLines.length = terminalRow + 1; }
+              else if (values[0] === 1) {
+                for (let i = 0; i < terminalRow; i++) terminalLines[i] = new Array(terminalCols).fill(null);
+                line.fill(null, 0, terminalColumn + 1);
+              }
+              terminalWrap = false;
+            }
+            if (character === "A") terminalRow = Math.max(0, terminalRow - (values[0] || 1));
+            if (character === "B") terminalRow = Math.min(1999, terminalRow + (values[0] || 1));
+            if (character === "C") terminalColumn = Math.min(terminalCols - 1, terminalColumn + (values[0] || 1));
+            if (character === "D") terminalColumn = Math.max(0, terminalColumn - (values[0] || 1));
+            if (character === "G") terminalColumn = Math.min(terminalCols - 1, Math.max(0, (values[0] || 1) - 1));
+            if (character === "H" || character === "f") {
+              terminalRow = Math.min(1999, Math.max(0, (values[0] || 1) - 1));
+              terminalColumn = Math.min(terminalCols - 1, Math.max(0, (values[1] || 1) - 1));
+            }
+            if (["A", "B", "C", "D", "G", "H", "f"].includes(character)) terminalWrap = false;
+          }
+          terminalEscape = "";
+          terminalSequence = "";
+        } else {
+          terminalSequence += character;
+          if (terminalSequence.length > 256) { terminalSequence = ""; terminalEscape = "discard"; }
+        }
+        continue;
+      }
+      if (character === "\x1b") { terminalEscape = "escape"; continue; }
+      if (character === "\x9b") { terminalEscape = "csi"; terminalSequence = ""; continue; }
+      if (["\x9d", "\x90", "\x9f"].includes(character)) { terminalEscape = "osc"; terminalSequence = ""; continue; }
+      if (character === "\r") { terminalColumn = 0; terminalWrap = false; continue; }
+      if (character === "\n") { terminalRow++; terminalColumn = 0; terminalWrap = false; continue; }
+      if (character === "\b") { terminalColumn = Math.max(0, terminalColumn - 1); terminalWrap = false; continue; }
+      if (character === "\t") { terminalColumn = Math.min(terminalCols - 1, (Math.floor(terminalColumn / 8) + 1) * 8); terminalWrap = false; continue; }
+      const code = character.codePointAt(0);
+      if (code < 32 || (code >= 127 && code < 160)) continue;
+      if (terminalWrap) { terminalRow++; terminalColumn = 0; terminalWrap = false; }
+      const line = terminalLines[terminalRow] ?? (terminalLines[terminalRow] = new Array(terminalCols).fill(null));
+      line[terminalColumn] = { text: character, color: terminalColor, bold: terminalBold };
+      if (terminalColumn === terminalCols - 1) terminalWrap = true;
+      else terminalColumn++;
+    }
+    for (let i = 0; i <= terminalRow; i++) terminalLines[i] ??= new Array(terminalCols).fill(null);
+    let count = terminalLines.reduce((sum, line) => sum + (line?.length ?? 0), 0);
+    while (terminalLines.length > 2000 || count > 200000) {
+      count -= terminalLines.shift()?.length ?? 0;
+      terminalRow = Math.max(0, terminalRow - 1);
+    }
+    const spans = [];
+    for (let index = 0; index < terminalLines.length; index++) {
+      const line = terminalLines[index] ?? [];
+      let text = "", color = 0, bold = false;
+      const flush = () => { if (text) spans.push(element(document, "span", {
+        className: `terminal-color-${color}${bold ? " terminal-bold" : ""}`, text,
+      })); text = ""; };
+      let end = line.length;
+      while (end && !line[end - 1]) end--;
+      for (let column = 0; column < end; column++) {
+        const cell = line[column] ?? { text: " ", color: 0, bold: false };
+        if (cell.color !== color || cell.bold !== bold) { flush(); color = cell.color; bold = cell.bold; }
+        text += cell.text;
+      }
+      if (index < terminalLines.length - 1) text += "\n";
+      flush();
+    }
+    replace(terminalScreen, ...spans);
+    terminalScreen.scrollTop = terminalScreen.scrollHeight;
+  }
+
+  function renderTerminal() {
+    const focused = document.activeElement === terminalScreen;
+    replace(terminalRoot, element(document, "h1", { text: "Terminal" }), terminalScreen);
+    measureTerminal();
+    if (terminalError) append(terminalRoot, element(document, "p", { className: "error", text: terminalError }));
+    if (terminalExited || (!terminalId && !terminalStarting)) append(terminalRoot,
+      makeButton(document, "Start shell", async () => { await stopTerminal(); await showTerminal(); }));
+    if (focused) terminalScreen.focus();
+  }
+
+  function measureTerminal() {
+    const probe = element(document, "span", { text: "M".repeat(32) });
+    probe.setAttribute("style", "position: absolute; visibility: hidden; white-space: pre; font: inherit;");
+    terminalScreen.append(probe);
+    const bounds = probe.getBoundingClientRect?.();
+    probe.remove();
+    if (!bounds?.width || !bounds.height || !terminalScreen.clientWidth) return;
+    const style = global.getComputedStyle(terminalScreen);
+    const width = terminalScreen.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const height = terminalScreen.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const cols = Math.max(1, Math.min(1000, Math.floor(width / (bounds.width / 32))));
+    terminalRows = Math.max(1, Math.min(1000, Math.floor(height / bounds.height)));
+    if (cols !== terminalCols) {
+      const lines = [];
+      let row = 0, column = 0;
+      terminalLines.forEach((line, index) => {
+        let end = line.length;
+        while (end && !line[end - 1]) end--;
+        if (index === terminalRow) end = Math.max(end, terminalColumn + 1);
+        if (index === terminalRow) {
+          row = lines.length + Math.floor(terminalColumn / cols);
+          column = terminalColumn % cols;
+        }
+        for (let start = 0; start < Math.max(1, end); start += cols) {
+          const next = new Array(cols).fill(null);
+          line.slice(start, Math.min(start + cols, end)).forEach((cell, i) => { next[i] = cell; });
+          lines.push(next);
+        }
+      });
+      terminalLines = lines;
+      terminalCols = cols;
+      terminalRow = row;
+      terminalColumn = column;
+      terminalWrap = false;
+      feedTerminal("");
+    }
+    terminalScreen.setAttribute("data-columns", String(terminalCols));
+  }
+
+  async function resizeTerminal() {
+    measureTerminal();
+    if (!terminalId || terminalExited) return;
+    try {
+      await boundary.terminalResize(terminalId, terminalCols, terminalRows);
+    } catch (error) { terminalError = errorText(error); renderTerminal(); }
+  }
+  global.addEventListener?.("resize", () => { if (selectedRailTool === "Terminal") void resizeTerminal(); });
+  if (global.ResizeObserver) new global.ResizeObserver(() => {
+    if (selectedRailTool === "Terminal") void resizeTerminal();
+  }).observe(terminalScreen);
+
+  function terminalOutput(payload) {
+    if (payload.terminal_id !== terminalId) {
+      if (terminalStarting) {
+        const previous = terminalPending.get(payload.terminal_id) ?? { data: "" };
+        terminalPending.set(payload.terminal_id, { ...payload, data: (previous.data + payload.data).slice(-200000) });
+      }
+      return;
+    }
+    feedTerminal(payload.data);
+    if (payload.exited) {
+      terminalExited = true;
+      feedTerminal(`\r\n[exited ${payload.exit_code}]\r\n`);
+      renderTerminal();
+    }
+  }
+
+  async function showTerminal() {
+    if (selectedRailTool !== "Terminal") return;
+    if (!terminalId && !terminalStarting) {
+      const generation = terminalGeneration;
+      terminalStarting = true;
+      terminalError = "";
+      renderTerminal();
+      try {
+        const listing = await boundary.terminals();
+        if (generation !== terminalGeneration) return;
+        const running = listing.terminals.find((terminal) => !terminal.exited);
+        if (running) {
+          terminalId = running.id;
+          terminalStarting = false;
+          const pending = terminalPending.get(terminalId);
+          terminalPending.clear();
+          feedTerminal(running.output);
+          if (pending) {
+            // Events can arrive while the saved output is being fetched. Find
+            // their overlap with the snapshot so it is rendered only once.
+            const prefix = new Array(pending.data.length).fill(0);
+            for (let i = 1, matched = 0; i < pending.data.length; i++) {
+              while (matched && pending.data[i] !== pending.data[matched]) matched = prefix[matched - 1];
+              if (pending.data[i] === pending.data[matched]) matched++;
+              prefix[i] = matched;
+            }
+            let overlap = running.output.includes(pending.data) ? pending.data.length : 0;
+            for (let i = 0; overlap !== pending.data.length && i < running.output.length; i++) {
+              const character = running.output[i];
+              while (overlap && character !== pending.data[overlap]) overlap = prefix[overlap - 1];
+              if (character === pending.data[overlap]) overlap++;
+            }
+            terminalOutput({ ...pending, data: pending.data.slice(overlap) });
+          }
+          renderTerminal();
+          await resizeTerminal();
+          terminalScreen.focus();
+          return;
+        }
+        const reply = await boundary.terminalStart();
+        if (generation !== terminalGeneration) { await boundary.terminalStop(reply.id); return; }
+        terminalId = reply.id;
+        terminalStarting = false;
+        const pending = terminalPending.get(terminalId);
+        terminalPending.clear();
+        if (pending) terminalOutput(pending);
+      } catch (error) {
+        if (generation !== terminalGeneration) return;
+        terminalStarting = false;
+        terminalError = errorText(error);
+      }
+    }
+    renderTerminal();
+    if (terminalId && !terminalExited) { await resizeTerminal(); terminalScreen.focus(); }
+  }
+
+  async function stopTerminal() {
+    const id = terminalId;
+    terminalGeneration++;
+    terminalId = null;
+    terminalStarting = false;
+    terminalExited = false;
+    terminalPending.clear();
+    terminalLines = [new Array(terminalCols).fill(null)]; terminalRow = 0; terminalColumn = 0; terminalWrap = false;
+    terminalColor = 0; terminalBold = false; terminalEscape = ""; terminalSequence = "";
+    feedTerminal("");
+    if (id) {
+      try { await boundary.terminalStop(id); }
+      catch (error) { terminalError = errorText(error); }
     }
   }
 
@@ -2408,6 +2763,8 @@ export async function start({ global, document, client }) {
         className: "files-viewer-path",
         text: selectedFilePath,
       }));
+      const editorLink = editorFileLink(selectedFilePath, 1);
+      if (editorLink) append(header, " ", editorLink);
       const children = [header];
       if (fileSourceLoading) {
         children.push(element(document, "p", { text: "Loading…" }));
@@ -2953,7 +3310,7 @@ export async function start({ global, document, client }) {
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
-    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot, Notes: notesRoot };
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot, Notes: notesRoot, Terminal: terminalRoot };
     for (const [name, pane] of Object.entries(panes)) {
       pane.hidden = showRailTools || name !== selectedRailTool;
     }
@@ -2976,6 +3333,7 @@ export async function start({ global, document, client }) {
     if (name === "Changes") return changed || changesDirty ? showChanges() : undefined;
     if (name === "Files") return changed || filesDirty ? refreshFiles() : undefined;
     if (name === "Notes") return showNotes();
+    if (name === "Terminal") return showTerminal();
     if (!changed) return undefined;
     if (name === "Jobs") return showJobs();
     return undefined;
@@ -2988,6 +3346,7 @@ export async function start({ global, document, client }) {
   }
 
   function closeRailTool(name) {
+    if (name === "Terminal") void stopTerminal();
     openRailTools = openRailTools.filter((tool) => tool !== name);
     if (selectedRailTool === name) selectedRailTool = openRailTools.at(-1) ?? "";
     showRailTools = openRailTools.length === 0;
@@ -2997,6 +3356,7 @@ export async function start({ global, document, client }) {
     if (selectedRailTool === "Changes") return showChanges();
     if (selectedRailTool === "Jobs") return showJobs();
     if (selectedRailTool === "Notes") return showNotes();
+    if (selectedRailTool === "Terminal") return showTerminal();
     return undefined;
   }
 
@@ -3008,6 +3368,7 @@ export async function start({ global, document, client }) {
   if (selectedRailTool === "Files") void refreshFiles();
   if (selectedRailTool === "Jobs") void showJobs();
   if (selectedRailTool === "Notes") void showNotes();
+  if (selectedRailTool === "Terminal") void showTerminal();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -3612,7 +3973,7 @@ export async function start({ global, document, client }) {
   listen(form, "submit", async (event) => {
     event.preventDefault();
     const text = expandPastedText(input.value);
-    if (editingPreviousPrompt) return submitEditedPreviousPrompt(text);
+    if (editingPreviousPrompt) return submitEditedPreviousPrompt(skillMentionPrompt(text));
     const command = text.trim();
     if (command.startsWith("/")) {
       clearDraft();
@@ -3640,9 +4001,10 @@ export async function start({ global, document, client }) {
       showPromptError();
       return startSpecLoop(text);
     }
+    const wireText = skillMentionPrompt(text);
     if (turn.state === RUNNING && pendingFiles.length === 0 && text.trim() && command !== "!") {
       try {
-        await boundary.steer(text);
+        await boundary.steer(wireText);
         input.value = "";
         clearDraft();
         promptFailure = "";
@@ -3678,7 +4040,7 @@ export async function start({ global, document, client }) {
     showPendingAttachments();
     promptFailure = "";
     rememberPrompt(text);
-    const actions = turn.submit(text, attachments);
+    const actions = turn.submit(wireText, attachments);
     showPromptError();
     return perform(actions);
   });
@@ -4293,6 +4655,21 @@ export async function start({ global, document, client }) {
     replace(fileMenu);
   }
 
+  function mentionSkills() {
+    return (Array.isArray(settingsReply?.settings?.skills) ? settingsReply.settings.skills : [])
+      .filter((skill) => typeof skill?.name === "string" && skill.name);
+  }
+
+  function skillMentionPrompt(text) {
+    const known = new Map(mentionSkills().map((skill) => [skill.name.toLowerCase(), skill.name]));
+    const mentioned = new Set();
+    for (const match of text.matchAll(/(?:^|\s)@([^\s]+)/g)) {
+      const token = match[1].replace(/[.,;:!?)}\]]+$/, "").toLowerCase();
+      if (known.has(token)) mentioned.add(known.get(token));
+    }
+    return mentioned.size ? `${[...mentioned].map((name) => `Use the ${name} skill.`).join("\n")}\n\n${text}` : text;
+  }
+
   function fileFragmentAtCursor() {
     const cursor = input.selectionStart ?? input.value.length;
     const before = input.value.slice(0, cursor);
@@ -4303,21 +4680,25 @@ export async function start({ global, document, client }) {
   }
 
   function renderFileRows() {
-    const rows = fileMatches.map((path, index) => {
-      const button = makeButton(document, path, null, { className: `file-suggestion${index === highlightedFile ? " focused" : ""}` });
+    const rows = fileMatches.map((match, index) => {
+      const label = match.kind === "skill" ? `${match.value} · skill` : match.value;
+      const button = makeButton(document, label, null, { className: `file-suggestion${index === highlightedFile ? " focused" : ""}` });
       button.setAttribute?.("role", "option");
       button.setAttribute?.("aria-selected", String(index === highlightedFile));
       listen(button, "mousedown", (event) => event.preventDefault());
-      listen(button, "click", () => insertFileMention(path));
+      listen(button, "click", () => insertFileMention(match));
       return button;
     });
     replace(fileMenu, ...rows);
   }
 
-  function insertFileMention(path) {
+  function insertFileMention(match) {
     if (!fileFragment) return;
-    input.value = `${input.value.slice(0, fileFragment.start)}@${path} ${input.value.slice(fileFragment.end)}`;
+    const value = match.value;
+    const cursor = fileFragment.start + value.length + 2;
+    input.value = `${input.value.slice(0, fileFragment.start)}@${value} ${input.value.slice(fileFragment.end)}`;
     input.focus();
+    input.setSelectionRange?.(cursor, cursor);
     closeFileMenu();
   }
 
@@ -4334,6 +4715,9 @@ export async function start({ global, document, client }) {
     const serial = ++fileSearchSerial;
     const searchedText = input.value;
     const searchedCursor = input.selectionStart ?? input.value.length;
+    const skills = mentionSkills().filter((skill) => skill.name.toLowerCase().includes(fragment.query.toLowerCase()))
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((skill) => ({ value: skill.name, kind: "skill" }));
     try {
       const reply = await boundary.files(fragment.query);
       if (
@@ -4341,18 +4725,17 @@ export async function start({ global, document, client }) {
         || input.value !== searchedText
         || (input.selectionStart ?? input.value.length) !== searchedCursor
       ) return;
-      fileMatches = Array.isArray(reply?.files) ? reply.files : [];
+      fileMatches = [...(Array.isArray(reply?.files) ? reply.files : []).map((path) => ({ value: path, kind: "path" })), ...skills];
       if (fileMatches.length === 0) {
-        replace(fileMenu, element(document, "div", { text: "No files found." }));
+        replace(fileMenu, element(document, "div", { text: "No matching paths or skills." }));
       } else {
         renderFileRows();
       }
     } catch (error) {
       if (serial !== fileSearchSerial) return;
-      fileMatches = [];
-      replace(fileMenu, element(document, "div", {
-        text: errorText(error),
-      }));
+      fileMatches = skills;
+      if (skills.length) renderFileRows();
+      else replace(fileMenu, element(document, "div", { text: errorText(error) }));
     }
   }
 
@@ -4706,6 +5089,10 @@ export async function start({ global, document, client }) {
     }
     if (frame.kind === "event" && frame.payload?.type === "JobChanged") {
       if (jobsPaneVisible()) await showJobs();
+      return;
+    }
+    if (frame.kind === "event" && frame.payload?.type === "TerminalOutput") {
+      terminalOutput(frame.payload);
       return;
     }
     if (frame.kind === "event" && frame.payload?.type === "LoopChanged") {

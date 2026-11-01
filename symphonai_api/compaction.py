@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.model_table import compact_at_for_model, context_window_for_model
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, patch_paths
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 from symphonai_api.providers.base import tool_result_text
 
@@ -314,10 +315,10 @@ def compact_messages_for_budget(
                 paths = list(restored.get("files_changed", []))
                 for message in dropped:
                     for call in message.tool_calls:
-                        path = call.arguments.get("path")
-                        if (call.name in {"write_file", "edit_file", "multi_edit_file"}
-                                and call.id in successful and isinstance(path, str) and path not in paths):
-                            paths.append(path)
+                        changed = (patch_paths(call.arguments.get("input")) if call.name == "apply_patch"
+                                   else [call.arguments.get("path")])
+                        if call.name in FILE_EDIT_TOOLS and call.id in successful:
+                            paths.extend(path for path in changed if isinstance(path, str) and path not in paths)
                 restore = {}
                 if plan is not None:
                     restore["plan"] = plan

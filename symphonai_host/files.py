@@ -36,6 +36,11 @@ def _walk_candidates(policy: PermissionPolicy, root: Path) -> tuple[tuple[str, .
             for path in entries:
                 if path.is_dir() and not path.is_symlink():
                     if policy.check_read(path).allowed:
+                        visited += 1
+                        if visited > MAX_SEARCH_FILES:
+                            truncated = True
+                            break
+                        paths.append(path.relative_to(root).as_posix() + "/")
                         next_level.append(path)
                 elif path.is_file() and policy.check_read(path).allowed:
                     visited += 1
@@ -64,7 +69,7 @@ def _candidate_paths(policy: PermissionPolicy, root: Path) -> tuple[tuple[str, .
 
 
 def repository_files(policy: PermissionPolicy, query: str, limit: int) -> tuple[list[str], bool]:
-    """Return readable repository paths ranked for an @file query."""
+    """Return readable files and folders ranked together for an @ query."""
     root = policy.repo_root.resolve()
     paths, truncated = _candidate_paths(policy, root)
     if not query:
@@ -74,7 +79,7 @@ def repository_files(policy: PermissionPolicy, query: str, limit: int) -> tuple[
 
     def rank(path: str) -> tuple[int, int, str]:
         value = path.casefold()
-        basename = value.rsplit("/", 1)[-1]
+        basename = value.rstrip("/").rsplit("/", 1)[-1]
         if basename.startswith(needle):
             priority = 0
         elif needle in basename:

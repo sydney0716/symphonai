@@ -329,3 +329,18 @@ def agent_shell_has_no_secret_named_variables():
         code = 'import os,json; print(json.dumps([k for k in os.environ if any(s in k.upper() for s in ("KEY","SECRET","TOKEN"))]))'
         result = run_shell(ws, [sys.executable, '-c', code])
         assert result.ok and json.loads(result.content) == []
+
+
+@check('access.patch_preflights_every_path')
+def patch_preflights_every_path():
+    with workspace() as ws:
+        first = ws.root/'first.txt'
+        first.write_text('before\n')
+        assert execute(ws, 'read_file', {'path': 'first.txt'}).ok
+        for denied in ('.env', str(ws.outside/'outside.txt')):
+            patch = ('*** Begin Patch\n*** Update File: first.txt\n@@\n-before\n+after\n'
+                     f'*** Add File: {denied}\n+blocked\n*** End Patch')
+            result = execute(ws, 'apply_patch', {'input': patch})
+            assert not result.ok and denied in result.error
+            assert first.read_text() == 'before\n'
+            assert not (ws.outside/'outside.txt').exists()

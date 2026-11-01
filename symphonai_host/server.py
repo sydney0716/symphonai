@@ -58,12 +58,14 @@ from symphonai_host.run import (
     ChangedOutsideError,
     CommandActiveError,
     HostRun,
+    TerminalOutput,
     ModeSelectionError,
     NoConversationError,
     ProviderSelectionError,
     RunActiveError,
     WorktreeApplyConflict,
 )
+from symphonai_host.terminal import sessions_for
 from symphonai_host.sessions import list_sessions, prompt_history
 from symphonai_host.projects import ProjectRuntime, record_recent_project, recent_projects
 from symphonai_host.loops import LoopStore
@@ -1360,6 +1362,36 @@ class HostServer:
                     result = git_commit(host.run.policy.repo_root, message, paths)
                 return _Reply(HTTPStatus.OK, result)
 
+            def _terminals(self):
+                return sessions_for(host.run, host._current_root,
+                    lambda identifier, data, exited, code: host.broker.publish(TerminalOutput(
+                        agent_id='', run_id='',
+                        terminal_id=identifier, data=data, exited=exited, exit_code=code,
+                    )))
+
+            def _get_terminals(self, payload):
+                return _Reply(HTTPStatus.OK, {'terminals': self._terminals().list()})
+
+            def _post_terminal_start(self, payload):
+                with self._errors(0):
+                    identifier = self._terminals().start()
+                return _Reply(HTTPStatus.OK, {'id': identifier})
+
+            def _post_terminal_input(self, payload):
+                with self._errors(0):
+                    self._terminals().get(payload['id']).input(payload['data'])
+                return _Reply(HTTPStatus.OK, {'written': True})
+
+            def _post_terminal_resize(self, payload):
+                with self._errors(0):
+                    self._terminals().get(payload['id']).resize(payload['cols'], payload['rows'])
+                return _Reply(HTTPStatus.OK, {'resized': True})
+
+            def _post_terminal_stop(self, payload):
+                with self._errors(0):
+                    self._terminals().stop(payload['id'])
+                return _Reply(HTTPStatus.OK, {'stopped': True})
+
             def _post_jobs_start(self, payload):
                 with self._errors(0):
                     command = payload.get('command')
@@ -1882,6 +1914,23 @@ class HostServer:
                 match='exact',
                 payload=_Payload({'message': str, 'paths': list}, ('message', 'paths'), extra=False),
                 errors=(((ProtocolError, 'bad_request'), (ValueError, 'bad_request'), (RuntimeError, 'conflict_tail')),),
+            ),
+            _Route('GET', '/terminals', Handler._get_terminals),
+            _Route('POST', '/terminal/start', Handler._post_terminal_start,
+                payload=_Payload({}, ()),
+                errors=((((ValueError, OSError), 'bad_request'),),),
+            ),
+            _Route('POST', '/terminal/input', Handler._post_terminal_input,
+                payload=_Payload({'id': str, 'data': str}, ('id', 'data')),
+                errors=(((KeyError, 'not_found'), ((ValueError, OSError), 'bad_request')),),
+            ),
+            _Route('POST', '/terminal/resize', Handler._post_terminal_resize,
+                payload=_Payload({'id': str, 'cols': int, 'rows': int}, ('id', 'cols', 'rows')),
+                errors=(((KeyError, 'not_found'), ((ValueError, OSError), 'bad_request')),),
+            ),
+            _Route('POST', '/terminal/stop', Handler._post_terminal_stop,
+                payload=_Payload({'id': str}, ('id',)),
+                errors=(((KeyError, 'not_found'), ((ValueError, OSError), 'bad_request')),),
             ),
             _Route('POST', '/jobs/start', Handler._post_jobs_start,
                 match='exact',

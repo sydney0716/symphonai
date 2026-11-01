@@ -85,7 +85,7 @@ from symphonai_api.session import TranscriptWriter
 from symphonai_api.streaming import ReasoningDelta, StreamAssembler, TextDelta
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import call_target
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, call_target
 from symphonai_api.tools.read_ledger import ReadLedger
 
 _CUT_TOOL_CALL_ERROR = (
@@ -108,7 +108,7 @@ def _tool_result_event_fields(
     output_truncated = False
     hidden_output_tools = {
         "dispatch_subagent", "update_plan", "ask_user", "propose_plan",
-        "write_file", "edit_file", "multi_edit_file",
+        *FILE_EDIT_TOOLS,
     }
     if (
         tool_name not in hidden_output_tools
@@ -189,6 +189,8 @@ class ApiAgent:
         context_budget: Callable[[str | None], int] | None = None,
         context_overflow: Callable[[int, int | None], None] | None = None,
         context_recent_turns: int = DEFAULT_RECENT_TURNS,
+        deferrable_tools: tuple[str, ...] = (),
+        tool_history: Path | None = None,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
         if effective_max_turns is not None and effective_max_turns < 1:
@@ -242,6 +244,21 @@ class ApiAgent:
         # without this, a real provider is never told any tool exists and
         # can never call one, even if `tools` would happily execute it.
         self._tool_schemas = tool_schemas or []
+        self._all_tool_schemas = self._tool_schemas
+        self._last_request_schemas = None
+        self._tool_search = None
+        marked_names = set(deferrable_tools) | {name for name in tools if name.startswith("mcp__")}
+        if marked_names:
+            from symphonai_api.tools.tool_search import DeferredTool, SearchTools
+
+            marked = {name: tools[name] for name in marked_names if name in tools}
+            if marked:
+                if "search_tools" in tools:
+                    raise ValueError("search_tools is reserved for MCP tool discovery")
+                history = tool_history or getattr(transcript, "path", None)
+                self._tool_search = SearchTools(marked, history)
+                self._tools = {name: (DeferredTool(tool, self._tool_search) if name in marked else tool)
+                               for name, tool in tools.items()}
 
     def _write_notes_coverage(self, text, coverage, tokens) -> None:
         write_atomic(self._notes_path.with_suffix(".coverage.json"), json.dumps({
@@ -730,8 +747,26 @@ class ApiAgent:
             nonlocal response, model, effort
             from symphonai_api.models import ImageBlock, TextBlock
             for request_attempt in range(2):
+                request_tools = self._tool_schemas
+                if self._tool_search is not None:
+                    if self._tool_schemas is not self._last_request_schemas:
+                        self._all_tool_schemas = self._tool_schemas
+                    self._tool_search.restore_messages(conversation)
+                    context_budget = (self._context_budget(model) if self._context_budget is not None
+                                      else budget_for_model(self._provider.wire_format, model))
+                    request_tools = self._tool_search.request_schemas(
+                        self._all_tool_schemas, self._provider.wire_format, context_budget,
+                    )
+                    self._tool_schemas = self._last_request_schemas = request_tools
+                    if self._tool_search.active:
+                        self._tools["search_tools"] = self._tool_search
+                    else:
+                        self._tools.pop("search_tools", None)
                 compact_for_request(turn_ref)
                 request_messages = list(conversation)
+                if self._tool_search is not None and self._tool_search.active:
+                    request_messages.insert(0, Message(Role.SYSTEM,
+                        "More MCP tools are available; use search_tools to find and load them."))
                 remaining_images = 5
                 for index in range(len(request_messages) - 1, -1, -1):
                     message = request_messages[index]
@@ -752,7 +787,7 @@ class ApiAgent:
                 request = ModelRequest(
                     messages=request_messages,
                     model=model,
-                    tools=self._tool_schemas,
+                    tools=request_tools,
                     effort=effort,
                     call_class=self._call_class,
                 )

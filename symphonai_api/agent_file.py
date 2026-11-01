@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 import tomllib
 
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS
 from symphonai_api.agent_spec import (
     AgentSpec,
     ContextInheritance,
@@ -59,9 +60,7 @@ _TABLE_KEYS = {
 }
 _STANDARD_TOOL_NAMES = (
     "read_file",
-    "write_file",
-    "edit_file",
-    "multi_edit_file",
+    *sorted(FILE_EDIT_TOOLS),
     "list_files",
     "glob",
     "grep",
@@ -155,6 +154,8 @@ def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | N
                 _raise(path, key, f"unknown tool name: {name!r}")
     base = set(tools)
     denied_names = set(denied)
+    if (base - denied_names).intersection({"edit_file", "multi_edit_file"}):
+        base.add("apply_patch")
     result = tuple(
         name
         for name in _AGENT_TOOL_NAMES

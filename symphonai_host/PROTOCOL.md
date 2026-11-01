@@ -56,6 +56,7 @@ fields on a known event are ignored for forward compatibility.
 | `BackgroundUsageRecorded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str` |
 | `JobChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `job_id: str`, `status: str`, `session_id: str | null` |
 | `LoopChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `loop_id: str`, `state: str`, `change: str`, `card_id: str`, `reason: str` |
+| `TerminalOutput` | `terminal_id: str`, `data: str`, `exited: bool`, `exit_code: int | null`, plus inherited event fields; ordered per terminal and independent of conversations |
 | `FilesChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `paths: list[str]`, `truncated: bool` |
 
 `target` is a bounded display string derived from the call, not the argument
@@ -744,3 +745,32 @@ Other model fields are omitted. Name rules match saved agent definitions.
 The draft is unsaved; POST /agent remains the save operation.
 Invalid descriptions return 400, no selected provider returns 409, and invalid
 model replies or provider failures return 502 with a short, credential-free reason.
+
+
+## Person's terminal
+
+These authenticated, project-scoped routes control the person's own unsandboxed
+login shell, separate from agent commands and jobs. Its PTY starts in the
+project root with the person's environment and TERM=dumb, PAGER=cat and
+GIT_PAGER=cat. At most four shells may be open.
+
+- `POST /terminal/start {}` returns `{id}`.
+- `POST /terminal/input {id, data}` writes UTF-8 keystrokes and returns `{written: true}`.
+- `POST /terminal/resize {id, cols, rows}` sets a size from 1 to 1000 in each dimension and returns `{resized: true}`.
+- `POST /terminal/stop {id}` stops the shell and its job process groups and returns `{stopped: true}`.
+- `GET /terminals` returns `{terminals: [{id, exited, exit_code, output}]}` with a bounded output tail.
+
+Unknown terminal ids return 404; invalid input or a fifth running terminal
+returns 400. TerminalOutput events carry incremental output, followed by one
+exit event. Closing the Terminal tab stops its shell; closing the host stops
+all shells. The plain terminal view handles colours and basic line/screen
+editing, not full-screen applications such as vim or top.
+
+
+The `files` array in `GET /files?query=<text>&limit=<n>` includes readable
+folders as well as files. Folder paths end in `/`, including empty folders;
+files and folders share the same query ranking and bounded search. Choosing a
+folder inserts its path as an @ mention; the agent lists the folder itself.
+The composer's @ menu additionally offers matching configured skills after
+paths. Skill mentions add one `Use the <name> skill.` line per distinct skill,
+a blank line, then the original typed text. The app displays that typed text.

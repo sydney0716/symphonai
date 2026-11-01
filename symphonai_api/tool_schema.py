@@ -55,4 +55,7 @@ def to_provider_tool_schema(tool: LocalTool, wire_format: int) -> dict:
 
 def tool_registry_schemas(tools: dict[str, LocalTool], wire_format: int) -> list[dict]:
     """Format a whole tool registry into a list of provider-shaped schemas."""
-    return [to_provider_tool_schema(tool, wire_format) for tool in tools.values()]
+    hidden = {"apply_patch"}
+    if wire_format == 1 and "apply_patch" in tools:
+        hidden = {"edit_file", "multi_edit_file"}
+    return [to_provider_tool_schema(tool, wire_format) for tool in tools.values() if tool.name not in hidden]
