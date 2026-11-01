@@ -70,7 +70,6 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 #
 # The leader plans and delegates, so use the pro alias by default.
 DEFAULT_MODEL = "gemini-pro-latest"
-ROUTINE_MODEL = "gemini-flash-latest"
 _THOUGHTS_DISABLED: set[tuple[str, str]] = set()
 _THOUGHTS_LOCK = threading.Lock()
 
@@ -431,7 +430,6 @@ class GeminiProvider(ModelProvider):
     any error message.
     """
 
-    routine_model = ROUTINE_MODEL
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL

@@ -84,7 +84,6 @@ class ModelProvider(ABC):
 
     model: str | None = None
     base_url: str | None = None
-    routine_model: str | None = None
     fallback_models: tuple[str, ...] = ()
 
     @property

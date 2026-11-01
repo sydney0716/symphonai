@@ -84,18 +84,7 @@ from symphonai_api.models import ContentInput, Message, ModelRequest, Role, Tool
 from symphonai_api.memory_extract import MemoryExtractor
 from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
-from symphonai_api.providers.anthropic_provider import (
-    DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL,
-    AnthropicProvider,
-)
-from symphonai_api.providers.gemini_provider import (
-    DEFAULT_MODEL as GEMINI_DEFAULT_MODEL,
-    GeminiProvider,
-)
-from symphonai_api.providers.openai_provider import (
-    DEFAULT_MODEL as OPENAI_DEFAULT_MODEL,
-    OpenAIProvider,
-)
+from symphonai_api.model_table import model_capabilities
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.spec_text import spec_validation
 from symphonai_api.tools.shell import RunShellTool
@@ -235,7 +224,6 @@ def builtin_subagent_specs(
     jobs: JobManager | None = None,
     *,
     model_override: str | None = None,
-    use_routine_model: bool = False,
     role_selectors: Mapping[str, ModelSelector] | None = None,
 ) -> dict[str, AgentSpec]:
     job_tools = ("job_output", "job_stop") if jobs is not None else ()
@@ -243,15 +231,16 @@ def builtin_subagent_specs(
 
     def selector(name: str) -> ModelSelector:
         configured = None if role_selectors is None else role_selectors.get(name)
-        if configured is not None:
-            return configured
         model = model_override or provider.model
-        if model_override is None and use_routine_model and name in {
-            "worker", "explorer", "implementer", "reviewer",
-        }:
-            routine_model = provider.routine_model
-            model = routine_model or model
-        return ModelSelector(provider=provider_name, model=model)
+        if configured is not None:
+            model = configured.model or (model if configured.provider == provider_name else None)
+            if configured.effort is not None:
+                return replace(configured, model=model)
+            return replace(configured, model=model, effort=_default_effort(
+                provider, model, "low", provider_name=configured.provider,
+            ))
+        return ModelSelector(provider=provider_name, model=model,
+                             effort=_default_effort(provider, model, "low"))
 
     specs = {
         name: AgentSpec(
@@ -301,14 +290,16 @@ def builtin_subagent_specs(
     return specs
 
 
-def _provider_default_model(provider: ModelProvider) -> str | None:
-    if isinstance(provider, AnthropicProvider):
-        return ANTHROPIC_DEFAULT_MODEL
-    if isinstance(provider, OpenAIProvider):
-        return OPENAI_DEFAULT_MODEL
-    if isinstance(provider, GeminiProvider):
-        return GEMINI_DEFAULT_MODEL
-    return getattr(provider, "DEFAULT_MODEL", None)
+def _default_effort(provider: ModelProvider, model: str | None, level: str,
+                    *, provider_name: str | None = None) -> str | None:
+    capability = next((item for item in model_capabilities()
+                       if item.model == model and (
+                           item.wire_format == provider.wire_format
+                           if provider_name is None or provider_name == provider.name
+                           else item.provider == provider_name
+                       )), None)
+    return level if capability is not None and any(option.id == level for option in capability.efforts) else None
+
 
 class _LeaderEventSink:
     """Fan out events and preserve parent identity for subagent spawning."""
@@ -745,23 +736,25 @@ class DispatchSubagentTool(LocalTool):
 
     def _spec_for(self, subagent_name: str) -> AgentSpec | None:
         if self._subagent_specs is not None:
-            return self._subagent_specs.get(subagent_name)
+            spec = self._subagent_specs.get(subagent_name)
+            if spec is not None and spec.model.effort is None:
+                model = spec.model.model or (
+                    self._subagent_provider.model
+                    if spec.model.provider == self._subagent_provider.name else None
+                )
+                return replace(spec, model=replace(spec.model, effort=_default_effort(
+                    self._subagent_provider, model, "low", provider_name=spec.model.provider,
+                )))
+            return spec
         provider_name = self._subagent_provider.name or "unknown"
         model = self._subagent_provider.model
-        if (
-            subagent_name in {"worker", "explorer", "implementer", "reviewer"}
-            and model == _provider_default_model(self._subagent_provider)
-        ):
-            model = (
-                self._subagent_provider.routine_model
-                or model
-            )
         return AgentSpec(
             name=subagent_name,
             prompt="",
             model=ModelSelector(
                 provider=provider_name,
                 model=model,
+                effort=_default_effort(self._subagent_provider, model, "low"),
             ),
             policy_ceiling=self._leader_policy,
             tool_names=self._subagent_tool_names,
@@ -1820,10 +1813,15 @@ class Leader:
             else defined_leader.model.model
         )
         self._leader_effort = (
-            config.leader_effort
-            if defined_leader is None or defined_leader.model.effort is None
-            else defined_leader.model.effort
+            defined_leader.model.effort
+            if defined_leader is not None and defined_leader.model.effort is not None
+            else None if is_loop_stage else config.leader_effort
         )
+        if self._leader_effort is None:
+            self._leader_effort = _default_effort(
+                config.leader_provider, self._leader_model or config.leader_provider.model,
+                "low" if is_loop_stage else "medium",
+            )
         self._leader_run: AgentRun | None = None
         self._control_lock = threading.RLock()
         self._dispatch_tool = DispatchSubagentTool(

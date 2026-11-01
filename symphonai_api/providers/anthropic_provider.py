@@ -56,7 +56,6 @@ from symphonai_api.streaming import (
 API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_MODEL = "claude-opus-5-5"
-ROUTINE_MODEL = "claude-sonnet-5-5"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 32000
 DEFAULT_STREAM_MAX_TOKENS = 32000
@@ -575,7 +574,6 @@ class AnthropicProvider(ModelProvider):
     never logged, and never included in any error message.
     """
 
-    routine_model = ROUTINE_MODEL
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL

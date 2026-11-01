@@ -53,7 +53,6 @@ from symphonai_api.streaming import (
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-6.1-sol"
-ROUTINE_MODEL = "gpt-6.1-sol"
 
 _ROLE_TO_OPENAI = {
     Role.SYSTEM: "system",
@@ -550,7 +549,6 @@ class OpenAIProvider(ModelProvider):
     never logged, and never included in any error message.
     """
 
-    routine_model = ROUTINE_MODEL
 
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL

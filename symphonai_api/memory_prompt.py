@@ -88,6 +88,9 @@ There are several discrete types of memory that you can store in your memory sys
 
 ## What NOT to save in memory
 
+- Tool errors, failed commands, sandbox refusals, and other environment or
+  harness failures seen in this conversation describe a moment, not the project.
+  Save one only when the person states it as a lasting fact.
 - Code patterns, conventions, architecture, file paths, or project structure;
   these can be derived from the current project state.
 - Git history, recent changes, or who changed what; git history is

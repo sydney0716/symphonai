@@ -1682,7 +1682,6 @@ class HostRun:
             lsp=self._lsp,
             jobs=jobs,
             model_override=self._model,
-            use_routine_model=self._model is None,
             role_selectors=role_selectors,
         )
         if self._extensions is not None:
@@ -1747,8 +1746,7 @@ class HostRun:
         leader_effort = self._effort
         if isinstance(role, str) and role in roster:
             roster["leader"] = roster[role]
-            if role in role_selectors:
-                leader_effort = role_selectors[role].effort
+            leader_effort = roster[role].model.effort
         defined_leader = roster.get("leader")
         leader_base_prompt = self._base_prompt
         if not isinstance(role, str) or role not in roster:
