@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import threading
 from collections.abc import Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
@@ -41,6 +42,7 @@ from symphonai_api.events import (
     RunFinished,
     RunStarted,
     CompactionApplied,
+    SessionNotesUpdated,
     ToolCallFailed,
     ToolCallFinished,
     ToolCallStarted,
@@ -67,6 +69,7 @@ from symphonai_api.models import (
     ToolCall,
     ToolResult,
 )
+from symphonai_api.paths import write_atomic
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import (
     ContextLengthExceededError,
@@ -182,6 +185,7 @@ class ApiAgent:
         stream: bool = False,
         read_ledger: ReadLedger | None = None,
         model_summary: bool = False,
+        session_notes: Path | None = None,
         context_budget: Callable[[str | None], int] | None = None,
         context_overflow: Callable[[int, int | None], None] | None = None,
         context_recent_turns: int = DEFAULT_RECENT_TURNS,
@@ -203,6 +207,32 @@ class ApiAgent:
         self._stream = stream
         self._read_ledger = read_ledger
         self._model_summary = model_summary
+        self._notes_path = session_notes
+        self._notes_lock = threading.Lock()
+        self._notes_thread: threading.Thread | None = None
+        self._notes_cancel: CancellationToken | None = None
+        self._notes_closed = False
+        self._notes_text = ""
+        self._notes_coverage: tuple[str, ...] = ()
+        self._notes_tokens = 0
+        self._notes_calls = 0
+        self._notes_last_calls = 0
+        self._notes_usage: list[tuple[str, UsageTotals]] = []
+        if session_notes is not None:
+            try:
+                with session_notes.open(encoding="utf-8", newline="") as source:
+                    text = source.read(48001)
+                if text.strip() and len(text) <= 48000:
+                    self._notes_text = text
+                    state = json.loads(session_notes.with_suffix(".coverage.json").read_text(encoding="utf-8"))
+                    if (state.get("notes_digest") == hashlib.sha256(text.encode("utf-8")).hexdigest()
+                            and isinstance(state.get("messages"), list)
+                            and all(isinstance(item, str) for item in state["messages"])
+                            and type(state.get("tokens")) is int):
+                        self._notes_coverage = tuple(state["messages"])
+                        self._notes_tokens = state["tokens"]
+            except (OSError, UnicodeError, ValueError, AttributeError):
+                pass
         self._context_budget = context_budget
         self._context_overflow = context_overflow
         self._context_recent_turns = context_recent_turns
@@ -212,6 +242,175 @@ class ApiAgent:
         # without this, a real provider is never told any tool exists and
         # can never call one, even if `tools` would happily execute it.
         self._tool_schemas = tool_schemas or []
+
+    def _write_notes_coverage(self, text, coverage, tokens) -> None:
+        write_atomic(self._notes_path.with_suffix(".coverage.json"), json.dumps({
+            "notes_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "messages": coverage, "tokens": tokens,
+        }))
+
+    def close_session_notes(self) -> None:
+        with self._notes_lock:
+            self._notes_closed = True
+            if self._notes_cancel is not None:
+                self._notes_cancel.cancel()
+            thread = self._notes_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+
+    def _session_notes_boundary(self, conversation, model, effort, run_id, calls, usage_by_model, record_usage):
+        if self._notes_path is None:
+            return
+        with self._notes_lock:
+            for key, usage in self._notes_usage:
+                usage_by_model[key] = usage_by_model.get(key, UsageTotals()).merged(usage)
+            self._notes_usage.clear()
+            self._notes_calls += calls
+            tokens = estimate_messages_tokens(conversation)
+            if (self._notes_closed or (self._notes_thread is not None and self._notes_thread.is_alive())
+                    or tokens < 10000
+                    or (self._notes_text and (tokens - self._notes_tokens < 5000
+                                             or self._notes_calls - self._notes_last_calls < 3))):
+                return
+            snapshot = tuple(conversation)
+            current_notes = self._notes_text
+            call_count = self._notes_calls
+            token = CancellationToken()
+            self._notes_cancel = token
+            provider = self._provider
+            tools = list(self._tool_schemas)
+            path = self._notes_path
+
+            def update():
+                from symphonai_api.models import ImageBlock, TextBlock
+                try:
+                    # Match normal requests' latest-image policy without rewriting the snapshot.
+                    request_messages = list(snapshot)
+                    remaining = 5
+                    for index in range(len(request_messages) - 1, -1, -1):
+                        content = list(request_messages[index].content)
+                        changed = False
+                        for block_index in range(len(content) - 1, -1, -1):
+                            if isinstance(content[block_index], ImageBlock):
+                                if remaining:
+                                    remaining -= 1
+                                else:
+                                    content[block_index] = TextBlock(
+                                        "[an earlier image was removed from context; ask the person to attach it again if you need it]")
+                                    changed = True
+                        if changed:
+                            request_messages[index] = replace(request_messages[index], content=content)
+                    instructions = (
+                        "Update this session's running notes from the conversation above. "
+                        "Return the complete replacement notes in Markdown only; do not call tools. "
+                        "Keep them under about 12,000 tokens, condensing older entries to stay there. "
+                        "Use these sections: Current state (in progress, next steps); Task (the person's "
+                        "request and decisions); Files and functions; Commands; Errors and corrections; "
+                        "Learnings; Key results (exact outputs the person asked for); Work log (terse)."
+                        "\n\nCurrent notes:\n" + current_notes
+                    )
+                    response = provider.create_response(ModelRequest(
+                        messages=[*request_messages, Message(Role.USER, instructions)],
+                        model=model, effort=effort, tools=tools, call_class=CallClass.BACKGROUND,
+                    ), cancel=token)
+                    key = model or provider.model or "unknown"
+                    threshold = long_context_threshold(provider.wire_format, key)
+                    usage = UsageTotals.from_usage(response.usage,
+                        long_context=threshold is not None and response.usage.input_tokens > threshold)
+                    record_usage(key, usage, turn_id=None)
+                    with self._notes_lock:
+                        self._notes_usage.append((key, usage))
+                    text = response.message.text
+                    if response.has_tool_calls or response.stop_reason == "refusal" or not text.strip() or len(text) > 48000:
+                        return
+                    with self._notes_lock:
+                        if self._notes_closed or token.cancelled:
+                            return
+                        coverage = tuple(_message_digest(message) for message in snapshot)
+                        # A hash mismatch after an interrupted pair of atomic writes fails closed.
+                        self._write_notes_coverage(text, coverage, tokens)
+                        write_atomic(path, text)
+                        self._notes_text = text
+                        self._notes_coverage = coverage
+                        self._notes_tokens = tokens
+                        self._notes_last_calls = call_count
+                    emit(self._events, SessionNotesUpdated(
+                        agent_id=self._agent_ref.agent_id, run_id=run_id,
+                        session_id=path.parent.name,
+                    ))
+                except Exception:
+                    # A failed background update must leave the turn and old notes intact.
+                    pass
+                finally:
+                    token.close()
+
+            self._notes_thread = threading.Thread(target=update, name="session-notes", daemon=True)
+            self._notes_thread.start()
+
+    def _compaction_recent_files(self, conversation: list[Message]) -> list[tuple[str, str]]:
+        recent_files = []
+        if self._read_ledger is not None:
+            read_paths = {str((self._policy.repo_root / call.arguments["path"]).resolve())
+                          for message in conversation for call in message.tool_calls
+                          if call.name == "read_file" and isinstance(call.arguments.get("path"), str)}
+            for message in conversation:
+                if message.text.startswith("Restored after compaction:\n"):
+                    try:
+                        state = json.loads(message.text.split("\n", 1)[1])
+                    except ValueError:
+                        continue
+                    if isinstance(state, dict):
+                        read_paths.update(str((self._policy.repo_root / item["path"]).resolve())
+                                          for item in state.get("recent_files", []))
+            with self._read_ledger._lock:
+                paths = [path for path in reversed(self._read_ledger._records)
+                         if str(path) in read_paths][:5]
+            for path in paths:
+                if not self._policy.check_read(path).allowed:
+                    continue
+                try:
+                    with path.open(encoding="utf-8") as source:
+                        content = source.read(20001)
+                    label = str(path.relative_to(self._policy.repo_root.resolve()))
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                recent_files.append((label, content))
+
+        return recent_files
+
+    def _compaction_notes_summary(self, conversation: list[Message], dropped: list[Message],
+                                  *, cancel: CancellationToken | None = None) -> str | None:
+        if self._notes_path is not None:
+            with self._notes_lock:
+                thread = self._notes_thread
+            deadline = time.monotonic() + 15
+            while thread is not None and thread.is_alive() and time.monotonic() < deadline:
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                thread.join(min(0.05, max(0, deadline - time.monotonic())))
+            with self._notes_lock:
+                covered = set()
+                for digest, message in zip(self._notes_coverage, conversation):
+                    if digest != _message_digest(message):
+                        break
+                    covered.add(id(message))
+                if self._notes_text and all(id(message) in covered for message in dropped):
+                    return self._notes_text
+        return None
+
+    def _compaction_notes_rebased(self, messages: list[Message], before_tokens: int,
+                                  after_tokens: int, notes_summary: str | None) -> None:
+        if self._notes_path is not None:
+            with self._notes_lock:
+                if notes_summary is not None and notes_summary == self._notes_text and any(message.text == (
+                    "Summary of the earlier conversation, written when it was compacted:\n\n" + notes_summary
+                ) for message in messages):
+                    self._notes_coverage = tuple(_message_digest(message) for message in messages)
+                self._notes_tokens = max(0, self._notes_tokens - (before_tokens - after_tokens))
+                try:
+                    self._write_notes_coverage(self._notes_text, self._notes_coverage, self._notes_tokens)
+                except OSError:
+                    pass
 
     @property
     def agent_ref(self) -> AgentRef:
@@ -369,8 +568,15 @@ class ApiAgent:
                 self._context_recent_turns if recent_turns is None else recent_turns
             )
             before = estimate_messages_tokens(conversation)
+            recent_files = self._compaction_recent_files(conversation)
+
+            notes_summary = None
 
             def summarize(dropped: list[Message]) -> str:
+                nonlocal notes_summary
+                notes_summary = self._compaction_notes_summary(conversation, dropped, cancel=cancel)
+                if notes_summary is not None:
+                    return notes_summary
                 summary_request = ModelRequest(
                     messages=[
                         Message(role=Role.SYSTEM, content=MODEL_SUMMARY_PROMPT),
@@ -409,7 +615,8 @@ class ApiAgent:
                         recent_turns=keep_turns,
                         assistant_turn_window=assistant_turn_window,
                         cancel=cancel,
-                        summarize=summarize if self._model_summary else None,
+                        recent_files=recent_files,
+                        summarize=summarize if self._model_summary or self._notes_path is not None else None,
                     )
                     break
                 except ContextCompactionError as exc:
@@ -433,6 +640,7 @@ class ApiAgent:
                 )
             persist_messages(rewritten, rewritten=True)
             conversation[:] = rewritten
+            self._compaction_notes_rebased(rewritten, before, result.after_tokens, notes_summary)
             append_record(
                 "compaction",
                 turn_id=turn_id,
@@ -520,10 +728,29 @@ class ApiAgent:
 
         def request_response(turn_ref: TurnRef) -> str:
             nonlocal response, model, effort
+            from symphonai_api.models import ImageBlock, TextBlock
             for request_attempt in range(2):
                 compact_for_request(turn_ref)
+                request_messages = list(conversation)
+                remaining_images = 5
+                for index in range(len(request_messages) - 1, -1, -1):
+                    message = request_messages[index]
+                    content = list(message.content)
+                    changed = False
+                    for block_index in range(len(content) - 1, -1, -1):
+                        if not isinstance(content[block_index], ImageBlock):
+                            continue
+                        if remaining_images:
+                            remaining_images -= 1
+                        else:
+                            content[block_index] = TextBlock(
+                                "[an earlier image was removed from context; ask the person to attach it again if you need it]"
+                            )
+                            changed = True
+                    if changed:
+                        request_messages[index] = replace(message, content=content)
                 request = ModelRequest(
-                    messages=list(conversation),
+                    messages=request_messages,
                     model=model,
                     tools=self._tool_schemas,
                     effort=effort,
@@ -980,6 +1207,8 @@ class ApiAgent:
                 record_response_usage(turn_ref, used_model)
                 refused = handle_response(turn_ref)
                 if not response.has_tool_calls:
+                    self._session_notes_boundary(conversation, model, effort, run_ref.run_id, 0,
+                                                 usage_by_model, record_usage)
                     finish_turn(turn_ref)
                     if not refused and run is not None:
                         run_limit = run.budget.max_turns
@@ -999,6 +1228,8 @@ class ApiAgent:
                     append_redirects(close=True)
                     return finish_run(response, "refused" if refused else "final_response", turn)
                 run_tools(turn_ref)
+                self._session_notes_boundary(conversation, model, effort, run_ref.run_id,
+                                             len(response.message.tool_calls), usage_by_model, record_usage)
                 # Checked once every batch of this turn has been answered, not
                 # between batches: a stop with a tool call still outstanding
                 # would return a conversation no provider will accept, and

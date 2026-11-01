@@ -233,6 +233,7 @@ def compact_messages_for_budget(
     cancel: CancellationToken | None = None,
     summarize: Callable[[list[Message]], str] | None = None,
     force: bool = False,
+    recent_files: list[tuple[str, str]] | None = None,
 ) -> CompactionResult:
     """Compact a conversation if it exceeds `budget`, or when `force` is true.
 
@@ -291,6 +292,43 @@ def compact_messages_for_budget(
                 recent = [compacted[index] for index in range(recent_start, len(compacted))]
                 # Summaries retain the original content, before microcompaction clears it.
                 dropped = [original[index] for index in dropped_indices]
+                # Replace the prior restoration rather than accumulating stale file bodies.
+                restored = {}
+                for message in original:
+                    if message.role == Role.SYSTEM and message.text.startswith("Restored after compaction:\n"):
+                        try:
+                            state = json.loads(message.text.split("\n", 1)[1])
+                            if isinstance(state, dict):
+                                restored = state
+                        except (ValueError, TypeError):
+                            pass
+                prefix = [message for message in prefix
+                          if not message.text.startswith("Restored after compaction:\n")]
+                plan = restored.get("plan")
+                for message in original:
+                    for call in message.tool_calls:
+                        if call.name == "update_plan":
+                            plan = call.arguments
+                successful = {message.tool_result.tool_call_id for message in original
+                              if message.tool_result is not None and message.tool_result.ok}
+                paths = list(restored.get("files_changed", []))
+                for message in dropped:
+                    for call in message.tool_calls:
+                        path = call.arguments.get("path")
+                        if (call.name in {"write_file", "edit_file", "multi_edit_file"}
+                                and call.id in successful and isinstance(path, str) and path not in paths):
+                            paths.append(path)
+                restore = {}
+                if plan is not None:
+                    restore["plan"] = plan
+                if paths:
+                    restore["files_changed"] = paths[:30]
+
+                def restore_message(state):
+                    return Message(Role.SYSTEM, "Restored after compaction:\n"
+                                   + json.dumps(state, ensure_ascii=False, indent=2))
+
+                mandatory = [restore_message(restore)] if restore else []
                 selected = None
                 if summarize is not None:
                     try:
@@ -309,6 +347,7 @@ def compact_messages_for_budget(
                                     + summary_text
                                 ),
                             ),
+                            *mandatory,
                             *recent,
                         ]
                         if estimate_messages_tokens(candidate) <= budget:
@@ -317,18 +356,42 @@ def compact_messages_for_budget(
                 if selected is None:
                     for max_summary_chars in (800, 320, 120, 0):
                         candidate = list(prefix)
-                        if max_summary_chars > 0:
+                        if max_summary_chars > 0 or mandatory or recent_files:
                             candidate.append(Message(
                                 role=Role.SYSTEM,
-                                content=_summarize_dropped_messages(dropped, max_chars=max_summary_chars),
+                                content=_summarize_dropped_messages(dropped, max_chars=max_summary_chars or 40),
                             ))
+                        candidate.extend(mandatory)
                         candidate.extend(recent)
                         if estimate_messages_tokens(candidate) <= budget:
                             selected = candidate
-                            summary_messages = int(max_summary_chars > 0)
+                            summary_messages = int(max_summary_chars > 0 or bool(mandatory) or bool(recent_files))
                             break
                 if selected is None:
                     raise _impossible_error(before_tokens, budget, recent_turns)
+                # Disk contents are supplied by the loop, newest read first.
+                full_reads = {call.id: call.arguments.get("path") for message in recent
+                              for call in message.tool_calls if call.name == "read_file"}
+                for path, content in (recent_files or [])[:5]:
+                    rendered = "\n".join(f"{index}\t{line}" for index, line in enumerate(content.splitlines(), 1))
+                    if any(message.tool_result is not None and message.tool_result.ok
+                           and full_reads.get(message.tool_result.tool_call_id) == path
+                           and message.tool_result.content in (content, rendered)
+                           for message in recent):
+                        continue
+                    if estimate_text_tokens(content) > 5000:
+                        content = content[:20000] + "\n[truncated at 5,000 estimated tokens]"
+                    state = {**restore, "recent_files": [*restore.get("recent_files", []),
+                                                        {"path": path, "content": content}]}
+                    insertion = len(prefix) + summary_messages
+                    candidate = list(selected)
+                    if restore:
+                        candidate[insertion] = restore_message(state)
+                    else:
+                        candidate.insert(insertion, restore_message(state))
+                    if estimate_messages_tokens(candidate) <= budget:
+                        selected = candidate
+                        restore = state
                 compacted = selected
                 after_tokens = estimate_messages_tokens(compacted)
                 dropped_messages = len(dropped)

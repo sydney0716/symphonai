@@ -130,7 +130,7 @@ const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
 const DIFF_MODE_KEY = "symphonai.diff-mode";
 const SIDEBAR_SESSION_LIMIT = 200;
-const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop"];
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop", "Notes"];
 const RAIL_TOOL_ICONS = Object.freeze({
   Agents: "icon-tool-agents",
   Roadmap: "icon-tool-roadmap",
@@ -138,6 +138,7 @@ const RAIL_TOOL_ICONS = Object.freeze({
   Files: "icon-tool-files",
   Jobs: "icon-tool-jobs",
   Loop: "icon-tool-loop",
+  Notes: "icon-tool-notes",
 });
 
 function storedRail(global) {
@@ -215,12 +216,15 @@ export async function start({ global, document, client }) {
   const jobsRoot = element(document, "div", { className: "rail-pane jobs-pane" });
   jobsRoot.setAttribute("role", "tabpanel");
   jobsRoot.hidden = true;
+  const notesRoot = element(document, "div", { className: "rail-pane notes-pane" });
+  notesRoot.setAttribute("role", "tabpanel");
+  notesRoot.hidden = true;
   const loopsRoot = element(document, "div", { className: "rail-pane loop-pane" });
   loopsRoot.setAttribute("role", "tabpanel");
   loopsRoot.hidden = true;
   const railTabsRoot = document.getElementById("rail-tabs");
   const railToolsRoot = document.getElementById("rail-tools");
-  railToolsRoot.before(jobsRoot, loopsRoot);
+  railToolsRoot.before(jobsRoot, loopsRoot, notesRoot);
   let { open: openRailTools, selected: selectedRailTool } = storedRail(global);
   let loops = [];
   let selectedLoopId = "";
@@ -889,6 +893,52 @@ export async function start({ global, document, client }) {
     }
   }
 
+  let notesRequest = 0;
+
+  function refreshOpenNotes() {
+    if (selectedRailTool === "Notes") return showNotes();
+    return undefined;
+  }
+
+  async function showNotes() {
+    if (selectedRailTool !== "Notes" || showRailTools) return;
+    const request = ++notesRequest;
+    const sessionId = currentSessionId;
+    replace(notesRoot, element(document, "h1", { text: "Notes" }));
+    const empty = "No notes yet. The leader starts notes once the conversation is long.";
+    if (!sessionId) {
+      append(notesRoot, element(document, "p", { text: empty }));
+      return;
+    }
+    try {
+      const reply = await boundary.sessionNotes(sessionId);
+      if (request !== notesRequest || sessionId !== currentSessionId || selectedRailTool !== "Notes") return;
+      if (!reply.text) {
+        append(notesRoot, element(document, "p", { text: empty }));
+        return;
+      }
+      const updatedAt = Date.parse(reply.updated_at);
+      if (Number.isFinite(updatedAt)) {
+        const updated = new Date(updatedAt);
+        const time = updated.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+        const label = updated.toDateString() === new Date().toDateString()
+          ? time
+          : `${updated.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${time}`;
+        append(notesRoot, element(document, "p", {
+          className: "activity-output-label", text: `Updated ${label}`,
+        }));
+      }
+      const body = element(document, "div", { className: "assistant" });
+      append(body, ...renderMarkdownBlocks(document, reply.text, parseMarkdown, { highlight }));
+      append(notesRoot, body);
+    } catch (error) {
+      if (request !== notesRequest || sessionId !== currentSessionId || selectedRailTool !== "Notes") return;
+      append(notesRoot, element(document, "p", {
+        className: "error", text: `Could not load notes: ${errorText(error)}`,
+      }));
+    }
+  }
+
   async function showJobs() {
     if (!jobsPaneVisible()) {
       updateJobsPolling([]);
@@ -1508,6 +1558,7 @@ export async function start({ global, document, client }) {
     const previousId = currentSessionId;
     transcript.reset();
     currentSessionId = runId;
+    void refreshOpenNotes();
     transcript.setSessionId(currentSessionId);
     restoreDraft();
     showProjects();
@@ -1521,6 +1572,7 @@ export async function start({ global, document, client }) {
     } catch (error) {
       transcript.restore(previous);
       currentSessionId = previousId;
+      void refreshOpenNotes();
       transcript.setSessionId(currentSessionId);
       restoreDraft();
       showProjects();
@@ -1781,6 +1833,7 @@ export async function start({ global, document, client }) {
         closeAgentView();
         transcript.reset();
         currentSessionId = null;
+        void refreshOpenNotes();
         transcript.setSessionId(null);
         clearConversationAgents();
         currentMode = launchMode;
@@ -1815,6 +1868,7 @@ export async function start({ global, document, client }) {
       await boundary.newSession();
       transcript.reset();
       currentSessionId = null;
+      void refreshOpenNotes();
       transcript.setSessionId(null);
       restoreDraft();
       showProjects();
@@ -2172,7 +2226,7 @@ export async function start({ global, document, client }) {
         promptFailure = "You can attach up to 10 files.";
         break;
       }
-      if (file.size > 5_000_000) {
+      if (file.size > 5_000_000 && !["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
         promptFailure = `${file.name || "File"} is over the 5,000,000 byte limit.`;
         continue;
       }
@@ -2189,7 +2243,33 @@ export async function start({ global, document, client }) {
 
   async function encodePendingFiles() {
     return Promise.all(pendingFiles.map(async (file) => {
-      const bytes = new Uint8Array(await file.arrayBuffer());
+      let source = file;
+      if (["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+        let bitmap;
+        try {
+          bitmap = await (global.createImageBitmap ?? globalThis.createImageBitmap)(file);
+          const longest = Math.max(bitmap.width, bitmap.height);
+          if (longest > 1568) {
+            const canvas = document.createElement("canvas");
+            const scale = 1568 / longest;
+            canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+            canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+            canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            const resized = await new Promise((resolve) => canvas.toBlob(resolve, file.type, 0.9));
+            if (resized && (resized.type === file.type || (file.type === "image/webp" && resized.type === "image/png"))) {
+              source = resized;
+            }
+          }
+        } catch {
+          // Undecodable images retain their original bytes.
+        } finally {
+          bitmap?.close?.();
+        }
+      }
+      if (source.size > 5_000_000) {
+        throw new Error(`${file.name || "File"} is over the 5,000,000 byte limit.`);
+      }
+      const bytes = new Uint8Array(await source.arrayBuffer());
       let binary = "";
       for (let offset = 0; offset < bytes.length; offset += 0x8000) {
         binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
@@ -2873,7 +2953,7 @@ export async function start({ global, document, client }) {
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
-    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot };
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot, Notes: notesRoot };
     for (const [name, pane] of Object.entries(panes)) {
       pane.hidden = showRailTools || name !== selectedRailTool;
     }
@@ -2895,6 +2975,7 @@ export async function start({ global, document, client }) {
     if (name === "Loop") return loadLoops();
     if (name === "Changes") return changed || changesDirty ? showChanges() : undefined;
     if (name === "Files") return changed || filesDirty ? refreshFiles() : undefined;
+    if (name === "Notes") return showNotes();
     if (!changed) return undefined;
     if (name === "Jobs") return showJobs();
     return undefined;
@@ -2915,6 +2996,7 @@ export async function start({ global, document, client }) {
     renderRail();
     if (selectedRailTool === "Changes") return showChanges();
     if (selectedRailTool === "Jobs") return showJobs();
+    if (selectedRailTool === "Notes") return showNotes();
     return undefined;
   }
 
@@ -2925,6 +3007,7 @@ export async function start({ global, document, client }) {
   if (selectedRailTool === "Changes") void showChanges();
   if (selectedRailTool === "Files") void refreshFiles();
   if (selectedRailTool === "Jobs") void showJobs();
+  if (selectedRailTool === "Notes") void showNotes();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -3434,6 +3517,7 @@ export async function start({ global, document, client }) {
           } else {
             if (!currentSessionId && typeof reply?.run_id === "string") {
               currentSessionId = reply.run_id;
+              void refreshOpenNotes();
               transcript.setSessionId(currentSessionId);
               showProjects();
             }
@@ -4518,7 +4602,7 @@ export async function start({ global, document, client }) {
       document,
       refreshConversation,
       get currentSessionId() { return currentSessionId; },
-      set currentSessionId(value) { currentSessionId = value; },
+      set currentSessionId(value) { currentSessionId = value; void refreshOpenNotes(); },
       get specMode() { return specMode; },
       set specMode(value) { specMode = value; },
       get conversation() { return conversation; },
@@ -4614,6 +4698,10 @@ export async function start({ global, document, client }) {
       }
       await approvals.onFrame(frame);
       showApprovals();
+      return;
+    }
+    if (frame.kind === "event" && frame.payload?.type === "SessionNotesUpdated") {
+      if (frame.payload.session_id === currentSessionId) await refreshOpenNotes();
       return;
     }
     if (frame.kind === "event" && frame.payload?.type === "JobChanged") {

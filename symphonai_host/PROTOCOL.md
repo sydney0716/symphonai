@@ -46,6 +46,7 @@ fields on a known event are ignored for forward compatibility.
 | `PermissionDenied` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `tool_name: str`, `tool_call_id: str`, `reason: str` |
 | `SessionStarted` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_run_id: str` |
 | `SessionEnded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_run_id: str` |
+| `SessionNotesUpdated` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str`; emitted after atomic replacement of the conversation leader's notes.md |
 | `SubagentSpawned` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `SubagentStopped` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str` |
 | `SubagentNotice` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `subagent_name: str`, `subagent_agent_id: str`, `kind: "finished" | "progress" | "question" | "message"`, `text: str` (finished: the delivered blocking result as JSON; otherwise the message text) |
@@ -308,6 +309,13 @@ already open reuses its leader. At most four conversations may run at once; a
 fifth start returns `409` with `{"error": "4 conversations are already running"}`.
 Busy checks concern the current conversation. `POST /stop` stops only the
 current conversation; open another one first to stop its run.
+
+`GET /session/notes?session_id=<id>` returns
+`{"text": <Markdown notes>, "updated_at": <ISO UTC time>}` for an existing
+session, or `{"text": "", "updated_at": null}` before notes exist. Unknown
+sessions and malformed session ids return `404` (`not_found`). Notes are
+read-only. The conversation leader publishes `SessionNotesUpdated` after an
+atomic notes write; clients may reload this route for that session.
 
 `GET /session/agent?session_id=<id>&agent_id=<id>` returns
 `{"session_id": <id>, "agent_id": <id>, "messages": [...]}` for one

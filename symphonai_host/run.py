@@ -27,7 +27,7 @@ from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
 from symphonai_api.config import permission_grants, restrict_permission_grants, resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
-from symphonai_api.events import Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SubagentSpawned, fan_out
+from symphonai_api.events import Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SessionNotesUpdated, SubagentSpawned, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.environment import capture_environment
 from symphonai_api.identity import new_id
@@ -1838,7 +1838,10 @@ class HostRun:
                 chat_recent_turns=self._chat_recent_turns,
                 permission_mode=policy.mode,
                 approval_callback=approvals.callback,
-                events=lambda event: self._publish_active(event),
+                events=lambda event: (
+                    self._broker.publish(event) if isinstance(event, SessionNotesUpdated)
+                    else self._publish_active(event)
+                ),
                 extensions=self._extensions,
                 stream=True,
                 result_store=result_store,
@@ -1848,6 +1851,7 @@ class HostRun:
                 leader_model=leader_model,
                 leader_effort=leader_effort,
                 model_summary=True,
+                session_notes=None if "spec_run" in meta else session.directory / "notes.md",
                 subagent_specs=roster,
                 subagent_budget=self._subagent_budget,
                 hook_runner=self._hooks,
@@ -2171,6 +2175,27 @@ class HostRun:
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
         }
+
+    def session_notes(self, session_id: str) -> dict:
+        """Read a session's notes without changing the session or publishing events."""
+        if re.fullmatch(r"run_[0-9a-f]{32}", session_id) is None:
+            raise SessionError("session not found")
+        reader = SessionStore.open(self._sessions_root, session_id)
+        try:
+            path = reader.directory / "notes.md"
+            if path.is_symlink():
+                raise SessionError("session notes not found")
+            try:
+                with path.open(encoding="utf-8") as source:
+                    text = source.read()
+                    updated_at = datetime.fromtimestamp(os.fstat(source.fileno()).st_mtime, timezone.utc).isoformat()
+            except FileNotFoundError:
+                return {"text": "", "updated_at": None}
+            except (OSError, UnicodeError) as exc:
+                raise SessionError("session notes unavailable") from exc
+            return {"text": text, "updated_at": updated_at}
+        finally:
+            reader.close()
 
     def agent_history(self, session_id: str, agent_id: str) -> dict:
         """Return one subagent's display-safe transcript without publishing it."""

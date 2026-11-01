@@ -301,6 +301,11 @@ export function createClient({
       return post("session/open", { run_id: runId });
     },
 
+    sessionNotes(sessionId) {
+      const query = new URLSearchParams({ session_id: sessionId });
+      return request("GET", `/session/notes?${query}`);
+    },
+
     agentHistory(sessionId, agentId) {
       const query = new URLSearchParams({ session_id: sessionId, agent_id: agentId });
       return request("GET", `/session/agent?${query}`);

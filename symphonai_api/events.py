@@ -131,6 +131,11 @@ class SessionEnded(Event):
 
 
 @dataclass(frozen=True)
+class SessionNotesUpdated(Event):
+    session_id: str = ""
+
+
+@dataclass(frozen=True)
 class SubagentSpawned(Event):
     subagent_name: str = ""
     subagent_agent_id: str = ""

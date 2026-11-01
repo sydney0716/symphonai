@@ -626,6 +626,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     if (
       type === "SessionStarted"
       || type === "SessionEnded"
+      || type === "SessionNotesUpdated"
       || type === "SubagentStopped"
       || type === "BackgroundUsageRecorded"
       || type === "LoopChanged"

@@ -631,3 +631,153 @@ def subagent_questions_wake_waits_and_progress_is_listed():
         assert any(m.text.startswith("[subagent first progress]") for m in provider.requests[-1].messages)
         assert any(m.text.startswith("[subagent first asks]") for m in provider.requests[-1].messages)
         assert {getattr(event, "kind", None) for event in notices} >= {"progress", "question", "message"}
+
+
+@check("turns.session_notes_compaction_requires_coverage_of_every_dropped_message")
+def session_notes_compaction_requires_coverage_of_every_dropped_message():
+    from symphonai_api.call_class import CallClass
+    from symphonai_api.compaction import MODEL_SUMMARY_PROMPT
+    from symphonai_api.events import SessionNotesUpdated
+    for covered in (True, False):
+        with workspace() as ws:
+            folder = ws.outside / "session"
+            folder.mkdir()
+            notes_path = folder / "notes.md"
+            if not covered:
+                notes_path.write_text("STALE NOTES", encoding="utf-8")
+            written = threading.Event()
+            foreground_entered = threading.Event()
+
+            class NotesScript(FakeModelProvider):
+                def __init__(self):
+                    super().__init__()
+                    self.foreground = 0
+                    self.summary_requests = []
+                    self.notes_requests = []
+
+                def create_response(self, request, *, cancel=None):
+                    if request.call_class is CallClass.BACKGROUND:
+                        self.notes_requests.append(request)
+                        assert foreground_entered.wait(5), "the notes update blocked the next leader turn"
+                        return answer("COVERED NOTES")
+                    if request.messages[0].text == MODEL_SUMMARY_PROMPT:
+                        self.summary_requests.append(request)
+                        return answer("FALLBACK SUMMARY")
+                    self.foreground += 1
+                    if self.foreground == 1:
+                        calls = [call("read_file", path="existing.txt") for _ in range(3 if covered else 1)]
+                        return answer("x" * 44000, *calls)
+                    if self.foreground == 2:
+                        foreground_entered.set()
+                        if covered:
+                            assert written.wait(5), "notes did not finish while the next turn was running"
+                        return answer("y" * 16000, call("read_file", path="existing.txt"))
+                    return answer("Finished after compaction")
+
+            def observe(event):
+                if isinstance(event, SessionNotesUpdated):
+                    written.set()
+
+            provider = NotesScript()
+            chat = Leader(LeaderConfig(
+                provider, FakeModelProvider(), str(ws.root),
+                leader_policy=ws.policy, session_notes=notes_path,
+                model_summary=True, compaction_limit=14000, chat_recent_turns=2,
+                events=observe, memory_extraction_enabled=False,
+            ))
+            try:
+                result = chat.run("Keep working after compaction")
+            finally:
+                chat.close()
+            summaries = [message.text for message in result.leader_messages
+                         if message.role is Role.SYSTEM and message.text.startswith(
+                             "Summary of the earlier conversation, written when it was compacted:")]
+            assert summaries
+            if covered:
+                assert len(provider.notes_requests) == 1 and not provider.summary_requests
+                assert summaries[-1].endswith("COVERED NOTES")
+                assert notes_path.read_text(encoding="utf-8") == "COVERED NOTES"
+            else:
+                assert not provider.notes_requests and len(provider.summary_requests) == 1
+                assert summaries[-1].endswith("FALLBACK SUMMARY")
+                assert notes_path.read_text(encoding="utf-8") == "STALE NOTES"
+
+    # Exercise the same coverage rule through chat-boundary and forced compaction.
+    for mode in ("chat", "force", "instructions"):
+        with workspace() as ws:
+            folder = ws.outside / "chat-session"
+            folder.mkdir()
+            written = threading.Event()
+
+            class ChatNotesScript(FakeModelProvider):
+                def __init__(self):
+                    super().__init__()
+                    self.foreground = 0
+                    self.summary_requests = []
+                    self.notes_requests = []
+                    self.foreground_requests = []
+
+                def create_response(self, request, *, cancel=None):
+                    if request.messages[0].text.startswith(MODEL_SUMMARY_PROMPT):
+                        self.summary_requests.append(request)
+                        return answer("INSTRUCTED SUMMARY")
+                    if request.call_class is CallClass.BACKGROUND:
+                        self.notes_requests.append(request)
+                        return answer("CHAT NOTES")
+                    self.foreground_requests.append(request)
+                    self.foreground += 1
+                    if self.foreground == 1:
+                        return answer("x" * 32000, call("read_file", path="existing.txt"))
+                    if self.foreground == 2:
+                        return answer("y" * 28000)
+                    return answer("Next turn after compaction")
+
+            def observe_chat(event):
+                if isinstance(event, SessionNotesUpdated):
+                    written.set()
+
+            provider = ChatNotesScript()
+            chat = Leader(LeaderConfig(
+                provider, FakeModelProvider(), str(ws.root), leader_policy=ws.policy,
+                session_notes=folder / "notes.md", model_summary=True,
+                compaction_limit=14000 if mode == "chat" else 20000,
+                chat_recent_turns=1, events=observe_chat, memory_extraction_enabled=False,
+            ))
+            if mode != "chat":
+                chat.seed_chat([
+                    Message(Role.USER, "Original goal"),
+                    Message(Role.ASSISTANT, "Earlier context to compact"),
+                    Message(Role.USER, "Earlier request"),
+                ])
+            try:
+                chat.chat("Read the file and finish this turn")
+                assert written.wait(5), "the complete first chat was not covered by notes"
+                (ws.root / "existing.txt").write_text("Current contents after the first chat", encoding="utf-8")
+                if mode == "chat":
+                    chat.chat("Continue with the current file")
+                    messages = provider.foreground_requests[-1].messages
+                else:
+                    instructions = "Focus on the exact file result" if mode == "instructions" else None
+                    compacted, _ = chat.force_compact_chat(instructions=instructions)
+                    assert compacted.changed
+                    messages = compacted.messages
+                summary = next(message.text for message in messages if message.role is Role.SYSTEM
+                               and message.text.startswith("Summary of the earlier conversation, written when it was compacted:"))
+                restore = next(message.text for message in messages
+                               if message.text.startswith("Restored after compaction:"))
+                assert "existing.txt" in restore and "Current contents after the first chat" in restore
+                if mode == "instructions":
+                    assert len(provider.summary_requests) == 1
+                    assert "Focus on the exact file result" in provider.summary_requests[0].messages[0].text
+                    assert summary.endswith("INSTRUCTED SUMMARY")
+                else:
+                    assert not provider.summary_requests and summary.endswith("CHAT NOTES")
+                    if mode == "force":
+                        chat.chat("One more request")
+                        compacted_again, _ = chat.force_compact_chat()
+                        assert compacted_again.changed and not provider.summary_requests
+                        assert any(message.text.endswith("CHAT NOTES") for message in compacted_again.messages
+                                   if message.role is Role.SYSTEM)
+                assert len(provider.notes_requests) == 1
+            finally:
+                chat.close()

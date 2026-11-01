@@ -1506,6 +1506,7 @@ class LeaderConfig:
     memory_extraction_enabled: bool = True
     memory_usage_callback: Callable[[str, UsageTotals], None] | None = None
     model_summary: bool = False
+    session_notes: Path | None = None
     checkpoints: CheckpointStore | None = None
     leader_tools: Mapping[str, LocalTool] | None = None
     lsp: LspManager | None = None
@@ -1965,6 +1966,7 @@ class Leader:
                 self._transcript
             ),
             model_summary=config.model_summary,
+            session_notes=config.session_notes,
             context_budget=lambda model: math.floor(
                 budget_for_model(
                     config.leader_provider.wire_format, model,
@@ -2314,6 +2316,20 @@ class Leader:
         force: bool = False,
         instructions: str | None = None,
     ) -> CompactionResult:
+        from symphonai_api.compaction import estimate_messages_tokens
+
+        notes_summary = None
+
+        def summarize(dropped: list[Message]) -> str:
+            nonlocal notes_summary
+            if instructions is None:
+                notes_summary = self._agent._compaction_notes_summary(
+                    self._chat_messages, dropped, cancel=cancel,
+                )
+                if notes_summary is not None:
+                    return notes_summary
+            return self._write_model_summary(dropped, cancel=cancel, instructions=instructions)
+
         compact_kwargs = {
             "budget": budget,
             "recent_turns": (
@@ -2322,13 +2338,15 @@ class Leader:
                 else recent_turns
             ),
             "cancel": cancel,
+            "recent_files": (
+                self._agent._compaction_recent_files(self._chat_messages)
+                if force or estimate_messages_tokens(self._chat_messages) > budget else []
+            ),
         }
         if force:
             compact_kwargs["force"] = True
-        if self._config.model_summary:
-            compact_kwargs["summarize"] = lambda dropped: self._write_model_summary(
-                dropped, cancel=cancel, instructions=instructions
-            )
+        if self._config.model_summary or self._config.session_notes is not None or instructions is not None:
+            compact_kwargs["summarize"] = summarize
         result = compact_messages_for_budget(self._chat_messages, **compact_kwargs)
         if result.changed:
             stripped_messages: list[Message] = []
@@ -2347,6 +2365,9 @@ class Leader:
                     else message
                 )
             result = replace(result, messages=stripped_messages)
+            self._agent._compaction_notes_rebased(
+                result.messages, result.before_tokens, result.after_tokens, notes_summary,
+            )
         self._chat_messages = result.messages
         if record_success:
             self._automatic_compaction_breaker.record_success()
@@ -2450,6 +2471,7 @@ class Leader:
         self._chat_messages.append(Message(role=Role.USER, content=text))
 
     def close(self) -> None:
+        self._agent.close_session_notes()
         if self._owns_leader_jobs and self._leader_jobs is not None:
             self._leader_jobs.close()
         elif self._config.jobs is not None:

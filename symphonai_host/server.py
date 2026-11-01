@@ -1155,6 +1155,15 @@ class HostServer:
             def _get_agent(self, payload):
                 return _StreamReply(self._serve_definition)
 
+            def _get_session_notes(self, payload):
+                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                session_ids = values.get('session_id', [])
+                if len(session_ids) != 1:
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
+                with self._errors(0):
+                    reply = host.run.session_notes(session_ids[0])
+                return _Reply(HTTPStatus.OK, reply)
+
             def _get_session_agent(self, payload):
                 request_url = urlsplit(self.path)
                 values = parse_qs(request_url.query, keep_blank_values=True)
@@ -1809,6 +1818,9 @@ class HostServer:
                     'definition_read': ((OSError, 'not_found'),),
                     'definition_decode': ((UnicodeDecodeError, 'empty_unsupported'),),
                 },
+            ),
+            _Route('GET', '/session/notes', Handler._get_session_notes,
+                errors=(((TranscriptError, 'not_found'),),),
             ),
             _Route('GET', '/session/agent', Handler._get_session_agent,
                 errors=(((TranscriptError, 'not_found'),),),
