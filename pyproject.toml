@@ -24,4 +24,4 @@ include = ["symphonai_api*", "symphonai_tui*", "symphonai_host*", "symphonai_app
 
 [tool.setuptools.package-data]
 "symphonai_api.data" = ["*.json", "skills/*.md"]
-symphonai_app = ["index.html", "app.css", "keys.default.json", "src/**/*"]
+symphonai_app = ["index.html", "app.css", "keys.default.json", "src/**/*", "vendor/**/*"]

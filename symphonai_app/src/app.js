@@ -139,7 +139,7 @@ const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
 const DIFF_MODE_KEY = "symphonai.diff-mode";
 const SIDEBAR_SESSION_LIMIT = 200;
-const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop", "Notes", "Terminal"];
+const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop", "Notes"];
 const RAIL_TOOL_ICONS = Object.freeze({
   Agents: "icon-tool-agents",
   Roadmap: "icon-tool-roadmap",
@@ -148,7 +148,6 @@ const RAIL_TOOL_ICONS = Object.freeze({
   Jobs: "icon-tool-jobs",
   Loop: "icon-tool-loop",
   Notes: "icon-tool-notes",
-  Terminal: "icon-tool-jobs",
 });
 
 function storedRail(global) {
@@ -226,9 +225,6 @@ export async function start({ global, document, client }) {
   const jobsRoot = element(document, "div", { className: "rail-pane jobs-pane" });
   jobsRoot.setAttribute("role", "tabpanel");
   jobsRoot.hidden = true;
-  const terminalRoot = element(document, "div", { className: "rail-pane terminal-pane" });
-  terminalRoot.setAttribute("role", "tabpanel");
-  terminalRoot.hidden = true;
   const notesRoot = element(document, "div", { className: "rail-pane notes-pane" });
   notesRoot.setAttribute("role", "tabpanel");
   notesRoot.hidden = true;
@@ -237,7 +233,7 @@ export async function start({ global, document, client }) {
   loopsRoot.hidden = true;
   const railTabsRoot = document.getElementById("rail-tabs");
   const railToolsRoot = document.getElementById("rail-tools");
-  railToolsRoot.before(jobsRoot, loopsRoot, notesRoot, terminalRoot);
+  railToolsRoot.before(jobsRoot, loopsRoot, notesRoot);
   let { open: openRailTools, selected: selectedRailTool } = storedRail(global);
   let loops = [];
   let selectedLoopId = "";
@@ -999,300 +995,276 @@ export async function start({ global, document, client }) {
     }
   }
 
-  let terminalId = null;
-  let terminalStarting = false;
-  let terminalExited = false;
-  let terminalError = "";
-  let terminalGeneration = 0;
-  let terminalWrites = Promise.resolve();
+  const terminalPanel = document.getElementById("terminal-panel");
+  const terminalTabs = element(document, "div", { className: "terminal-tabs" });
+  terminalTabs.setAttribute("role", "tablist");
+  terminalTabs.setAttribute("aria-label", "Terminals");
+  const terminalViews = element(document, "div", { className: "terminal-views" });
+  const terminalError = element(document, "p", { className: "terminal-error error" });
+  terminalError.setAttribute("aria-live", "polite");
+  const terminalResizeHandle = element(document, "div", { className: "terminal-resize-handle" });
+  terminalResizeHandle.setAttribute("role", "separator");
+  terminalResizeHandle.setAttribute("aria-label", "Resize terminal panel");
+  terminalResizeHandle.setAttribute("aria-orientation", "horizontal");
+  terminalResizeHandle.tabIndex = 0;
+  const terminalToggle = makeButton(document, "Terminal", () => toggleTerminal(), { className: "terminal-toggle" });
+  terminalToggle.setAttribute("aria-controls", "terminal-panel");
+  terminalToggle.disabled = projectless;
+  const terminalSessions = new Map();
   const terminalPending = new Map();
-  const terminalScreen = element(document, "pre", { className: "terminal-screen" });
-  terminalScreen.setAttribute("style", "white-space: pre; overflow-wrap: normal;");
-  terminalScreen.tabIndex = 0;
-  terminalScreen.setAttribute("role", "textbox");
-  terminalScreen.setAttribute("aria-label", "Project terminal");
-  terminalScreen.setAttribute("aria-multiline", "true");
-  let terminalCols = 80, terminalRows = 24, terminalWrap = false;
-  let terminalLines = [new Array(terminalCols).fill(null)], terminalRow = 0, terminalColumn = 0;
-  let terminalColor = 0, terminalBold = false, terminalEscape = "", terminalSequence = "";
-
-  function terminalWrite(data) {
-    if (!terminalId || terminalExited) return;
-    const id = terminalId, generation = terminalGeneration;
-    terminalWrites = terminalWrites.then(() => boundary.terminalInput(id, data)).catch((error) => {
-      if (generation !== terminalGeneration) return;
-      terminalError = errorText(error);
-      renderTerminal();
-    });
+  let terminalOpen = false, terminalHeight = 280, terminalLoading = false, terminalSelected = null;
+  let terminalNumber = 0;
+  try {
+    const saved = JSON.parse(global.localStorage?.getItem("symphonai.terminal-panel") ?? "null");
+    terminalOpen = saved?.open === true;
+    if (Number.isFinite(saved?.height)) terminalHeight = saved.height;
+  } catch {
+    // Storage is optional in embedded and privacy-restricted browsers.
   }
+  append(terminalPanel, terminalResizeHandle, terminalTabs, terminalViews, terminalError);
 
-  listen(terminalScreen, "keydown", (event) => {
-    if (event.isComposing || event.keyCode === 229 || event.metaKey) return;
-    const keys = { Enter: "\r", Backspace: "\x7f", Tab: "\t", ArrowUp: "\x1b[A", ArrowDown: "\x1b[B",
-      ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D", Home: "\x1b[H", End: "\x1b[F", Delete: "\x1b[3~" };
-    let data = keys[event.key];
-    if (event.ctrlKey && /^[a-z]$/i.test(event.key)) data = String.fromCharCode(event.key.toUpperCase().charCodeAt(0) - 64);
-    else if (!event.ctrlKey && event.key?.length === 1) data = `${event.altKey ? "\x1b" : ""}${event.key}`;
-    if (data === undefined) return;
-    event.preventDefault();
-    event.stopPropagation();
-    terminalWrite(data);
-  });
-  listen(terminalScreen, "paste", (event) => {
-    event.preventDefault();
-    terminalWrite(event.clipboardData?.getData("text/plain") ?? "");
-  });
-  listen(terminalScreen, "compositionend", (event) => { if (event.data) terminalWrite(event.data); });
-
-  function feedTerminal(text) {
-    for (const character of text) {
-      if (terminalEscape === "osc") {
-        if (character === "\x07" || character === "\x9c" || (terminalSequence === "\x1b" && character === "\\")) terminalEscape = "";
-        terminalSequence = character === "\x1b" ? character : "";
-        continue;
-      }
-      if (terminalEscape === "charset") { terminalEscape = ""; continue; }
-      if (terminalEscape === "escape") {
-        terminalEscape = character === "[" ? "csi" : ["]", "P", "_", "^", "X"].includes(character) ? "osc"
-          : ["(", ")", "*", "+", "#", "%", " "].includes(character) ? "charset" : "";
-        terminalSequence = "";
-        continue;
-      }
-      if (terminalEscape === "csi" || terminalEscape === "discard") {
-        if (/[@-~]/.test(character)) {
-          if (terminalEscape === "csi") {
-            const values = terminalSequence.split(";").map((value) => Number(value) || 0);
-            if (character === "m") for (const value of values) {
-              if (value === 0) { terminalColor = 0; terminalBold = false; }
-              else if (value === 1) terminalBold = true;
-              else if (value === 22) terminalBold = false;
-              else if (value === 39) terminalColor = 0;
-              else if ((value >= 30 && value <= 37) || (value >= 90 && value <= 97)) terminalColor = value;
-            }
-            const line = terminalLines[terminalRow] ?? (terminalLines[terminalRow] = new Array(terminalCols).fill(null));
-            if (character === "K") {
-              if (values[0] === 2) line.fill(null);
-              else if (values[0] === 1) line.fill(null, 0, terminalColumn + 1);
-              else line.fill(null, terminalColumn);
-            }
-            if (character === "J") {
-              if (values[0] === 2 || values[0] === 3) { terminalLines = [new Array(terminalCols).fill(null)]; terminalRow = 0; terminalColumn = 0; }
-              else if (values[0] === 0) { line.fill(null, terminalColumn); terminalLines.length = terminalRow + 1; }
-              else if (values[0] === 1) {
-                for (let i = 0; i < terminalRow; i++) terminalLines[i] = new Array(terminalCols).fill(null);
-                line.fill(null, 0, terminalColumn + 1);
-              }
-              terminalWrap = false;
-            }
-            if (character === "A") terminalRow = Math.max(0, terminalRow - (values[0] || 1));
-            if (character === "B") terminalRow = Math.min(1999, terminalRow + (values[0] || 1));
-            if (character === "C") terminalColumn = Math.min(terminalCols - 1, terminalColumn + (values[0] || 1));
-            if (character === "D") terminalColumn = Math.max(0, terminalColumn - (values[0] || 1));
-            if (character === "G") terminalColumn = Math.min(terminalCols - 1, Math.max(0, (values[0] || 1) - 1));
-            if (character === "H" || character === "f") {
-              terminalRow = Math.min(1999, Math.max(0, (values[0] || 1) - 1));
-              terminalColumn = Math.min(terminalCols - 1, Math.max(0, (values[1] || 1) - 1));
-            }
-            if (["A", "B", "C", "D", "G", "H", "f"].includes(character)) terminalWrap = false;
-          }
-          terminalEscape = "";
-          terminalSequence = "";
-        } else {
-          terminalSequence += character;
-          if (terminalSequence.length > 256) { terminalSequence = ""; terminalEscape = "discard"; }
-        }
-        continue;
-      }
-      if (character === "\x1b") { terminalEscape = "escape"; continue; }
-      if (character === "\x9b") { terminalEscape = "csi"; terminalSequence = ""; continue; }
-      if (["\x9d", "\x90", "\x9f"].includes(character)) { terminalEscape = "osc"; terminalSequence = ""; continue; }
-      if (character === "\r") { terminalColumn = 0; terminalWrap = false; continue; }
-      if (character === "\n") { terminalRow++; terminalColumn = 0; terminalWrap = false; continue; }
-      if (character === "\b") { terminalColumn = Math.max(0, terminalColumn - 1); terminalWrap = false; continue; }
-      if (character === "\t") { terminalColumn = Math.min(terminalCols - 1, (Math.floor(terminalColumn / 8) + 1) * 8); terminalWrap = false; continue; }
-      const code = character.codePointAt(0);
-      if (code < 32 || (code >= 127 && code < 160)) continue;
-      if (terminalWrap) { terminalRow++; terminalColumn = 0; terminalWrap = false; }
-      const line = terminalLines[terminalRow] ?? (terminalLines[terminalRow] = new Array(terminalCols).fill(null));
-      line[terminalColumn] = { text: character, color: terminalColor, bold: terminalBold };
-      if (terminalColumn === terminalCols - 1) terminalWrap = true;
-      else terminalColumn++;
-    }
-    for (let i = 0; i <= terminalRow; i++) terminalLines[i] ??= new Array(terminalCols).fill(null);
-    let count = terminalLines.reduce((sum, line) => sum + (line?.length ?? 0), 0);
-    while (terminalLines.length > 2000 || count > 200000) {
-      count -= terminalLines.shift()?.length ?? 0;
-      terminalRow = Math.max(0, terminalRow - 1);
-    }
-    const spans = [];
-    for (let index = 0; index < terminalLines.length; index++) {
-      const line = terminalLines[index] ?? [];
-      let text = "", color = 0, bold = false;
-      const flush = () => { if (text) spans.push(element(document, "span", {
-        className: `terminal-color-${color}${bold ? " terminal-bold" : ""}`, text,
-      })); text = ""; };
-      let end = line.length;
-      while (end && !line[end - 1]) end--;
-      for (let column = 0; column < end; column++) {
-        const cell = line[column] ?? { text: " ", color: 0, bold: false };
-        if (cell.color !== color || cell.bold !== bold) { flush(); color = cell.color; bold = cell.bold; }
-        text += cell.text;
-      }
-      if (index < terminalLines.length - 1) text += "\n";
-      flush();
-    }
-    replace(terminalScreen, ...spans);
-    terminalScreen.scrollTop = terminalScreen.scrollHeight;
-  }
-
-  function renderTerminal() {
-    const focused = document.activeElement === terminalScreen;
-    replace(terminalRoot, element(document, "h1", { text: "Terminal" }), terminalScreen);
-    measureTerminal();
-    if (terminalError) append(terminalRoot, element(document, "p", { className: "error", text: terminalError }));
-    if (terminalExited || (!terminalId && !terminalStarting)) append(terminalRoot,
-      makeButton(document, "Start shell", async () => { await stopTerminal(); await showTerminal(); }));
-    if (focused) terminalScreen.focus();
-  }
-
-  function measureTerminal() {
-    const probe = element(document, "span", { text: "M".repeat(32) });
-    probe.setAttribute("style", "position: absolute; visibility: hidden; white-space: pre; font: inherit;");
-    terminalScreen.append(probe);
-    const bounds = probe.getBoundingClientRect?.();
-    probe.remove();
-    if (!bounds?.width || !bounds.height || !terminalScreen.clientWidth) return;
-    const style = global.getComputedStyle(terminalScreen);
-    const width = terminalScreen.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-    const height = terminalScreen.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-    const cols = Math.max(1, Math.min(1000, Math.floor(width / (bounds.width / 32))));
-    terminalRows = Math.max(1, Math.min(1000, Math.floor(height / bounds.height)));
-    if (cols !== terminalCols) {
-      const lines = [];
-      let row = 0, column = 0;
-      terminalLines.forEach((line, index) => {
-        let end = line.length;
-        while (end && !line[end - 1]) end--;
-        if (index === terminalRow) end = Math.max(end, terminalColumn + 1);
-        if (index === terminalRow) {
-          row = lines.length + Math.floor(terminalColumn / cols);
-          column = terminalColumn % cols;
-        }
-        for (let start = 0; start < Math.max(1, end); start += cols) {
-          const next = new Array(cols).fill(null);
-          line.slice(start, Math.min(start + cols, end)).forEach((cell, i) => { next[i] = cell; });
-          lines.push(next);
-        }
-      });
-      terminalLines = lines;
-      terminalCols = cols;
-      terminalRow = row;
-      terminalColumn = column;
-      terminalWrap = false;
-      feedTerminal("");
-    }
-    terminalScreen.setAttribute("data-columns", String(terminalCols));
-  }
-
-  async function resizeTerminal() {
-    measureTerminal();
-    if (!terminalId || terminalExited) return;
+  function saveTerminalPanel() {
     try {
-      await boundary.terminalResize(terminalId, terminalCols, terminalRows);
-    } catch (error) { terminalError = errorText(error); renderTerminal(); }
+      global.localStorage?.setItem("symphonai.terminal-panel", JSON.stringify({ open: terminalOpen, height: terminalHeight }));
+    } catch {
+      // Storage is optional in embedded and privacy-restricted browsers.
+    }
   }
-  global.addEventListener?.("resize", () => { if (selectedRailTool === "Terminal") void resizeTerminal(); });
-  if (global.ResizeObserver) new global.ResizeObserver(() => {
-    if (selectedRailTool === "Terminal") void resizeTerminal();
-  }).observe(terminalScreen);
+
+  function sizeTerminalPanel(height = terminalHeight) {
+    terminalHeight = Math.max(120, Math.min(height, Math.max(120, (global.innerHeight || 800) * 0.8)));
+    terminalPanel.setAttribute("style", `height: ${terminalHeight}px`);
+    terminalResizeHandle.setAttribute("aria-valuemin", "120");
+    terminalResizeHandle.setAttribute("aria-valuemax", String(Math.max(120, (global.innerHeight || 800) * 0.8)));
+    terminalResizeHandle.setAttribute("aria-valuenow", String(terminalHeight));
+  }
+
+  function terminalOptions() {
+    const style = global.getComputedStyle?.(terminalPanel);
+    const token = (name) => style?.getPropertyValue(name).trim();
+    return {
+      fontFamily: token("--font-code") || "monospace", fontSize: 13, scrollback: 2000,
+      theme: {
+        background: token("--ui-inset"), foreground: token("--ui-text"),
+        cursor: token("--ui-text"), cursorAccent: token("--ui-inset"),
+        selectionBackground: token("--ui-selected"), selectionForeground: token("--ui-text"),
+        black: token("--ui-text-secondary"), brightBlack: token("--ui-text-secondary"),
+        red: token("--ui-danger"), brightRed: token("--ui-danger"),
+        green: token("--ui-success"), brightGreen: token("--ui-success"),
+        yellow: token("--ui-warning"), brightYellow: token("--ui-warning"),
+        blue: token("--ui-accent"), brightBlue: token("--ui-accent"),
+        magenta: token("--ui-danger"), brightMagenta: token("--ui-danger"),
+        cyan: token("--ui-accent"), brightCyan: token("--ui-accent"),
+        white: token("--ui-text"), brightWhite: token("--ui-text"),
+      },
+    };
+  }
+
+  function fitTerminal() {
+    const session = terminalSessions.get(terminalSelected);
+    if (terminalPanel.hidden || !session || session.exited) return;
+    try {
+      session.terminal.options = terminalOptions();
+      session.fit.fit();
+      void boundary.terminalResize(session.id, session.terminal.cols, session.terminal.rows).catch((error) => {
+        terminalError.textContent = errorText(error);
+      });
+    } catch (error) { terminalError.textContent = errorText(error); }
+  }
+
+  function renderTerminalTabs() {
+    const tabs = [];
+    for (const session of terminalSessions.values()) {
+      const selected = terminalSelected === session.id;
+      session.view.hidden = !selected;
+      const row = element(document, "div", { className: "terminal-tab-item" });
+      const tab = makeButton(document, `Shell ${session.number}${session.exited ? " (exited)" : ""}`, () => {
+        terminalSelected = session.id;
+        renderTerminalTabs(); fitTerminal(); session.terminal.focus();
+      });
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", String(selected));
+      tab.setAttribute("aria-controls", session.view.id);
+      const close = makeButton(document, "×", () => closeTerminal(session));
+      close.setAttribute("aria-label", `Close terminal ${session.number}`);
+      close.setAttribute("title", `Close terminal ${session.number}`);
+      append(row, tab, close);
+      tabs.push(row);
+    }
+    const add = makeButton(document, "+", () => addTerminal());
+    add.setAttribute("aria-label", "Add terminal");
+    add.setAttribute("title", "Add terminal");
+    add.disabled = terminalLoading || terminalSessions.size >= 4 || !global.Terminal || !global.FitAddon?.FitAddon;
+    const close = makeButton(document, "Hide", () => toggleTerminal());
+    close.setAttribute("aria-label", "Hide terminal panel");
+    replace(terminalTabs, ...tabs, add, close);
+  }
+
+  function attachTerminal(saved) {
+    const view = element(document, "div", { className: "terminal-view" });
+    view.id = `terminal-${saved.id}`;
+    view.setAttribute("role", "tabpanel");
+    append(terminalViews, view);
+    const terminal = new global.Terminal(terminalOptions());
+    const fit = new global.FitAddon.FitAddon();
+    terminal.loadAddon(fit);
+    terminal.open(view);
+    const session = { id: saved.id, number: ++terminalNumber, terminal, fit, view, exited: false, writes: Promise.resolve() };
+    terminalSessions.set(saved.id, session);
+    terminal.attachCustomKeyEventHandler((event) => {
+      event.stopPropagation();
+      if (lookup(keymap, event, { platform }) === "toggle-terminal") {
+        event.preventDefault();
+        if (event.type === "keydown") void toggleTerminal();
+        return false;
+      }
+      return true;
+    });
+    let replaying = true;
+    terminal.onData((data) => {
+      if (replaying || session.exited) return;
+      session.writes = session.writes.then(() => boundary.terminalInput(session.id, data)).catch((error) => {
+        terminalError.textContent = errorText(error);
+      });
+    });
+    let replay = saved.output || "";
+    const pending = terminalPending.get(saved.id);
+    terminalPending.delete(saved.id);
+    if (pending) {
+      // Reconcile buffered events with the saved output fetched during attach.
+      const prefix = new Array(pending.data.length).fill(0);
+      for (let i = 1, matched = 0; i < pending.data.length; i++) {
+        while (matched && pending.data[i] !== pending.data[matched]) matched = prefix[matched - 1];
+        if (pending.data[i] === pending.data[matched]) matched++;
+        prefix[i] = matched;
+      }
+      const output = saved.output || "";
+      let overlap = output.includes(pending.data) ? pending.data.length : 0;
+      for (let i = 0; overlap !== pending.data.length && i < output.length; i++) {
+        while (overlap && output[i] !== pending.data[overlap]) overlap = prefix[overlap - 1];
+        if (output[i] === pending.data[overlap]) overlap++;
+      }
+      replay += pending.data.slice(overlap);
+      if (pending.exited) {
+        session.exited = true;
+        replay += `\r\n[exited ${pending.exit_code}]\r\n`;
+      }
+    }
+    // Query replies and keystrokes are both stale until replay parsing ends.
+    if (replay) terminal.write(replay, () => { replaying = false; });
+    else replaying = false;
+    terminalSelected ??= session.id;
+    return session;
+  }
 
   function terminalOutput(payload) {
-    if (payload.terminal_id !== terminalId) {
-      if (terminalStarting) {
-        const previous = terminalPending.get(payload.terminal_id) ?? { data: "" };
-        terminalPending.set(payload.terminal_id, { ...payload, data: (previous.data + payload.data).slice(-200000) });
+    const session = terminalSessions.get(payload.terminal_id);
+    if (!session) {
+      if (terminalLoading) {
+        const previous = terminalPending.get(payload.terminal_id)?.data || "";
+        terminalPending.set(payload.terminal_id, { ...payload, data: (previous + payload.data).slice(-200000) });
       }
       return;
     }
-    feedTerminal(payload.data);
+    session.terminal.write(payload.data);
     if (payload.exited) {
-      terminalExited = true;
-      feedTerminal(`\r\n[exited ${payload.exit_code}]\r\n`);
-      renderTerminal();
+      session.exited = true;
+      session.terminal.write(`\r\n[exited ${payload.exit_code}]\r\n`);
+      renderTerminalTabs();
     }
   }
 
-  async function showTerminal() {
-    if (selectedRailTool !== "Terminal") return;
-    if (!terminalId && !terminalStarting) {
-      const generation = terminalGeneration;
-      terminalStarting = true;
-      terminalError = "";
-      renderTerminal();
+  async function addTerminal() {
+    if (terminalLoading || terminalSessions.size >= 4) return;
+    terminalLoading = true;
+    terminalError.textContent = "";
+    renderTerminalTabs();
+    try {
+      const reply = await boundary.terminalStart();
+      attachTerminal({ id: reply.id, output: "" });
+      terminalSelected = reply.id;
+    } catch (error) { terminalError.textContent = errorText(error); }
+    finally { terminalLoading = false; terminalPending.clear(); }
+    renderTerminalTabs(); fitTerminal();
+    if (terminalOpen) terminalSessions.get(terminalSelected)?.terminal.focus();
+  }
+
+  async function closeTerminal(session) {
+    try { await boundary.terminalStop(session.id); }
+    catch (error) { terminalError.textContent = errorText(error); return; }
+    session.terminal.dispose(); session.view.remove();
+    terminalSessions.delete(session.id);
+    if (terminalSelected === session.id) terminalSelected = terminalSessions.keys().next().value ?? null;
+    renderTerminalTabs(); fitTerminal();
+    if (terminalOpen) terminalSessions.get(terminalSelected)?.terminal.focus();
+  }
+
+  async function toggleTerminal() {
+    if (projectless) return;
+    terminalOpen = !terminalOpen;
+    terminalPanel.hidden = !terminalOpen;
+    terminalToggle.setAttribute("aria-expanded", String(terminalOpen));
+    saveTerminalPanel();
+    if (!terminalOpen) { input.focus(); return; }
+    await openTerminalPanel();
+  }
+
+  async function openTerminalPanel() {
+    terminalPanel.hidden = false;
+    sizeTerminalPanel();
+    if (!global.Terminal || !global.FitAddon?.FitAddon) {
+      terminalError.textContent = "Terminal unavailable";
+      renderTerminalTabs();
+      return;
+    }
+    if (!terminalLoading) {
+      terminalLoading = true;
+      terminalError.textContent = "";
+      renderTerminalTabs();
       try {
-        const listing = await boundary.terminals();
-        if (generation !== terminalGeneration) return;
-        const running = listing.terminals.find((terminal) => !terminal.exited);
-        if (running) {
-          terminalId = running.id;
-          terminalStarting = false;
-          const pending = terminalPending.get(terminalId);
-          terminalPending.clear();
-          feedTerminal(running.output);
-          if (pending) {
-            // Events can arrive while the saved output is being fetched. Find
-            // their overlap with the snapshot so it is rendered only once.
-            const prefix = new Array(pending.data.length).fill(0);
-            for (let i = 1, matched = 0; i < pending.data.length; i++) {
-              while (matched && pending.data[i] !== pending.data[matched]) matched = prefix[matched - 1];
-              if (pending.data[i] === pending.data[matched]) matched++;
-              prefix[i] = matched;
-            }
-            let overlap = running.output.includes(pending.data) ? pending.data.length : 0;
-            for (let i = 0; overlap !== pending.data.length && i < running.output.length; i++) {
-              const character = running.output[i];
-              while (overlap && character !== pending.data[overlap]) overlap = prefix[overlap - 1];
-              if (character === pending.data[overlap]) overlap++;
-            }
-            terminalOutput({ ...pending, data: pending.data.slice(overlap) });
-          }
-          renderTerminal();
-          await resizeTerminal();
-          terminalScreen.focus();
-          return;
+        const reply = await boundary.terminals();
+        for (const saved of reply.terminals.filter((item) => !item.exited)) {
+          if (!terminalSessions.has(saved.id) && terminalSessions.size < 4) attachTerminal(saved);
         }
-        const reply = await boundary.terminalStart();
-        if (generation !== terminalGeneration) { await boundary.terminalStop(reply.id); return; }
-        terminalId = reply.id;
-        terminalStarting = false;
-        const pending = terminalPending.get(terminalId);
-        terminalPending.clear();
-        if (pending) terminalOutput(pending);
-      } catch (error) {
-        if (generation !== terminalGeneration) return;
-        terminalStarting = false;
-        terminalError = errorText(error);
-      }
+      } catch (error) { terminalError.textContent = errorText(error); }
+      finally { terminalLoading = false; terminalPending.clear(); }
+      if (!terminalSessions.size && !terminalError.textContent) await addTerminal();
     }
-    renderTerminal();
-    if (terminalId && !terminalExited) { await resizeTerminal(); terminalScreen.focus(); }
+    renderTerminalTabs(); fitTerminal();
+    if (terminalOpen) terminalSessions.get(terminalSelected)?.terminal.focus();
   }
 
-  async function stopTerminal() {
-    const id = terminalId;
-    terminalGeneration++;
-    terminalId = null;
-    terminalStarting = false;
-    terminalExited = false;
-    terminalPending.clear();
-    terminalLines = [new Array(terminalCols).fill(null)]; terminalRow = 0; terminalColumn = 0; terminalWrap = false;
-    terminalColor = 0; terminalBold = false; terminalEscape = ""; terminalSequence = "";
-    feedTerminal("");
-    if (id) {
-      try { await boundary.terminalStop(id); }
-      catch (error) { terminalError = errorText(error); }
-    }
-  }
+  let terminalDrag = null;
+  listen(terminalResizeHandle, "pointerdown", (event) => {
+    terminalDrag = { y: event.clientY, height: terminalHeight };
+    terminalResizeHandle.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+  listen(terminalResizeHandle, "pointermove", (event) => {
+    if (!terminalDrag) return;
+    sizeTerminalPanel(terminalDrag.height + terminalDrag.y - event.clientY);
+    fitTerminal();
+  });
+  const finishTerminalDrag = () => { terminalDrag = null; saveTerminalPanel(); };
+  listen(terminalResizeHandle, "pointerup", finishTerminalDrag);
+  listen(terminalResizeHandle, "pointercancel", finishTerminalDrag);
+  listen(terminalResizeHandle, "keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    sizeTerminalPanel(terminalHeight + (event.key === "ArrowUp" ? 20 : -20));
+    saveTerminalPanel(); fitTerminal();
+  });
+  global.addEventListener?.("resize", () => { sizeTerminalPanel(); fitTerminal(); });
+  if (global.ResizeObserver) new global.ResizeObserver(() => fitTerminal()).observe(terminalViews);
+  const updateTerminalTheme = () => {
+    for (const session of terminalSessions.values()) session.terminal.options = terminalOptions();
+  };
+  if (global.MutationObserver) new global.MutationObserver(updateTerminalTheme)
+    .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  global.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", updateTerminalTheme);
+  sizeTerminalPanel();
+  terminalPanel.hidden = !terminalOpen;
+  terminalToggle.setAttribute("aria-expanded", String(terminalOpen));
 
   async function showJobs() {
     if (!jobsPaneVisible()) {
@@ -1412,7 +1384,9 @@ export async function start({ global, document, client }) {
       showSettings(route.section);
     }
     const pane = route.page === "settings" ? settingsPane : chatPane;
-    replace(pageRoot, pane);
+    replace(pageRoot, pane, terminalPanel);
+    terminalPanel.hidden = !terminalOpen;
+    if (!terminalPanel.hidden) fitTerminal();
     if (route.page === "chat") {
       chatRoot.scrollTop = following ? chatRoot.scrollHeight : savedScrollTop;
       jumpLatest.hidden = following;
@@ -3310,7 +3284,7 @@ export async function start({ global, document, client }) {
       return row;
     });
     replace(railToolsRoot, element(document, "h2", { text: "Tools" }), ...tools);
-    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot, Notes: notesRoot, Terminal: terminalRoot };
+    const panes = { Agents: agentsRoot, Roadmap: roadmapRoot, Changes: changesRoot, Files: filesRoot, Jobs: jobsRoot, Loop: loopsRoot, Notes: notesRoot };
     for (const [name, pane] of Object.entries(panes)) {
       pane.hidden = showRailTools || name !== selectedRailTool;
     }
@@ -3333,7 +3307,6 @@ export async function start({ global, document, client }) {
     if (name === "Changes") return changed || changesDirty ? showChanges() : undefined;
     if (name === "Files") return changed || filesDirty ? refreshFiles() : undefined;
     if (name === "Notes") return showNotes();
-    if (name === "Terminal") return showTerminal();
     if (!changed) return undefined;
     if (name === "Jobs") return showJobs();
     return undefined;
@@ -3346,7 +3319,6 @@ export async function start({ global, document, client }) {
   }
 
   function closeRailTool(name) {
-    if (name === "Terminal") void stopTerminal();
     openRailTools = openRailTools.filter((tool) => tool !== name);
     if (selectedRailTool === name) selectedRailTool = openRailTools.at(-1) ?? "";
     showRailTools = openRailTools.length === 0;
@@ -3356,7 +3328,6 @@ export async function start({ global, document, client }) {
     if (selectedRailTool === "Changes") return showChanges();
     if (selectedRailTool === "Jobs") return showJobs();
     if (selectedRailTool === "Notes") return showNotes();
-    if (selectedRailTool === "Terminal") return showTerminal();
     return undefined;
   }
 
@@ -3368,7 +3339,6 @@ export async function start({ global, document, client }) {
   if (selectedRailTool === "Files") void refreshFiles();
   if (selectedRailTool === "Jobs") void showJobs();
   if (selectedRailTool === "Notes") void showNotes();
-  if (selectedRailTool === "Terminal") void showTerminal();
 
   function costText(cost) {
     return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
@@ -3408,7 +3378,9 @@ export async function start({ global, document, client }) {
         : "",
       statusFields.usage && usageText(conversation?.usage),
     ].filter(Boolean);
-    conversationUsage.textContent = [primaryStatus, ...extraStatus].filter(Boolean).join(" · ");
+    replace(conversationUsage, element(document, "span", {
+      className: "conversation-status", text: [primaryStatus, ...extraStatus].filter(Boolean).join(" · "),
+    }), terminalToggle);
     conversationUsage.className = `conversation-usage${mode === "plan" ? " plan" : ""}${specMode ? " spec-mode" : ""}`;
   }
 
@@ -3907,6 +3879,14 @@ export async function start({ global, document, client }) {
   }
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
+      if (lookup(keymap, event, { platform }) === "toggle-terminal") {
+        event.preventDefault();
+        await toggleTerminal();
+        return;
+      }
+      for (let node = event.target; node; node = node.parentNode) {
+        if (node === terminalPanel) return;
+      }
       if (!quickOpenState && lookup(keymap, event, { platform }) === "quick-open") {
         event.preventDefault();
         openQuickOpen();
@@ -4772,6 +4752,7 @@ export async function start({ global, document, client }) {
       newline: "Insert a new line",
       cancel: "Cancel or close",
       "stop-run": "Stop the current run",
+      "toggle-terminal": "Show or hide the terminal panel",
       "focus-input": "Focus the composer",
       "command-palette": "Open command palette",
       "quick-open": "Open quick file search",
@@ -5251,6 +5232,7 @@ export async function start({ global, document, client }) {
       // A failed refresh must not prevent the conversation from opening.
     }
   }
+  if (terminalOpen && !projectless) await openTerminalPanel();
   updateWindowTitle();
   showPromptError();
   return {

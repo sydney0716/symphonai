@@ -10,5 +10,6 @@
   "mod+p": "quick-open",
   "mod+f": "find",
   "ctrl+r": "history-search",
-  "mod+k": "clear-chat"
+  "mod+k": "clear-chat",
+  "ctrl+`": "toggle-terminal"
 }

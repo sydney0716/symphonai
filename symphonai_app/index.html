@@ -12,6 +12,7 @@
         }
       } catch {}
     </script>
+    <link rel="stylesheet" href="vendor/xterm/xterm.css">
     <link rel="stylesheet" href="app.css">
     <!-- symphonai-handshake -->
   </head>
@@ -35,6 +36,7 @@
             <p id="prompt-error" class="prompt-error" aria-live="polite"></p>
           </form>
         </main>
+        <section id="terminal-panel" class="terminal-panel" aria-label="Terminal" hidden></section>
       </div>
       <aside id="status-rail" aria-label="Status">
         <div id="rail-tabs" class="rail-tabs" role="tablist" aria-label="Open tools"></div>
@@ -47,6 +49,8 @@
       </aside>
       <button id="rail-toggle" class="rail-toggle icon-right-panel" type="button">Hide status</button>
     </div>
+    <script src="vendor/xterm/xterm.js"></script>
+    <script src="vendor/xterm/addon-fit.js"></script>
     <script type="module" src="src/app.js"></script>
   </body>
 </html>

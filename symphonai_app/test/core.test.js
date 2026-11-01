@@ -122,6 +122,7 @@ class Document {
     make("textarea", "prompt", form);
     make("div", "prompt-attachments", form);
     make("div", "prompt-error", form);
+    make("section", "terminal-panel", page).hidden = true;
     const rail = make("aside", "status-rail", shell);
     for (const id of ["rail-tabs", "agents", "roadmap", "changes", "spec", "files", "rail-tools"]) make("div", id, rail);
     make("button", "rail-toggle", shell);
@@ -172,93 +173,195 @@ async function submit(document, text) {
   await document.getElementById("prompt-form").dispatch("submit");
 }
 
-test("Terminal reattaches after two reloads, restores output and closes its shell", async () => {
+function terminalBrowser() {
   const global = browser();
+  const instances = [], listeners = new Map();
+  global.innerHeight = 800;
+  global.addEventListener = (type, callback) => {
+    const callbacks = listeners.get(type) ?? [];
+    callbacks.push(callback);
+    listeners.set(type, callbacks);
+  };
+  global.Terminal = class {
+    constructor(options) { this.options = options; this.output = ""; this.cols = 80; this.rows = 24; instances.push(this); }
+    loadAddon(addon) { addon.terminal = this; }
+    open(view) { this.view = view; }
+    write(text, callback) { this.output += text; callback?.(); }
+    onData(callback) { this.input = callback; }
+    attachCustomKeyEventHandler(callback) { this.key = callback; }
+    focus() { this.view.focus(); }
+    dispose() { this.disposed = true; }
+  };
+  global.FitAddon = { FitAddon: class {
+    fit() { this.terminal.cols = 96; this.terminal.rows = 12; }
+  } };
+  global.getComputedStyle = () => ({ getPropertyValue: (name) => ({
+    "--font-code": "fixture-monospace", "--ui-text": "#202124", "--ui-inset": "#EFEFED",
+    "--ui-danger": "#B4232D",
+  })[name] ?? "" });
+  const event = (key, fields = {}) => ({
+    key, type: "keydown", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false,
+    preventDefault() {}, stopPropagation() {}, ...fields,
+  });
+  return { global, instances, event, dispatch: async (type, value) => {
+    for (const callback of listeners.get(type) ?? []) await callback(value);
+  } };
+}
+
+test("Terminal panel starts closed and opens without xterm globals", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  const app = await start({ global: browser(), document, client: script.client });
+  const panel = document.getElementById("terminal-panel");
+  assert.ok(panel.hidden);
+  assert.equal(app.route().page, "chat");
+  assert.ok(!find(document.getElementById("rail-tools"), (node) => node.textContent === "Terminal"));
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  assert.ok(!panel.hidden);
+  assert.match(panel.textContent, /Terminal unavailable/);
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  assert.ok(panel.hidden);
+});
+
+test("Terminal tabs route input, preserve output while hidden, and reattach on reload", async () => {
+  const fixture = terminalBrowser();
+  const { global, instances } = fixture;
   const script = scriptedClient();
   let starts = 0;
-  let shell = null;
-  const inputs = [], stopped = [];
+  const shells = new Map(), inputs = [], stopped = [], sizes = [];
   Object.assign(script.client, {
-    terminals: async () => ({ terminals: shell ? [shell] : [] }),
+    terminals: async () => ({ terminals: [...shells.values()] }),
     terminalStart: async () => {
-      starts++;
-      shell = { id: "shell", exited: false, output: "" };
-      return { id: shell.id };
+      const id = `shell-${++starts}`;
+      shells.set(id, { id, exited: false, output: "" });
+      return { id };
     },
     terminalInput: async (id, data) => { inputs.push([id, data]); },
-    terminalResize: async () => ({}),
-    terminalStop: async (id) => { stopped.push(id); shell = null; },
+    terminalResize: async (id, cols, rows) => { sizes.push([id, cols, rows]); },
+    terminalStop: async (id) => { stopped.push(id); shells.delete(id); },
   });
   let document = new Document();
   await start({ global, document, client: script.client });
-  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Open a tool").click();
-  await find(document.getElementById("rail-tools"), (node) => node.textContent === "Terminal").click();
-  shell.output = "earlier output\r\n";
-  await script.emit("TerminalOutput", { terminal_id: shell.id, data: shell.output, exited: false });
-  for (let reload = 0; reload < 2; reload++) {
-    document = new Document();
-    await start({ global, document, client: script.client });
-    await new Promise((resolve) => setImmediate(resolve));
-    const screen = find(document.body, (node) => node.className === "terminal-screen");
-    assert.equal(screen.textContent, "earlier output\n");
-    await screen.dispatch("keydown", { key: "x" });
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await fixture.dispatch("keydown", fixture.event("`", { ctrlKey: true, target: document.body }));
+  const panel = document.getElementById("terminal-panel");
+  assert.ok(!panel.hidden);
   assert.equal(starts, 1);
-  assert.deepEqual(inputs, [["shell", "x"], ["shell", "x"]]);
-  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Close Terminal").click();
-  assert.deepEqual(stopped, ["shell"]);
+  assert.deepEqual(sizes.at(-1), ["shell-1", 96, 12]);
+  assert.equal(instances[0].options.fontFamily, "fixture-monospace");
+  assert.equal(instances[0].options.theme.red, "#B4232D");
+  instances[0].input("pwd\r");
+  instances[0].input("\x03");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(inputs, [["shell-1", "pwd\r"], ["shell-1", "\x03"]]);
+  const output = "\x1b[31mred\x1b[0m\r\n";
+  shells.get("shell-1").output = output;
+  await script.emit("TerminalOutput", { terminal_id: "shell-1", data: output, exited: false });
+  assert.equal(instances[0].output, output, "raw output is passed unchanged to xterm");
+  for (let added = 0; added < 3; added++) {
+    await find(panel, (node) => node.getAttribute?.("aria-label") === "Add terminal").click();
+  }
+  assert.equal(starts, 4);
+  assert.ok(find(panel, (node) => node.getAttribute?.("aria-label") === "Add terminal").disabled);
+  instances[1].input("second\r");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(inputs.at(-1), ["shell-2", "second\r"]);
+  await find(panel, (node) => node.getAttribute?.("aria-label") === "Close terminal 2").click();
+  assert.deepEqual(stopped, ["shell-2"]);
+  assert.ok(instances[1].disposed);
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  assert.ok(panel.hidden);
+  await script.emit("TerminalOutput", { terminal_id: "shell-1", data: "hidden output", exited: false });
+  shells.get("shell-1").output += "hidden output";
+  assert.ok(instances[0].output.endsWith("hidden output"));
+  assert.deepEqual(stopped, ["shell-2"], "hiding the panel does not stop shells");
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  const handle = find(panel, (node) => node.getAttribute?.("role") === "separator");
+  await handle.dispatch("pointerdown", { clientY: 500 });
+  await handle.dispatch("pointermove", { clientY: 380 });
+  await handle.dispatch("pointerup");
+  assert.equal(JSON.parse(global.localStorage.getItem("symphonai.terminal-panel")).height, 400);
+  document = new Document();
+  await start({ global, document, client: script.client });
+  assert.equal(starts, 4, "reload reuses all three running shells");
+  assert.ok(!document.getElementById("terminal-panel").hidden);
+  assert.match(document.getElementById("terminal-panel").getAttribute("style"), /400px/);
+  assert.equal(instances.at(-3).output, shells.get("shell-1").output);
 });
 
-test("Terminal wraps at measured columns and erases physical rows during shell redraws", async () => {
-  const document = new Document();
-  const createElement = document.createElement.bind(document);
-  document.createElement = (tag) => {
-    const node = createElement(tag);
-    if (tag === "pre") node.clientWidth = 326;
-    if (tag === "span") node.getBoundingClientRect = () => ({ width: node.textContent.length * 10, height: 20 });
-    return node;
-  };
-  const global = browser();
-  const resize = [];
-  global.addEventListener = (type, callback) => { if (type === "resize") resize.push(callback); };
-  global.getComputedStyle = () => ({ paddingLeft: "8px", paddingRight: "8px", paddingTop: "8px", paddingBottom: "8px" });
+test("Terminal replay drops stale replies and keystrokes until parsing finishes, then answers live queries", async () => {
+  for (const buffered of [false, true]) {
+    const { global, instances } = terminalBrowser();
+    const script = scriptedClient();
+    const inputs = [], writes = [];
+    global.Terminal.prototype.write = function (text, callback) {
+      this.output += text;
+      writes.push({ text, callback });
+    };
+    const saved = "saved\x1b[6n";
+    const pending = "buffered\x1b[c\x1b]11;?\x07\x1b[?25$p";
+    Object.assign(script.client, {
+      terminals: async () => {
+        if (buffered) await script.emit("TerminalOutput", {
+          terminal_id: "existing", data: saved + pending, exited: false,
+        });
+        return { terminals: [{ id: "existing", output: saved, exited: false }] };
+      },
+      terminalResize: async () => ({}),
+      terminalInput: async (id, data) => { inputs.push([id, data]); },
+    });
+    const document = new Document();
+    await start({ global, document, client: script.client });
+    await find(document.body, (node) => node.className === "terminal-toggle").click();
+    const terminal = instances[0];
+    assert.equal(writes.length, 1, "saved and buffered output share a final replay callback");
+    assert.equal(writes[0].text, saved + (buffered ? pending : ""));
+    terminal.input("typed during replay\r");
+    terminal.input("\x1b[2;1R\x1b[?1;2c\x1b]11;rgb:1515/1616/1818\x07\x1b[?25;1$y");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(inputs, [], "neither keystrokes nor automatic replies reach the shell before the callback");
+    // A live frame queued behind replay must be allowed to answer when parsed.
+    await script.emit("TerminalOutput", { terminal_id: "existing", data: "\x1b[6n", exited: false });
+    writes[0].callback();
+    terminal.input("vim\r");
+    terminal.input("\x1b[3;1R");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(inputs, [["existing", "vim\r"], ["existing", "\x1b[3;1R"]]);
+    assert.equal(writes[1].text, "\x1b[6n", "live queries still go through xterm");
+  }
+});
+
+test("Terminal focus isolates shortcuts and the panel height stays within its bounds", async () => {
+  const fixture = terminalBrowser();
+  const { global, instances } = fixture;
   const script = scriptedClient();
-  const sizes = [];
+  let stops = 0;
   Object.assign(script.client, {
-    terminals: async () => ({ terminals: [] }),
-    terminalStart: async () => ({ id: "grid" }),
-    terminalResize: async (id, cols, rows) => { sizes.push({ id, cols, rows }); },
+    terminals: async () => ({ terminals: [{ id: "existing", output: "saved", exited: false }] }),
+    terminalResize: async () => ({}),
+    stop: async () => { stops++; return {}; },
   });
+  const document = new Document();
   await start({ global, document, client: script.client });
-  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Open a tool").click();
-  await find(document.getElementById("rail-tools"), (node) => node.textContent === "Terminal").click();
-  const screen = find(document.body, (node) => node.className === "terminal-screen");
-  const output = (data) => script.emit("TerminalOutput", { terminal_id: "grid", data, exited: false });
-  assert.equal(sizes.at(-1).cols, 31);
-  assert.equal(screen.getAttribute("data-columns"), "31");
-  assert.match(screen.getAttribute("style"), /white-space: pre;/);
-  const command = `echo ${"x".repeat(65)}`;
-  await output(command.slice(0, 31));
-  assert.equal(screen.textContent, command.slice(0, 31), "wrapping waits for the next printable character");
-  await output(command.slice(31) + "\r\n" + "x".repeat(65) + "\r\n$ ");
-  assert.equal(screen.textContent, [command.slice(0, 31), command.slice(31, 62), command.slice(62),
-    "x".repeat(31), "x".repeat(31), "xxx", "$ "].join("\n"));
-  // A shell redraw clears the bottom row, moves up, and clears the old rows.
-  await output("y".repeat(70));
-  await output("\r\x1b[K\x1b[A\r\x1b[K\x1b[A\r\x1b[K$ ");
-  assert.ok(screen.textContent.endsWith("xxx\n$ \n\n"));
-  assert.ok(!screen.textContent.includes("y"));
-  await output("abc\b \b\b \b\b \b");
-  assert.ok(screen.textContent.endsWith("xxx\n$    \n\n"), "backspace overwrites stay within the prompt row");
-  screen.clientWidth = 216;
-  for (const callback of resize) callback();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(sizes.at(-1).cols, 20);
-  assert.equal(screen.getAttribute("data-columns"), "20");
-  assert.ok(screen.textContent.split("\n").every((line) => line.length <= 20));
-  assert.equal(screen.textContent.split("\n").join("").split("x").length - 1, 130,
-    "narrowing retains finished output");
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  assert.equal(instances[0].output, "saved");
+  let propagationStopped = false;
+  assert.equal(instances[0].key(fixture.event(".", { ctrlKey: true, stopPropagation() { propagationStopped = true; } })), true);
+  assert.ok(propagationStopped, "shell keystrokes do not bubble to app shortcuts");
+  await fixture.dispatch("keydown", fixture.event(".", { ctrlKey: true, target: instances[0].view }));
+  assert.equal(stops, 0);
+  const panel = document.getElementById("terminal-panel");
+  const handle = find(panel, (node) => node.getAttribute?.("role") === "separator");
+  await handle.dispatch("pointerdown", { clientY: 500 });
+  await handle.dispatch("pointermove", { clientY: -5000 });
+  await handle.dispatch("pointerup");
+  assert.match(panel.getAttribute("style"), /640px/);
+  await handle.dispatch("pointerdown", { clientY: 500 });
+  await handle.dispatch("pointermove", { clientY: 5000 });
+  await handle.dispatch("pointerup");
+  assert.match(panel.getAttribute("style"), /120px/);
+  assert.equal(instances[0].key(fixture.event("`", { ctrlKey: true })), false);
+  assert.ok(panel.hidden);
+  assert.equal(document.activeElement, document.getElementById("prompt"));
 });
 
 test("page starts against the scripted client", async () => {

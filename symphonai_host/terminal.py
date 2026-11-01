@@ -31,7 +31,7 @@ class Terminal:
         if self.pid == 0:
             try:
                 os.chdir(root)
-                environment = dict(os.environ, TERM="dumb", PAGER="cat", GIT_PAGER="cat")
+                environment = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor")
                 shell = environment.get("SHELL") or "/bin/sh"
                 os.execvpe(shell, [shell, "-l", "-i"], environment)
             except Exception:
