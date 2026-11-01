@@ -1223,11 +1223,14 @@ class HostServer:
                     return resolved.relative_to(root).as_posix() if resolved.is_relative_to(root) else str(resolved)
 
                 def roster(kind: str) -> list[dict[str, str]]:
+                    from symphonai_api import data
+
                     if extensions is None:
                         return []
                     members = getattr(extensions, kind)
                     paths = getattr(members, 'paths', {})
-                    return [{'name': name, 'path': display_directory(source) if source is not None else ''} for name in sorted(members) for source in (paths.get(name, getattr(members[name], 'path', None)),)]
+                    bundled_directory = (Path(data.__file__).parent / 'skills').resolve()
+                    return [{'name': name, 'path': 'bundled' if kind == 'skills' and source is not None and source.resolve().parent == bundled_directory else display_directory(source) if source is not None else ''} for name in sorted(members) for source in (paths.get(name, getattr(members[name], 'path', None)),)]
                 ceiling = None if extensions is None else extensions.ceiling
                 search_key = None if extensions is None else extensions.config.get('search.endpoint')
                 configured_search = None if search_key is None else search_endpoint(search_key)

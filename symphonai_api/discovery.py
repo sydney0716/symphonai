@@ -104,6 +104,7 @@ def _combine(
     project_directory: Path,
     user_paths: Mapping[str, Path],
     project_paths: Mapping[str, Path],
+    bundled: Mapping[str, _T] | None = None,
 ) -> Mapping[str, _T]:
     duplicate = next((name for name in user if name in project), None)
     if duplicate is not None:
@@ -111,7 +112,7 @@ def _combine(
             f"{kind} {duplicate!r} is offered by user scope at "
             f"{user_directory} and project scope at {project_directory}"
         )
-    members = {**user, **project}
+    members = {**(bundled or {}), **user, **project}
     paths = {name: path for name, path in {**user_paths, **project_paths}.items() if name in members}
     return LocatedMapping(members, paths)
 
@@ -125,11 +126,16 @@ def discover(
     price_table: PriceTable | None = None,
     default_model: ModelSelector | None = None,
 ) -> Discovered:
-    """Discover two directory scopes, withholding untrusted repository content."""
+    """Discover bundled and user extensions, withholding untrusted repository content."""
     root = Path(repo_root)
     user_root = symphonai_home(home)
     project_root = root / ".symphonai"
     withheld: list[Offered] = []
+    bundled_directory = Path(__file__).parent / "data" / "skills"
+    try:
+        bundled_skills = load_skill_directory(bundled_directory)
+    except SkillError as exc:
+        raise DiscoveryError(f"bundled skills directory {bundled_directory}: SkillError: {exc}") from exc
 
     def agent_loader(directory: Path) -> dict[str, AgentSpec]:
         return load_agent_directory(
@@ -196,6 +202,7 @@ def discover(
             project_directory=project_directory,
             user_paths=user_paths,
             project_paths=project_paths,
+            bundled=bundled_skills if kind == "skills" else None,
         )
     return Discovered(
         agents=combined["agents"],
