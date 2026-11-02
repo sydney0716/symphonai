@@ -287,9 +287,15 @@ class ApiAgent:
         self._tool_schemas = [schema for schema in self._tool_schemas if schema_name(schema) in selected]
 
     def _ask_hook_model(self, prompt, cancel):
+        from symphonai_api.model_table import model_capabilities
+
+        model = self._previous_answering_model or self._provider.model
+        capability = next((item for item in model_capabilities()
+                           if item.wire_format == self._provider.wire_format and item.model == model), None)
+        effort = "low" if capability is not None and any(option.id == "low" for option in capability.efforts) else None
         return self._provider.create_response(ModelRequest(
             messages=[Message(Role.USER, prompt)],
-            model=self._previous_answering_model or self._provider.model, effort="low",
+            model=model, effort=effort,
         ), cancel=cancel)
 
     def _write_notes_coverage(self, text, coverage, tokens) -> None:
@@ -301,11 +307,15 @@ class ApiAgent:
     def close_session_notes(self) -> None:
         with self._notes_lock:
             self._notes_closed = True
-            if self._notes_cancel is not None:
-                self._notes_cancel.cancel()
             thread = self._notes_thread
+            token = self._notes_cancel
         if thread is not None and thread is not threading.current_thread():
-            thread.join()
+            thread.join(timeout=30)
+            if thread.is_alive() and token is not None:
+                import logging
+
+                logging.getLogger(__name__).warning("Session notes update cancelled after 30 seconds closing")
+                token.cancel()
 
     def _session_notes_boundary(self, conversation, model, effort, run_id, calls, usage_by_model, record_usage):
         if self._notes_path is None:
@@ -331,6 +341,10 @@ class ApiAgent:
             path = self._notes_path
 
             def update():
+                import logging
+                from symphonai_api.secrets import mask_secrets
+
+                logger = logging.getLogger(__name__)
                 try:
                     request_messages = _limit_images(snapshot)
                     instructions = (
@@ -354,10 +368,18 @@ class ApiAgent:
                     with self._notes_lock:
                         self._notes_usage.append((key, usage))
                     text = response.message.text
-                    if response.has_tool_calls or response.stop_reason == "refusal" or not text.strip() or len(text) > 48000:
+                    if response.has_tool_calls:
+                        logger.warning("Session notes update failed: tool-call reply")
+                        return
+                    if response.stop_reason == "refusal":
+                        logger.warning("Session notes update failed: refusal")
+                        return
+                    if not text.strip() or len(text) > 48000:
+                        logger.warning("Session notes update failed: %s reply", "empty" if not text.strip() else "oversized")
                         return
                     with self._notes_lock:
-                        if self._notes_closed or token.cancelled:
+                        if token.cancelled:
+                            logger.warning("Session notes update failed: cancellation")
                             return
                         coverage = tuple(_message_digest(message) for message in snapshot)
                         # A hash mismatch after an interrupted pair of atomic writes fails closed.
@@ -371,9 +393,11 @@ class ApiAgent:
                         agent_id=self._agent_ref.agent_id, run_id=run_id,
                         session_id=path.parent.name,
                     ))
-                except Exception:
+                except Exception as exc:
                     # A failed background update must leave the turn and old notes intact.
-                    pass
+                    logger.warning("Session notes update failed: %s: %s",
+                                   "cancellation" if isinstance(exc, OperationCancelled) else type(exc).__name__,
+                                   mask_secrets(str(exc)))
                 finally:
                     token.close()
 

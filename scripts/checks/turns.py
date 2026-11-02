@@ -635,9 +635,88 @@ def subagent_questions_wake_waits_and_progress_is_listed():
 
 @check("turns.session_notes_compaction_requires_coverage_of_every_dropped_message")
 def session_notes_compaction_requires_coverage_of_every_dropped_message():
+    from contextlib import closing
+    from unittest import TestCase
+    from symphonai_api.cancellation import OperationCancelled
     from symphonai_api.call_class import CallClass
     from symphonai_api.compaction import MODEL_SUMMARY_PROMPT
     from symphonai_api.events import SessionNotesUpdated
+    from symphonai_api.providers.base import ProviderError
+    from symphonai_api.session import SessionStore
+
+    # Only the final answer crosses the threshold; close must let its update finish.
+    with workspace() as ws, closing(SessionStore(ws.outside / "sessions", "closing-notes")) as store:
+        release = threading.Event()
+        started = threading.Event()
+        notes_path = ws.outside / "notes.md"
+
+        class ClosingNotesScript(FakeModelProvider):
+            def create_response(self, request, *, cancel=None):
+                if request.call_class is CallClass.BACKGROUND:
+                    started.set()
+                    assert release.wait(5)
+                    assert not cancel.cancelled
+                    return answer("FINAL NOTES", usage=Usage(input_tokens=123, output_tokens=7))
+                return answer("x" * 44000)
+
+        chat = Leader(LeaderConfig(
+            ClosingNotesScript(), FakeModelProvider(), str(ws.root), leader_policy=ws.policy,
+            session_notes=notes_path, memory_extraction_enabled=False,
+        ), session=store)
+        try:
+            result = chat.run("Finish this short task")
+            assert started.wait(5) and not notes_path.exists()
+            timer = threading.Timer(0.05, release.set)
+            timer.start()
+            chat.close()
+            timer.join()
+            assert notes_path.read_text(encoding="utf-8") == "FINAL NOTES"
+            import json
+            records = [json.loads(line) for path in (ws.outside / "sessions").rglob("*.jsonl")
+                       for line in path.read_text(encoding="utf-8").splitlines()]
+            assert any(record["type"] == "usage" and record["data"].get("input_tokens") == 123
+                       for record in records)
+            assert result.final_answer == "x" * 44000
+        finally:
+            release.set()
+            chat.close()
+
+    for failure, cause in (
+        (ProviderError("fixture provider failure"), "fixture provider failure"),
+        (OperationCancelled("fixture cancellation"), "cancellation"),
+        (answer("", call("read_file", path="existing.txt")), "tool-call"),
+        (answer(" "), "empty"),
+        (answer("x" * 48001), "oversized"),
+    ):
+        with workspace() as ws:
+            notes_path = ws.outside / "notes.md"
+            notes_path.write_text("OLD NOTES", encoding="utf-8")
+
+            class FailingNotesScript(FakeModelProvider):
+                foreground = 0
+
+                def create_response(self, request, *, cancel=None):
+                    if request.call_class is CallClass.BACKGROUND:
+                        if isinstance(failure, Exception):
+                            raise failure
+                        return failure
+                    self.foreground += 1
+                    if self.foreground == 1:
+                        return answer("", *[call("read_file", path="existing.txt") for _ in range(3)])
+                    return answer("x" * 44000)
+
+            chat = Leader(LeaderConfig(
+                FailingNotesScript(), FakeModelProvider(), str(ws.root), leader_policy=ws.policy,
+                session_notes=notes_path, memory_extraction_enabled=False,
+            ))
+            with TestCase().assertLogs("symphonai_api.agent_loop", level="WARNING") as logged:
+                try:
+                    chat.run("Finish")
+                finally:
+                    chat.close()
+            assert any(cause in line for line in logged.output)
+            assert notes_path.read_text(encoding="utf-8") == "OLD NOTES"
+
     for covered in (True, False):
         with workspace() as ws:
             folder = ws.outside / "session"
@@ -860,6 +939,31 @@ def hook_rewrites_still_validate_and_check_permissions():
     import json
 
     with workspace() as ws:
+        hooks = HookRunner((HookSpec(("PreToolUse",), prompt="Allow this read.", blocking=True),), cwd=ws.root)
+        for reply in (
+            {"decision": "allow", "updated_input": None, "context": {"note": "unused"}},
+            {"decision": "allow", "updated_input": {"path": "existing.txt"}},
+            {"decision": "allow", "updated_input": None, "context": None},
+            {"decision": "allow", "context": {"note": "unused"}},
+            {"decision": "allow"},
+        ):
+            text = json.dumps(reply)
+            for output in (text, "```json\n" + text + "\n```"):
+                assert hooks.pre_tool("read_file", "fixture", {"path": "existing.txt"},
+                                      ask_model=lambda prompt, cancel: answer(output)) is None
+                result, provider = run_tools(ws, [answer("", call("read_file", path="existing.txt")),
+                                                 answer(output), answer()], hooks=hooks)
+                assert results(result)[0].ok and "Hook note:" not in results(result)[0].content
+                assert len(provider.requests) == 3 and provider.requests[1].effort is None
+        for reply in ({}, {"decision": "maybe"}, {"decision": "allow", "updated_input": {"path": 42}},
+                      {"decision": "allow", "updated_input": "invalid"}):
+            result, _ = run_tools(ws, [answer("", call("read_file", path="existing.txt")),
+                                      answer(json.dumps(reply)), answer()], hooks=hooks)
+            assert not results(result)[0].ok
+        stop_hooks = HookRunner((HookSpec(("Stop",), prompt="Check completion.", blocking=True),), cwd=ws.root)
+        assert stop_hooks.stop(agent_name="fixture", session_id=None, final_text="done", turns_used=1,
+                               stop_continues=0, ask_model=lambda prompt, cancel:
+                               answer('```json\n{"decision":"continue","reason":"work remains"}\n```')) == "work remains"
         for updated in ({"path": ".env"}, {"path": 42}):
             command = (sys.executable, "-c", "import json,sys; p=json.load(sys.stdin); "
                        "assert 'arguments' in p and p['agent_name']; "

@@ -378,9 +378,9 @@ _DISPATCH_PROPERTIES = {
         "minLength": 1,
         "type": "string",
         "description": (
-            "A short, stable identifier for this subagent, e.g. "
-            "'researcher' or 'coder'. Reuse the same name to continue a "
-            "conversation with the same subagent."
+            "Choose a configured subagent: the built-in roles are explorer, "
+            "implementer, planner, reviewer, and worker. Dispatching the same "
+            "name again continues that subagent's conversation."
         ),
     },
     "task": {
@@ -416,6 +416,18 @@ def dispatch_subagent_tool_schema(
     symphonai_api.tool_schema.
     """
     parameters = _dispatch_parameters_schema()
+    if subagents is not None:
+        parameters["properties"] = {
+            **parameters["properties"],
+            "subagent_name": {
+                **parameters["properties"]["subagent_name"],
+                "enum": list(subagents),
+                "description": (
+                    "Choose one of the configured subagent names in the enum. "
+                    "Dispatching the same name again continues that subagent's conversation."
+                ),
+            },
+        }
     description = _dispatch_description(subagents)
     if wire_format == 1:
         return {
@@ -433,10 +445,13 @@ def dispatch_subagent_tool_schema(
             "input_schema": parameters,
         }
     if wire_format == 3:
+        parameters = sanitize_for_gemini(parameters)
+        if subagents is not None:
+            parameters["properties"]["subagent_name"]["enum"] = list(subagents)
         return {
             "name": DISPATCH_TOOL_NAME,
             "description": description,
-            "parameters": sanitize_for_gemini(parameters),
+            "parameters": parameters,
         }
     # Other/unclassified providers: keep schemas self-describing for debugging.
     return {

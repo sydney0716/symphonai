@@ -251,14 +251,22 @@ class HookRunner:
                     else:
                         if ask_model is None:
                             raise ValueError("no model callback")
+                        reply_format = (
+                            'Reply with one JSON object: {"decision": "allow" | "deny", "reason": "<one sentence>"}. '
+                            'Add "updated_input": {…full new arguments…} only to change the call, and '
+                            '"context": "<text>" only to add a note for the agent. Leave out any field you do not use.'
+                            if payload["type"] == "PreToolUse" else
+                            'Reply with one JSON object: {"decision": "continue" | "stop", "reason": "<text>"}.'
+                        )
                         response = ask_model(
-                            "Act as a decision hook. Reply with one JSON object only, using decision, reason, "
-                            "updated_input and context as instructed.\n" + mask_secrets(hook.prompt) + "\nPayload:\n" + masked,
+                            "Act as a decision hook. " + reply_format + "\n" + mask_secrets(hook.prompt) + "\nPayload:\n" + masked,
                             token,
                         )
                         if response.stop_reason == "refusal" or response.refusal_category:
                             raise ValueError("hook model refused")
-                        text = response.message.text
+                        text = response.message.text.strip()
+                        if text.startswith("```json\n") and text.endswith("\n```"):
+                            text = text[len("```json\n"):-len("\n```")]
                         if not isinstance(json.loads(text), dict):
                             raise ValueError("hook model must reply with a JSON object")
                     completed.put((text, None))
@@ -328,20 +336,28 @@ class HookRunner:
             if not outcome.stdout.strip():
                 continue
             try:
-                reply = json.loads(outcome.stdout)
+                text = outcome.stdout.strip()
+                if text.startswith("```json\n") and text.endswith("\n```"):
+                    text = text[len("```json\n"):-len("\n```")]
+                reply = json.loads(text)
                 if not isinstance(reply, dict) or reply.get("decision") not in ("allow", "deny"):
                     raise ValueError()
                 if reply["decision"] == "deny":
                     return reply.get("reason") if isinstance(reply.get("reason"), str) and reply["reason"].strip() else f"{hook.label}: tool call denied"
-                if "updated_input" in reply:
-                    if not isinstance(reply["updated_input"], dict):
+                updated = reply.get("updated_input")
+                if updated is not None:
+                    if not isinstance(updated, dict):
                         raise ValueError()
-                    current = reply["updated_input"]
-                    updated_by = hook.label
-                if "context" in reply:
-                    if not isinstance(reply["context"], str):
-                        raise ValueError()
-                    notes.append(reply["context"])
+                    if updated != current:
+                        current = updated
+                        updated_by = hook.label
+                context = reply.get("context")
+                if context is not None:
+                    if isinstance(context, str):
+                        if context:
+                            notes.append(context)
+                    else:
+                        _LOG.warning("blocking hook %s ignored non-text context", hook.label)
             except (ValueError, TypeError):
                 return f"{hook.label}: blocking hook produced unparseable output"
         return HookInput(current, "\n".join(notes), updated_by) if updated_by or notes else None
@@ -361,7 +377,10 @@ class HookRunner:
             if problem is not None or not outcome.ok:
                 return None
             try:
-                reply = json.loads(outcome.stdout)
+                text = outcome.stdout.strip()
+                if text.startswith("```json\n") and text.endswith("\n```"):
+                    text = text[len("```json\n"):-len("\n```")]
+                reply = json.loads(text)
                 if (not isinstance(reply, dict) or reply.get("decision") != "continue"
                     or not isinstance(reply.get("reason"), str) or not reply["reason"].strip()):
                     return None
