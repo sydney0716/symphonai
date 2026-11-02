@@ -1,5 +1,0 @@
-terminal-bench/chess-best-move
-terminal-bench/log-summary-date-ranges
-terminal-bench/openssl-selfsigned-cert
-terminal-bench/regex-log
-terminal-bench/sqlite-db-truncate
