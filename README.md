@@ -21,12 +21,12 @@ it met.
 
 ```
 the spec                     the report
-  ## Goal                      ### Summary
-  ## Scope                     ### Changed Files
-  ## Context                   ### Validation
-  ## Contract                  ### Acceptance Criteria
-  ## Acceptance criteria       ### Risks & Notes
-  ## Tests
+  ## Goal                      ## Summary
+  ## Scope                     ## Changed Files
+  ## Context                   ## Validation
+  ## Contract                  ## Acceptance Criteria
+  ## Acceptance criteria       ## Risks & Notes
+  ## Checks
   ## Validation
   ## Report
 ```
@@ -41,47 +41,45 @@ still being able to say what the agents did and what state the project is in,
 without replaying anything. The app's dashboard shows the roadmap, and opening
 an item puts the spec next to the report that came back.
 
+## What's in the app
+
+- **Chat with a leader** that plans and hands work to subagents, in the
+  background or one at a time, and messages them while they run.
+- **The spec loop:** a goal becomes specs, cards run in lanes, each is
+  reviewed, and a failed card gets a follow-up spec or a question for you.
+- **Review:** Changes with diffs, Files, and the session notes the leader keeps.
+- **A terminal** of your own in a panel under the chat.
+- **Extensible:** skills (five ship with it), MCP servers, hooks, and agent
+  definitions.
+
 ## Running it
 
-Python 3.11 or later and Node 18 or later. Node's built-in test runner checks
-the JavaScript app, so there is no npm install. Install from a checkout with
-`pip install .` (or `pip install -e .` for development). API keys come from the
-environment or Settings › Models, never from a file in the repository.
+Python 3.11 or later. Install from a checkout, then open the app for a project.
+API keys come from the environment or Settings › Models, never from a file in
+the repository.
 
 ```bash
-python3 scripts/check.py                 # the check suite (--only selects a subset)
-pip install .                            # install from this checkout
-pip install -e .                         # editable install for development
-pip install -e ".[tui]"                  # optional Textual UI
-python3 scripts/tui.py                   # run it
-symphonai app                            # open the app for the current project
-symphonai app --repo-root /work/project --no-open  # print its address without opening a browser
-python3 -m symphonai_host                # development entry point for the host
+pip install .                                      # install from this checkout
+symphonai app                                      # open the app for the current project
+symphonai app --repo-root /work/project --no-open  # print its address instead of opening a browser
 ```
-
-For development and desktop-shell integration, `python3 -m symphonai_host`
-keeps its stdout JSON handshake as the contract used by the shell and scripts.
 
 ### Run without the app
 
-Run one task from a project directory, or pass `--repo-root` to choose one.
-Use `--json` for a machine-readable result. `ask` mode is the default; use
-`--mode allow` when an unattended run should apply tool actions.
+From a project directory, or with `--repo-root`. `ask` mode is the default; use
+`--mode allow` when an unattended run should apply tool actions, and `--json`
+for a machine-readable result.
 
 ```bash
 symphonai run --json "Run the test suite and summarize failures"
-symphonai run --repo-root /work/project --mode allow "Fix the failing tests"
+symphonai run --mode allow "Fix the failing tests"
+symphonai loop "Add rate limiting to the API"      # plan, implement and review as a spec loop
+symphonai review                                   # review the uncommitted changes
 ```
 
-In a CI shell step, the command's exit code determines whether the step passes:
-
-```bash
-symphonai run --json "Run the test suite"
-```
-
-Exit codes are `0` for a final answer, `1` for a failed run, `2` for usage or
-configuration errors, `3` when a turn limit or budget stops the run, and `130`
-when interrupted.
+Exit codes: `0` final answer, `1` failed run, `2` usage or configuration error,
+`3` stopped by a turn limit or budget, `130` interrupted. In CI, the exit code
+decides the step.
 
 ### Desktop shell
 
@@ -102,6 +100,17 @@ The Tauri bundle copies the complete target-suffixed host directory from
 application launches without a system Python installation. Its shell receives
 the bearer token through the piped handshake and owns the sidecar until exit.
 
+## Development
+
+```bash
+pip install -e .                   # editable install
+python3 scripts/check.py           # the check suite (--only selects a subset)
+python3 -m symphonai_host          # the host alone; prints a JSON handshake on stdout
+```
+
+Node 18 or later runs the app's tests with its built-in runner; there is no npm
+install.
+
 ## How it was built
 
 The same way it describes. Claude Code writes the specs and reviews the diffs,
@@ -112,7 +121,7 @@ exchange.
 
 # SymphonAI (한국어)
 
-Agent-native한 개발을 위한 코딩 에이전트 런타임입니다. 리더 모델이 서브에이전트에게 작업을 위임하며, 사용자는 에이전트들의 작업 현황과 계획을 보여주는 대시보드를 통해 Humman in the loop가 아닌 Humman on the loop로 개발 할 수 있습니다.
+Agent-native한 개발을 위한 코딩 에이전트 런타임입니다. 리더 모델이 서브에이전트에게 작업을 위임하며, 사용자는 에이전트들의 작업 현황과 계획을 보여주는 대시보드를 통해 Human in the loop가 아닌 Human on the loop로 개발할 수 있습니다.
 
 ## 개발 배경
 
@@ -124,12 +133,12 @@ Agent-native한 개발을 위한 코딩 에이전트 런타임입니다. 리더 
 
 ```
 the spec                     the report
-  ## Goal                      ### Summary
-  ## Scope                     ### Changed Files
-  ## Context                   ### Validation
-  ## Contract                  ### Acceptance Criteria
-  ## Acceptance criteria       ### Risks & Notes
-  ## Tests
+  ## Goal                      ## Summary
+  ## Scope                     ## Changed Files
+  ## Context                   ## Validation
+  ## Contract                  ## Acceptance Criteria
+  ## Acceptance criteria       ## Risks & Notes
+  ## Checks
   ## Validation
   ## Report
 ```
@@ -137,24 +146,38 @@ the spec                     the report
 두 템플릿 문서는 저장소의 [`specs/TEMPLATE.md`](specs/TEMPLATE.md)와
 [`specs/REPORT-TEMPLATE.md`](specs/REPORT-TEMPLATE.md)에서 확인할 수 있습니다.
 
-**Humman in the loop가 아니라 Humman on the loop.** 루프 안에 머무른다는 것은 도구 호출마다 일일이 승인하고 모든 턴을 직접 따라가야 함을 의미합니다. 반면 루프 위에서 조율한다는 것은 작업의 방향을 설정한 뒤, 대화 기록을 일일이 되짚지 않고도 에이전트가 수행한 작업과 프로젝트의 현재 상태를 즉각 파악할 수 있음을 뜻합니다. 앱 대시보드에서 전체 로드맵을 확인할 수 있으며, 특정 항목을 열면 작성된 스펙과 반환된 리포트를 나란히 비교하여 검토할 수 있습니다.
+**Human in the loop가 아니라 Human on the loop.** 루프 안에 머무른다는 것은 도구 호출마다 일일이 승인하고 모든 턴을 직접 따라가야 함을 의미합니다. 반면 루프 위에서 조율한다는 것은 작업의 방향을 설정한 뒤, 대화 기록을 일일이 되짚지 않고도 에이전트가 수행한 작업과 프로젝트의 현재 상태를 즉각 파악할 수 있음을 뜻합니다. 앱 대시보드에서 전체 로드맵을 확인할 수 있으며, 특정 항목을 열면 작성된 스펙과 반환된 리포트를 나란히 비교하여 검토할 수 있습니다.
+
+## 앱의 구성
+
+- **리더와의 채팅:** 리더가 계획을 세우고 서브에이전트에게 작업을 맡기며, 백그라운드 실행과 실행 중 메시지 교환을 지원합니다.
+- **스펙 루프:** 목표가 스펙으로 나뉘고, 카드가 레인별로 실행되어 각각 리뷰되며, 실패한 카드는 후속 스펙이나 사용자에게 보내는 질문으로 이어집니다.
+- **검토:** 변경 사항(diff), 파일, 리더가 유지하는 세션 노트를 확인할 수 있습니다.
+- **터미널:** 채팅 아래 패널에서 사용자 본인의 셸을 사용할 수 있습니다.
+- **확장성:** 스킬(기본 제공 5종), MCP 서버, 훅, 에이전트 정의를 지원합니다.
 
 ## 실행 방법
 
-Python 3.11 이상 및 Node 18 이상 환경이 필요합니다. JavaScript 앱은 Node의 내장 테스트 러너로 검증하므로 별도의 `npm install` 과정이 필요하지 않습니다. 체크아웃에서 `pip install .`로 설치하고, 개발 중에는 `pip install -e .`를 사용합니다. API 키는 환경 변수 또는 설정 › 모델에서 관리하며 저장소 파일에서는 읽지 않습니다.
+Python 3.11 이상이 필요합니다. 체크아웃에서 설치한 뒤 프로젝트에서 앱을 엽니다. API 키는 환경 변수 또는 설정 › 모델에서 관리하며 저장소 파일에서는 읽지 않습니다.
 
 ```bash
-python3 scripts/check.py                 # 전체 검사 스위트 실행 (--only 옵션으로 일부 선택 가능)
-pip install .                            # 현재 체크아웃에서 설치
-pip install -e .                         # 개발용 editable 설치
-pip install -e ".[tui]"                  # 선택 사항: Textual UI 설치
-python3 scripts/tui.py                   # TUI 실행
-symphonai app                            # 현재 프로젝트의 앱을 브라우저에서 열기
+pip install .                                      # 현재 체크아웃에서 설치
+symphonai app                                      # 현재 프로젝트의 앱을 브라우저에서 열기
 symphonai app --repo-root /work/project --no-open  # 브라우저를 열지 않고 주소 출력
-python3 -m symphonai_host                # 개발용 호스트 진입점
 ```
 
-개발 및 데스크톱 셸 연동에서는 `python3 -m symphonai_host`를 사용하며 stdout의 JSON 핸드셰이크는 셸과 스크립트가 사용하는 계약입니다.
+### 앱 없이 실행
+
+프로젝트 디렉터리에서 실행하거나 `--repo-root`로 지정합니다. 기본 모드는 `ask`이며, 무인 실행에서 도구 작업을 적용하려면 `--mode allow`를, 기계가 읽을 결과가 필요하면 `--json`을 사용합니다.
+
+```bash
+symphonai run --json "Run the test suite and summarize failures"
+symphonai run --mode allow "Fix the failing tests"
+symphonai loop "Add rate limiting to the API"      # 스펙 루프로 계획, 구현, 리뷰
+symphonai review                                   # 커밋되지 않은 변경 사항 리뷰
+```
+
+종료 코드: `0` 최종 답변, `1` 실행 실패, `2` 사용법 또는 설정 오류, `3` 턴 제한이나 예산으로 중단, `130` 중단됨. CI에서는 종료 코드가 단계의 성공 여부를 결정합니다.
 
 ### 데스크톱 셸
 
@@ -164,9 +187,21 @@ macOS용 Tauri 셸은 브라우저 앱과 동일한 파일을 사용하며, 사�
 python3 scripts/build_host.py
 cd packaging/tauri
 cargo tauri build
+# 또는 셸 개발 중에는
+cargo tauri dev
 ```
 
 Tauri 번들은 `dist/` 디렉터리에서 타깃 접미사가 붙은 호스트 디렉터리 전체를 복사합니다. 실행 파일과 `_internal/` 디렉터리는 반드시 함께 유지되어야 합니다. 이렇게 빌드된 애플리케이션은 시스템에 별도의 Python이 설치되어 있지 않아도 단독 실행됩니다. 셸은 파이프로 연결된 핸드셰이크를 통해 베어러 토큰을 전달받으며, 앱이 종료될 때까지 사이드카 프로세스를 관리합니다.
+
+## 개발
+
+```bash
+pip install -e .                   # 개발용 editable 설치
+python3 scripts/check.py           # 검사 스위트 실행 (--only 옵션으로 일부 선택 가능)
+python3 -m symphonai_host          # 호스트만 실행; stdout에 JSON 핸드셰이크 출력
+```
+
+앱 테스트는 Node 18 이상의 내장 테스트 러너로 실행하므로 별도의 npm install이 필요하지 않습니다.
 
 ## 개발 방식
 
