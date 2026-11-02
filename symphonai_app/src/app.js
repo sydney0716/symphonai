@@ -264,6 +264,10 @@ export async function start({ global, document, client }) {
   const attachmentList = document.getElementById("prompt-attachments");
   const pendingFiles = [];
   const pastedTextChips = [];
+  const previewMarks = [];
+  let previewMarkSession = null;
+  let previewMarksSequence = 0;
+  const previewDeliveries = new Map();
   let nextPastedTextId = 1;
   const promptAttachments = [];
   let following = true;
@@ -395,11 +399,24 @@ export async function start({ global, document, client }) {
       }));
   };
   let skillCommands = getSkillCommands(settingsReply);
-  const mcpCommands = (Array.isArray(mcpReply?.prompts) ? mcpReply.prompts : []).map((prompt) => ({
+
+  async function refreshSettings() {
+    settingsReply = await boundary.settings();
+    skillCommands = getSkillCommands(settingsReply);
+    if (boundary.mcpPrompts) {
+      try { mcpCommands = getMcpCommands(await boundary.mcpPrompts()); }
+      catch { mcpCommands = []; }
+    }
+    if (route?.page === "settings") renderSettingsSection(route.section, settingsContext());
+    if (input.value) await renderComposerMenus();
+    return settingsReply;
+  }
+  const getMcpCommands = reply => (Array.isArray(reply?.prompts) ? reply.prompts : []).map((prompt) => ({
     name: `mcp.${prompt.server}.${prompt.name}`, aliases: [], description: prompt.description || "MCP prompt",
     argumentHint: (prompt.arguments || []).map((argument) => `${argument.required ? "<" : "["}${argument.name}${argument.required ? ">" : "]"}`).join(" "),
     prompt,
   }));
+  let mcpCommands = getMcpCommands(mcpReply);
   const defaultKeymap = parseKeymap(JSON.stringify(keymapDefaults));
   const userKeymap = global.__symphonai?.keys ?? global.keymap ?? userKeymapFile;
   const keymap = mergeKeymap(
@@ -407,7 +424,7 @@ export async function start({ global, document, client }) {
     parseKeymap(JSON.stringify(userKeymap)),
   ).bindings;
   const platform = /mac/i.test(global.navigator?.platform ?? "") ? "darwin" : "other";
-  const allModes = ["ask", "plan", "allow"];
+  const allModes = ["ask", "plan", "auto", "allow"];
   const ceilingModes = settingsReply?.settings?.ceiling?.modes;
   const permittedModes = Array.isArray(ceilingModes)
     ? allModes.filter((mode) => ceilingModes.includes(mode))
@@ -653,6 +670,7 @@ export async function start({ global, document, client }) {
       loadMemory,
       providerRows,
       getSkillCommands,
+      refreshSettings,
       statusFields,
       saveStatusFields,
       showConversationUsage,
@@ -2026,6 +2044,7 @@ export async function start({ global, document, client }) {
     clearConversationAgents();
     try {
       await boundary.openSession(runId);
+      await refreshPreviewMarks();
       await refreshConversation();
       await markSessionViewed(runId);
       await refreshSelectedChanges();
@@ -2336,6 +2355,7 @@ export async function start({ global, document, client }) {
       await boundary.newSession();
       transcript.reset();
       currentSessionId = null;
+      await refreshPreviewMarks();
       void refreshOpenNotes();
       transcript.setSessionId(null);
       restoreDraft();
@@ -2627,6 +2647,53 @@ export async function start({ global, document, client }) {
     return forkEditedPrompt(text, reply.recordId);
   }
 
+  async function refreshPreviewMarks() {
+    if (projectless || !boundary.previewMarks) return;
+    if (previewMarkSession !== currentSessionId) {
+      previewMarks.splice(0);
+      showPendingAttachments();
+    }
+    const sequence = ++previewMarksSequence;
+    try {
+      const reply = await boundary.previewMarks();
+      if (sequence !== previewMarksSequence || reply.session_id !== currentSessionId) return;
+      previewMarkSession = reply.session_id;
+      previewMarks.splice(0, previewMarks.length, ...(reply.marks ?? []));
+      showPendingAttachments();
+    } catch (error) {
+      promptFailure = `Could not load preview marks: ${errorText(error)}`;
+      showPromptError();
+    }
+  }
+
+  async function openPreview(args) {
+    if (args[0] === "stop") {
+      await boundary.previewStop();
+      answerCommand("Preview stopped.");
+      return;
+    }
+    const window = global.open?.("", "_blank", "popup,width=1100,height=800");
+    if (!window) {
+      answerCommand("Allow pop-up windows to open the preview.");
+      return;
+    }
+    window.opener = null;
+    try {
+      const reply = await boundary.previewStart(args[0] ?? "");
+      window.location.href = reply.preview_url;
+    } catch (error) {
+      window.close();
+      answerCommand(errorText(error));
+    }
+  }
+
+  function withPreviewMarks(text, marks) {
+    return [text, ...marks.map((mark, index) => {
+      const fence = "`".repeat(Math.max(3, ...[...mark.html.matchAll(/`+/g)].map((match) => match[0].length + 1)));
+      return `## Preview mark ${index + 1}\nComment: ${mark.comment}\nURL: ${mark.url}\nSelector: ${mark.selector}\nSource${mark.source_guess ? " (guess)" : ""}: ${mark.source_hint || "unknown"}\n${fence}html\n${mark.html}\n${fence}`;
+    })].filter(Boolean).join("\n\n");
+  }
+
   function showPendingAttachments() {
     const files = pendingFiles.map((file, index) => {
       const chip = element(document, "span", {
@@ -2665,7 +2732,21 @@ export async function start({ global, document, client }) {
       }
       return chip;
     });
-    replace(attachmentList, ...files, ...pastes);
+    const marks = previewMarks.map((mark) => {
+      const chip = element(document, "span", { className: "attachment-chip preview-mark-chip", text:
+        `${mark.text?.slice(0, 40) || mark.selector} · ${mark.comment}` });
+      append(chip, makeButton(document, "Remove", async () => {
+        try {
+          await boundary.removePreviewMarks([mark.id], previewMarkSession);
+          await refreshPreviewMarks();
+        } catch (error) {
+          promptFailure = errorText(error);
+          showPromptError();
+        }
+      }));
+      return chip;
+    });
+    replace(attachmentList, ...files, ...pastes, ...marks);
   }
 
   function expandPastedText(value) {
@@ -3987,13 +4068,25 @@ export async function start({ global, document, client }) {
               promptFailure = "The message was not sent. Send it again.";
             }
           } else {
+            let previewClearError = "";
+            const delivery = previewDeliveries.get(action.text);
+            if (delivery) {
+              try {
+                await boundary.removePreviewMarks(delivery.ids, delivery.sessionId);
+                previewDeliveries.delete(action.text);
+                previewMarks.splice(0, previewMarks.length, ...previewMarks.filter((mark) => !delivery.ids.includes(mark.id)));
+                showPendingAttachments();
+              } catch (error) {
+                previewClearError = `Message sent; could not clear preview marks: ${errorText(error)}`;
+              }
+            }
             if (!currentSessionId && typeof reply?.run_id === "string") {
               currentSessionId = reply.run_id;
               void refreshOpenNotes();
               transcript.setSessionId(currentSessionId);
               showProjects();
             }
-            promptFailure = "";
+            promptFailure = previewClearError;
             await perform(turn.accepted());
             try {
               await refreshSessionLists();
@@ -4118,8 +4211,9 @@ export async function start({ global, document, client }) {
       showPromptError();
       return startSpecLoop(text);
     }
-    const wireText = skillMentionPrompt(text);
-    if (turn.state === RUNNING && pendingFiles.length === 0 && text.trim() && command !== "!") {
+    const selectedMarks = previewMarks.slice();
+    const wireText = withPreviewMarks(skillMentionPrompt(text), selectedMarks);
+    if (turn.state === RUNNING && selectedMarks.length === 0 && pendingFiles.length === 0 && text.trim() && command !== "!") {
       try {
         await boundary.steer(wireText);
         input.value = "";
@@ -4139,7 +4233,7 @@ export async function start({ global, document, client }) {
       showPromptError();
       return;
     }
-    if (text === "" && pendingFiles.length === 0) return;
+    if (text === "" && pendingFiles.length === 0 && selectedMarks.length === 0) return;
     let attachments = [];
     if (pendingFiles.length > 0) {
       try {
@@ -4157,6 +4251,7 @@ export async function start({ global, document, client }) {
     showPendingAttachments();
     promptFailure = "";
     rememberPrompt(text);
+    if (selectedMarks.length) previewDeliveries.set(wireText, { ids: selectedMarks.map((mark) => mark.id), sessionId: previewMarkSession });
     const actions = turn.submit(wireText, attachments);
     showPromptError();
     return perform(actions);
@@ -5111,6 +5206,7 @@ export async function start({ global, document, client }) {
       return;
     }
     await entry.handler({
+      refreshSettings,
       closePicker,
       openModePicker,
       openDefaultModelPicker,
@@ -5128,6 +5224,7 @@ export async function start({ global, document, client }) {
       showConversationUsage,
       resumeConversation,
       showCost,
+      openPreview,
       showUsage,
       showContext,
       showPromptError,
@@ -5236,6 +5333,10 @@ export async function start({ global, document, client }) {
       showApprovals();
       return;
     }
+    if (frame.kind === "event" && frame.payload?.type === "PreviewMarkAdded") {
+      if (frame.payload.repo_root === project.repo_root && frame.payload.session_id === currentSessionId) await refreshPreviewMarks();
+      return;
+    }
     if (frame.kind === "event" && frame.payload?.type === "SessionNotesUpdated") {
       if (frame.payload.session_id === currentSessionId) await refreshOpenNotes();
       return;
@@ -5283,6 +5384,9 @@ export async function start({ global, document, client }) {
       return;
     }
     const frameSessionId = frame.kind === "event" ? frame.payload?.session_id : null;
+    if (frame.kind === "event" && frame.payload?.type === "PersonNotice") {
+      notify("Leader", frame.payload.text, frameSessionId);
+    }
     if (frame.kind === "event" && ["RunFinished", "RunFailed"].includes(frame.payload?.type)) {
       const payload = decodeEvent(frame.payload);
       const rootAgentId = frameSessionId === currentSessionId
@@ -5384,6 +5488,7 @@ export async function start({ global, document, client }) {
     }
   }
 
+  await refreshPreviewMarks();
   const subscription = boundary.events((frame) => onFrame(frame));
   if (currentSessionId && route.page === "chat" && !document.hidden) {
     await markSessionViewed(currentSessionId);

@@ -193,7 +193,7 @@ def routes_require_the_token():
              "/agent", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard",
              "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit",
              "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start",
-             "/memory/update", "/memory/delete", "/credentials")
+             "/memory/update", "/memory/delete", "/memory/restore", "/credentials", "/extensions/reload", "/config/set")
     with workspace() as ws, running_host(ws) as host:
         exposed = {}
         for method, paths in (("GET", gets), ("POST", posts)):
@@ -202,6 +202,20 @@ def routes_require_the_token():
                 if status != 401:
                     exposed[f"{method} {path}"] = status
         assert not exposed, f"routes accessible without a token: {exposed}"
+        config = ws.outside / "home" / ".symphonai" / "config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        original = '# Keep header\n[memory]\nextract = true  # Keep comment\n'
+        config.write_text(original)
+        post(host, "/config/set", {"key": "memory.extract", "value": False, "scope": "user"})
+        assert config.read_text() == original.replace("true", "false")
+        assert {row["key"]: row["value"] for row in get(host, "/settings")["settings"]["config"]}["memory.extract"] is False
+        saved = config.read_bytes()
+        for key, value, scope in (("roles.leader.model", "fixture", "project"),
+                                  ("memory.extract", "invalid", "user"),
+                                  ("unknown.value", 1, "user"), ("memory.model", [], "user")):
+            status, reply, _ = request(host, "/config/set", {"key": key, "value": value, "scope": scope})
+            assert status == 400 and reply["error"]
+            assert config.read_bytes() == saved
 
 
 @check("host.app_page_and_assets_require_the_page_token_or_cookie")

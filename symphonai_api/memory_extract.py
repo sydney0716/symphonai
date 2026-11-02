@@ -289,6 +289,12 @@ class MemoryExtractor:
             success = False
             try:
                 success = self._extract(context, cursor, cancel)
+                if success:
+                    from symphonai_api.memory_consolidate import consolidate_due
+
+                    provider = context[5] or context[1]
+                    consolidate_due(self._store, provider, context[6] or provider.model,
+                                    cancel=cancel, usage_callback=self._usage_callback)
             except Exception:
                 success = False
             with self._lock:

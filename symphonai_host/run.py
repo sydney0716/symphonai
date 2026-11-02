@@ -27,7 +27,7 @@ from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
 from symphonai_api.config import permission_grants, restrict_permission_grants, resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
-from symphonai_api.events import Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SessionNotesUpdated, SubagentSpawned, fan_out
+from symphonai_api.events import AutoReviewed, PreviewMarkAdded, Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SessionNotesUpdated, SubagentSpawned, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.environment import capture_environment
 from symphonai_api.identity import new_id
@@ -59,6 +59,7 @@ from symphonai_api.session import (
     tool_result_search_path,
 )
 from symphonai_api.serialization import message_from_json
+from symphonai_api.skills import Skill
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.edit import _diff_result
@@ -111,6 +112,24 @@ def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
 
 
 MAX_ACTIVE_CONVERSATIONS = 4
+
+
+@dataclass(frozen=True)
+class _SkillSnapshot(Skill):
+    saved_body: str = field(repr=False, compare=False)
+
+    def body(self) -> str:
+        return self.saved_body
+
+
+def _snapshot_extensions(extensions):
+    if extensions is None:
+        return None
+    return replace(extensions, skills={
+        name: _SkillSnapshot(skill.name, skill.description, skill.when_to_use,
+                             skill.path, skill.always_on_tokens, skill.body())
+        for name, skill in extensions.skills.items()
+    })
 
 
 class RunActiveError(RuntimeError):
@@ -202,7 +221,7 @@ def _checkpoint_file_bytes(checkpoints: CheckpointStore, path: str) -> bytes | N
     return target.read_bytes()
 
 
-PERMISSION_MODES = ("ask", "plan", "allow")
+PERMISSION_MODES = ("ask", "plan", "auto", "allow")
 _LOG = logging.getLogger(__name__)
 
 
@@ -326,7 +345,13 @@ class HostRun:
         chat_token_budget: int | None = None,
         chat_recent_turns: int = DEFAULT_RECENT_TURNS,
         lsp: LspManager | None = None,
+        reload_policy: PermissionPolicy | None = None,
     ) -> None:
+        self._reload_policy = replace(reload_policy or policy)
+        self._next_policy = None
+        self._memory_extraction_override = memory_extraction_enabled
+        self._reload_price_table = price_table
+        extensions = _snapshot_extensions(extensions)
         if extensions is not None:
             lifted = set(extensions.config.get("always_deny.lift", []))
             if lifted:
@@ -488,6 +513,10 @@ class HostRun:
         self._context_by_session: dict[str, ContextReport | None] = {}
         self._usage_by_session: dict[str, dict[str, tuple[str, dict[str, UsageTotals]]]] = {}
         self._closing = False
+        self._preview = None
+        self._preview_lock = threading.RLock()
+        self._preview_last_url = ""
+        self._preview_marks = {}
         from symphonai_host.spec_loop import LoopController
         self._loop_store = LoopStore(self._repo_root)
         self._loops = LoopController(self, self._loop_store)
@@ -521,13 +550,152 @@ class HostRun:
             self._mcp_tools = tools
             self._mcp_instructions = pool.instructions
 
+    def replace_extensions(self, extensions, pool, tools) -> bool:
+        extensions = _snapshot_extensions(extensions)
+        config = extensions.config
+        memory_provider = None
+        memory_model = config.get("memory.model")
+        enabled = (config.get("memory.extract", True) if self._memory_extraction_override is None
+                   else self._memory_extraction_override)
+        name = config.get("memory.provider")
+        if name is not None:
+            memory_provider = (None if self._provider_factory is None else
+                               self._provider_factory(name, memory_model, None))
+            enabled = enabled and memory_provider is not None
+        budgets = resolve_run_budgets(config, repo_root=self._repo_root,
+                                      leader_max_turns=self._max_turns,
+                                      subagent_max_turns=None, price_table=self._reload_price_table)
+        shell, fetch = permission_grants(config, extensions.ceiling)
+        policy = extensions.ceiling.bound(replace(
+            self._reload_policy,
+            shell_sandbox=config.get("sandbox.shell", False),
+            sandbox_network=config.get("sandbox.network", False),
+            sandbox_readable=tuple(config.get("sandbox.readable", ())),
+            always_deny_commands=tuple(command for command in ALWAYS_DENY_COMMANDS
+                                      if " ".join(command) not in config.get("always_deny.lift", [])),
+            allow_uncheckable_shell=config.get("always_deny.allow_uncheckable_shell", False),
+            allow_discarding_work=config.get("always_deny.allow_discarding_work", False),
+        ))
+        endpoint = config.get("search.endpoint")
+        hooks = extensions.hook_runner(cwd=self._repo_root)
+        modes = tuple(mode for mode in PERMISSION_MODES
+                      if extensions.ceiling.modes is None or mode in extensions.ceiling.modes)
+        if not modes:
+            raise ValueError("agents.ceiling.modes must permit at least one mode")
+        with self._lock:
+            if self._closing:
+                raise ValueError("Project is closing")
+            retained = bool(self._open_conversations)
+            self._extensions = extensions
+            self.mcp_pool = pool
+            self._mcp_tools = tools
+            self._mcp_instructions = pool.instructions
+            self._hooks = hooks
+            self._memory_provider, self._memory_model = memory_provider, memory_model
+            self._memory_extraction_enabled = enabled
+            self._search_backend = None if endpoint is None else HttpJsonSearchBackend(search_endpoint(endpoint))
+            self._leader_budget, self._subagent_budget, self._price_table = budgets
+            self._subagent_turn_limit_configured = "budgets.subagent.max_turns" in config.values
+            self._configured_shell_grants, self._configured_fetch_grants = shell, fetch
+            self._project_shell_grants, self._project_fetch_grants = restrict_permission_grants(
+                (*shell, *self._stored_project_shell_grants),
+                (*fetch, *self._stored_project_fetch_grants), extensions.ceiling,
+            )
+            policy.fetch_allowlist = list(self._project_fetch_grants)
+            self._starting_mode = "ask" if "ask" in modes else modes[0]
+            policy.mode = self._starting_mode
+            self._next_policy = policy
+            self._base_policy = replace(policy)
+            if self._conversation is None:
+                self._policy = policy
+                self.approvals = self._new_approval_broker(None)
+                policy.approval_callback = self.approvals.callback
+            return retained
+
     def _new_approval_broker(self, session_id: str | None) -> ApprovalBroker:
+        def review(request):
+            from symphonai_host.auto_review import review_call
+            from symphonai_api.permissions import DenialReason, PermissionDecision
+            from symphonai_api.secrets import mask_secrets
+
+            with self._lock:
+                policy = self._policy_by_session.get(session_id, self._policy)
+                if policy.mode != "auto":
+                    return None
+                conversation = self._open_conversations.get(session_id)
+                active = self._active_by_session.get(session_id)
+            headless = False
+            try:
+                if conversation is None:
+                    raise ValueError("No conversation for review")
+                leader, store = conversation
+                headless = store.read_meta().get("headless") is True
+                records, _ = read_records(store.directory / "run.jsonl")
+                person = ""
+                for record in records:
+                    if record.get("type") == "message":
+                        message = message_from_json(record["data"])
+                        if (message.role is Role.USER and not SUBAGENT_NOTICE_PATTERN.match(message.text)
+                            and not message.text.startswith(("[Stop hook] ", "Goal check failed (round ", "Round "))):
+                            person = message.text
+                found = None
+                for path in (store.directory / "run.jsonl", *sorted(store.directory.glob("agent-*.jsonl"))):
+                    transcript, _ = read_records(path)
+                    last_text = ""
+                    for record in transcript:
+                        if record.get("type") != "message":
+                            continue
+                        message = message_from_json(record["data"])
+                        if message.role is Role.ASSISTANT:
+                            last_text = message.text or last_text
+                            if any(call.id == request.tool_call_id for call in message.tool_calls):
+                                found = (path, record, last_text)
+                    if found is not None:
+                        break
+                if found is None:
+                    raise ValueError("Call context unavailable")
+                path, record, last_text = found
+                owner = leader._agent if path.name == "run.jsonl" else next(
+                    (item.agent for item in leader._dispatch_tool.pool.values()
+                     if item.agent_ref.agent_id == record["agent_id"]), None)
+                if owner is None:
+                    raise ValueError("Call owner unavailable")
+                if owner._policy.mode != "auto":
+                    return None
+                provider = leader._config.leader_provider
+                model = leader._agent._previous_answering_model or leader._leader_spec.model.model or provider.model
+                decision, reason = review_call(
+                    provider, model, request, user_text=person, agent_text=last_text,
+                    repo_root=owner._policy.repo_root,
+                    on_usage=lambda model, usage: self._record_background_usage(session_id, model or "unknown", usage),
+                    cancel=None if active is None else active.cancel,
+                )
+                event = AutoReviewed(
+                    agent_id=record["agent_id"], run_id=record["run_id"], turn_id=record.get("turn_id"),
+                    operation=request.operation, target=mask_secrets(request.target),
+                    decision=decision, reason=reason, tool_call_id=request.tool_call_id,
+                )
+                store.writer_for(record["agent_id"], is_root=path.name == "run.jsonl").append(
+                    "auto_reviewed", run_id=event.run_id, agent_id=event.agent_id,
+                    turn_id=event.turn_id, data={"operation": event.operation, "target": event.target,
+                        "decision": event.decision, "reason": event.reason, "tool_call_id": event.tool_call_id},
+                )
+                self._publish_session(event, session_id)
+                if decision == "approve":
+                    return PermissionDecision.allow()
+                return PermissionDecision.deny(f"Auto reviewer denied: {reason}", denial=DenialReason.DENIED_BY_USER)
+            except Exception:
+                if headless or self._closing or (active is not None and active.cancel.cancelled):
+                    return PermissionDecision.deny("Auto reviewer failed; call denied", denial=DenialReason.APPROVAL_FAILED)
+                return None
+
         return ApprovalBroker(
             self._publish_approval_callback,
             timeout=self._approval_timeout,
             session_id=session_id,
             shell_grants=self._project_shell_grants,
             fetch_grants=self._project_fetch_grants,
+            review=review,
         )
 
     @property
@@ -1068,13 +1236,19 @@ class HostRun:
         return result
 
     @staticmethod
-    def _replay_tool_call(call, result=None) -> dict:
+    def _replay_tool_call(call, result=None, review=None) -> dict:
         replay = {"id": call.id, "name": call.name}
+        if review is not None:
+            replay["auto_reviews"] = review
         if call.name == "dispatch_subagent":
             for key in ("subagent_name", "task"):
                 value = call.arguments.get(key)
                 if isinstance(value, str):
                     replay[key] = value
+        elif call.name == "notify_person":
+            if result is not None and result.ok:
+                from symphonai_api.secrets import mask_secrets
+                replay["text"] = mask_secrets(call.arguments.get("text", ""))
         elif call.name == "update_plan":
             for key in ("plan", "explanation"):
                 value = call.arguments.get(key)
@@ -1132,11 +1306,20 @@ class HostRun:
         return replay
 
     @staticmethod
-    def _replay_tool_calls(message: Message, results: Mapping[str, object]) -> list[dict]:
+    def _replay_tool_calls(message: Message, results: Mapping[str, object], reviews=None) -> list[dict]:
         return [
-            HostRun._replay_tool_call(call, results.get(call.id))
+            HostRun._replay_tool_call(call, results.get(call.id), (reviews or {}).get(call.id))
             for call in message.tool_calls
         ]
+
+    @staticmethod
+    def _saved_auto_reviews(records):
+        reviews = {}
+        for record in records:
+            data = record.get("data")
+            if record.get("type") == "auto_reviewed" and isinstance(data, dict) and isinstance(data.get("tool_call_id"), str):
+                reviews.setdefault(data["tool_call_id"], []).append(data)
+        return reviews
 
     @staticmethod
     def _replay_tool_results(messages: list[Message]) -> dict[str, object]:
@@ -1420,6 +1603,8 @@ class HostRun:
             run_id = new_id("run")
             cancel = CancellationToken()
             if conversation is None:
+                if not detached and self._next_policy is not None:
+                    policy = self._next_policy
                 if self._provider is None and self._provider_factory is not None:
                     self._provider = self._provider_factory(None, None, None)
                     if self._provider is not None:
@@ -1637,6 +1822,7 @@ class HostRun:
         policy: PermissionPolicy | None = None, approvals: ApprovalBroker | None = None,
         tool_restriction: frozenset[str] | None = None,
     ) -> Leader:
+        extensions = self._extensions
         policy = self._policy if policy is None else policy
         approvals = self.approvals if approvals is None else approvals
         tool_restriction = self._restricted_tool_names if tool_restriction is None else tool_restriction
@@ -1787,8 +1973,8 @@ class HostRun:
         def configure_fallback(provider: ModelProvider | None) -> ModelProvider | None:
             if provider is not None:
                 provider.fallback_models = tuple(
-                    () if self._extensions is None else
-                    self._extensions.config.get(f"fallback.{provider.name}", ())
+                    () if extensions is None else
+                    extensions.config.get(f"fallback.{provider.name}", ())
                 )
             return provider
 
@@ -1983,6 +2169,7 @@ class HostRun:
                         updated = dict(by_model)
                         updated[model] = updated.get(model, UsageTotals()).merged(totals)
                         persisted_usage[agent_id] = (name, updated)
+                auto_reviews = self._saved_auto_reviews(records)
                 metadata = reader.read_meta()
                 checkpoint_keys, replay_edits = self._checkpoint_replay_data(
                     records, subagent_records
@@ -2030,7 +2217,7 @@ class HostRun:
                         text=message.text,
                         notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
                         reasoning=message.reasoning,
-                        tool_calls=self._replay_tool_calls(message, tool_results),
+                        tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
                         turn_id=message.turn_id, record_id=record_id,
                         attachments=[
                             {
@@ -2089,7 +2276,7 @@ class HostRun:
                     effort,
                     provider_choice,
                 )
-                self._policy = replace(self._policy)
+                self._policy = replace(self._next_policy or self._policy)
                 self._policy.mode = self._starting_mode
                 self.approvals = self._new_approval_broker(run_id)
                 self._policy.approval_callback = self.approvals.callback
@@ -2140,7 +2327,7 @@ class HostRun:
                 text=message.text,
                 notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
                 reasoning=message.reasoning,
-                tool_calls=self._replay_tool_calls(message, tool_results),
+                tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
                 turn_id=message.turn_id,
                 record_id=record_id,
                 attachments=[
@@ -2202,6 +2389,7 @@ class HostRun:
                 raise SessionError("agent not found")
             records, _ = read_records(reader.directory / f"agent-{agent_id}.jsonl")
             tool_results = self._replay_tool_results(loaded.messages)
+            auto_reviews = self._saved_auto_reviews(records)
             replay_turns = self._turn_replay_data(records)
             messages = []
             wait_ids = {call.id for saved in loaded.messages for call in saved.tool_calls
@@ -2213,7 +2401,7 @@ class HostRun:
                     text=message.text,
                     notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
                     reasoning=message.reasoning,
-                    tool_calls=self._replay_tool_calls(message, tool_results),
+                    tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
                     turn_id=message.turn_id,
                     attachments=[
                         {
@@ -2369,7 +2557,7 @@ class HostRun:
                 self._goal_session_id = None
                 self._goal_check = None
                 self._goal_check_thread = None
-                self._policy = replace(self._policy)
+                self._policy = replace(self._next_policy or self._policy)
                 self._policy.mode = self._starting_mode
                 self._policy.approval_callback = self.approvals.callback
                 self._context_report = None
@@ -2384,6 +2572,7 @@ class HostRun:
             self._goal_session_id = None
             self._conversation = None
             self._active = None
+            self._policy = replace(self._next_policy or self._policy)
             self._policy.mode = self._starting_mode
             self._context_report = None
             self._usage_by_agent.clear()
@@ -2491,9 +2680,64 @@ class HostRun:
                     store.close()
         return True
 
+    def start_preview(self, url: str = "") -> dict:
+        from symphonai_host.preview import Preview, target_url
+
+        with self._preview_lock:
+            url = url or self._preview_last_url
+            target_url(url)
+            self.stop_preview()
+            with self._lock:
+                if self._closing:
+                    raise ValueError("Project is closing")
+                self._preview = Preview(url, self._policy, self._add_preview_mark)
+                self._preview_last_url = url
+                return {"preview_url": self._preview.url}
+
+    def stop_preview(self) -> dict:
+        with self._preview_lock:
+            with self._lock:
+                preview, self._preview = self._preview, None
+            if preview is not None:
+                preview.close()
+        return {"stopped": True}
+
+    def _add_preview_mark(self, mark: dict) -> None:
+        with self._lock:
+            if self._closing:
+                raise ValueError("Project is closing")
+            session_id = None if self._conversation is None else self._conversation[1].run_id
+            self._preview_marks.setdefault(session_id, []).append(mark)
+            event = PreviewMarkAdded(
+                agent_id="", run_id="", mark=mark, session_id=session_id, repo_root=str(self._repo_root),
+            )
+            if session_id is None:
+                self._broker.publish(event)
+            else:
+                self._publish_session(event, session_id)
+
+    def add_preview_mark(self, token: str, value: dict) -> dict:
+        with self._lock:
+            preview = self._preview
+        if preview is None:
+            raise PermissionError("Preview is not running")
+        return preview.mark(token, value)
+
+    def preview_marks(self) -> dict:
+        with self._lock:
+            session_id = None if self._conversation is None else self._conversation[1].run_id
+            return {"session_id": session_id, "marks": list(self._preview_marks.get(session_id, []))}
+
+    def remove_preview_marks(self, ids: list[str], session_id: str | None) -> dict:
+        with self._lock:
+            self._preview_marks[session_id] = [mark for mark in self._preview_marks.get(session_id, [])
+                                               if mark["id"] not in ids]
+        return {"removed": True}
+
     def close(self) -> None:
         from symphonai_host.terminal import close_host
         self._closing = True
+        self.stop_preview()
         self._keep_awake.close()
         close_host(self)
         with self._lock:

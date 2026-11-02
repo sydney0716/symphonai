@@ -267,6 +267,15 @@ export function createTranscript({ now = () => Date.now() } = {}) {
 
   function applyEvent(event) {
     const { type, fields } = event;
+    if (type === "PreviewMarkAdded") return;
+    if (type === "AutoReviewed") {
+      model.push({ type: "auto-reviewed", ...fields });
+      return;
+    }
+    if (type === "PersonNotice") {
+      model.push({ type: "person-notice", text: fields.text });
+      return;
+    }
     const notice = subagentNotice({ type, ...fields });
     if (notice !== null) {
       model.push(notice);
@@ -325,6 +334,11 @@ export function createTranscript({ now = () => Date.now() } = {}) {
           text: fields.text,
         });
         for (const toolCall of fields.tool_calls ?? []) {
+          for (const review of toolCall.auto_reviews ?? []) model.push({ type: "auto-reviewed", ...review });
+          if (toolCall.name === "notify_person") {
+            if (typeof toolCall.text === "string") model.push({ type: "person-notice", text: toolCall.text });
+            continue;
+          }
           if (toolCall.name === "update_plan" && Array.isArray(toolCall.plan)) {
             appendPlan({
               agent_id: fields.agent_id,
@@ -472,7 +486,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       return;
     }
     if (type === "ToolCallStarted") {
-      if (fields.tool_name === "update_plan" || fields.tool_name === "ask_user" || fields.tool_name === "propose_plan") return;
+      if (fields.tool_name === "notify_person" || fields.tool_name === "update_plan" || fields.tool_name === "ask_user" || fields.tool_name === "propose_plan") return;
       if (!endedRuns.has(fields.run_id) && !calls.has(fields.tool_call_id)) {
         appendActivity(fields);
       }

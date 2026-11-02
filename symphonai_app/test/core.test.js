@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { start } from "../src/app.js";
 import { createClient } from "../src/client.js";
+import { renderMemorySettings } from "../src/settings.js";
 
 // A small DOM with real parent/child and textContent semantics. Missing ids
 // return null, and operations on a non-child fail rather than hiding a crash.
@@ -210,6 +211,100 @@ function terminalBrowser() {
     for (const callback of listeners.get(type) ?? []) await callback(value);
   } };
 }
+
+test("reload refreshes skill commands and the mention roster", async () => {
+  const script = scriptedClient();
+  let reloaded = false;
+  script.client.settings = async () => ({ settings: {
+    mode: "allow", providers: [{ name: "openai", key_present: true }],
+    skills: reloaded ? [{ name: "new-skill", description: "Fixture skill" }] : [],
+  } });
+  script.client.reloadExtensions = async () => {
+    reloaded = true;
+    return { changes: { skills: { added: ["new-skill"], removed: [], changed: [], failed: [] } } };
+  };
+  const document = new Document();
+  const app = await start({ global: browser(), document, client: script.client });
+  await submit(document, "/reload");
+  assert.match(document.body.textContent, /1 added/);
+  await submit(document, "/new-skill");
+  assert.equal(script.prompts[0], "Use the new-skill skill.");
+  await script.emit("RunStarted", { parent_run_id: null });
+  await script.emit("RunFinished", { stopped_reason: "final_response" });
+  await submit(document, "@new-skill help");
+  assert.match(script.prompts[1], /^Use the new-skill skill\./);
+  app.subscription.close();
+});
+
+test("General saves a scalar and keeps an invalid draft beside its error", async () => {
+  const script = scriptedClient();
+  const writes = [];
+  let extract = true;
+  script.client.settings = async () => ({ settings: { mode: "allow", providers: [], config: [
+    { key: "memory.extract", value: extract, scope: "user" },
+    { key: "memory.model", value: "fixture", scope: "user" },
+  ] } });
+  script.client.setConfig = async (key, value, scope) => {
+    writes.push({ key, value, scope });
+    if (key === "memory.model") throw new Error("invalid model");
+    extract = value;
+    return { changes: {} };
+  };
+  const document = new Document();
+  const global = browser(); global.location.hash = "#/settings/general";
+  const app = await start({ global, document, client: script.client });
+  const field = find(document.body, node => node.getAttribute?.("aria-label") === "memory.extract");
+  field.checked = false;
+  await find(field.parentNode, node => node.tagName === "BUTTON").click();
+  assert.deepEqual(writes[0], { key: "memory.extract", value: false, scope: "user" });
+  assert.equal(find(document.body, node => node.getAttribute?.("aria-label") === "memory.extract").checked, false);
+  const model = find(document.body, node => node.getAttribute?.("aria-label") === "memory.model");
+  model.value = "bad draft";
+  await find(model.parentNode, node => node.tagName === "BUTTON").click();
+  assert.equal(model.value, "bad draft");
+  assert.match(model.parentNode.textContent, /invalid model/);
+  app.subscription.close();
+});
+
+test("Memory shows consolidation changes and restores the selected scope", async () => {
+  const document = new Document();
+  const content = document.createElement("section");
+  const restored = [];
+  const context = {
+    document, settingsContent: content, memoryLoading: false, memoryLoadError: null,
+    memoryReply: { project: { entries: [], has_previous: true, last_consolidation: {
+      time: "2026-11-02", merged: [{ ids: ["a", "b"], text: "Merged fact", previous: [{ text: "Old fact" }] }],
+      removed: [{ id: "c", text: "Outdated fact", reason: "Superseded" }],
+    } } },
+    boundary: { restoreMemory: async scope => restored.push(scope) },
+    loadMemory: async () => { context.memoryReply.project.entries = [{ id: "a", text: "Restored fact" }]; },
+    renderMemoryContent() {},
+  };
+  renderMemorySettings(context);
+  assert.match(content.textContent, /1 merges, 1 removed/);
+  assert.match(content.textContent, /Old fact → Merged fact/);
+  assert.match(content.textContent, /Outdated fact — Superseded/);
+  await find(content, node => node.tagName === "BUTTON" && node.textContent === "Restore previous").click();
+  assert.deepEqual(restored, ["project"]);
+  assert.equal(context.memoryReply.project.entries[0].text, "Restored fact");
+});
+
+test("client sends reload, config and memory restore requests as authenticated POSTs", async () => {
+  const calls = [];
+  const client = createClient({ port: 4312, token: "core-inert-token", fetch: async (url, options) => {
+    assert.equal(options.headers.Authorization, "Bearer core-inert-token");
+    calls.push([new URL(url).pathname, options.method, JSON.parse(options.body)]);
+    return { status: 200, json: async () => ({ changes: {} }) };
+  } });
+  await client.reloadExtensions();
+  await client.setConfig("memory.extract", false, "user");
+  await client.restoreMemory("global");
+  assert.deepEqual(calls, [
+    ["/extensions/reload", "POST", {}],
+    ["/config/set", "POST", { key: "memory.extract", value: false, scope: "user" }],
+    ["/memory/restore", "POST", { scope: "global" }],
+  ]);
+});
 
 test("Terminal panel starts closed and opens without xterm globals", async () => {
   const document = new Document();
@@ -696,4 +791,74 @@ test("real client requests the selected usage period without the protocol encode
   } });
   assert.equal((await client.usage(90)).days, 90);
   assert.deepEqual(calls, [["/usage?days=90", "GET"]]);
+});
+
+
+test("preview marks stay in the composer and send together as one prompt", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  const global = browser();
+  const opened = [];
+  global.open = (_url, _target, features) => {
+    const window = { location: { href: '' }, opener: {}, close() {} };
+    opened.push({ window, features });
+    return window;
+  };
+  let marks = [];
+  const starts = [], removed = [];
+  script.client.previewStart = async (url) => { starts.push(url); return { preview_url: 'http://127.0.0.1:4321/' }; };
+  script.client.previewStop = async () => ({ stopped: true });
+  script.client.previewMarks = async () => ({ session_id: null, marks });
+  script.client.removePreviewMarks = async (ids, sessionId) => {
+    removed.push([ids, sessionId]);
+    marks = marks.filter((mark) => !ids.includes(mark.id));
+  };
+  const app = await start({ global, document, client: script.client });
+  await submit(document, '/preview http://127.0.0.1:3000');
+  assert.deepEqual(starts, ['http://127.0.0.1:3000']);
+  assert.equal(opened[0].window.location.href, 'http://127.0.0.1:4321/');
+  assert.equal(opened[0].window.opener, null);
+  marks = [
+    { id: 'one', text: 'Button', comment: 'Make it blue', selector: '#submit',
+      html: '<button id="submit">Button</button>', url: 'http://127.0.0.1:4321/', source_hint: 'src/Button.tsx', source_guess: true },
+    { id: 'two', text: 'Heading', comment: 'Larger title', selector: 'h1',
+      html: '<h1>Heading</h1>', url: 'http://127.0.0.1:4321/', source_hint: 'src/App.tsx:8', source_guess: false },
+  ];
+  await script.emit('PreviewMarkAdded', { repo_root: '/core-project', session_id: null, mark: marks[0] });
+  const composer = document.getElementById('prompt-attachments');
+  assert.match(composer.textContent, /Button · Make it blue/);
+  assert.match(composer.textContent, /Heading · Larger title/);
+  assert.ok(!app.transcript.model.some((entry) => entry.type === 'prompt'));
+  await submit(document, 'please fix these');
+  assert.equal(script.prompts.length, 1);
+  for (const text of ['please fix these', 'Make it blue', 'Larger title', '#submit', 'h1',
+    '<button id="submit">Button</button>', '<h1>Heading</h1>', 'Source (guess): src/Button.tsx', 'Source: src/App.tsx:8']) {
+    assert.ok(script.prompts[0].includes(text), text);
+  }
+  assert.deepEqual(removed, [[['one', 'two'], null]]);
+  assert.equal(find(composer, (node) => node.className === 'attachment-chip preview-mark-chip'), null);
+  app.subscription.close();
+});
+
+
+test("leader notes show before the answer and replay without becoming prompts", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  const app = await start({ global: browser(), document, client: script.client });
+  await script.emit('RunStarted');
+  await script.emit('PersonNotice', { text: 'halfway' });
+  assert.match(document.getElementById('chat').textContent, /Leader: halfway/);
+  assert.equal(app.transcript.model.filter((entry) => entry.type === 'prompt').length, 0);
+  await script.emit('AssistantTextDelta', { text: 'Finished work' });
+  const live = document.getElementById('chat').textContent;
+  assert.ok(live.indexOf('Leader: halfway') < live.indexOf('Finished work'));
+  app.transcript.reset();
+  await script.emit('HistoryMessage', { role: 'assistant', text: '', tool_calls: [
+    { id: 'note', name: 'notify_person', text: 'halfway' },
+  ] });
+  await script.emit('HistoryMessage', { role: 'assistant', text: 'Finished work', tool_calls: [] });
+  assert.match(document.getElementById('chat').textContent, /Leader: halfway/);
+  assert.equal(app.transcript.model.filter((entry) => entry.type === 'person-notice').length, 1);
+  assert.equal(app.transcript.model.filter((entry) => entry.type === 'prompt').length, 0);
+  app.subscription.close();
 });

@@ -33,6 +33,7 @@ _RECORD_TYPES = frozenset(
         "message",
         "tool_started",
         "tool_result",
+        "auto_reviewed",
         "turn_finished",
         "cancellation",
         "compaction",

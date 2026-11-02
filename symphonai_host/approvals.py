@@ -157,10 +157,12 @@ class ApprovalBroker:
         session_id: str | None = None,
         shell_grants: tuple[tuple[str, ...], ...] = (),
         fetch_grants: tuple[str, ...] = (),
+        review: Callable[[ToolApprovalRequest], PermissionDecision | None] | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("approval timeout must be greater than 0")
         self._publish = publish
+        self._review = review
         self._timeout = timeout
         self._session_id = session_id
         self._pending: dict[str, _Pending] = {}
@@ -197,6 +199,13 @@ class ApprovalBroker:
                 self._granted_fetch_hosts | self._project_fetch_hosts
             ):
                 return PermissionDecision.allow()
+        if self._review is not None:
+            try:
+                decision = self._review(request)
+            except Exception:
+                decision = None
+            if decision is not None:
+                return decision
         distinct_prefixes = tuple(dict.fromkeys(grant_prefixes))
         remember = (
             ", ".join(" ".join(prefix) for prefix in distinct_prefixes)

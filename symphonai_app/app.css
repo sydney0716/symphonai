@@ -2772,3 +2772,5 @@ button.session-link {
 .usage-bar-track { background: var(--ui-inset); height: 0.5rem; }
 .usage-bar { display: block; background: var(--ui-accent); height: 100%; }
 .usage-project { overflow-wrap: anywhere; }
+
+.preview-mark-chip { max-width: 100%; overflow-wrap: anywhere; }

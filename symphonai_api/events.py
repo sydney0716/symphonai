@@ -214,3 +214,24 @@ class CollectingSink:
     def of_type(self, event_type: type) -> list[Event]:
         with self._lock:
             return [event for event in self.events if isinstance(event, event_type)]
+
+
+@dataclass(frozen=True)
+class PreviewMarkAdded(Event):
+    mark: dict | None = None
+    session_id: str | None = None
+    repo_root: str = ""
+
+
+@dataclass(frozen=True)
+class PersonNotice(Event):
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class AutoReviewed(Event):
+    operation: str = ""
+    target: str = ""
+    decision: str = ""
+    reason: str = ""
+    tool_call_id: str = ""

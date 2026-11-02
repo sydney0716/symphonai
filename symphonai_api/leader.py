@@ -70,6 +70,7 @@ from symphonai_api.events import (
     SubagentSpawned,
     SubagentStopped,
     SubagentNotice,
+    PersonNotice,
     ToolCallStarted,
     emit,
     fan_out,
@@ -1712,6 +1713,33 @@ class _SubagentControlTool(LocalTool):
             return ToolResult(tool_call.id, ok=False, error=str(exc))
 
 
+class _NotifyPersonTool(LocalTool):
+    name = "notify_person"
+    description = "Send the person a short progress note without waiting for a reply."
+    parameters = {"type": "object", "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 500},
+    }, "required": ["text"], "additionalProperties": False}
+
+    def __init__(self, leader):
+        self.leader = leader
+
+    def metadata(self, arguments):
+        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+
+    def validate(self, arguments):
+        return None if arguments["text"].strip() else "note text must not be blank"
+
+    def _execute(self, tool_call, policy, cancel=None):
+        run_id = self.leader._leader_run_id()
+        if run_id is None:
+            return ToolResult(tool_call.id, ok=False, error="the leader is not running")
+        emit(self.leader._event_sink, PersonNotice(
+            agent_id=self.leader.agent_ref.agent_id, run_id=run_id,
+            text=mask_secrets(tool_call.arguments["text"]),
+        ))
+        return ToolResult(tool_call.id, ok=True, content="sent")
+
+
 class _MessageLeaderTool(LocalTool):
     name = "message_leader"
     description = "Send the leader a progress note or question, then keep working."
@@ -1921,6 +1949,7 @@ class Leader:
             for name in FILE_EDIT_TOOLS:
                 leader_only_tools.pop(name, None)
         leader_tools.update(leader_only_tools)
+        leader_tools["notify_person"] = _NotifyPersonTool(self)
         if restrict_leader:
             for name in FILE_EDIT_TOOLS:
                 leader_tools.pop(name, None)

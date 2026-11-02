@@ -718,6 +718,9 @@ function renderUnknown(document, entry) {
 const TRANSCRIPT_RENDERERS = Object.freeze({
   prompt: renderPrompt,
   "subagent-notice": renderSubagentNotice,
+  "auto-reviewed": (document, entry) => element(document, "p", { className: "activity auto-reviewed", text:
+    `Auto-${entry.decision === "approve" ? "approved" : "denied"}: ${entry.operation} ${entry.target} — ${entry.reason}` }),
+  "person-notice": (document, entry) => element(document, "p", { className: "activity person-notice", text: `Leader: ${entry.text}` }),
   steer: renderSteer,
   text: renderText,
   thought: renderThought,

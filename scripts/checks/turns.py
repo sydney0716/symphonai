@@ -48,6 +48,46 @@ def answer(text="finished", *calls, usage=None):
     return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)), usage=usage or Usage())
 
 
+@check("turns.memory_consolidation_preserves_unnamed_entries_and_rejects_invalid_results")
+def memory_consolidation_preserves_unnamed_entries_and_rejects_invalid_results():
+    import json
+    from symphonai_api.agent_memory import AgentMemory
+    from symphonai_api.memory_consolidate import apply_result
+
+    for scope in ("project", "global"):
+        with workspace() as ws:
+            store = AgentMemory(ws.outside / "memory", ws.root)
+            original = tuple(store.write(text, agent_name="fixture", run_id="fixture", scope=scope)
+                             for text in ("Use pytest", "Run pytest", "Use the retired command",
+                                          "Keep this exact fact", "Keep this other fact"))
+            merge = {"ids": [original[0].id, original[1].id], "text": "Run pytest"}
+            for invalid in (
+                {"merge": [merge], "remove": [{"id": "missing", "reason": "outdated"}]},
+                {"merge": [merge], "remove": [], "entries": []},
+                {"merge": [], "remove": [{"reason": "remove everything"}]},
+                {"merge": [merge], "remove": [{"id": original[0].id, "reason": "duplicate"}]},
+                {"merge": [{"ids": merge["ids"], "text": "x" * 501}], "remove": []},
+            ):
+                try:
+                    apply_result(store, scope, original, json.dumps(invalid))
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("invalid consolidation was accepted")
+                assert store.read_status(scope) == (original, False)
+                assert store.last_consolidation(scope) is None and not store.has_previous(scope)
+            added = store.write("Added while the model was working", agent_name="fixture", run_id="later", scope=scope)
+            apply_result(store, scope, original, json.dumps({
+                "merge": [merge], "remove": [{"id": original[2].id, "reason": "retired command"}],
+            }))
+            remaining, unreadable = store.read_status(scope)
+            assert not unreadable
+            assert tuple(entry for entry in remaining if entry.id in {original[3].id, original[4].id, added.id}) == (*original[3:], added)
+            assert len(remaining) == 4 and remaining[-1].text == "Run pytest"
+            store.restore_previous(scope)
+            assert store.read_status(scope) == ((*original, added), False)
+
+
 def call(tool_name, /, **arguments):
     return ToolCall(f"{tool_name}-{os.urandom(4).hex()}", tool_name, arguments)
 

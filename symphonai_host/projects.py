@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import hashlib
+import threading
 from pathlib import Path
 from collections.abc import Callable, Mapping
 
@@ -23,6 +25,72 @@ class ProjectRuntime:
     pool: McpPool | None = None
     lsp: LspManager | None = None
     _closed: bool = field(default=False, init=False)
+    _reload_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _retired_pools: list = field(default_factory=list, init=False)
+    _skill_digests: dict[str, str] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        if self.run.extensions is not None:
+            self._skill_digests = {name: hashlib.sha256(skill.body().encode()).hexdigest()
+                                   for name, skill in self.run.extensions.skills.items()}
+
+    def reload_extensions(self, *, home: Path | None = None) -> dict:
+        """Prepare outside the host lock, then publish a complete replacement."""
+        with self._reload_lock:
+            previous = self.run.extensions
+            changes = {kind: {"added": [], "removed": [], "changed": [], "failed": []}
+                       for kind in ("skills", "agents", "plugins", "mcp_servers")}
+            try:
+                extensions = load_extensions(repo_root=self.root, home=home)
+                if extensions.config.warnings:
+                    raise ValueError("; ".join(extensions.config.warnings))
+                skill_digests = {name: hashlib.sha256(skill.body().encode()).hexdigest()
+                                 for name, skill in extensions.skills.items()}
+            except (ValueError, OSError) as exc:
+                for kind in ("skills", "agents", "plugins"):
+                    if kind in str(exc):
+                        changes[kind]["failed"].append({"error": str(exc)})
+                return {"changes": changes, "error": str(exc)}
+            for kind, delta in changes.items():
+                before = {} if previous is None else getattr(previous, kind)
+                after = getattr(extensions, kind)
+                if kind == "mcp_servers":
+                    before = {spec.name: spec for spec in before}
+                    after = {spec.name: spec for spec in after}
+                delta["added"] = sorted(after.keys() - before.keys())
+                delta["removed"] = sorted(before.keys() - after.keys())
+                if kind == "skills":
+                    delta["changed"] = sorted(name for name in before.keys() & after.keys()
+                                              if (before[name].discoverability_text(), before[name].path,
+                                                  self._skill_digests.get(name)) !=
+                                                 (after[name].discoverability_text(), after[name].path,
+                                                  skill_digests[name]))
+                else:
+                    delta["changed"] = sorted(name for name in before.keys() & after.keys()
+                                              if before[name] != after[name])
+            reuse = self.pool is not None and previous is not None and previous.mcp_servers == extensions.mcp_servers
+            pool = self.pool if reuse else McpPool(
+                extensions.mcp_servers, cwd=self.root, reserved_names=set(standard_tool_registry()))
+            try:
+                tools = pool.start()
+                tools.update(pool.resource_tools)
+                changes["mcp_servers"]["failed"] = [
+                    {"name": name, "error": state["error"]}
+                    for name, state in pool.states.items() if state["state"] != "started"
+                ]
+                retained = self.run.replace_extensions(extensions, pool, tools)
+            except BaseException:
+                if not reuse:
+                    pool.close()
+                raise
+            old, self.pool = self.pool, pool
+            self._skill_digests = skill_digests
+            if old is not None and old is not pool:
+                if retained:
+                    self._retired_pools.append(old)
+                else:
+                    old.close()
+            return {"changes": changes, "error": None}
 
     def close(self) -> None:
         if self._closed:
@@ -33,6 +101,8 @@ class ProjectRuntime:
             self.lsp.close()
         if self.pool is not None:
             self.pool.close()
+        for pool in self._retired_pools:
+            pool.close()
 
 
 def build_project(
@@ -73,6 +143,7 @@ def build_project(
             fetch_enabled=True,
         )
         ceiling = getattr(extensions, "ceiling", None)
+        reload_policy = policy
         if ceiling is not None:
             policy = ceiling.bound(policy)
         run = HostRun(
@@ -89,6 +160,7 @@ def build_project(
             mcp_pool=pool,
             mcp_instructions=pool.instructions,
             lsp=lsp,
+            reload_policy=reload_policy,
         )
         return ProjectRuntime(root, run, pool, lsp)
     except BaseException:

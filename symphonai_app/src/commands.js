@@ -2,12 +2,16 @@ import { errorText, element } from "./render.js";
 
 export const COMMANDS = Object.freeze([
   Object.freeze({
+    name: "reload", maxArgs: 0, handler: handleReload, aliases: Object.freeze([]),
+    description: "Reload skills, plugins, agents and MCP servers", argumentHint: "",
+  }),
+  Object.freeze({
     name: "mode",
-    maxArgs: 0,
+    maxArgs: 1,
     handler: handleMode,
     aliases: Object.freeze([]),
     description: "Choose the permission mode",
-    argumentHint: "",
+    argumentHint: "[ask | plan | auto | allow]",
   }),
   Object.freeze({
     name: "model",
@@ -71,6 +75,14 @@ export const COMMANDS = Object.freeze([
     aliases: Object.freeze([]),
     description: "Show what this conversation has used",
     argumentHint: "",
+  }),
+  Object.freeze({
+    name: "preview",
+    maxArgs: 1,
+    handler: async (context, { args }) => context.openPreview(args),
+    aliases: Object.freeze([]),
+    description: "Open a local web preview and mark elements",
+    argumentHint: "[<url> | stop]",
   }),
   Object.freeze({
     name: "stats",
@@ -185,8 +197,22 @@ export function matchCommands(text, extra = []) {
 }
 
 async function handleMode(context, { args, command, typedName, usage }) {
-  const { openModePicker } = context;
-  openModePicker();
+  const { openModePicker, boundary, answerCommand } = context;
+  if (args.length === 0) {
+    openModePicker();
+    return;
+  }
+  if (!["ask", "plan", "auto", "allow"].includes(args[0])) {
+    answerCommand(usage);
+    return;
+  }
+  try {
+    await boundary.selectMode(args[0]);
+    await context.refreshConversation();
+    answerCommand(`Mode: ${args[0]}`);
+  } catch (error) {
+    answerCommand(errorText(error));
+  }
   return;
 }
 
@@ -256,6 +282,25 @@ async function handleNew(context, { args, command, typedName, usage }) {
   const { startNewChat } = context;
   await startNewChat();
   return;
+}
+
+export function reloadSummary(reply) {
+  const changes = Object.entries(reply.changes ?? {}).flatMap(([kind, delta]) => {
+    const counts = ["added", "removed", "changed", "failed"]
+      .filter(key => delta[key].length).map(key => `${delta[key].length} ${key}`);
+    return counts.length ? [`${kind.replaceAll("_", " ")}: ${counts.join(", ")}`] : [];
+  });
+  return changes.length ? `Reloaded ${changes.join("; ")}.` : "Extensions reloaded.";
+}
+
+async function handleReload(context) {
+  try {
+    const reply = await context.boundary.reloadExtensions();
+    await context.refreshSettings();
+    context.answerCommand(reloadSummary(reply));
+  } catch (error) {
+    context.answerCommand(`Could not reload extensions: ${errorText(error)}`);
+  }
 }
 
 async function handleRename(context, { args, command, typedName, usage }) {

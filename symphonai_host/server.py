@@ -241,6 +241,8 @@ class HostServer:
             **({"model": provider.model} if provider.model else {}),
         } if provider is not None else {}))
         self._home = symphonai_home(home)
+        self._config_home = home
+        self._extensions_lock = threading.Lock()
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
         self._model_cache_lock = threading.Lock()
         self._usage_report = UsageReport()
@@ -1045,6 +1047,36 @@ class HostServer:
             def _get_health(self, payload):
                 return _Reply(HTTPStatus.OK, {'protocol_version': PROTOCOL_VERSION, 'state': 'active' if host.run is not None and host.run.active else 'idle', 'run_id': None if host.run is None else host.run.active_run_id, 'runtime_run_id': None if host.run is None else host.run.runtime_run_id})
 
+            def _post_preview_start(self, payload):
+                try:
+                    reply = host.run.start_preview(payload.get('url', ''))
+                except (ValueError, OSError):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Could not start preview: use a local http URL'})
+                return _Reply(HTTPStatus.OK, reply)
+
+            def _post_preview_stop(self, payload):
+                return _Reply(HTTPStatus.OK, host.run.stop_preview())
+
+            def _get_preview_marks(self, payload):
+                return _Reply(HTTPStatus.OK, host.run.preview_marks())
+
+            def _post_preview_mark(self, payload):
+                if 'remove' in payload:
+                    # Preview credentials grant creation only, never composer control.
+                    if not self._authorized():
+                        return None
+                    ids, session_id = payload.get('remove'), payload.get('session_id')
+                    if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids) or not (session_id is None or isinstance(session_id, str)):
+                        return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Invalid mark removal'})
+                    return _Reply(HTTPStatus.OK, host.run.remove_preview_marks(ids, session_id))
+                try:
+                    mark = host.run.add_preview_mark(self.headers.get('X-Preview-Token', ''), payload)
+                except PermissionError:
+                    return _Reply(HTTPStatus.FORBIDDEN, {'error': 'Invalid preview token'})
+                except (ValueError, TypeError):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Invalid preview mark'})
+                return _Reply(HTTPStatus.OK, mark)
+
             def _get_usage(self, payload):
                 values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                 try:
@@ -1095,6 +1127,11 @@ class HostServer:
                 for scope in ('project', 'global'):
                     entries, unreadable = memory.read_status(scope)
                     reply[scope] = {'entries': [], 'error': 'unreadable'} if unreadable else {'entries': [_memory_entry_reply(entry) for entry in entries]}
+                    try:
+                        reply[scope]['last_consolidation'] = memory.last_consolidation(scope)
+                        reply[scope]['has_previous'] = memory.has_previous(scope)
+                    except (OSError, ValueError):
+                        reply[scope]['consolidation_error'] = 'Could not read consolidation history'
                 return _Reply(HTTPStatus.OK, reply)
 
             def _get_roadmap(self, payload):
@@ -1341,6 +1378,23 @@ class HostServer:
                     settings['config_warnings'] = config_warnings
                 return _Reply(HTTPStatus.OK, {'settings': settings})
 
+            def _post_extensions_reload(self, payload):
+                with host._runtimes_lock:
+                    runtime = host._runtimes[host._current_root]
+                with self._errors(0), host._extensions_lock:
+                    result = runtime.reload_extensions(home=host._config_home)
+                return _Reply(HTTPStatus.BAD_REQUEST if result['error'] else HTTPStatus.OK, result)
+
+            def _post_config_set(self, payload):
+                from symphonai_api.config_edit import set_config_value
+                with host._runtimes_lock:
+                    runtime = host._runtimes[host._current_root]
+                with self._errors(0), host._extensions_lock:
+                    set_config_value(payload['key'], payload['value'], payload['scope'],
+                                     repo_root=runtime.root, home=host._config_home)
+                    result = runtime.reload_extensions(home=host._config_home)
+                return _Reply(HTTPStatus.BAD_REQUEST if result['error'] else HTTPStatus.OK, result)
+
             def _get_approvals(self, payload):
                 return _Reply(HTTPStatus.OK, {'pending': host.pending_approvals()})
 
@@ -1547,6 +1601,14 @@ class HostServer:
                 if not deleted:
                     return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown memory id'})
                 return _Reply(HTTPStatus.OK, {'deleted': payload['id']})
+
+            def _post_memory_restore(self, payload):
+                memory = host.run.memory_store()
+                if memory is None:
+                    return _Reply(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': 'memory is unavailable'})
+                with self._errors(0):
+                    memory.restore_previous(payload['scope'])
+                return _Reply(HTTPStatus.OK, {'restored': payload['scope']})
 
             def _post_loop_start(self, payload):
                 with self._errors(0):
@@ -1913,6 +1975,13 @@ class HostServer:
                 match='exact',
                 project_free=True,
             ),
+            _Route('POST', '/preview/start', Handler._post_preview_start,
+                payload=_Payload({'url': str}, (), extra=False)),
+            _Route('POST', '/preview/stop', Handler._post_preview_stop,
+                payload=_Payload({}, (), extra=False)),
+            _Route('POST', '/preview/mark', Handler._post_preview_mark, auth=False,
+                payload=_Payload({}, (), extra=True)),
+            _Route('GET', '/preview/marks', Handler._get_preview_marks),
             _Route('GET', '/usage', Handler._get_usage,
             ),
             _Route('GET', '/conversation', Handler._get_conversation,
@@ -2004,6 +2073,14 @@ class HostServer:
             _Route('GET', '/settings', Handler._get_settings,
                 project_free=True,
             ),
+            _Route('POST', '/extensions/reload', Handler._post_extensions_reload,
+                payload=_Payload({}, (), extra=False),
+                errors=((((ValueError, OSError), 'bad_request'),),),
+            ),
+            _Route('POST', '/config/set', Handler._post_config_set,
+                payload=_Payload({'key': str, 'value': (bool, int, float, str), 'scope': str}, ('key', 'value', 'scope'), extra=False),
+                errors=((((ValueError, OSError), 'bad_request'),),),
+            ),
             _Route('GET', '/approvals', Handler._get_approvals,
                 match='exact',
             ),
@@ -2088,6 +2165,10 @@ class HostServer:
                 match='exact',
                 payload=_Payload({'id': str}, ('id',), extra=False),
                 errors=(((ProtocolError, 'bad_request'),), ((MemoryUnavailable, 'empty_unavailable'),)),
+            ),
+            _Route('POST', '/memory/restore', Handler._post_memory_restore,
+                payload=_Payload({'scope': str}, ('scope',), extra=False),
+                errors=((((MemoryUnavailable, ValueError, OSError), 'bad_request'),),),
             ),
             _Route('POST', '/loop/start', Handler._post_loop_start,
                 match='exact',

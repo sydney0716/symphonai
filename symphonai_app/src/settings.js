@@ -1,4 +1,5 @@
 import { button as makeButton, errorText, append, element, listen, replace } from "./render.js";
+import { reloadSummary } from "./commands.js";
 
 export const EDITOR_KEY = "symphonai.editor";
 
@@ -526,6 +527,49 @@ function renderGeneral(section, context) {
   const rows = generalRows(context.settingsReply).map(({ key, value, scope }) => [
     key, value, scope,
   ]);
+  const configTable = settingsTable(["Setting", "Value", "Scope"], rows);
+  const rawValues = new Map((context.settingsReply?.settings?.config ?? []).map(row => [row.key, row]));
+  rows.forEach(([key], index) => {
+    const { value, scope } = rawValues.get(key);
+    const cell = configTable.children[index + 1].children[1];
+    if (!["boolean", "number", "string"].includes(typeof value)) {
+      append(cell, element(document, "span", { text: " Open file to edit this table or list." }));
+      return;
+    }
+    const input = document.createElement("input");
+    input.type = typeof value === "boolean" ? "checkbox" : typeof value === "number" ? "number" : "text";
+    input.setAttribute("aria-label", key);
+    if (typeof value === "boolean") input.checked = value;
+    else input.value = String(value);
+    if (typeof value === "number") input.step = "any";
+    const target = document.createElement("select");
+    target.setAttribute("aria-label", `Save ${key} to`);
+    for (const scope of ["user", "project"]) {
+      const option = element(document, "option", { text: scope });
+      option.value = scope;
+      append(target, option);
+    }
+    target.value = scope === "user" ? "user" : "project";
+    const notice = element(document, "span", { className: "error" });
+    notice.setAttribute("role", "status");
+    const save = makeButton(document, "Save", async () => {
+      save.disabled = true;
+      notice.textContent = "";
+      try {
+        let next = input.value;
+        if (typeof value === "boolean") next = input.checked;
+        else if (typeof value === "number") {
+          if (!input.value.trim() || !Number.isFinite(Number(input.value))) throw new Error("Enter a number.");
+          next = Number(input.value);
+        }
+        await context.boundary.setConfig(key, next, target.value);
+        await context.refreshSettings();
+      } catch (error) { notice.textContent = `Could not save ${key}: ${errorText(error)}`; }
+      finally { save.disabled = false; }
+    });
+    save.setAttribute("aria-label", `Save ${key}`);
+    replace(cell, input, target, save, notice);
+  });
   let theme = "system";
   try {
     const storedTheme = global.localStorage?.getItem("symphonai.theme");
@@ -641,7 +685,7 @@ function renderGeneral(section, context) {
     editorSelect,
     statusGroup,
     notificationGroup,
-    settingsTable(["Setting", "Value", "Scope"], rows),
+    configTable,
   );
 }
 
@@ -652,7 +696,23 @@ const SETTINGS_RENDERERS = Object.freeze({
 });
 
 export function renderSettingsSection(section, context) {
-  return (SETTINGS_RENDERERS[section] ?? renderGeneral)(section, context);
+  (SETTINGS_RENDERERS[section] ?? renderGeneral)(section, context);
+  if (["skills", "plugins", "agents", "mcp"].includes(section)) {
+    const notice = element(context.document, "p");
+    notice.setAttribute("role", "status");
+    const reload = makeButton(context.document, "Reload", async () => {
+      reload.disabled = true;
+      try {
+        const reply = await context.boundary.reloadExtensions();
+        await context.refreshSettings();
+        const result = element(context.document, "p", { text: reloadSummary(reply) });
+        result.setAttribute("role", "status");
+        append(context.settingsContent, result);
+      } catch (error) { notice.textContent = `Could not reload extensions: ${errorText(error)}`; }
+      finally { reload.disabled = false; }
+    });
+    append(context.settingsContent, reload, notice);
+  }
 }
 
 export function renderMemorySettings(context) {
@@ -677,6 +737,32 @@ export function renderMemorySettings(context) {
       append(group, element(document, "h3", { text: label }));
       const memorySet = context.memoryReply[scope] ?? {};
       const entries = memorySet.entries ?? [];
+      const last = memorySet.last_consolidation;
+      if (last) {
+        append(group, element(document, "p", {
+          text: `Last consolidation: ${last.time}; ${last.merged.length} merges, ${last.removed.length} removed.${last.restored_at ? ` Restored ${last.restored_at}.` : ""}`,
+        }));
+        for (const merge of last.merged) {
+          append(group, element(document, "p", { text: `Merged: ${(merge.previous ?? []).map(item => item.text).join("; ")} → ${merge.text}` }));
+        }
+        for (const removal of last.removed) {
+          append(group, element(document, "p", { text: `Removed: ${removal.text} — ${removal.reason}` }));
+        }
+      }
+      if (memorySet.consolidation_error) append(group, element(document, "p", { className: "error", text: memorySet.consolidation_error }));
+      if (memorySet.has_previous) {
+        const notice = element(document, "p", { className: "error" });
+        notice.setAttribute("role", "status");
+        const restore = makeButton(document, "Restore previous", async () => {
+          restore.disabled = true;
+          try {
+            await boundary.restoreMemory(scope);
+            await loadMemory();
+          } catch (error) { notice.textContent = `Could not restore memory: ${errorText(error)}`; }
+          finally { restore.disabled = false; }
+        });
+        append(group, restore, notice);
+      }
       if (memorySet.error === "unreadable") {
         append(group, element(document, "p", {
           className: "memory-load-error",

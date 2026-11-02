@@ -366,3 +366,119 @@ def mcp_credentials_are_private_to_the_host():
                 result = run_shell(ws, ['cat', str(directory / 'mcp-scripted.json')], policy)
                 assert not result.ok
                 assert 'fixture-secret-do-not-read' not in result.content
+
+
+@check('access.preview_tokens_only_add_local_preview_marks')
+def preview_tokens_only_add_local_preview_marks():
+    import http.client
+    import re
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from symphonai_host.server import HostServer
+    from symphonai_host.projects import ProjectRuntime
+
+    class Page(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            body = b'<html><body><button class="special-button">Button</button></body></html>'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with workspace() as ws:
+        (ws.root / 'button.jsx').write_text('<button className="special-button">Button</button>')
+        page = ThreadingHTTPServer(('127.0.0.1', 0), Page)
+        thread = threading.Thread(target=page.serve_forever, daemon=True)
+        thread.start()
+        broker = EventBroker()
+        run = HostRun(FakeModelProvider(), ws.policy, broker, sessions_root=ws.outside / 'sessions',
+                      memory_extraction_enabled=False)
+        host = HostServer(FakeModelProvider(), ProjectRuntime(ws.root, run), broker=broker, home=ws.outside / 'home')
+        host.start()
+
+        def request(path, body=None, token=None, preview_token=None):
+            connection = http.client.HTTPConnection('127.0.0.1', host.port, timeout=5)
+            headers = {'Content-Type': 'application/json'}
+            if token:
+                headers['Authorization'] = 'Bearer ' + token
+            if preview_token:
+                headers['X-Preview-Token'] = preview_token
+            connection.request('GET' if body is None else 'POST', path,
+                               body=None if body is None else json.dumps(body), headers=headers)
+            response = connection.getresponse()
+            status, raw = response.status, response.read()
+            connection.close()
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                value = None
+            return status, value
+
+        try:
+            for url in ('http://example.com', 'https://localhost', 'http://127.0.0.1.example.com', 'http://user@localhost'):
+                status, _ = request('/preview/start', {'url': url}, host.token)
+                assert status == 400, url
+            status, reply = request('/preview/start', {'url': f'http://127.0.0.1:{page.server_port}'}, host.token)
+            assert status == 200
+            preview_url = reply['preview_url']
+            proxy = urlsplit(preview_url)
+            connection = http.client.HTTPConnection(proxy.hostname, proxy.port, timeout=5)
+            connection.request('GET', '/')
+            response = connection.getresponse()
+            html = response.read().decode()
+            connection.close()
+            preview_token = re.search(r'const token = "([^"]+)"', html)[1]
+            mark = {'comment': 'Make it blue', 'url': preview_url, 'selector': 'button.special-button',
+                    'html': '<button class="special-button">Button</button>', 'text': 'Button', 'source_hint': ''}
+            assert request('/preview/mark', mark)[0] == 403
+            assert request('/preview/mark', mark, preview_token='invalid')[0] == 403
+            status, added = request('/preview/mark', mark, preview_token=preview_token)
+            assert status == 200 and added['source_guess'] and added['source_hint'] == 'button.jsx'
+            assert request('/preview/marks', token=host.token)[1]['marks'][0]['id'] == added['id']
+            for path, body in (('/preview/marks', None), ('/settings', None), ('/preview/stop', {}),
+                               ('/preview/start', {'url': preview_url}), ('/mode', {'mode': 'allow'})):
+                assert request(path, body, preview_token, preview_token)[0] in (401, 403), path
+            assert request('/preview/mark', {'remove': [added['id']]}, preview_token=preview_token)[0] in (401, 403)
+            assert request('/preview/mark', {'remove': [added['id']], 'session_id': None}, host.token)[0] == 200
+            assert not request('/preview/marks', token=host.token)[1]['marks']
+            request('/preview/stop', {}, host.token)
+            assert request('/preview/mark', mark, preview_token=preview_token)[0] == 403
+        finally:
+            host.close()
+            page.shutdown()
+            page.server_close()
+            thread.join(timeout=2)
+
+
+@check('access.auto_fixed_rules_refuse_before_review')
+def auto_fixed_rules_refuse_before_review():
+    from symphonai_api.permissions import PermissionDecision
+    from symphonai_host.approvals import ApprovalBroker
+    from symphonai_host.auto_review import review_call
+
+    reviewer = FakeModelProvider([ModelResponse(Message(Role.ASSISTANT, '{"decision":"approve","reason":"fixture"}'))])
+    requests = []
+
+    def review(request):
+        requests.append(request)
+        review_call(reviewer, None, request, user_text='fixture', agent_text='', repo_root=ws.root,
+                    on_usage=lambda *args: None)
+        return PermissionDecision.allow()
+
+    with workspace() as ws:
+        broker = ApprovalBroker(lambda approval: False, review=review)
+        policy = replace(ws.policy, mode='auto', shell_enabled=True, shell_allowlist=[()], approval_callback=broker.callback)
+        for name, arguments in (
+            ('run_shell', {'argv': ['rm', '-rf', '/']}),
+            ('write_file', {'path': '.env', 'content': 'must not write'}),
+            ('write_file', {'path': str(ws.outside / 'outside.txt'), 'content': 'must not write'}),
+        ):
+            result = execute(ws, name, arguments, policy)
+            assert not result.ok, name
+        assert requests == [] and reviewer.call_count == 0
+        assert not broker.pending()

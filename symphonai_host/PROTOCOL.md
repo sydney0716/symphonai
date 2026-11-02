@@ -598,6 +598,42 @@ is a boolean; key values never appear in the
 response. It is assembled from already loaded host state and makes no network
 requests. Only the ordinary bearer header authorizes this route.
 
+Authenticated `POST /extensions/reload` takes `{}` and reloads the current
+project's config, trust, hooks, skills, agents, plugins and MCP definitions.
+Preparation and MCP startup occur outside the host/runtime state locks; the
+result applies to newly started conversations. The reply is
+`{"changes": {"skills": delta, "agents": delta, "plugins": delta,
+"mcp_servers": delta}, "error": null}`, where each delta contains sorted
+`added`, `removed`, `changed` name lists and a `failed` list of error objects.
+Config/definition errors return 400 with the file-naming `error` and retain the
+previous extensions. MCP connection failures are reported per server without
+discarding successfully loaded extensions. Unchanged MCP definitions reuse
+their pool. A changed roster starts a replacement pool; removed pools close
+immediately if no conversations reference them, otherwise at project shutdown
+so existing conversations retain working clients. `/reload` and Reload in
+Settings refresh the settings and the slash/mention menus.
+
+Authenticated `POST /config/set` takes `{"key": "memory.extract", "value":
+false, "scope": "user"}`. Scope is `user` or `project`; only scalar booleans,
+finite numbers and strings may be set. Tables/lists and unknown sections are
+refused, as are project writes to roles, permissions, always_deny and
+sandbox.readable. Existing single-line assignments preserve surrounding text,
+including comments and line endings; missing keys are placed under their table
+or a new final header. Multiline scalar assignments require editing the file.
+The candidate is parsed and validated with the layered config loader before an
+atomic write. Validation errors return 400 without changing the file. A saved
+value invokes the reload above and returns its result. General settings exposes
+scalar editors with a destination scope and per-row errors; arrays/tables keep
+an Open file hint.
+
+`GET /memory` additionally includes each scope's `last_consolidation` (time,
+merged groups with prior/replacement texts, removed ids/texts/reasons),
+`has_previous`, and any `consolidation_error`. Authenticated `POST
+/memory/restore` takes `{"scope": "project"}` or `{"scope": "global"}` and
+atomically restores that scope's `.bak`, logging the restoration. It returns
+`{"restored": scope}`; an absent or invalid backup returns 400. Settings shows
+the consolidation and offers Restore previous for scopes with a backup.
+
 Provider keys can be stored with authenticated `POST /credentials` and a JSON
 body containing `name` and `value`. `name` must be one of the host's known
 `API_KEY_ENV_VAR` names. An empty `value` deletes the stored entry and unsets
@@ -892,3 +928,87 @@ and include a warning rather than assigning them all to the latest provider.
 Per-call recording is unchanged. Inherited usage in forked root transcripts
 is excluded until the fork's first new run, avoiding counting the copied
 prefix as new usage.
+
+### Element marks in local web previews
+
+`POST /preview/start {"url":"http://127.0.0.1:3000"}` starts the project's
+preview and returns `{preview_url}` on its own loopback port. Omitting url
+reuses the last URL from this project's host lifetime. Only http URLs whose
+host is exactly localhost, 127.0.0.1 or [::1] are accepted; credentials and
+fragments are rejected. The proxy connects only to literal loopback addresses,
+never follows upstream redirects itself, and never substitutes the host's
+bearer credentials. `/preview stop` calls authenticated `POST /preview/stop`.
+Starting another preview invalidates the previous preview token; project
+closure stops the proxy and its tunnels.
+
+The proxy mirrors origin-relative paths, uses identity encoding, injects a
+picker into HTML, and tunnels WebSocket traffic. HTML injection adjusts body
+length and removes stale encoding, ETag and CSP headers; ordinary HTTP uses
+connection-close framing while retaining body bytes. Compressed gzip/deflate
+HTML is decoded before injection. The picker runs in a separate window with
+no opener reference and receives only a per-preview token.
+
+`POST /preview/mark` accepts the picker's `X-Preview-Token`, with
+`{comment,url,selector,html,text,source_hint}`. It is also available directly
+on the preview origin, avoiding cross-origin host access. Both paths use the
+same token validation. Marks are accepted only for that preview's page
+origin or its target origin. Invalid/missing tokens return 403. HTML is
+limited to 2,000 characters; marks are secret-masked. Missing source metadata
+uses a bounded, permission-checked project search and returns
+`source_guess: true` with the best matching relative path or an empty hint.
+
+Authenticated `GET /preview/marks` returns `{session_id,marks}` for the
+current conversation (null for a not-yet-started chat). Each mark adds an
+`id`. Creation emits `PreviewMarkAdded` with `{mark,session_id,repo_root}`
+plus normal event identity fields. This event updates composer chips and is
+not a chat entry. Pending marks remain in the host for its lifetime.
+
+The same POST mark route accepts `{remove:[ids],session_id}` only with the
+host's normal bearer authorization, for chip removal and clearing accepted
+messages. The preview token grants creation only and cannot remove marks,
+read marks, stop/start previews, change mode or call other host routes.
+The app combines selected marks and the person's text into one prompt,
+including comment, URL, selector, fenced HTML and a source hint labelled
+"guess" when appropriate. Marks are cleared after the prompt is accepted.
+
+### Leader notes
+
+The leader-only `notify_person(text)` tool accepts nonblank text up to 500
+characters, returns `sent` without waiting for a reply, and emits
+`PersonNotice {agent_id,run_id,text}`. The text is secret-masked. The saved
+assistant tool call and successful tool result carry the note; history replay
+exposes its text rather than creating a person prompt or final answer.
+The app shows `Leader: …` and uses its existing notification preference and
+background-notification behavior. Headless runs print `note: …` to stderr and
+include current-run notes in the result's `notes` array, including --json.
+
+### Auto approval review
+
+Permission modes are plan, ask, auto and allow, in increasing capability order.
+`auto` has its own meaning and is no longer a renamed value for allow. The
+app offers it and `/mode [ask|plan|auto|allow]` accepts an optional value;
+without a value the picker opens. Headless accepts `--mode auto`.
+
+Fixed permission rules still run first; existing grants bypass model review.
+For other approvals the broker reviews using the conversation's own model,
+with low effort only if its capabilities list it, and background call class.
+The request contains operation, target, command(s)/diff, project root, the
+latest person message and the calling agent's last text. These excerpts are
+secret-masked and labelled as untrusted data. The required reply is
+`{"decision":"approve"|"deny","reason":"<one sentence>"}`. A single JSON
+fence is accepted; null optional fields are ignored. Unknown decisions fail.
+A missing/null reason uses a neutral default rather than losing the decision.
+
+Each decision emits `AutoReviewed` with operation, target, decision, reason,
+tool_call_id and standard event identity. A denial names the auto reviewer
+and its reason. Review calls are bounded to 30 seconds and cancellable; usage
+is recorded as the leader's background usage even if parsing fails. An app
+review failure falls back to its existing approval interaction; headless
+review failure is denied without asking a connected client. A narrower
+calling-agent mode retains its ordinary approval behavior.
+
+Review decisions use the `auto_reviewed` transcript record and are joined to
+their tool call by tool_call_id during history replay. The app renders
+`Auto-approved: …` or `Auto-denied: …` beside the call. They are not person
+prompts and are not sent as model messages. This separate record preserves
+decisions for refused calls and failed actions without rewriting tool output.

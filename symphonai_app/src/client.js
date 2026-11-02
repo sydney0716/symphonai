@@ -422,6 +422,10 @@ export function createClient({
       });
     },
 
+    restoreMemory(scope) {
+      return request("POST", "/memory/restore", { scope }, readReply, { detailOnError: true });
+    },
+
     revertChanges(payload) {
       return request("POST", "/changes/revert", payload, readReply, {
         detailOnError: true,
@@ -511,6 +515,14 @@ export function createClient({
       return request("GET", "/settings");
     },
 
+    reloadExtensions() {
+      return request("POST", "/extensions/reload", {}, readReply, { detailOnError: true });
+    },
+
+    setConfig(key, value, scope) {
+      return request("POST", "/config/set", { key, value, scope }, readReply, { detailOnError: true });
+    },
+
     permissions() {
       return request("GET", "/permissions");
     },
@@ -590,6 +602,13 @@ export function createClient({
 
     newSession() {
       return request("POST", "/session/new", {}, readReply, { detailOnError: true });
+    },
+
+    previewStart(url) { return request("POST", "/preview/start", { url }, readReply, { detailOnError: true }); },
+    previewStop() { return request("POST", "/preview/stop", {}, readReply, { detailOnError: true }); },
+    previewMarks() { return request("GET", "/preview/marks"); },
+    removePreviewMarks(ids, sessionId) {
+      return request("POST", "/preview/mark", { remove: ids, session_id: sessionId }, readReply, { detailOnError: true });
     },
 
     usage(days = 30) {

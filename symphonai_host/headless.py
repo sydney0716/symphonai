@@ -18,7 +18,7 @@ from pathlib import Path
 
 from symphonai_api.agent_spec import IOContract, validate_output
 from symphonai_api.config import ConfigError
-from symphonai_api.events import ModelFallback, RunFailed, RunFinished
+from symphonai_api.events import PersonNotice, ModelFallback, RunFailed, RunFinished
 from symphonai_api.extensions import load_extensions
 from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
@@ -110,7 +110,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--provider")
     run.add_argument("--model")
     run.add_argument("--effort")
-    run.add_argument("--mode", choices=("ask", "plan", "allow"), default="ask")
+    run.add_argument("--mode", choices=("ask", "plan", "auto", "allow"), default="ask")
     run.add_argument("--max-turns", type=int)
     run.add_argument("--resume")
     run.add_argument("--output-schema", type=Path)
@@ -381,7 +381,7 @@ def _rejected_key_message(provider_name: str, status: int) -> str:
 
 
 def _wait_for_terminal(
-    run, subscription, stream_json: bool, provider=None, provider_name: str | None = None,  # noqa: ANN001
+    run, subscription, stream_json: bool, provider=None, provider_name: str | None = None, notes=None,  # noqa: ANN001
 ) -> tuple[RunFinished | RunFailed, bool, str | None]:
     interrupted = False
     fallback_models = {}
@@ -400,6 +400,10 @@ def _wait_for_terminal(
                 encoded["error"] = _rejected_key_message(provider_name or provider.name, provider.key_error_status)
             if encoded["type"] != "SessionStarted":
                 print(json.dumps(encoded, ensure_ascii=False), flush=True)
+        if isinstance(event, PersonNotice):
+            print(f"note: {event.text}", file=sys.stderr, flush=True)
+            if notes is not None:
+                notes.append(event.text)
         if isinstance(event, ModelFallback):
             fallback_models[event.agent_id] = event.to_model
         if isinstance(event, RunFailed) and event.agent_name == "leader":
@@ -527,8 +531,9 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
         session_id = arguments.resume or host_run_id
         if not (arguments.json or arguments.stream_json):
             print(f"Running session {session_id}", file=sys.stderr, flush=True)
+        notes = []
         terminal, interrupted, fallback_model = _wait_for_terminal(
-            runtime.run, subscription, arguments.stream_json, provider, choice.get("name", provider.name),
+            runtime.run, subscription, arguments.stream_json, provider, choice.get("name", provider.name), notes,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         stats = runtime.run.conversation_stats() or {}
@@ -592,6 +597,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             "cost": cost,
             "duration_ms": duration_ms,
             "files_changed": sorted(changed_paths),
+            "notes": notes,
         }
         if output_schema is not None and error is None:
             result["output"] = output_value

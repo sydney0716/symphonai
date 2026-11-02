@@ -300,7 +300,7 @@ class PermissionDecision:
         return cls(allowed=False, reason=reason, denial=denial)
 
 
-PermissionMode = Literal["ask", "plan", "allow"]
+PermissionMode = Literal["ask", "plan", "auto", "allow"]
 
 
 def approval_diff(current: str | None, updated: str, path: str) -> str:
@@ -317,8 +317,8 @@ def approval_diff(current: str | None, updated: str, path: str) -> str:
         lines = [*lines[:403], f"… {remaining} more lines"]
     return "\n".join(lines)
 
-_MODE_ORDER = {"plan": 0, "ask": 1, "allow": 2}
-RENAMED_MODES = {"prompt": "ask", "auto": "allow", "accept_edits": "ask, plan, or allow"}
+_MODE_ORDER = {"plan": 0, "ask": 1, "auto": 2, "allow": 3}
+RENAMED_MODES = {"prompt": "ask", "accept_edits": "ask, plan, or allow"}
 BUDGET_KEYS = {"max_turns", "wall_seconds", "max_total_tokens", "max_cost"}
 
 
@@ -327,7 +327,7 @@ def permission_mode(value: object) -> PermissionMode:
         replacement = RENAMED_MODES.get(value) if isinstance(value, str) else None
         if replacement is not None:
             raise ValueError(f"unknown permission mode {value!r}; use {replacement!r} instead")
-        raise ValueError(f"unknown permission mode {value!r}; expected 'ask', 'plan', or 'allow'")
+        raise ValueError(f"unknown permission mode {value!r}; expected 'ask', 'plan', 'auto', or 'allow'")
     return value
 
 
@@ -780,7 +780,7 @@ class PermissionPolicy:
                 denial=DenialReason.PLAN_MODE,
                 tool_name="write_file",
             )
-        if self.mode == "ask":
+        if self.mode in ("ask", "auto"):
             return self._ask_approval(
                 operation="write_file",
                 target=str(path),
@@ -844,7 +844,7 @@ class PermissionPolicy:
 
         if host in preapproved_domains() or host in self.fetch_allowlist:
             return PermissionDecision.allow()
-        if self.mode == "ask":
+        if self.mode in ("ask", "auto"):
             return self._ask_approval(
                 operation="web_fetch",
                 target=url,
@@ -988,7 +988,7 @@ class PermissionPolicy:
                 denial=DenialReason.PLAN_MODE,
                 tool_name="run_shell",
             )
-        if self.mode == "ask":
+        if self.mode in ("ask", "auto"):
             nested = (
                 len(argv) >= 3
                 and os.path.basename(argv[0]) in {"sh", "bash", "zsh", "dash"}
@@ -1049,7 +1049,7 @@ class PermissionPolicy:
                 denial=DenialReason.PLAN_MODE,
                 tool_name=tool_name,
             )
-        if self.mode == "ask":
+        if self.mode in ("ask", "auto"):
             return self._ask_approval(
                 operation=tool_name,
                 target=target,

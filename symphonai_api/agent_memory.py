@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -13,12 +14,15 @@ import uuid
 from typing import Literal
 
 from symphonai_api.identity import SCHEMA_VERSION
+from symphonai_api.paths import write_atomic
 
 
 MAX_ENTRIES = 32
 MAX_ENTRY_CHARS = 500
 MAX_TOTAL_CHARS = 8000
 MemoryScope = Literal["project", "global"]
+_STORE_LOCKS: dict[Path, tuple[threading.RLock, threading.Lock]] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -71,7 +75,9 @@ class AgentMemory:
         self._project_key = hashlib.sha256(
             str(self._repo_root).encode("utf-8")
         ).hexdigest()
-        self._lock = threading.Lock()
+        with _STORE_LOCKS_GUARD:
+            self._lock, self.consolidation_lock = _STORE_LOCKS.setdefault(
+                self._root, (threading.RLock(), threading.Lock()))
 
     def _path(self, scope: MemoryScope) -> Path:
         if scope == "global":
@@ -247,3 +253,104 @@ class AgentMemory:
             if unreadable is not None:
                 raise unreadable
         return False
+
+    def last_consolidation(self, scope: MemoryScope) -> dict | None:
+        self._path(scope)
+        with self._lock:
+            try:
+                lines = (self._root / "consolidation.jsonl").read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                return None
+            last = None
+            for line in lines:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("invalid consolidation history record")
+                if record.get("scope") != scope or record.get("project") != (str(self._repo_root) if scope == "project" else None):
+                    continue
+                if record.get("action") == "restore":
+                    if last is not None:
+                        last["restored_at"] = record["time"]
+                else:
+                    last = record
+            return last
+
+    def _append_consolidation(self, scope: MemoryScope, record: dict) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        record.update(time=datetime.now(timezone.utc).isoformat(), scope=scope,
+                      project=str(self._repo_root) if scope == "project" else None)
+        descriptor = os.open(self._root / "consolidation.jsonl", os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(descriptor, "r+", encoding="utf-8") as output:
+            output.seek(0, os.SEEK_END)
+            previous = output.tell()
+            try:
+                output.write(json.dumps(record) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+            except Exception:
+                output.seek(previous)
+                output.truncate()
+                raise
+
+    def consolidate(self, scope: MemoryScope, expected: tuple[MemoryEntry, ...],
+                    merges: list[dict], removals: list[dict]) -> dict:
+        """Validate against the snapshot and current file before backing up or writing."""
+        path = self._path(scope)
+        with self._lock:
+            entries = self._decode(path, scope)
+            snapshot = {entry.id: entry for entry in expected}
+            current = {entry.id: entry for entry in entries}
+            named: set[str] = set()
+            for group in merges:
+                self._validate_text(group["text"])
+                for entry_id in group["ids"]:
+                    if entry_id in named or entry_id not in snapshot or current.get(entry_id) != snapshot[entry_id]:
+                        raise ValueError("consolidation names a missing, repeated, or changed id")
+                    named.add(entry_id)
+            for removal in removals:
+                entry_id = removal["id"]
+                if entry_id in named or entry_id not in snapshot or current.get(entry_id) != snapshot[entry_id]:
+                    raise ValueError("consolidation names a missing, repeated, or changed id")
+                named.add(entry_id)
+            remaining = [entry for entry in entries if entry.id not in named]
+            for group in merges:
+                remaining.append(MemoryEntry(uuid.uuid4().hex, group["text"], time.time(),
+                                             "memory-consolidation", "consolidation", scope))
+            if len(remaining) > MAX_ENTRIES or sum(len(entry.text) for entry in remaining) > MAX_TOTAL_CHARS:
+                raise ValueError("consolidation would exceed memory limits")
+            record = {"action": "consolidate", "merged": [
+                          {**group, "previous": [{"id": key, "text": current[key].text} for key in group["ids"]]}
+                          for group in merges],
+                      "removed": [{**item, "text": current[item["id"]].text} for item in removals],
+                      "entries": {entry.id: entry.text for entry in remaining}}
+            if not named:
+                self._append_consolidation(scope, record)
+                return record
+            original = path.read_bytes()
+            write_atomic(path.with_name(path.name + ".bak"), original)
+            self._write_entries(path, remaining)
+            try:
+                self._append_consolidation(scope, record)
+            except Exception:
+                write_atomic(path, original)
+                raise
+            return record
+
+    def has_previous(self, scope: MemoryScope) -> bool:
+        path = self._path(scope)
+        return path.with_name(path.name + ".bak").is_file()
+
+    def restore_previous(self, scope: MemoryScope) -> None:
+        path = self._path(scope)
+        backup = path.with_name(path.name + ".bak")
+        with self._lock:
+            if not backup.is_file():
+                raise ValueError("no previous memory file is available")
+            self._decode(backup, scope)
+            original = path.read_bytes()
+            write_atomic(path, backup.read_bytes())
+            try:
+                self._append_consolidation(scope, {"action": "restore"})
+            except Exception:
+                write_atomic(path, original)
+                raise
