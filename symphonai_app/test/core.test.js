@@ -72,6 +72,7 @@ class Node {
   removeAttribute(name) { this.attributes.delete(name); }
   set href(value) { this.setAttribute("href", new URL(value, "http://127.0.0.1/app/").href); }
   get href() { return this.getAttribute("href"); }
+  contains(node) { return node === this || this.childNodes.some((child) => child.contains(node)); }
   focus() { this.ownerDocument.activeElement = this; }
   setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
   addEventListener(type, listener) {
@@ -302,7 +303,7 @@ test("Terminal replay drops stale replies and keystrokes until parsing finishes,
     Object.assign(script.client, {
       terminals: async () => {
         if (buffered) await script.emit("TerminalOutput", {
-          terminal_id: "existing", data: saved + pending, exited: false,
+          terminal_id: "existing", data: saved + pending, offset: 0, exited: false,
         });
         return { terminals: [{ id: "existing", output: saved, exited: false }] };
       },
@@ -328,6 +329,46 @@ test("Terminal replay drops stale replies and keystrokes until parsing finishes,
     assert.deepEqual(inputs, [["existing", "vim\r"], ["existing", "\x1b[3;1R"]]);
     assert.equal(writes[1].text, "\x1b[6n", "live queries still go through xterm");
   }
+});
+
+test("Terminal reattach uses character offsets when repeated Unicode output overlaps the snapshot", async () => {
+  const { global, instances } = terminalBrowser();
+  const script = scriptedClient();
+  const line = "😀 repeated\r\n", length = Array.from(line).length;
+  script.client.terminals = async () => {
+    await script.emit("TerminalOutput", { terminal_id: "repeated", offset: 0, data: line.repeat(30), exited: false });
+    await script.emit("TerminalOutput", { terminal_id: "repeated", offset: length * 30, data: line.repeat(20), exited: false });
+    return { terminals: [{ id: "repeated", output: line.repeat(25), end: length * 25, exited: false }] };
+  };
+  script.client.terminalResize = async () => ({});
+  const document = new Document();
+  await start({ global, document, client: script.client });
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  assert.equal(instances[0].output, line.repeat(50));
+  await script.emit("TerminalOutput", { terminal_id: "repeated", offset: 0, data: line.repeat(50), exited: false });
+  assert.equal(instances[0].output, line.repeat(50), "already replayed data is ignored");
+});
+
+test("Terminal batches input arriving while a request is in flight", async () => {
+  const { global, instances } = terminalBrowser();
+  const script = scriptedClient();
+  const inputs = [];
+  let release;
+  script.client.terminals = async () => ({ terminals: [{ id: "batch", output: "", end: 0, exited: false }] });
+  script.client.terminalResize = async () => ({});
+  script.client.terminalInput = async (id, data) => {
+    inputs.push([id, data]);
+    if (inputs.length === 1) await new Promise((resolve) => { release = resolve; });
+  };
+  const document = new Document();
+  await start({ global, document, client: script.client });
+  await find(document.body, (node) => node.className === "terminal-toggle").click();
+  instances[0].input("x");
+  for (let chunk = 0; chunk < 10; chunk++) instances[0].input("p".repeat(500));
+  assert.deepEqual(inputs, [["batch", "x"]]);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(inputs, [["batch", "x"], ["batch", "p".repeat(5000)]]);
 });
 
 test("Terminal focus isolates shortcuts and the panel height stays within its bounds", async () => {
@@ -376,6 +417,9 @@ test("MCP slash prompts show required arguments and submit rendered text", async
       description: "Explain a topic", arguments: arguments_ }] });
     script.client.mcpPrompt = async (server, name, arguments_) => {
       calls.push({ server, name, arguments: arguments_ });
+      if (!arguments_.topic || (multiple && !arguments_.style)) {
+        throw new Error("Required prompt argument is missing");
+      }
       return { text: `Explain ${arguments_.topic}${arguments_.style ? ` in ${arguments_.style}` : ""}` };
     };
     await start({ global: browser(), document, client: script.client });
@@ -386,8 +430,9 @@ test("MCP slash prompts show required arguments and submit rendered text", async
     assert.match(document.body.textContent, /<topic>/);
     await submit(document, "/mcp.fixture.explain");
     assert.deepEqual(script.prompts, []);
-    assert.deepEqual(calls, []);
-    assert.match(document.getElementById("chat").textContent, /Usage: \/mcp.fixture.explain <topic>/);
+    assert.deepEqual(calls, [{ server: "fixture", name: "explain", arguments: {} }]);
+    assert.match(document.getElementById("chat").textContent, /Required prompt argument is missing/);
+    calls.length = 0;
     await submit(document, multiple ? '/mcp.fixture.explain topic="async IO" style=detail' : "/mcp.fixture.explain async IO");
     assert.deepEqual(calls, [{ server: "fixture", name: "explain", arguments: multiple
       ? { topic: "async IO", style: "detail" } : { topic: "async IO" } }]);

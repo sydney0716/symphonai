@@ -1020,6 +1020,7 @@ class DispatchSubagentTool(LocalTool):
             standard_tools = (
                 standard_tool_registry(
                     tool_names,
+                    wire_format=child_provider.wire_format,
                     ledger=read_ledger,
                     result_store=self._result_store,
                     search_backend=self._search_backend,
@@ -1053,7 +1054,6 @@ class DispatchSubagentTool(LocalTool):
                     policy=effective_policy,
                     max_turns=self._subagent_max_turns,
                     tool_schemas=tool_registry_schemas(subagent_tools, child_provider.wire_format),
-                    deferrable_tools=tuple(selected_extra),
                     agent_ref=agent_ref,
                     events=self._events,
                     stream=self._stream,
@@ -1885,6 +1885,7 @@ class Leader:
         standard_tools = merge_tool_registry(
             standard_tool_registry(
                 tool_names,
+                wire_format=config.leader_provider.wire_format,
                 ledger=read_ledger,
                 result_store=config.result_store,
                 search_backend=config.search_backend,
@@ -1955,7 +1956,6 @@ class Leader:
                     config.leader_provider.wire_format,
                 ),
             ],
-            deferrable_tools=tuple(config.extra_tools or {}),
             tool_history=None if session is None else session.directory / "run.jsonl",
             agent_ref=self._agent_ref,
             events=self._event_sink,

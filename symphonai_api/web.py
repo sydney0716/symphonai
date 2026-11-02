@@ -88,7 +88,21 @@ class _RedirectBlocked(WebFetchError):
         self.status = status
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+def valid_service_url(url: object) -> bool:
+    """HTTPS, or exact loopback HTTP, without URL user information."""
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+        return bool(parsed.hostname and parsed.username is None and parsed.password is None
+                    and (parsed.scheme == "https" or parsed.scheme == "http"
+                         and parsed.hostname in ("localhost", "127.0.0.1", "::1")))
+    except ValueError:
+        return False
+
+
+class RedirectBlocker(urllib.request.HTTPRedirectHandler):
     def redirect_request(
         self,
         req: urllib.request.Request,
@@ -190,7 +204,7 @@ def fetch_url(
 
     current_url = url
     redirects = 0
-    opener = urllib.request.build_opener(_NoRedirectHandler())
+    opener = urllib.request.build_opener(RedirectBlocker())
 
     while True:
         if cancel is not None:

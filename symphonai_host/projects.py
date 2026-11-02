@@ -86,10 +86,10 @@ def build_project(
             memory_root=memory_root,
             extensions=extensions,
             mcp_tools=mcp_tools,
+            mcp_pool=pool,
             mcp_instructions=pool.instructions,
             lsp=lsp,
         )
-        run._mcp_pool = pool
         return ProjectRuntime(root, run, pool, lsp)
     except BaseException:
         if lsp is not None:

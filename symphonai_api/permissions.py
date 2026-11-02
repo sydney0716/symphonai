@@ -226,6 +226,7 @@ class DenialReason(str, Enum):
 
     OUTSIDE_ROOT = "outside_root"
     FORBIDDEN_PATTERN = "forbidden_pattern"
+    PROTECTED_PATH = "protected_path"
     OUTSIDE_WRITE_SCOPE = "outside_write_scope"
     EMPTY_COMMAND = "empty_command"
     ALWAYS_DENY = "always_deny"
@@ -470,6 +471,12 @@ class ToolApprovalRequest:
 ApprovalCallback = Callable[[ToolApprovalRequest], PermissionDecision | bool]
 
 
+def credential_directories() -> tuple[Path, ...]:
+    from symphonai_api.paths import symphonai_home
+    return tuple({(Path.home() / '.symphonai' / 'credentials').resolve(),
+                  (symphonai_home() / 'credentials').resolve()})
+
+
 @dataclass
 class PermissionPolicy:
     """Deny-by-default policy for filesystem and shell access.
@@ -487,6 +494,7 @@ class PermissionPolicy:
     repo_root: Path
     allowed_write_scope: list[Path] = field(default_factory=list)
     forbidden_patterns: tuple[str, ...] = DEFAULT_FORBIDDEN_PATTERNS
+    protected_paths: tuple[Path, ...] = field(default=(), kw_only=True)
     shell_enabled: bool = False
     shell_allowlist: list[tuple[str, ...]] = field(default_factory=list)
     shell_sandbox: bool = False
@@ -505,6 +513,9 @@ class PermissionPolicy:
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
+        self.protected_paths = tuple(dict.fromkeys((
+            *credential_directories(), *(Path(path).resolve() for path in self.protected_paths),
+        )))
         self.allowed_write_scope = [Path(p).resolve() for p in self.allowed_write_scope]
         if self.sandbox_write_scope is not None:
             self.sandbox_write_scope = [Path(p).resolve() for p in self.sandbox_write_scope]
@@ -731,39 +742,38 @@ class PermissionPolicy:
                 return pattern
         return None
 
-    def check_read(self, path: str | Path) -> PermissionDecision:
-        from symphonai_api.mcp_auth import credential_directories
-
+    def _check_path(self, path: str | Path, operation: str) -> tuple[Path, PermissionDecision]:
         candidate = Path(path)
-        candidate = (candidate if candidate.is_absolute() else self.repo_root / candidate).resolve()
-        if any(candidate == folder or folder in candidate.parents for folder in credential_directories()):
-            return self._deny("SymphonAI credentials are private", denial=DenialReason.FORBIDDEN_PATTERN,
-                              tool_name="read_file")
-        resolved = self._resolve_within_root(path)
-        if resolved is None:
-            return self._deny(
+        resolved = (candidate if candidate.is_absolute() else self.repo_root / candidate).resolve()
+        protected = self.protected_paths
+        if any(resolved == folder or folder in resolved.parents for folder in protected):
+            return resolved, self._deny(
+                f"{operation} refused protected path: {path!r}",
+                denial=DenialReason.PROTECTED_PATH, tool_name=operation,
+            )
+        if resolved != self.repo_root and self.repo_root not in resolved.parents:
+            return resolved, self._deny(
                 f"path escapes repo_root: {path!r}",
-                denial=DenialReason.OUTSIDE_ROOT,
-                tool_name="read_file",
+                denial=DenialReason.OUTSIDE_ROOT, tool_name=operation,
             )
         forbidden = self._matches_forbidden(resolved)
         if forbidden is not None:
-            return self._deny(
+            return resolved, self._deny(
                 f"path matches forbidden pattern {forbidden!r}: {path!r}",
-                denial=DenialReason.FORBIDDEN_PATTERN,
-                tool_name="read_file",
+                denial=DenialReason.FORBIDDEN_PATTERN, tool_name=operation,
             )
-        return PermissionDecision.allow()
+        return resolved, PermissionDecision.allow()
 
-    # list_files follows exactly the same rule as read_file.
-    check_list = check_read
+    def check_read(self, path: str | Path) -> PermissionDecision:
+        return self._check_path(path, "read_file")[1]
+
+    def check_list(self, path: str | Path) -> PermissionDecision:
+        return self._check_path(path, "list_files")[1]
 
     def check_write(self, path: str | Path, *, diff: str = "") -> PermissionDecision:
-        read_decision = self.check_read(path)
-        if not read_decision.allowed:
-            return read_decision
-        resolved = self._resolve_within_root(path)
-        assert resolved is not None  # check_read already validated this
+        resolved, decision = self._check_path(path, "write_file")
+        if not decision.allowed:
+            return decision
         if self.mode == "plan":
             return self._deny(
                 "plan mode allows reads only; this call would change the world",

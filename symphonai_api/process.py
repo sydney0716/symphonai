@@ -61,3 +61,33 @@ def run_process(
         stderr = stderr[-output_limit:] if output_limit else b""
     return ProcessResult(None if timed_out or cancelled else process.returncode,
                          stdout, stderr, timed_out, cancelled)
+
+
+def stop_process_group(proc: subprocess.Popen, pgid: int, *, timeout: float = 0.2) -> None:
+    if proc.poll() is None:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(pgid, signal.SIGKILL)
+        elif proc.poll() is None:
+            proc.kill()
+    except (OSError, ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass

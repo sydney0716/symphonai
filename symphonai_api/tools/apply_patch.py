@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import difflib
 
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import approval_diff
 from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.edit import _diff_result
 from symphonai_api.tools.diagnostics import DiagnosticsAfterWrite
 from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata, patch_paths
 
@@ -46,16 +46,19 @@ def parse_patch(text):
     return operations
 
 
+_PUNCTUATION = str.maketrans({**dict.fromkeys("‐‑‒–—―−", "-"), **dict.fromkeys("‘’‚‛", "'"),
+                                **dict.fromkeys("“”„‟", '"'), **dict.fromkeys("\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000", " ")})
+
+
 def _seek(lines, pattern, start, eof=False):
     if not pattern:
         return len(lines) if eof else start
     positions = range(max(start, len(lines) - len(pattern)) if eof else start, len(lines) - len(pattern) + 1)
-    punctuation = str.maketrans({**dict.fromkeys("‐‑‒–—―−", "-"), **dict.fromkeys("‘’‚‛", "'"),
-                                **dict.fromkeys("“”„‟", '"'), **dict.fromkeys("\u00a0\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000", " ")})
-    for normalize in (lambda value: value, str.rstrip, str.strip, lambda value: value.strip().translate(punctuation)):
+    for normalize in (lambda value: value, str.rstrip, str.strip, lambda value: value.strip().translate(_PUNCTUATION)):
         expected = [normalize(value) for value in pattern]
+        normalized = [normalize(value) for value in lines]
         for position in positions:
-            if [normalize(value) for value in lines[position:position + len(pattern)]] == expected:
+            if normalized[position:position + len(pattern)] == expected:
                 return position
     return None
 
@@ -200,25 +203,22 @@ class ApplyPatchTool(LocalTool):
                         path.write_bytes(original[0])
                         path.chmod(original[1])
                 raise
-            diff, added, removed = [], 0, 0
+            results = []
             for path, content in changes.items():
                 original = originals[path]
-                old = original[0].decode("utf-8").splitlines() if original else []
-                new = content.decode("utf-8").splitlines() if content is not None else []
+                old = original[0].decode("utf-8") if original else ""
+                new = content.decode("utf-8") if content is not None else ""
                 relative = path.relative_to(policy.repo_root.resolve()).as_posix()
-                file_diff = list(difflib.unified_diff(old, new, fromfile=relative, tofile=relative, lineterm=""))
-                diff.extend(file_diff)
-                for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(None, old, new).get_opcodes():
-                    if tag in ("insert", "replace"):
-                        added += new_end - new_start
-                    if tag in ("delete", "replace"):
-                        removed += old_end - old_start
+                results.append(_diff_result(tool_call.id, relative, old, new))
                 if content is not None:
-                    self._ledger.record(path, full=True, content=content.decode("utf-8"))
-            patch = "\n".join(diff)
+                    self._ledger.record(path, full=True, content=new)
             return ToolResult(tool_call.id, ok=True, content="\n".join(labels), payload={
-                "kind": "file_diff", "path": ", ".join(str(path.relative_to(policy.repo_root.resolve())) for path in changes),
-                "diff": patch, "lines_added": added, "lines_removed": removed, "truncated": False,
+                "kind": "file_diff", "path": ", ".join(result.payload["path"] for result in results),
+                "diff": "\n".join(result.content for result in results),
+                "lines_added": sum(result.payload["lines_added"] for result in results),
+                "lines_removed": sum(result.payload["lines_removed"] for result in results),
+                "truncated": any(result.payload["truncated"] for result in results),
+                "hunks": [dict(hunk, path=result.payload["path"]) for result in results for hunk in result.payload["hunks"]],
             })
         except (OSError, UnicodeError, ValueError) as exc:
             return ToolResult(tool_call.id, ok=False, error=str(exc))

@@ -1214,7 +1214,7 @@ class HostServer:
 
             def _get_mcp_prompts(self, payload):
                 from symphonai_api.mcp import McpError
-                pool = getattr(host.run, '_mcp_pool', None)
+                pool = host.run.mcp_pool
                 try:
                     return _Reply(HTTPStatus.OK, {'prompts': [] if pool is None else pool.prompts()})
                 except McpError:
@@ -1222,14 +1222,14 @@ class HostServer:
 
             def _post_mcp_prompt(self, payload):
                 from symphonai_api.mcp import McpError
-                pool = getattr(host.run, '_mcp_pool', None)
-                if pool is None or payload['server'] not in pool.prompt_clients:
+                pool = host.run.mcp_pool
+                if pool is None or payload['server'] not in pool.clients or pool.status(payload['server'])['state'] != 'started' or 'prompts' not in pool.clients[payload['server']].capabilities:
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Unknown prompt server'})
                 arguments = payload['arguments']
                 if not all(isinstance(key, str) and isinstance(value, str) for key, value in arguments.items()):
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Prompt arguments must be strings'})
                 try:
-                    prompt = next((entry for entry in pool.prompts() if entry['server'] == payload['server'] and entry['name'] == payload['name']), None)
+                    prompt = next((entry for entry in pool.prompts(payload['server']) if entry['name'] == payload['name']), None)
                     if prompt is None:
                         raise ValueError('Unknown MCP prompt')
                     declared = prompt.get('arguments', [])
@@ -1237,22 +1237,24 @@ class HostServer:
                         raise ValueError('Required prompt argument is missing')
                     if set(arguments) - {item['name'] for item in declared}:
                         raise ValueError('Unknown prompt argument')
-                    result = pool.prompt_clients[payload['server']].get_prompt(payload['name'], arguments)
+                    result = pool.clients[payload['server']].get_prompt(payload['name'], arguments)
                     text = []
                     for message in result['messages']:
                         content = message.get('content', {})
                         blocks = content if isinstance(content, list) else [content]
                         text.extend(block['text'] for block in blocks if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str))
                     return _Reply(HTTPStatus.OK, {'text': '\n\n'.join(text)})
-                except (McpError, ValueError, KeyError, TypeError, AttributeError):
+                except ValueError as exc:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
+                except (McpError, KeyError, TypeError, AttributeError):
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Could not render MCP prompt; check its arguments'})
 
             def _post_mcp_sign_in(self, payload):
                 from symphonai_api.mcp_auth import AuthError
                 run = host.run
-                pool = getattr(run, '_mcp_pool', None)
+                pool = run.mcp_pool
                 client = None if pool is None else pool.clients.get(payload['server'])
-                oauth = getattr(client, '_oauth', None)
+                oauth = None if client is None else client.oauth
                 if oauth is None:
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'This server does not support app sign-in'})
                 try:
@@ -1280,7 +1282,7 @@ class HostServer:
                         raise AuthError('Sign-in was refused')
                     oauth.finish(flow, query.get('code', [''])[0])
                     run.restart_mcp(oauth.server)
-                    if run._mcp_pool.status(oauth.server)['state'] != 'started':
+                    if run.mcp_pool.status(oauth.server)['state'] != 'started':
                         raise AuthError('MCP server did not start')
                 except (AuthError, ValueError, RuntimeError):
                     self._bytes(HTTPStatus.BAD_REQUEST, b'Sign-in failed. Please try signing in again.', 'text/html; charset=utf-8')
@@ -1312,7 +1314,7 @@ class HostServer:
                 ceiling = None if extensions is None else extensions.ceiling
                 search_key = None if extensions is None else extensions.config.get('search.endpoint')
                 configured_search = None if search_key is None else search_endpoint(search_key)
-                pool = getattr(host.run, '_mcp_pool', None)
+                pool = host.run.mcp_pool
                 mcp_rows = []
                 for spec in (() if extensions is None else extensions.mcp_servers):
                     state = pool.status(spec.name) if pool is not None else {'state': 'disabled', 'error': ''}
@@ -1451,9 +1453,9 @@ class HostServer:
 
             def _terminals(self):
                 return sessions_for(host.run, host._current_root,
-                    lambda identifier, data, exited, code: host.broker.publish(TerminalOutput(
+                    lambda identifier, data, exited, code, offset: host.broker.publish(TerminalOutput(
                         agent_id='', run_id='',
-                        terminal_id=identifier, data=data, exited=exited, exit_code=code,
+                        terminal_id=identifier, data=data, offset=offset, exited=exited, exit_code=code,
                     )))
 
             def _get_terminals(self, payload):

@@ -18,12 +18,29 @@ if TYPE_CHECKING:
 FILE_EDIT_TOOLS = frozenset({"write_file", "edit_file", "multi_edit_file", "apply_patch"})
 
 
+def edit_tool_names(names, wire_format: int | None = None) -> set[str]:
+    """An editing capability selects the model's edit family, or all names for rosters."""
+    names = set(names)
+    edits = FILE_EDIT_TOOLS - {"write_file"}
+    if names & edits:
+        family = edits if wire_format is None else {"apply_patch"} if wire_format == 1 else {"edit_file", "multi_edit_file"}
+        names = (names - edits) | family
+    return names
+
+
 def patch_paths(value: object) -> list[str]:
     if not isinstance(value, str):
         return []
     prefixes = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
     return list(dict.fromkeys(line[len(prefix):] for line in value.splitlines()
                              for prefix in prefixes if line.startswith(prefix)))
+
+
+def changed_paths(tool_name: str, arguments: dict) -> list[str]:
+    if tool_name == "apply_patch":
+        return patch_paths(arguments.get("input"))
+    path = arguments.get("path")
+    return [path] if tool_name in FILE_EDIT_TOOLS and isinstance(path, str) else []
 
 
 TARGET_LIMIT = 200
@@ -60,8 +77,6 @@ def _url_origin(url: object) -> str:
 
 _TARGET_KEYS = {
     "read_file": ("path", _plain_target),
-    **{name: ("path", _plain_target) for name in FILE_EDIT_TOOLS if name != "apply_patch"},
-    "apply_patch": ("input", lambda value: next(iter(patch_paths(value)), "")),
     "list_files": ("path", _plain_target),
     "glob": ("pattern", _plain_target),
     "grep": ("pattern", _plain_target),
@@ -79,6 +94,8 @@ def call_target(tool_name: str, arguments: dict) -> str:
     """Return a bounded display target derived safely for one known tool."""
     if not isinstance(tool_name, str) or not isinstance(arguments, dict):
         return ""
+    if tool_name in FILE_EDIT_TOOLS:
+        return next(iter(changed_paths(tool_name, arguments)), "")[:TARGET_LIMIT]
     if tool_name == "run_shell" and "command" in arguments:
         commands = parse_command_line(arguments["command"])
         if commands is None or not commands[0].argv:

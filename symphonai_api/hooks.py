@@ -5,15 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import math
-import ipaddress
 import queue
 import threading
 import urllib.request
-from urllib.parse import urlsplit
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from symphonai_api.web import RedirectBlocker, valid_service_url
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.events import Event
 from symphonai_api.cancellation import CancellationToken
@@ -25,6 +24,7 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TIMEOUT_SECONDS = 30.0
 
 _LOG = logging.getLogger(__name__)
+_DECISION_POINTS = (("PreToolUse",), ("Stop",))
 
 
 @dataclass(frozen=True)
@@ -72,27 +72,11 @@ def _mask_payload(value):
     return value
 
 
-def _valid_hook_url(value):
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = urlsplit(value)
-        parsed.port
-        if not parsed.hostname:
-            return False
-        if parsed.scheme == "https":
-            return True
-        if parsed.scheme != "http":
-            return False
-        return parsed.hostname == "localhost" or ipaddress.ip_address(parsed.hostname).is_loopback
-    except ValueError:
-        return False
-
 
 def _valid_event_names() -> tuple[str, ...]:
     return tuple(
         sorted(
-            {"Event", "PreToolUse", "Stop"}
+            {"Event"} | {name for (name,) in _DECISION_POINTS}
             | {event_type.__name__ for event_type in Event.__subclasses__()}
         )
     )
@@ -178,12 +162,12 @@ def hooks_from_config(
                 or not all(isinstance(item, str) and item for item in raw_command)):
                 raise _config_error(source, index, "command", "must be a non-empty argv array of strings")
             command = tuple(raw_command)
-        elif kind == "url" and not _valid_hook_url(raw_hook["url"]):
+        elif kind == "url" and not valid_service_url(raw_hook["url"]):
             raise _config_error(source, index, "url", "must be https, or http on localhost only")
         elif kind == "prompt":
             if not isinstance(raw_hook["prompt"], str) or not raw_hook["prompt"].strip():
                 raise _config_error(source, index, "prompt", "must be non-blank text")
-            if events not in (("PreToolUse",), ("Stop",)):
+            if events not in _DECISION_POINTS:
                 raise _config_error(source, index, "prompt", "allowed only on ['PreToolUse'] or ['Stop']")
 
         raw_timeout = raw_hook.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
@@ -205,12 +189,12 @@ def hooks_from_config(
         raw_blocking = raw_hook.get("blocking", False)
         if type(raw_blocking) is not bool:
             raise _config_error(source, index, "blocking", "must be a boolean")
-        for decision_point in ("PreToolUse", "Stop"):
+        for (decision_point,) in _DECISION_POINTS:
             if decision_point in events and events != (decision_point,):
                 raise _config_error(source, index, "on", f"{decision_point} cannot be mixed with event-channel names")
-        if events in (("PreToolUse",), ("Stop",)) and not raw_blocking:
+        if events in _DECISION_POINTS and not raw_blocking:
             raise _config_error(source, index, "blocking", f"{events[0]} must be blocking")
-        if raw_blocking and events not in (("PreToolUse",), ("Stop",)):
+        if raw_blocking and events not in _DECISION_POINTS:
             raise _config_error(source, index, "blocking", "the event channel is one-way; blocking is valid only for PreToolUse or Stop")
         agents = raw_hook.get("agents")
         if agents is not None:
@@ -255,16 +239,12 @@ class HookRunner:
             def invoke():
                 try:
                     if hook.url is not None:
-                        if not _valid_hook_url(hook.url):
+                        if not valid_service_url(hook.url):
                             raise ValueError("invalid hook URL")
-
-                        class NoRedirect(urllib.request.HTTPRedirectHandler):
-                            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                                return None
 
                         request = urllib.request.Request(hook.url, data=masked.encode("utf-8"),
                                                          headers={"Content-Type": "application/json"}, method="POST")
-                        with urllib.request.build_opener(NoRedirect).open(request, timeout=hook.timeout_seconds) as response:
+                        with urllib.request.build_opener(RedirectBlocker()).open(request, timeout=hook.timeout_seconds) as response:
                             if not 200 <= response.status < 300:
                                 raise ValueError("non-2xx hook response")
                             text = response.read().decode("utf-8")

@@ -10,15 +10,15 @@ import os
 from pathlib import Path
 import queue
 import re
-import signal
 import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from symphonai_api.process import stop_process_group
+from symphonai_api.web import valid_service_url
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.tools.base import LocalTool
@@ -140,16 +140,8 @@ def mcp_servers_from_config(
         if url is not None:
             if not isinstance(url, str) or not url:
                 raise _config_error(source, f"{key}.url", "must be a non-empty HTTP or HTTPS URL")
-            try:
-                parsed_url = urlsplit(url)
-                hostname = parsed_url.hostname
-                parsed_url.port
-            except ValueError:
-                raise _config_error(source, f"{key}.url", "must be a valid HTTP or HTTPS URL") from None
-            if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc or hostname is None:
-                raise _config_error(source, f"{key}.url", "must be a valid HTTP or HTTPS URL")
-            if parsed_url.scheme == "http" and hostname.lower() not in ("localhost", "127.0.0.1", "::1"):
-                raise _config_error(source, f"{key}.url", "HTTP is allowed only for localhost")
+            if not valid_service_url(url):
+                raise _config_error(source, f"{key}.url", "must use HTTPS or loopback HTTP, without user info")
         bearer_token_env_var = entry.get("bearer_token_env_var")
         if bearer_token_env_var is not None:
             if url is None:
@@ -202,34 +194,6 @@ def mcp_servers_from_config(
     return tuple(specs)
 
 
-def _terminate_process_group(proc: subprocess.Popen[str], pgid: int) -> None:
-    if proc.poll() is None:
-        try:
-            if hasattr(os, "killpg"):
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                proc.terminate()
-        except (OSError, ProcessLookupError, PermissionError):
-            pass
-        try:
-            proc.wait(timeout=_CLEANUP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(pgid, signal.SIGKILL)
-        elif proc.poll() is None:
-            proc.kill()
-    except (OSError, ProcessLookupError, PermissionError):
-        pass
-    try:
-        proc.wait(timeout=_CLEANUP_TIMEOUT_SECONDS)
-    except (OSError, subprocess.TimeoutExpired):
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
 
 
 class McpClient:
@@ -255,6 +219,8 @@ class McpClient:
         self._http_ready = False
         self.instructions: str | None = None
         self.capabilities: dict = {}
+        self.auth_state = "starting" if spec.enabled else "disabled"
+        self.oauth = None
 
     def start(self) -> None:
         if not self.spec.enabled:
@@ -307,19 +273,25 @@ class McpClient:
                 timeout=self.spec.startup_timeout_seconds,
                 phase="startup",
             )
-            if not isinstance(result, Mapping):
-                raise McpError(
-                    f"MCP server {self.spec.name!r} returned an invalid initialize result"
-                )
-            self._keep_instructions(result)
-            capabilities = result.get("capabilities", {})
-            if not isinstance(capabilities, Mapping):
-                raise McpError("MCP server returned invalid capabilities")
-            self.capabilities = dict(capabilities)
+            self._read_capabilities(result)
             self._notify("notifications/initialized", {})
-        except McpError:
-            self.close()
-            raise
+            self.auth_state = "started"
+        except McpError as exc:
+            self._fail("failed", str(exc))
+
+    def _fail(self, state: str, message: str):
+        self.auth_state = state
+        self.close()
+        raise McpError(message) from None
+
+    def _read_capabilities(self, result):
+        if not isinstance(result, Mapping):
+            raise McpError(f"MCP server {self.spec.name!r} returned an invalid initialize result")
+        self._keep_instructions(result)
+        capabilities = result.get("capabilities", {})
+        if not isinstance(capabilities, Mapping):
+            raise McpError("MCP server returned invalid capabilities")
+        self.capabilities = dict(capabilities)
 
     def _start_http(self) -> None:
         if self.spec.bearer_token_env_var is not None:
@@ -332,7 +304,7 @@ class McpClient:
             self._http_token = token
         else:
             from symphonai_api.mcp_auth import OAuthSession
-            self._oauth = OAuthSession(self.spec.name, self.spec.url)
+            self.oauth = OAuthSession(self.spec.name, self.spec.url)
         try:
             result = self._request(
                 "initialize",
@@ -344,15 +316,7 @@ class McpClient:
                 timeout=self.spec.startup_timeout_seconds,
                 phase="startup",
             )
-            if not isinstance(result, Mapping):
-                raise McpError(
-                    f"MCP server {self.spec.name!r} returned an invalid initialize result"
-                )
-            self._keep_instructions(result)
-            capabilities = result.get("capabilities", {})
-            if not isinstance(capabilities, Mapping):
-                raise McpError("MCP server returned invalid capabilities")
-            self.capabilities = dict(capabilities)
+            self._read_capabilities(result)
             version = result.get("protocolVersion")
             if not isinstance(version, str) or not version:
                 raise McpError(
@@ -361,9 +325,8 @@ class McpClient:
             self._http_protocol_version = version
             self._notify("notifications/initialized", {})
             self._http_ready = True
-        except McpError:
-            self.close()
-            raise
+        except McpError as exc:
+            self._fail(self.auth_state if self.auth_state == "needs_sign_in" else "failed", str(exc))
 
     def _keep_instructions(self, result: Mapping) -> None:
         instructions = result.get("instructions")
@@ -407,15 +370,13 @@ class McpClient:
                 "params": dict(params),
             }
             from symphonai_api.mcp_auth import AuthError
-            oauth = getattr(self, "_oauth", None)
+            oauth = self.oauth
             for attempt in range(2):
                 if oauth is not None:
                     try:
                         self._http_token = oauth.access_token(force=attempt == 1)
                     except AuthError:
-                        self._auth_state = "needs_sign_in"
-                        self.close()
-                        raise McpError(f"MCP server {self.spec.name!r} needs sign-in from the app") from None
+                        self._fail("needs_sign_in", f"MCP server {self.spec.name!r} needs sign-in from the app")
                 request = Request(self.spec.url,
                     data=json.dumps(message, separators=(",", ":")).encode("utf-8"),
                     headers=self._http_headers(), method="POST")
@@ -433,27 +394,18 @@ class McpClient:
                         oauth.challenge = exc.headers.get("WWW-Authenticate", "")
                         if attempt == 0 and oauth.record.get("refresh_token"):
                             continue
-                        self._auth_state = "needs_sign_in"
-                        self.close()
-                        raise McpError(f"MCP server {self.spec.name!r} needs sign-in from the app") from None
-                    self._auth_state = "failed"
-                    self.close()
-                    raise McpError(f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {phase}") from None
+                        self._fail("needs_sign_in", f"MCP server {self.spec.name!r} needs sign-in from the app")
+                    self._fail("failed", f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {phase}")
                 except (TimeoutError, URLError, OSError, ValueError):
-                    self._auth_state = "failed"
-                    self.close()
-                    raise McpError(f"MCP server {self.spec.name!r} connection failed during {phase}") from None
+                    self._fail("failed", f"MCP server {self.spec.name!r} connection failed during {phase}")
                 try:
                     result = self._decode_http_response(body, content_type=content_type,
                         request_id=request_id, status=status, phase=phase)
-                except McpError:
-                    self._auth_state = "failed"
-                    authenticated = bool(self._http_token)
-                    self.close()
-                    if oauth is not None or authenticated:
-                        raise McpError(f"MCP server {self.spec.name!r} returned an invalid response") from None
-                    raise
-                self._auth_state = "started"
+                except McpError as exc:
+                    message = (f"MCP server {self.spec.name!r} returned an invalid response"
+                               if oauth is not None or self._http_token else str(exc))
+                    self._fail("failed", message)
+                self.auth_state = "started"
                 return result
 
     def _decode_http_response(
@@ -823,7 +775,7 @@ class McpClient:
         pgid = self._process_group
         if proc is None or pgid is None:
             return
-        _terminate_process_group(proc, pgid)
+        stop_process_group(proc, pgid)
         if proc.stdin is not None:
             try:
                 proc.stdin.close()
@@ -860,6 +812,8 @@ def _render_content(content: object) -> str:
 
 class McpTool(LocalTool):
     """One server-side tool, presented as a LocalTool."""
+
+    deferrable = True
 
     def __init__(
         self,

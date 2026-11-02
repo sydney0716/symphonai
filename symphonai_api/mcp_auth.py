@@ -5,14 +5,14 @@ import base64
 import hashlib
 import json
 import math
-from pathlib import Path
 import re
 import secrets
 import threading
 import time
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.request import Request, build_opener
 
+from symphonai_api.web import RedirectBlocker, valid_service_url
 from symphonai_api.paths import ensure_private_directory, symphonai_home, write_atomic
 
 
@@ -20,24 +20,9 @@ class AuthError(ValueError):
     """An authentication failure whose message contains no server response or token."""
 
 
-def credential_directories() -> tuple[Path, ...]:
-    return tuple({(Path.home() / '.symphonai' / 'credentials').resolve(),
-                  (symphonai_home() / 'credentials').resolve()})
-
-
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
 
 def _endpoint(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        valid = isinstance(url, str) and parsed.hostname and not (parsed.username or parsed.password or parsed.fragment)
-        valid = valid and (parsed.scheme == 'https' or parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost', '::1'))
-    except (TypeError, ValueError):
-        valid = False
-    if not valid:
+    if not valid_service_url(url):
         raise AuthError('OAuth requires HTTPS endpoints (HTTP is allowed on loopback only)')
     return url
 
@@ -49,7 +34,7 @@ def _json_request(url, data=None, *, form=False):
         headers = {'Accept': 'application/json'}
         if body is not None:
             headers['Content-Type'] = 'application/x-www-form-urlencoded' if form else 'application/json'
-        with build_opener(_NoRedirect()).open(Request(url, data=body, headers=headers), timeout=10) as reply:
+        with build_opener(RedirectBlocker()).open(Request(url, data=body, headers=headers), timeout=10) as reply:
             result = json.loads(reply.read(1_000_001))
         if not isinstance(result, dict):
             raise ValueError()
@@ -149,7 +134,8 @@ class OAuthSession:
 
     def _save_token(self, token, record):
         access = token.get('access_token')
-        if not isinstance(access, str) or not access or not isinstance(token.get('token_type', 'Bearer'), str) or token.get('token_type', 'Bearer').lower() != 'bearer':
+        token_type = token.get('token_type', 'Bearer')
+        if not isinstance(access, str) or not access or not isinstance(token_type, str) or token_type.lower() != 'bearer':
             raise AuthError('OAuth returned an invalid access token')
         updated = {**record, 'access_token': access}
         if token.get('refresh_token'):

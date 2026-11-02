@@ -9,9 +9,29 @@ from dataclasses import dataclass, replace
 
 from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.model_table import compact_at_for_model, context_window_for_model
-from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, patch_paths
+from symphonai_api.tools.metadata import changed_paths
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextBlock, ToolCall, ToolResult
 from symphonai_api.providers.base import tool_result_text
+
+_RESTORE_PREFIX = "Restored after compaction:\n"
+
+
+def is_restore_message(message: Message) -> bool:
+    return message.role == Role.SYSTEM and message.text.startswith(_RESTORE_PREFIX)
+
+
+def restored_state(messages) -> dict:
+    state = {}
+    for message in messages:
+        if is_restore_message(message):
+            try:
+                value = json.loads(message.text[len(_RESTORE_PREFIX):])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict):
+                state = value
+    return state
+
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 16_000
 DEFAULT_CONTEXT_WINDOW = 128_000
@@ -294,17 +314,8 @@ def compact_messages_for_budget(
                 # Summaries retain the original content, before microcompaction clears it.
                 dropped = [original[index] for index in dropped_indices]
                 # Replace the prior restoration rather than accumulating stale file bodies.
-                restored = {}
-                for message in original:
-                    if message.role == Role.SYSTEM and message.text.startswith("Restored after compaction:\n"):
-                        try:
-                            state = json.loads(message.text.split("\n", 1)[1])
-                            if isinstance(state, dict):
-                                restored = state
-                        except (ValueError, TypeError):
-                            pass
-                prefix = [message for message in prefix
-                          if not message.text.startswith("Restored after compaction:\n")]
+                restored = restored_state(original)
+                prefix = [message for message in prefix if not is_restore_message(message)]
                 plan = restored.get("plan")
                 for message in original:
                     for call in message.tool_calls:
@@ -315,10 +326,8 @@ def compact_messages_for_budget(
                 paths = list(restored.get("files_changed", []))
                 for message in dropped:
                     for call in message.tool_calls:
-                        changed = (patch_paths(call.arguments.get("input")) if call.name == "apply_patch"
-                                   else [call.arguments.get("path")])
-                        if call.name in FILE_EDIT_TOOLS and call.id in successful:
-                            paths.extend(path for path in changed if isinstance(path, str) and path not in paths)
+                        if call.id in successful:
+                            paths.extend(path for path in changed_paths(call.name, call.arguments) if path not in paths)
                 restore = {}
                 if plan is not None:
                     restore["plan"] = plan
@@ -326,7 +335,7 @@ def compact_messages_for_budget(
                     restore["files_changed"] = paths[:30]
 
                 def restore_message(state):
-                    return Message(Role.SYSTEM, "Restored after compaction:\n"
+                    return Message(Role.SYSTEM, _RESTORE_PREFIX
                                    + json.dumps(state, ensure_ascii=False, indent=2))
 
                 mandatory = [restore_message(restore)] if restore else []

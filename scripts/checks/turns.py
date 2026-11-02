@@ -790,6 +790,7 @@ def deferred_mcp_tools_load_execute_and_survive_compaction():
     from symphonai_api.tool_schema import tool_registry_schemas
 
     class McpFixture(LocalTool):
+        deferrable = True
         parameters = {"type": "object", "properties": {}}
 
         def __init__(self, name):
@@ -823,7 +824,7 @@ def deferred_mcp_tools_load_execute_and_survive_compaction():
         budget = [100000]
         agent = ApiAgent(provider, tools, ws.policy,
                          tool_schemas=tool_registry_schemas(tools, provider.wire_format),
-                         deferrable_tools=tuple(tools), context_budget=lambda model: budget[0],
+                         context_budget=lambda model: budget[0],
                          context_recent_turns=1, transcript=store.writer_for("mcp-agent", is_root=True))
         first = agent.run([Message(Role.SYSTEM, "Preserve instructions"), Message(Role.USER, "Original goal")])
         names = lambda request: {schema.get("function", schema)["name"] for schema in request.tools}
@@ -843,15 +844,14 @@ def deferred_mcp_tools_load_execute_and_survive_compaction():
         resumed_provider = Script([answer("", call("github_create_issue")), answer()])
         resumed = ApiAgent(resumed_provider, tools, ws.policy,
                            tool_schemas=tool_registry_schemas(tools, resumed_provider.wire_format),
-                           deferrable_tools=tuple(tools), transcript=store.writer_for("mcp-agent", is_root=True))
+                           transcript=store.writer_for("mcp-agent", is_root=True))
         resumed.run(load_run(store).messages + [Message(Role.USER, "Use the previously loaded tool")])
         assert "github_create_issue" in names(resumed_provider.requests[0])
         assert tools["github_create_issue"].calls == 2
         small_tools = dict(list(tools.items())[:5])
         small_provider = Script([answer()])
         ApiAgent(small_provider, small_tools, ws.policy,
-                 tool_schemas=tool_registry_schemas(small_tools, small_provider.wire_format),
-                 deferrable_tools=tuple(small_tools)).run([Message(Role.USER, "A small MCP set")])
+                 tool_schemas=tool_registry_schemas(small_tools, small_provider.wire_format)).run([Message(Role.USER, "A small MCP set")])
         assert names(small_provider.requests[0]) == set(small_tools)
 
 

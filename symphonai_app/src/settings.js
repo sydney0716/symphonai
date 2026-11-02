@@ -1,5 +1,7 @@
 import { button as makeButton, errorText, append, element, listen, replace } from "./render.js";
 
+export const EDITOR_KEY = "symphonai.editor";
+
 export class SettingsError extends Error {
   constructor(message) {
     super(message);
@@ -566,15 +568,15 @@ function renderGeneral(section, context) {
   }
   let editor = "none";
   try {
-    const stored = global.localStorage?.getItem("symphonai.editor");
+    const stored = global.localStorage?.getItem(EDITOR_KEY);
     if (editors.some(([value]) => value === stored)) editor = stored;
   } catch { /* Storage is optional. */ }
   editorSelect.value = editor;
   listen(editorSelect, "change", () => {
     const chosen = editors.some(([value]) => value === editorSelect.value) ? editorSelect.value : "none";
-    try { global.localStorage?.setItem("symphonai.editor", chosen); }
+    try { global.localStorage?.setItem(EDITOR_KEY, chosen); }
     catch { /* Storage is optional. */ }
-    global.dispatchEvent?.(new (global.Event ?? Event)("symphonai.editor"));
+    global.dispatchEvent?.(new (global.Event ?? Event)(EDITOR_KEY));
   });
   const statusOptions = [
     ["provider", "Provider"], ["model", "Model"], ["effort", "Effort"],

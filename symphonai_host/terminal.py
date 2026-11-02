@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import codecs
+from collections import deque
+import logging
 import fcntl
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import struct
 import subprocess
 import termios
 import threading
+import time
 import uuid
 import weakref
 
@@ -22,7 +25,12 @@ class Terminal:
         self.id = uuid.uuid4().hex
         self.exited = False
         self.exit_code = None
-        self.output = ""
+        self._chunks = deque()
+        self._length = 0
+        self.end = 0
+        self._pending = []
+        self._published_end = 0
+        self._last_publish = 0.0
         self._publish = publish
         self._lock = threading.Lock()
         self._input_lock = threading.Lock()
@@ -41,44 +49,75 @@ class Terminal:
         self._reader = threading.Thread(target=self._read, name=f"terminal-{self.id}", daemon=True)
         self._reader.start()
 
-    def _read(self):
-        import logging
+    def _append(self, text):
+        with self._lock:
+            if not text:
+                return
+            self._chunks.append(text)
+            self._length += len(text)
+            self.end += len(text)
+            while self._length > 200000:
+                excess = self._length - 200000
+                first = self._chunks.popleft()
+                removed = min(excess, len(first))
+                if removed < len(first):
+                    self._chunks.appendleft(first[removed:])
+                self._length -= removed
+            self._pending.append(text)
 
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    def _flush(self, exited=False):
+        delay = 0.03 - (time.monotonic() - self._last_publish)
+        if delay > 0:
+            time.sleep(delay)
+        with self._lock:
+            text = ''.join(self._pending)
+            self._pending.clear()
+            offset = self._published_end
+            self._published_end += len(text)
+            code = self.exit_code
+        if not text and not exited:
+            return
+        self._last_publish = time.monotonic()
         try:
-            while True:
-                ready, _, _ = select.select([self._fd], [], [], 0.1)
-                if not ready:
-                    continue
-                try:
-                    data = os.read(self._fd, 8192)
-                except OSError:
-                    break
-                if not data:
-                    break
-                text = decoder.decode(data)
-                with self._lock:
-                    self.output = (self.output + text)[-200000:]
-                try:
-                    self._publish(self.id, text, False, None)
-                except Exception:
-                    logging.getLogger(__name__).exception("Could not publish terminal output")
+            self._publish(self.id, text, exited, code if exited else None, offset)
+        except Exception:
+            logging.getLogger(__name__).exception("Could not publish terminal output")
+
+    def _read(self):
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        closed = False
+        try:
+            while not closed:
+                # Idle readers sleep until output or PTY closure, without polling.
+                select.select([self._fd], [], [])
+                deadline = max(time.monotonic(), self._last_publish + 0.03)
+                while True:
+                    try:
+                        data = os.read(self._fd, 8192)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        closed = True
+                        break
+                    if not data:
+                        closed = True
+                        break
+                    self._append(decoder.decode(data))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([self._fd], [], [], remaining)[0]:
+                        break
+                if not closed:
+                    self._flush()
         finally:
-            # Close the master before reaping, including on a reader failure.
-            # Closing it also hangs up a shell that is still alive.
             with self._lock:
                 os.close(self._fd)
                 self._fd = -1
             _, status = os.waitpid(self.pid, 0)
-            tail = decoder.decode(b"", final=True)
+            self._append(decoder.decode(b"", final=True))
             with self._lock:
                 self.exited = True
                 self.exit_code = os.waitstatus_to_exitcode(status)
-                self.output = (self.output + tail)[-200000:]
-            try:
-                self._publish(self.id, tail, True, self.exit_code)
-            except Exception:
-                logging.getLogger(__name__).exception("Could not publish terminal exit")
+            self._flush(exited=True)
 
     def input(self, data: str):
         encoded = data.encode("utf-8")
@@ -104,34 +143,16 @@ class Terminal:
 
     def snapshot(self):
         with self._lock:
-            return {"id": self.id, "exited": self.exited, "exit_code": self.exit_code, "output": self.output}
+            return {"id": self.id, "exited": self.exited, "exit_code": self.exit_code, "output": "".join(self._chunks), "end": self.end}
 
-    def stop(self):
-        if self.exited:
-            self._reader.join(timeout=0.3)
-            return
-        if self._stopping.is_set():
-            self._reader.join(timeout=0.3)
+    def stop(self, groups=None, *, wait=True):
+        if self.exited or self._stopping.is_set():
+            if wait:
+                self._reader.join(timeout=0.3)
             return
         self._stopping.set()
-        # Interactive jobs can have their own process groups. Capture descendants
-        # before terminating the shell so background jobs are stopped as well.
-        groups = {self.pid}
-        try:
-            listing = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid="],
-                                     capture_output=True, text=True, timeout=0.2, check=True)
-            processes = [tuple(map(int, line.split())) for line in listing.stdout.splitlines()]
-            descendants = {self.pid}
-            while True:
-                found = {pid for pid, parent, _ in processes if parent in descendants}
-                if found <= descendants:
-                    break
-                descendants.update(found)
-            groups.update(group for pid, _, group in processes if pid in descendants)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-        groups.discard(os.getpgrp())
-        groups.discard(0)
+        if groups is None:
+            groups = _process_groups([self])[self.pid]
         for number in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.kill(self.pid, number)
@@ -142,9 +163,31 @@ class Terminal:
                     os.killpg(group, number)
                 except ProcessLookupError:
                     pass
-            if number == signal.SIGTERM:
+            if wait and number == signal.SIGTERM:
                 self._reader.join(timeout=0.3)
-        self._reader.join(timeout=0.3)
+        if wait:
+            self._reader.join(timeout=0.3)
+
+
+def _process_groups(terminals):
+    processes = []
+    try:
+        listing = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid="],
+                                 capture_output=True, text=True, timeout=0.2, check=True)
+        processes = [tuple(map(int, line.split())) for line in listing.stdout.splitlines()]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    result = {}
+    for terminal in terminals:
+        descendants = {terminal.pid}
+        while True:
+            found = {pid for pid, parent, _ in processes if parent in descendants}
+            if found <= descendants:
+                break
+            descendants.update(found)
+        groups = {terminal.pid} | {group for pid, _, group in processes if pid in descendants}
+        result[terminal.pid] = groups - {os.getpgrp(), 0}
+    return result
 
 
 class TerminalSessions:
@@ -157,7 +200,7 @@ class TerminalSessions:
 
     def start(self):
         with _LOCK:
-            running = sum(not item["exited"] for sessions in _HOSTS.values() for item in sessions.list())
+            running = sum(sessions.running_count() for sessions in _HOSTS.values())
             if running >= 4:
                 raise ValueError("4 terminals are already open")
             with self._lock:
@@ -181,6 +224,10 @@ class TerminalSessions:
         with self._lock:
             self._sessions.pop(identifier, None)
 
+    def running_count(self):
+        with self._lock:
+            return sum(not terminal.exited for terminal in self._sessions.values())
+
     def list(self):
         with self._lock:
             return [terminal.snapshot() for terminal in self._sessions.values()]
@@ -189,8 +236,11 @@ class TerminalSessions:
         with self._lock:
             self._closed = True
             sessions = list(self._sessions.values())
+        groups = _process_groups(sessions) if sessions else {}
         for terminal in sessions:
-            terminal.stop()
+            terminal.stop(groups[terminal.pid], wait=False)
+        for terminal in sessions:
+            terminal._reader.join(timeout=0.6)
         with self._lock:
             self._sessions.clear()
 

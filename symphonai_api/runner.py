@@ -31,7 +31,7 @@ from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.apply_patch import ApplyPatchTool, DiagnosticsAfterPatch
-from symphonai_api.tools.metadata import FILE_EDIT_TOOLS
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, edit_tool_names
 from symphonai_api.tools.edit import EditFileTool, MultiEditFileTool
 from symphonai_api.tools.diagnostics import DiagnosticsAfterWrite
 from symphonai_api.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
@@ -50,6 +50,7 @@ from symphonai_api.web_search import SearchBackend
 def standard_tool_registry(
     names: Sequence[str] | None = None,
     *,
+    wire_format: int | None = None,
     ledger: ReadLedger | None = None,
     result_store: ToolResultStore | None = None,
     search_backend: SearchBackend | None = None,
@@ -78,6 +79,8 @@ def standard_tool_registry(
         RunShellTool(jobs),
         WebFetchTool(),
     ]
+    selected_edits = edit_tool_names(FILE_EDIT_TOOLS - {"write_file"}, wire_format)
+    tools = [tool for tool in tools if tool.name not in FILE_EDIT_TOOLS - {"write_file"} or tool.name in selected_edits]
     if lsp is not None and lsp.has_enabled_servers:
         tools = [
             (DiagnosticsAfterPatch(tool, lsp) if tool.name == "apply_patch" else DiagnosticsAfterWrite(tool, lsp))
@@ -101,13 +104,11 @@ def standard_tool_registry(
     if names is not None:
         if not names:
             raise ValueError("names must not be empty; omit it for the full registry")
-        known_names = {tool.name for tool in tools}
+        known_names = {tool.name for tool in tools} | (FILE_EDIT_TOOLS - {"write_file"})
         for name in names:
             if name not in known_names:
                 raise ValueError(f"unknown tool name: {name!r}")
-        requested_names = set(names)
-        if requested_names.intersection({"edit_file", "multi_edit_file"}):
-            requested_names.add("apply_patch")
+        requested_names = edit_tool_names(names, wire_format)
     else:
         requested_names = None
     registry = {
@@ -182,6 +183,7 @@ def run_task(
     )
     tools = merge_tool_registry(
         standard_tool_registry(
+            wire_format=provider.wire_format,
             ledger=ledger,
             result_store=result_store,
             search_backend=search_backend,
@@ -243,7 +245,7 @@ def resume_task(
         else None
     )
     ledger = ReadLedger()
-    tools = standard_tool_registry(ledger=ledger, result_store=result_store)
+    tools = standard_tool_registry(wire_format=provider.wire_format, ledger=ledger, result_store=result_store)
     agent_ref = new_agent_ref("agent")
     agent = ApiAgent(
         provider=provider,

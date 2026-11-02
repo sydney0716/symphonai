@@ -126,6 +126,12 @@ class ReadLedger:
                 return None
             return "file has changed since it was read; read it again before editing it"
 
+    def recent(self, paths, limit: int) -> tuple[Path, ...]:
+        """Return the most recently used recorded paths among the selected paths."""
+        selected = {Path(path) for path in paths}
+        with self._lock:
+            return tuple(path for path in reversed(self._records) if path in selected)[:max(0, limit)]
+
     def changed_files(self) -> tuple[tuple[Path, int | None], ...]:
         """Return recorded paths that are newer on disk or have been deleted."""
         changed: list[tuple[Path, int | None]] = []

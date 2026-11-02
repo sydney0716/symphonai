@@ -30,6 +30,7 @@ from symphonai_api.compaction import (
     compact_messages_for_budget,
     estimate_messages_tokens,
     render_dropped_messages,
+    restored_state,
 )
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
@@ -62,6 +63,8 @@ from symphonai_api.model_table import long_context_threshold
 from symphonai_api.hooks import HookRunner
 from symphonai_api.agent_run import AgentRun
 from symphonai_api.models import (
+    ImageBlock,
+    TextBlock,
     Message,
     ModelRequest,
     ModelResponse,
@@ -85,7 +88,8 @@ from symphonai_api.session import TranscriptWriter
 from symphonai_api.streaming import ReasoningDelta, StreamAssembler, TextDelta
 from symphonai_api.tool_results import ToolResultStore, offload_tool_result
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, call_target
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, call_target, edit_tool_names
+from symphonai_api.tools.tool_search import schema_name
 from symphonai_api.tools.read_ledger import ReadLedger
 
 _CUT_TOOL_CALL_ERROR = (
@@ -99,6 +103,25 @@ def _message_digest(message: Message) -> str:
         message_to_json(message), sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.blake2b(canonical, digest_size=16).hexdigest()
+
+
+def _limit_images(messages, keep=5):
+    limited = list(messages)
+    for index in range(len(limited) - 1, -1, -1):
+        message = limited[index]
+        content = list(message.content)
+        changed = False
+        for block_index in range(len(content) - 1, -1, -1):
+            if isinstance(content[block_index], ImageBlock):
+                if keep:
+                    keep -= 1
+                else:
+                    content[block_index] = TextBlock(
+                        "[an earlier image was removed from context; ask the person to attach it again if you need it]")
+                    changed = True
+        if changed:
+            limited[index] = replace(message, content=content)
+    return limited
 
 
 def _tool_result_event_fields(
@@ -189,7 +212,6 @@ class ApiAgent:
         context_budget: Callable[[str | None], int] | None = None,
         context_overflow: Callable[[int, int | None], None] | None = None,
         context_recent_turns: int = DEFAULT_RECENT_TURNS,
-        deferrable_tools: tuple[str, ...] = (),
         tool_history: Path | None = None,
     ) -> None:
         effective_max_turns = budget.max_turns if budget is not None else max_turns
@@ -243,11 +265,9 @@ class ApiAgent:
         # `tools` above is only the *execution* registry, keyed by name --
         # without this, a real provider is never told any tool exists and
         # can never call one, even if `tools` would happily execute it.
-        self._tool_schemas = tool_schemas or []
-        self._all_tool_schemas = self._tool_schemas
-        self._last_request_schemas = None
+        self._tool_schemas = list(tool_schemas or [])
         self._tool_search = None
-        marked_names = set(deferrable_tools) | {name for name in tools if name.startswith("mcp__")}
+        marked_names = {name for name, tool in tools.items() if getattr(tool, "deferrable", False)}
         if marked_names:
             from symphonai_api.tools.tool_search import DeferredTool, SearchTools
 
@@ -259,6 +279,18 @@ class ApiAgent:
                 self._tool_search = SearchTools(marked, history)
                 self._tools = {name: (DeferredTool(tool, self._tool_search) if name in marked else tool)
                                for name, tool in tools.items()}
+
+    def restrict_tools(self, names) -> None:
+        """Restrict both execution and offered schemas using the model's edit family."""
+        selected = edit_tool_names(names, self._provider.wire_format)
+        self._tools = {name: tool for name, tool in self._tools.items() if name in selected}
+        self._tool_schemas = [schema for schema in self._tool_schemas if schema_name(schema) in selected]
+
+    def _ask_hook_model(self, prompt, cancel):
+        return self._provider.create_response(ModelRequest(
+            messages=[Message(Role.USER, prompt)],
+            model=self._previous_answering_model or self._provider.model, effort="low",
+        ), cancel=cancel)
 
     def _write_notes_coverage(self, text, coverage, tokens) -> None:
         write_atomic(self._notes_path.with_suffix(".coverage.json"), json.dumps({
@@ -299,24 +331,8 @@ class ApiAgent:
             path = self._notes_path
 
             def update():
-                from symphonai_api.models import ImageBlock, TextBlock
                 try:
-                    # Match normal requests' latest-image policy without rewriting the snapshot.
-                    request_messages = list(snapshot)
-                    remaining = 5
-                    for index in range(len(request_messages) - 1, -1, -1):
-                        content = list(request_messages[index].content)
-                        changed = False
-                        for block_index in range(len(content) - 1, -1, -1):
-                            if isinstance(content[block_index], ImageBlock):
-                                if remaining:
-                                    remaining -= 1
-                                else:
-                                    content[block_index] = TextBlock(
-                                        "[an earlier image was removed from context; ask the person to attach it again if you need it]")
-                                    changed = True
-                        if changed:
-                            request_messages[index] = replace(request_messages[index], content=content)
+                    request_messages = _limit_images(snapshot)
                     instructions = (
                         "Update this session's running notes from the conversation above. "
                         "Return the complete replacement notes in Markdown only; do not call tools. "
@@ -370,18 +386,10 @@ class ApiAgent:
             read_paths = {str((self._policy.repo_root / call.arguments["path"]).resolve())
                           for message in conversation for call in message.tool_calls
                           if call.name == "read_file" and isinstance(call.arguments.get("path"), str)}
-            for message in conversation:
-                if message.text.startswith("Restored after compaction:\n"):
-                    try:
-                        state = json.loads(message.text.split("\n", 1)[1])
-                    except ValueError:
-                        continue
-                    if isinstance(state, dict):
-                        read_paths.update(str((self._policy.repo_root / item["path"]).resolve())
-                                          for item in state.get("recent_files", []))
-            with self._read_ledger._lock:
-                paths = [path for path in reversed(self._read_ledger._records)
-                         if str(path) in read_paths][:5]
+            state = restored_state(conversation)
+            read_paths.update(str((self._policy.repo_root / item["path"]).resolve())
+                              for item in state.get("recent_files", []))
+            paths = self._read_ledger.recent(read_paths, 5)
             for path in paths:
                 if not self._policy.check_read(path).allowed:
                     continue
@@ -467,9 +475,7 @@ class ApiAgent:
 
                     decision = hooks.pre_tool(
                         tool_call.name, tool_call.id, tool_call.arguments, self._agent_ref.name,
-                        ask_model=lambda prompt, token, provider=self._provider, hook_model=self._previous_answering_model or self._provider.model: provider.create_response(ModelRequest(
-                            messages=[Message(Role.USER, prompt)], model=hook_model, effort="low",
-                        ), cancel=token), cancel=cancel,
+                        ask_model=self._ask_hook_model, cancel=cancel,
                     )
                     if isinstance(decision, str):
                         return ToolResult(tool_call.id, ok=False, error=decision)
@@ -511,6 +517,8 @@ class ApiAgent:
         run_ref = new_run_ref(self._agent_ref.agent_id, parent_run_id)
         event_sink = events if events is not None else self._events
         conversation = list(messages)
+        if self._tool_search is not None:
+            self._tool_search.restore_messages(conversation)
         response: ModelResponse | None = None
         usage_by_model: dict[str, UsageTotals] = {}
         budget_state = (
@@ -762,45 +770,23 @@ class ApiAgent:
 
         def request_response(turn_ref: TurnRef) -> str:
             nonlocal response, model, effort
-            from symphonai_api.models import ImageBlock, TextBlock
             for request_attempt in range(2):
                 request_tools = self._tool_schemas
                 if self._tool_search is not None:
-                    if self._tool_schemas is not self._last_request_schemas:
-                        self._all_tool_schemas = self._tool_schemas
-                    self._tool_search.restore_messages(conversation)
                     context_budget = (self._context_budget(model) if self._context_budget is not None
                                       else budget_for_model(self._provider.wire_format, model))
                     request_tools = self._tool_search.request_schemas(
-                        self._all_tool_schemas, self._provider.wire_format, context_budget,
+                        self._tool_schemas, self._provider.wire_format, context_budget,
                     )
-                    self._tool_schemas = self._last_request_schemas = request_tools
                     if self._tool_search.active:
                         self._tools["search_tools"] = self._tool_search
                     else:
                         self._tools.pop("search_tools", None)
                 compact_for_request(turn_ref)
-                request_messages = list(conversation)
+                request_messages = _limit_images(conversation)
                 if self._tool_search is not None and self._tool_search.active:
                     request_messages.insert(0, Message(Role.SYSTEM,
                         "More MCP tools are available; use search_tools to find and load them."))
-                remaining_images = 5
-                for index in range(len(request_messages) - 1, -1, -1):
-                    message = request_messages[index]
-                    content = list(message.content)
-                    changed = False
-                    for block_index in range(len(content) - 1, -1, -1):
-                        if not isinstance(content[block_index], ImageBlock):
-                            continue
-                        if remaining_images:
-                            remaining_images -= 1
-                        else:
-                            content[block_index] = TextBlock(
-                                "[an earlier image was removed from context; ask the person to attach it again if you need it]"
-                            )
-                            changed = True
-                    if changed:
-                        request_messages[index] = replace(message, content=content)
                 request = ModelRequest(
                     messages=request_messages,
                     model=model,
@@ -1287,9 +1273,7 @@ class ApiAgent:
                             session_id=None if transcript_path is None else transcript_path.parent.name,
                             final_text=response.message.text, turns_used=provider_calls,
                             stop_continues=stop_continues,
-                            ask_model=lambda prompt, token, provider=self._provider, hook_model=self._previous_answering_model or model: provider.create_response(ModelRequest(
-                                messages=[Message(Role.USER, prompt)], model=hook_model, effort="low",
-                            ), cancel=token), cancel=cancel,
+                            ask_model=self._ask_hook_model, cancel=cancel,
                         )
                         if reason is not None:
                             if stop_continues < 3 and (self._max_turns is None or turn < self._max_turns):

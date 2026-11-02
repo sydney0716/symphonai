@@ -57,6 +57,10 @@ class SearchTools(LocalTool):
         self.loaded = set()
         self.active = False
         self.available = set(tools)
+        self._restored = False
+        self._cache_key = None
+        self._cache_source = None
+        self._cached_schemas = []
         if history is not None and history.is_file():
             records, _ = read_records(history)
             for record in records:
@@ -68,6 +72,8 @@ class SearchTools(LocalTool):
                 if data.get("ok") is True:
                     self._restore_payload(data.get("payload"))
 
+            self._restored = True
+
     def _restore_payload(self, payload):
         if not isinstance(payload, dict) or payload.get("kind") != "tool_search":
             return
@@ -76,18 +82,26 @@ class SearchTools(LocalTool):
                 self.loaded.add(item["name"])
 
     def restore_messages(self, messages):
+        if self._restored:
+            return
+        self._restored = True
         for message in messages:
             if message.tool_result is not None and message.tool_result.ok:
                 self._restore_payload(message.tool_result.payload)
 
     def request_schemas(self, schemas, wire_format, budget):
+        key = (wire_format, budget, frozenset(self.loaded))
+        if self._cache_source is schemas and self._cache_key == key:
+            return self._cached_schemas
+        self._cache_source, self._cache_key = schemas, key
         schemas = [schema for schema in schemas if schema_name(schema) != self.name]
         deferred = [schema for schema in schemas if schema_name(schema) in self.tools]
         self.available = {schema_name(schema) for schema in deferred}
         self.active = bool(deferred) and (len(deferred) > 40 or estimate_text_tokens(json.dumps(deferred, ensure_ascii=False)) > budget * .1)
-        if not self.active:
-            return schemas
-        return [schema for schema in schemas if schema_name(schema) not in self.tools or schema_name(schema) in self.loaded] + [to_provider_tool_schema(self, wire_format)]
+        self._cached_schemas = schemas if not self.active else [
+            schema for schema in schemas if schema_name(schema) not in self.tools or schema_name(schema) in self.loaded
+        ] + [to_provider_tool_schema(self, wire_format)]
+        return self._cached_schemas
 
     def metadata(self, arguments):
         return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=False, paths=())

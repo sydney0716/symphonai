@@ -12,12 +12,12 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import subprocess
 import threading
 import time
 from typing import Any
 
+from symphonai_api.process import stop_process_group
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 
 
@@ -300,14 +300,7 @@ class LspClient:
                 self._send({"jsonrpc": "2.0", "method": "exit", "params": {}})
             except LspError:
                 pass
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-                self.process.wait(timeout=0.2)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                except OSError:
-                    self.process.kill()
+            stop_process_group(self.process, self.process.pid)
         if threading.current_thread() is not self._reader:
             self._reader.join(timeout=0.5)
 

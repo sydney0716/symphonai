@@ -156,6 +156,7 @@ class LoopChanged(Event):
 class TerminalOutput(Event):
     terminal_id: str = ""
     data: str = ""
+    offset: int = 0
     exited: bool = False
     exit_code: int | None = None
 
@@ -319,6 +320,7 @@ class HostRun:
         project_grants_root: Path | None = None,
         extensions: Extensions | None = None,
         mcp_tools: Mapping[str, LocalTool] | None = None,
+        mcp_pool=None,
         mcp_instructions: tuple[tuple[str, str], ...] = (),
         price_table: PriceTable | None = None,
         chat_token_budget: int | None = None,
@@ -444,6 +446,7 @@ class HostRun:
             else getattr(extensions, "hook_runner", lambda **_: None)(cwd=policy.repo_root)
         )
         self._mcp_tools = mcp_tools
+        self.mcp_pool = mcp_pool
         self._mcp_instructions = tuple(mcp_instructions)
         self._lsp = lsp
         self._restricted_tool_names: frozenset[str] | None = None
@@ -504,14 +507,17 @@ class HostRun:
         )
 
     def restart_mcp(self, server: str) -> None:
-        pool = getattr(self, "_mcp_pool", None)
+        pool = self.mcp_pool
         if pool is None:
             raise ValueError("MCP is unavailable")
         with self._lock:
             if self._closing:
                 raise ValueError("Project is closing")
-            tools = pool.start(server)
-            tools.update(pool.resource_tools)
+        tools = pool.start(server)
+        tools.update(pool.resource_tools)
+        with self._lock:
+            if self._closing:
+                raise ValueError("Project is closing")
             self._mcp_tools = tools
             self._mcp_instructions = pool.instructions
 
@@ -1879,14 +1885,7 @@ class HostRun:
         )
         if tool_restriction is not None:
             selected = set(tool_restriction)
-            leader._agent._tools = {
-                name: tool for name, tool in leader._agent._tools.items()
-                if name in selected
-            }
-            leader._agent._tool_schemas = [
-                schema for schema in leader._agent._tool_schemas
-                if _schema_tool_name(schema) in selected
-            ]
+            leader._agent.restrict_tools(selected)
             leader._leader_spec = replace(
                 leader._leader_spec,
                 tool_names=tuple(name for name in leader._leader_spec.tool_names if name in selected),

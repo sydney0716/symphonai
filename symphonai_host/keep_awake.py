@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
 import shutil
-import signal
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
+
+from symphonai_api.process import stop_process_group
 
 _LOG = logging.getLogger(__name__)
 _lock = threading.Lock()
@@ -26,23 +26,7 @@ def _stop_process() -> None:
     process, _process = _process, None
     if process is None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=0.5)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    # The inhibitor wrapper can exit before its sleep child does.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    try:
-        process.wait(timeout=0.5)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    stop_process_group(process, process.pid, timeout=0.5)
 
 
 def _commands() -> list[list[str]]:

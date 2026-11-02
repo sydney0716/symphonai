@@ -56,7 +56,7 @@ fields on a known event are ignored for forward compatibility.
 | `BackgroundUsageRecorded` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `session_id: str` |
 | `JobChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `job_id: str`, `status: str`, `session_id: str | null` |
 | `LoopChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `loop_id: str`, `state: str`, `change: str`, `card_id: str`, `reason: str` |
-| `TerminalOutput` | `terminal_id: str`, `data: str`, `exited: bool`, `exit_code: int | null`, plus inherited event fields; ordered per terminal and independent of conversations |
+| `TerminalOutput` | `terminal_id: str`, `data: str`, `offset: int`, `exited: bool`, `exit_code: int | null`, plus inherited event fields; ordered per terminal and independent of conversations |
 | `FilesChanged` | `agent_id: str`, `run_id: str`, `turn_id: str | null`, `schema_version: int`, `paths: list[str]`, `truncated: bool` |
 
 `target` is a bounded display string derived from the call, not the argument
@@ -826,3 +826,11 @@ explicit values appear as `power.keep_awake` in Settings' existing config rows.
 Configuration is read when the project starts. Host activity is polled every ten
 seconds; approval waiting alone is idle. Headless run/loop commands hold through
 completion. This prevents idle sleep, not lid closure, shutdown or quitting.
+
+Terminal snapshots include `end`, the total Unicode code-point count read so far,
+including output trimmed from the 200,000-character scrollback. Each
+`TerminalOutput` includes `offset`, the count before that event's `data`.
+Reattach writes saved output, then only buffered event data past the snapshot's
+`end`; identical repeated text is not used to infer overlap. Output events are
+coalesced with at least 30 ms between publications. Input arriving while a
+terminal input request is in flight is batched into the next request.

@@ -12,7 +12,7 @@ import { COMMANDS, matchCommands } from "./commands.js";
 import keymapDefaults from "../keys.default.json" with { type: "json" };
 import { lookup, mergeKeymap, parseKeymap } from "./keys.js";
 import { createPicker } from "./picker.js";
-import { renderSettingsSection, renderMemorySettings, renderPermissionSettings } from "./settings.js";
+import { EDITOR_KEY, renderSettingsSection, renderMemorySettings, renderPermissionSettings } from "./settings.js";
 import { createTranscript } from "./transcript.js";
 import { createTurnState, DISPATCHING, RUNNING } from "./turn.js";
 
@@ -137,6 +137,7 @@ function clientFor(global, supplied) {
 
 const ROUTE_KEY = "symphonai.route";
 const RAIL_KEY = "symphonai.rail-tools";
+const TERMINAL_PANEL_KEY = "symphonai.terminal-panel";
 const DIFF_MODE_KEY = "symphonai.diff-mode";
 const SIDEBAR_SESSION_LIMIT = 200;
 const RAIL_TOOL_NAMES = ["Agents", "Roadmap", "Changes", "Files", "Jobs", "Loop", "Notes"];
@@ -363,6 +364,7 @@ export async function start({ global, document, client }) {
   let healthReply;
   let conversationReply = { conversation: null };
   let initialProjects = { recent: [] };
+  let mcpReply = { prompts: [] };
   if (projectless) {
     [settingsReply, healthReply, initialProjects] = await Promise.all([
       boundary.settings(),
@@ -370,13 +372,14 @@ export async function start({ global, document, client }) {
       (boundary.projects?.() ?? Promise.resolve({ recent: [] })).catch(() => ({ recent: [] })),
     ]);
   } else {
-    [initialSessions, initialArchivedSessions, initialRoadmap, settingsReply, healthReply, conversationReply] = await Promise.all([
+    [initialSessions, initialArchivedSessions, initialRoadmap, settingsReply, healthReply, conversationReply, mcpReply] = await Promise.all([
       boundary.sessions(SIDEBAR_SESSION_LIMIT),
       boundary.sessions(SIDEBAR_SESSION_LIMIT, undefined, true),
       readRoadmap(),
       boundary.settings(),
       boundary.health().catch(() => null),
       boundary.conversationStats().catch(() => ({ conversation: null })),
+      (boundary.mcpPrompts?.() ?? Promise.resolve({ prompts: [] })).catch(() => ({ prompts: [] })),
     ]);
   }
   const providerRows = (settingsReply?.settings?.providers ?? []).map((row) => ({ ...row }));
@@ -392,7 +395,6 @@ export async function start({ global, document, client }) {
       }));
   };
   let skillCommands = getSkillCommands(settingsReply);
-  const mcpReply = await (boundary.mcpPrompts?.() ?? Promise.resolve({ prompts: [] })).catch(() => ({ prompts: [] }));
   const mcpCommands = (Array.isArray(mcpReply?.prompts) ? mcpReply.prompts : []).map((prompt) => ({
     name: `mcp.${prompt.server}.${prompt.name}`, aliases: [], description: prompt.description || "MCP prompt",
     argumentHint: (prompt.arguments || []).map((argument) => `${argument.required ? "<" : "["}${argument.name}${argument.required ? ">" : "]"}`).join(" "),
@@ -691,7 +693,7 @@ export async function start({ global, document, client }) {
   let changesDirty = false;
   function editorFileLink(path, line = 1) {
     let scheme;
-    try { scheme = global.localStorage?.getItem("symphonai.editor"); }
+    try { scheme = global.localStorage?.getItem(EDITOR_KEY); }
     catch { return null; }
     const label = new Map([["vscode", "VS Code"], ["cursor", "Cursor"], ["zed", "Zed"]]).get(scheme);
     if (!label || typeof project?.repo_root !== "string") return null;
@@ -706,7 +708,7 @@ export async function start({ global, document, client }) {
     return link;
   }
 
-  global.addEventListener?.("symphonai.editor", () => {
+  global.addEventListener?.(EDITOR_KEY, () => {
     renderFiles();
     if (selectedRailTool === "Changes" || route.page === "changes") void showChanges();
   });
@@ -851,7 +853,8 @@ export async function start({ global, document, client }) {
           if (loadingDiff) return loadingDiff;
           diff.textContent = "Loading diff…";
           loadingDiff = Promise.resolve().then(() => boundary.gitDiff(file.path)).then((result) => {
-            if (editorLink) editorLink.href = editorLink.href.replace(/:\d+:1$/, `:${firstChangedLine(result.diff ?? "")}:1`);
+            const updatedLink = editorFileLink(file.path, firstChangedLine(result.diff ?? ""));
+            if (editorLink && updatedLink) editorLink.href = updatedLink.href;
             diffLoaded = true;
             row.replaceChildren(summary, diffView(result.diff ?? ""));
             return true;
@@ -1021,7 +1024,7 @@ export async function start({ global, document, client }) {
   let terminalOpen = false, terminalHeight = 280, terminalLoading = false, terminalSelected = null;
   let terminalNumber = 0;
   try {
-    const saved = JSON.parse(global.localStorage?.getItem("symphonai.terminal-panel") ?? "null");
+    const saved = JSON.parse(global.localStorage?.getItem(TERMINAL_PANEL_KEY) ?? "null");
     terminalOpen = saved?.open === true;
     if (Number.isFinite(saved?.height)) terminalHeight = saved.height;
   } catch {
@@ -1031,17 +1034,18 @@ export async function start({ global, document, client }) {
 
   function saveTerminalPanel() {
     try {
-      global.localStorage?.setItem("symphonai.terminal-panel", JSON.stringify({ open: terminalOpen, height: terminalHeight }));
+      global.localStorage?.setItem(TERMINAL_PANEL_KEY, JSON.stringify({ open: terminalOpen, height: terminalHeight }));
     } catch {
       // Storage is optional in embedded and privacy-restricted browsers.
     }
   }
 
   function sizeTerminalPanel(height = terminalHeight) {
-    terminalHeight = Math.max(120, Math.min(height, Math.max(120, (global.innerHeight || 800) * 0.8)));
+    const maximum = Math.max(120, (global.innerHeight || 800) * 0.8);
+    terminalHeight = Math.max(120, Math.min(height, maximum));
     terminalPanel.setAttribute("style", `height: ${terminalHeight}px`);
     terminalResizeHandle.setAttribute("aria-valuemin", "120");
-    terminalResizeHandle.setAttribute("aria-valuemax", String(Math.max(120, (global.innerHeight || 800) * 0.8)));
+    terminalResizeHandle.setAttribute("aria-valuemax", String(maximum));
     terminalResizeHandle.setAttribute("aria-valuenow", String(terminalHeight));
   }
 
@@ -1115,7 +1119,7 @@ export async function start({ global, document, client }) {
     const fit = new global.FitAddon.FitAddon();
     terminal.loadAddon(fit);
     terminal.open(view);
-    const session = { id: saved.id, number: ++terminalNumber, terminal, fit, view, exited: false, writes: Promise.resolve() };
+    const session = { id: saved.id, number: ++terminalNumber, terminal, fit, view, exited: false, end: saved.end ?? Array.from(saved.output || "").length, pendingInput: "", inputInFlight: false };
     terminalSessions.set(saved.id, session);
     terminal.attachCustomKeyEventHandler((event) => {
       event.stopPropagation();
@@ -1127,33 +1131,30 @@ export async function start({ global, document, client }) {
       return true;
     });
     let replaying = true;
+    async function sendInput() {
+      session.inputInFlight = true;
+      try {
+        while (session.pendingInput && !session.exited) {
+          const data = session.pendingInput;
+          session.pendingInput = "";
+          try { await boundary.terminalInput(session.id, data); }
+          catch (error) { terminalError.textContent = errorText(error); }
+        }
+      } finally { session.inputInFlight = false; }
+    }
     terminal.onData((data) => {
       if (replaying || session.exited) return;
-      session.writes = session.writes.then(() => boundary.terminalInput(session.id, data)).catch((error) => {
-        terminalError.textContent = errorText(error);
-      });
+      session.pendingInput += data;
+      if (!session.inputInFlight) void sendInput();
     });
     let replay = saved.output || "";
-    const pending = terminalPending.get(saved.id);
+    const pending = terminalPending.get(saved.id) || [];
     terminalPending.delete(saved.id);
-    if (pending) {
-      // Reconcile buffered events with the saved output fetched during attach.
-      const prefix = new Array(pending.data.length).fill(0);
-      for (let i = 1, matched = 0; i < pending.data.length; i++) {
-        while (matched && pending.data[i] !== pending.data[matched]) matched = prefix[matched - 1];
-        if (pending.data[i] === pending.data[matched]) matched++;
-        prefix[i] = matched;
-      }
-      const output = saved.output || "";
-      let overlap = output.includes(pending.data) ? pending.data.length : 0;
-      for (let i = 0; overlap !== pending.data.length && i < output.length; i++) {
-        while (overlap && output[i] !== pending.data[overlap]) overlap = prefix[overlap - 1];
-        if (output[i] === pending.data[overlap]) overlap++;
-      }
-      replay += pending.data.slice(overlap);
-      if (pending.exited) {
+    for (const payload of pending) {
+      replay += unseenTerminalOutput(session, payload);
+      if (payload.exited) {
         session.exited = true;
-        replay += `\r\n[exited ${pending.exit_code}]\r\n`;
+        replay += `\r\n[exited ${payload.exit_code}]\r\n`;
       }
     }
     // Query replies and keystrokes are both stale until replay parsing ends.
@@ -1163,16 +1164,26 @@ export async function start({ global, document, client }) {
     return session;
   }
 
+  function unseenTerminalOutput(session, payload) {
+    const offset = payload.offset ?? session.end;
+    const length = Array.from(payload.data).length;
+    const skipped = Math.max(0, session.end - offset);
+    session.end = Math.max(session.end, offset + length);
+    if (skipped >= length) return "";
+    return skipped ? Array.from(payload.data).slice(skipped).join("") : payload.data;
+  }
+
   function terminalOutput(payload) {
     const session = terminalSessions.get(payload.terminal_id);
     if (!session) {
       if (terminalLoading) {
-        const previous = terminalPending.get(payload.terminal_id)?.data || "";
-        terminalPending.set(payload.terminal_id, { ...payload, data: (previous + payload.data).slice(-200000) });
+        const pending = terminalPending.get(payload.terminal_id) || [];
+        pending.push(payload);
+        terminalPending.set(payload.terminal_id, pending);
       }
       return;
     }
-    session.terminal.write(payload.data);
+    session.terminal.write(unseenTerminalOutput(session, payload));
     if (payload.exited) {
       session.exited = true;
       session.terminal.write(`\r\n[exited ${payload.exit_code}]\r\n`);
@@ -1198,6 +1209,7 @@ export async function start({ global, document, client }) {
   async function closeTerminal(session) {
     try { await boundary.terminalStop(session.id); }
     catch (error) { terminalError.textContent = errorText(error); return; }
+    session.exited = true;
     session.terminal.dispose(); session.view.remove();
     terminalSessions.delete(session.id);
     if (terminalSelected === session.id) terminalSelected = terminalSessions.keys().next().value ?? null;
@@ -3890,9 +3902,7 @@ export async function start({ global, document, client }) {
         await toggleTerminal();
         return;
       }
-      for (let node = event.target; node; node = node.parentNode) {
-        if (node === terminalPanel) return;
-      }
+      if (terminalPanel.contains(event.target)) return;
       if (!quickOpenState && lookup(keymap, event, { platform }) === "quick-open") {
         event.preventDefault();
         openQuickOpen();
@@ -4951,7 +4961,7 @@ export async function start({ global, document, client }) {
           }
           if (text.slice(end).trim()) valid = false;
         }
-        if (!valid || declared.some((argument) => argument.required && !values[argument.name]) || Object.keys(values).some((key) => !declared.some((argument) => argument.name === key))) {
+        if (!valid) {
           answerCommand(`Usage: /${mcp.name} ${mcp.argumentHint}`);
           input.value = `/${mcp.name} `;
           input.focus();
