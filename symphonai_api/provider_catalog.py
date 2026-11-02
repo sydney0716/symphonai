@@ -69,26 +69,22 @@ CATALOG: dict[str, CatalogEntry] = {
         label="xAI Grok",
         base_url="https://api.x.ai/v1",
         api_key_env_var="XAI_API_KEY",
-        default_model="grok-4.5",
+        default_model="grok-4.7",
         notes=(
-            "xAI's OpenAI-compatible surface. base_url confirmed identical in "
-            "opencodex's registry; default model raised from grok-4 to grok-4.5 "
-            "to match what that registry currently ships."
+            "Checked 2026-11-02: xAI's OpenAI-compatible surface lists grok-4.7; "
+            "grok-build-0.1 is the cheaper coding model."
         ),
     ),
     "kimi": CatalogEntry(
         key="kimi",
         label="Moonshot Kimi",
-        base_url="https://api.moonshot.cn/v1",
+        base_url="https://api.moonshot.ai/v1",
         api_key_env_var="MOONSHOT_API_KEY",
-        default_model="moonshot-v1-8k",
+        default_model="kimi-k2.7-code",
         notes=(
-            "Moonshot AI. There is also a .ai international endpoint; check which "
-            "your key is for. DIVERGENCE: opencodex uses "
-            "'https://api.kimi.com/coding/v1' with model 'kimi-k2.7-code'. That "
-            "path is specific to Kimi's coding subscription, so it is deliberately "
-            "not adopted as the general default here -- a plain Moonshot API key "
-            "would likely fail against it. Switch to it if you hold a coding plan."
+            "Checked 2026-11-02: Moonshot's international platform uses "
+            "https://api.moonshot.ai/v1 with kimi-k2.7-code. The .cn endpoint "
+            "is for keys from the China platform."
         ),
     ),
     "deepseek": CatalogEntry(
@@ -96,13 +92,11 @@ CATALOG: dict[str, CatalogEntry] = {
         label="DeepSeek",
         base_url="https://api.deepseek.com/v1",
         api_key_env_var="DEEPSEEK_API_KEY",
-        default_model="deepseek-chat",
+        default_model="deepseek-flash",
         notes=(
-            "opencodex uses the bare 'https://api.deepseek.com'; DeepSeek documents "
-            "both that and the '/v1' form as valid for OpenAI compatibility, so the "
-            "explicit '/v1' is kept here. 'deepseek-chat' is a rolling alias for "
-            "their current chat model and is preferred over opencodex's pinned "
-            "'deepseek-v4-flash' so it cannot go stale."
+            "Checked 2026-11-02: DeepSeek's /models lists deepseek-flash and "
+            "deepseek-v4-pro, the larger model. The OpenAI-compatible /v1 "
+            "base URL is unchanged."
         ),
     ),
     "qwen": CatalogEntry(

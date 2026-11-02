@@ -349,17 +349,33 @@ def transient_status_retries_within_deadline():
                 assert 0 < timeouts[1] <= timeouts[0] <= 10
 
 
-@check("vendors.background_overload_is_not_retried")
-def background_overload_is_not_retried():
-    for kind in ("anthropic", "openai", "chat", "gemini"):
+@check("vendors.background_retries_rate_limits_not_overload")
+def background_retries_rate_limits_not_overload():
+    for kind, value in (("anthropic", anthropic()), ("openai", responses()), ("chat", chat()), ("gemini", gemini())):
         for stream in (False, True):
-            with exchange(error(429, "overloaded")) as (bodies, _, _):
-                try:
-                    invoke(provider(kind), ModelRequest([USER], call_class=CallClass.BACKGROUND), stream=stream)
-                except ProviderError:
-                    assert len(bodies) == 1
-                else:
-                    raise AssertionError("background overload accepted")
+            request = ModelRequest([USER], call_class=CallClass.BACKGROUND)
+            limited = error(429, "request reached organization max RPM")
+            limited.headers["Retry-After"] = "0"
+            with exchange(limited, streamed(kind, value) if stream else value) as (bodies, _, _):
+                result = invoke(provider(kind), request, stream=stream)
+                assert result.message.text == "answer" and len(bodies) == 2
+            for status, message in ((529, "overloaded"), (503, "model overloaded"),
+                                    (503, "model unavailable"), (429, "request reached organization max RPM")):
+                failure = error(status, message)
+                if status == 429:
+                    failure.headers["Retry-After"] = "120"
+                with exchange(failure) as (bodies, _, _), mock.patch("time.sleep") as sleep:
+                    try:
+                        invoke(provider(kind), request, stream=stream)
+                    except ProviderError as exc:
+                        assert len(bodies) == 1
+                        sleep.assert_not_called()
+                        if status == 429:
+                            assert message in str(exc)
+                        else:
+                            assert "did not retry" in str(exc)
+                    else:
+                        raise AssertionError("background overload or long rate-limit wait accepted")
 
 
 @check("vendors.context_length_errors_keep_token_counts")

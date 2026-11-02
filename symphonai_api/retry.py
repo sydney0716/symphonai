@@ -26,7 +26,7 @@ RETRY_BASE_SECONDS = 0.5
 MAX_RETRY_DELAY_SECONDS = 32.0
 MAX_RETRY_AFTER_SECONDS = 120.0
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 529})
-OVERLOAD_STATUS_CODES = frozenset({429, 529})
+OVERLOAD_STATUS_CODES = frozenset({529})
 FALLBACK_OVERLOAD_MAX_ATTEMPTS = 3
 NON_RETRYABLE_SERVER_STATUS_CODES = frozenset({501, 505, 511})
 MAX_ERROR_DETAIL_BYTES = 500
@@ -120,7 +120,13 @@ def read_with_retry(
                     actual_tokens=actual_tokens,
                     limit_tokens=limit_tokens,
                 ) from None
-            if exc.code in OVERLOAD_STATUS_CODES and call_class is CallClass.BACKGROUND:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if exc.code == 429:
+                retry_after = rate_limit_retry_after(retry_after, detail)
+            overloaded = exc.code in OVERLOAD_STATUS_CODES or (
+                exc.code == 503 and re.search(r"overloaded|unavailable", detail, re.IGNORECASE)
+            )
+            if overloaded and call_class is CallClass.BACKGROUND:
                 attempt_text = (
                     "the first attempt" if attempt == 1 else f"attempt {attempt}"
                 )
@@ -130,13 +136,13 @@ def read_with_retry(
                 ) from None
             retryable_status = is_retryable_status(exc.code)
             retry_attempts = max_attempts
-            if fallback_configured and exc.code in OVERLOAD_STATUS_CODES:
+            if fallback_configured and exc.code in (429, 529):
                 retry_attempts = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
             if retryable_status and wait_before_retry(
                 attempt=attempt,
                 max_attempts=retry_attempts,
                 deadline=deadline,
-                retry_after=exc.headers.get("Retry-After") if exc.headers else None,
+                retry_after=retry_after,
                 cancel=cancel,
             ):
                 continue
@@ -144,6 +150,8 @@ def read_with_retry(
                 f"{operation} returned HTTP {exc.code} after "
                 f"{_attempt_label(attempt)}: {detail}"
             )
+            if exc.code == 429:
+                message = f"{operation} rate limit persisted after {_attempt_label(attempt)}: {detail}"
             if retryable_status:
                 raise ProviderUnavailableError(message, status=exc.code) from None
             raise ProviderError(message) from None
@@ -249,6 +257,18 @@ def is_retryable_url_error(exc: urllib.error.URLError) -> bool:
     # resolver failures are commonly transient, so retry them within the same
     # overall deadline rather than classifying them as permanent.
     return True
+
+
+def rate_limit_retry_after(retry_after: str | None, detail: str) -> str | None:
+    """Resolve the vendor's rate-limit wait and reject waits over one minute."""
+    if retry_after is None:
+        match = re.search(r"try again after\s+(\d+(?:\.\d+)?)\s+seconds?", detail, re.IGNORECASE)
+        if match:
+            retry_after = match.group(1)
+    delay = _retry_after_delay(retry_after) if retry_after is not None else None
+    if delay is not None and delay > 60:
+        raise ProviderError(f"rate limit requires a wait over 60 seconds: {detail}") from None
+    return retry_after
 
 
 def wait_before_retry(
