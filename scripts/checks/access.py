@@ -344,3 +344,25 @@ def patch_preflights_every_path():
             assert not result.ok and denied in result.error
             assert first.read_text() == 'before\n'
             assert not (ws.outside/'outside.txt').exists()
+
+
+@check('access.mcp_credentials_are_private_to_the_host')
+def mcp_credentials_are_private_to_the_host():
+    with workspace() as ws:
+        default_home = ws.root / 'default-home'
+        configured = ws.root / 'configured-home'
+        with mock.patch('pathlib.Path.home', return_value=default_home), mock.patch.dict(os.environ, {'SYMPHONAI_HOME': str(configured)}):
+            targets = [default_home / '.symphonai' / 'credentials', configured / 'credentials']
+            policy = shell_policy(ws, forbidden_patterns=(), sandbox_readable=('credentials',), shell_sandbox=True)
+            for directory in targets:
+                directory.mkdir(parents=True)
+                path = directory / 'mcp-scripted.json'
+                path.write_text('fixture-secret-do-not-read')
+                assert not execute(ws, 'read_file', {'path': str(path)}, policy).ok
+                assert not execute(ws, 'write_file', {'path': str(path), 'content': 'replacement'}, policy).ok
+            if not shell.sandbox_available():
+                skip('platform shell sandbox is unavailable')
+            for directory in targets:
+                result = run_shell(ws, ['cat', str(directory / 'mcp-scripted.json')], policy)
+                assert not result.ok
+                assert 'fixture-secret-do-not-read' not in result.content

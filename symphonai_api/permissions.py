@@ -732,6 +732,13 @@ class PermissionPolicy:
         return None
 
     def check_read(self, path: str | Path) -> PermissionDecision:
+        from symphonai_api.mcp_auth import credential_directories
+
+        candidate = Path(path)
+        candidate = (candidate if candidate.is_absolute() else self.repo_root / candidate).resolve()
+        if any(candidate == folder or folder in candidate.parents for folder in credential_directories()):
+            return self._deny("SymphonAI credentials are private", denial=DenialReason.FORBIDDEN_PATTERN,
+                              tool_name="read_file")
         resolved = self._resolve_within_root(path)
         if resolved is None:
             return self._deny(

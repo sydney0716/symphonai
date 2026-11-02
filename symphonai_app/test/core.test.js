@@ -364,6 +364,48 @@ test("Terminal focus isolates shortcuts and the panel height stays within its bo
   assert.equal(document.activeElement, document.getElementById("prompt"));
 });
 
+test("MCP slash prompts show required arguments and submit rendered text", async () => {
+  for (const multiple of [false, true]) {
+    const document = new Document();
+    const script = scriptedClient();
+    const calls = [];
+    const arguments_ = multiple
+      ? [{ name: "topic", required: true }, { name: "style", required: true }]
+      : [{ name: "topic", required: true }];
+    script.client.mcpPrompts = async () => ({ prompts: [{ server: "fixture", name: "explain",
+      description: "Explain a topic", arguments: arguments_ }] });
+    script.client.mcpPrompt = async (server, name, arguments_) => {
+      calls.push({ server, name, arguments: arguments_ });
+      return { text: `Explain ${arguments_.topic}${arguments_.style ? ` in ${arguments_.style}` : ""}` };
+    };
+    await start({ global: browser(), document, client: script.client });
+    const input = document.getElementById("prompt");
+    input.value = "/mcp.fixture";
+    await input.dispatch("input");
+    assert.match(document.body.textContent, /mcp.fixture.explain/);
+    assert.match(document.body.textContent, /<topic>/);
+    await submit(document, "/mcp.fixture.explain");
+    assert.deepEqual(script.prompts, []);
+    assert.deepEqual(calls, []);
+    assert.match(document.getElementById("chat").textContent, /Usage: \/mcp.fixture.explain <topic>/);
+    await submit(document, multiple ? '/mcp.fixture.explain topic="async IO" style=detail' : "/mcp.fixture.explain async IO");
+    assert.deepEqual(calls, [{ server: "fixture", name: "explain", arguments: multiple
+      ? { topic: "async IO", style: "detail" } : { topic: "async IO" } }]);
+    assert.deepEqual(script.prompts, [multiple ? "Explain async IO in detail" : "Explain async IO"]);
+  }
+});
+
+test("A tools-only MCP catalog adds no slash commands", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  script.client.mcpPrompts = async () => ({ prompts: [] });
+  await start({ global: browser(), document, client: script.client });
+  const input = document.getElementById("prompt");
+  input.value = "/mcp.";
+  await input.dispatch("input");
+  assert.ok(!find(document.body, (node) => node.className?.startsWith("command-suggestion")));
+});
+
 test("page starts against the scripted client", async () => {
   const document = new Document();
   const script = scriptedClient();

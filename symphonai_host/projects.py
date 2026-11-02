@@ -61,6 +61,7 @@ def build_project(
     lsp = None
     try:
         mcp_tools = pool.start()
+        mcp_tools.update(pool.resource_tools)
         lsp = lsp_factory(extensions.lsp_servers, root=root)
         policy = policy_factory(
             repo_root=root,
@@ -88,6 +89,7 @@ def build_project(
             mcp_instructions=pool.instructions,
             lsp=lsp,
         )
+        run._mcp_pool = pool
         return ProjectRuntime(root, run, pool, lsp)
     except BaseException:
         if lsp is not None:

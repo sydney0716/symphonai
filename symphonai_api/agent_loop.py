@@ -460,15 +460,31 @@ class ApiAgent:
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
             ):
+                hook_note = ""
                 if hooks is not None:
-                    refusal = hooks.pre_tool(tool_call.name, tool_call.id)
-                    if refusal is not None:
-                        return ToolResult(
-                            tool_call_id=tool_call.id,
-                            ok=False,
-                            error=refusal,
-                        )
-                return tool.execute(tool_call, self._policy, cancel=cancel)
+                    from symphonai_api.hooks import HookInput
+                    from symphonai_api.schema_validation import validate_schema
+
+                    decision = hooks.pre_tool(
+                        tool_call.name, tool_call.id, tool_call.arguments, self._agent_ref.name,
+                        ask_model=lambda prompt, token, provider=self._provider, hook_model=self._previous_answering_model or self._provider.model: provider.create_response(ModelRequest(
+                            messages=[Message(Role.USER, prompt)], model=hook_model, effort="low",
+                        ), cancel=token), cancel=cancel,
+                    )
+                    if isinstance(decision, str):
+                        return ToolResult(tool_call.id, ok=False, error=decision)
+                    if isinstance(decision, HookInput):
+                        if decision.updated_by:
+                            error = validate_schema(decision.arguments, tool.parameters, "arguments")
+                            if error is None:
+                                error = tool.validate(decision.arguments)
+                            if error is not None:
+                                return ToolResult(tool_call.id, ok=False,
+                                                  error=f"{decision.updated_by}: invalid updated_input: {error}")
+                            tool_call = replace(tool_call, arguments=decision.arguments)
+                        hook_note = decision.context
+                result = tool.execute(tool_call, self._policy, cancel=cancel)
+                return replace(result, content=result.content + f"\nHook note: {hook_note}") if hook_note else result
         except OperationCancelled:
             raise
         except Exception as exc:
@@ -508,6 +524,7 @@ class ApiAgent:
         )
         turn = 0
         provider_calls = 0
+        stop_continues = 0
         current_turn_ref: TurnRef | None = None
         reported_changes: dict[Path, int | None] = {}
         last_failure: tuple[str, str | None] | None = None
@@ -1260,6 +1277,36 @@ class ApiAgent:
                                     return finish_for_budget(budget_reason)
                             if run.has_redirects():
                                 continue
+                    if (not refused and hooks is not None and exceeded_budget() is None
+                        and (cancel is None or not cancel.cancelled)
+                        and (run is None or redirect_limit is None or turn < redirect_limit)):
+                        writer = getattr(self._transcript, "_writer", self._transcript)
+                        transcript_path = getattr(writer, "path", None)
+                        reason = hooks.stop(
+                            agent_name=self._agent_ref.name,
+                            session_id=None if transcript_path is None else transcript_path.parent.name,
+                            final_text=response.message.text, turns_used=provider_calls,
+                            stop_continues=stop_continues,
+                            ask_model=lambda prompt, token, provider=self._provider, hook_model=self._previous_answering_model or model: provider.create_response(ModelRequest(
+                                messages=[Message(Role.USER, prompt)], model=hook_model, effort="low",
+                            ), cancel=token), cancel=cancel,
+                        )
+                        if reason is not None:
+                            if stop_continues < 3 and (self._max_turns is None or turn < self._max_turns):
+                                stop_continues += 1
+                                append_message(Message(Role.USER, "[Stop hook] " + reason))
+                                continue
+                            if stop_continues >= 3:
+                                note = "\n\n(Stop hook asked to continue; limit of 3 reached)"
+                                response = replace(response, message=replace(
+                                    response.message, content=[*response.message.content, note],
+                                ))
+                                conversation[-1] = response.message
+                                persist_messages(conversation, rewritten=True)
+                                emit(event_sink, AssistantTextDelta(
+                                    agent_id=self._agent_ref.agent_id, run_id=run_ref.run_id,
+                                    turn_id=turn_ref.turn_id, text=note,
+                                ))
                     append_redirects(close=True)
                     return finish_run(response, "refused" if refused else "final_response", turn)
                 run_tools(turn_ref)

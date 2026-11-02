@@ -75,7 +75,7 @@ _CEILING_KEYS = {
     "fetch_allowlist",
     "modes",
 }
-_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles", "compaction", "always_deny")
+_SECTIONS = ("agents", "hooks", "skills", "mcp", "plugins", "trust", "sessions", "budgets", "search", "models", "fallback", "memory", "sandbox", "lsp", "worktree", "permissions", "roles", "compaction", "always_deny", "power")
 _PROVIDER_NAMES = {
     "anthropic", "gemini", "openai", "deepseek", "grok", "groq", "kimi",
     "ollama", "openrouter", "qwen", "together",
@@ -123,6 +123,12 @@ def _strings(source: Path | None, key: str, value: object) -> list[str]:
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
+    power = _table(source, values, "power")
+    if power is not None:
+        _unknown_keys(source, "power", power, {"keep_awake"})
+        if "keep_awake" in power:
+            _boolean(source, "power.keep_awake", power["keep_awake"])
+
     always_deny = _table(source, values, "always_deny")
     if always_deny is not None:
         _unknown_keys(source, "always_deny", always_deny, {

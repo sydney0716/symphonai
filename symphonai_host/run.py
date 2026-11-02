@@ -203,9 +203,6 @@ def _checkpoint_file_bytes(checkpoints: CheckpointStore, path: str) -> bytes | N
 
 PERMISSION_MODES = ("ask", "plan", "allow")
 _LOG = logging.getLogger(__name__)
-_sleep_keeper_lock = threading.Lock()
-_sleep_keeper_holders: set[int] = set()
-_sleep_keeper_process: subprocess.Popen | None = None
 
 
 def _schema_tool_name(schema: dict) -> str | None:
@@ -491,7 +488,6 @@ class HostRun:
         from symphonai_host.spec_loop import LoopController
         self._loop_store = LoopStore(self._repo_root)
         self._loops = LoopController(self, self._loop_store)
-        self._sleep_keeper_released = False
         self._sessions_root = default_sessions_root() if sessions_root is None else Path(sessions_root)
         self._memory_root = default_memory_root() if memory_root is None else Path(memory_root)
         self._memory: AgentMemory | None = None
@@ -501,6 +497,23 @@ class HostRun:
         self._approval_timeout = approval_timeout
         self.approvals = self._new_approval_broker(None)
         self._policy.approval_callback = self.approvals.callback
+        from symphonai_host.keep_awake import KeepAwake
+        self._keep_awake = KeepAwake(
+            enabled=extensions is None or extensions.config.get("power.keep_awake", True),
+            busy=self._keep_awake_busy,
+        )
+
+    def restart_mcp(self, server: str) -> None:
+        pool = getattr(self, "_mcp_pool", None)
+        if pool is None:
+            raise ValueError("MCP is unavailable")
+        with self._lock:
+            if self._closing:
+                raise ValueError("Project is closing")
+            tools = pool.start(server)
+            tools.update(pool.resource_tools)
+            self._mcp_tools = tools
+            self._mcp_instructions = pool.instructions
 
     def _new_approval_broker(self, session_id: str | None) -> ApprovalBroker:
         return ApprovalBroker(
@@ -859,7 +872,6 @@ class HostRun:
             context = GoalCheck(goal, session_id, threading.Event(), leader.agent_ref.agent_id)
             self._goal_check = context
             self._goal_checks_by_session[session_id] = context
-            self._refresh_sleep_prevention()
             thread = threading.Thread(
                 target=self._perform_goal_check,
                 args=(context, ""),
@@ -872,47 +884,6 @@ class HostRun:
 
     def _root_agent_id(self) -> str:
         return "" if self._conversation is None else self._conversation[0].agent_ref.agent_id
-
-    def _refresh_sleep_prevention(self) -> None:
-        global _sleep_keeper_process
-        active = (
-            not self._sleep_keeper_released
-            and bool(self._active_by_session or self._goal_checks_by_session)
-        )
-        supported = sys.platform == "darwin" and os.path.isfile("/usr/bin/caffeinate")
-        with _sleep_keeper_lock:
-            if active and supported:
-                _sleep_keeper_holders.add(id(self))
-            else:
-                _sleep_keeper_holders.discard(id(self))
-            if not supported:
-                return
-            if _sleep_keeper_holders:
-                if _sleep_keeper_process is None or _sleep_keeper_process.poll() is not None:
-                    try:
-                        _sleep_keeper_process = subprocess.Popen(
-                            ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                    except OSError:
-                        _sleep_keeper_process = None
-            elif _sleep_keeper_process is not None:
-                process = _sleep_keeper_process
-                _sleep_keeper_process = None
-                try:
-                    process.terminate()
-                    process.wait(timeout=1)
-                except (OSError, subprocess.SubprocessError):
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-
-    def _release_sleep_prevention(self) -> None:
-        self._sleep_keeper_released = True
-        self._refresh_sleep_prevention()
 
     def _start_for_session(self, session_id: str, prompt: str) -> str:
         return self.start(prompt, _goal_round=True, session_id=session_id)
@@ -1195,13 +1166,26 @@ class HostRun:
             activity = {session_id: "idle" for session_id in self._open_conversations}
             for session_id in self._active_by_session:
                 activity[session_id] = "working"
+            for session_id in self._goal_checks_by_session:
+                activity[session_id] = "working"
             for broker in self._approvals_by_session.values():
                 for approval in broker.pending():
                     if approval.session_id is not None:
                         activity[approval.session_id] = "waiting"
-            for session_id in self._goal_checks_by_session:
-                activity[session_id] = "working"
             return activity
+
+    def _keep_awake_busy(self) -> bool:
+        # Loop cards use conversation sessions; persisted card states can be stale.
+        working = any(state == "working" for state in self.session_activity().values())
+        with self._lock:
+            if self._closing:
+                return False
+            validating = bool(self._loops._loop_validation_cancel)
+            conversations = tuple(self._open_conversations.values())
+        return working or validating or self._person_jobs.has_running() or any(
+            leader.background_jobs is not None and leader.background_jobs.has_running()
+            for leader, _session in conversations
+        )
 
     def has_work_in_flight(self) -> bool:
         with self._lock:
@@ -1571,14 +1555,12 @@ class HostRun:
                 self._goal = goal
                 self._goal_session_id = goal_session_id
             self._active_by_session[session_id] = active
-            self._refresh_sleep_prevention()
             try:
                 thread.start()
             except Exception:
                 if not detached:
                     self._active = None
                 self._active_by_session.pop(session_id, None)
-                self._refresh_sleep_prevention()
                 if _new_goal is not None:
                     self._save_goal(session_id, None)
                     self._goals_by_session.pop(session_id, None)
@@ -2507,9 +2489,9 @@ class HostRun:
 
     def close(self) -> None:
         from symphonai_host.terminal import close_host
-        close_host(self)
         self._closing = True
-        self._release_sleep_prevention()
+        self._keep_awake.close()
+        close_host(self)
         with self._lock:
             active_runs = tuple(self._active_by_session.values())
             approval_brokers = tuple(dict.fromkeys(self._approvals_by_session.values()))
@@ -3297,7 +3279,6 @@ class HostRun:
                     self._goal_check = None
                     self._goal_check_thread = None
                 self._goal_checks_by_session.pop(context.session_id, None)
-                self._refresh_sleep_prevention()
                 self._close_idle_conversations_locked()
                 return
             goal.last_check = result
@@ -3334,7 +3315,6 @@ class HostRun:
                 self._goal_check = None
                 self._goal_check_thread = None
             self._goal_checks_by_session.pop(context.session_id, None)
-            self._refresh_sleep_prevention()
             self._goal_event("check", goal, run_id, context.agent_id)
             if goal.phase in ("complete", "blocked", "paused"):
                 self._loops._finish_spec_run(context.session_id, goal.phase)
@@ -3380,7 +3360,6 @@ class HostRun:
                     and self._active_by_session.get(session_id) is active_to_finish
                 ):
                     self._active_by_session.pop(session_id, None)
-                    self._refresh_sleep_prevention()
                     if self._conversation is not None and self._conversation[1].run_id == session_id:
                         self._active = None
                     if terminal_event is not None:
@@ -3415,7 +3394,6 @@ class HostRun:
                         self._goal_check = context
                         self._goal_check_thread = threading.current_thread()
                     self._goal_checks_by_session[session_id] = context
-                    self._refresh_sleep_prevention()
                     run_check_now = True
                 elif goal.rounds < goal.max_rounds:
                     next_prompt = _unchecked_goal_prompt(goal)

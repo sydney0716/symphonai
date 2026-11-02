@@ -254,6 +254,7 @@ class McpClient:
         self._http_token: str | None = None
         self._http_ready = False
         self.instructions: str | None = None
+        self.capabilities: dict = {}
 
     def start(self) -> None:
         if not self.spec.enabled:
@@ -311,6 +312,10 @@ class McpClient:
                     f"MCP server {self.spec.name!r} returned an invalid initialize result"
                 )
             self._keep_instructions(result)
+            capabilities = result.get("capabilities", {})
+            if not isinstance(capabilities, Mapping):
+                raise McpError("MCP server returned invalid capabilities")
+            self.capabilities = dict(capabilities)
             self._notify("notifications/initialized", {})
         except McpError:
             self.close()
@@ -325,6 +330,9 @@ class McpClient:
                     f"{self.spec.bearer_token_env_var!r}"
                 )
             self._http_token = token
+        else:
+            from symphonai_api.mcp_auth import OAuthSession
+            self._oauth = OAuthSession(self.spec.name, self.spec.url)
         try:
             result = self._request(
                 "initialize",
@@ -341,6 +349,10 @@ class McpClient:
                     f"MCP server {self.spec.name!r} returned an invalid initialize result"
                 )
             self._keep_instructions(result)
+            capabilities = result.get("capabilities", {})
+            if not isinstance(capabilities, Mapping):
+                raise McpError("MCP server returned invalid capabilities")
+            self.capabilities = dict(capabilities)
             version = result.get("protocolVersion")
             if not isinstance(version, str) or not version:
                 raise McpError(
@@ -394,47 +406,55 @@ class McpClient:
                 "method": method,
                 "params": dict(params),
             }
-            request = Request(
-                self.spec.url,
-                data=json.dumps(message, separators=(",", ":")).encode("utf-8"),
-                headers=self._http_headers(),
-                method="POST",
-            )
-            try:
-                with urlopen(request, timeout=timeout) as response:
-                    status = response.status
-                    content_type = response.headers.get_content_type()
-                    body = response.read()
-                    if method == "initialize":
-                        session_id = response.headers.get("Mcp-Session-Id")
-                        if session_id:
-                            self._http_session_id = session_id
-            except HTTPError as exc:
-                self.close()
-                raise McpError(
-                    f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {phase}"
-                ) from None
-            except (TimeoutError, URLError, OSError) as exc:
-                self.close()
-                detail = "timed out" if isinstance(exc, TimeoutError) else "connection failed"
-                if isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError):
-                    detail = "timed out"
-                raise McpError(
-                    f"MCP server {self.spec.name!r} HTTP status unavailable during "
-                    f"{phase}: {detail}"
-                ) from None
-
-            try:
-                return self._decode_http_response(
-                    body,
-                    content_type=content_type,
-                    request_id=request_id,
-                    status=status,
-                    phase=phase,
-                )
-            except McpError:
-                self.close()
-                raise
+            from symphonai_api.mcp_auth import AuthError
+            oauth = getattr(self, "_oauth", None)
+            for attempt in range(2):
+                if oauth is not None:
+                    try:
+                        self._http_token = oauth.access_token(force=attempt == 1)
+                    except AuthError:
+                        self._auth_state = "needs_sign_in"
+                        self.close()
+                        raise McpError(f"MCP server {self.spec.name!r} needs sign-in from the app") from None
+                request = Request(self.spec.url,
+                    data=json.dumps(message, separators=(",", ":")).encode("utf-8"),
+                    headers=self._http_headers(), method="POST")
+                try:
+                    with urlopen(request, timeout=timeout) as response:
+                        status = response.status
+                        content_type = response.headers.get_content_type()
+                        body = response.read()
+                        if method == "initialize":
+                            session_id = response.headers.get("Mcp-Session-Id")
+                            if session_id:
+                                self._http_session_id = session_id
+                except HTTPError as exc:
+                    if exc.code == 401 and oauth is not None:
+                        oauth.challenge = exc.headers.get("WWW-Authenticate", "")
+                        if attempt == 0 and oauth.record.get("refresh_token"):
+                            continue
+                        self._auth_state = "needs_sign_in"
+                        self.close()
+                        raise McpError(f"MCP server {self.spec.name!r} needs sign-in from the app") from None
+                    self._auth_state = "failed"
+                    self.close()
+                    raise McpError(f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {phase}") from None
+                except (TimeoutError, URLError, OSError, ValueError):
+                    self._auth_state = "failed"
+                    self.close()
+                    raise McpError(f"MCP server {self.spec.name!r} connection failed during {phase}") from None
+                try:
+                    result = self._decode_http_response(body, content_type=content_type,
+                        request_id=request_id, status=status, phase=phase)
+                except McpError:
+                    self._auth_state = "failed"
+                    authenticated = bool(self._http_token)
+                    self.close()
+                    if oauth is not None or authenticated:
+                        raise McpError(f"MCP server {self.spec.name!r} returned an invalid response") from None
+                    raise
+                self._auth_state = "started"
+                return result
 
     def _decode_http_response(
         self,
@@ -714,6 +734,53 @@ class McpClient:
             seen.add(adapted.name)
             tools.append(adapted)
         return tuple(tools)
+
+    def list_resources(self, cursor: str | None = None) -> dict:
+        return self._list_catalog("resources", cursor)
+
+    def list_prompts(self, cursor: str | None = None) -> dict:
+        return self._list_catalog("prompts", cursor)
+
+    def _list_catalog(self, kind: str, cursor: str | None) -> dict:
+        if kind not in self.capabilities:
+            raise McpError(f"MCP server {self.spec.name!r} does not offer {kind}")
+        result = self._request(f"{kind}/list", {} if cursor is None else {"cursor": cursor},
+                               timeout=self.spec.call_timeout_seconds, phase=f"{kind}/list")
+        if not isinstance(result, Mapping) or not isinstance(result.get(kind), list):
+            raise McpError(f"MCP server {self.spec.name!r} returned an invalid {kind} list")
+        for entry in result[kind]:
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+                raise McpError(f"MCP server {self.spec.name!r} returned an invalid {kind} entry")
+            if not isinstance(entry.get("description", ""), str):
+                raise McpError("MCP catalog entry has an invalid description")
+            if kind == "resources" and not isinstance(entry.get("uri"), str):
+                raise McpError("MCP resource has no URI")
+            if kind == "prompts":
+                arguments = entry.get("arguments", [])
+                if not isinstance(arguments, list) or any(not isinstance(argument, Mapping)
+                        or not isinstance(argument.get("name"), str)
+                        or not isinstance(argument.get("required", False), bool) for argument in arguments):
+                    raise McpError("MCP prompt has invalid arguments")
+        if result.get("nextCursor") is not None and not isinstance(result["nextCursor"], str):
+            raise McpError("MCP catalog has an invalid cursor")
+        return dict(result)
+
+    def read_resource(self, uri: str) -> dict:
+        if "resources" not in self.capabilities:
+            raise McpError("MCP server does not offer resources")
+        result = self._request("resources/read", {"uri": uri}, timeout=self.spec.call_timeout_seconds, phase="resources/read")
+        if not isinstance(result, Mapping) or not isinstance(result.get("contents"), list):
+            raise McpError("MCP server returned invalid resource contents")
+        return dict(result)
+
+    def get_prompt(self, name: str, arguments: Mapping[str, str]) -> dict:
+        if "prompts" not in self.capabilities:
+            raise McpError("MCP server does not offer prompts")
+        result = self._request("prompts/get", {"name": name, "arguments": dict(arguments)},
+                               timeout=self.spec.call_timeout_seconds, phase="prompts/get")
+        if not isinstance(result, Mapping) or not isinstance(result.get("messages"), list):
+            raise McpError("MCP server returned invalid prompt messages")
+        return dict(result)
 
     def call(self, tool: str, arguments: Mapping[str, object]) -> str:
         result = self._request(

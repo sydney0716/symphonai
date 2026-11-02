@@ -853,3 +853,39 @@ def deferred_mcp_tools_load_execute_and_survive_compaction():
                  tool_schemas=tool_registry_schemas(small_tools, small_provider.wire_format),
                  deferrable_tools=tuple(small_tools)).run([Message(Role.USER, "A small MCP set")])
         assert names(small_provider.requests[0]) == set(small_tools)
+
+
+@check("turns.hook_rewrites_still_validate_and_check_permissions")
+def hook_rewrites_still_validate_and_check_permissions():
+    import json
+
+    with workspace() as ws:
+        for updated in ({"path": ".env"}, {"path": 42}):
+            command = (sys.executable, "-c", "import json,sys; p=json.load(sys.stdin); "
+                       "assert 'arguments' in p and p['agent_name']; "
+                       f"print({json.dumps({'decision': 'allow', 'updated_input': updated})!r})")
+            hooks = HookRunner((HookSpec(("PreToolUse",), command, blocking=True),), cwd=ws.root)
+            result, _ = run_tools(ws, [answer("", call("read_file", path="existing.txt")), answer()], hooks=hooks)
+            refused = results(result)[0]
+            assert not refused.ok
+            if updated["path"] == ".env":
+                assert ".env" in refused.error and "forbidden" in refused.error
+            else:
+                assert sys.executable in refused.error and "updated_input" in refused.error
+
+
+@check("turns.stop_hook_continuation_is_bounded_and_failure_finishes")
+def stop_hook_continuation_is_bounded_and_failure_finishes():
+    with workspace() as ws:
+        command = (sys.executable, "-c", 'print(\'{"decision":"continue","reason":"work remains"}\')')
+        hooks = HookRunner((HookSpec(("Stop",), command, blocking=True),), cwd=ws.root)
+        result, provider = run_tools(ws, [answer("answer") for _ in range(4)], hooks=hooks)
+        assert len(provider.requests) == 4 and result.turns_used == 4
+        assert sum(message.role is Role.USER and message.text.startswith("[Stop hook] ") for message in result.messages) == 3
+        assert "(Stop hook asked to continue; limit of 3 reached)" in result.final_response.message.text
+        assert result.messages[-1] == result.final_response.message
+        timeout = HookSpec(("Stop",), (sys.executable, "-c", "import time; time.sleep(30)"),
+                           blocking=True, timeout_seconds=.01)
+        result, provider = run_tools(ws, [answer("finished")], hooks=HookRunner((timeout,), cwd=ws.root))
+        assert len(provider.requests) == 1 and result.stopped_reason == "final_response"
+        assert result.final_response.message.text == "finished"

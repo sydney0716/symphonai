@@ -392,6 +392,12 @@ export async function start({ global, document, client }) {
       }));
   };
   let skillCommands = getSkillCommands(settingsReply);
+  const mcpReply = await (boundary.mcpPrompts?.() ?? Promise.resolve({ prompts: [] })).catch(() => ({ prompts: [] }));
+  const mcpCommands = (Array.isArray(mcpReply?.prompts) ? mcpReply.prompts : []).map((prompt) => ({
+    name: `mcp.${prompt.server}.${prompt.name}`, aliases: [], description: prompt.description || "MCP prompt",
+    argumentHint: (prompt.arguments || []).map((argument) => `${argument.required ? "<" : "["}${argument.name}${argument.required ? ">" : "]"}`).join(" "),
+    prompt,
+  }));
   const defaultKeymap = parseKeymap(JSON.stringify(keymapDefaults));
   const userKeymap = global.__symphonai?.keys ?? global.keymap ?? userKeymapFile;
   const keymap = mergeKeymap(
@@ -4732,7 +4738,7 @@ export async function start({ global, document, client }) {
   }
 
   function renderCommandMenu() {
-    commandMatches = matchCommands(input.value, skillCommands);
+    commandMatches = matchCommands(input.value, [...skillCommands, ...mcpCommands]);
     highlightedCommand = 0;
     if (commandMatches.length === 0) {
       closeCommandMenu();
@@ -4923,6 +4929,40 @@ export async function start({ global, document, client }) {
     ));
     const args = parts.slice(1);
     if (!entry) {
+      const mcp = mcpCommands.find((candidate) => candidate.name.toLowerCase() === typedName.slice(1).toLowerCase());
+      if (mcp) {
+        const declared = mcp.prompt.arguments || [];
+        const text = command.slice(typedName.length).trim();
+        const values = Object.create(null);
+        let valid = true;
+        if (declared.length === 1 && text) values[declared[0].name] = text;
+        else if (text) {
+          const pairs = /(?:^|\s)([^\s=]+)=("(?:\\.|[^"\\])*"|'[^']*'|[^\s]+)/g;
+          let end = 0;
+          for (const match of text.matchAll(pairs)) {
+            if (text.slice(end, match.index).trim()) valid = false;
+            let value = match[2];
+            try {
+              if (value.startsWith('"')) value = JSON.parse(value);
+              else if (value.startsWith("'")) value = value.slice(1, -1);
+            } catch { valid = false; }
+            values[match[1]] = value;
+            end = match.index + match[0].length;
+          }
+          if (text.slice(end).trim()) valid = false;
+        }
+        if (!valid || declared.some((argument) => argument.required && !values[argument.name]) || Object.keys(values).some((key) => !declared.some((argument) => argument.name === key))) {
+          answerCommand(`Usage: /${mcp.name} ${mcp.argumentHint}`);
+          input.value = `/${mcp.name} `;
+          input.focus();
+          return;
+        }
+        try {
+          const reply = await boundary.mcpPrompt(mcp.prompt.server, mcp.prompt.name, { ...values });
+          await submitCommandPrompt(reply.text);
+        } catch (error) { answerCommand(errorText(error)); }
+        return;
+      }
       const skill = skillCommands.find((candidate) => candidate.name.toLowerCase() === typedName.slice(1).toLowerCase());
       if (skill) {
         const request = command.slice(typedName.length).trim();

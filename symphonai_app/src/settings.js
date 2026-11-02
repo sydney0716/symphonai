@@ -414,16 +414,35 @@ function renderModels(section, context) {
 }
 
 function renderMcp(section, context) {
-  const { document, settingsContent, settingsTable } = context;
-  const rows = serverRows(context.settingsReply).map(({ name, command, started }) => [
-    name, command, started ? "started" : "not started",
-  ]);
-  replace(
-    settingsContent,
-    element(document, "h2", { text: "MCP servers" }),
-    settingsTable(["Server", "Command", "Started"], rows),
-  );
-  return;
+  const { document, global, boundary, settingsContent, settingsTable } = context;
+  const servers = context.settingsReply?.settings?.mcp_servers ?? [];
+  const table = settingsTable(["Server", "Command", "State"], servers.map(({ name, command, state, error, started }) => [
+    name, command, state === "needs_sign_in" ? "needs sign-in" : state === "failed" ? `failed: ${error}` : state || (started ? "started" : "not started"),
+  ]));
+  servers.forEach((server, index) => {
+    if (server.state !== "needs_sign_in") return;
+    const signIn = makeButton(document, "Sign in", async () => {
+      const tab = global.open?.("about:blank", "_blank");
+      if (tab) tab.opener = null;
+      signIn.disabled = true;
+      try {
+        const reply = await boundary.mcpSignIn(server.name);
+        if (tab) tab.location.href = reply.authorization_url;
+        else global.open?.(reply.authorization_url, "_blank", "noopener,noreferrer");
+        global.addEventListener?.("focus", async () => {
+          try {
+            context.settingsReply = await boundary.settings();
+            if (context.route?.page === "settings" && context.route.section === "mcp") renderMcp(section, context);
+          } catch { /* Keep the last server state if refreshing fails. */ }
+        }, { once: true });
+      } catch (error) {
+        tab?.close();
+        append(settingsContent, element(document, "p", { className: "error", text: errorText(error) }));
+      } finally { signIn.disabled = false; }
+    });
+    append(table.children[index + 1].children[2], signIn);
+  });
+  replace(settingsContent, element(document, "h2", { text: "MCP servers" }), table);
 }
 
 function renderRoster(section, context) {

@@ -242,6 +242,7 @@ class HostServer:
         self._home = symphonai_home(home)
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
         self._model_cache_lock = threading.Lock()
+        self._mcp_auth_flows = {}
         self.broker = broker or EventBroker()
         initial_runtime = runtime
         initial_run = None if initial_runtime is None else initial_runtime.run
@@ -1211,6 +1212,83 @@ class HostServer:
                     entries = sorted(({'name': child.name, 'path': str(child)} for child in target.iterdir() if not child.name.startswith('.') and child.is_dir()), key=lambda entry: entry['name'].casefold())
                 return _Reply(HTTPStatus.OK, {'path': str(target), 'parent': None if target == Path('/') else str(target.parent), 'entries': entries})
 
+            def _get_mcp_prompts(self, payload):
+                from symphonai_api.mcp import McpError
+                pool = getattr(host.run, '_mcp_pool', None)
+                try:
+                    return _Reply(HTTPStatus.OK, {'prompts': [] if pool is None else pool.prompts()})
+                except McpError:
+                    return _Reply(HTTPStatus.SERVICE_UNAVAILABLE, {'error': 'Could not list MCP prompts'})
+
+            def _post_mcp_prompt(self, payload):
+                from symphonai_api.mcp import McpError
+                pool = getattr(host.run, '_mcp_pool', None)
+                if pool is None or payload['server'] not in pool.prompt_clients:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Unknown prompt server'})
+                arguments = payload['arguments']
+                if not all(isinstance(key, str) and isinstance(value, str) for key, value in arguments.items()):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Prompt arguments must be strings'})
+                try:
+                    prompt = next((entry for entry in pool.prompts() if entry['server'] == payload['server'] and entry['name'] == payload['name']), None)
+                    if prompt is None:
+                        raise ValueError('Unknown MCP prompt')
+                    declared = prompt.get('arguments', [])
+                    if any(item.get('required') and not arguments.get(item['name']) for item in declared):
+                        raise ValueError('Required prompt argument is missing')
+                    if set(arguments) - {item['name'] for item in declared}:
+                        raise ValueError('Unknown prompt argument')
+                    result = pool.prompt_clients[payload['server']].get_prompt(payload['name'], arguments)
+                    text = []
+                    for message in result['messages']:
+                        content = message.get('content', {})
+                        blocks = content if isinstance(content, list) else [content]
+                        text.extend(block['text'] for block in blocks if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str))
+                    return _Reply(HTTPStatus.OK, {'text': '\n\n'.join(text)})
+                except (McpError, ValueError, KeyError, TypeError, AttributeError):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'Could not render MCP prompt; check its arguments'})
+
+            def _post_mcp_sign_in(self, payload):
+                from symphonai_api.mcp_auth import AuthError
+                run = host.run
+                pool = getattr(run, '_mcp_pool', None)
+                client = None if pool is None else pool.clients.get(payload['server'])
+                oauth = getattr(client, '_oauth', None)
+                if oauth is None:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'This server does not support app sign-in'})
+                try:
+                    url, flow = oauth.begin(f'http://127.0.0.1:{host.port}/mcp/callback')
+                except AuthError as exc:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
+                with host._runtimes_lock:
+                    host._mcp_auth_flows = {state: value for state, value in host._mcp_auth_flows.items()
+                                           if value[0]['expires'] > time.monotonic()}
+                    host._mcp_auth_flows[flow['state']] = (flow, oauth, run)
+                return _Reply(HTTPStatus.OK, {'authorization_url': url})
+
+            def _get_mcp_callback(self, payload):
+                from html import escape
+                from symphonai_api.mcp_auth import AuthError
+                query = parse_qs(urlsplit(self.path).query)
+                with host._runtimes_lock:
+                    pending = host._mcp_auth_flows.pop(query.get('state', [''])[0], None)
+                if pending is None or pending[0]['expires'] <= time.monotonic():
+                    self._bytes(HTTPStatus.BAD_REQUEST, b'Invalid or expired sign-in state.', 'text/html; charset=utf-8')
+                    return
+                flow, oauth, run = pending
+                try:
+                    if 'error' in query:
+                        raise AuthError('Sign-in was refused')
+                    oauth.finish(flow, query.get('code', [''])[0])
+                    run.restart_mcp(oauth.server)
+                    if run._mcp_pool.status(oauth.server)['state'] != 'started':
+                        raise AuthError('MCP server did not start')
+                except (AuthError, ValueError, RuntimeError):
+                    self._bytes(HTTPStatus.BAD_REQUEST, b'Sign-in failed. Please try signing in again.', 'text/html; charset=utf-8')
+                    return
+                message = f'Signed in to {escape(oauth.server)}. You can close this tab.'
+                self._bytes(HTTPStatus.OK, message.encode(), 'text/html; charset=utf-8',
+                            headers=(('Referrer-Policy', 'no-referrer'),))
+
             def _get_settings(self, payload):
                 if host.run is None:
                     selection = host._provider_selection or None
@@ -1234,7 +1312,13 @@ class HostServer:
                 ceiling = None if extensions is None else extensions.ceiling
                 search_key = None if extensions is None else extensions.config.get('search.endpoint')
                 configured_search = None if search_key is None else search_endpoint(search_key)
-                settings = {'mode': host.run.starting_mode, 'selection': host.run.selection(), 'config': [] if extensions is None else [{'key': key, 'value': value, 'scope': extensions.config.provenance[key].scope.value} for key, value in sorted(extensions.config.values.items())], 'ceiling': {'allowed_write_scope': None if ceiling is None or ceiling.allowed_write_scope is None else [str(path) for path in ceiling.allowed_write_scope], 'shell_enabled': None if ceiling is None else ceiling.shell_enabled, 'shell_allowlist': None if ceiling is None or ceiling.shell_allowlist is None else [list(command) for command in ceiling.shell_allowlist], 'fetch_enabled': None if ceiling is None else ceiling.fetch_enabled, 'fetch_allowlist': None if ceiling is None or ceiling.fetch_allowlist is None else list(ceiling.fetch_allowlist), 'modes': None if ceiling is None or ceiling.modes is None else list(ceiling.modes)}, 'trust': [] if extensions is None else [{'root': str(entry.root), 'allow': sorted(entry.allow)} for entry in sorted(extensions.trust.entries, key=lambda entry: str(entry.root))], 'hooks': [] if extensions is None else [{'event': event, 'command': shlex.join(hook.command)} for hook in extensions.hooks for event in hook.events], 'mcp_servers': [] if extensions is None else [{'name': spec.name, 'command': shlex.join(spec.command), 'started': spec.enabled and host.run._mcp_tools is not None} for spec in sorted(extensions.mcp_servers, key=lambda spec: spec.name)], 'agents': roster('agents'), 'skills': roster('skills'), 'plugins': roster('plugins'), 'withheld': [] if extensions is None else [{'scope': offered.scope.value, 'directory': display_directory(offered.directory), 'names': sorted(offered.names), 'reason': f'repository not trusted for {offered.directory.name}'} for offered in sorted(extensions.withheld, key=lambda offered: (offered.scope.value, str(offered.directory)))], 'providers': [{'name': name, 'env_var': variable, 'key_present': bool(os.environ.get(variable, '').strip())} for name, variable, _ in PROVIDERS], 'search': [] if configured_search is None else [{'name': configured_search.key, 'env_var': configured_search.api_key_env_var, 'key_present': bool(os.environ.get(configured_search.api_key_env_var, '').strip())}]}
+                pool = getattr(host.run, '_mcp_pool', None)
+                mcp_rows = []
+                for spec in (() if extensions is None else extensions.mcp_servers):
+                    state = pool.status(spec.name) if pool is not None else {'state': 'disabled', 'error': ''}
+                    mcp_rows.append({'name': spec.name, 'command': spec.url or shlex.join(spec.command),
+                                     'started': state['state'] == 'started', **state})
+                settings = {'mode': host.run.starting_mode, 'selection': host.run.selection(), 'config': [] if extensions is None else [{'key': key, 'value': value, 'scope': extensions.config.provenance[key].scope.value} for key, value in sorted(extensions.config.values.items())], 'ceiling': {'allowed_write_scope': None if ceiling is None or ceiling.allowed_write_scope is None else [str(path) for path in ceiling.allowed_write_scope], 'shell_enabled': None if ceiling is None else ceiling.shell_enabled, 'shell_allowlist': None if ceiling is None or ceiling.shell_allowlist is None else [list(command) for command in ceiling.shell_allowlist], 'fetch_enabled': None if ceiling is None else ceiling.fetch_enabled, 'fetch_allowlist': None if ceiling is None or ceiling.fetch_allowlist is None else list(ceiling.fetch_allowlist), 'modes': None if ceiling is None or ceiling.modes is None else list(ceiling.modes)}, 'trust': [] if extensions is None else [{'root': str(entry.root), 'allow': sorted(entry.allow)} for entry in sorted(extensions.trust.entries, key=lambda entry: str(entry.root))], 'hooks': [] if extensions is None else [{'event': event, 'command': shlex.join(hook.command)} for hook in extensions.hooks for event in hook.events], 'mcp_servers': sorted(mcp_rows, key=lambda row: row['name']), 'agents': roster('agents'), 'skills': roster('skills'), 'plugins': roster('plugins'), 'withheld': [] if extensions is None else [{'scope': offered.scope.value, 'directory': display_directory(offered.directory), 'names': sorted(offered.names), 'reason': f'repository not trusted for {offered.directory.name}'} for offered in sorted(extensions.withheld, key=lambda offered: (offered.scope.value, str(offered.directory)))], 'providers': [{'name': name, 'env_var': variable, 'key_present': bool(os.environ.get(variable, '').strip())} for name, variable, _ in PROVIDERS], 'search': [] if configured_search is None else [{'name': configured_search.key, 'env_var': configured_search.api_key_env_var, 'key_present': bool(os.environ.get(configured_search.api_key_env_var, '').strip())}]}
                 config_warnings = [] if extensions is None else list(extensions.config.warnings)
                 if config_warnings:
                     settings['config_warnings'] = config_warnings
@@ -1782,6 +1866,12 @@ class HostServer:
 
 
         routes = (
+            _Route('GET', '/mcp/prompts', Handler._get_mcp_prompts),
+            _Route('POST', '/mcp/prompt', Handler._post_mcp_prompt,
+                payload=_Payload({'server': str, 'name': str, 'arguments': dict}, ('server', 'name', 'arguments'), extra=False)),
+            _Route('POST', '/mcp/sign-in', Handler._post_mcp_sign_in,
+                payload=_Payload({'server': str}, ('server',), extra=False)),
+            _Route('GET', '/mcp/callback', Handler._get_mcp_callback, auth=False, project_free=True),
             _Route('GET', '/health', Handler._get_health,
                 match='exact',
                 project_free=True,

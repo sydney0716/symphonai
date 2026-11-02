@@ -301,6 +301,10 @@ export function createClient({
       return post("session/open", { run_id: runId });
     },
 
+    mcpPrompts() { return request("GET", "/mcp/prompts"); },
+    mcpPrompt(server, name, arguments_) { return request("POST", "/mcp/prompt", { server, name, arguments: arguments_ }); },
+    mcpSignIn(server) { return request("POST", "/mcp/sign-in", { server }); },
+
     terminals() { return request("GET", "/terminals"); },
     terminalStart() { return request("POST", "/terminal/start", {}); },
     terminalInput(id, data) { return request("POST", "/terminal/input", { id, data }); },

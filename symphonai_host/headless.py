@@ -39,6 +39,7 @@ from symphonai_host.broker import EventBroker
 from symphonai_host.credentials import CredentialError, apply_to_environment, load
 from symphonai_host.__main__ import main as _host_main
 from symphonai_host.loops import LoopStore
+from symphonai_host.keep_awake import KeepAwake
 from symphonai_host.projects import build_project
 from symphonai_host.protocol import encode_event
 from symphonai_host.run import LoopChanged, ModeSelectionError, ProviderSelectionError, MissingAPIKeyError, RunActiveError
@@ -463,9 +464,12 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
     broker = EventBroker()
     runtime = None
     subscription = None
+    keep_awake = None
     original_threading_excepthook = threading.excepthook
     threading.excepthook = lambda _args: None
     try:
+        extensions = load_extensions(repo_root=root)
+        keep_awake = KeepAwake(enabled=extensions.config.get("power.keep_awake", True))
         runtime = build_project(
             root,
             broker,
@@ -478,7 +482,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             provider_factory=lambda name, selected_model, base_url: _provider(
                 name, selected_model, base_url
             ),
-            extensions_loader=load_extensions,
+            extensions_loader=lambda **_: extensions,
             pool_factory=McpPool,
             lsp_factory=LspManager,
             policy_factory=PermissionPolicy,
@@ -607,12 +611,16 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             return 1
         return 0 if status == "finished" else 3
     finally:
-        if subscription is not None:
-            subscription.close()
-        if runtime is not None:
-            runtime.close()
-        threading.excepthook = original_threading_excepthook
-        broker.close()
+        try:
+            if subscription is not None:
+                subscription.close()
+            if runtime is not None:
+                runtime.close()
+            threading.excepthook = original_threading_excepthook
+            broker.close()
+        finally:
+            if keep_awake is not None:
+                keep_awake.close()
 
 
 def _print_loop_result(loop: dict, json_output: bool, reason: str | None = None) -> None:
@@ -706,6 +714,7 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
     broker = EventBroker()
     runtime = None
     subscription = None
+    keep_awake = None
     original_threading_excepthook = threading.excepthook
     threading.excepthook = lambda _args: None
     unanswered_failure_question = False
@@ -720,6 +729,8 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
     retries = []
     retried_stages = set()
     try:
+        extensions = load_extensions(repo_root=root)
+        keep_awake = KeepAwake(enabled=extensions.config.get("power.keep_awake", True))
         runtime = build_project(
             root,
             broker,
@@ -731,7 +742,7 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
             provider_factory=lambda name, selected_model, base_url: _provider(
                 name, selected_model, base_url
             ),
-            extensions_loader=load_extensions,
+            extensions_loader=lambda **_: extensions,
             pool_factory=McpPool,
             lsp_factory=LspManager,
             policy_factory=PermissionPolicy,
@@ -844,12 +855,16 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
             print(f"loop {loop['id']} cancelled", file=sys.stderr, flush=True)
         return 130
     finally:
-        if subscription is not None:
-            subscription.close()
-        if runtime is not None:
-            runtime.close()
-        threading.excepthook = original_threading_excepthook
-        broker.close()
+        try:
+            if subscription is not None:
+                subscription.close()
+            if runtime is not None:
+                runtime.close()
+            threading.excepthook = original_threading_excepthook
+            broker.close()
+        finally:
+            if keep_awake is not None:
+                keep_awake.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

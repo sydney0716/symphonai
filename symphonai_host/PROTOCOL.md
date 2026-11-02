@@ -774,3 +774,55 @@ folder inserts its path as an @ mention; the agent lists the folder itself.
 The composer's @ menu additionally offers matching configured skills after
 paths. Skill mentions add one `Use the <name> skill.` line per distinct skill,
 a blank line, then the original typed text. The app displays that typed text.
+
+### MCP sign-in
+
+Settings `mcp_servers` rows include `name`, `command` (or HTTP URL), `started`,
+`state` (`started`, `needs_sign_in`, `failed`, or `disabled`), and a safe `error`.
+A failed server is skipped independently; other servers and the project remain usable.
+
+`POST /mcp/sign-in {"server":"name"}` returns `{"authorization_url":"..."}`.
+Open that URL in a browser. OAuth uses PKCE S256, dynamic registration and the
+MCP resource indicator. `GET /mcp/callback?state=...&code=...` is the only
+unauthenticated OAuth endpoint: state is single-use and expires in ten minutes.
+Its response says `Signed in to <server>. You can close this tab.` on success.
+Tokens are stored only in `<SymphonAI home>/credentials/mcp-<server>.json`,
+written atomically with mode 0600 inside a mode-0700 directory. There is no OS
+credential-store lookup or migration; credentials saved there by an older build
+are ignored, requiring sign-in again if no guarded file exists. No token is
+passed in a subprocess argument. The callback restarts only that server. New conversations
+receive its tools; existing conversations retain their tool registries.
+Access and refresh tokens never appear in these replies. Expired tokens refresh
+before requests, with one refresh retry after a 401; refresh failure requires sign-in.
+
+### MCP resources and prompts
+
+`GET /mcp/prompts` returns `{"prompts":[{"server":"name","name":"prompt",
+"description":"...","arguments":[{"name":"topic","required":true}]}]}`
+for started servers declaring prompt capabilities. Lists follow the server's
+pagination cursors. `POST /mcp/prompt` takes `server`, `name` and an `arguments`
+object of strings and returns `{"text":"..."}` from the prompt messages' text
+blocks. Unknown servers/prompts, undeclared arguments and missing required
+arguments are rejected. The app offers `/mcp.<server>.<prompt>` commands; one
+argument receives the whole remaining text, while multiple arguments use
+`key=value` pairs (quoted values may contain spaces). The rendered text becomes
+the person's message.
+
+When started servers advertise resources, new agent registries include the
+read-only `list_mcp_resources(server?, cursor?)` and
+`read_mcp_resource(server, uri)` tools. Lists return at most 100 entries with
+`server`, `uri`, `name`, `description`, `mimeType`, and an optional opaque
+`next_cursor`. Pass that cursor back with the same server selection to continue;
+it preserves the underlying server cursor and position within oversized pages.
+Reads return text and describe binary contents without inlining their base64.
+Normal tool output limits/offload apply. Tools-only servers add no resource
+tools and no prompt commands; MCP tool deferral is unchanged.
+
+### Power
+
+`[power] keep_awake = false` in user or project configuration disables idle-sleep
+prevention for that project's host and headless runs. It defaults to true;
+explicit values appear as `power.keep_awake` in Settings' existing config rows.
+Configuration is read when the project starts. Host activity is polled every ten
+seconds; approval waiting alone is idle. Headless run/loop commands hold through
+completion. This prevents idle sleep, not lid closure, shutdown or quitting.

@@ -143,6 +143,9 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
             continue
         denied = regex_filter(prefix + component_regex(pattern) + "(/|$)")
         rules.append(f"(deny file-read* (require-all {denied} (require-not {excluded})))")
+    from symphonai_api.mcp_auth import credential_directories
+    rules.extend(f"(deny file-read* file-write* (subpath {quote_path(str(folder))}))"
+                 for folder in credential_directories())
     return "\n".join(rules)
 
 
@@ -335,6 +338,12 @@ def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None =
                 path = Path(directory) / name
                 if not path.is_symlink() and _matching_forbidden_component(name, patterns):
                     command.extend(("--ro-bind", "/dev/null", str(path)))
+    from symphonai_api.mcp_auth import credential_directories
+    from symphonai_api.paths import ensure_private_directory
+    for folder in credential_directories():
+        # Mount before a sign-in can create the first token during this shell.
+        ensure_private_directory(folder)
+        command.extend(("--tmpfs", str(folder), "--remount-ro", str(folder)))
     if not policy.sandbox_network:
         # Each call gets its own loopback; only server and client in one command can connect.
         command.append("--unshare-net")
