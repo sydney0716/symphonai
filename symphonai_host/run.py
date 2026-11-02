@@ -1737,7 +1737,12 @@ class HostRun:
                 )
                 for name, spec in roster.items()
             }
+        from symphonai_host.session_search import session_tools
+
         meta = session.read_meta()
+        history_tools = {} if "spec_run" in meta else session_tools(
+            self._sessions_root, policy.repo_root, session.run_id,
+        )
         role = meta.get("spec_run", {}).get("role") if isinstance(meta.get("spec_run"), dict) else None
         leader_effort = self._effort
         if isinstance(role, str) and role in roster:
@@ -1866,7 +1871,7 @@ class HostRun:
                 leases=self._leases,
                 lsp=self._lsp,
                 jobs=jobs,
-                leader_tools=goal_tools(
+                leader_tools=history_tools | goal_tools(
                     lambda: self._goal_for_session(session.run_id),
                     lambda status, message: self._update_goal_for_session(
                         session.run_id, status, message,

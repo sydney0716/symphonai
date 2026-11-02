@@ -67,6 +67,7 @@ from symphonai_host.run import (
 )
 from symphonai_host.terminal import sessions_for
 from symphonai_host.sessions import list_sessions, prompt_history
+from symphonai_host.usage import UsageReport
 from symphonai_host.projects import ProjectRuntime, record_recent_project, recent_projects
 from symphonai_host.loops import LoopStore
 from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
@@ -242,6 +243,7 @@ class HostServer:
         self._home = symphonai_home(home)
         self._model_cache: dict[tuple[str, str | None], tuple[str, ...]] = {}
         self._model_cache_lock = threading.Lock()
+        self._usage_report = UsageReport()
         self._mcp_auth_flows = {}
         self.broker = broker or EventBroker()
         initial_runtime = runtime
@@ -1043,6 +1045,19 @@ class HostServer:
             def _get_health(self, payload):
                 return _Reply(HTTPStatus.OK, {'protocol_version': PROTOCOL_VERSION, 'state': 'active' if host.run is not None and host.run.active else 'idle', 'run_id': None if host.run is None else host.run.active_run_id, 'runtime_run_id': None if host.run is None else host.run.runtime_run_id})
 
+            def _get_usage(self, payload):
+                values = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                try:
+                    days = int(values.get('days', ['30'])[0])
+                    if not 1 <= days <= 90:
+                        raise ValueError()
+                except ValueError:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'days must be an integer from 1 to 90'})
+                report = host._usage_report.read(
+                    host.run.sessions_root, days=days, price_table=host.run._price_table,
+                )
+                return _Reply(HTTPStatus.OK, report)
+
             def _get_conversation(self, payload):
                 return _Reply(HTTPStatus.OK, {'conversation': host.run.conversation_stats()})
 
@@ -1727,6 +1742,26 @@ class HostServer:
                     host.run.end_conversation()
                 return _Reply(HTTPStatus.OK, {'ended': True})
 
+            def _post_session_viewed(self, payload):
+                session_id = payload['session_id']
+                if not session_id or session_id in ('.', '..') or Path(session_id).name != session_id:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'invalid session_id'})
+                directory = (host.run.sessions_root / session_id).resolve()
+                if directory.parent != host.run.sessions_root.resolve() or not directory.is_dir():
+                    return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown session'})
+                if not host._session_belongs_here(session_id):
+                    return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
+                with host.run._lock:
+                    opened = host.run._open_conversations.get(session_id)
+                    store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, session_id)
+                    try:
+                        viewed_at = datetime.now(timezone.utc).isoformat()
+                        store.update_meta(lambda meta: meta.update(viewed_at=viewed_at))
+                    finally:
+                        if opened is None:
+                            store.close()
+                return _Reply(HTTPStatus.OK, {'session_id': session_id, 'viewed_at': viewed_at})
+
             def _post_session_rename(self, payload):
                 with self._errors(0):
                     run_id = payload['run_id']
@@ -1877,6 +1912,8 @@ class HostServer:
             _Route('GET', '/health', Handler._get_health,
                 match='exact',
                 project_free=True,
+            ),
+            _Route('GET', '/usage', Handler._get_usage,
             ),
             _Route('GET', '/conversation', Handler._get_conversation,
                 match='exact',
@@ -2162,6 +2199,11 @@ class HostServer:
                 match='exact',
                 payload=_Payload({}, (), extra=False),
                 errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'),)),
+            ),
+            _Route('POST', '/session/viewed', Handler._post_session_viewed,
+                match='exact',
+                payload=_Payload({'session_id': str}, ('session_id',), extra=False),
+                errors=(),
             ),
             _Route('POST', '/session/rename', Handler._post_session_rename,
                 match='exact',

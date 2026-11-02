@@ -2734,3 +2734,41 @@ button.session-link {
 .terminal-error:empty {
   display: none;
 }
+
+.session-dot {
+  display: inline-block;
+  width: 0.375rem;
+  height: 0.375rem;
+  margin-right: var(--space-2);
+  border-radius: 50%;
+  background: var(--ui-accent);
+  flex-shrink: 0;
+}
+.session-dot.waiting { background: var(--ui-warning); }
+.session-waiting { color: var(--ui-warning); margin-left: var(--space-1); }
+
+.usage-page {
+  min-height: 0;
+  padding: var(--space-6);
+  overflow: auto;
+  min-width: 0;
+  flex: 1;
+  font-size: 0.875rem;
+}
+.usage-page h1 { font-size: 1.125rem; font-weight: 600; margin: 0 0 var(--space-4); }
+.usage-page h2 { font-size: 0.875rem; font-weight: 600; margin: var(--space-6) 0 var(--space-2); }
+.usage-ranges { display: flex; gap: var(--space-2); }
+.usage-ranges button[aria-pressed="true"] { background: var(--ui-selected); border-color: var(--ui-accent); font-weight: 600; }
+.usage-provider { overflow-x: auto; }
+.usage-table { border-collapse: collapse; width: 100%; font-size: 0.8125rem; }
+.usage-table th, .usage-table td { padding: var(--space-2); border-bottom: 1px solid var(--ui-border); text-align: right; white-space: nowrap; }
+.usage-table th:first-child, .usage-table td:first-child { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.usage-scope, .usage-refreshed { color: var(--ui-text-secondary); }
+.usage-refreshed { font-size: 0.75rem; }
+.usage-warning { color: var(--ui-warning); }
+.usage-daily { display: grid; gap: var(--space-1); font-size: 0.75rem; }
+.usage-day { display: grid; grid-template-columns: 6rem minmax(2rem, 1fr) 5rem; align-items: center; gap: var(--space-2); }
+.usage-day > :last-child { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-bar-track { background: var(--ui-inset); height: 0.5rem; }
+.usage-bar { display: block; background: var(--ui-accent); height: 100%; }
+.usage-project { overflow-wrap: anywhere; }

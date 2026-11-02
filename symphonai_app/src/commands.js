@@ -73,6 +73,14 @@ export const COMMANDS = Object.freeze([
     argumentHint: "",
   }),
   Object.freeze({
+    name: "stats",
+    maxArgs: 0,
+    handler: handleStats,
+    aliases: Object.freeze([]),
+    description: "Show usage and cost over time",
+    argumentHint: "",
+  }),
+  Object.freeze({
     name: "context",
     maxArgs: 0,
     handler: handleContext,
@@ -335,6 +343,10 @@ async function handleCost(context, { args, command, typedName, usage }) {
   const { showCost } = context;
   await showCost(args);
   return;
+}
+
+async function handleStats(context) {
+  await context.showUsage();
 }
 
 async function handleContext(context, { args, command, typedName, usage }) {

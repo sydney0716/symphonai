@@ -558,6 +558,9 @@ export async function start({ global, document, client }) {
   append(settingsPane, element(document, "h1", { text: "Settings" }), settingsSections, settingsContent);
   let promptFailure = "";
   let route;
+  const usagePane = element(document, "main", { className: "usage-page" });
+  let usageDays = 30;
+  let usageSequence = 0;
   const conversationUsage = element(document, "p", { className: "conversation-usage" });
   append(chatPane, conversationUsage);
   const statusFields = readStatusFields(global);
@@ -1401,7 +1404,7 @@ export async function start({ global, document, client }) {
     if (route.page === "settings") {
       showSettings(route.section);
     }
-    const pane = route.page === "settings" ? settingsPane : chatPane;
+    const pane = route.page === "usage" ? usagePane : route.page === "settings" ? settingsPane : chatPane;
     replace(pageRoot, pane, terminalPanel);
     terminalPanel.hidden = !terminalOpen;
     if (!terminalPanel.hidden) fitTerminal();
@@ -1410,6 +1413,105 @@ export async function start({ global, document, client }) {
       jumpLatest.hidden = following;
     }
     updateMissingKeyNotice();
+  }
+
+  async function showUsage(days = usageDays) {
+    usageDays = days;
+    const sequence = ++usageSequence;
+    showPage({ page: "usage", section: "" });
+    const title = element(document, "h1", { text: "Usage" });
+    const ranges = element(document, "div", { className: "usage-ranges" });
+    ranges.setAttribute("aria-label", "Usage period");
+    for (const range of [7, 30, 90]) {
+      const button = makeButton(document, `${range} days`, () => showUsage(range));
+      button.setAttribute("aria-pressed", String(range === days));
+      append(ranges, button);
+    }
+    const content = element(document, "div", { className: "usage-content" });
+    append(content, element(document, "p", { text: "Loading usage…" }));
+    replace(usagePane, title, ranges, content);
+    try {
+      const report = await boundary.usage(days);
+      if (sequence !== usageSequence) return;
+      replace(content);
+      append(content, element(document, "p", { className: "usage-scope", text:
+        "Tokens and estimates cover saved calls across projects. Vendor costs cover the organization and may lag recent calls." }));
+      const counts = new Intl.NumberFormat();
+      const balanceNumbers = new Intl.NumberFormat(undefined, { maximumFractionDigits: 20 });
+      const amountText = (value) => {
+        if (!value) return "unavailable";
+        if (!value.currency) return `${balanceNumbers.format(Number(value.amount))} balance`;
+        const money = new Intl.NumberFormat(undefined, {
+          style: "currency", currency: value.currency, minimumFractionDigits: 2, maximumFractionDigits: 2,
+        });
+        const exact = Number(value.exact_amount ?? value.amount);
+        if (exact !== 0 && Math.abs(exact) < 0.01) {
+          return exact < 0 ? `>-${money.format(0.01)}` : `<${money.format(0.01)}`;
+        }
+        return money.format(Number(value.amount));
+      };
+      const vendorNames = {
+        anthropic: "Anthropic", openai: "OpenAI", gemini: "Google Gemini", deepseek: "DeepSeek",
+        kimi: "Moonshot (Kimi)", grok: "xAI (Grok)", openrouter: "OpenRouter",
+        qwen: "Alibaba Qwen (DashScope)", ollama: "Ollama (local)", groq: "Groq", together: "Together AI",
+      };
+      const providers = report.providers ?? [];
+      if (providers.length === 0) append(content, element(document, "p", { text: "No saved usage or connected balances for this period." }));
+      for (const provider of providers) {
+        const section = element(document, "section", { className: "usage-provider" });
+        append(section, element(document, "h2", { text: vendorNames[provider.provider] ?? provider.provider }));
+        const table = element(document, "table", { className: "usage-table" });
+        const header = element(document, "tr");
+        for (const name of ["Model", "Input", "Cached", "Output", "Cost", "Balance"]) {
+          const cell = element(document, "th", { text: name });
+          cell.setAttribute("scope", "col");
+          append(header, cell);
+        }
+        const head = element(document, "thead");
+        append(head, header);
+        const body = element(document, "tbody");
+        const addRow = (label, input, cached, output, cost = "", balance = "") => {
+          const row = element(document, "tr");
+          for (const value of [label, counts.format(input), counts.format(cached), counts.format(output), cost, balance]) append(row, element(document, "td", { text: String(value) }));
+          append(body, row);
+        };
+        for (const model of provider.models ?? []) {
+          addRow(model.model, model.input_tokens, (model.cache_read_tokens ?? 0) + (model.cache_write_tokens ?? 0), model.output_tokens);
+        }
+        addRow("Total", provider.input_tokens ?? 0, (provider.cache_read_tokens ?? 0) + (provider.cache_write_tokens ?? 0),
+          provider.output_tokens ?? 0, provider.cost ? `${amountText(provider.cost)} · ${provider.cost.source}` : "unavailable",
+          provider.balance?.map(amountText).join("; ") || "unavailable");
+        append(table, head, body);
+        append(section, table);
+        if (provider.cost?.data_refreshed_at) append(section, element(document, "p", { className: "usage-refreshed", text: `Vendor data refreshed at ${provider.cost.data_refreshed_at}` }));
+        if (provider.error) append(section, element(document, "p", { className: "error", text: provider.error }));
+        append(content, section);
+      }
+      append(content, element(document, "h2", { text: "Daily tokens (UTC)" }));
+      const daily = report.daily ?? [];
+      const largest = Math.max(1, ...daily.map((day) => day.input_tokens + day.output_tokens));
+      const bars = element(document, "div", { className: "usage-daily" });
+      for (const day of daily) {
+        const total = day.input_tokens + day.output_tokens;
+        const row = element(document, "div", { className: "usage-day" });
+        const track = element(document, "div", { className: "usage-bar-track" });
+        const bar = element(document, "span", { className: "usage-bar" });
+        bar.setAttribute("style", `width: ${Math.max(0, total / largest * 100)}%`);
+        bar.setAttribute("aria-hidden", "true");
+        append(track, bar);
+        append(row, element(document, "span", { text: day.date }), track, element(document, "span", { text: counts.format(total) }));
+        append(bars, row);
+      }
+      append(content, bars);
+      if ((report.projects ?? []).length) {
+        append(content, element(document, "h2", { text: "By project" }));
+        for (const project of report.projects) append(content, element(document, "p", { className: "usage-project", text:
+          `${project.repo_root || "Unknown project"}: ${counts.format(project.input_tokens)} input · ${counts.format(project.cache_read_tokens + project.cache_write_tokens)} cached · ${counts.format(project.output_tokens)} output` }));
+      }
+      for (const warning of report.warnings ?? []) append(content, element(document, "p", { className: "usage-warning", text: warning }));
+    } catch (error) {
+      if (sequence === usageSequence) replace(content, element(document, "p", { className: "error", text: `Could not load usage: ${errorText(error)}` }));
+    }
   }
 
   function navigate(nextRoute, { updateFragment = true } = {}) {
@@ -1894,6 +1996,17 @@ export async function start({ global, document, client }) {
     jumpLatest.hidden = true;
   });
 
+  async function markSessionViewed(sessionId) {
+    try {
+      await boundary.sessionViewed(sessionId);
+      await refreshSessionLists();
+      showProjects();
+    } catch (error) {
+      sessionRowError = errorText(error);
+      showProjects();
+    }
+  }
+
   async function openSession(runId) {
     closeAgentView();
     const targetSession = [...sessions, ...archivedSessions].find((session) => session.run_id === runId);
@@ -1914,6 +2027,7 @@ export async function start({ global, document, client }) {
     try {
       await boundary.openSession(runId);
       await refreshConversation();
+      await markSessionViewed(runId);
       await refreshSelectedChanges();
       navigate({ page: "chat", section: "" });
     } catch (error) {
@@ -2001,7 +2115,7 @@ export async function start({ global, document, client }) {
         const parent = sessions.find((item) => item.run_id === session.parent_session_id);
         const label = (session.title || session.run_id) + (
           session.parent_session_id ? ` · fork of ${parent?.title || session.parent_session_id}` : ""
-        ) + (["working", "waiting"].includes(session.activity) ? ` · ${session.activity}` : "");
+        ) + (session.activity === "working" ? " · working" : "");
         if (!current && !group.root) {
           const unavailable = element(document, "p", {
             className: "session-link unavailable",
@@ -2013,6 +2127,13 @@ export async function start({ global, document, client }) {
         }
         const row = element(document, "div", { className: "session-row" });
         const button = makeButton(document, label, null, { className: "session-link" });
+        if (session.activity === "waiting" || session.unread) {
+          const waiting = session.activity === "waiting";
+          const dot = element(document, "span", { className: `session-dot ${waiting ? "waiting" : "unread"}` });
+          dot.setAttribute("aria-label", waiting ? "Waiting" : "Unread");
+          replace(button, dot, document.createTextNode(label));
+          if (waiting) append(button, element(document, "span", { className: "session-waiting", text: " waiting" }));
+        }
         if (session.run_id === currentSessionId) {
           button.setAttribute("aria-current", "true");
         }
@@ -5007,6 +5128,7 @@ export async function start({ global, document, client }) {
       showConversationUsage,
       resumeConversation,
       showCost,
+      showUsage,
       showContext,
       showPromptError,
       submitCommandPrompt,
@@ -5256,12 +5378,16 @@ export async function start({ global, document, client }) {
       await refreshSelectedChanges();
       const rootAgentId = conversation?.agents?.find((agent) => agent.parent_agent_id == null)?.agent_id;
       if (typeof rootAgentId === "string" && event.fields.agent_id === rootAgentId) {
+        if (route.page === "chat" && !agentView && !document.hidden) await markSessionViewed(currentSessionId);
         await requestActivityRefresh();
       }
     }
   }
 
   const subscription = boundary.events((frame) => onFrame(frame));
+  if (currentSessionId && route.page === "chat" && !document.hidden) {
+    await markSessionViewed(currentSessionId);
+  }
   if (subscription.ready) {
     await subscription.ready;
     if (currentSessionId) {

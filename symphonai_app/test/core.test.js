@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { start } from "../src/app.js";
+import { createClient } from "../src/client.js";
 
 // A small DOM with real parent/child and textContent semantics. Missing ids
 // return null, and operations on a non-child fail rather than hiding a crash.
@@ -150,6 +151,7 @@ function scriptedClient() {
   const client = {
     project: async () => ({ repo_root: "/core-project", name: "Core project" }),
     sessions: async () => [],
+    sessionViewed: async () => ({ viewed_at: "2026-11-02T00:00:00+00:00" }),
     roadmap: async () => ({ goals: [] }),
     settings: async () => ({ settings: { mode: "allow", providers: [{ name: "openai", key_present: true }] } }),
     health: async () => ({ state: "idle", runtime_run_id: null }),
@@ -583,4 +585,115 @@ test("subagent notices render equally live and replayed, with rail progress and 
   assert.match(replayChat.textContent, /Complete result\nValidation: passed/);
   await replay.emit("HistoryMessage", { role: "user", notice: false, text: "A person's real prompt", tool_calls: [] });
   assert.equal(replayChat.children.filter((node) => node.className === "prompt").length, 1);
+});
+
+
+test("sidebar unread and waiting marks persist on reload and opening records viewed", async () => {
+  const script = scriptedClient();
+  const sessions = [
+    { run_id: "past", repo_root: "/core-project", title: "Finished work", unread: true, activity: "idle" },
+    { run_id: "waiting", repo_root: "/core-project", title: "Needs approval", unread: true, activity: "waiting" },
+  ];
+  script.client.sessions = async (_limit, _query, archived) => archived ? [] : sessions;
+  let opened = null;
+  const viewed = [];
+  script.client.openSession = async (id) => { opened = id; };
+  script.client.conversationStats = async () => ({ conversation: opened ? { session_id: opened, agents: [] } : null });
+  script.client.sessionViewed = async (id) => {
+    viewed.push(id);
+    sessions.find((session) => session.run_id === id).unread = false;
+    return { session_id: id };
+  };
+  for (let reload = 0; reload < 2; reload += 1) {
+    const document = new Document();
+    const app = await start({ global: browser(), document, client: script.client });
+    assert.ok(find(document.body, (node) => node.className === "session-dot unread"));
+    assert.ok(find(document.body, (node) => node.className === "session-dot waiting"));
+    assert.match(find(document.body, (node) => node.className === "projects").textContent, /Needs approval waiting/);
+    app.subscription.close();
+  }
+  const document = new Document();
+  const app = await start({ global: browser(), document, client: script.client });
+  await find(document.body, (node) => node.className === "session-link" && node.textContent === "Finished work").click();
+  assert.deepEqual(viewed, ["past"]);
+  assert.equal(find(document.body, (node) => node.className === "session-dot unread"), null);
+  assert.ok(find(document.body, (node) => node.className === "session-dot waiting"));
+  app.subscription.close();
+});
+
+
+test("real client sends session viewed directly over HTTP", async () => {
+  const calls = [];
+  const client = createClient({
+    port: 4312, token: "core-inert-token",
+    fetch: async (url, options) => {
+      calls.push({ path: new URL(url).pathname, method: options.method, body: JSON.parse(options.body) });
+      return { status: 200, json: async () => ({ session_id: "shown", viewed_at: "2026-11-02T00:00:00Z" }) };
+    },
+  });
+  await client.sessionViewed("shown");
+  assert.deepEqual(calls, [{ path: "/session/viewed", method: "POST", body: { session_id: "shown" } }]);
+});
+
+
+test("stats opens Usage with vendor and estimated costs, balances, errors and three ranges", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  const ranges = [];
+  script.client.usage = async (days) => {
+    ranges.push(days);
+    return {
+      providers: [
+        { provider: "anthropic", input_tokens: 125618, output_tokens: 20, cache_read_tokens: 10,
+          cost: { amount: "3.99", exact_amount: "3.99473345", currency: "USD", source: "vendor", data_refreshed_at: "2026-10-01T04:02:11Z" },
+          models: [{ model: "claude-opus-5-5", input_tokens: 125618, output_tokens: 20, cache_read_tokens: 10 }] },
+        { provider: "gemini", cost: { amount: "0.25", currency: "USD", source: "estimate" }, models: [] },
+        { provider: "kimi", balance: [{ amount: "9.98959", currency: null }], models: [] },
+        { provider: "openai", cost: { amount: "10.66", exact_amount: "10.66323600000000000000000000", currency: "USD", source: "vendor" }, models: [] },
+        { provider: "deepseek", balance: [{ amount: "4.90", currency: "USD" }], models: [] },
+        { provider: "grok", cost: { amount: "0.00", exact_amount: "0.004", currency: "USD", source: "estimate" }, models: [] },
+        { provider: "qwen", error: "Vendor cost request returned HTTP 503.", models: [] },
+        { provider: "ollama", models: [] }, { provider: "groq", models: [] },
+        { provider: "together", models: [] }, { provider: "openrouter", models: [] },
+        { provider: "unknown", models: [], cost: null },
+      ],
+      daily: [{ date: "2026-11-02", input_tokens: 100, output_tokens: 20 }],
+      projects: [{ repo_root: "/core-project", input_tokens: 100, output_tokens: 20, cache_read_tokens: 10, cache_write_tokens: 0 }],
+    };
+  };
+  const app = await start({ global: browser(), document, client: script.client });
+  await submit(document, "/stats");
+  assert.equal(app.route().page, "usage");
+  const pane = find(document.body, (node) => node.className === "usage-page");
+  const money = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  assert.ok(pane.textContent.includes(`${money.format(3.99)} · vendor`));
+  assert.ok(pane.textContent.includes(`${money.format(10.66)} · vendor`));
+  assert.ok(pane.textContent.includes(`${money.format(0.25)} · estimate`));
+  assert.ok(pane.textContent.includes(`<${money.format(0.01)} · estimate`));
+  assert.ok(pane.textContent.includes(new Intl.NumberFormat().format(125618)));
+  for (const name of ["Anthropic", "OpenAI", "Google Gemini", "DeepSeek", "Moonshot (Kimi)",
+    "xAI (Grok)", "OpenRouter", "Alibaba Qwen (DashScope)", "Ollama (local)", "Groq", "Together AI"]) {
+    assert.ok(find(pane, (node) => node.tagName === "H2" && node.textContent === name), name);
+  }
+  assert.match(pane.textContent, /Vendor data refreshed at 2026-10-01T04:02:11Z/);
+  assert.match(pane.textContent, /Moonshot \(Kimi\)/);
+  assert.ok(pane.textContent.includes(`${new Intl.NumberFormat(undefined, { maximumFractionDigits: 20 }).format(9.98959)} balance`));
+  assert.match(pane.textContent, /HTTP 503/);
+  assert.ok(find(pane, (node) => node.className === "usage-bar"));
+  for (const range of [7, 90]) {
+    await find(pane, (node) => node.tagName === "BUTTON" && node.textContent === `${range} days`).click();
+  }
+  assert.deepEqual(ranges, [30, 7, 90]);
+  assert.deepEqual(script.prompts, []);
+  app.subscription.close();
+});
+
+test("real client requests the selected usage period without the protocol encoder", async () => {
+  const calls = [];
+  const client = createClient({ port: 4312, token: "core-inert-token", fetch: async (url, options) => {
+    calls.push([new URL(url).pathname + new URL(url).search, options.method]);
+    return { status: 200, json: async () => ({ days: 90, providers: [] }) };
+  } });
+  assert.equal((await client.usage(90)).days, 90);
+  assert.deepEqual(calls, [["/usage?days=90", "GET"]]);
 });

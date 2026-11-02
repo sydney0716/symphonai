@@ -137,6 +137,7 @@ def list_sessions(
             "state": "unreadable",
             "message_count": 0,
             "activity": (activity or {}).get(directory.name, "idle"),
+            "unread": False,
         }
         store = None
         try:
@@ -147,6 +148,7 @@ def list_sessions(
                 for key in ("run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id")
             })
             item["archived"] = meta.get("archived") is True
+            item["unread"] = not meta.get("viewed_at") and "spec_run" not in meta
             repo_root = meta.get("repo_root")
             item["repo_root"] = repo_root if isinstance(repo_root, str) else ""
         except (OSError, TranscriptError, ValueError, KeyError, TypeError):
@@ -155,30 +157,8 @@ def list_sessions(
     sessions = [entry for entry in sessions if entry[0]["archived"] is archived]
     sessions.sort(key=lambda entry: entry[0]["updated_at"] or "", reverse=True)
     if query:
-        needle = query.casefold()
-        filtered = []
-        for item, store in sessions:
-            title = item["title"]
-            if isinstance(title, str) and needle in title.casefold():
-                filtered.append((item, store))
-                continue
-            if store is None:
-                continue
-            try:
-                records, _ = read_records(store.directory / "run.jsonl")
-                matched = False
-                for record in records:
-                    if record.get("type") != "message":
-                        continue
-                    message = message_from_json(record["data"])
-                    if message.role in (Role.USER, Role.ASSISTANT) and needle in message.text.casefold():
-                        matched = True
-                        break
-            except (OSError, TranscriptError, ValueError, KeyError, TypeError, UnicodeError):
-                matched = False
-            if matched:
-                filtered.append((item, store))
-        sessions = filtered
+        sessions = [(item, store) for item, store in sessions
+                    if matching_snippets(item["title"], store, query)]
     selected = sessions if limit is None else sessions[:limit]
     for item, store in selected:
         if store is None:
@@ -188,8 +168,42 @@ def list_sessions(
             records, _ = read_records(store.directory / "run.jsonl")
             item["state"] = classify_run(loaded, records).state.value
             item["message_count"] = len(loaded.messages)
+            meta = store.read_meta()
+            viewed_at = meta.get("viewed_at")
+            ended_at = next((record.get("ts") for record in reversed(records)
+                             if record.get("type") in ("run_finished", "run_failed")), None)
+            if item["stopped_reason"] and isinstance(viewed_at, str) and isinstance(ended_at, str):
+                item["unread"] = datetime.fromisoformat(ended_at) > datetime.fromisoformat(viewed_at)
         except (OSError, TranscriptError, ValueError, KeyError, TypeError):
             pass
     for item, _ in selected:
         item.pop("archived", None)
     return [item for item, _ in selected]
+
+
+def matching_snippets(title: str | None, store: SessionStore | None, query: str) -> list[str]:
+    """Share sidebar and agent matching over titles and conversation text."""
+    needle = query.casefold()
+    snippets = []
+
+    def add(text):
+        index = text.casefold().find(needle)
+        if index >= 0:
+            start = max(0, index - 80)
+            snippets.append(text[start:start + 200])
+
+    if isinstance(title, str):
+        add(title)
+    if store is not None and len(snippets) < 3:
+        try:
+            records, _ = read_records(store.directory / "run.jsonl")
+            for record in records:
+                if record.get("type") == "message":
+                    message = message_from_json(record["data"])
+                    if message.role in (Role.USER, Role.ASSISTANT):
+                        add(message.text)
+                        if len(snippets) >= 3:
+                            break
+        except (OSError, TranscriptError, ValueError, KeyError, TypeError, UnicodeError):
+            pass
+    return snippets

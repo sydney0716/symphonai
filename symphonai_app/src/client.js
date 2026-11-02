@@ -297,6 +297,10 @@ export function createClient({
       return request("POST", "/command", { command }, readReply, { detailOnError: true });
     },
 
+    sessionViewed(sessionId) {
+      return request("POST", "/session/viewed", { session_id: sessionId }, readReply, { detailOnError: true });
+    },
+
     openSession(runId) {
       return post("session/open", { run_id: runId });
     },
@@ -586,6 +590,10 @@ export function createClient({
 
     newSession() {
       return request("POST", "/session/new", {}, readReply, { detailOnError: true });
+    },
+
+    usage(days = 30) {
+      return request("GET", `/usage?days=${encodeURIComponent(days)}`, undefined, readReply, { detailOnError: true });
     },
 
     conversationStats() {

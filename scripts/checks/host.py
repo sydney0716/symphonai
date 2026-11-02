@@ -295,6 +295,28 @@ def session_from_another_project_is_refused():
             status, value, _ = request(host, "/session/open", {"run_id": session})
             assert status == 409 and "error" in value
             assert get(host, "/conversation")["conversation"] is None
+            from symphonai_host.session_search import session_tools
+
+            past = []
+            for text in ("retry rule changed", "notes decision", "RETRY discussion"):
+                past.append(prompt(host, text))
+                post(host, "/session/new", {})
+            current = prompt(host, "retry current conversation")
+            tools = session_tools(shared, first.root, current)
+            found = tools["search_sessions"].execute(tool("search_sessions", query="retry"), first.policy)
+            assert found.ok
+            matches = json.loads(found.content)["sessions"]
+            assert {item["session_id"] for item in matches} == {past[0], past[2]}
+            assert all(item["snippets"] for item in matches)
+            page = tools["read_session"].execute(tool("read_session", session_id=past[0], limit=1), first.policy)
+            assert page.ok and json.loads(page.content)["messages"][0]["text"] == "retry rule changed"
+            assert json.loads(page.content)["next_offset"] == 1
+            next_page = tools["read_session"].execute(
+                tool("read_session", session_id=past[0], offset=1, limit=1), first.policy,
+            )
+            assert next_page.ok and json.loads(next_page.content)["messages"][0]["role"] == "assistant"
+            for session_id in (session, "missing", "../outside"):
+                assert not tools["read_session"].execute(tool("read_session", session_id=session_id), first.policy).ok
 
 
 def git(root, *arguments):

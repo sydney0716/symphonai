@@ -834,3 +834,61 @@ Reattach writes saved output, then only buffered event data past the snapshot's
 `end`; identical repeated text is not used to infer overlap. Output events are
 coalesced with at least 30 ms between publications. Input arriving while a
 terminal input request is in flight is batched into the next request.
+
+### Viewed and unread conversations
+
+`POST /session/viewed {"session_id":"…"}` records UTC `viewed_at` in the
+current project's session metadata and returns `{session_id, viewed_at}`.
+Unknown sessions return 404, foreign-project sessions 409, invalid IDs 400.
+`GET /sessions` includes `unread: boolean`: a non-spec conversation never
+viewed, or a session whose last run ended after its viewed time. Activity
+`waiting` takes visual precedence over unread. The app records viewed on open
+and when the visible conversation's root run finishes.
+
+### Usage over time
+
+`GET /usage?days=<n>` returns usage for the last `n` UTC calendar days including
+today (default 30, integer 1–90). Invalid ranges return 400. It reads all saved
+projects under the host's sessions root; it does not change per-call records.
+
+Response:
+
+- `days`, `starting_at`, `ending_at`: selected period, with UTC timestamps.
+- `tokens`: rows `{date, provider, model, project, ...usage counters}`.
+- `providers`: rows `{provider, models, ...usage counters, cost, balance, error}`.
+  `models` contains model totals. Counters retain input, output, calls, cache
+  read/write, one-hour writes and long-context fields from saved usage.
+- `cost`: null or `{amount, currency, source, scope}`, with decimal-string
+  amounts. `source` is `vendor` or `estimate`. Vendor cost covers the entire
+  organization, whereas estimates cover local saved calls. A vendor failure
+  leaves its error visible even if a price-file estimate is available.
+  Anthropic includes `data_refreshed_at` when returned by the vendor.
+- `balance`: null or an array of `{amount, currency}`. Moonshot uses provider
+  ID `kimi`; its currency is null because the vendor does not state one.
+  DeepSeek preserves each returned currency. OpenRouter credits minus usage
+  are USD. Balances describe the current account, not the selected period.
+- `projects`: totals by `repo_root`; `daily`: zero-filled UTC daily totals;
+  `warnings`: unreadable/invalid saved-record warnings without transcript data.
+
+The host's usage module alone reads OPENAI_ADMIN_KEY and ANTHROPIC_ADMIN_KEY.
+It sends them only as Authorization headers to fixed vendor endpoints, never
+stores the keys or exposes headers/errors containing them, and refuses HTTP
+redirects. Cost reports and balances are cached in memory for 15 minutes;
+credential changes invalidate their cached results. Failures stay in the
+provider's row and do not fail other providers. No admin key is required for
+local tokens or price-file estimates. Normal DEEPSEEK_API_KEY,
+MOONSHOT_API_KEY and OPENROUTER_API_KEY enable their balances. Gemini has no
+vendor cost-report request and can show only a price-file estimate.
+
+Anthropic requests use the supplied analytics beta header, RFC3339 bounds,
+31-day windows and pagination; fractional cents are divided by 100. OpenAI
+costs use daily buckets and pagination; amounts are already dollars. All
+amounts use decimal arithmetic. `/stats` opens the app's Usage main pane with
+7/30/90-day controls and daily token bars; `/cost` remains conversation-only.
+
+Saved usage predating provider fields uses the session's provider selection.
+Sessions known to have switched providers group untagged calls as `unknown`
+and include a warning rather than assigning them all to the latest provider.
+Per-call recording is unchanged. Inherited usage in forked root transcripts
+is excluded until the fork's first new run, avoiding counting the copied
+prefix as new usage.
