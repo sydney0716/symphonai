@@ -703,3 +703,57 @@ def loop_expands_items_and_waits_for_all():
         finished = loop_state(host, loop_id, "awaiting_commit")
         assert all(card["state"] == "done" for card in finished["cards"])
         assert script.items_started == {"x", "y", "z"}
+
+
+@check("host.opening_another_project_preserves_provider_selection")
+def opening_another_project_preserves_provider_selection():
+    from symphonai_api.permissions import PermissionPolicy
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class PausedProvider(FakeModelProvider):
+        def create_response(self, request, *, cancel=None):
+            entered.set()
+            while not release.wait(0.01):
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+            return super().create_response(request, cancel=cancel)
+
+    with workspace() as first, workspace() as second:
+        provider = PausedProvider([reply()])
+        broker = EventBroker()
+        home = first.outside / "project-switch-home"
+        created = []
+
+        def factory(root, events, publish):
+            run = HostRun(FakeModelProvider(), PermissionPolicy(root, allowed_write_scope=[root]), events,
+                          sessions_root=first.outside / "switch-sessions",
+                          memory_root=first.outside / "switch-memory" / root.name,
+                          memory_extraction_enabled=False, publish_approval=publish,
+                          project_grants_root=home / "permissions")
+            runtime = ProjectRuntime(root, run)
+            created.append(runtime)
+            return runtime
+
+        host = HostServer(provider, None, broker=broker, home=home, project_factory=factory,
+                          provider_selection={"name": provider.name, "model": "chosen-model", "effort": "low"})
+        host.start()
+        try:
+            assert post(host, "/project/open", {"path": str(first.root)})["repo_root"] == str(first.root)
+            first_run = host.run
+            expected = {"provider": provider.name, "model": "chosen-model", "effort": "low"}
+            assert first_run.provider is provider and first_run.selection() == expected
+            post(host, "/prompt", {"prompt": "Keep project A running while B opens"})
+            assert entered.wait(5), "project A did not start"
+            assert post(host, "/project/open", {"path": str(second.root)})["repo_root"] == str(second.root)
+            second_run = host.run
+            assert second_run is not first_run
+            assert second_run.provider is provider and second_run.selection() == expected
+            assert get(host, "/settings")["settings"]["selection"] == expected
+            assert post(host, "/project/open", {"path": str(first.root)})["repo_root"] == str(first.root)
+            assert host.run is first_run and first_run.selection() == expected
+            assert [runtime.root for runtime in created] == [first.root, second.root]
+        finally:
+            release.set()
+            host.close()

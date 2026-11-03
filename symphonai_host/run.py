@@ -700,6 +700,12 @@ class HostRun:
         )
 
     @property
+    def provider(self) -> ModelProvider | None:
+        """The provider currently selected for the leader."""
+        with self._lock:
+            return self._provider
+
+    @property
     def policy(self) -> PermissionPolicy:
         return self._policy
 
