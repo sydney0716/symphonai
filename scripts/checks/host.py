@@ -192,7 +192,7 @@ def routes_require_the_token():
              "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact",
              "/agent", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard",
              "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit",
-             "/loop/resume", "/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start",
+             "/loop/resume",
              "/memory/update", "/memory/delete", "/memory/restore", "/credentials", "/extensions/reload", "/config/set")
     with workspace() as ws, running_host(ws) as host:
         exposed = {}
@@ -202,6 +202,24 @@ def routes_require_the_token():
                 if status != 401:
                     exposed[f"{method} {path}"] = status
         assert not exposed, f"routes accessible without a token: {exposed}"
+        for path in ("/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start"):
+            assert request(host, path, {})[0] == 404
+        from symphonai_host.roadmap_tools import roadmap_tools
+
+        tools = roadmap_tools(host.run)
+        added = tools["add_roadmap_goal"].execute(tool("add_roadmap_goal", goal="Fixture roadmap goal"), ws.policy)
+        assert added.ok
+        goal_id = json.loads(added.content)["goals"][0]["id"]
+        started = tools["start_roadmap_goal"].execute(tool("start_roadmap_goal", goal_id=goal_id), ws.policy)
+        assert started.ok
+        loop_id = json.loads(started.content)["loop_id"]
+        assert get(host, "/roadmap")["goals"][0]["loop_id"] == loop_id
+        again = tools["start_roadmap_goal"].execute(tool("start_roadmap_goal", goal_id=goal_id), ws.policy)
+        assert not again.ok and "already has" in again.error
+        removed = tools["remove_roadmap_goal"].execute(tool("remove_roadmap_goal", goal_id=goal_id), ws.policy)
+        assert removed.ok and not json.loads(removed.content)["goals"]
+        assert (ws.root / ".symphonai" / "loops" / loop_id).is_dir()
+        assert not tools["remove_roadmap_goal"].execute(tool("remove_roadmap_goal", goal_id=goal_id), ws.policy).ok
         config = ws.outside / "home" / ".symphonai" / "config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         original = '# Keep header\n[memory]\nextract = true  # Keep comment\n'

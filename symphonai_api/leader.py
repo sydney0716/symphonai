@@ -106,7 +106,7 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.memory import MemoryTool
-from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, ToolEffect, ToolMetadata, changed_paths
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
@@ -830,15 +830,17 @@ class DispatchSubagentTool(LocalTool):
         can_edit = selected_tool_names is None or bool(
             editable_tools.intersection(selected_tool_names)
         )
-        validation_commands = spec_validation(task) if can_edit else []
-        if can_edit and not validation_commands:
+        document_role = subagent_name in ("planner", "reviewer")
+        validation_commands = spec_validation(task) if can_edit and not document_role else []
+        if can_edit and not document_role and not validation_commands:
+            defect = ("the task has no ## Validation heading" if not re.search(
+                r"(?im)^##[ \t]+Validation[ \t]*(?:#+[ \t]*)?$", task,
+            ) else "the ## Validation section has no fenced sh/bash block of commands")
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=False,
-                error=(
-                    "a change needs a spec with a ## Validation section "
-                    "holding one fenced sh block"
-                ),
+                error=(f"subagent {subagent_name}: {defect}. Put the spec in the task, with "
+                       "## Validation and a fenced sh block of commands, or dispatch planner first to write one."),
             )
         available_extra = self._extra_tools or {}
         named_mcp_tools = spec.mcp_tool_names
@@ -1062,6 +1064,15 @@ class DispatchSubagentTool(LocalTool):
                 standard_tools,
                 selected_extra,
             )
+            if document_role:
+                # Opaque tools and jobs must not bypass the document write boundary.
+                document_tools = set(EXPLORER_TOOL_NAMES) | FILE_EDIT_TOOLS | {
+                    "run_shell", "web_search", "use_skill", "read_tool_result",
+                }
+                subagent_tools = {name: tool for name, tool in subagent_tools.items() if name in document_tools}
+                for name, tool in tuple(subagent_tools.items()):
+                    if name in FILE_EDIT_TOOLS or name == "run_shell":
+                        subagent_tools[name] = _DocumentRoleTool(tool, subagent_name)
             subagent_tools["message_leader"] = _MessageLeaderTool(self, subagent_name)
             record = SubagentRecord(
                 agent=ApiAgent(
@@ -1238,6 +1249,9 @@ class DispatchSubagentTool(LocalTool):
 
         def execute_dispatch() -> ToolResult:
             nonlocal child_run
+            document_shell = record.agent._tools.get("run_shell") if document_role else None
+            if isinstance(document_shell, _DocumentRoleTool):
+                document_shell.changed_paths.clear()
             run_result, failure, execution_error = run_child(child_run, initial=True)
             if isinstance(execution_error, LeaseConflict):
                 return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
@@ -1250,7 +1264,7 @@ class DispatchSubagentTool(LocalTool):
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     ok=False,
-                    content=content,
+                    content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
                     error=failure or str(execution_error) or "subagent dispatch failed",
                     payload=payload,
                 )
@@ -1312,7 +1326,7 @@ class DispatchSubagentTool(LocalTool):
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     ok=False,
-                    content=content,
+                    content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
                     error=error,
                     payload=payload,
                 )
@@ -1376,7 +1390,7 @@ class DispatchSubagentTool(LocalTool):
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=succeeded,
-                content=content,
+                content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
                 error=error,
                 payload=payload,
             )
@@ -1598,13 +1612,55 @@ def _project_snapshot(root: Path) -> dict[str, tuple[int, int]] | None:
     return snapshot
 
 
+class _DocumentRoleTool(LocalTool):
+    """Constrain leader-dispatched document roles without changing loop stages."""
+
+    def __init__(self, delegate, role):
+        self._delegate = delegate
+        self._role = role
+        self.changed_paths = set()
+
+    name = property(lambda self: self._delegate.name)
+    description = property(lambda self: self._delegate.description)
+    parameters = property(lambda self: self._delegate.parameters)
+
+    def metadata(self, arguments):
+        return self._delegate.metadata(arguments)
+
+    def report(self, content):
+        if self.changed_paths:
+            content += (f"\n\nThe {self._role}'s shell changed non-Markdown project files: "
+                        + ", ".join(sorted(self.changed_paths)))
+        return content
+
+    def _execute(self, tool_call, policy, cancel=None):
+        if self.name == "run_shell":
+            return _LeaderShellTool(
+                self._delegate, root=policy.repo_root, role=self._role,
+                on_change=self.changed_paths.update,
+            ).execute(tool_call, policy, cancel=cancel)
+        paths = changed_paths(self.name, tool_call.arguments)
+        for path in paths:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                candidate = policy.repo_root / candidate
+            if not path.endswith(".md") or candidate.resolve().suffix != ".md":
+                return ToolResult(tool_call.id, ok=False, error=(
+                    f"the {self._role} writes specs (Markdown files) only; code goes to the implementer"
+                ))
+        return self._delegate.execute(tool_call, policy, cancel=cancel)
+
+
 class _LeaderShellTool(LocalTool):
     """Run the normal shell while recording changes to existing project files."""
 
-    def __init__(self, delegate: LocalTool, *, root: Path, leader: "Leader") -> None:
+    def __init__(self, delegate: LocalTool, *, root: Path, leader: "Leader | None" = None,
+                 role: str | None = None, on_change=None) -> None:
         self._delegate = delegate
         self._root = root.resolve()
         self._leader = leader
+        self._role = role
+        self._on_change = on_change
 
     @property
     def name(self) -> str:
@@ -1640,6 +1696,23 @@ class _LeaderShellTool(LocalTool):
                 if path not in after or after[path] != details
             )
             new_files_count = sum(path not in before for path in after)
+        if self._role is not None:
+            changed = ([] if skipped else sorted(
+                path for path in before.keys() | after.keys()
+                if not path.endswith(".md") and before.get(path) != after.get(path)
+            ))
+            if self._on_change is not None:
+                self._on_change(changed)
+            if changed:
+                suffix = (f"your command changed {', '.join(changed)}; the {self._role} "
+                          "writes no code — say so in your report")
+                result = replace(result, content=f"{result.content}\n{suffix}" if result.content else suffix)
+            elif skipped:
+                result = replace(result, content=(
+                    f"{result.content}\nProject change snapshot skipped: tree exceeds 50000 entries; "
+                    "say what your command changed in your report"
+                ))
+            return result
         transcript = self._leader._transcript
         run_id = self._leader._leader_run_id()
         if transcript is not None and run_id is not None:

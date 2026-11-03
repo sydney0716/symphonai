@@ -481,6 +481,13 @@ def resolve_run_budgets(
             price_table = load_price_table(path)
         except ValueError as exc:
             _raise(origin, table_key, str(exc))
+    else:
+        path = symphonai_home() / "prices.json"
+        if path.exists():
+            try:
+                price_table = load_price_table(path)
+            except ValueError as exc:
+                _raise(path, table_key, str(exc))
 
     def budget_for(role: str, default_turns: int) -> RunBudget | None:
         prefix = f"budgets.{role}."

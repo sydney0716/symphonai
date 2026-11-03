@@ -20,12 +20,12 @@ const userKeymapFile = await import("../keys.json", { with: { type: "json" } })
   .then(({ default: keymap }) => keymap)
   .catch(() => ({}));
 
-const STATUS_LINE_KEY = "symphonai.status-line";
+const STATUS_LINE_KEY = "symphonai.status-line.v2";
 const NOTIFICATIONS_KEY = "symphonai.notifications";
 const PROMPT_DRAFTS_KEY = "symphonai.drafts";
 const DEFAULT_STATUS_FIELDS = Object.freeze({
   provider: false, model: true, effort: true, mode: false,
-  goal: false, context: false, usage: false,
+  goal: false, context: false, usage: true,
 });
 
 function stateLabel(state) {
@@ -36,10 +36,12 @@ function stateLabel(state) {
 
 function readStatusFields(global) {
   try {
-    const stored = JSON.parse(global.localStorage?.getItem(STATUS_LINE_KEY) ?? "null");
+    const current = global.localStorage?.getItem(STATUS_LINE_KEY);
+    const stored = JSON.parse(current ?? global.localStorage?.getItem("symphonai.status-line") ?? "null");
     return Object.fromEntries(Object.keys(DEFAULT_STATUS_FIELDS).map((key) => [
       key,
-      typeof stored?.[key] === "boolean" ? stored[key] : DEFAULT_STATUS_FIELDS[key],
+      key === "usage" && current == null ? true
+        : typeof stored?.[key] === "boolean" ? stored[key] : DEFAULT_STATUS_FIELDS[key],
     ]));
   } catch {
     return { ...DEFAULT_STATUS_FIELDS };
@@ -450,6 +452,13 @@ export async function start({ global, document, client }) {
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
   let conversation = conversationReply?.conversation ?? null;
+  let pendingNewChat = null;
+  function bindTranscriptLeader() {
+    if ((conversation?.session_id ?? null) !== currentSessionId) return;
+    const leader = conversation?.agents?.find((agent) => agent.parent_agent_id == null);
+    transcript.setRootAgentId(leader?.agent_id ?? null);
+  }
+  bindTranscriptLeader();
   let draftSaveTimer = null;
 
   async function refreshSessionLists() {
@@ -566,8 +575,6 @@ export async function start({ global, document, client }) {
   restoreDraft();
   let roadmapGoals = Array.isArray(initialRoadmap.goals) ? initialRoadmap.goals : [];
   let roadmapError = initialRoadmap.error;
-  let roadmapDraft = "";
-  let roadmapPending = false;
   let showRailTools = false;
   const settingsPane = element(document, "section", { className: "settings-pane" });
   const settingsSections = element(document, "nav", { className: "settings-sections" });
@@ -1905,17 +1912,16 @@ export async function start({ global, document, client }) {
   }
 
   function renderAgentViewHeader() {
+    showAgents();
     if (!agentView) {
       agentViewHeader.hidden = true;
       replace(agentViewHeader);
       form.hidden = false;
       return;
     }
-    const back = makeButton(document, "Back to conversation", closeAgentView, { className: "agent-conversation-back" });
     replace(
       agentViewHeader,
       element(document, "h2", { className: "agent-conversation-title", text: agentView.name }),
-      back,
     );
     agentViewHeader.hidden = false;
     form.hidden = true;
@@ -1935,6 +1941,7 @@ export async function start({ global, document, client }) {
     };
     agentTranscript.reset();
     agentTranscript.setSessionId(currentSessionId);
+    agentTranscript.setRootAgentId(rowData.agentId);
     renderAgentViewHeader();
     following = true;
     preserveChatScroll = true;
@@ -2026,6 +2033,7 @@ export async function start({ global, document, client }) {
   }
 
   async function openSession(runId) {
+    pendingNewChat = null;
     closeAgentView();
     const targetSession = [...sessions, ...archivedSessions].find((session) => session.run_id === runId);
     if (targetSession?.repo_root && targetSession.repo_root !== project.repo_root) {
@@ -2831,29 +2839,6 @@ export async function start({ global, document, client }) {
     }));
   }
 
-  async function saveRoadmapAction(action, { clearDraft = false } = {}) {
-    if (roadmapPending) return;
-    roadmapPending = true;
-    roadmapError = "";
-    renderRoadmapUI();
-    try {
-      const reply = await action();
-      if (Array.isArray(reply?.goals)) roadmapGoals = reply.goals;
-      if (clearDraft) roadmapDraft = "";
-      if (reply?.loop?.id) {
-        selectedLoopId = reply.loop.id;
-        selectedLoop = reply.loop;
-        loops = [reply.loop, ...loops.filter((loop) => loop.id !== reply.loop.id)];
-        await openRailTool("Loop");
-      }
-    } catch (error) {
-      roadmapError = errorText(error);
-    } finally {
-      roadmapPending = false;
-      renderRoadmapUI();
-    }
-  }
-
   async function refreshRoadmap() {
     const reply = await readRoadmap();
     if (reply.error) {
@@ -2866,30 +2851,8 @@ export async function start({ global, document, client }) {
   }
 
   function renderRoadmapUI() {
-    const form = element(document, "form", { className: "roadmap-add-form" });
-    const field = element(document, "input", { className: "roadmap-add-input" });
-    field.type = "text";
-    field.value = roadmapDraft;
-    field.setAttribute("aria-label", "Goal");
-    field.setAttribute("placeholder", "Add a goal");
-    field.disabled = roadmapPending;
-    listen(field, "input", () => {
-      roadmapDraft = field.value;
-      add.disabled = roadmapPending || !roadmapDraft.trim();
-    });
-    const add = makeButton(document, "Add goal");
-    add.type = "submit";
-    add.disabled = roadmapPending || !roadmapDraft.trim();
-    listen(form, "submit", (event) => {
-      event.preventDefault();
-      if (roadmapDraft.trim()) {
-        return saveRoadmapAction(() => boundary.addRoadmapGoal(roadmapDraft.trim()), { clearDraft: true });
-      }
-    });
-    append(form, field, add);
-
     const list = element(document, "ol", { className: "roadmap-goals" });
-    for (const [index, goal] of roadmapGoals.entries()) {
+    for (const goal of roadmapGoals) {
       const row = element(document, "li", { className: "roadmap-goal" });
       const detail = element(document, "div", { className: "roadmap-goal-detail" });
       if (typeof goal.loop_id === "string" && goal.loop_id) {
@@ -2904,30 +2867,13 @@ export async function start({ global, document, client }) {
         append(detail, element(document, "span", { className: "roadmap-goal-text", text: goal.goal }));
       }
       append(detail, element(document, "span", { className: "roadmap-goal-state", text: stateLabel(goal.state) }));
-      const actions = element(document, "div", { className: "roadmap-goal-actions" });
-      for (const [label, delta] of [["Move up", -1], ["Move down", 1]]) {
-        const button = makeButton(document, label);
-        button.disabled = roadmapPending || index + delta < 0 || index + delta >= roadmapGoals.length;
-        listen(button, "click", () => saveRoadmapAction(() => boundary.moveRoadmapGoal(goal.id, index + delta)));
-        append(actions, button);
-      }
-      const remove = makeButton(document, "Remove");
-      remove.disabled = roadmapPending;
-      listen(remove, "click", () => saveRoadmapAction(() => boundary.removeRoadmapGoal(goal.id)));
-      append(actions, remove);
-      if (["not_started", "cancelled"].includes(goal.state)) {
-        const start = makeButton(document, "Start");
-        start.disabled = roadmapPending;
-        listen(start, "click", () => saveRoadmapAction(() => boundary.startRoadmapGoal(goal.id)));
-        append(actions, start);
-      }
-      append(row, detail, actions);
+      append(row, detail);
       append(list, row);
     }
-    const children = [element(document, "h2", { text: "Roadmap" }), form];
+    const children = [element(document, "h2", { text: "Roadmap" })];
     if (roadmapError) children.push(element(document, "p", { className: "error", text: roadmapError }));
     if (roadmapGoals.length === 0 && !roadmapError) {
-      children.push(element(document, "p", { className: "roadmap-empty", text: "No goals yet." }));
+      children.push(element(document, "p", { className: "roadmap-empty", text: "No goals yet. Ask the leader to add one." }));
     }
     children.push(list);
     replace(roadmapRoot, ...children);
@@ -3561,16 +3507,29 @@ export async function start({ global, document, client }) {
   if (selectedRailTool === "Notes") void showNotes();
 
   function costText(cost) {
-    return cost && typeof cost.amount === "string" && typeof cost.currency === "string"
-      ? `${cost.currency} ${cost.amount}`
-      : "";
+    if (!cost || typeof cost.amount !== "string" || typeof cost.currency !== "string") return "";
+    let money = `${cost.currency} ${cost.amount}`;
+    const amount = Number(cost.amount);
+    const belowCent = amount > 0 && amount < 0.01;
+    if (Number.isFinite(amount)) {
+      try {
+        money = new Intl.NumberFormat(undefined, {
+          style: "currency", currency: cost.currency,
+        }).format(belowCent ? 0.01 : amount);
+        if (belowCent) money = `<${money}`;
+      } catch { /* Keep the currency code when Intl cannot format it. */ }
+    }
+    return `${cost.estimated ? "~" : ""}${money}`;
   }
 
   function usageText(usage) {
     if (!usage || !Number.isInteger(usage.total_tokens)) {
       return "";
     }
-    return [`${usage.total_tokens} tokens`, costText(usage.cost)].filter(Boolean).join(" · ");
+    const tokens = `${usage.total_tokens.toLocaleString()} tokens`;
+    const money = costText(usage.cost);
+    return money ? `${money} · ${tokens}`
+      : `${tokens} · ${usage.unpriced_model ? `no price for ${usage.unpriced_model}` : "no prices set"}`;
   }
 
   function showConversationUsage() {
@@ -3702,19 +3661,22 @@ export async function start({ global, document, client }) {
           ? description(tool, target)
           : "";
       const row = element(document, "div", { className: "agent-row" });
-      if (name !== "leader" && parentAgentId) {
+      if (agentView ? agentView.agentId === agentId : name === "leader") {
+        row.setAttribute("aria-current", "true");
+      }
+      if (name === "leader" || parentAgentId) {
         row.tabIndex = 0;
         row.setAttribute("role", "button");
-        row.setAttribute("aria-label", `Open ${name}'s conversation`);
+        row.setAttribute("aria-label", name === "leader" ? "Back to the conversation" : `Open ${name}'s conversation`);
         listen(row, "click", (event) => {
           event.stopPropagation?.();
-          return openAgentView({ agentId, parentAgentId, name });
+          return name === "leader" ? closeAgentView() : openAgentView({ agentId, parentAgentId, name });
         });
         listen(row, "keydown", (event) => {
           if (event.key !== "Enter") return;
           event.preventDefault();
           event.stopPropagation?.();
-          return openAgentView({ agentId, parentAgentId, name });
+          return name === "leader" ? closeAgentView() : openAgentView({ agentId, parentAgentId, name });
         });
       }
       append(row, element(document, "span", {
@@ -3797,6 +3759,8 @@ export async function start({ global, document, client }) {
     try {
       const reply = await boundary.conversationStats();
       conversation = reply?.conversation ?? null;
+      bindTranscriptLeader();
+      showTranscript();
       showInstructionWarnings(conversation);
       if (permittedModes.includes(conversation?.mode)) {
         currentMode = conversation.mode;
@@ -4051,12 +4015,15 @@ export async function start({ global, document, client }) {
           attachments: (action.attachments ?? []).map(({ kind, filename }) => ({ kind, filename })),
         };
         if (presentation.attachments.length > 0) promptAttachments.push(presentation);
+        const startingChat = currentSessionId === null ? { frames: [] } : null;
+        if (startingChat) pendingNewChat = startingChat;
         try {
           const reply = await boundary.prompt(
             action.text,
             (action.attachments ?? []).map(({ data, filename }) => ({ data, ...(filename ? { filename } : {}) })),
           );
           if (reply?.conflict === true) {
+            if (pendingNewChat === startingChat) pendingNewChat = null;
             const pendingIndex = promptAttachments.indexOf(presentation);
             if (pendingIndex !== -1) promptAttachments.splice(pendingIndex, 1);
             const active = await activeRuntimeRun();
@@ -4088,6 +4055,11 @@ export async function start({ global, document, client }) {
             }
             promptFailure = previewClearError;
             await perform(turn.accepted());
+            await refreshConversation();
+            if (startingChat && pendingNewChat === startingChat) {
+              while (startingChat.frames.length) await onFrame(startingChat.frames.shift(), true);
+              if (pendingNewChat === startingChat) pendingNewChat = null;
+            }
             try {
               await refreshSessionLists();
               showProjects();
@@ -4096,6 +4068,7 @@ export async function start({ global, document, client }) {
             }
           }
         } catch (error) {
+          if (pendingNewChat === startingChat) pendingNewChat = null;
           const pendingIndex = promptAttachments.indexOf(presentation);
           if (pendingIndex !== -1) promptAttachments.splice(pendingIndex, 1);
           turn.rejected(String(error));
@@ -5317,7 +5290,11 @@ export async function start({ global, document, client }) {
     return false;
   }
 
-  async function onFrame(frame) {
+  async function onFrame(frame, held = false) {
+    if (!held && pendingNewChat && typeof frame.payload?.session_id === "string") {
+      pendingNewChat.frames.push(frame);
+      return;
+    }
     if (frame.kind === "approval_requested") {
       const payload = frame.payload ?? {};
       if (typeof payload.approval_id === "string" && typeof payload.diff === "string") {
@@ -5350,6 +5327,7 @@ export async function start({ global, document, client }) {
       return;
     }
     if (frame.kind === "event" && frame.payload?.type === "LoopChanged") {
+      if (frame.payload.change === "roadmap") { await refreshRoadmap(); return; }
       const loopId = frame.payload.loop_id;
       if (typeof loopId === "string" && typeof frame.payload.state === "string") {
         roadmapGoals = roadmapGoals.map((goal) => goal.loop_id === loopId

@@ -130,14 +130,19 @@ def _tool_result_event_fields(
     output = ""
     output_truncated = False
     hidden_output_tools = {
-        "dispatch_subagent", "update_plan", "ask_user", "propose_plan",
+        "update_plan", "ask_user", "propose_plan",
         *FILE_EDIT_TOOLS,
     }
     if (
         tool_name not in hidden_output_tools
-        and not (isinstance(result.payload, dict) and result.payload.get("kind") == "file_diff")
+        and (tool_name == "dispatch_subagent" or not (
+            isinstance(result.payload, dict) and result.payload.get("kind") == "file_diff"
+        ))
     ):
         text = tool_result_text(result)
+        if tool_name == "dispatch_subagent":
+            from symphonai_api.secrets import mask_secrets
+            text = mask_secrets(text)
         output = text[:4000]
         output_truncated = len(text) > 4000
     defaults: dict[str, str | int | bool] = {
@@ -153,7 +158,7 @@ def _tool_result_event_fields(
     payload = result.payload
     if not result.ok or not isinstance(payload, dict):
         return defaults
-    if payload.get("kind") != "file_diff":
+    if tool_name == "dispatch_subagent" or payload.get("kind") != "file_diff":
         return defaults
     path = payload.get("path")
     lines_added = payload.get("lines_added")

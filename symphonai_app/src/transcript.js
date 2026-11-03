@@ -54,7 +54,7 @@ function diffResult(fields) {
     : null;
 }
 
-export function createTranscript({ now = () => Date.now() } = {}) {
+export function createTranscript({ now = () => Date.now(), rootAgentId: initialRootAgentId = null } = {}) {
   const model = [];
   const calls = new Map();
   const questions = new Map();
@@ -63,7 +63,8 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   let turnSerial = 0;
   let sessionId = null;
   let activeTurn = null;
-  let rootAgentId = null;
+  let rootAgentId = typeof initialRootAgentId === "string" && initialRootAgentId ? initialRootAgentId : null;
+  const heldFrames = [];
   let currentPrompt = null;
   const activityTurns = new Map();
   const thoughtTurns = new Map();
@@ -71,6 +72,11 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   const promptUndone = new Map();
   const promptStarts = new Map();
   const dispatchCalls = [];
+  const otherCalls = new Map();
+
+  function otherAgent(agentId) {
+    return rootAgentId !== null && typeof agentId === "string" && agentId !== rootAgentId;
+  }
 
   function appendTurnTime(prompt, endedAt, outcome, error = "") {
     const startValue = promptStarts.get(prompt);
@@ -146,6 +152,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   }
 
   function recordDecision(entry, toolCallId) {
+    if (otherCalls.has(toolCallId)) return () => {};
     const previous = pendingDecisions.get(toolCallId);
     const index = model.indexOf(previous);
     const decision = index === -1 ? entry : { ...previous, ...entry };
@@ -179,6 +186,10 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     question.resolved = true;
     question.allowed = allowed;
     question.reason = reason;
+    if (otherAgent(question.agentId)) {
+      const index = model.indexOf(question);
+      if (index !== -1) model.splice(index, 1);
+    }
   }
 
   function appendEditCard(prompt, edits, { canUndo = false, undone = false } = {}) {
@@ -268,6 +279,27 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   function applyEvent(event) {
     const { type, fields } = event;
     if (type === "PreviewMarkAdded") return;
+    if (otherAgent(fields.agent_id) && type !== "PromptSubmitted" && type !== "PermissionRequested") {
+      if (type === "ToolCallStarted" && !otherCalls.has(fields.tool_call_id)) {
+        otherCalls.set(fields.tool_call_id, false);
+      }
+      if (type === "ToolCallFinished") {
+        const edit = fields.ok && diffResult(fields);
+        if (edit && currentPrompt !== null && !otherCalls.get(fields.tool_call_id)) {
+          promptEdits.get(currentPrompt)?.push(edit);
+        }
+        otherCalls.set(fields.tool_call_id, true);
+      }
+      if (["ToolCallStarted", "ToolCallFinished", "ToolCallFailed", "PermissionDenied"].includes(type)) {
+        resolveQuestion(fields, type !== "PermissionDenied" && fields.ok !== false, fields.reason ?? fields.error ?? "");
+      }
+      if (type === "RunFinished" || type === "RunFailed") {
+        for (const [id, question] of questions) {
+          if (question.agentId === fields.agent_id) resolveQuestion({ tool_call_id: id }, false);
+        }
+      }
+      return;
+    }
     if (type === "AutoReviewed") {
       model.push({ type: "auto-reviewed", ...fields });
       return;
@@ -381,13 +413,16 @@ export function createTranscript({ now = () => Date.now() } = {}) {
             });
             const record = calls.get(toolCall.id);
             if (record) {
-              record.call.status = "settled";
+              record.call.status = toolCall.ok === false ? "failed" : toolCall.ok === true ? "succeeded" : "settled";
               if (typeof toolCall.task === "string") record.call.task = toolCall.task;
+              record.call.output = typeof toolCall.output === "string" ? toolCall.output : "";
+              record.call.outputTruncated = toolCall.output_truncated === true;
+              if (typeof toolCall.error === "string") record.call.error = toolCall.error;
               calls.delete(toolCall.id);
             }
             continue;
           }
-          if (["update_plan", "ask_user", "propose_plan", "write_file", "edit_file", "multi_edit_file"].includes(toolCall.name)) continue;
+          if (["update_plan", "ask_user", "propose_plan"].includes(toolCall.name)) continue;
           appendActivity({
             agent_id: fields.agent_id,
             run_id: fields.run_id,
@@ -505,7 +540,8 @@ export function createTranscript({ now = () => Date.now() } = {}) {
         return;
       }
       record.call.status = fields.ok ? "succeeded" : "failed";
-      record.call.output = typeof fields.output === "string" ? fields.output : "";
+      record.call.output = record.call.name === "dispatch_subagent" && !fields.ok ? ""
+        : typeof fields.output === "string" ? fields.output : "";
       record.call.outputTruncated = fields.output_truncated === true;
       return;
     }
@@ -665,6 +701,7 @@ export function createTranscript({ now = () => Date.now() } = {}) {
   function apply(frame) {
     const frameSessionId = frame?.payload?.session_id;
     if (typeof frameSessionId === "string" && frameSessionId !== sessionId) {
+      if (sessionId === null) heldFrames.push(frame);
       return;
     }
     const dropped = frame?.dropped ?? frame?.payload?.dropped;
@@ -674,7 +711,8 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     }
     const event = unpack(frame);
     if (event !== null) {
-      applyEvent(event);
+      if (rootAgentId === null) heldFrames.push(frame);
+      else applyEvent(event);
     }
   }
 
@@ -689,9 +727,11 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     promptUndone.clear();
     promptStarts.clear();
     dispatchCalls.length = 0;
+    otherCalls.clear();
     turnSerial = 0;
     activeTurn = null;
     rootAgentId = null;
+    heldFrames.length = 0;
     currentPrompt = null;
   }
 
@@ -707,10 +747,12 @@ export function createTranscript({ now = () => Date.now() } = {}) {
       promptUndone: new Map(promptUndone),
       promptStarts: new Map(promptStarts),
       dispatchCalls: [...dispatchCalls],
+      otherCalls: new Map(otherCalls),
       turnSerial,
       sessionId,
       activeTurn,
       rootAgentId,
+      heldFrames: [...heldFrames],
       currentPrompt,
     };
   }
@@ -727,10 +769,12 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     for (const [key, value] of state.promptUndone) promptUndone.set(key, value);
     for (const [key, value] of state.promptStarts) promptStarts.set(key, value);
     dispatchCalls.push(...state.dispatchCalls);
+    for (const [key, value] of state.otherCalls) otherCalls.set(key, value);
     turnSerial = state.turnSerial;
     sessionId = state.sessionId;
     activeTurn = state.activeTurn;
     rootAgentId = state.rootAgentId;
+    heldFrames.push(...state.heldFrames);
     currentPrompt = state.currentPrompt;
   }
 
@@ -742,6 +786,15 @@ export function createTranscript({ now = () => Date.now() } = {}) {
     restore,
     setSessionId(value) {
       sessionId = typeof value === "string" ? value : null;
+      if (rootAgentId !== null) {
+        for (const frame of heldFrames.splice(0)) apply(frame);
+      }
+    },
+    setRootAgentId(value) {
+      rootAgentId = typeof value === "string" && value ? value : null;
+      if (rootAgentId !== null) {
+        for (const frame of heldFrames.splice(0)) apply(frame);
+      }
     },
     get model() {
       return model;

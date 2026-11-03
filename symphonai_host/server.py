@@ -254,6 +254,7 @@ class HostServer:
         self._runtimes_lock = threading.RLock()
         self._event_session_ids: dict[str, str] = {}
         if initial_runtime is not None and self._current_root is not None:
+            initial_runtime.run._roadmap_tools_enabled = True
             self._runtimes[self._current_root] = initial_runtime
         self._watch_stop = threading.Event()
         self._event_watch: threading.Thread | None = None
@@ -367,6 +368,7 @@ class HostServer:
             }
             provider = current.provider if current is not None else self._default_provider
             runtime = self._project_factory(resolved, self.broker, self._publish_approval)
+            runtime.run._roadmap_tools_enabled = True
             with self._runtimes_lock:
                 self._runtimes[resolved] = runtime
             if provider is not None:
@@ -1615,37 +1617,6 @@ class HostServer:
                     loop = host.run.start_loop(payload['goal'])
                 return _Reply(HTTPStatus.OK, {'loop': loop, 'session_id': loop['planner_session_id']})
 
-            def _post_roadmap_add(self, payload):
-                with self._errors(0):
-                    with host.run._lock:
-                        roadmap_store = RoadmapStore(host.run._repo_root)
-                        roadmap = roadmap_store.load()
-                        if self._route.action == 'add':
-                            goal_text = payload['goal'].strip()
-                            if not goal_text:
-                                raise ProtocolError('goal must not be blank')
-                            roadmap_store.add(roadmap, goal_text)
-                        else:
-                            item = roadmap_store.find(roadmap, payload['id'])
-                            if item is None:
-                                return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
-                            if self._route.action == 'remove':
-                                roadmap['goals'].remove(item)
-                            else:
-                                index = payload.get('index')
-                                if not 0 <= index < len(roadmap['goals']):
-                                    raise ProtocolError('index must be between 0 and the last goal index')
-                                roadmap['goals'].remove(item)
-                                roadmap['goals'].insert(index, item)
-                        roadmap_store.save(roadmap)
-                        reply = roadmap_store.reply(roadmap)
-                return _Reply(HTTPStatus.OK, reply)
-
-            def _post_roadmap_start(self, payload):
-                with self._errors(0):
-                    roadmap_reply, loop = host.run.start_roadmap_goal(payload['id'])
-                return _Reply(HTTPStatus.OK, {**roadmap_reply, 'loop': loop, 'session_id': loop['planner_session_id']})
-
             def _post_loop_plan(self, payload):
                 with self._errors(0):
                     loop_id, action = (payload.get('loop_id'), payload.get('action'))
@@ -2174,29 +2145,6 @@ class HostServer:
                 match='exact',
                 payload=_Payload({'goal': str}, ('goal',), extra=False),
                 errors=(((ProtocolError, 'bad_request'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
-            ),
-            _Route('POST', '/roadmap/add', Handler._post_roadmap_add,
-                match='exact',
-                payload=_Payload({'goal': str}, ('goal',), extra=False),
-                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request')),),
-                action='add',
-            ),
-            _Route('POST', '/roadmap/remove', Handler._post_roadmap_add,
-                match='exact',
-                payload=_Payload({'id': str}, ('id',), extra=False),
-                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request')),),
-                action='remove',
-            ),
-            _Route('POST', '/roadmap/move', Handler._post_roadmap_add,
-                match='exact',
-                payload=_Payload({'id': str, 'index': int}, ('id', 'index'), extra=False),
-                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request')),),
-                action='move',
-            ),
-            _Route('POST', '/roadmap/start', Handler._post_roadmap_start,
-                match='exact',
-                payload=_Payload({'id': str}, ('id',), extra=False),
-                errors=(((InvalidRoadmap, 'invalid_roadmap'), (ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run'), (ValueError, 'bad_request')),),
             ),
             _Route('POST', '/loop/plan', Handler._post_loop_plan,
                 match='exact',

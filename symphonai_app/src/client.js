@@ -263,22 +263,6 @@ export function createClient({
       return request("GET", "/roadmap");
     },
 
-    addRoadmapGoal(goal) {
-      return request("POST", "/roadmap/add", { goal }, readReply, { detailOnError: true });
-    },
-
-    removeRoadmapGoal(id) {
-      return request("POST", "/roadmap/remove", { id }, readReply, { detailOnError: true });
-    },
-
-    moveRoadmapGoal(id, index) {
-      return request("POST", "/roadmap/move", { id, index }, readReply, { detailOnError: true });
-    },
-
-    startRoadmapGoal(id) {
-      return request("POST", "/roadmap/start", { id }, readReply, { detailOnError: true });
-    },
-
     approve(id, allowed, reason = "", remember = false, answerText = "") {
       return post("approval", {
         approval_id: id,

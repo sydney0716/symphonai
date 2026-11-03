@@ -82,6 +82,17 @@ class RoadmapStore:
             goal["done"] = True
             self.save(roadmap)
 
+    def record_loop(self, loop_id: str, text: str, goal_id: str | None = None) -> None:
+        roadmap = self.load()
+        if any(goal["loop_id"] == loop_id for goal in roadmap["goals"]):
+            return
+        goal = self.find(roadmap, goal_id) if goal_id is not None else self.add(roadmap, text)
+        if goal is None:
+            raise KeyError(goal_id)
+        goal["loop_id"] = loop_id
+        goal["done"] = False
+        self.save(roadmap)
+
     def reply(self, roadmap: dict) -> dict:
         from symphonai_host.loops import LoopStore
 

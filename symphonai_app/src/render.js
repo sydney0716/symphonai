@@ -459,11 +459,13 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
         : call.status === "failed"
           ? ` (failed${call.error ? `: ${call.error}` : ""})`
           : "";
+      const finished = call.name === "dispatch_subagent" && call.status === "succeeded"
+        && call.output && call.output !== `subagent ${call.target} is running` ? " (finished)" : "";
       const memoryTarget = call.target !== null && ["remember", "forget"].includes(call.name);
       const targetText = call.target === null
         ? ""
         : memoryTarget ? ` "${call.target}"` : ` ${call.target}`;
-      sentence += `${separator}${label}${targetText}${failure}`;
+      sentence += `${separator}${label}${targetText}${failure}${finished}`;
       return [
         ...(separator ? [element(document, "span", { text: separator })] : []),
         element(document, "span", { text: label }),
@@ -472,6 +474,7 @@ function renderActivity(document, entry, _parseMarkdown, actions) {
           ...(memoryTarget ? [] : [renderPathCode(document, call.target, actions)]),
         ]),
         ...(failure ? [element(document, "span", { text: failure })] : []),
+        ...(finished ? [element(document, "span", { text: finished })] : []),
       ];
     }),
     ...(!endsWithQuotedMemory
@@ -659,14 +662,17 @@ function renderQuestion(document, entry) {
 
 function renderSubagentNotice(document, entry, _parseMarkdown, actions) {
   let fullText = entry.text;
+  let failure = "";
   if (entry.kind === "finished") {
     try {
       const result = JSON.parse(fullText);
       fullText = [result.content, result.error].filter(Boolean).join("\n");
+      if (result.ok === false) failure = result.error || "subagent did not finish";
     } catch { /* A peer may send the result as plain text. */ }
   }
   const preview = String(fullText).split("\n")[0].slice(0, 160);
-  const label = entry.kind === "finished" ? `${entry.name} finished`
+  const label = entry.kind === "finished" ? failure
+    ? `${entry.name} failed: ${String(failure).split("\n")[0].slice(0, 160)}` : `${entry.name} finished`
     : entry.kind === "progress" ? `${entry.name}: ${preview}`
       : entry.kind === "question" ? `${entry.name} asks: ${preview}`
         : entry.name ? `To ${entry.name}: ${preview}` : `From the leader: ${preview}`;

@@ -135,6 +135,9 @@ carry a null key, an empty edits list, and false. These fields contain
 repository-relative paths only; they do not include file contents or diffs.
 Replayed tool calls carry `id` and `name`; `dispatch_subagent` calls also carry
 their `subagent_name` and `task` so clients can show the dispatch after reopen.
+When a saved dispatch result exists, its replay also includes `ok`. Successful
+dispatches include secret-masked `output`, limited to 4,000 characters, and
+`output_truncated`; failed dispatches include the masked `error` reason.
 Root user messages carry `turn_started_at` as an ISO-8601 UTC string. Exactly
 one replayed record for each root run carries `turn_ended_at` and
 `turn_outcome` (`finished`, `cancelled`, or `failed`): the final assistant
@@ -191,11 +194,21 @@ line remains machine-readable for a parent process.
 ### Roadmap
 
 Each project keeps its ordered goals in `.symphonai/roadmap.json`. Authenticated
-`GET /roadmap` returns the goals and their linked loop state. `POST /roadmap/add`
-accepts `{"goal": str}`, `/roadmap/remove` accepts `{"id": str}`, and
-`/roadmap/move` accepts `{"id": str, "index": int}`. These operations update
-only the roadmap. `POST /roadmap/start` accepts `{"id": str}`, starts a spec
-loop for that goal, and links the loop to it. A goal can be started again only
+`GET /roadmap` returns the goals and their linked loop state. The Roadmap tab
+is read-only progress: it has no goal input or Add/Move/Remove/Start controls.
+Goals with a loop open it in the Loop tab. Empty roadmaps say "No goals yet.
+Ask the leader to add one." The former POST routes `/roadmap/add`,
+`/roadmap/remove`, `/roadmap/move` and `/roadmap/start` return 404.
+
+App conversation leaders receive `list_roadmap`, `add_roadmap_goal(goal)`,
+`start_roadmap_goal(goal_id)` and `remove_roadmap_goal(goal_id)`; headless run
+and review do not. Tools change the roadmap only when the person asks. Each
+returns the GET response shape; start also returns a top-level `loop_id`.
+Unknown ids and already-started goals return tool errors with a reason.
+Removing a goal never removes its loop. Add/remove emit `LoopChanged` with
+`change: "roadmap"`; ordinary loop changes also refresh the tab. Every loop
+started in the app is recorded with its goal before its initial event, including
+loops started through the chat composer's spec mode. A goal can be started again only
 when its linked loop was cancelled. Approving a loop at its commit checkpoint
 marks its linked roadmap goal done. Invalid roadmap files return `409` and are
 left unchanged.
@@ -371,8 +384,13 @@ Each role may set any subset of the four limit keys. Turn and token limits are
 positive integers, wall time is a positive finite number of seconds, and cost
 is a quoted non-negative decimal. `price_table` names a version-1 JSON price
 table, relative to the config file containing that key (or the repository root
-for a session override). A host-supplied price table is used when no path is
-configured. A cost limit with no price for the requested model stops before
+for a session override). When no path is configured, the host loads
+`~/.symphonai/prices.json` if present (respecting `SYMPHONAI_HOME`); invalid
+default files report their path. A named table wins over this default. A
+host-supplied table is used if neither path is present. Conversation usage
+includes leader and subagent totals, with `unpriced_model` naming the first
+model missing from a loaded table when no complete cost is available.
+A cost limit with no price for the requested model stops before
 the first request with `budget_cost_unpriced`. A subagent definition's own budget is narrowed by the configured subagent
 ceiling. There is no turn limit unless one is configured. The leader budget's
 `max_turns` takes precedence over the host's `--max-turns`; without a leader
@@ -1012,3 +1030,10 @@ their tool call by tool_call_id during history replay. The app renders
 `Auto-approved: …` or `Auto-denied: …` beside the call. They are not person
 prompts and are not sent as model messages. This separate record preserves
 decisions for refused calls and failed actions without rewriting tool output.
+
+Live `ToolCallFinished` for `dispatch_subagent` includes the text the leader
+received as `output`, secret-masked before truncation to 4,000 characters,
+with `output_truncated` indicating omitted text. This uses the same bound and
+masking as replayed dispatch output. Plan/question/proposal and file-edit
+outputs remain hidden as before; dispatch failures continue to use the
+existing ToolCallFailed reason in chat.

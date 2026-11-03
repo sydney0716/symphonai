@@ -1,8 +1,12 @@
 import test from "node:test";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { start } from "../src/app.js";
 import { createClient } from "../src/client.js";
 import { renderMemorySettings } from "../src/settings.js";
+import { createTranscript } from "../src/transcript.js";
+import { renderTranscript } from "../src/render.js";
+import { parseMarkdown } from "../src/markdown.js";
 
 // A small DOM with real parent/child and textContent semantics. Missing ids
 // return null, and operations on a non-child fail rather than hiding a crash.
@@ -156,7 +160,7 @@ function scriptedClient() {
     roadmap: async () => ({ goals: [] }),
     settings: async () => ({ settings: { mode: "allow", providers: [{ name: "openai", key_present: true }] } }),
     health: async () => ({ state: "idle", runtime_run_id: null }),
-    conversationStats: async () => ({ conversation: null }),
+    conversationStats: async () => ({ conversation: { agents: [{ agent_id: "core-agent", name: "leader", parent_agent_id: null }] } }),
     approvals: async () => ({ pending: [] }),
     approve: async () => ({ resolved: true }),
     stop: async () => ({ accepted: true }),
@@ -558,6 +562,203 @@ test("page starts against the scripted client", async () => {
   assert.equal(document.getElementById("chat").textContent, "");
 });
 
+test("leader row returns from an agent view by click or Enter and preserves scroll", async () => {
+  const script = scriptedClient();
+  script.client.openSession = async () => ({});
+  script.client.conversationStats = async () => ({ conversation: {
+    session_id: "session", agents: [
+      { agent_id: "root", name: "leader", parent_agent_id: null, state: "finished" },
+      { agent_id: "worker", name: "worker", parent_agent_id: "root", state: "finished" },
+    ],
+  } });
+  script.client.agentHistory = async () => ({ messages: [{ role: "assistant", text: "Worker answer" }] });
+  const document = new Document();
+  const app = await start({ global: browser(), document, client: script.client });
+  const chat = document.getElementById("chat");
+  for (const keyboard of [false, true]) {
+    chat.scrollTop = 123;
+    await chat.dispatch("scroll");
+    const worker = () => find(document.body, node => node.getAttribute?.("aria-label") === "Open worker's conversation");
+    await worker().click();
+    assert.equal(worker().getAttribute("aria-current"), "true");
+    assert.equal(find(document.body, node => node.className === "agent-conversation-back"), null);
+    assert.match(chat.textContent, /Worker answer/);
+    const leader = find(document.body, node => node.getAttribute?.("aria-label") === "Back to the conversation");
+    assert.equal(leader.getAttribute("role"), "button");
+    if (keyboard) await leader.dispatch("keydown", { key: "Enter" });
+    else await leader.click();
+    assert.equal(chat.scrollTop, 123);
+    assert.equal(worker().getAttribute("aria-current"), null);
+    assert.doesNotMatch(chat.textContent, /Worker answer/);
+  }
+  app.subscription.close();
+});
+
+test("Usage defaults on, explains missing prices, migrates once and keeps new choices", async () => {
+  const global = browser();
+  global.localStorage.setItem("symphonai.status-line", JSON.stringify({ usage: false, model: false }));
+  const script = scriptedClient();
+  script.client.openSession = async () => ({});
+  const usage = { total_tokens: 182340, cost: { amount: "0.42", currency: "USD", estimated: true } };
+  script.client.conversationStats = async () => ({ conversation: { session_id: "session", usage } });
+  const document = new Document();
+  const app = await start({ global, document, client: script.client });
+  assert.match(document.body.textContent, /~\$0\.42 · 182,340 tokens/);
+  global.location.hash = "#/settings/general";
+  await find(document.body, node => node.className === "icon-settings").click();
+  const checkbox = find(document.body, node => node.getAttribute?.("aria-label") === "Usage");
+  assert.equal(checkbox.checked, true);
+  checkbox.checked = false;
+  await checkbox.dispatch("change");
+  assert.equal(JSON.parse(global.localStorage.getItem("symphonai.status-line.v2")).usage, false);
+  app.subscription.close();
+  const nextDocument = new Document();
+  const next = await start({ global, document: nextDocument, client: script.client });
+  await find(nextDocument.body, node => node.className === "icon-settings").click();
+  assert.equal(find(nextDocument.body, node => node.getAttribute?.("aria-label") === "Usage").checked, false);
+  next.subscription.close();
+  for (const reason of [null, "grok-4.20-0309-non-reasoning"]) {
+    const fresh = browser();
+    script.client.conversationStats = async () => ({ conversation: {
+      session_id: "session", usage: { total_tokens: 182340, ...(reason ? { unpriced_model: reason } : {}) },
+    } });
+    const doc = new Document();
+    const instance = await start({ global: fresh, document: doc, client: script.client });
+    assert.ok(doc.body.textContent.includes(reason ? `no price for ${reason}` : "no prices set"));
+    instance.subscription.close();
+  }
+});
+
+test("conversation costs use standard decimals and a below-cent indicator", async () => {
+  for (const [amount, estimated, currency, expected] of [
+    ["1.234567", false, "USD", "$1.23"],
+    ["0.000428", false, "USD", "<$0.01"],
+    ["0", false, "USD", "$0.00"],
+    ["0.42", true, "USD", "~$0.42"],
+    ["12.345678", false, "USD", "$12.35"],
+    ["0.000428", true, "USD", "~<$0.01"],
+    ["1.234567", true, "credits", "~credits 1.234567"],
+  ]) {
+    const script = scriptedClient();
+    script.client.openSession = async () => ({});
+    script.client.conversationStats = async () => ({ conversation: {
+      session_id: "session", usage: { total_tokens: 10, cost: { amount, currency, estimated } },
+    } });
+    const document = new Document();
+    const app = await start({ global: browser(), document, client: script.client });
+    assert.ok(document.body.textContent.includes(`${expected} · 10 tokens`), document.body.textContent);
+    app.subscription.close();
+  }
+});
+
+test("main transcript hides child work but retains exchanges, pending approvals and child edit totals", () => {
+  const main = createTranscript({ now: () => 0, rootAgentId: "root" });
+  const worker = createTranscript({ now: () => 0, rootAgentId: "child" });
+  const event = (type, agent_id, fields = {}) => ({ kind: "event", payload: {
+    type, agent_id, run_id: agent_id === "root" ? "root-run" : "child-run", ...fields,
+  } });
+  main.apply(event("PromptSubmitted", "root", { text: "Person's request", checkpoint_key: "checkpoint" }));
+  main.apply(event("AssistantTextDelta", "root", { text: "Leader text" }));
+  main.apply(event("PlanChanged", "root", { steps: [{ step: "Delegate", status: "in_progress" }] }));
+  main.apply(event("AutoReviewed", "root", { tool_call_id: "root-review", reason: "Leader review" }));
+  main.apply(event("ToolCallStarted", "root", { tool_call_id: "dispatch", tool_name: "dispatch_subagent", target: "worker" }));
+  main.apply(event("SubagentSpawned", "root", { subagent_name: "worker", subagent_agent_id: "child" }));
+  const child = (type, fields = {}) => {
+    const frame = event(type, "child", fields);
+    main.apply(frame); worker.apply(frame);
+  };
+  child("RunStarted");
+  child("PromptSubmitted", { text: "Worker task" });
+  child("ToolCallStarted", { tool_call_id: "read", tool_name: "read_file", target: "fixture.txt" });
+  child("PermissionRequested", { tool_call_id: "read", tool_name: "read_file", mode: "ask" });
+  assert.ok(main.model.some(entry => entry.type === "question" && !entry.resolved));
+  main.recordDecision({ type: "user-question", question: "Child question", answer: "Yes" }, "read");
+  child("ToolCallFinished", { tool_call_id: "read", ok: true, output: "Private read output" });
+  assert.ok(!main.model.some(entry => entry.type === "question"));
+  child("ToolCallStarted", { tool_call_id: "write", tool_name: "write_file", target: "worker.txt" });
+  const edit = { tool_call_id: "write", ok: true, result_kind: "file_diff", result_path: "worker.txt",
+    lines_added: 3, lines_removed: 1, diff: "-old\n+new" };
+  child("ToolCallFinished", edit);
+  main.apply(event("ToolCallFinished", "child", edit));
+  child("AssistantTextDelta", { text: "Private worker answer" });
+  child("AssistantReasoningDelta", { text: "Private worker thought" });
+  child("PlanChanged", { steps: [{ step: "Private plan", status: "completed" }] });
+  child("AutoReviewed", { reason: "Private review" });
+  child("RunFinished", { stopped_reason: "final_response" });
+  for (const [kind, text] of [["progress", "Progress message"], ["question", "Agent asks"], ["message", "Leader sent"]]) {
+    main.apply(event("SubagentNotice", "root", { subagent_name: "worker", kind, text }));
+  }
+  main.apply(event("ToolCallFinished", "root", { tool_call_id: "dispatch", ok: true, output: "Delivered result", output_truncated: false }));
+  main.apply(event("RunFinished", "root", { stopped_reason: "final_response" }));
+  assert.ok(!main.model.some(entry => entry.agentId === "child"));
+  assert.ok(!main.model.some(entry => entry.type === "user-question"));
+  assert.equal(main.model.filter(entry => entry.type === "subagent-notice").length, 3);
+  assert.ok(main.model.some(entry => entry.type === "auto-reviewed" && entry.reason === "Leader review"));
+  assert.deepEqual(main.model.find(entry => entry.type === "edit-card").files, [{ path: "worker.txt", added: 3, removed: 1 }]);
+  assert.ok(worker.model.some(entry => entry.type === "edit" && entry.path === "worker.txt"));
+  assert.ok(worker.model.some(entry => entry.type === "text" && entry.text === "Private worker answer"));
+  assert.ok(worker.model.some(entry => entry.type === "thought" && entry.text === "Private worker thought"));
+  assert.ok(worker.model.some(entry => entry.type === "activity" && entry.calls.some(call => call.name === "read_file")));
+});
+
+test("dispatch results and failure reasons render equally from supplied live events and history", async () => {
+  for (const error of [null, "dispatch refused: missing Validation section", "validation failed after 5 rounds"]) {
+    const live = createTranscript({ rootAgentId: "root" });
+    const replay = createTranscript({ rootAgentId: "root" });
+    const frame = (type, fields) => ({ kind: "event", payload: { type, agent_id: "root", run_id: "run", ...fields } });
+    live.apply(frame("PromptSubmitted", { text: "Request" }));
+    live.apply(frame("ToolCallStarted", { tool_call_id: "dispatch", tool_name: "dispatch_subagent", target: "worker" }));
+    live.apply(frame("ToolCallFinished", { tool_call_id: "dispatch", ok: !error, output: error ? "" : "Delivered result" }));
+    if (error) live.apply(frame("ToolCallFailed", { tool_call_id: "dispatch", error }));
+    replay.apply(frame("HistoryMessage", { role: "user", text: "Request" }));
+    replay.apply(frame("HistoryMessage", { role: "assistant", tool_calls: [{
+      id: "dispatch", name: "dispatch_subagent", subagent_name: "worker", ok: !error,
+      ...(error ? { error } : { output: "Delivered result", output_truncated: false }),
+    }] }));
+    const document = new Document();
+    const roots = [document.createElement("div"), document.createElement("div")];
+    for (const [index, transcript] of [live, replay].entries()) {
+      const root = roots[index];
+      renderTranscript(document, root, transcript.model, parseMarkdown, {
+        rerender: () => renderTranscript(document, root, transcript.model, parseMarkdown),
+      });
+      if (error) assert.ok(root.textContent.includes(error));
+      else {
+        assert.match(root.textContent, /worker \(finished\)/);
+        assert.ok(!root.textContent.includes("Delivered result"));
+        await find(root, node => node.getAttribute?.("aria-expanded") === "false").click();
+        assert.ok(root.textContent.includes("Delivered result"));
+      }
+    }
+    assert.equal(roots[0].textContent, roots[1].textContent);
+  }
+});
+
+test("Roadmap is read-only, refreshes on changes and opens its linked loop", async () => {
+  const script = scriptedClient();
+  let goals = [];
+  script.client.roadmap = async () => ({ goals });
+  script.client.loops = async () => ({ loops: [{ id: "loop_fixture", goal: "x", state: "awaiting_plan" }] });
+  const opened = [];
+  script.client.loop = async id => { opened.push(id); return { loop: { id, goal: "x", state: "awaiting_plan", cards: [], lanes: [] } }; };
+  const document = new Document();
+  const app = await start({ global: browser(), document, client: script.client });
+  await app.openTool("Roadmap");
+  const root = document.getElementById("roadmap");
+  assert.match(root.textContent, /No goals yet. Ask the leader to add one./);
+  assert.equal(find(root, node => node.tagName === "INPUT"), null);
+  goals = [{ id: "goal_fixture", goal: "x", loop_id: "loop_fixture", state: "awaiting_plan" }];
+  await script.emit("LoopChanged", { change: "roadmap", loop_id: "", state: "" });
+  assert.match(root.textContent, /Awaiting plan/);
+  for (const label of ["Add goal", "Move up", "Move down", "Remove", "Start"]) {
+    assert.equal(find(root, node => node.tagName === "BUTTON" && node.textContent === label), null);
+  }
+  await find(root, node => node.className === "roadmap-goal-link").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(opened.includes("loop_fixture"));
+  app.subscription.close();
+});
+
 test("prompt renders the reply and keeps tool output collapsed until opened", async () => {
   const document = new Document();
   const script = scriptedClient();
@@ -853,6 +1054,7 @@ test("leader notes show before the answer and replay without becoming prompts", 
   const live = document.getElementById('chat').textContent;
   assert.ok(live.indexOf('Leader: halfway') < live.indexOf('Finished work'));
   app.transcript.reset();
+  app.transcript.setRootAgentId("core-agent");
   await script.emit('HistoryMessage', { role: 'assistant', text: '', tool_calls: [
     { id: 'note', name: 'notify_person', text: 'halfway' },
   ] });
@@ -861,4 +1063,262 @@ test("leader notes show before the answer and replay without becoming prompts", 
   assert.equal(app.transcript.model.filter((entry) => entry.type === 'person-notice').length, 1);
   assert.equal(app.transcript.model.filter((entry) => entry.type === 'prompt').length, 0);
   app.subscription.close();
+});
+
+
+test("real runtime dispatch events carry masked bounded output while other hidden tools stay hidden", async () => {
+  const payload = JSON.parse(execFileSync("python3", ["-c", String.raw`
+import json, tempfile
+from dataclasses import asdict
+from pathlib import Path
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.tools.base import LocalTool
+from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+
+class ResultTool(LocalTool):
+    name = "fixture"
+    description = "Scripted result"
+    parameters = {"type": "object", "properties": {}}
+    def __init__(self, name, text):
+        self.name, self.text = name, text
+    def metadata(self, arguments):
+        return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=True, paths=None)
+    def _execute(self, call, policy, cancel=None):
+        return ToolResult(call.id, True, content=self.text)
+
+secret = "sk-" + "Z" * 32
+text = "Worker answer: " + secret + " " + "x" * 4100
+names = ["dispatch_subagent", "update_plan", "ask_user", "propose_plan", "write_file", "edit_file", "multi_edit_file", "apply_patch"]
+events = []
+with tempfile.TemporaryDirectory() as root:
+    provider = FakeModelProvider([
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall(name, name, {}) for name in names])),
+        ModelResponse(Message(Role.ASSISTANT, "Leader answer")),
+    ])
+    ApiAgent(provider, {name: ResultTool(name, text) for name in names},
+             PermissionPolicy(Path(root)), events=events.append).run([Message(Role.USER, "Request")])
+print(json.dumps({"secret": secret, "events": [{"type": type(event).__name__, **asdict(event)} for event in events]}))
+`], { cwd: new URL("../../", import.meta.url), encoding: "utf8" }));
+  const finished = payload.events.filter((event) => event.type === "ToolCallFinished");
+  assert.equal(finished.length, 8);
+  const dispatch = finished.find((event) => event.tool_name === "dispatch_subagent");
+  assert.equal(dispatch.output.length, 4000);
+  assert.equal(dispatch.output_truncated, true);
+  assert.ok(!dispatch.output.includes(payload.secret));
+  assert.ok(dispatch.output.includes("[REDACTED_SECRET]"));
+  assert.ok(finished.filter((event) => event.tool_name !== "dispatch_subagent").every((event) => event.output === "" && !event.output_truncated));
+  const main = createTranscript({ rootAgentId: dispatch.agent_id });
+  const replay = createTranscript({ rootAgentId: dispatch.agent_id });
+  const frame = (type, fields) => ({ kind: "event", payload: { type, agent_id: dispatch.agent_id, run_id: dispatch.run_id, ...fields } });
+  main.apply(frame("RunStarted", { agent_name: "leader" }));
+  main.apply(frame("ToolCallStarted", { tool_call_id: dispatch.tool_call_id, tool_name: "dispatch_subagent", target: "worker" }));
+  main.apply(frame("ToolCallFinished", dispatch));
+  replay.apply(frame("HistoryMessage", { role: "assistant", tool_calls: [{
+    id: dispatch.tool_call_id, name: "dispatch_subagent", subagent_name: "worker", ok: true,
+    output: dispatch.output, output_truncated: dispatch.output_truncated,
+  }] }));
+  const document = new Document();
+  const roots = [];
+  for (const transcript of [main, replay]) {
+    const call = transcript.model.find((entry) => entry.type === "activity").calls[0];
+    assert.equal(call.output, dispatch.output);
+    assert.equal(call.outputTruncated, true);
+    assert.ok(!JSON.stringify(transcript.model).includes(payload.secret));
+    const root = document.createElement("div");
+    renderTranscript(document, root, transcript.model, parseMarkdown, {
+      rerender: () => renderTranscript(document, root, transcript.model, parseMarkdown),
+    });
+    assert.ok(!root.textContent.includes("Worker answer:"));
+    await find(root, (node) => node.getAttribute?.("aria-expanded") === "false").click();
+    assert.ok(root.textContent.includes("Worker answer: [REDACTED_SECRET]"));
+    assert.ok(!root.textContent.includes(payload.secret));
+    roots.push(root);
+  }
+  assert.equal(roots[0].textContent, roots[1].textContent);
+});
+
+
+test("transcript waits for explicit leader and session facts rather than the first child event", () => {
+  const transcript = createTranscript();
+  const frame = (type, agent_id, session_id, fields = {}) => ({ kind: "event", payload: {
+    type, agent_id, session_id, run_id: `${agent_id}-run`, ...fields,
+  } });
+  transcript.apply(frame("AssistantTextDelta", "child", "wanted", { text: "PRIVATE CHILD" }));
+  transcript.apply(frame("PromptSubmitted", "root", "other", { text: "OTHER CONVERSATION" }));
+  transcript.apply(frame("PromptSubmitted", "root", "wanted", { text: "Request" }));
+  transcript.apply(frame("AssistantTextDelta", "root", "wanted", { text: "Leader" }));
+  assert.deepEqual(transcript.model, []);
+  const held = transcript.snapshot();
+  transcript.reset();
+  transcript.restore(held);
+  transcript.setSessionId("wanted");
+  assert.deepEqual(transcript.model, []);
+  transcript.setRootAgentId("root");
+  assert.deepEqual(transcript.model.filter((entry) => entry.type === "prompt" || entry.type === "text").map((entry) => entry.text), ["Request", "Leader"]);
+  assert.ok(!JSON.stringify(transcript.model).includes("PRIVATE CHILD"));
+  assert.ok(!JSON.stringify(transcript.model).includes("OTHER CONVERSATION"));
+});
+
+test("new chat holds early frames, pins the recorded leader and replays the same exchanges", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  let serverConversation = null;
+  let reply;
+  let requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  const pendingReply = new Promise((resolve) => { reply = resolve; });
+  const agents = [
+    { agent_id: "child", name: "worker", parent_agent_id: "root", state: "running" },
+    { agent_id: "root", name: "leader", parent_agent_id: null, state: "running" },
+  ];
+  const emit = (type, agent, fields = {}) => script.emit(type, {
+    agent_id: agent, agent_name: agent === "root" ? "leader" : "worker",
+    run_id: `${agent}-run`, session_id: "new-session", ...fields,
+  });
+  script.client.conversationStats = async () => ({ conversation: serverConversation });
+  script.client.sessions = async (_limit, _query, archived) => archived ? [] : [{
+    run_id: "new-session", title: "Test conversation", repo_root: "/core-project", activity: "idle",
+  }];
+  script.client.prompt = async () => {
+    serverConversation = { session_id: "new-session", agents };
+    await emit("PromptSubmitted", "root", { text: "Please work" });
+    await emit("RunStarted", "root");
+    await emit("AssistantTextDelta", "root", { text: "LEADER-TEXT delegating" });
+    await emit("ToolCallStarted", "root", { tool_call_id: "dispatch", tool_name: "dispatch_subagent", target: "worker" });
+    await emit("SubagentSpawned", "root", { subagent_name: "worker", subagent_agent_id: "child" });
+    await emit("RunStarted", "child");
+    await emit("ToolCallStarted", "child", { tool_call_id: "read", tool_name: "read_file", target: "in.txt" });
+    await emit("ToolCallFinished", "child", { tool_call_id: "read", tool_name: "read_file", ok: true, output: "PRIVATE READ" });
+    await emit("ToolCallStarted", "child", { tool_call_id: "write", tool_name: "write_file", target: "out.txt" });
+    await emit("PermissionRequested", "child", { tool_call_id: "write", tool_name: "write_file", target: "out.txt" });
+    requestStarted();
+    return pendingReply;
+  };
+  script.client.agentHistory = async () => ({ messages: [
+    { role: "assistant", text: "", tool_calls: [{ id: "read", name: "read_file", target: "in.txt", ok: true, output: "PRIVATE READ" }] },
+  ] });
+  const app = await start({ global: browser(), document, client: script.client });
+  const sending = submit(document, "Please work");
+  await started;
+  assert.ok(!document.getElementById("chat").textContent.includes("PRIVATE READ"));
+  reply({ accepted: true, run_id: "new-session" });
+  await sending;
+  const chat = document.getElementById("chat");
+  assert.match(chat.textContent, /Please work/);
+  assert.match(chat.textContent, /LEADER-TEXT delegating/);
+  assert.ok(app.transcript.model.some((entry) => entry.type === "question" && !entry.resolved));
+  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Open worker's conversation").click();
+  assert.match(chat.textContent, /in.txt/);
+  await emit("ToolCallStarted", "child", { tool_call_id: "write", tool_name: "write_file", target: "out.txt" });
+  await emit("ToolCallFinished", "child", { tool_call_id: "write", tool_name: "write_file", ok: true,
+    result_kind: "file_diff", result_path: "out.txt", lines_added: 1, lines_removed: 0, diff: "+output" });
+  await emit("AssistantTextDelta", "child", { text: "PRIVATE WORKER ANSWER" });
+  assert.match(chat.textContent, /out.txt/);
+  assert.match(chat.textContent, /PRIVATE WORKER ANSWER/);
+  await emit("RunFinished", "child", { stopped_reason: "final_response" });
+  await emit("ToolCallFinished", "root", { tool_call_id: "dispatch", tool_name: "dispatch_subagent", ok: true,
+    output: "Worker finished [REDACTED_SECRET]", output_truncated: false });
+  await emit("AssistantTextDelta", "root", { text: "LEADER-FINAL all done" });
+  await find(document.body, (node) => node.getAttribute?.("aria-label") === "Back to the conversation").click();
+  assert.match(chat.textContent, /Dispatched worker \(finished\)/);
+  assert.match(chat.textContent, /LEADER-FINAL all done/);
+  assert.ok(!chat.textContent.includes("PRIVATE"));
+  assert.ok(!chat.textContent.includes("Worker finished"));
+  assert.ok(chat.textContent.indexOf("Please work") < chat.textContent.indexOf("LEADER-TEXT"));
+  assert.ok(chat.textContent.indexOf("LEADER-TEXT") < chat.textContent.indexOf("Dispatched worker"));
+  assert.ok(chat.textContent.indexOf("Dispatched worker") < chat.textContent.indexOf("LEADER-FINAL"));
+  script.client.openSession = async () => {
+    await emit("HistoryMessage", "root", { role: "user", text: "Please work" });
+    await emit("HistoryMessage", "root", { role: "assistant", text: "LEADER-TEXT delegating", tool_calls: [{
+      id: "dispatch", name: "dispatch_subagent", subagent_name: "worker", ok: true,
+      output: "Worker finished [REDACTED_SECRET]", output_truncated: false,
+    }] });
+    await emit("HistoryMessage", "root", { role: "assistant", text: "LEADER-FINAL all done", tool_calls: [] });
+    return {};
+  };
+  await find(document.body, (node) => node.className === "session-link" && node.textContent === "Test conversation").click();
+  assert.match(chat.textContent, /Please work/);
+  assert.match(chat.textContent, /LEADER-TEXT delegating/);
+  assert.match(chat.textContent, /Dispatched worker \(finished\)/);
+  assert.match(chat.textContent, /LEADER-FINAL all done/);
+  assert.ok(!chat.textContent.includes("PRIVATE"));
+  app.subscription.close();
+});
+
+
+test("agent history replays writes with path and state without exposing edit content", () => {
+  const saved = JSON.parse(execFileSync("python3", ["-c", String.raw`
+import json, tempfile
+from pathlib import Path
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.identity import new_id, new_agent_ref
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_api.runner import standard_tool_registry
+from symphonai_api.session import SessionStore
+from symphonai_host.broker import EventBroker
+from symphonai_host.run import HostRun
+
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    root = base / "project"
+    root.mkdir()
+    (root / "a.txt").write_text("alpha")
+    policy = PermissionPolicy(root, allowed_write_scope=[root])
+    sessions = base / "sessions"
+    session_id = new_id("run")
+    agent = new_agent_ref("worker")
+    store = SessionStore(sessions, session_id, repo_root=root)
+    provider = FakeModelProvider([
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("read", "read_file", {"path": "a.txt"})])),
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("write", "write_file", {"path": "out.txt", "content": "UNEXPOSED_EDIT_CONTENT"})])),
+        ModelResponse(Message(Role.ASSISTANT, "", tool_calls=[ToolCall("failed", "write_file", {"path": str(base / "outside.txt"), "content": "UNEXPOSED_EDIT_CONTENT"})])),
+        ModelResponse(Message(Role.ASSISTANT, "WORKER ANSWER")),
+    ])
+    ApiAgent(provider, standard_tool_registry(), policy, agent_ref=agent,
+             transcript=store.writer_for(agent.agent_id)).run([Message(Role.USER, "Worker task")])
+    store.close()
+    host = HostRun(FakeModelProvider(), policy, EventBroker(), sessions_root=sessions,
+                   memory_root=base / "memory", memory_extraction_enabled=False)
+    try:
+        history = host.agent_history(session_id, agent.agent_id)
+        print(json.dumps({"agent_id": agent.agent_id, "session_id": session_id, "messages": history["messages"]}))
+    finally:
+        host.close()
+`], { cwd: new URL("../../", import.meta.url), encoding: "utf8" }));
+  const calls = saved.messages.flatMap((message) => message.tool_calls ?? []);
+  const written = calls.find((call) => call.id === "write");
+  const failed = calls.find((call) => call.id === "failed");
+  assert.equal(written.target, "out.txt");
+  assert.equal(written.ok, true);
+  assert.equal(failed.ok, false);
+  for (const call of [written, failed]) {
+    assert.ok(!Object.hasOwn(call, "output"));
+    assert.ok(!Object.hasOwn(call, "diff"));
+    assert.ok(!JSON.stringify(call).includes("UNEXPOSED_EDIT_CONTENT"));
+  }
+  const worker = createTranscript({ rootAgentId: saved.agent_id });
+  const main = createTranscript({ rootAgentId: "leader" });
+  worker.setSessionId(saved.session_id);
+  main.setSessionId(saved.session_id);
+  for (const message of saved.messages) {
+    const frame = { kind: "event", payload: { ...message, type: "HistoryMessage", agent_id: saved.agent_id, session_id: saved.session_id } };
+    worker.apply(frame);
+    main.apply(frame);
+  }
+  const document = new Document();
+  const view = document.createElement("div");
+  renderTranscript(document, view, worker.model, parseMarkdown);
+  assert.match(view.textContent, /Read a.txt/);
+  assert.match(view.textContent, /Wrote out.txt/);
+  assert.match(view.textContent, /WORKER ANSWER/);
+  assert.ok(view.textContent.indexOf("Read a.txt") < view.textContent.indexOf("Wrote out.txt"));
+  assert.ok(view.textContent.indexOf("Wrote out.txt") < view.textContent.indexOf("WORKER ANSWER"));
+  assert.ok(worker.model.some((entry) => entry.type === "activity" && entry.calls.some((call) => call.toolCallId === "failed" && call.status === "failed")));
+  assert.ok(!JSON.stringify(main.model).includes("out.txt"));
+  assert.ok(!JSON.stringify(worker.model).includes("UNEXPOSED_EDIT_CONTENT"));
 });

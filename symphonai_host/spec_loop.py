@@ -378,6 +378,7 @@ class LoopController:
 
     def start_loop(
         self, goal: str, *, runner_pid: int | None = None, runner_lock: bool = False,
+        roadmap_goal_id: str | None = None,
     ) -> Loop:
 
         from symphonai_host.run import ProviderSelectionError, RunActiveError
@@ -414,6 +415,9 @@ class LoopController:
             loop.runner_lock = True
         if runner_pid is not None or runner_lock:
             store.save(loop)
+        with self.host._lock:
+            if self.host._roadmap_tools_enabled or roadmap_goal_id is not None:
+                RoadmapStore(self.host._repo_root).record_loop(loop.id, goal, roadmap_goal_id)
         return self._start_loop_planner(loop, "created")
 
 
@@ -422,7 +426,7 @@ class LoopController:
 
         with self.host._lock:
             roadmap_store = RoadmapStore(self.host._repo_root)
-            roadmap = roadmap_store.load_record()
+            roadmap = roadmap_store.load()
             goal = roadmap_store.find(roadmap, goal_id)
             if goal is None:
                 raise KeyError(goal_id)
@@ -434,11 +438,8 @@ class LoopController:
                     raise RunActiveError("roadmap goal already has a loop") from None
                 if existing.get("state") != "cancelled":
                     raise RunActiveError("roadmap goal already has a loop")
-            loop = self.start_loop(goal["goal"])
-            goal["loop_id"] = loop.id
-            goal["done"] = False
-            roadmap_store.save(roadmap)
-            return roadmap_store.reply(roadmap), loop
+            loop = self.start_loop(goal["goal"], roadmap_goal_id=goal_id)
+            return roadmap_store.reply(roadmap_store.load()), loop
 
 
     def _start_loop_planner(

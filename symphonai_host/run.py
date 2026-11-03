@@ -349,6 +349,7 @@ class HostRun:
     ) -> None:
         self._reload_policy = replace(reload_policy or policy)
         self._next_policy = None
+        self._roadmap_tools_enabled = False
         self._memory_extraction_override = memory_extraction_enabled
         self._reload_price_table = price_table
         extensions = _snapshot_extensions(extensions)
@@ -1237,6 +1238,8 @@ class HostRun:
 
     @staticmethod
     def _replay_tool_call(call, result=None, review=None) -> dict:
+        from symphonai_api.secrets import mask_secrets
+
         replay = {"id": call.id, "name": call.name}
         if review is not None:
             replay["auto_reviews"] = review
@@ -1245,9 +1248,20 @@ class HostRun:
                 value = call.arguments.get(key)
                 if isinstance(value, str):
                     replay[key] = value
+            if result is not None:
+                replay["ok"] = result.ok
+                if result.ok:
+                    text = mask_secrets(tool_result_text(result))
+                    replay["output"] = text[:4000]
+                    replay["output_truncated"] = len(text) > 4000
+                else:
+                    replay["error"] = mask_secrets(result.error or "tool call failed")
+        elif call.name in FILE_EDIT_TOOLS:
+            replay["target"] = mask_secrets(call_target(call.name, call.arguments))
+            if result is not None:
+                replay["ok"] = result.ok
         elif call.name == "notify_person":
             if result is not None and result.ok:
-                from symphonai_api.secrets import mask_secrets
                 replay["text"] = mask_secrets(call.arguments.get("text", ""))
         elif call.name == "update_plan":
             for key in ("plan", "explanation"):
@@ -1924,6 +1938,7 @@ class HostRun:
                 for name, spec in roster.items()
             }
         from symphonai_host.session_search import session_tools
+        from symphonai_host.roadmap_tools import roadmap_tools
 
         meta = session.read_meta()
         history_tools = {} if "spec_run" in meta else session_tools(
@@ -2057,7 +2072,7 @@ class HostRun:
                 leases=self._leases,
                 lsp=self._lsp,
                 jobs=jobs,
-                leader_tools=history_tools | goal_tools(
+                leader_tools=(roadmap_tools(self) if self._roadmap_tools_enabled and "spec_run" not in meta else {}) | history_tools | goal_tools(
                     lambda: self._goal_for_session(session.run_id),
                     lambda status, message: self._update_goal_for_session(
                         session.run_id, status, message,
@@ -3085,6 +3100,10 @@ class HostRun:
                 totals = totals.merged(usage)
             fields = {**totals.to_record(), "total_tokens": totals.total_tokens}
             cost = total_cost(by_model, price_table)
+            if price_table is not None:
+                unpriced = next((model for model in by_model if model not in price_table.prices), None)
+                if unpriced is not None:
+                    fields["unpriced_model"] = unpriced
             if cost is not None and price_table is not None:
                 fields["cost"] = {
                     "amount": str(cost),

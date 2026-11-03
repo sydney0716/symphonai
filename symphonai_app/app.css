@@ -1131,6 +1131,13 @@ button.session-link {
   outline-offset: 2px;
 }
 
+.agent-row[aria-current="true"],
+.agent-row[aria-current="true"]:hover,
+.agent-row[aria-current="true"]:focus-visible {
+  background: var(--ui-selected);
+  outline: 1px solid var(--ui-control-border);
+}
+
 #agents > .agent-row + .agent-row {
   border-top: 1px solid var(--ui-border);
 }
@@ -1339,10 +1346,6 @@ button.session-link {
   margin: 0;
   font-size: 0.875rem;
   font-weight: 600;
-}
-
-.agent-conversation-back {
-  color: var(--ui-accent);
 }
 
 .agent-history-status {

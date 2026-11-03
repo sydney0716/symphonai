@@ -1033,3 +1033,41 @@ def stop_hook_continuation_is_bounded_and_failure_finishes():
         result, provider = run_tools(ws, [answer("finished")], hooks=HookRunner((timeout,), cwd=ws.root))
         assert len(provider.requests) == 1 and result.stopped_reason == "final_response"
         assert result.final_response.message.text == "finished"
+
+
+@check("turns.document_roles_write_markdown_without_change_validation")
+def document_roles_write_markdown_without_change_validation():
+    from symphonai_api.leader import builtin_subagent_specs
+
+    for role in ("planner", "reviewer"):
+        with workspace() as ws:
+            task = handoff_spec("Write a spec for fib.py", "printf ran > validation-ran\necho 10 | python3 fib.py")
+            parent = Script([answer("", call("dispatch_subagent", subagent_name=role, task=task)), answer()])
+            child = Script([
+                answer("", call("write_file", path="fib.py", content="print(10)"),
+                       call("write_file", path="specs/fib.md", content="# Fibonacci spec\n")),
+                answer("spec ready"),
+            ])
+            run = leader(ws, parent, child, subagent_specs=builtin_subagent_specs(child, ws.policy)).run("delegate")
+            assert results(run)[0].ok and results(run)[0].content == "spec ready"
+            assert child.call_count == 2 and len(run.subagents[role].runs) == 1
+            assert not (ws.root / "fib.py").exists() and not (ws.root / "validation-ran").exists()
+            assert (ws.root / "specs/fib.md").read_text() == "# Fibonacci spec\n"
+            tool_results = [message.tool_result for message in run.subagents[role].messages
+                            if message.tool_result is not None]
+            assert not tool_results[0].ok
+            assert f"the {role} writes specs (Markdown files) only; code goes to the implementer" in tool_results[0].error
+            assert tool_results[1].ok
+    with workspace() as ws:
+        child = Script()
+        parent = Script([
+            answer("", call("dispatch_subagent", subagent_name="worker", task="Write code")),
+            answer("", call("dispatch_subagent", subagent_name="worker", task="## Validation\n```python\nprint(1)\n```")),
+            answer(),
+        ])
+        run = leader(ws, parent, child).run("delegate")
+        failures = results(run)
+        assert not failures[0].ok and "worker" in failures[0].error and "no ## Validation heading" in failures[0].error
+        assert not failures[1].ok and "no fenced sh/bash block" in failures[1].error
+        assert all("dispatch planner first" in failure.error for failure in failures)
+        assert child.call_count == 0
