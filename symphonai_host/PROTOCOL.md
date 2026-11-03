@@ -313,7 +313,14 @@ before its directory is removed. `POST /session/archive` takes
 `{"archived": bool}` or `404` for an unknown session. Archiving an open
 conversation leaves it open. `POST /session/open` takes a `run_id`, replays
 `HistoryMessage` event frames before
-its reply, and makes that conversation current. Each history and runtime event
+its reply, and makes that conversation current. The reply includes an opaque
+`replay_id` and `history_frames`, the exact number of history frames published,
+including waited-subagent notices. Every such frame carries the same
+`replay_id`. The existing `replayed` field counts saved records only. HTTP and
+event-stream delivery may arrive in either order; clients finish replay when
+they have received `history_frames` frames with the matching replay ID, then
+render the complete history. A zero count completes immediately. Frames from
+an older replay must not be mixed into a newer open. Each history and runtime event
 frame includes the originating `session_id`. Later prompts append to the same
 session directory and transcript, while each prompt still has a distinct run
 id. `POST /session/new` takes an empty JSON object, selects a new conversation

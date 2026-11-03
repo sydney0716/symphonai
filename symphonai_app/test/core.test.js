@@ -156,6 +156,7 @@ function scriptedClient() {
   const client = {
     project: async () => ({ repo_root: "/core-project", name: "Core project" }),
     sessions: async () => [],
+    openSession: async () => ({ replay_id: "empty", history_frames: 0 }),
     sessionViewed: async () => ({ viewed_at: "2026-11-02T00:00:00+00:00" }),
     roadmap: async () => ({ goals: [] }),
     settings: async () => ({ settings: { mode: "allow", providers: [{ name: "openai", key_present: true }] } }),
@@ -562,9 +563,95 @@ test("page starts against the scripted client", async () => {
   assert.equal(document.getElementById("chat").textContent, "");
 });
 
+test("saved history waits for its exact replay count, paints once, then reconciles edits together", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  const global = browser();
+  const paints = [];
+  global.requestAnimationFrame = callback => paints.push(callback);
+  script.client.sessions = async (_limit, _query, archived) => archived ? [] : [
+    { run_id: "saved", title: "Saved", repo_root: "/core-project" },
+  ];
+  let opened = false;
+  script.client.openSession = async () => {
+    opened = true;
+    return { replay_id: "batch", history_frames: 40 };
+  };
+  script.client.conversationStats = async () => ({ conversation: opened ? { session_id: "saved", agents: [
+    { agent_id: "core-agent", parent_agent_id: null },
+  ] } : null });
+  let changesCalls = 0, finishChanges;
+  script.client.changes = () => {
+    changesCalls += 1;
+    return new Promise(resolve => { finishChanges = resolve; });
+  };
+  const app = await start({ global, document, client: script.client });
+  const chat = document.getElementById("chat");
+  const rendered = [];
+  const replace = chat.replaceChildren.bind(chat);
+  chat.replaceChildren = (...nodes) => { replace(...nodes); if (chat.textContent) rendered.push(chat.textContent); };
+  const opening = find(document.body, node => node.className === "session-link" && node.textContent === "Saved").click();
+  await script.emit("HistoryMessage", { session_id: "saved", replay_id: "stale", role: "user", text: "STALE" });
+  for (let i = 0; i < 40; i += 1) {
+    await script.emit("HistoryMessage", { session_id: "saved", replay_id: "batch", role: "user", text: `Message ${i}`,
+      ...(i < 3 ? { checkpoint_key: `edit-${i}`, edits: [{ path: `file-${i}.txt`, added: 1, removed: 0 }],
+        turn_ended_at: "2026-11-03T00:00:00Z", turn_outcome: "final_response" } : {}),
+    });
+    if (i < 39) assert.equal(chat.textContent, "");
+  }
+  await opening;
+  assert.equal(rendered.length, 1);
+  assert.ok(!chat.textContent.includes("STALE"));
+  for (let i = 0; i < 40; i += 1) assert.ok(chat.textContent.includes(`Message ${i}`));
+  assert.equal(app.transcript.model.filter(entry => entry.type === "edit-card").length, 3);
+  assert.equal(chat.scrollTop, chat.scrollHeight);
+  assert.equal(changesCalls, 0);
+  paints.shift()();
+  const reconciliation = paints.shift()();
+  assert.equal(changesCalls, 1);
+  await script.emit("AssistantTextDelta", { session_id: "saved", text: "LIVE FIRST" });
+  assert.match(chat.textContent, /LIVE FIRST/);
+  await script.emit("AssistantTextDelta", { session_id: "saved", text: " SECOND" });
+  assert.match(chat.textContent, /LIVE FIRST SECOND/);
+  finishChanges({ turns: [0, 1, 2].map(i => ({ key: `edit-${i}`, paths: [`file-${i}.txt`] })) });
+  await reconciliation;
+  assert.equal(changesCalls, 1);
+  app.subscription.close();
+});
+
+test("switched and failed opens never expose partial history", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  script.client.sessions = async (_limit, _query, archived) => archived ? [] : ["A", "B"].map(id => ({
+    run_id: id, title: id, repo_root: "/core-project",
+  }));
+  const app = await start({ global: browser(), document, client: script.client });
+  await script.emit("PromptSubmitted", { text: "Original conversation" });
+  const replies = [];
+  script.client.openSession = id => new Promise((resolve, reject) => replies.push({ id, resolve, reject }));
+  const open = id => find(document.body, node => node.className === "session-link" && node.textContent === id).click();
+  const first = open("A");
+  await script.emit("HistoryMessage", { session_id: "A", replay_id: "old-A", role: "user", text: "Partial A" });
+  const second = open("B");
+  replies[0].resolve({ replay_id: "old-A", history_frames: 1 });
+  await first;
+  await script.emit("HistoryMessage", { session_id: "B", replay_id: "B", role: "user", text: "Partial B" });
+  const third = open("A");
+  replies[1].resolve({ replay_id: "B", history_frames: 1 });
+  await second;
+  await script.emit("HistoryMessage", { session_id: "A", replay_id: "old-A", role: "user", text: "Stale A" });
+  assert.equal(document.getElementById("chat").textContent, "");
+  await script.emit("HistoryMessage", { session_id: "A", replay_id: "new-A", role: "user", text: "Partial new A" });
+  replies[2].reject(new Error("Open failed"));
+  await assert.rejects(third, /Open failed/);
+  assert.match(document.getElementById("chat").textContent, /Original conversation/);
+  assert.ok(!document.getElementById("chat").textContent.includes("Partial"));
+  app.subscription.close();
+});
+
 test("leader row returns from an agent view by click or Enter and preserves scroll", async () => {
   const script = scriptedClient();
-  script.client.openSession = async () => ({});
+  script.client.openSession = async () => ({ replay_id: "empty", history_frames: 0 });
   script.client.conversationStats = async () => ({ conversation: {
     session_id: "session", agents: [
       { agent_id: "root", name: "leader", parent_agent_id: null, state: "finished" },
@@ -598,7 +685,7 @@ test("Usage defaults on, explains missing prices, migrates once and keeps new ch
   const global = browser();
   global.localStorage.setItem("symphonai.status-line", JSON.stringify({ usage: false, model: false }));
   const script = scriptedClient();
-  script.client.openSession = async () => ({});
+  script.client.openSession = async () => ({ replay_id: "empty", history_frames: 0 });
   const usage = { total_tokens: 182340, cost: { amount: "0.42", currency: "USD", estimated: true } };
   script.client.conversationStats = async () => ({ conversation: { session_id: "session", usage } });
   const document = new Document();
@@ -640,7 +727,7 @@ test("conversation costs use standard decimals and a below-cent indicator", asyn
     ["1.234567", true, "credits", "~credits 1.234567"],
   ]) {
     const script = scriptedClient();
-    script.client.openSession = async () => ({});
+    script.client.openSession = async () => ({ replay_id: "empty", history_frames: 0 });
     script.client.conversationStats = async () => ({ conversation: {
       session_id: "session", usage: { total_tokens: 10, cost: { amount, currency, estimated } },
     } });
@@ -893,7 +980,7 @@ test("sidebar unread and waiting marks persist on reload and opening records vie
   script.client.sessions = async (_limit, _query, archived) => archived ? [] : sessions;
   let opened = null;
   const viewed = [];
-  script.client.openSession = async (id) => { opened = id; };
+  script.client.openSession = async (id) => { opened = id; return { replay_id: "empty", history_frames: 0 }; };
   script.client.conversationStats = async () => ({ conversation: opened ? { session_id: opened, agents: [] } : null });
   script.client.sessionViewed = async (id) => {
     viewed.push(id);
@@ -1231,13 +1318,13 @@ test("new chat holds early frames, pins the recorded leader and replays the same
   assert.ok(chat.textContent.indexOf("LEADER-TEXT") < chat.textContent.indexOf("Dispatched worker"));
   assert.ok(chat.textContent.indexOf("Dispatched worker") < chat.textContent.indexOf("LEADER-FINAL"));
   script.client.openSession = async () => {
-    await emit("HistoryMessage", "root", { role: "user", text: "Please work" });
-    await emit("HistoryMessage", "root", { role: "assistant", text: "LEADER-TEXT delegating", tool_calls: [{
+    await emit("HistoryMessage", "root", { replay_id: "saved", role: "user", text: "Please work" });
+    await emit("HistoryMessage", "root", { replay_id: "saved", role: "assistant", text: "LEADER-TEXT delegating", tool_calls: [{
       id: "dispatch", name: "dispatch_subagent", subagent_name: "worker", ok: true,
       output: "Worker finished [REDACTED_SECRET]", output_truncated: false,
     }] });
-    await emit("HistoryMessage", "root", { role: "assistant", text: "LEADER-FINAL all done", tool_calls: [] });
-    return {};
+    await emit("HistoryMessage", "root", { replay_id: "saved", role: "assistant", text: "LEADER-FINAL all done", tool_calls: [] });
+    return { replay_id: "saved", history_frames: 3 };
   };
   await find(document.body, (node) => node.className === "session-link" && node.textContent === "Test conversation").click();
   assert.match(chat.textContent, /Please work/);
@@ -1321,4 +1408,91 @@ with tempfile.TemporaryDirectory() as temporary:
   assert.ok(worker.model.some((entry) => entry.type === "activity" && entry.calls.some((call) => call.toolCallId === "failed" && call.status === "failed")));
   assert.ok(!JSON.stringify(main.model).includes("out.txt"));
   assert.ok(!JSON.stringify(worker.model).includes("UNEXPOSED_EDIT_CONTENT"));
+});
+
+
+test("checkpoint-backed worker writes form one matching live and replayed edit card", () => {
+  const fixture = JSON.parse(execFileSync("python3", ["-c", String.raw`
+import json, subprocess, tempfile
+from pathlib import Path
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
+from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.providers.fake import FakeModelProvider
+from symphonai_host.broker import EventBroker
+from symphonai_host.run import HostRun
+from symphonai_host.protocol import encode_event
+
+class Script(FakeModelProvider):
+    def __init__(self):
+        super().__init__()
+        self.parent_calls = self.child_calls = 0
+    def create_response(self, request, *, cancel=None):
+        names = {tool.get('name', tool.get('function', {}).get('name')) for tool in request.tools}
+        if 'dispatch_subagent' in names:
+            self.parent_calls += 1
+            calls = [] if self.parent_calls > 1 else [
+                ToolCall('dispatch-' + name, 'dispatch_subagent', {'subagent_name': name,
+                    'task': 'Write ' + path + '\n\n## Validation\n' + chr(96) * 3 + 'sh\ntrue\n' + chr(96) * 3})
+                for name, path in [('worker', 'a.txt'), ('implementer', 'b.txt')]]
+            return ModelResponse(Message(Role.ASSISTANT, 'All done' if not calls else 'Delegating', tool_calls=calls))
+        index = self.child_calls
+        self.child_calls += 1
+        path = 'a.txt' if index < 2 else 'b.txt'
+        calls = [] if index % 2 else [ToolCall('write-' + path, 'write_file', {'path': path, 'content': 'one line\n'})]
+        return ModelResponse(Message(Role.ASSISTANT, 'Worker finished' if not calls else '', tool_calls=calls))
+
+def encode(event):
+    return event.payload() if hasattr(event, 'payload') else encode_event(event)
+
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    root = base / 'project'
+    root.mkdir()
+    subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    broker = EventBroker()
+    run = HostRun(Script(), PermissionPolicy(root, allowed_write_scope=[root], shell_enabled=True, shell_allowlist=[()]),
+                  broker, sessions_root=base/'sessions', memory_root=base/'memory', memory_extraction_enabled=False)
+    subscription = broker.subscribe()
+    try:
+        run.select_mode('allow')
+        session = run.start('Please write both files')
+        live = []
+        while True:
+            event = subscription.get(timeout=10)
+            if event is None:
+                raise AssertionError('scripted run did not finish')
+            live.append(encode(event))
+            if type(event).__name__ in ('RunFinished', 'RunFailed') and getattr(event, 'agent_name', '') == 'leader':
+                assert type(event).__name__ == 'RunFinished'
+                leader = event.agent_id
+                break
+        run.open_session(session)
+        replay = []
+        while (event := subscription.get(timeout=0.01)) is not None:
+            replay.append(encode(event))
+        changes = run.changes()
+        undone = run.revert_changes(key=changes['turns'][-1]['key'])
+        assert not (root / 'a.txt').exists() and not (root / 'b.txt').exists()
+        print(json.dumps({'session': session, 'leader': leader, 'live': live, 'replay': replay,
+                          'changes': changes, 'undone': undone}))
+    finally:
+        subscription.close()
+        run.close()
+`], { cwd: new URL("../../", import.meta.url), encoding: "utf8" }));
+  const cards = [];
+  for (const events of [fixture.live, fixture.replay]) {
+    const transcript = createTranscript({ rootAgentId: fixture.leader });
+    transcript.setSessionId(fixture.session);
+    for (const payload of events) transcript.apply({ kind: "event", payload });
+    const edits = transcript.model.filter((entry) => entry.type === "edit-card");
+    assert.equal(edits.length, 1, JSON.stringify({ phase: events === fixture.live ? "live" : "replay",
+      changes: fixture.changes, summaries: events.filter((event) => event.type === "HistoryMessage" || event.type === "PromptSubmitted") }));
+    assert.deepEqual(edits[0].files, [{ path: "a.txt", added: 1, removed: 0 }, { path: "b.txt", added: 1, removed: 0 }]);
+    assert.ok(fixture.changes.turns.some((turn) => turn.key === edits[0].checkpointKey && turn.paths.includes("a.txt") && turn.paths.includes("b.txt")));
+    assert.ok(!transcript.model.some((entry) => entry.type === "activity" && entry.calls.some((call) => call.name === "write_file")));
+    cards.push(edits[0]);
+  }
+  assert.equal(cards[0].checkpointKey, cards[1].checkpointKey);
+  assert.equal(cards[0].canUndo, true);
+  assert.deepEqual(fixture.undone.reverted.sort(), ["a.txt", "b.txt"]);
 });

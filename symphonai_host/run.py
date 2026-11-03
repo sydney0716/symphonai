@@ -1074,14 +1074,62 @@ class HostRun:
         self._broker.publish(event)
 
     @staticmethod
+    def _checkpoint_edit_totals(checkpoints, selected_key=None):
+        """Count each turn against its before/after checkpoint file versions."""
+        edits = {}
+        after_by_path = {}
+        for entry in reversed(checkpoints.entries()):
+            if entry.path not in after_by_path:
+                after_by_path[entry.path] = _checkpoint_file_bytes(checkpoints, entry.path)
+            after = after_by_path[entry.path]
+            before = None if entry.backup is None else (checkpoints.directory / entry.backup).read_bytes()
+            after_by_path[entry.path] = before
+            if selected_key is not None and entry.key != selected_key:
+                continue
+            rows = edits.setdefault(entry.key, [])
+            if before == after:
+                continue
+            if b"\x00" in (before or b"") or b"\x00" in (after or b""):
+                added = removed = 0
+            else:
+                diff = _diff_result("turn-edits", entry.path,
+                                    (before or b"").decode("utf-8", errors="replace"),
+                                    (after or b"").decode("utf-8", errors="replace"))
+                added = diff.payload["lines_added"]
+                removed = diff.payload["lines_removed"]
+            rows.append({"path": entry.path, "added": added, "removed": removed})
+        return {key: sorted(rows, key=lambda row: row["path"]) for key, rows in edits.items()}
+
+    def _record_turn_edits(self, session_id, event):
+        conversation = self._open_conversations.get(session_id)
+        if conversation is None or event.agent_id != conversation[0].agent_ref.agent_id:
+            return
+        leader, session = conversation
+        checkpoints = leader._config.checkpoints
+        keys = () if checkpoints is None else checkpoints.keys()
+        if not keys:
+            return
+        key = keys[-1]
+        edits = self._checkpoint_edit_totals(checkpoints, key).get(key, [])
+        session.writer_for(event.agent_id, is_root=True).append(
+            "checkpoint", run_id=event.run_id, agent_id=event.agent_id, turn_id=None,
+            data={"key": key, "edits": edits},
+        )
+        self._broker.publish(HistoryMessage(
+            role="assistant", text="", tool_calls=[], turn_id=None, session_id=session_id,
+            checkpoint_key=key, edits=edits,
+        ))
+
+    @staticmethod
     def _checkpoint_replay_data(
-        records: list[dict], subagent_records: list[list[dict]] | None = None,
+        records: list[dict], subagent_records: list[list[dict]] | None = None, checkpoints=None,
     ) -> tuple[dict[str, str], dict[str, list[dict[str, str | int]]]]:
         keys: dict[str, str] = {}
         root_run_keys: dict[str, str] = {}
         edits: dict[str, list[dict[str, str | int]]] = {}
         pending_key: str | None = None
         current_root_run: str | None = None
+        recorded_edits = {}
         for record in records:
             if record.get("type") == "run_started":
                 data = record.get("data")
@@ -1089,6 +1137,9 @@ class HostRun:
                     current_root_run = record.get("run_id")
             elif record.get("type") == "checkpoint":
                 key = record.get("data", {}).get("key")
+                if isinstance(key, str) and isinstance(record.get("data", {}).get("edits"), list):
+                    recorded_edits[key] = record["data"]["edits"]
+                    continue
                 pending_key = key if isinstance(key, str) else None
                 if current_root_run is not None and pending_key is not None:
                     root_run_keys[current_root_run] = pending_key
@@ -1198,6 +1249,9 @@ class HostRun:
                     edits[key].append(edit)
                 edit["added"] += payload["lines_added"]
                 edit["removed"] += payload["lines_removed"]
+        if checkpoints is not None:
+            edits.update(HostRun._checkpoint_edit_totals(checkpoints))
+        edits.update(recorded_edits)
         return keys, edits
 
     @staticmethod
@@ -2165,6 +2219,29 @@ class HostRun:
 
     def open_session(self, run_id: str) -> dict:
         """Load and replay a finished transcript without ever rewriting it."""
+        from dataclasses import asdict
+
+        @dataclass(frozen=True)
+        class ReplayedHistoryMessage(ForkableHistoryMessage):
+            record_id: str | None
+            replay_id: str = field(kw_only=True)
+
+            def payload(self) -> dict:
+                payload = {**super().payload(), "replay_id": self.replay_id}
+                if self.record_id is None:
+                    payload.pop("record_id")
+                return payload
+
+        replay_id = new_id("replay")
+        history_frames = 0
+
+        def publish_history(message):
+            nonlocal history_frames
+            values = asdict(message)
+            values.setdefault("record_id", None)
+            self._broker.publish(ReplayedHistoryMessage(**values, replay_id=replay_id))
+            history_frames += 1
+
         with self._lock:
             reader = SessionStore.open(self._sessions_root, run_id)
             try:
@@ -2192,8 +2269,11 @@ class HostRun:
                         persisted_usage[agent_id] = (name, updated)
                 auto_reviews = self._saved_auto_reviews(records)
                 metadata = reader.read_meta()
+                checkpoint_directory = reader.directory / "checkpoints"
                 checkpoint_keys, replay_edits = self._checkpoint_replay_data(
-                    records, subagent_records
+                    records, subagent_records,
+                    CheckpointStore(checkpoint_directory, self._repo_root)
+                    if (checkpoint_directory / "manifest.jsonl").is_file() else None,
                 )
                 replay_turns = self._turn_replay_data(records)
                 undone_keys = metadata.get("undone_checkpoint_keys", [])
@@ -2233,7 +2313,7 @@ class HostRun:
                             if call.name == "wait_subagents"}
                 for message, record_id in zip(loaded.messages, loaded.record_ids):
                     checkpoint_key = checkpoint_keys.get(record_id)
-                    self._broker.publish(ForkableHistoryMessage(
+                    publish_history(ForkableHistoryMessage(
                         role=message.role.value,
                         text=message.text,
                         notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
@@ -2256,12 +2336,13 @@ class HostRun:
                         **replay_turns.get(record_id, {}),
                     ))
                     for notice in self._waited_subagent_notices(message, wait_ids, run_id):
-                        self._broker.publish(notice)
+                        publish_history(notice)
                 self._close_idle_conversations_locked()
                 return {
                     "run_id": loaded.run_id, "state": diagnosis.state.value,
                     "replayed": len(loaded.record_ids), "repaired_ids": repaired_ids,
                     "dropped_bytes": loaded.dropped_bytes,
+                    "replay_id": replay_id, "history_frames": history_frames,
                 }
             previous_provider = (
                 self._provider,
@@ -2343,7 +2424,7 @@ class HostRun:
                     if call.name == "wait_subagents"}
         for message, record_id in zip(loaded.messages, loaded.record_ids):
             checkpoint_key = checkpoint_keys.get(record_id)
-            self._broker.publish(ForkableHistoryMessage(
+            publish_history(ForkableHistoryMessage(
                 role=message.role.value,
                 text=message.text,
                 notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
@@ -2367,13 +2448,14 @@ class HostRun:
                 **replay_turns.get(record_id, {}),
             ))
             for notice in self._waited_subagent_notices(message, wait_ids, run_id):
-                self._broker.publish(notice)
+                publish_history(notice)
         return {
             "run_id": loaded.run_id,
             "state": diagnosis.state.value,
             "replayed": len(loaded.record_ids),
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
+            "replay_id": replay_id, "history_frames": history_frames,
         }
 
     def session_notes(self, session_id: str) -> dict:
@@ -3504,6 +3586,11 @@ class HostRun:
                 keys = () if checkpoints is None else checkpoints.keys()
                 if keys:
                     event = replace(event, checkpoint_key=keys[-1])
+        if isinstance(event, (RunFinished, RunFailed)) and session_id is not None:
+            try:
+                self._record_turn_edits(session_id, event)
+            except (OSError, ValueError):
+                _LOG.warning("Could not record turn edit totals for %s", session_id)
         if isinstance(event, RunStarted):
             try:
                 with self._lock:
@@ -3613,6 +3700,7 @@ class HostRun:
         session_id: str = "",
     ) -> None:
         terminal_event = None
+        failure_published = False
         active_to_finish = None
         failure: Exception | None = None
         try:
@@ -3637,6 +3725,7 @@ class HostRun:
                         self._active = None
                     if terminal_event is not None:
                         self._publish(run_id, terminal_event, session_id=session_id)
+                        failure_published = isinstance(terminal_event, RunFailed)
                     for event in active_to_finish.deferred_memory_events:
                         event_run_id = getattr(event, "run_id", run_id)
                         self._publish(event_run_id, event, session_id=session_id)
@@ -3644,12 +3733,15 @@ class HostRun:
                 if self._closing and self._conversation is not None and self._conversation[1].run_id == session_id:
                     self._conversation = None
                     self._active = None
+        if failure_published:
+            error = " ".join(terminal_event.error.splitlines())
+            print(f"run {run_id} failed: {error}", file=sys.stderr, flush=True)
         if not goal_round:
             self._loops._finish_spec_review(session_id, leader, terminal_event)
             self._loops._finish_loop_plan(session_id, terminal_event, error=failure)
             with self._lock:
                 self._close_idle_conversations_locked()
-            if failure is not None:
+            if failure is not None and not failure_published:
                 raise failure
             return
         next_prompt = None
@@ -3657,6 +3749,8 @@ class HostRun:
             goal = self._goals_by_session.get(session_id)
             if goal is None or session_id is None or goal.phase != "active":
                 self._close_idle_conversations_locked()
+                if failure is not None and not failure_published:
+                    raise failure
                 return
             if isinstance(terminal_event, RunFinished) and terminal_event.stopped_reason == "final_response":
                 if goal.check:
@@ -3707,6 +3801,8 @@ class HostRun:
                     self._save_goal(session_id, goal)
                     self._goal_event("pause", goal, run_id, self._root_agent_id())
         if failure is not None:
-            raise failure
+            if not failure_published:
+                raise failure
+            return
         with self._lock:
             self._close_idle_conversations_locked()

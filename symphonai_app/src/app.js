@@ -2032,16 +2032,41 @@ export async function start({ global, document, client }) {
     }
   }
 
+  let sessionReplay = null;
+  let sessionOpenSerial = 0;
+
   async function openSession(runId) {
     pendingNewChat = null;
+    const preceding = sessionReplay?.sessionId === currentSessionId ? sessionReplay : null;
+    sessionReplay?.cancel();
+    sessionReplay = null;
+    const serial = ++sessionOpenSerial;
     closeAgentView();
     const targetSession = [...sessions, ...archivedSessions].find((session) => session.run_id === runId);
     if (targetSession?.repo_root && targetSession.repo_root !== project.repo_root) {
       return openProjectAt(targetSession.repo_root, runId);
     }
     saveDraft();
-    const previous = transcript.snapshot();
-    const previousId = currentSessionId;
+    const previous = preceding?.previous ?? transcript.snapshot();
+    const previousId = preceding ? preceding.previousId : currentSessionId;
+    let resolveReplay;
+    const done = new Promise(resolve => { resolveReplay = resolve; });
+    const replay = {
+      sessionId: runId, previous, previousId, batches: new Map(), live: [],
+      replayId: null, expected: null, error: null,
+      cancel: () => resolveReplay(false),
+      check: () => {
+        if (replay.expected === null) return;
+        const count = replay.batches.get(replay.replayId)?.length ?? 0;
+        if (count > replay.expected) {
+          replay.error = new Error("The host sent an invalid history frame count.");
+          resolveReplay(false);
+        } else if (count === replay.expected) resolveReplay(true);
+      },
+    };
+    sessionReplay = replay;
+    const root = project.repo_root;
+    const current = () => serial === sessionOpenSerial && currentSessionId === runId && project.repo_root === root;
     transcript.reset();
     currentSessionId = runId;
     void refreshOpenNotes();
@@ -2051,13 +2076,85 @@ export async function start({ global, document, client }) {
     showTranscript();
     clearConversationAgents();
     try {
-      await boundary.openSession(runId);
-      await refreshPreviewMarks();
-      await refreshConversation();
-      await markSessionViewed(runId);
-      await refreshSelectedChanges();
+      const reply = await boundary.openSession(runId);
+      if (!current()) return;
+      if (typeof reply?.replay_id !== "string" || !Number.isInteger(reply?.history_frames) || reply.history_frames < 0) {
+        throw new Error("The host did not report a complete history replay.");
+      }
+      replay.replayId = reply.replay_id;
+      replay.expected = reply.history_frames;
+      replay.check();
+      const complete = await done;
+      if (replay.error) throw replay.error;
+      if (!complete || !current()) return;
+      const stats = await boundary.conversationStats();
+      if (!current()) return;
+      conversation = stats?.conversation ?? null;
+      bindTranscriptLeader();
+      for (const frame of replay.batches.get(replay.replayId) ?? []) {
+        if (!current()) return;
+        await onFrame(frame, true, true);
+      }
+      const live = [];
+      for (const frame of replay.live) {
+        if (!current()) return;
+        if (["SessionStarted", "SessionEnded"].includes(frame.payload?.type)) await onFrame(frame, true, true);
+        else live.push(frame);
+      }
+      if (!current()) return;
+      sessionReplay = null;
+      following = true;
       navigate({ page: "chat", section: "" });
+      preserveChatScroll = true;
+      showAgents();
+      showTranscript();
+      chatRoot.scrollTop = chatRoot.scrollHeight;
+      jumpLatest.hidden = true;
+      preserveChatScroll = false;
+
+      const cards = transcript.model.filter(entry => entry.type === "edit-card" && entry.checkpointKey && !entry.undone);
+      if (cards.length) {
+        changesDirty = true;
+        const afterPaint = global.requestAnimationFrame ? callback => global.requestAnimationFrame(callback) : queueMicrotask;
+        afterPaint(() => afterPaint(async () => {
+          if (!current()) return;
+          try {
+            const changes = await boundary.changes();
+            if (!current()) return;
+            let changed = false;
+            for (const card of cards) {
+              if (!transcript.model.includes(card) || card.undone) continue;
+              const turn = (Array.isArray(changes?.turns) ? changes.turns : [])
+                .find(turn => turn?.key === card.checkpointKey);
+              if (!Array.isArray(turn?.paths)) continue;
+              const paths = new Set(turn.paths.filter(path => typeof path === "string"));
+              const files = card.files.filter(file => paths.has(file.path));
+              const canUndo = files.length > 0 && paths.size > 0;
+              changed ||= files.length !== card.files.length || canUndo !== card.canUndo;
+              card.files = files;
+              card.added = files.reduce((sum, file) => sum + file.added, 0);
+              card.removed = files.reduce((sum, file) => sum + file.removed, 0);
+              card.canUndo = canUndo;
+            }
+            if (changed) showTranscript();
+          } catch { /* Replayed cards stay non-undoable if Changes is unavailable. */ }
+        }));
+      }
+      for (const frame of live) {
+        if (!current()) return;
+        await onFrame(frame, true);
+      }
+      await refreshPreviewMarks();
+      if (!current()) return;
+      showInstructionWarnings(conversation);
+      if (permittedModes.includes(conversation?.mode)) currentMode = conversation.mode;
+      showConversationUsage();
+      showAgents();
+      await markSessionViewed(runId);
+      if (current() && !cards.length) await refreshSelectedChanges();
     } catch (error) {
+      if (!current()) return;
+      sessionReplay = null;
       transcript.restore(previous);
       currentSessionId = previousId;
       void refreshOpenNotes();
@@ -2067,6 +2164,9 @@ export async function start({ global, document, client }) {
       showTranscript();
       await refreshConversation();
       throw error;
+    } finally {
+      replay.cancel();
+      if (sessionReplay === replay) sessionReplay = null;
     }
   }
 
@@ -5290,10 +5390,31 @@ export async function start({ global, document, client }) {
     return false;
   }
 
-  async function onFrame(frame, held = false) {
+  async function onFrame(frame, held = false, replaying = false) {
     if (!held && pendingNewChat && typeof frame.payload?.session_id === "string") {
       pendingNewChat.frames.push(frame);
       return;
+    }
+    if (!replaying) {
+      if (frame.kind === "event" && frame.payload?.type === "HistoryMessage" && typeof frame.payload.replay_id === "string") {
+        if (sessionReplay && frame.payload.session_id === sessionReplay.sessionId) {
+          const id = frame.payload.replay_id;
+          const batch = sessionReplay.batches.get(id) ?? [];
+          batch.push(frame);
+          sessionReplay.batches.set(id, batch);
+          sessionReplay.check();
+        }
+        return;
+      }
+      if (sessionReplay && frame.kind === "error" && (frame.dropped ?? frame.payload?.dropped) > 0) {
+        sessionReplay.error = new Error("History replay was interrupted. Open the conversation again.");
+        sessionReplay.cancel();
+        return;
+      }
+      if (sessionReplay && frame.payload?.session_id === sessionReplay.sessionId) {
+        sessionReplay.live.push(frame);
+        return;
+      }
     }
     if (frame.kind === "approval_requested") {
       const payload = frame.payload ?? {};
@@ -5388,7 +5509,7 @@ export async function start({ global, document, client }) {
       agentTranscript.apply(frame);
     }
     const newEntries = transcript.model.slice(previousLength);
-    for (const entry of newEntries) {
+    for (const entry of replaying ? [] : newEntries) {
       if (entry.type === "edit-card") {
         await reconcileEditCard(entry);
       }
@@ -5408,6 +5529,7 @@ export async function start({ global, document, client }) {
       }
     }
     board.apply(frame);
+    if (replaying) return;
     showAgents();
     showTranscript();
     const dropped = frame.dropped ?? frame.payload?.dropped;

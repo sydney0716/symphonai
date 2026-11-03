@@ -314,6 +314,13 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
       return;
     }
     if (type === "HistoryMessage") {
+      if (fields.role === "assistant" && typeof fields.checkpoint_key === "string" && Array.isArray(fields.edits)) {
+        if (currentPrompt?.checkpointKey === fields.checkpoint_key) {
+          promptEdits.set(currentPrompt, fields.edits.filter((edit) => typeof edit?.path === "string"
+            && Number.isInteger(edit.added) && Number.isInteger(edit.removed)));
+        }
+        return;
+      }
       if (!fields.text && !fields.reasoning && !fields.attachments?.length && !fields.tool_calls?.length && !fields.turn_ended_at) {
         return;
       }
@@ -339,7 +346,7 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
           }
         }
         model.push(entry);
-        if (commandEntry === null && (rootAgentId === null || fields.agent_id === rootAgentId)) {
+        if (commandEntry === null && !otherAgent(fields.agent_id)) {
           currentPrompt = entry;
         }
         if (commandEntry === null && fields.turn_ended_at) {
