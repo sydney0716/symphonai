@@ -10,9 +10,10 @@ from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from uuid import uuid4
 
-from scripts.checks.harness import check
+from scripts.checks.harness import check, fail
 from scripts.checks.workspace import workspace
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.call_class import CallClass
@@ -24,6 +25,7 @@ from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_compatible import OpenAICompatibleProvider
 from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.streaming import StreamAssembler
+from symphonai_api.runner import run_task
 
 KEY = "core-vendor-inert-key"
 ENV = {name: KEY for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "CORE_CHAT_KEY")}
@@ -68,7 +70,8 @@ def exchange(*responses):
 
 def provider(kind, **options):
     # Unique endpoints isolate public capability learning without touching caches.
-    url = f"https://core-{uuid4().hex}.invalid/v1"
+    version = "v1beta" if kind == "gemini" else "v1"
+    url = f"https://core-{uuid4().hex}.invalid/{version}"
     if kind == "anthropic":
         return AnthropicProvider(base_url=url, **options)
     if kind == "openai":
@@ -458,7 +461,10 @@ def recorded_exchanges_replay():
             with exchange("".join(recorded["response"]["body_lines"]).encode()) as (bodies, requests, _):
                 result = invoke(p, ModelRequest(messages, tools=tools, model=model), stream=True)
             actual = bodies[0]
-            # Synthetic cassettes intentionally record only some request fields.
+            # Only synthetic cassettes intentionally omit request fields.
+            if not path.name.startswith("synthetic-"):
+                assert actual.keys() == expected.keys(), (path.name, index, actual.keys(), expected.keys())
+            assert urlsplit(requests[0].full_url).path == urlsplit(recorded["request"]["url"]).path, (path.name, index)
             for key, value in expected.items():
                 built = actual[key]
                 if key == "input":
@@ -481,3 +487,101 @@ def recorded_exchanges_replay():
                 messages.extend(Message(Role.TOOL, tool_result=ToolResult(call.id, True, text))
                                 for call, text in zip(calls, outputs[-len(calls):]))
         assert result.message.text == recording["final_answer"], path.name
+
+
+@check("vendors.openai_tools_and_model_override")
+def openai_tools_and_model_override():
+    with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-openai-fake-test-key-do-not-use"}):
+        with workspace() as ws:
+            policy = ws.policy
+            captured: dict = {}
+            def _fake_urlopen(request, timeout=None):  # noqa: ANN001
+                captured["body"] = json.loads(request.data.decode("utf-8"))
+                payload = json.dumps(
+                    {
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}],
+                        }],
+                        "usage": {},
+                    }
+                ).encode("utf-8")
+                return Response(payload)
+
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+                run_task(
+                    OpenAIProvider(model="constructor-default-model"),
+                    policy,
+                    "hello",
+                    model="request-override-model",
+                )
+
+            sent_tool_names = {tool["name"] for tool in captured.get("body", {}).get("tools", [])}
+            expected_tool_names = {
+                "read_file",
+                "write_file",
+                "apply_patch",
+                "list_files",
+                "glob",
+                "grep",
+                "run_shell",
+                "web_fetch",
+            }
+            if sent_tool_names != expected_tool_names:
+                fail(f"expected run_task() request to include {expected_tool_names}, got {sent_tool_names!r}")
+            if captured.get("body", {}).get("model") != "request-override-model":
+                fail(f"run_task(model=...) did not reach the wire: {captured.get('body')!r}")
+
+
+@check("vendors.gemini_tools_and_model_override")
+def gemini_tools_and_model_override():
+    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "AIza-fake-test-key-do-not-use"}):
+        with workspace() as ws:
+            policy = ws.policy
+            expected_tool_names = {
+                "read_file",
+                "write_file",
+                "edit_file",
+                "multi_edit_file",
+                "list_files",
+                "glob",
+                "grep",
+                "run_shell",
+                "web_fetch",
+            }
+            # Tools must use Gemini's native function-declaration schema.
+            gemini_captured: dict = {}
+
+            def _fake_gemini_urlopen(request, timeout=None):  # noqa: ANN001
+                gemini_captured["url"] = request.full_url
+                gemini_captured["body"] = json.loads(request.data.decode("utf-8"))
+                payload = json.dumps(
+                    {
+                        "candidates": [
+                            {"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+                        ],
+                        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+                    }
+                ).encode("utf-8")
+                return Response(payload)
+
+            with mock.patch("urllib.request.urlopen", side_effect=_fake_gemini_urlopen):
+                run_task(GeminiProvider(model="gemini-constructor-default"), policy, "hello", model="gemini-wire-override")
+
+            if "AIza-fake-test-key-do-not-use" in gemini_captured.get("url", ""):
+                fail("Gemini API key must never appear in the request URL")
+            if "/models/gemini-wire-override:generateContent" not in gemini_captured.get("url", ""):
+                fail(f"Gemini request model override did not reach URL: {gemini_captured.get('url')!r}")
+            declarations = (gemini_captured.get("body", {}).get("tools") or [{}])[0].get(
+                "functionDeclarations", []
+            )
+            gemini_tool_names = {d.get("name") for d in declarations}
+            if gemini_tool_names != expected_tool_names:
+                fail(f"expected Gemini request to declare {expected_tool_names}, got {gemini_tool_names!r}")
+            argv_schema = next(
+                (d["parameters"] for d in declarations if d["name"] == "run_shell"), {}
+            )
+            if argv_schema.get("type") != "object" or "argv" not in argv_schema.get("properties", {}):
+                fail(f"expected run_shell's Gemini parameters to survive sanitization, got {argv_schema!r}")

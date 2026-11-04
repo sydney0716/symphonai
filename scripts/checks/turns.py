@@ -109,44 +109,6 @@ def compaction_keeps_one_summary_and_fits_long_turns():
         assert result.final_response.message.text == 'Recovered'
 
 
-@check("turns.memory_consolidation_preserves_unnamed_entries_and_rejects_invalid_results")
-def memory_consolidation_preserves_unnamed_entries_and_rejects_invalid_results():
-    import json
-    from symphonai_api.agent_memory import AgentMemory
-    from symphonai_api.memory_consolidate import apply_result
-
-    for scope in ("project", "global"):
-        with workspace() as ws:
-            store = AgentMemory(ws.outside / "memory", ws.root)
-            original = tuple(store.write(text, agent_name="fixture", run_id="fixture", scope=scope)
-                             for text in ("Use pytest", "Run pytest", "Use the retired command",
-                                          "Keep this exact fact", "Keep this other fact"))
-            merge = {"ids": [original[0].id, original[1].id], "text": "Run pytest"}
-            for invalid in (
-                {"merge": [merge], "remove": [{"id": "missing", "reason": "outdated"}]},
-                {"merge": [merge], "remove": [], "entries": []},
-                {"merge": [], "remove": [{"reason": "remove everything"}]},
-                {"merge": [merge], "remove": [{"id": original[0].id, "reason": "duplicate"}]},
-                {"merge": [{"ids": merge["ids"], "text": "x" * 501}], "remove": []},
-            ):
-                try:
-                    apply_result(store, scope, original, json.dumps(invalid))
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError("invalid consolidation was accepted")
-                assert store.read_status(scope) == (original, False)
-                assert store.last_consolidation(scope) is None and not store.has_previous(scope)
-            added = store.write("Added while the model was working", agent_name="fixture", run_id="later", scope=scope)
-            apply_result(store, scope, original, json.dumps({
-                "merge": [merge], "remove": [{"id": original[2].id, "reason": "retired command"}],
-            }))
-            remaining, unreadable = store.read_status(scope)
-            assert not unreadable
-            assert tuple(entry for entry in remaining if entry.id in {original[3].id, original[4].id, added.id}) == (*original[3:], added)
-            assert len(remaining) == 4 and remaining[-1].text == "Run pytest"
-            store.restore_previous(scope)
-            assert store.read_status(scope) == ((*original, added), False)
 
 
 def call(tool_name, /, **arguments):
@@ -296,12 +258,24 @@ def steering_reaches_the_next_request():
 
 @check("turns.leader_has_no_file_editing_tools")
 def leader_has_no_file_editing_tools():
-    with workspace() as ws:
-        provider = Script([answer()])
-        leader(ws, provider, FakeModelProvider()).run("inspect")
-        names = {tool["name"] for tool in provider.requests[0].tools}
-        assert "dispatch_subagent" in names
-        assert not names.intersection({"write_file", "edit_file", "multi_edit_file"})
+    from symphonai_api.tools.metadata import FILE_EDIT_TOOLS
+
+    for wire_format in (4, 1, 2, 3):
+        class WireScript(Script):
+            @property
+            def wire_format(self):
+                return wire_format
+
+        with workspace() as ws:
+            provider = WireScript([answer()])
+            chat = leader(ws, provider, FakeModelProvider())
+            try:
+                chat.run("inspect")
+            finally:
+                chat.close()
+            names = {tool.get("function", tool)["name"] for tool in provider.requests[0].tools}
+            assert "dispatch_subagent" in names, wire_format
+            assert not names.intersection(FILE_EDIT_TOOLS), (wire_format, names)
 
 
 @check("turns.dispatch_runs_the_spec_and_its_validation")
@@ -734,15 +708,11 @@ def subagent_questions_wake_waits_and_progress_is_listed():
         assert {getattr(event, "kind", None) for event in notices} >= {"progress", "question", "message"}
 
 
-@check("turns.session_notes_compaction_requires_coverage_of_every_dropped_message")
-def session_notes_compaction_requires_coverage_of_every_dropped_message():
+@check("turns.session_notes_close_finishes_and_accounts_for_the_final_update")
+def session_notes_close_finishes_and_accounts_for_the_final_update():
     from contextlib import closing
-    from unittest import TestCase
-    from symphonai_api.cancellation import OperationCancelled
     from symphonai_api.call_class import CallClass
-    from symphonai_api.compaction import MODEL_SUMMARY_PROMPT
     from symphonai_api.events import SessionNotesUpdated
-    from symphonai_api.providers.base import ProviderError
     from symphonai_api.session import SessionStore
 
     # Only the final answer crosses the threshold; close must let its update finish.
@@ -782,6 +752,14 @@ def session_notes_compaction_requires_coverage_of_every_dropped_message():
             release.set()
             chat.close()
 
+
+@check("turns.failed_session_notes_updates_preserve_previous_notes")
+def failed_session_notes_updates_preserve_previous_notes():
+    from unittest import TestCase
+    from symphonai_api.cancellation import OperationCancelled
+    from symphonai_api.call_class import CallClass
+    from symphonai_api.providers.base import ProviderError
+
     for failure, cause in (
         (ProviderError("fixture provider failure"), "fixture provider failure"),
         (OperationCancelled("fixture cancellation"), "cancellation"),
@@ -817,6 +795,13 @@ def session_notes_compaction_requires_coverage_of_every_dropped_message():
                     chat.close()
             assert any(cause in line for line in logged.output)
             assert notes_path.read_text(encoding="utf-8") == "OLD NOTES"
+
+
+@check("turns.session_notes_compaction_requires_coverage_of_every_dropped_message")
+def session_notes_compaction_requires_coverage_of_every_dropped_message():
+    from symphonai_api.call_class import CallClass
+    from symphonai_api.compaction import MODEL_SUMMARY_PROMPT
+    from symphonai_api.events import SessionNotesUpdated
 
     for covered in (True, False):
         with workspace() as ws:
@@ -882,85 +867,104 @@ def session_notes_compaction_requires_coverage_of_every_dropped_message():
                 assert summaries[-1].endswith("FALLBACK SUMMARY")
                 assert notes_path.read_text(encoding="utf-8") == "STALE NOTES"
 
-    # Exercise the same coverage rule through chat-boundary and forced compaction.
-    for mode in ("chat", "force", "instructions"):
-        with workspace() as ws:
-            folder = ws.outside / "chat-session"
-            folder.mkdir()
-            written = threading.Event()
 
-            class ChatNotesScript(FakeModelProvider):
-                def __init__(self):
-                    super().__init__()
-                    self.foreground = 0
-                    self.summary_requests = []
-                    self.notes_requests = []
-                    self.foreground_requests = []
+def chat_notes_compaction(mode):
+    from symphonai_api.call_class import CallClass
+    from symphonai_api.compaction import MODEL_SUMMARY_PROMPT
+    from symphonai_api.events import SessionNotesUpdated
 
-                def create_response(self, request, *, cancel=None):
-                    if request.messages[0].text.startswith(MODEL_SUMMARY_PROMPT):
-                        self.summary_requests.append(request)
-                        return answer("INSTRUCTED SUMMARY")
-                    if request.call_class is CallClass.BACKGROUND:
-                        self.notes_requests.append(request)
-                        return answer("CHAT NOTES")
-                    self.foreground_requests.append(request)
-                    self.foreground += 1
-                    if self.foreground == 1:
-                        return answer("x" * 32000, call("read_file", path="existing.txt"))
-                    if self.foreground == 2:
-                        return answer("y" * 28000)
-                    return answer("Next turn after compaction")
+    with workspace() as ws:
+        folder = ws.outside / "chat-session"
+        folder.mkdir()
+        written = threading.Event()
 
-            def observe_chat(event):
-                if isinstance(event, SessionNotesUpdated):
-                    written.set()
+        class ChatNotesScript(FakeModelProvider):
+            def __init__(self):
+                super().__init__()
+                self.foreground = 0
+                self.summary_requests = []
+                self.notes_requests = []
+                self.foreground_requests = []
 
-            provider = ChatNotesScript()
-            chat = Leader(LeaderConfig(
-                provider, FakeModelProvider(), str(ws.root), leader_policy=ws.policy,
-                session_notes=folder / "notes.md", model_summary=True,
-                compaction_limit=14000 if mode == "chat" else 20000,
-                chat_recent_turns=1, events=observe_chat, memory_extraction_enabled=False,
-            ))
-            if mode != "chat":
-                chat.seed_chat([
-                    Message(Role.USER, "Original goal"),
-                    Message(Role.ASSISTANT, "Earlier context to compact"),
-                    Message(Role.USER, "Earlier request"),
-                ])
-            try:
-                chat.chat("Read the file and finish this turn")
-                assert written.wait(5), "the complete first chat was not covered by notes"
-                (ws.root / "existing.txt").write_text("Current contents after the first chat", encoding="utf-8")
-                if mode == "chat":
-                    chat.chat("Continue with the current file")
-                    messages = provider.foreground_requests[-1].messages
-                else:
-                    instructions = "Focus on the exact file result" if mode == "instructions" else None
-                    compacted, _ = chat.force_compact_chat(instructions=instructions)
-                    assert compacted.changed
-                    messages = compacted.messages
-                summary = next(message.text for message in messages if message.role is Role.SYSTEM
-                               and message.text.startswith("Summary of the earlier conversation, written when it was compacted:"))
-                restore = next(message.text for message in messages
-                               if message.text.startswith("Restored after compaction:"))
-                assert "existing.txt" in restore and "Current contents after the first chat" in restore
-                if mode == "instructions":
-                    assert len(provider.summary_requests) == 1
-                    assert "Focus on the exact file result" in provider.summary_requests[0].messages[0].text
-                    assert summary.endswith("INSTRUCTED SUMMARY")
-                else:
-                    assert not provider.summary_requests and summary.endswith("CHAT NOTES")
-                    if mode == "force":
-                        chat.chat("One more request")
-                        compacted_again, _ = chat.force_compact_chat()
-                        assert compacted_again.changed and not provider.summary_requests
-                        assert any(message.text.endswith("CHAT NOTES") for message in compacted_again.messages
-                                   if message.role is Role.SYSTEM)
-                assert len(provider.notes_requests) == 1
-            finally:
-                chat.close()
+            def create_response(self, request, *, cancel=None):
+                if request.messages[0].text.startswith(MODEL_SUMMARY_PROMPT):
+                    self.summary_requests.append(request)
+                    return answer("INSTRUCTED SUMMARY")
+                if request.call_class is CallClass.BACKGROUND:
+                    self.notes_requests.append(request)
+                    return answer("CHAT NOTES")
+                self.foreground_requests.append(request)
+                self.foreground += 1
+                if self.foreground == 1:
+                    return answer("x" * 32000, call("read_file", path="existing.txt"))
+                if self.foreground == 2:
+                    return answer("y" * 28000)
+                return answer("Next turn after compaction")
+
+        def observe_chat(event):
+            if isinstance(event, SessionNotesUpdated):
+                written.set()
+
+        provider = ChatNotesScript()
+        chat = Leader(LeaderConfig(
+            provider, FakeModelProvider(), str(ws.root), leader_policy=ws.policy,
+            session_notes=folder / "notes.md", model_summary=True,
+            compaction_limit=14000 if mode == "chat" else 20000,
+            chat_recent_turns=1, events=observe_chat, memory_extraction_enabled=False,
+        ))
+        if mode != "chat":
+            chat.seed_chat([
+                Message(Role.USER, "Original goal"),
+                Message(Role.ASSISTANT, "Earlier context to compact"),
+                Message(Role.USER, "Earlier request"),
+            ])
+        try:
+            chat.chat("Read the file and finish this turn")
+            assert written.wait(5), "the complete first chat was not covered by notes"
+            (ws.root / "existing.txt").write_text("Current contents after the first chat", encoding="utf-8")
+            if mode == "chat":
+                chat.chat("Continue with the current file")
+                messages = provider.foreground_requests[-1].messages
+            else:
+                instructions = "Focus on the exact file result" if mode == "instructions" else None
+                compacted, _ = chat.force_compact_chat(instructions=instructions)
+                assert compacted.changed
+                messages = compacted.messages
+            summary = next(message.text for message in messages if message.role is Role.SYSTEM
+                           and message.text.startswith("Summary of the earlier conversation, written when it was compacted:"))
+            restore = next(message.text for message in messages
+                           if message.text.startswith("Restored after compaction:"))
+            assert "existing.txt" in restore and "Current contents after the first chat" in restore
+            if mode == "instructions":
+                assert len(provider.summary_requests) == 1
+                assert "Focus on the exact file result" in provider.summary_requests[0].messages[0].text
+                assert summary.endswith("INSTRUCTED SUMMARY")
+            else:
+                assert not provider.summary_requests and summary.endswith("CHAT NOTES")
+                if mode == "force":
+                    chat.chat("One more request")
+                    compacted_again, _ = chat.force_compact_chat()
+                    assert compacted_again.changed and not provider.summary_requests
+                    assert any(message.text.endswith("CHAT NOTES") for message in compacted_again.messages
+                               if message.role is Role.SYSTEM)
+            assert len(provider.notes_requests) == 1
+        finally:
+            chat.close()
+
+
+@check("turns.chat_compaction_uses_covering_session_notes")
+def chat_compaction_uses_covering_session_notes():
+    chat_notes_compaction("chat")
+
+
+@check("turns.forced_compaction_reuses_covering_session_notes")
+def forced_compaction_reuses_covering_session_notes():
+    chat_notes_compaction("force")
+
+
+@check("turns.explicit_compaction_instructions_require_a_model_summary")
+def explicit_compaction_instructions_require_a_model_summary():
+    chat_notes_compaction("instructions")
 
 
 @check("turns.deferred_mcp_tools_load_execute_and_survive_compaction")

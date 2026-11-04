@@ -1469,14 +1469,18 @@ export async function start({ global, document, client }) {
       const amountText = (value) => {
         if (!value) return "unavailable";
         if (!value.currency) return `${balanceNumbers.format(Number(value.amount))} balance`;
-        const money = new Intl.NumberFormat(undefined, {
-          style: "currency", currency: value.currency, minimumFractionDigits: 2, maximumFractionDigits: 2,
-        });
-        const exact = Number(value.exact_amount ?? value.amount);
-        if (exact !== 0 && Math.abs(exact) < 0.01) {
-          return exact < 0 ? `>-${money.format(0.01)}` : `<${money.format(0.01)}`;
+        try {
+          const money = new Intl.NumberFormat(undefined, {
+            style: "currency", currency: value.currency, minimumFractionDigits: 2, maximumFractionDigits: 2,
+          });
+          const exact = Number(value.exact_amount ?? value.amount);
+          if (exact !== 0 && Math.abs(exact) < 0.01) {
+            return exact < 0 ? `>-${money.format(0.01)}` : `<${money.format(0.01)}`;
+          }
+          return money.format(Number(value.amount));
+        } catch {
+          return `${balanceNumbers.format(Number(value.exact_amount ?? value.amount))} ${value.currency}`;
         }
-        return money.format(Number(value.amount));
       };
       const vendorNames = {
         anthropic: "Anthropic", openai: "OpenAI", gemini: "Google Gemini", deepseek: "DeepSeek",
@@ -1778,14 +1782,25 @@ export async function start({ global, document, client }) {
     findMatches[0]?.scrollIntoView?.({ block: "nearest" });
   }
 
+  let findOpener = null;
+
   function closeFind() {
     clearFindHighlights();
     findInput.value = "";
     findBar.hidden = true;
     findCount.textContent = "0 of 0";
+    let visible = findOpener && document.documentElement.contains(findOpener);
+    for (let node = findOpener; visible && node?.nodeType === 1; node = node.parentNode) {
+      const style = global.getComputedStyle?.(node);
+      if (node.hidden || node.inert || style?.display === "none"
+        || style?.visibility === "hidden" || style?.visibility === "collapse") visible = false;
+    }
+    (visible ? findOpener : input).focus();
+    findOpener = null;
   }
 
   function openFind() {
+    if (findBar.hidden) findOpener = document.activeElement;
     if (route.page !== "chat") navigate({ page: "chat" });
     findBar.hidden = false;
     findInput.focus();
@@ -4720,7 +4735,7 @@ export async function start({ global, document, client }) {
     if (usage.cache_read_tokens > 0) details.push(`cache read ${usage.cache_read_tokens}`);
     if (usage.cache_write_tokens > 0) details.push(`cache write ${usage.cache_write_tokens}`);
     const cost = usage.cost && typeof usage.cost.amount === "string" && typeof usage.cost.currency === "string"
-      ? ` · ${usage.cost.amount} ${usage.cost.currency}`
+      ? ` · ${costText(usage.cost)}`
       : "";
     return `${name}: ${usage.total_tokens} tokens (${details.join(", ")})${cost}`;
   }

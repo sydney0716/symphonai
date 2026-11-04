@@ -517,11 +517,11 @@ export function createClient({
       return request("POST", "/agent/draft", { description }, readReply, { detailOnError: true });
     },
 
-    saveAgent(name, scope, text) {
+    saveAgent(name, scope, fields) {
       return request(
         "POST",
         "/agent",
-        { name, scope, text },
+        { name, scope, fields },
         readReply,
         { detailOnError: true },
       );

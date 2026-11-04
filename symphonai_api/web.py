@@ -187,10 +187,19 @@ class _HTMLTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._drop_depth = 0
+        self._in_head = False
         self._chunks: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.casefold()
+        if self._in_head and tag not in {
+            "html", "head", "base", "basefont", "bgsound", "link", "meta", "title",
+            "style", "script", "noscript", "noframes", "template",
+        }:
+            self._in_head = False
+            self._drop_depth = 0
+        if tag == "head":
+            self._in_head = True
         if tag in _DROP_TAGS:
             self._drop_depth += 1
         elif self._drop_depth == 0 and tag in _BLOCK_TAGS:
@@ -199,11 +208,16 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_startendtag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
-        if self._drop_depth == 0 and tag.casefold() in _BLOCK_TAGS:
-            self._chunks.append("\n")
+        self.handle_starttag(tag, attrs)
+        if tag.casefold() in _DROP_TAGS:
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.casefold()
+        if tag == "head":
+            if not self._in_head:
+                return
+            self._in_head = False
         if tag in _DROP_TAGS:
             self._drop_depth = max(0, self._drop_depth - 1)
         elif self._drop_depth == 0 and tag in _BLOCK_TAGS:

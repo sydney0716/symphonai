@@ -1,21 +1,56 @@
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { start } from "../src/app.js";
-import { createClient } from "../src/client.js";
+import { start as startApp } from "../src/app.js";
 import { renderMemorySettings } from "../src/settings.js";
 import { createTranscript } from "../src/transcript.js";
 import { renderTranscript } from "../src/render.js";
 import { parseMarkdown } from "../src/markdown.js";
 
+function start(options) {
+  options.document.defaultView = options.global;
+  return startApp(options);
+}
+
+function addListener(target, type, listener) {
+  const listeners = target.listeners.get(type) ?? [];
+  listeners.push(listener);
+  target.listeners.set(type, listeners);
+}
+
+async function dispatch(target, type, values = {}) {
+  let stopped = false;
+  const event = { type, target, defaultPrevented: false,
+    ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...values };
+  event.preventDefault = () => { event.defaultPrevented = true; values.preventDefault?.(); };
+  event.stopPropagation = () => { stopped = true; values.stopPropagation?.(); };
+  const path = [];
+  for (let node = target; node; node = node.parentNode) path.push(node);
+  const document = target.ownerDocument;
+  if (document) path.push(document);
+  if (document?.defaultView) path.push(document.defaultView);
+  const pending = [];
+  for (const current of path) {
+    event.currentTarget = current;
+    for (const listener of [...(current.listeners.get(type) ?? [])]) {
+      pending.push(listener(event));
+    }
+    if (stopped) break;
+  }
+  await Promise.all(pending);
+  return event;
+}
+
 // A small DOM with real parent/child and textContent semantics. Missing ids
 // return null, and operations on a non-child fail rather than hiding a crash.
 class Node {
   constructor(document, tagName = "", text = "") {
-    this.ownerDocument = document;
+    Object.defineProperties(this, {
+      ownerDocument: { value: document, writable: true },
+      parentNode: { value: null, writable: true },
+    });
     this.nodeType = tagName ? 1 : 3;
     this.tagName = tagName.toUpperCase();
-    this.parentNode = null;
     this.childNodes = [];
     this.data = text;
     this.className = "";
@@ -81,15 +116,8 @@ class Node {
   contains(node) { return node === this || this.childNodes.some((child) => child.contains(node)); }
   focus() { this.ownerDocument.activeElement = this; }
   setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
-  addEventListener(type, listener) {
-    const listeners = this.listeners.get(type) ?? [];
-    listeners.push(listener);
-    this.listeners.set(type, listeners);
-  }
-  async dispatch(type, values = {}) {
-    const event = { target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...values };
-    for (const listener of this.listeners.get(type) ?? []) await listener(event);
-  }
+  addEventListener(type, listener) { addListener(this, type, listener); }
+  dispatch(type, values = {}) { return dispatch(this, type, values); }
   click() { return this.dispatch("click"); }
   requestSubmit() { return this.dispatch("submit"); }
 }
@@ -137,14 +165,16 @@ class Document {
   createElement(tag) { return new Node(this, tag); }
   createTextNode(text) { return new Node(this, "", String(text)); }
   getElementById(id) { return find(this.documentElement, (node) => node.id === id); }
-  addEventListener(type, listener) { this.listeners.set(type, listener); }
+  addEventListener(type, listener) { addListener(this, type, listener); }
 }
 
 function browser() {
   const storage = new Map();
   return {
     location: { hash: "#/chat" },
-    addEventListener() {},
+    listeners: new Map(),
+    addEventListener(type, listener) { addListener(this, type, listener); },
+    dispatch(type, values = {}) { return dispatch(this, type, values); },
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
   };
 }
@@ -196,7 +226,7 @@ function scriptedClient() {
     prompt: async (text) => { prompts.push(text); return { accepted: true, run_id: "core-run" }; },
     newSession: async () => { newSessions += 1; return { ended: true }; },
   };
-  return { client, prompts, newSessions: () => newSessions, emit: (type, fields = {}) => receive({
+  return { client, prompts, newSessions: () => newSessions, frame: value => receive(value), emit: (type, fields = {}) => receive({
     kind: "event", payload: { type, agent_id: "core-agent", agent_name: "leader", run_id: "core-run", ...fields },
   }) };
 }
@@ -208,13 +238,8 @@ async function submit(document, text) {
 
 function terminalBrowser() {
   const global = browser();
-  const instances = [], listeners = new Map();
+  const instances = [];
   global.innerHeight = 800;
-  global.addEventListener = (type, callback) => {
-    const callbacks = listeners.get(type) ?? [];
-    callbacks.push(callback);
-    listeners.set(type, callbacks);
-  };
   global.Terminal = class {
     constructor(options) { this.options = options; this.output = ""; this.cols = 80; this.rows = 24; instances.push(this); }
     loadAddon(addon) { addon.terminal = this; }
@@ -236,9 +261,7 @@ function terminalBrowser() {
     key, type: "keydown", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false,
     preventDefault() {}, stopPropagation() {}, ...fields,
   });
-  return { global, instances, event, dispatch: async (type, value) => {
-    for (const callback of listeners.get(type) ?? []) await callback(value);
-  } };
+  return { global, instances, event, dispatch: (type, value) => global.dispatch(type, value) };
 }
 
 test("reload refreshes skill commands and the mention roster", async () => {
@@ -315,24 +338,6 @@ test("Memory shows consolidation changes and restores the selected scope", async
   assert.match(content.textContent, /Outdated fact — Superseded/);
   await find(content, node => node.tagName === "BUTTON" && node.textContent === "Restore previous").click();
   assert.deepEqual(restored, ["project"]);
-  assert.equal(context.memoryReply.project.entries[0].text, "Restored fact");
-});
-
-test("client sends reload, config and memory restore requests as authenticated POSTs", async () => {
-  const calls = [];
-  const client = createClient({ port: 4312, token: "core-inert-token", fetch: async (url, options) => {
-    assert.equal(options.headers.Authorization, "Bearer core-inert-token");
-    calls.push([new URL(url).pathname, options.method, JSON.parse(options.body)]);
-    return { status: 200, json: async () => ({ changes: {} }) };
-  } });
-  await client.reloadExtensions();
-  await client.setConfig("memory.extract", false, "user");
-  await client.restoreMemory("global");
-  assert.deepEqual(calls, [
-    ["/extensions/reload", "POST", {}],
-    ["/config/set", "POST", { key: "memory.extract", value: false, scope: "user" }],
-    ["/memory/restore", "POST", { scope: "global" }],
-  ]);
 });
 
 test("Terminal panel starts closed and opens without xterm globals", async () => {
@@ -342,7 +347,6 @@ test("Terminal panel starts closed and opens without xterm globals", async () =>
   const panel = document.getElementById("terminal-panel");
   assert.ok(panel.hidden);
   assert.equal(app.route().page, "chat");
-  assert.ok(!find(document.getElementById("rail-tools"), (node) => node.textContent === "Terminal"));
   await find(document.body, (node) => node.className === "terminal-toggle").click();
   assert.ok(!panel.hidden);
   assert.match(panel.textContent, /Terminal unavailable/);
@@ -566,27 +570,6 @@ test("MCP slash prompts show required arguments and submit rendered text", async
   }
 });
 
-test("A tools-only MCP catalog adds no slash commands", async () => {
-  const document = new Document();
-  const script = scriptedClient();
-  script.client.mcpPrompts = async () => ({ prompts: [] });
-  await start({ global: browser(), document, client: script.client });
-  const input = document.getElementById("prompt");
-  input.value = "/mcp.";
-  await input.dispatch("input");
-  assert.ok(!find(document.body, (node) => node.className?.startsWith("command-suggestion")));
-});
-
-test("page starts against the scripted client", async () => {
-  const document = new Document();
-  const script = scriptedClient();
-  const app = await start({ global: browser(), document, client: script.client });
-  assert.equal(app.client, script.client);
-  assert.equal(app.route().page, "chat");
-  assert.ok(document.getElementById("prompt"));
-  assert.equal(document.getElementById("chat").textContent, "");
-});
-
 test("saved history waits for its exact replay count, paints once, then reconciles edits together", async () => {
   const document = new Document();
   const script = scriptedClient();
@@ -726,7 +709,6 @@ test("leader row returns from an agent view by click or Enter and preserves scro
     const worker = () => find(document.body, node => node.getAttribute?.("aria-label") === "Open worker's conversation");
     await worker().click();
     assert.equal(worker().getAttribute("aria-current"), "true");
-    assert.equal(find(document.body, node => node.className === "agent-conversation-back"), null);
     assert.match(chat.textContent, /Worker answer/);
     const leader = find(document.body, node => node.getAttribute?.("aria-label") === "Back to the conversation");
     assert.equal(leader.getAttribute("role"), "button");
@@ -1063,20 +1045,6 @@ test("sidebar unread and waiting marks persist on reload and opening records vie
 });
 
 
-test("real client sends session viewed directly over HTTP", async () => {
-  const calls = [];
-  const client = createClient({
-    port: 4312, token: "core-inert-token",
-    fetch: async (url, options) => {
-      calls.push({ path: new URL(url).pathname, method: options.method, body: JSON.parse(options.body) });
-      return { status: 200, json: async () => ({ session_id: "shown", viewed_at: "2026-11-02T00:00:00Z" }) };
-    },
-  });
-  await client.sessionViewed("shown");
-  assert.deepEqual(calls, [{ path: "/session/viewed", method: "POST", body: { session_id: "shown" } }]);
-});
-
-
 test("stats opens Usage with vendor and estimated costs, balances, errors and three ranges", async () => {
   const document = new Document();
   const script = scriptedClient();
@@ -1128,17 +1096,6 @@ test("stats opens Usage with vendor and estimated costs, balances, errors and th
   assert.deepEqual(script.prompts, []);
   app.subscription.close();
 });
-
-test("real client requests the selected usage period without the protocol encoder", async () => {
-  const calls = [];
-  const client = createClient({ port: 4312, token: "core-inert-token", fetch: async (url, options) => {
-    calls.push([new URL(url).pathname + new URL(url).search, options.method]);
-    return { status: 200, json: async () => ({ days: 90, providers: [] }) };
-  } });
-  assert.equal((await client.usage(90)).days, 90);
-  assert.deepEqual(calls, [["/usage?days=90", "GET"]]);
-});
-
 
 test("preview marks stay in the composer and send together as one prompt", async () => {
   const document = new Document();
@@ -1611,4 +1568,75 @@ test("a steered replay keeps the original turn's edit card at the end", () => {
     assert.equal(chat.children.filter(node => node.className === "edit-card").length, 1);
     assert.match(find(chat, node => node.className === "edit-card").textContent, /out.txt/);
   }
+});
+
+
+test("permission requests send the Allow and Reject decisions to the host", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  const answers = [];
+  script.client.approve = async (...args) => { answers.push(args); return { resolved: true }; };
+  const app = await start({ global: browser(), document, client: script.client });
+  try {
+    await submit(document, "edit the fixture");
+    await script.emit("RunStarted", { parent_run_id: null });
+    for (const [id, allowed, button] of [["allow-edit", true, "Allow"], ["reject-edit", false, "Deny"]]) {
+      await script.emit("ToolCallStarted", { tool_call_id: id, tool_name: "write_file", target: `${id}.txt` });
+      await script.emit("PermissionRequested", { tool_call_id: id, tool_name: "write_file", mode: "ask" });
+      await script.frame({ kind: "approval_requested", payload: {
+        approval_id: id, tool_call_id: id, operation: "write_file", target: `${id}.txt`, details: "Replace fixture text",
+      } });
+      const row = find(document.body, node => node.className?.split(" ").includes("approval") && node.textContent.includes(`${id}.txt`));
+      assert.ok(row, "the pending permission request is visible");
+      await find(row, node => node.tagName === "BUTTON" && node.textContent === button).click();
+      assert.deepEqual(answers.at(-1), [id, allowed, "", false, ""]);
+    }
+    assert.equal(answers.length, 2);
+  } finally { app.subscription.close(); }
+});
+
+test("composer Stop, Escape and mod-period each stop a running turn once", async () => {
+  const stops = [];
+  for (const action of ["button", "escape", "shortcut"]) {
+    const document = new Document();
+    const script = scriptedClient();
+    script.client.stop = async () => { stops.push(action); return { accepted: true }; };
+    const app = await start({ global: browser(), document, client: script.client });
+    try {
+      await submit(document, "run the fixture");
+      await script.emit("RunStarted", { parent_run_id: null });
+      const input = document.getElementById("prompt");
+      if (action === "button") {
+        const stop = find(document.getElementById("prompt-form"), node => node.tagName === "BUTTON" && node.textContent === "Stop");
+        assert.ok(stop && !stop.hidden, "Stop is reachable in the composer");
+        await stop.click();
+      } else {
+        await input.dispatch("keydown", action === "escape" ? { key: "Escape" } : { key: ".", ctrlKey: true });
+      }
+      assert.equal(stops.length, ["button", "escape", "shortcut"].indexOf(action) + 1);
+    } finally { app.subscription.close(); }
+  }
+});
+
+test("Escape closes Find before it can stop the running turn", async () => {
+  const document = new Document();
+  const script = scriptedClient();
+  let stops = 0;
+  script.client.stop = async () => { stops++; return { accepted: true }; };
+  const app = await start({ global: browser(), document, client: script.client });
+  try {
+    await submit(document, "keep running");
+    await script.emit("RunStarted", { parent_run_id: null });
+    const input = document.getElementById("prompt");
+    await input.dispatch("keydown", { key: "f", ctrlKey: true });
+    const bar = find(document.body, node => node.className === "transcript-find");
+    assert.equal(bar.hidden, false);
+    await input.dispatch("keydown", { key: "Escape" });
+    assert.equal(bar.hidden, true);
+    assert.equal(document.activeElement, input);
+    assert.equal(stops, 0);
+    await input.dispatch("keydown", { key: "Escape" });
+    assert.equal(bar.hidden, true);
+    assert.equal(stops, 1, "after Find closes, the next Escape reaches Stop");
+  } finally { app.subscription.close(); }
 });

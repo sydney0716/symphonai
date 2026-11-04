@@ -5,16 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import sys
 import threading
 from collections.abc import Callable, Sequence
 
 from symphonai_api.agent_memory import AgentMemory, MemoryEntry
 from symphonai_api.call_class import CallClass
-from symphonai_api.cancellation import CancellationToken
+from symphonai_api.cancellation import CancellationToken, OperationCancelled
 from symphonai_api.compaction import estimate_text_tokens
 from symphonai_api.cost import UsageTotals
 from symphonai_api.events import (
     EventSink,
+    PersonNotice,
     ToolCallFailed,
     ToolCallFinished,
     ToolCallStarted,
@@ -23,7 +25,7 @@ from symphonai_api.events import (
 from symphonai_api.identity import new_id
 from symphonai_api.memory_prompt import MEMORY_GUIDE, memory_age
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, ToolResult
-from symphonai_api.model_table import model_capabilities
+from symphonai_api.model_table import capability_for_model
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, tool_result_text
 from symphonai_api.secrets import mask_secrets as redact_secrets
@@ -295,8 +297,14 @@ class MemoryExtractor:
                     provider = context[5] or context[1]
                     consolidate_due(self._store, provider, context[6] or provider.model,
                                     cancel=cancel, usage_callback=self._usage_callback)
-            except Exception:
+            except OperationCancelled:
                 success = False
+            except Exception as exc:
+                success = False
+                reason = " ".join(redact_secrets(f"{type(exc).__name__}: {exc}").splitlines())
+                print(f"Memory extraction failed: {reason}", file=sys.stderr, flush=True)
+                emit(self._events, PersonNotice(agent_id=self._agent_id, run_id="",
+                     text=f"Memory extraction failed: {reason}"))
             with self._lock:
                 if success and context[0]:
                     self._cursor = (
@@ -361,15 +369,7 @@ class MemoryExtractor:
         else:
             provider = target_provider
             model = memory_model or provider.model
-            capabilities = next(
-                (
-                    capability
-                    for capability in model_capabilities()
-                    if capability.wire_format == provider.wire_format
-                    and capability.model == model
-                ),
-                None,
-            )
+            capabilities = capability_for_model(provider.wire_format, model)
             effort = (
                 "low"
                 if capabilities is not None

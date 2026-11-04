@@ -104,199 +104,6 @@ function emptyAgentFields() {
   };
 }
 
-function commentIndex(line) {
-  let quote = "";
-  let escaped = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (quote === '"' && escaped) {
-      escaped = false;
-    } else if (quote === '"' && character === "\\") {
-      escaped = true;
-    } else if (quote && character === quote) {
-      quote = "";
-    } else if (!quote && (character === '"' || character === "'")) {
-      quote = character;
-    } else if (!quote && character === "#") {
-      return index;
-    }
-  }
-  return -1;
-}
-
-function parseValue(value) {
-  const trimmed = value.trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
-      return trimmed.slice(1, -1);
-    }
-    return trimmed;
-  }
-}
-
-function scanAgentText(text) {
-  const lines = text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-  const assignments = [];
-  let table = "";
-  for (const [index, line] of lines.entries()) {
-    const body = line.replace(/\r?\n$/, "");
-    const end = commentIndex(body);
-    const content = (end < 0 ? body : body.slice(0, end));
-    const section = content.match(/^\s*\[([^\]]+)\]\s*$/);
-    if (section) {
-      table = section[1].trim();
-      continue;
-    }
-    const assignment = content.match(/^(\s*[A-Za-z0-9_-]+\s*=\s*)(.*?)(\s*)$/);
-    if (!assignment) continue;
-    const key = assignment[1].match(/[A-Za-z0-9_-]+(?=\s*=)/)?.[0];
-    if (!key) continue;
-    assignments.push({
-      index,
-      table,
-      key,
-      value: parseValue(assignment[2]),
-      prefix: assignment[1],
-      trailing: assignment[3],
-      comment: end < 0 ? "" : body.slice(end),
-      ending: line.slice(body.length),
-    });
-  }
-  return { lines, assignments };
-}
-
-export function parseAgentText(text) {
-  const fields = {
-    ...emptyAgentFields(),
-  };
-  if (typeof text !== "string") {
-    return fields;
-  }
-  for (const assignment of scanAgentText(text).assignments) {
-    const { table, key, value } = assignment;
-    if (table === "model" && ["provider", "model", "effort"].includes(key)) {
-      fields[key] = typeof value === "string" ? value : "";
-    } else if (table === "" && key === "prompt") {
-      fields.prompt = typeof value === "string" ? value : "";
-    } else if (table === "" && key === "tools") {
-      fields.tools = Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
-    } else if (table === "" && key === "deny_tools") {
-      fields.denyTools = Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
-    }
-  }
-  return fields;
-}
-
-function tomlString(value) {
-  return JSON.stringify(value ?? "");
-}
-
-function tomlArray(values) {
-  return `[${values.map((value) => tomlString(value)).join(", ")}]`;
-}
-
-export function composeAgentText(fields, original) {
-  const next = {
-    ...emptyAgentFields(),
-    ...fields,
-    tools: Array.isArray(fields?.tools) ? fields.tools.filter(Boolean) : [],
-    denyTools: Array.isArray(fields?.denyTools) ? fields.denyTools.filter(Boolean) : [],
-  };
-  const output = rewriteAgentText(original, next, original === "");
-  return output;
-}
-
-function rewriteAgentText(original, fields, creating) {
-  const { lines, assignments } = scanAgentText(original);
-  const ending = lines.find((line) => line.endsWith("\r\n")) ? "\r\n" : "\n";
-  const desired = [
-    { table: "", key: "prompt", field: "prompt", value: fields.prompt, empty: creating ? false : fields.prompt === "" },
-    { table: "", key: "tools", field: "tools", value: fields.tools, empty: fields.tools.length === 0 },
-    { table: "", key: "deny_tools", field: "denyTools", value: fields.denyTools, empty: fields.denyTools.length === 0 },
-    { table: "model", key: "provider", field: "provider", value: fields.provider, empty: fields.provider === "" },
-    { table: "model", key: "model", field: "model", value: fields.model, empty: fields.model === "" },
-    { table: "model", key: "effort", field: "effort", value: fields.effort, empty: fields.effort === "" },
-  ];
-  const edits = new Map();
-  const insertions = new Map();
-  const present = new Set();
-  for (const item of desired) {
-    const match = assignments.find(({ table, key }) => table === item.table && key === item.key);
-    const current = item.field === "tools" || item.field === "denyTools"
-      ? (Array.isArray(match?.value) ? match.value.filter((value) => typeof value === "string") : [])
-      : (typeof match?.value === "string" ? match.value : "");
-    if (match) present.add(item.field);
-    const changed = JSON.stringify(current) !== JSON.stringify(item.value);
-    if (match && changed && item.empty) {
-      edits.set(match.index, null);
-    } else if (match && changed) {
-      const value = Array.isArray(item.value) ? tomlArray(item.value) : tomlString(item.value);
-      edits.set(match.index, `${match.prefix}${value}${match.trailing}${match.comment}${match.ending}`);
-    } else if (!match && !item.empty) {
-      const value = Array.isArray(item.value) ? tomlArray(item.value) : tomlString(item.value);
-      const line = `${item.key} = ${value}${ending}`;
-      const location = item.table === "" ? topLevelEnd(lines) : modelEnd(lines);
-      if (!insertions.has(location)) insertions.set(location, []);
-      insertions.get(location).push({ table: item.table, line });
-    }
-  }
-  if (creating && !present.has("prompt") && fields.prompt === "") {
-    insertions.set(0, [{ table: "", line: `prompt = ${tomlString(fields.prompt)}${ending}` }]);
-  }
-
-  const output = [];
-  let modelHeaderAdded = false;
-  for (let index = 0; index <= lines.length; index += 1) {
-    if (insertions.has(index)) {
-      const additions = insertions.get(index);
-      if (index === lines.length && lines.length > 0 && !lines.at(-1).endsWith("\n")) {
-        output.push(ending);
-      }
-      for (const item of additions) {
-        if (item.table === "model" && !hasModelTable(lines) && !modelHeaderAdded) {
-          output.push(`[model]${ending}`);
-          modelHeaderAdded = true;
-        }
-        output.push(item.line);
-      }
-    }
-    if (index === lines.length) break;
-    if (edits.has(index)) {
-      const replacement = edits.get(index);
-      if (replacement !== null) output.push(replacement);
-      continue;
-    }
-    output.push(lines[index]);
-  }
-  return output.join("");
-}
-
-function topLevelEnd(lines) {
-  const index = lines.findIndex((line) => /^\s*\[[^\]]+\]/.test(line));
-  return index < 0 ? lines.length : index;
-}
-
-function hasModelTable(lines) {
-  return lines.some((line) => /^\s*\[model\]\s*(?:#.*)?(?:\r?\n)?$/.test(line));
-}
-
-function modelEnd(lines) {
-  let header = -1;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (/^\s*\[model\]\s*(?:#.*)?(?:\r?\n)?$/.test(lines[index])) {
-      header = index;
-      break;
-    }
-  }
-  if (header < 0) return lines.length;
-  for (let index = header + 1; index < lines.length; index += 1) {
-    if (/^\s*\[[^\]]+\]/.test(lines[index])) return index;
-  }
-  return lines.length;
-}
-
 export function inventoryRows(reply) {
   return section(reply, "withheld")
     .map(({ scope, directory, names, reason }) => ({
@@ -984,7 +791,7 @@ function renderAgents(section, context) {
     return control;
   }
 
-  function renderEditor(values, identity = null, original = "", message = "") {
+  function renderEditor(values, identity = null, message = "") {
     const form = element(document, "form", { className: "agent-form" });
     const name = field(document, "input", "agent-name", identity?.name ?? values.name ?? "");
     const scope = field(document, "select", "agent-scope", identity?.scope ?? "project");
@@ -1020,16 +827,16 @@ function renderAgents(section, context) {
       event.preventDefault();
       const currentName = name.value.trim();
       const currentScope = scope.value;
-      const text = composeAgentText({
+      const fields = {
         prompt: prompt.value,
         provider: provider.value.trim(),
         model: model.value.trim(),
         effort: effort.value.trim(),
         tools: tools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
-        denyTools: denyTools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
-      }, original);
+        deny_tools: denyTools.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+      };
       try {
-        const reply = await boundary.saveAgent(currentName, currentScope, text);
+        const reply = await boundary.saveAgent(currentName, currentScope, fields);
         context.settingsReply = await boundary.settings();
         context.skillCommands = getSkillCommands(context.settingsReply);
         renderAgentRows();
@@ -1046,8 +853,7 @@ function renderAgents(section, context) {
     if (status) status.textContent = "Loading definition…";
     try {
       const reply = await boundary.agent(rowData.name, rowData.scope);
-      const original = typeof reply?.text === "string" ? reply.text : "";
-      renderEditor(parseAgentText(original), rowData, original);
+      renderEditor({ ...emptyAgentFields(), ...reply.fields, denyTools: reply.fields.deny_tools ?? [] }, rowData);
     } catch (error) {
       if (status) status.textContent = errorText(error);
     }
@@ -1080,7 +886,7 @@ function renderAgents(section, context) {
       const draft = await boundary.draftAgent(description.value);
       renderEditor({
         ...emptyAgentFields(), ...draft, denyTools: draft.deny_tools ?? [],
-      }, null, "", `Draft · not saved${draft.dropped?.length ? ` · Dropped tools: ${draft.dropped.join(", ")}` : ""}`);
+      }, null, `Draft · not saved${draft.dropped?.length ? ` · Dropped tools: ${draft.dropped.join(", ")}` : ""}`);
     } catch (error) {
       draftStatus.textContent = errorText(error);
     } finally {
@@ -1090,7 +896,7 @@ function renderAgents(section, context) {
   });
   const draftControls = element(document, "div");
   append(draftControls, descriptionLabel, draftButton, draftStatus);
-  listen(newAgent, "click", () => renderEditor(parseAgentText(""), null, ""));
+  listen(newAgent, "click", () => renderEditor(emptyAgentFields()));
   renderAgentRows();
   replace(
     settingsContent,

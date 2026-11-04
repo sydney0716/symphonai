@@ -10,6 +10,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -55,44 +56,57 @@ def target_triple() -> str:
 
 
 def verify_handshake_without_python(binary: Path) -> float:
-    """Prove the frozen executable starts with no inherited environment."""
-    started = time.monotonic()
-    process = subprocess.Popen(
-        [str(binary)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env={},
-    )
-    try:
-        if process.stdout is None:
-            raise RuntimeError("sidecar did not expose stdout")
-        line: list[str] = []
-        ready = threading.Event()
-
-        def read_handshake() -> None:
-            line.append(process.stdout.readline())
-            ready.set()
-
-        threading.Thread(target=read_handshake, daemon=True).start()
-        if not ready.wait(HANDSHAKE_TIMEOUT_SECONDS):
-            elapsed = time.monotonic() - started
-            raise RuntimeError(
-                f"sidecar did not emit its handshake within {elapsed:.2f}s"
-            )
-        handshake = json.loads(line[0])
-        if not isinstance(handshake.get("port"), int) or not isinstance(
-            handshake.get("token"), str
-        ):
-            raise RuntimeError(f"sidecar emitted an invalid handshake: {line[0]!r}")
-        return time.monotonic() - started
-    finally:
-        process.terminate()
+    """Prove the executable starts in an isolated home without inherited keys."""
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory) / "home"
+        app_home = home / ".symphonai"
+        project = Path(directory) / "project"
+        app_home.mkdir(parents=True)
+        project.mkdir()
+        environment = {
+            "HOME": str(home), "USERPROFILE": str(home), "SYMPHONAI_HOME": str(app_home),
+            "SYMPHONAI_SESSIONS_DIR": str(app_home / "sessions"),
+            "SYMPHONAI_MEMORY_DIR": str(app_home / "memory"),
+            "SYMPHONAI_CREDENTIALS_FILE": str(app_home / "credentials.json"),
+        }
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [str(binary.resolve()), "--repo-root", str(project)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=project,
+            env=environment,
+        )
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            if process.stdout is None:
+                raise RuntimeError("sidecar did not expose stdout")
+            line: list[str] = []
+            ready = threading.Event()
+
+            def read_handshake() -> None:
+                line.append(process.stdout.readline())
+                ready.set()
+
+            threading.Thread(target=read_handshake, daemon=True).start()
+            if not ready.wait(HANDSHAKE_TIMEOUT_SECONDS):
+                elapsed = time.monotonic() - started
+                raise RuntimeError(
+                    f"sidecar did not emit its handshake within {elapsed:.2f}s"
+                )
+            handshake = json.loads(line[0])
+            if not isinstance(handshake.get("port"), int) or not isinstance(
+                handshake.get("token"), str
+            ):
+                raise RuntimeError(f"sidecar emitted an invalid handshake: {line[0]!r}")
+            return time.monotonic() - started
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def measure_warm_start(binary: Path) -> tuple[float, list[float], float]:

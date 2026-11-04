@@ -36,53 +36,71 @@ class CheckpointStore:
     def _reload(self) -> None:
         if not self._manifest.exists():
             return
-        with self._manifest.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"invalid checkpoint manifest line {line_number}") from exc
-                kind = record.get("type") if isinstance(record, dict) else None
-                if kind == "begin" and isinstance(record.get("key"), str):
-                    self._key = record["key"]
-                    self._keys.append(self._key)
-                    label = record.get("label")
-                    if isinstance(label, str):
-                        self._labels[self._key] = label
-                elif kind == "write":
-                    key, path, backup = record.get("key"), record.get("path"), record.get("backup")
-                    if (
-                        isinstance(key, str)
-                        and isinstance(path, str)
-                        and (backup is None or isinstance(backup, str) and Path(backup).name == backup)
-                    ):
-                        entry = CheckpointEntry(key, path, backup)
-                        self._entries.append(entry)
-                        self._entry_keys.add((key, path))
-                        if backup is not None and backup.startswith("backup-"):
-                            try:
-                                self._backup_number = max(
-                                    self._backup_number,
-                                    int(backup.removeprefix("backup-").removesuffix(".bin")) + 1,
-                                )
-                            except ValueError:
-                                pass
-                        digest = record.get("sha256")
-                        if isinstance(digest, str):
-                            self._last_written[path] = digest
-                        elif digest is None:
-                            self._last_written.pop(path, None)
-                elif kind in ("after_write", "restore"):
-                    path, digest = record.get("path"), record.get("sha256")
-                    if isinstance(path, str):
-                        if isinstance(digest, str):
-                            self._last_written[path] = digest
-                        elif digest is None:
-                            self._last_written.pop(path, None)
+        lines = self._manifest.read_bytes().splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("record is not an object")
+            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                if index == len(lines) - 1:
+                    self._torn_bytes = len(line)
+                    break
+                raise ValueError(f"invalid checkpoint manifest line {index + 1}") from exc
+            kind = record.get("type") if isinstance(record, dict) else None
+            if kind == "begin" and isinstance(record.get("key"), str):
+                self._key = record["key"]
+                self._keys.append(self._key)
+                label = record.get("label")
+                if isinstance(label, str):
+                    self._labels[self._key] = label
+            elif kind == "write":
+                key, path, backup = record.get("key"), record.get("path"), record.get("backup")
+                if (
+                    isinstance(key, str)
+                    and isinstance(path, str)
+                    and (backup is None or isinstance(backup, str) and Path(backup).name == backup)
+                ):
+                    entry = CheckpointEntry(key, path, backup)
+                    self._entries.append(entry)
+                    self._entry_keys.add((key, path))
+                    if backup is not None and backup.startswith("backup-"):
+                        try:
+                            self._backup_number = max(
+                                self._backup_number,
+                                int(backup.removeprefix("backup-").removesuffix(".bin")) + 1,
+                            )
+                        except ValueError:
+                            pass
+                    digest = record.get("sha256")
+                    if isinstance(digest, str):
+                        self._last_written[path] = digest
+                    elif digest is None:
+                        self._last_written.pop(path, None)
+            elif kind in ("after_write", "restore"):
+                path, digest = record.get("path"), record.get("sha256")
+                if isinstance(path, str):
+                    if isinstance(digest, str):
+                        self._last_written[path] = digest
+                    elif digest is None:
+                        self._last_written.pop(path, None)
 
     def _append(self, record: dict) -> None:
-        with self._manifest.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        with self._manifest.open("a+b") as handle:
+            handle.seek(0, 2)
+            torn = getattr(self, "_torn_bytes", 0)
+            if torn:
+                handle.truncate(handle.tell() - torn)
+            handle.seek(0, 2)
+            separator = b""
+            if handle.tell():
+                handle.seek(-1, 2)
+                if handle.read(1) != b"\n":
+                    separator = b"\n"
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+            handle.write(separator + line)
+            handle.flush()
+            self._torn_bytes = 0
 
     def _relative_path(self, path: Path) -> tuple[Path, str]:
         resolved = Path(path).resolve()

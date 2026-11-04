@@ -264,9 +264,10 @@ class HookRunner:
                         )
                         if response.stop_reason == "refusal" or response.refusal_category:
                             raise ValueError("hook model refused")
-                        text = response.message.text.strip()
-                        if text.startswith("```json\n") and text.endswith("\n```"):
-                            text = text[len("```json\n"):-len("\n```")]
+                        text = response.message.text.strip().replace("\r\n", "\n")
+                        lines = text.split("\n")
+                        if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
+                            text = "\n".join(lines[1:-1])
                         if not isinstance(json.loads(text), dict):
                             raise ValueError("hook model must reply with a JSON object")
                     completed.put((text, None))

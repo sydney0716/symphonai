@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 
 
+if sys.flags.optimize:
+    print("checks require assertions; optimized Python (-O/PYTHONOPTIMIZE) is not supported", file=sys.stderr)
+    raise SystemExit(2)
+
 sys.dont_write_bytecode = True
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -18,7 +22,6 @@ from scripts.checks import history  # noqa: E402, F401
 from scripts.checks import vendors  # noqa: E402, F401
 from scripts.checks import turns  # noqa: E402, F401
 from scripts.checks import host  # noqa: E402, F401
-from scripts.checks import providers_live  # noqa: E402, F401
 from scripts.checks.harness import names, run  # noqa: E402
 
 

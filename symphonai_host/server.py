@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 import tempfile
+import tomllib
+import re
 from datetime import datetime, timezone
 from collections.abc import Mapping
 from collections.abc import Callable
@@ -893,6 +895,109 @@ class HostServer:
                     "agents",
                 )
 
+            def _definition_fields(self, text: str) -> dict:
+                data = tomllib.loads(text)
+                model = data.get("model", {})
+                return {
+                    "prompt": data.get("prompt", ""),
+                    "tools": data.get("tools", []),
+                    "deny_tools": data.get("deny_tools", []),
+                    **{key: model.get(key, "") for key in ("provider", "model", "effort")},
+                }
+
+            def _edit_definition_fields(self, text: str, fields: dict) -> str:
+                current = self._definition_fields(text)
+                for key, value in fields.items():
+                    if key not in current:
+                        raise ValueError("unknown agent field: " + key)
+                    valid = (
+                        isinstance(value, list) and all(isinstance(item, str) for item in value)
+                        if key in ("tools", "deny_tools") else isinstance(value, str)
+                    )
+                    if not valid:
+                        raise ValueError("invalid agent field: " + key)
+                changes = {key: value for key, value in fields.items() if value != current[key]}
+                lines = text.splitlines(keepends=True)
+                ending = "\r\n" if "\r\n" in text else "\n"
+                table = ()
+                root_end = len(lines)
+                model_end = None
+                edits = []
+                index = 0
+                while index < len(lines):
+                    line = lines[index]
+                    if line.lstrip().startswith("["):
+                        header = tomllib.loads(line)
+                        table = ()
+                        while isinstance(header, dict) and len(header) == 1:
+                            key, header = next(iter(header.items()))
+                            table += (key,)
+                        root_end = min(root_end, index)
+                        if model_end is not None and table != ("model",):
+                            model_end = min(model_end, index)
+                        if table == ("model",):
+                            model_end = len(lines)
+                        index += 1
+                        continue
+                    match = re.match(r"(\s*([^=]+?)\s*=\s*)(.*)", line)
+                    if match is None or line.lstrip().startswith("#"):
+                        index += 1
+                        continue
+                    end = index + 1
+                    while True:
+                        statement = "".join(lines[index:end])
+                        try:
+                            parsed = tomllib.loads(statement)
+                            break
+                        except tomllib.TOMLDecodeError:
+                            if end == len(lines):
+                                raise
+                            end += 1
+                    path = table
+                    while isinstance(parsed, dict) and len(parsed) == 1:
+                        key, parsed = next(iter(parsed.items()))
+                        path += (key,)
+                    field = path[-1] if path in (("prompt",), ("tools",), ("deny_tools",),
+                        ("model", "provider"), ("model", "model"), ("model", "effort")) else None
+                    if field in changes:
+                        value = changes.pop(field)
+                        comment = ""
+                        for offset, character in enumerate(statement):
+                            if character != "#":
+                                continue
+                            try:
+                                tomllib.loads(statement[:offset])
+                            except tomllib.TOMLDecodeError:
+                                continue
+                            comment = " " + statement[offset:].rstrip("\r\n")
+                            break
+                        suffix = ending if lines[end - 1].endswith("\n") else ""
+                        replacement = match[1] + json.dumps(value, ensure_ascii=False) + comment + suffix
+                        if field != "prompt" and not value:
+                            replacement = comment.lstrip() + suffix if comment else ""
+                        edits.append((index, end, replacement))
+                    index = end
+                additions = {}
+                for key, value in changes.items():
+                    if not value and key != "prompt":
+                        continue
+                    root = key in ("prompt", "tools", "deny_tools")
+                    location = root_end if root else (model_end if model_end is not None else len(lines))
+                    additions.setdefault(location, []).append((root, key, value))
+                for location, values in additions.items():
+                    replacement = ""
+                    if location and not lines[location - 1].endswith("\n"):
+                        replacement += ending
+                    for root, key, value in sorted(values, key=lambda item: not item[0]):
+                        if not root and model_end is None:
+                            replacement += "[model]" + ending
+                            model_end = location
+                        replacement += key + " = " + json.dumps(value, ensure_ascii=False) + ending
+                    edits.append((location, location, replacement))
+                for start, end, replacement in sorted(edits, reverse=True):
+                    lines[start:end] = [replacement]
+                return "".join(lines)
+
             def _validate_definition(self, target: Path, text: str) -> None:
                 try:
                     with tempfile.TemporaryDirectory() as temporary:
@@ -940,9 +1045,14 @@ class HostServer:
                     data = target.read_bytes()
                 with self._errors('definition_decode'):
                     text = data.decode("utf-8")
+                try:
+                    fields = self._definition_fields(text)
+                except (tomllib.TOMLDecodeError, AttributeError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
                 self._json(
                     HTTPStatus.OK,
-                    {"name": stem, "scope": scope, "text": text},
+                    {"name": stem, "scope": scope, "text": text, "fields": fields},
                 )
 
             def _read_object(self) -> dict:
@@ -1728,10 +1838,19 @@ class HostServer:
                     return
                 if not self._definition_trusted(scope):
                     return _Reply(HTTPStatus.FORBIDDEN, {'error': 'repository not trusted for agents'})
+                if ('text' in payload) == ('fields' in payload):
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'supply exactly one of text or fields'})
+                try:
+                    text = payload.get('text')
+                    if text is None:
+                        original = target.read_bytes().decode("utf-8") if target.exists() else ""
+                        text = self._edit_definition_fields(original, payload['fields'])
+                except (ValueError, AttributeError, OSError) as exc:
+                    return _Reply(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
                 with self._errors(1):
-                    self._validate_definition(target, payload['text'])
+                    self._validate_definition(target, text)
                 with self._errors(2):
-                    self._write_definition(target, payload['text'])
+                    self._write_definition(target, text)
                 return _Reply(HTTPStatus.OK, {'written': True, 'name': stem, 'scope': scope, 'path': str(target), 'message': 'definition saved; it will take effect on the next run'})
 
             def _post_steer(self, payload):
@@ -2209,7 +2328,7 @@ class HostServer:
             ),
             _Route('POST', '/agent', Handler._post_agent,
                 match='exact',
-                payload=_Payload({'name': str, 'scope': str, 'text': str}, ('name', 'scope', 'text'), extra=False),
+                payload=_Payload({'name': str, 'scope': str, 'text': str, 'fields': dict}, ('name', 'scope'), extra=False),
                 errors=(((ProtocolError, 'bad_request'),), ((AgentFileError, 'bad_request'),), ((OSError, 'definition_write_failed'),)),
                 helper_errors={
                     'definition_target': (((OSError, RuntimeError), 'empty_forbidden'),),

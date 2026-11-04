@@ -63,23 +63,32 @@ def _smoke_binary(binary: Path) -> None:
     with tempfile.TemporaryDirectory() as directory:
         with _ScriptedProvider() as provider:
             _require_loopback_base_url(provider.base_url)
-            environment = {
-                key: value
-                for key, value in os.environ.items()
-                if not key.endswith("_API_KEY")
-            }
-            # This is an inert local value, not a developer credential. The
-            # real provider requires a non-empty header before it will make a
-            # request, and the configured base URL is the loopback fixture.
-            environment["OPENAI_API_KEY"] = "sidecar-smoke-key"
-            environment["SYMPHONAI_SESSIONS_DIR"] = str(Path(directory) / "sessions")
+            home = Path(directory) / "home"
+            app_home = home / ".symphonai"
+            project = Path(directory) / "project"
+            app_home.mkdir(parents=True)
+            project.mkdir()
+            (app_home / "selection.json").write_text(json.dumps({
+                "name": "openai", "model": "smoke-model", "base_url": provider.base_url,
+            }), encoding="utf-8")
+            (app_home / "config.toml").write_text("[memory]\nextract = false\n", encoding="utf-8")
+            environment = {key: value for key, value in os.environ.items()
+                           if key in {"PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL"}}
+            environment.update({
+                "HOME": str(home), "USERPROFILE": str(home),
+                "SYMPHONAI_HOME": str(app_home),
+                "SYMPHONAI_SESSIONS_DIR": str(app_home / "sessions"),
+                "SYMPHONAI_MEMORY_DIR": str(app_home / "memory"),
+                "SYMPHONAI_CREDENTIALS_FILE": str(app_home / "credentials.json"),
+                "OPENAI_API_KEY": "sidecar-smoke-key",
+            })
             try:
                 child = subprocess.Popen(
-                    [str(binary), "--repo-root", directory, "--base-url", provider.base_url],
+                    [str(binary), "--repo-root", str(project)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
-                    cwd=directory,
+                    cwd=project,
                     env=environment,
                 )
             except OSError as exc:
@@ -107,11 +116,15 @@ def _smoke_binary(binary: Path) -> None:
                                         failures.append("approval reply was rejected")
                                         return
                                     approved.set()
+                                elif payload.get("operation") == "run_shell" and payload.get("target") == "true":
+                                    if not client.send_approval(payload["approval_id"], allowed=True).get("resolved"):
+                                        failures.append("validation approval reply was rejected")
+                                        return
                                 else:
                                     second_approval.set()
                             elif kind == "event" and isinstance(
                                 decode_event(payload), RunFinished
-                            ):
+                            ) and decode_event(payload).agent_name == "leader":
                                 finished.set()
                     except Exception as exc:
                         failures.append(f"event stream failed: {exc}")
@@ -129,7 +142,7 @@ def _smoke_binary(binary: Path) -> None:
                     raise RuntimeError(f"run completion failed: {failures}")
                 if failures:
                     raise RuntimeError(f"run completion failed: {failures[0]}")
-                if (Path(directory) / "approved.txt").read_text(encoding="utf-8") != "ok":
+                if (project / "approved.txt").read_text(encoding="utf-8") != "ok":
                     raise RuntimeError("run completion failed: approved tool did not execute")
                 print("OK:   approved run finished")
                 sessions = client.list_sessions()
@@ -215,17 +228,33 @@ class _ScriptedProvider:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
-                if self.path != "/v1/chat/completions":
+                if self.path not in {"/v1/chat/completions", "/v1/responses"}:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
                 if self.headers.get("Authorization") != "Bearer sidecar-smoke-key":
                     self.send_error(HTTPStatus.UNAUTHORIZED)
                     return
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
                 provider.requests += 1
-                payload = json.dumps(provider._response()).encode("utf-8")
+                reply = provider._response()
+                if self.path == "/v1/responses":
+                    output = []
+                    for choice in reply["choices"]:
+                        message = choice["message"]
+                        if message.get("content"):
+                            output.append({"type": "message", "role": "assistant", "content": [
+                                {"type": "output_text", "text": message["content"]},
+                            ]})
+                        for call in message.get("tool_calls", []):
+                            output.append({"type": "function_call", "call_id": call["id"], **call["function"]})
+                    reply = {"id": f"smoke-{provider.requests}", "status": "completed", "output": output, "usage": {}}
+                payload = json.dumps(reply).encode("utf-8")
+                content_type = "application/json"
+                if self.path == "/v1/responses" and request.get("stream"):
+                    payload = b"event: response.completed\ndata: " + json.dumps({"response": reply}).encode("utf-8") + b"\n\n"
+                    content_type = "text/event-stream"
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -364,9 +393,6 @@ def _smoke_interpreter() -> None:
                             failed.append("approval reply was rejected")
                             return
                         if writing:
-                            host.run._conversation[0].subagents[
-                                "implementer"
-                            ].agent._policy.mode = "allow"
                             approved.set()
                         else:
                             validation_approved.set()

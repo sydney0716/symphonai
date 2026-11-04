@@ -154,11 +154,9 @@ class AgentMemory:
             }
             for entry in entries
         ]
-        temporary = path.with_name(f".{path.name}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
-            temporary.replace(path)
+            write_atomic(path, json.dumps(payload), mode=0o600, fsync=True)
         except OSError as exc:
             raise MemoryUnavailable("write", path, exc) from exc
 
@@ -258,14 +256,19 @@ class AgentMemory:
         self._path(scope)
         with self._lock:
             try:
-                lines = (self._root / "consolidation.jsonl").read_text(encoding="utf-8").splitlines()
+                lines = (self._root / "consolidation.jsonl").read_bytes().splitlines(keepends=True)
             except FileNotFoundError:
                 return None
             last = None
-            for line in lines:
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise ValueError("invalid consolidation history record")
+            for index, line in enumerate(lines):
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError("invalid consolidation history record")
+                except (UnicodeError, json.JSONDecodeError, ValueError):
+                    if index == len(lines) - 1:
+                        break
+                    raise ValueError(f"invalid consolidation history line {index + 1}") from None
                 if record.get("scope") != scope or record.get("project") != (str(self._repo_root) if scope == "project" else None):
                     continue
                 if record.get("action") == "restore":

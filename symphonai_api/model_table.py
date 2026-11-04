@@ -127,6 +127,16 @@ def model_capabilities() -> tuple[ModelCapability, ...]:
         return ()
 
 
+def capability_for_model(
+    wire_format: int, model: str | None,
+    capabilities: tuple[ModelCapability, ...] | None = None,
+) -> ModelCapability | None:
+    """Find a model capability, including dated and preview aliases."""
+    if model is None:
+        return None
+    return _capability_for_model(wire_format, model, model_capabilities() if capabilities is None else capabilities)
+
+
 def _capability_for_model(
     wire_format: int,
     model: str,

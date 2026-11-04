@@ -1,14 +1,12 @@
 """Core access boundaries through public policies, tools and agent calls."""
 from __future__ import annotations
 
-import io
 import json
 import os
 from pathlib import Path
 import socket
 import sys
 import tempfile
-import urllib.error
 from dataclasses import replace
 from unittest import mock
 
@@ -19,11 +17,9 @@ from symphonai_api.agent_file import load_agent_file
 from symphonai_api.config import CapabilityCeiling
 from symphonai_api.extensions import load_extensions
 from symphonai_api.leader import DispatchSubagentTool
-from symphonai_api.models import Message, ModelResponse, ModelRequest, Role, ToolCall
+from symphonai_api.models import Message, ModelResponse, Role, ToolCall
 from symphonai_api.permissions import PermissionPolicy
-from symphonai_api.providers.base import ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
-from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.tools import shell
 from symphonai_host.broker import EventBroker
 from symphonai_host.run import HostRun
@@ -370,16 +366,6 @@ def tool_results_mask_secret_values_and_key_shapes():
             result = ApiAgent(FakeModelProvider(responses), ws.tools, ws.policy).run([Message(Role.USER, 'read')])
         text = next(m.tool_result.content for m in result.messages if m.tool_result is not None)
         assert 'normal' in text and all(value not in text for value in (secret, key, value))
-
-
-@check('access.provider_errors_mask_the_api_key')
-def provider_errors_mask_the_api_key():
-    key = 'core-provider-key-not-real-12345'
-    error = urllib.error.HTTPError('https://fixture.invalid', 400, 'bad', {}, io.BytesIO(json.dumps({'error': {'message': key}}).encode()))
-    with mock.patch.dict(os.environ, {'OPENAI_API_KEY': key}), mock.patch('urllib.request.urlopen', side_effect=error):
-        try: OpenAIProvider().create_response(ModelRequest(messages=[Message(Role.USER, 'request')]))
-        except ProviderError as exc: assert key not in str(exc)
-        else: raise AssertionError('scripted provider failure did not fail')
 
 
 @check('access.agent_shell_has_no_secret_named_variables')

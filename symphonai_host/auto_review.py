@@ -8,7 +8,7 @@ import threading
 from symphonai_api.call_class import CallClass
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.cost import UsageTotals
-from symphonai_api.model_table import model_capabilities
+from symphonai_api.model_table import capability_for_model
 from symphonai_api.models import Message, ModelRequest, Role
 from symphonai_api.secrets import mask_secrets
 
@@ -27,8 +27,7 @@ def review_call(provider, model, request, *, user_text, agent_text, repo_root, o
     context = {"operation": request.operation, "target": request.target, "details": request.details,
                "command": list(request.command), "commands": request.commands, "diff": request.diff,
                "person_message": user_text, "agent_text": agent_text, "project_root": str(repo_root)}
-    capability = next((item for item in model_capabilities()
-                       if item.wire_format == provider.wire_format and item.model == model), None)
+    capability = capability_for_model(provider.wire_format, model)
     effort = "low" if capability is not None and any(item.id == "low" for item in capability.efforts) else None
     token = (cancel.child(deadline_seconds=REVIEW_TIMEOUT_SECONDS) if cancel is not None
              else CancellationToken(deadline_seconds=REVIEW_TIMEOUT_SECONDS))

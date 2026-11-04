@@ -752,19 +752,28 @@ class McpClient:
                 return message["result"]
 
     def list_tools(self) -> tuple["McpTool", ...]:
-        result = self._request(
-            "tools/list",
-            {},
-            timeout=self.spec.call_timeout_seconds,
-            phase="tools/list",
-        )
-        if not isinstance(result, Mapping) or not isinstance(result.get("tools"), list):
-            raise McpError(
-                f"MCP server {self.spec.name!r} returned an invalid tools/list result"
+        entries = []
+        cursor = None
+        cursors = set()
+        for _ in range(100):
+            result = self._request(
+                "tools/list", {} if cursor is None else {"cursor": cursor},
+                timeout=self.spec.call_timeout_seconds, phase="tools/list",
             )
+            if not isinstance(result, Mapping) or not isinstance(result.get("tools"), list):
+                raise McpError(f"MCP server {self.spec.name!r} returned an invalid tools/list result")
+            entries.extend(result["tools"])
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise McpError(f"MCP server {self.spec.name!r} returned an invalid tools/list cursor")
+            cursors.add(cursor)
+        else:
+            raise McpError(f"MCP server {self.spec.name!r} exceeded 100 tools/list pages")
         tools: list[McpTool] = []
         seen: set[str] = set()
-        for index, entry in enumerate(result["tools"]):
+        for index, entry in enumerate(entries):
             if not isinstance(entry, Mapping):
                 raise McpError(
                     f"MCP server {self.spec.name!r} tool {index} is not an object"

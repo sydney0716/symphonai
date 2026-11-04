@@ -711,8 +711,13 @@ host adds the command and result to the open conversation as user context, or
 holds it for the next prompt when no conversation is open.
 
 `GET /agent?name=<name>&scope=<user|project>` returns one agent definition as
-`{"name": <stem>, "scope": <scope>, "text": <contents>}`. `POST /agent`
-takes `{"name": <name>, "scope": <user|project>, "text": <contents>}` and
+`{"name": <stem>, "scope": <scope>, "text": <contents>, "fields": <fields>}`.
+The host parses `fields` with `tomllib`: `prompt`, `provider`, `model`, and
+`effort` are strings; `tools` and `deny_tools` are string arrays. Missing fields
+have empty defaults. `POST /agent` takes `name`, `scope`, and exactly one of
+`fields` (a partial field patch) or `text` (a complete TOML document). Field
+patches preserve unchanged lines, comments and multi-line strings; changed
+values are encoded as TOML strings or arrays by the host. The host
 validates the text with the runtime's `load_agent_file` before atomically
 replacing or creating the definition. A name may be a single stem or that
 stem with a `.toml` suffix; separators, `..`, and other extensions are

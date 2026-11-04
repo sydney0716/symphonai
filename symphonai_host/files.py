@@ -22,6 +22,8 @@ def _is_subsequence(query: str, value: str) -> bool:
 
 
 def _walk_candidates(policy: PermissionPolicy, root: Path) -> tuple[tuple[str, ...], bool]:
+    from symphonai_api.tools.search import DEFAULT_SKIP_DIRECTORIES
+
     paths: list[str] = []
     visited = 0
     truncated = False
@@ -35,6 +37,8 @@ def _walk_candidates(policy: PermissionPolicy, root: Path) -> tuple[tuple[str, .
                 continue
             for path in entries:
                 if path.is_dir() and not path.is_symlink():
+                    if path.name in DEFAULT_SKIP_DIRECTORIES or path.name.endswith(".egg-info"):
+                        continue
                     if policy.check_read(path).allowed:
                         visited += 1
                         if visited > MAX_SEARCH_FILES:

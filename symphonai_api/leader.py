@@ -85,7 +85,7 @@ from symphonai_api.models import ContentInput, Message, ModelRequest, Role, Tool
 from symphonai_api.memory_extract import MemoryExtractor
 from symphonai_api.permissions import ApprovalCallback, DenialReason, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
-from symphonai_api.model_table import model_capabilities
+from symphonai_api.model_table import capability_for_model, model_capabilities
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.spec_text import spec_validation
 from symphonai_api.tools.shell import RunShellTool, shell_executable
@@ -309,12 +309,13 @@ def builtin_subagent_specs(
 
 def _default_effort(provider: ModelProvider, model: str | None, level: str,
                     *, provider_name: str | None = None) -> str | None:
-    capability = next((item for item in model_capabilities()
-                       if item.model == model and (
-                           item.wire_format == provider.wire_format
-                           if provider_name is None or provider_name == provider.name
-                           else item.provider == provider_name
-                       )), None)
+    candidates = None
+    wire_format = provider.wire_format
+    if provider_name is not None and provider_name != provider.name:
+        candidates = tuple(item for item in model_capabilities() if item.provider == provider_name)
+        if candidates:
+            wire_format = candidates[0].wire_format
+    capability = capability_for_model(wire_format, model, candidates)
     return level if capability is not None and any(option.id == level for option in capability.efforts) else None
 
 
@@ -1646,9 +1647,12 @@ class _LeaderTranscript:
 
 def _project_snapshot(root: Path) -> dict[str, tuple[int, int]] | None:
     """Capture file size and mtime for a reasonably sized project tree."""
+    from symphonai_api.tools.search import DEFAULT_SKIP_DIRECTORIES
+
     snapshot: dict[str, tuple[int, int]] = {}
     entries = 0
     for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in DEFAULT_SKIP_DIRECTORIES and not name.endswith(".egg-info")]
         entries += len(dirnames) + len(filenames)
         if entries > 50_000:
             return None

@@ -292,11 +292,10 @@ class ApiAgent:
         self._tool_schemas = [schema for schema in self._tool_schemas if schema_name(schema) in selected]
 
     def _ask_hook_model(self, prompt, cancel):
-        from symphonai_api.model_table import model_capabilities
+        from symphonai_api.model_table import capability_for_model
 
         model = self._previous_answering_model or self._provider.model
-        capability = next((item for item in model_capabilities()
-                           if item.wire_format == self._provider.wire_format and item.model == model), None)
+        capability = capability_for_model(self._provider.wire_format, model)
         effort = "low" if capability is not None and any(option.id == "low" for option in capability.efforts) else None
         return self._provider.create_response(ModelRequest(
             messages=[Message(Role.USER, prompt)],
@@ -861,13 +860,9 @@ class ApiAgent:
                                 ) if message.tool_calls else message
                                 for message in request.messages
                             ]
-                            from symphonai_api.model_table import model_capabilities
+                            from symphonai_api.model_table import capability_for_model
 
-                            capability = next((
-                                item for item in model_capabilities()
-                                if item.wire_format == self._provider.wire_format
-                                and item.model == candidate_model
-                            ), None)
+                            capability = capability_for_model(self._provider.wire_format, candidate_model)
                             effort = request.effort
                             if capability is None or not any(
                                 option.id == effort for option in capability.efforts

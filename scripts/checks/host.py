@@ -182,26 +182,26 @@ def terminal_input_streams_ordered_output():
 
 @check("host.routes_require_the_token")
 def routes_require_the_token():
-    gets = ("/health", "/events", "/conversation", "/git/status", "/git/diff", "/git/pull-request",
-            "/jobs", "/changes", "/memory", "/roadmap", "/models", "/tree", "/source", "/files",
-            "/agent", "/session/agent", "/survey", "/project", "/projects", "/directories",
-            "/settings", "/approvals", "/permissions", "/sessions", "/session/export", "/loops",
-            "/loop", "/loop/card", "/history", "/app/", "/app/src/app.js")
-    posts = ("/project/open", "/git/commit", "/git/pull-request", "/jobs/start", "/jobs/stop", "/prompt",
-             "/stop", "/approval", "/permissions/remove", "/session/open", "/session/fork", "/session/new",
-             "/session/rename", "/session/delete", "/session/archive", "/provider", "/mode", "/compact",
-             "/agent", "/steer", "/command", "/changes/revert", "/worktree/apply", "/worktree/discard",
-             "/goal", "/goal/state", "/loop/start", "/loop/plan", "/loop/cancel", "/loop/commit",
-             "/loop/resume",
-             "/memory/update", "/memory/delete", "/memory/restore", "/credentials", "/extensions/reload", "/config/set")
+    from inspect import getclosurevars
+
     with workspace() as ws, running_host(ws) as host:
+        handler = host._httpd.RequestHandlerClass
+        routes = getclosurevars(handler._dispatch).nonlocals["routes"]
+        public = {(route.method, route.path) for route in routes if not route.auth}
+        assert public == {("GET", "/mcp/callback"), ("GET", "/app"), ("POST", "/preview/mark")}, public
         exposed = {}
-        for method, paths in (("GET", gets), ("POST", posts)):
-            for path in paths:
-                status, _, _ = request(host, path, {} if method == "POST" else None, authenticated=False)
-                if status != 401:
-                    exposed[f"{method} {path}"] = status
+        for route in routes:
+            if not route.auth:
+                continue
+            status, _, _ = request(host, route.path, {} if route.method == "POST" else None, authenticated=False)
+            if status != 401:
+                exposed[f"{route.method} {route.path}"] = status
         assert not exposed, f"routes accessible without a token: {exposed}"
+
+
+@check("host.roadmap_tools_record_start_and_remove_goals")
+def roadmap_tools_record_start_and_remove_goals():
+    with workspace() as ws, running_host(ws) as host:
         for path in ("/roadmap/add", "/roadmap/remove", "/roadmap/move", "/roadmap/start"):
             assert request(host, path, {})[0] == 404
         from symphonai_host.roadmap_tools import roadmap_tools
@@ -220,6 +220,11 @@ def routes_require_the_token():
         assert removed.ok and not json.loads(removed.content)["goals"]
         assert (ws.root / ".symphonai" / "loops" / loop_id).is_dir()
         assert not tools["remove_roadmap_goal"].execute(tool("remove_roadmap_goal", goal_id=goal_id), ws.policy).ok
+
+
+@check("host.config_set_preserves_comments_and_refuses_invalid_values")
+def config_set_preserves_comments_and_refuses_invalid_values():
+    with workspace() as ws, running_host(ws) as host:
         config = ws.outside / "home" / ".symphonai" / "config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         original = '# Keep header\n[memory]\nextract = true  # Keep comment\n'
@@ -590,13 +595,68 @@ def headless_failed_run_exits_nonzero_with_json():
 
 @check("host.app_core")
 def app_core():
+    import signal
+    import sys
+    import tempfile
+
     node = shutil.which("node")
     assert node is not None, "Node 18 or later is required"
     version = subprocess.run([node, "--version"], capture_output=True, text=True, check=True).stdout
     assert int(version.lstrip("v").split(".")[0]) >= 18
-    result = subprocess.run([node, "--experimental-default-type=module", "--test", "symphonai_app/test/core.test.js"],
-                            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
+    with tempfile.TemporaryFile(mode="w+t") as stdout, tempfile.TemporaryFile(mode="w+t") as stderr:
+        process = subprocess.Popen(
+            [node, "--experimental-default-type=module", "--test", "symphonai_app/test/core.test.js"],
+            cwd=Path(__file__).resolve().parents[2], stdout=stdout, stderr=stderr,
+            text=True, start_new_session=True,
+        )
+        try:
+            last_sample = time.monotonic()
+            deadline = last_sample + 15
+            memory_kind = "physical footprint" if sys.platform == "darwin" else "RSS"
+            while process.poll() is None:
+                assert time.monotonic() < deadline, "host.app_core exceeded the 15 s time limit"
+                try:
+                    listing = subprocess.run(
+                        ["ps", "-axo", "pid=,pgid=,rss="], capture_output=True, text=True,
+                        check=True, timeout=0.2,
+                    )
+                    members = {}
+                    for line in listing.stdout.splitlines():
+                        pid, group, rss = map(int, line.split())
+                        if group == process.pid:
+                            members[pid] = rss * 1024
+                    if not members:
+                        raise ValueError("no process group members sampled")
+                    if sys.platform == "darwin":
+                        footprint = subprocess.run(
+                            ["footprint", "--noCategories", "-f", "bytes",
+                             *(arg for pid in members for arg in ("-p", str(pid)))],
+                            capture_output=True, text=True, check=True, timeout=0.4,
+                        )
+                        values = {int(pid): int(size) for pid, size in re.findall(
+                            r"(?m)^.*\[(\d+)\]:[^\n]*Footprint:\s*(\d+)\s+B\b", footprint.stdout,
+                        )}
+                        if values.keys() != members.keys():
+                            raise ValueError("incomplete physical footprint sample")
+                        memory = sum(values.values())
+                    else:
+                        memory = sum(members.values())
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
+                else:
+                    last_sample = time.monotonic()
+                    assert memory <= 2 * 1024 ** 3, f"host.app_core exceeded the 2 GB group {memory_kind} limit"
+                assert time.monotonic() - last_sample < 5, "host.app_core could not read group memory for 5 s"
+                time.sleep(0.05)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+        stdout.seek(0)
+        stderr.seek(0)
+        assert process.returncode == 0, stdout.read() + stderr.read()
 
 
 class FailureFollowUpScript(LoopScript):
@@ -772,7 +832,7 @@ def a_run_that_fails_early_still_ends():
         original_open = Path.open
 
         def open_path(path, mode='r', *args, **kwargs):
-            if path.name == 'manifest.jsonl' and mode == 'a':
+            if path.name == 'manifest.jsonl' and mode.startswith('a'):
                 raise PermissionError('fixture checkpoint manifest is unwritable')
             return original_open(path, mode, *args, **kwargs)
 
