@@ -346,25 +346,35 @@ def _smoke_interpreter() -> None:
         client = HostClient(HostAddress(host.port, host.token))
         finished = threading.Event()
         approved = threading.Event()
+        validation_approved = threading.Event()
         failed: list[str] = []
 
         def consume() -> None:
             try:
                 for kind, payload in client.events():
                     if kind == "approval_requested":
-                        if payload.get("operation") != "write_file":
-                            failed.append(f"unexpected approval request: {payload.get('operation')!r}")
+                        operation = payload.get("operation")
+                        writing = operation == "write_file" and not approved.is_set()
+                        validating = (operation == "run_shell" and payload.get("target") == "true"
+                                      and not validation_approved.is_set())
+                        if not writing and not validating:
+                            failed.append(f"unexpected approval request: {operation!r} {payload.get('target')!r}")
                             return
                         if not client.send_approval(payload["approval_id"], allowed=True).get("resolved"):
                             failed.append("approval reply was rejected")
                             return
-                        host.run._conversation[0].subagents[
-                            "implementer"
-                        ].agent._policy.mode = "allow"
-                        approved.set()
-                    elif kind == "event" and isinstance(decode_event(payload), RunFinished):
-                        finished.set()
-                        return
+                        if writing:
+                            host.run._conversation[0].subagents[
+                                "implementer"
+                            ].agent._policy.mode = "allow"
+                            approved.set()
+                        else:
+                            validation_approved.set()
+                    elif kind == "event":
+                        event = decode_event(payload)
+                        if isinstance(event, RunFinished) and event.agent_name == "leader":
+                            finished.set()
+                            return
             except Exception as exc:
                 failed.append(f"event stream failed: {exc}")
 
@@ -377,8 +387,10 @@ def _smoke_interpreter() -> None:
             if not client.send_prompt("smoke").get("accepted"):
                 raise RuntimeError("prompt was not accepted")
             if not approved.wait(5):
-                raise RuntimeError(f"approval did not arrive: {failed}")
-            print("OK:   client answered the approval")
+                raise RuntimeError(f"implementer write_file approval did not arrive: {failed}")
+            if not validation_approved.wait(5):
+                raise RuntimeError(f"Validation run_shell approval for 'true' did not arrive: {failed}")
+            print("OK:   client answered write_file and Validation run_shell approvals")
             if not finished.wait(5):
                 raise RuntimeError(f"run did not finish: {failed}")
             if failed:

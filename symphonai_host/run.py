@@ -311,8 +311,18 @@ class _ActiveRun:
 
 @dataclass
 class _UserCommand:
+    session_id: str | None = None
     stop_requested: bool = False
     process: subprocess.Popen | None = None
+    next: _UserCommand | None = None
+
+    def for_session(self, session_id: str | None) -> _UserCommand | None:
+        command = self
+        while command is not None:
+            if command.session_id == session_id:
+                return command
+            command = command.next
+        return None
 
 
 class HostRun:
@@ -1668,7 +1678,10 @@ class HostRun:
                 approvals = self.approvals
                 goal = None if detached else self._goal
                 goal_session_id = None if detached else self._goal_session_id
-            if self._user_command is not None and not detached:
+            command_session = None if conversation is None else conversation[1].run_id
+            if (self._user_command is not None
+                    and (conversation is not None or not detached)
+                    and self._user_command.for_session(command_session) is not None):
                 raise CommandActiveError("wait for the command to finish")
             if not detached and self._active is not None:
                 raise RunActiveError(self._active.run_id)
@@ -2892,13 +2905,13 @@ class HostRun:
     def stop(self) -> None:
         with self._lock:
             active = self._active
-            command = self._user_command
+            session_id = None if self._conversation is None else self._conversation[1].run_id
+            command = None if self._user_command is None else self._user_command.for_session(session_id)
             if command is not None:
                 command.stop_requested = True
                 process = command.process
             else:
                 process = None
-            session_id = None if self._conversation is None else self._conversation[1].run_id
             goal_check = None if session_id is None else self._goal_checks_by_session.get(session_id)
         if active is not None:
             active.cancel.cancel()
@@ -2930,11 +2943,13 @@ class HostRun:
         with self._lock:
             if self._active is not None:
                 raise RunActiveError("wait for the turn to finish")
-            if self._user_command is not None:
-                raise CommandActiveError("a command is already running")
             conversation = self._conversation
+            session_id = None if conversation is None else conversation[1].run_id
+            if self._user_command is not None and self._user_command.for_session(session_id) is not None:
+                raise CommandActiveError("a command is already running")
             repo_root = self._repo_root if conversation is None else self._policy.repo_root
-            running = _UserCommand()
+            limit = self._policy.shell_output_limit_chars
+            running = _UserCommand(session_id=session_id, next=self._user_command)
             self._user_command = running
         try:
             from symphonai_api.process import run_process
@@ -2952,7 +2967,6 @@ class HostRun:
                 raise result.error
             output = result.stdout.decode("utf-8", errors="replace")
             timed_out, stopped, exit_code = result.timed_out, result.cancelled, result.exit_code
-            limit = self._policy.shell_output_limit_chars
             if len(output) > limit:
                 output = output[:limit] + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
             outcome = "stopped" if stopped else "timed out after 120 s" if timed_out else f"exit code {exit_code}"
@@ -2974,7 +2988,13 @@ class HostRun:
         finally:
             with self._lock:
                 if self._user_command is running:
-                    self._user_command = None
+                    self._user_command = running.next
+                else:
+                    previous = self._user_command
+                    while previous is not None and previous.next is not running:
+                        previous = previous.next
+                    if previous is not None:
+                        previous.next = running.next
 
     @staticmethod
     def _kill_user_command(process: subprocess.Popen) -> None:

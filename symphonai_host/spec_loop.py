@@ -788,6 +788,7 @@ class LoopController:
             except (OSError, RuntimeError) as cleanup_error:
                 reason = f"{reason}; integration cleanup failed: {cleanup_error}"
             card["failure"] = reason
+            card["reason"] = reason
             loop.failure_stage = "integration"
             self._loop_attention(loop, f"card {card.id} integration failed: {reason}", card)
             raise RuntimeError(reason) from exc
@@ -1255,14 +1256,30 @@ class LoopController:
                     continue
                 session_id = card.session_id
                 if isinstance(session_id, str):
+                    try:
+                        source = SessionStore.open(self.host._sessions_root, session_id)
+                        try:
+                            review = source.read_meta().get("review", {})
+                        finally:
+                            source.close()
+                    except (OSError, SessionError, TranscriptError):
+                        review = {}
+                    review_id = review.get("session_id") if isinstance(review, dict) else None
+                    active = self.host._active_by_session.get(review_id)
+                    if active is not None:
+                        active.cancel.cancel()
+                    approvals = self.host._approvals_by_session.get(review_id)
+                    if approvals is not None:
+                        approvals.cancel_all(reason="loop resumed")
                     worktree = self.host._sessions_root / session_id / "worktree"
-                    if worktree.exists():
-                        remove_worktree(self.host._repo_root, worktree)
                     previous_sessions = card.setdefault("previous_session_ids", [])
                     if session_id not in previous_sessions:
                         previous_sessions.append(session_id)
+                card.pop("reason", None)
                 card.update(state="planned", session_id=None)
                 self._loop_card_changed(loop, card)
+                if isinstance(session_id, str) and worktree.exists():
+                    remove_worktree(self.host._repo_root, worktree)
             validation_failed = loop.failure_stage == "validation"
             if "failure_stage" not in loop:
                 validation_failed = str(loop.reason).startswith("validation failed:")
@@ -1744,78 +1761,102 @@ class LoopController:
     def _finish_spec_review(self, session_id: str, leader: Leader, terminal_event: RunFinished | RunFailed | None) -> None:
         from symphonai_host.spec_run import patch_digest, review_verdict
 
-        review_store = SessionStore.open(self.host._sessions_root, session_id)
-        try:
-            review_meta = review_store.read_meta()
-            review_info = review_meta.get("spec_run")
-        finally:
-            review_store.close()
-        if not isinstance(review_info, dict) or review_info.get("kind") != "review":
-            return
-        source_id = review_info.get("of")
-        if not isinstance(source_id, str):
-            return
-        source = SessionStore.open(self.host._sessions_root, source_id)
-        try:
-            source_meta = source.read_meta()
-            original = source_meta.get("spec_run")
-            if not isinstance(original, dict):
+        with self.host._lock:
+            review_store = SessionStore.open(self.host._sessions_root, session_id)
+            try:
+                review_meta = review_store.read_meta()
+                review_info = review_meta.get("spec_run")
+            finally:
+                review_store.close()
+            if not isinstance(review_info, dict) or review_info.get("kind") != "review":
                 return
-            worktree = Path(review_info.get("worktree_path", ""))
-            current = worktree_diff(worktree)
-            answer = next((message.text for message in reversed(leader._chat_messages) if message.role == Role.ASSISTANT and message.text.strip()), "")
-            verdict, follow_ups = review_verdict(answer)
-            if not isinstance(terminal_event, RunFinished) or terminal_event.stopped_reason != "final_response":
-                verdict, follow_ups = "no-verdict", []
-            baseline_files = review_info.get("baseline_files", {})
-            unchanged = isinstance(baseline_files, dict) and all(
-                (
-                    (worktree / name).is_file()
-                    and hashlib.sha256((worktree / name).read_bytes()).hexdigest() == digest
-                    if digest is not None else not (worktree / name).exists()
+            source_id = review_info.get("of")
+            if not isinstance(source_id, str):
+                return
+            source = SessionStore.open(self.host._sessions_root, source_id)
+            try:
+                source_meta = source.read_meta()
+                original = source_meta.get("spec_run")
+                if not isinstance(original, dict):
+                    return
+                loop_id, card_id = review_info.get("loop_id"), review_info.get("card_id")
+                if loop_id and card_id:
+                    loop = self.store.load_record(loop_id)
+                    card = next((item for item in loop.cards if item.id == card_id), None)
+                    if (loop.state == "cancelled" or card is None or card.session_id != source_id
+                            or card.state not in ("review", "failed")):
+                        return
+                prior = source_meta.get("review")
+                if isinstance(prior, dict) and prior.get("session_id") != session_id:
+                    return
+                worktree = Path(review_info.get("worktree_path", ""))
+                try:
+                    current = worktree_diff(worktree)
+                except (OSError, WorktreeError) as exc:
+                    reason = (f"review worktree is missing: {worktree}" if not worktree.is_dir()
+                              else f"review worktree could not be read: {exc}")
+                    source.update_meta(lambda meta: meta.update({"review": {
+                        "session_id": session_id, "verdict": "failed", "error": reason,
+                        "follow_ups": [], "not_copied": [],
+                    }}))
+                    if loop_id and card_id:
+                        card["reason"] = reason
+                        self._loop_card_changed(loop, card)
+                    self._finish_loop_card_review(review_info)
+                    return
+                answer = next((message.text for message in reversed(leader._chat_messages) if message.role == Role.ASSISTANT and message.text.strip()), "")
+                verdict, follow_ups = review_verdict(answer)
+                if not isinstance(terminal_event, RunFinished) or terminal_event.stopped_reason != "final_response":
+                    verdict, follow_ups = "no-verdict", []
+                baseline_files = review_info.get("baseline_files", {})
+                unchanged = isinstance(baseline_files, dict) and all(
+                    (
+                        (worktree / name).is_file()
+                        and hashlib.sha256((worktree / name).read_bytes()).hexdigest() == digest
+                        if digest is not None else not (worktree / name).exists()
+                    )
+                    for name, digest in baseline_files.items()
                 )
-                for name, digest in baseline_files.items()
-            )
-            allowed_additions = set(follow_ups) if verdict == "follow-ups" else set()
-            additions = set(current.files) - set(baseline_files if isinstance(baseline_files, dict) else {})
-            if review_info.get("loop_id"):
-                loop_follow_ups = {
-                    value for value in follow_ups
-                    if (worktree / value).is_file()
+                allowed_additions = set(follow_ups) if verdict == "follow-ups" else set()
+                additions = set(current.files) - set(baseline_files if isinstance(baseline_files, dict) else {})
+                if review_info.get("loop_id"):
+                    loop_follow_ups = {
+                        value for value in follow_ups
+                        if (worktree / value).is_file()
+                    }
+                    unchanged = unchanged and loop_follow_ups == set(follow_ups)
+                unchanged = unchanged and additions <= allowed_additions
+                if not unchanged:
+                    verdict = "tree-changed"
+                    follow_ups = []
+                copied: list[str] = []
+                not_copied: list[str] = []
+                spec_directory = Path(str(original.get("spec", ""))).parent
+                if verdict == "follow-ups":
+                    for value in follow_ups:
+                        relative = Path(value)
+                        if relative.is_absolute() or ".." in relative.parts or not relative.as_posix().startswith(spec_directory.as_posix() + "/"):
+                            not_copied.append(value)
+                            continue
+                        source_file = worktree / relative
+                        target_file = self.host._repo_root / relative
+                        if not source_file.is_file() or target_file.exists():
+                            not_copied.append(value)
+                            continue
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_file, target_file)
+                        copied.append(value)
+                review = {
+                    "session_id": session_id, "verdict": verdict,
+                    "follow_ups": copied, "not_copied": not_copied,
                 }
-                unchanged = unchanged and loop_follow_ups == set(follow_ups)
-            unchanged = unchanged and additions <= allowed_additions
-            if not unchanged:
-                verdict = "tree-changed"
-                follow_ups = []
-            copied: list[str] = []
-            not_copied: list[str] = []
-            spec_directory = Path(str(original.get("spec", ""))).parent
-            if verdict == "follow-ups":
-                for value in follow_ups:
-                    relative = Path(value)
-                    if relative.is_absolute() or ".." in relative.parts or not relative.as_posix().startswith(spec_directory.as_posix() + "/"):
-                        not_copied.append(value)
-                        continue
-                    source_file = worktree / relative
-                    target_file = self.host._repo_root / relative
-                    if not source_file.is_file() or target_file.exists():
-                        not_copied.append(value)
-                        continue
-                    target_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source_file, target_file)
-                    copied.append(value)
-            review = {
-                "session_id": session_id, "verdict": verdict,
-                "follow_ups": copied, "not_copied": not_copied,
-            }
-            if isinstance(terminal_event, RunFinished):
-                review["stopped_reason"] = terminal_event.stopped_reason
-            elif isinstance(terminal_event, RunFailed):
-                review["error"] = terminal_event.error
-            source.update_meta(lambda meta: meta.update({"review": review}))
-        finally:
-            source.close()
-        if isinstance(review_info, dict):
-            self._finish_loop_card_review(review_info)
+                if isinstance(terminal_event, RunFinished):
+                    review["stopped_reason"] = terminal_event.stopped_reason
+                elif isinstance(terminal_event, RunFailed):
+                    review["error"] = terminal_event.error
+                source.update_meta(lambda meta: meta.update({"review": review}))
+            finally:
+                source.close()
+            if isinstance(review_info, dict):
+                self._finish_loop_card_review(review_info)
 

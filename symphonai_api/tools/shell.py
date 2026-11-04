@@ -416,7 +416,7 @@ def _shell_output(stdout: str, stderr: str, limit: int) -> str:
             return text
         head = (budget + 1) // 2
         tail = budget // 2
-        return (text[:head] + f"\n[omitted {len(text) - budget} characters]\n"
+        return (text[:head] + f"\n[... {len(text) - budget} characters truncated ...]\n"
                 + (text[-tail:] if tail else ""))
 
     stdout_budget = limit - min(len(stderr), limit // 2)

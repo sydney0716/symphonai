@@ -224,6 +224,7 @@ class SessionStore:
         self._meta_lock = threading.Lock()
         self._run_start_times_lock = threading.Lock()
         self._run_start_times: dict[str, str] = {}
+        self._run_start_times_loaded = create
         if create:
             try:
                 ensure_private_directory(self._root)
@@ -252,14 +253,6 @@ class SessionStore:
                     "repo_root": "" if repo_root is None else str(Path(repo_root).resolve()),
                 }
             )
-        if not create:
-            for path in sorted(self._directory.glob("*.jsonl")):
-                try:
-                    records, _ = read_records(path)
-                except Exception:
-                    continue
-                for record in records:
-                    self._remember_run_start(record)
         emit(
             self._events,
             SessionStarted(
@@ -349,6 +342,20 @@ class SessionStore:
     def run_start_times(self) -> dict[str, str]:
         """Snapshot the exact persisted start times, including subagent runs."""
         with self._run_start_times_lock:
+            if not self._run_start_times_loaded:
+                starts: dict[str, str] = {}
+                for path in sorted(self._directory.glob("*.jsonl")):
+                    try:
+                        records, _ = read_records(path)
+                    except Exception:
+                        continue
+                    for record in records:
+                        if record.get("type") == "run_started" and isinstance(record.get("ts"), str):
+                            starts.setdefault(record.get("run_id"), record["ts"])
+                for run_id, timestamp in self._run_start_times.items():
+                    starts.setdefault(run_id, timestamp)
+                self._run_start_times = starts
+                self._run_start_times_loaded = True
             return dict(self._run_start_times)
 
     def writer_for(
