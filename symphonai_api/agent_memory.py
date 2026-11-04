@@ -271,8 +271,17 @@ class AgentMemory:
                 if record.get("action") == "restore":
                     if last is not None:
                         last["restored_at"] = record["time"]
+                        last["time"] = record["time"]
+                        last["entries"] = record.get("entries")
                 else:
                     last = record
+            if last is not None and last.get("entries") is None:
+                path = self._path(scope)
+                last["entries"] = {
+                    entry.id: entry.text for entry in self._decode(
+                        path.with_name(path.name + ".bak"), scope
+                    )
+                }
             return last
 
     def _append_consolidation(self, scope: MemoryScope, record: dict) -> None:
@@ -346,11 +355,14 @@ class AgentMemory:
         with self._lock:
             if not backup.is_file():
                 raise ValueError("no previous memory file is available")
-            self._decode(backup, scope)
+            restored = self._decode(backup, scope)
             original = path.read_bytes()
             write_atomic(path, backup.read_bytes())
             try:
-                self._append_consolidation(scope, {"action": "restore"})
+                self._append_consolidation(scope, {
+                    "action": "restore",
+                    "entries": {entry.id: entry.text for entry in restored},
+                })
             except Exception:
                 write_atomic(path, original)
                 raise

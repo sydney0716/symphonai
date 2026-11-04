@@ -116,6 +116,13 @@ def _walk_candidates(
     *,
     include_skipped: bool = False,
 ):
+    if search_root.is_file():
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        if policy.check_read(search_root).allowed:
+            yield _Candidate(search_root, search_root.relative_to(policy.repo_root).as_posix(),
+                             search_root.name, search_root.stat().st_mtime)
+        return
     files_seen = 0
     ignored = _git_ignored_paths(search_root, policy)
     for directory, dirnames, filenames in os.walk(
@@ -228,6 +235,8 @@ class GlobTool(LocalTool):
         if not decision.allowed:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         search_root = policy._resolve_within_root(path)
+        if not search_root.exists():
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=f"no such file or directory: {path}")
         explicit = (
             any(_default_skipped_directory(part) for part in search_root.relative_to(policy.repo_root).parts)
             or any(_default_skipped_directory(part) for part in tool_call.arguments["pattern"].split("/"))
@@ -341,6 +350,8 @@ class GrepTool(LocalTool):
         flags = re.IGNORECASE if arguments.get("case_insensitive", False) else 0
         expression = re.compile(arguments["pattern"], flags)
         search_root = policy._resolve_within_root(path)
+        if not search_root.exists():
+            return ToolResult(tool_call_id=tool_call.id, ok=False, error=f"no such file or directory: {path}")
         glob_pattern = arguments.get("glob")
         explicit = any(
             _default_skipped_directory(part)
@@ -357,6 +368,7 @@ class GrepTool(LocalTool):
 
         output_mode = arguments.get("output_mode", "files_with_matches")
         matches: list[str] = []
+        skipped_large = 0
         for candidate in candidates:
             if cancel is not None:
                 cancel.raise_if_cancelled()
@@ -366,6 +378,7 @@ class GrepTool(LocalTool):
             except OSError:
                 continue
             if len(data) > MAX_READ_BYTES:
+                skipped_large += 1
                 continue
             try:
                 text = data.decode("utf-8")
@@ -373,7 +386,7 @@ class GrepTool(LocalTool):
                 continue
             matching_lines = [
                 (lineno, line)
-                for lineno, line in enumerate(text.splitlines(), start=1)
+                for lineno, line in enumerate(text.removesuffix("\n").split("\n") if text else [], start=1)
                 if expression.search(line)
             ]
             if not matching_lines:
@@ -386,9 +399,8 @@ class GrepTool(LocalTool):
                     for lineno, line in matching_lines
                 )
 
-        if not matches:
-            return ToolResult(tool_call_id=tool_call.id, ok=True, content="no matches")
-        content = _bounded_content(
-            matches, arguments.get("head_limit"), arguments.get("offset", 0)
-        )
+        content = (_bounded_content(matches, arguments.get("head_limit"), arguments.get("offset", 0))
+                   if matches else "no matches")
+        if skipped_large:
+            content += f"\n[skipped {skipped_large} files over {MAX_READ_BYTES} bytes]"
         return ToolResult(tool_call_id=tool_call.id, ok=True, content=content)

@@ -37,6 +37,9 @@ def apply_result(store, scope, snapshot, reply: str) -> dict:
 
 
 def consolidate_due(store, provider, model, *, cancel, usage_callback=None) -> None:
+    from datetime import datetime
+
+    minimum_interval_seconds = 60 * 60
     # Shared by all extractors using this memory root, not just one conversation.
     if not store.consolidation_lock.acquire(blocking=False):
         return
@@ -49,11 +52,14 @@ def consolidate_due(store, provider, model, *, cancel, usage_callback=None) -> N
                     continue
                 last = store.last_consolidation(scope)
                 baseline = {} if last is None else last.get("entries", {})
-                changes = sum(baseline.get(entry.id) != entry.text for entry in entries)
-                if (changes < 5 and len(entries) <= MAX_ENTRIES * .75
-                        and sum(len(entry.text) for entry in entries) <= MAX_TOTAL_CHARS * .75):
+                current = {entry.id: entry.text for entry in entries}
+                if (current == baseline or (
+                        len(entries) <= MAX_ENTRIES * .75
+                        and sum(len(entry.text) for entry in entries) <= MAX_TOTAL_CHARS * .75)):
                     continue
                 now = time.time()
+                if last is not None and now - datetime.fromisoformat(last["time"]).timestamp() < minimum_interval_seconds:
+                    continue
                 response = provider.create_response(ModelRequest(
                     model=model, call_class=CallClass.BACKGROUND,
                     messages=[Message(Role.SYSTEM,

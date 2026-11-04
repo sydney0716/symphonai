@@ -67,7 +67,8 @@ _STANDARD_TOOL_NAMES = (
     "run_shell",
     "web_fetch",
 )
-_AGENT_TOOL_NAMES = (*_STANDARD_TOOL_NAMES, "web_search", "use_skill", "lsp")
+_AGENT_TOOL_NAMES = (*_STANDARD_TOOL_NAMES, "web_search", "use_skill", "lsp",
+                     "read_tool_result", "job_output", "job_stop")
 
 def _is_mcp_tool_name(name: str) -> bool:
     if not name.startswith("mcp__"):
@@ -139,7 +140,7 @@ def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | N
     tools = (
         _strings(path, "tools", values["tools"])
         if tools_present
-        else list(_STANDARD_TOOL_NAMES)
+        else list(_AGENT_TOOL_NAMES)
     )
     denied = (
         _strings(path, "deny_tools", values["deny_tools"])

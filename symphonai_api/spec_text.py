@@ -12,6 +12,7 @@ def spec_validation(text: str) -> list[str]:
     validation = []
     in_section = False
     in_fence = False
+    command_fence = False
     section_level = 0
     for line in text.splitlines():
         if not in_fence:
@@ -30,14 +31,25 @@ def spec_validation(text: str) -> list[str]:
             continue
         if line.startswith("```"):
             if in_fence:
-                break
-            in_fence = line[3:].strip() in ("", "bash", "sh")
+                if command_fence:
+                    validation.append(None)
+                in_fence = False
+                command_fence = False
+                continue
+            in_fence = True
+            command_fence = line[3:].strip() in ("", "bash", "sh")
             continue
-        if in_fence:
+        if in_fence and command_fence:
             validation.append(line)
+    if in_fence and command_fence:
+        raise ValueError("Validation has an unclosed shell fence")
     commands: list[str] = []
     pending: list[str] = []
     for line in validation:
+        if line is None:
+            if pending:
+                raise ValueError(f"Validation command {chr(10).join(pending)!r} cannot be parsed: incomplete shell block")
+            continue
         if not pending and not line.strip():
             continue
         pending.append(line)

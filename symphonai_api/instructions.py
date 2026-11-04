@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -84,9 +83,41 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def _process_text(raw: str) -> tuple[str, tuple[str, ...]]:
-    without_frontmatter = _strip_frontmatter(raw)
-    without_comments = re.sub(r"<!--.*?(?:-->|$)", "", without_frontmatter, flags=re.DOTALL)
+def _process_text(raw: str) -> tuple[str, tuple[str, ...], bool]:
+    source = _strip_frontmatter(raw)
+    chunks: list[str] = []
+    index = 0
+    fence = ""
+    unclosed_comment = False
+    while index < len(source):
+        end = source.find("\n", index)
+        end = len(source) if end < 0 else end + 1
+        line = source[index:end]
+        stripped = line.strip()
+        if fence:
+            chunks.append(line)
+            if stripped and set(stripped) == {fence[0]} and len(stripped) >= len(fence):
+                fence = ""
+            index = end
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:len(stripped) - len(stripped.lstrip(stripped[0]))]
+            chunks.append(line)
+            index = end
+            continue
+        opening = source.find("<!--", index, end)
+        if opening < 0:
+            chunks.append(line)
+            index = end
+            continue
+        chunks.append(source[index:opening])
+        closing = source.find("-->", opening + 4)
+        if closing < 0:
+            chunks.append(source[opening:])
+            unclosed_comment = True
+            break
+        index = closing + 3
+    without_comments = "".join(chunks)
     content_lines: list[str] = []
     includes: list[str] = []
     fence_character: str | None = None
@@ -115,7 +146,7 @@ def _process_text(raw: str) -> tuple[str, tuple[str, ...]]:
             includes.append(target)
         else:
             content_lines.append(line)
-    return "".join(content_lines).strip("\r\n"), tuple(includes)
+    return "".join(content_lines).strip("\r\n"), tuple(includes), unclosed_comment
 
 
 def load_instructions(
@@ -195,7 +226,9 @@ def load_instructions(
                 f"instruction file {resolved} has {len(raw)} characters, over the "
                 f"{MAX_INSTRUCTION_FILE_CHARS} character reference limit; loaded in full"
             )
-        text, includes = _process_text(raw)
+        text, includes, unclosed_comment = _process_text(raw)
+        if unclosed_comment:
+            warnings.append(f"instruction file {resolved} has an unclosed HTML comment; kept as text")
         entries.append(
             LoadedInstruction(
                 path=resolved,

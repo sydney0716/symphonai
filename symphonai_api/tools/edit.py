@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import re
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.checkpoints import CheckpointStore
@@ -12,6 +13,17 @@ from symphonai_api.tools import filesystem as filesystem_tools
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
 from symphonai_api.tools.read_ledger import ReadLedger
+
+
+def _replace_with_endings(original: str, old: str, new: str, *, replace_all: bool) -> str:
+    newline = original.find("\n")
+    ending = "\r\n" if newline > 0 and original[newline - 1] == "\r" else "\n"
+    pattern = r"\r?\n".join(re.escape(line) for line in old.split("\n"))
+    replacement = new.replace("\r\n", "\n").replace("\n", ending)
+    updated = re.sub(pattern, lambda match: replacement, original, count=0 if replace_all else 1)
+    if original and not original.endswith("\n"):
+        updated = re.sub(r"(?:\r?\n)+\Z", "", updated)
+    return updated
 
 
 def _edit_validation_error(arguments: dict) -> str | None:
@@ -164,7 +176,8 @@ class EditFileTool(LocalTool):
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         resolved = policy._resolve_within_root(path)
         try:
-            content = resolved.read_text(encoding="utf-8")
+            raw = resolved.read_bytes().decode("utf-8")
+            content = raw.replace("\r\n", "\n")
             stale_error = self._ledger.check(resolved)
         except UnicodeDecodeError:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
@@ -189,9 +202,8 @@ class EditFileTool(LocalTool):
                     "change every match, or add surrounding context to identify one"
                 ),
             )
-        updated = content.replace(old_string, new_string) if replace_all else content.replace(
-            old_string, new_string, 1
-        )
+        raw_updated = _replace_with_endings(raw, old_string, new_string, replace_all=replace_all)
+        updated = raw_updated.replace("\r\n", "\n")
         if policy.mode in ("ask", "auto"):
             decision = policy.check_write(
                 path, diff=approval_diff(content, updated, str(path))
@@ -204,7 +216,7 @@ class EditFileTool(LocalTool):
         try:
             if self._checkpoints is not None:
                 self._checkpoints.before_write(resolved)
-            resolved.write_text(updated, encoding="utf-8")
+            resolved.write_bytes(raw_updated.encode("utf-8"))
             if self._checkpoints is not None:
                 self._checkpoints.after_write(resolved)
             self._ledger.record(resolved, full=True, content=updated)
@@ -280,7 +292,8 @@ class MultiEditFileTool(EditFileTool):
             return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
         resolved = policy._resolve_within_root(path)
         try:
-            original = resolved.read_text(encoding="utf-8")
+            raw_updated = resolved.read_bytes().decode("utf-8")
+            original = raw_updated.replace("\r\n", "\n")
             stale_error = self._ledger.check(resolved)
         except UnicodeDecodeError:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
@@ -309,11 +322,10 @@ class MultiEditFileTool(EditFileTool):
                         "context to identify one"
                     ),
                 )
-            updated = (
-                updated.replace(old_string, edit["new_string"])
-                if edit.get("replace_all", False)
-                else updated.replace(old_string, edit["new_string"], 1)
+            raw_updated = _replace_with_endings(
+                raw_updated, old_string, edit["new_string"], replace_all=edit.get("replace_all", False)
             )
+            updated = raw_updated.replace("\r\n", "\n")
         if policy.mode in ("ask", "auto"):
             decision = policy.check_write(
                 path, diff=approval_diff(original, updated, str(path))
@@ -326,7 +338,7 @@ class MultiEditFileTool(EditFileTool):
         try:
             if self._checkpoints is not None:
                 self._checkpoints.before_write(resolved)
-            resolved.write_text(updated, encoding="utf-8")
+            resolved.write_bytes(raw_updated.encode("utf-8"))
             if self._checkpoints is not None:
                 self._checkpoints.after_write(resolved)
             self._ledger.record(resolved, full=True, content=updated)

@@ -328,7 +328,16 @@ class LspManager:
                 return None
             client = self._clients.get(spec.name)
             if client is not None:
-                return client
+                if client.process.poll() is None:
+                    return client
+                client.close()
+                self._clients.pop(spec.name, None)
+                if not hasattr(self, "_restarts"):
+                    self._restarts: dict[str, int] = {}
+                if self._restarts.get(spec.name, 0) >= 3:
+                    self._failed.update(ext.casefold() for ext in spec.extensions)
+                    return None
+                self._restarts[spec.name] = self._restarts.get(spec.name, 0) + 1
             try:
                 client = LspClient(spec, root=self.root)
             except LspError:

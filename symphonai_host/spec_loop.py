@@ -403,22 +403,48 @@ class LoopController:
                     raise ProviderSelectionError(
                         f"role {role} provider {provider_name!r} is unavailable"
                     )
-        store = self.store
-        loop = Loop.from_payload(store.create(goal))
-        if runner_pid is not None:
-            loop.runner_pid = runner_pid
-        if runner_lock:
-            descriptor = self._acquire_loop_runner_lock(loop.id)
-            if descriptor is None:
-                raise RunActiveError(loop.id)
-            self._loop_runner_lock_fds[loop.id] = descriptor
-            loop.runner_lock = True
-        if runner_pid is not None or runner_lock:
-            store.save(loop)
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("goal must not be blank")
+        from symphonai_host.run import MAX_ACTIVE_CONVERSATIONS
         with self.host._lock:
+            if len(self.host._active_by_session) >= MAX_ACTIVE_CONVERSATIONS:
+                raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
+            roadmap_store = None
             if self.host._roadmap_tools_enabled or roadmap_goal_id is not None:
-                RoadmapStore(self.host._repo_root).record_loop(loop.id, goal, roadmap_goal_id)
-        return self._start_loop_planner(loop, "created")
+                roadmap_store = RoadmapStore(self.host._repo_root)
+                roadmap = roadmap_store.load()
+                if roadmap_goal_id is not None and roadmap_store.find(roadmap, roadmap_goal_id) is None:
+                    raise KeyError(roadmap_goal_id)
+            store = self.store
+            loop = Loop.from_payload(store.create(goal))
+            try:
+                if runner_pid is not None:
+                    loop.runner_pid = runner_pid
+                if runner_lock:
+                    descriptor = self._acquire_loop_runner_lock(loop.id)
+                    if descriptor is None:
+                        raise RunActiveError(loop.id)
+                    self._loop_runner_lock_fds[loop.id] = descriptor
+                    loop.runner_lock = True
+                if runner_pid is not None or runner_lock:
+                    store.save(loop)
+                if roadmap_store is not None:
+                    roadmap_store.record_loop(loop.id, goal, roadmap_goal_id)
+            except Exception:
+                descriptor = self._loop_runner_lock_fds.pop(loop.id, None)
+                if descriptor is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                shutil.rmtree(store.path(loop.id, "."))
+                raise
+            try:
+                return self._start_loop_planner(loop, "created")
+            except Exception as exc:
+                loop.failure_stage = "planning"
+                store.set_state(loop, "needs_attention", f"planner failed: {exc}")
+                self._loop_changed(loop, "state")
+                return loop
+
 
 
     def start_roadmap_goal(self, goal_id: str) -> tuple[dict, Loop]:
@@ -671,8 +697,9 @@ class LoopController:
                     os.killpg(process.pid, signal.SIGKILL)
                 except (OSError, ProcessLookupError):
                     process.kill()
-            store.set_state(loop, "cancelled")
-            self._loop_changed(loop, "state")
+            if loop.state in ("running", "validating"):
+                store.set_state(loop, "needs_attention", "cancelling")
+                self._loop_changed(loop, "state")
             active_runs = [self.host._active_by_session[sid] for sid in session_ids if sid in self.host._active_by_session]
             goal_thread = self.host._goal_check_thread
         for active in active_runs:
@@ -689,17 +716,32 @@ class LoopController:
             if not checks_running and not validation_running:
                 break
             time.sleep(0.01)
-        for session_id in worktree_ids:
-            worktree = self.host._sessions_root / session_id / "worktree"
-            if worktree.exists():
-                remove_worktree(self.host._repo_root, worktree)
-        integration_admin = self.host._sessions_root / "loops" / loop_id / "integration"
-        if integration_admin.exists():
-            remove_worktree(self.host._repo_root, integration_admin)
-        branch = loop.branch
-        if isinstance(branch, str):
-            _loop_git(self.host._repo_root, "branch", "-D", branch)
-        return store.load_record(loop_id)
+        try:
+            for session_id in worktree_ids:
+                worktree = self.host._sessions_root / session_id / "worktree"
+                if worktree.exists():
+                    remove_worktree(self.host._repo_root, worktree)
+            integration_admin = self.host._sessions_root / "loops" / loop_id / "integration"
+            if integration_admin.exists():
+                remove_worktree(self.host._repo_root, integration_admin)
+            branch = loop.branch
+            if isinstance(branch, str):
+                branches = _loop_git(self.host._repo_root, "branch", "--list", branch).stdout
+                if branches.strip():
+                    _loop_git(self.host._repo_root, "branch", "-D", branch)
+        except (OSError, RuntimeError) as exc:
+            with self.host._lock:
+                loop = store.load_record(loop_id)
+                loop.reason = f"cancel failed: {exc}"
+                store.save(loop)
+                self._loop_changed(loop, "state")
+            raise WorktreeError(str(exc)) from exc
+        with self.host._lock:
+            loop = store.load_record(loop_id)
+            store.set_state(loop, "cancelled")
+            self._loop_changed(loop, "state")
+            return loop
+
 
 
     def integrate(self, loop: Loop, card: Card, worktree: Path) -> str:
@@ -726,16 +768,30 @@ class LoopController:
         if checked.returncode:
             message = checked.stderr.decode("utf-8", errors="replace").strip()
             raise WorktreeApplyConflict(message or "git apply --check failed")
-        applied = subprocess.run(
-            ["git", "apply", "--binary"], cwd=integration_root,
-            input=patch, capture_output=True, check=False,
-        )
-        if applied.returncode:
-            message = applied.stderr.decode("utf-8", errors="replace").strip()
-            raise WorktreeApplyConflict(message or "git apply failed")
-        stage_worktree(integration_root)
-        _loop_git(integration_root, "commit", "-m", f"{card.id}: {card.title}")
-        return os.fsdecode(_loop_git(integration_root, "rev-parse", "HEAD").stdout.strip())
+        try:
+            applied = subprocess.run(
+                ["git", "apply", "--binary"], cwd=integration_root,
+                input=patch, capture_output=True, check=False,
+            )
+            if applied.returncode:
+                message = applied.stderr.decode("utf-8", errors="replace").strip()
+                raise WorktreeApplyConflict(message or "git apply failed")
+            stage_worktree(integration_root)
+            _loop_git(integration_root, "commit", "-m", f"{card.id}: {card.title}")
+            return os.fsdecode(_loop_git(integration_root, "rev-parse", "HEAD").stdout.strip())
+        except (OSError, RuntimeError) as exc:
+            reason = str(exc)
+            try:
+                _loop_git(integration_root, "reset", "--hard", "HEAD")
+                _loop_git(integration_root, "clean", "-fd", "--", ".",
+                          *(f":(exclude){path}" for path in linked))
+            except (OSError, RuntimeError) as cleanup_error:
+                reason = f"{reason}; integration cleanup failed: {cleanup_error}"
+            card["failure"] = reason
+            loop.failure_stage = "integration"
+            self._loop_attention(loop, f"card {card.id} integration failed: {reason}", card)
+            raise RuntimeError(reason) from exc
+
 
 
     @staticmethod
@@ -1174,6 +1230,24 @@ class LoopController:
                 loop.runner_lock = True
             if runner_pid is not None or runner_lock:
                 store.save(loop)
+            planning_failed = loop.failure_stage == "planning" or str(loop.reason).startswith(
+                ("planner failed:", "planner stopped:", "plan.json", "plan ", "spec ")
+            ) or not loop.cards
+            if not planning_failed:
+                try:
+                    plan = json.loads(store.path(loop_id, "plan.json").read_text(encoding="utf-8"))
+                    planning_failed = bool(self._loop_plan_problem(store, loop_id, plan))
+                except (OSError, UnicodeError, ValueError):
+                    planning_failed = True
+            if planning_failed:
+                store.set_state(loop, "planning", "")
+                try:
+                    return self._start_loop_planner(loop, "state")
+                except Exception as exc:
+                    loop.failure_stage = "planning"
+                    store.set_state(loop, "needs_attention", f"planner failed: {exc}")
+                    self._loop_changed(loop, "state")
+                    raise
             for card in loop.cards:
                 if card.state != "failed" or any(
                     item.follow_up_of and card.id in item.after for item in loop.cards
@@ -1296,6 +1370,12 @@ class LoopController:
         store = self.store
         for loop in store.records():
             with self.host._lock:
+                if loop.state == "planning":
+                    if loop.planner_session_id not in self.host._active_by_session:
+                        loop.failure_stage = "planning"
+                        store.set_state(loop, "needs_attention", "planner stopped: host restarted")
+                        self._loop_changed(loop, "state")
+                    continue
                 if loop.state == "validating":
                     self._start_loop_validation(loop.id)
                     continue

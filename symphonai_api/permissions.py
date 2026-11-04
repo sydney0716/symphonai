@@ -801,7 +801,19 @@ class PermissionPolicy:
         candidate = Path(path)
         resolved = (candidate if candidate.is_absolute() else self.repo_root / candidate).resolve()
         protected = self.protected_paths
-        if any(resolved == folder or folder in resolved.parents for folder in protected):
+        protected_match = any(resolved == folder or folder in resolved.parents for folder in protected)
+        if not protected_match:
+            for ancestor in (resolved, *resolved.parents):
+                for folder in protected:
+                    try:
+                        if ancestor.samefile(folder):
+                            protected_match = True
+                            break
+                    except OSError:
+                        continue
+                if protected_match:
+                    break
+        if protected_match:
             return resolved, self._deny(
                 f"{operation} refused protected path: {path!r}",
                 denial=DenialReason.PROTECTED_PATH, tool_name=operation,

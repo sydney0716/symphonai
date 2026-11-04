@@ -83,7 +83,8 @@ class McpPool:
                         message = 'needs sign-in; sign in from the app' if state == 'needs_sign_in' else str(error)
                         print(f'MCP server {spec.name!r} skipped: {message}', file=sys.stderr)
                 reserved.update(tool.name for tool in self._server_tools.get(spec.name, ()))
-            self._tools = {tool.name: tool for spec in self._specs for tool in self._server_tools.get(spec.name, ())}
+            self._tools = {tool.name: _PoolTool(self, spec.name, tool)
+                           for spec in self._specs for tool in self._server_tools.get(spec.name, ())}
             self._instructions = tuple((spec.name, self.clients[spec.name].instructions) for spec in self._specs
                                        if spec.name in self._server_tools and self.clients[spec.name].instructions)
             self._started = True
@@ -92,14 +93,40 @@ class McpPool:
     def status(self, name: str) -> dict:
         client = self.clients.get(name)
         current = self.states.get(name, {'state': 'disabled', 'error': ''})
-        if client is not None and client.auth_state in ('failed', 'needs_sign_in') and current['state'] != client.auth_state:
-            self.states[name] = {'state': client.auth_state, 'error':
-                                 'MCP connection failed' if client.auth_state == 'failed' else 'Sign in from the app'}
+        if client is not None:
+            state = client.auth_state
+            if state == 'started':
+                running = (client._http_ready if client.spec.url is not None else
+                           client._process is not None and client._process.poll() is None)
+                if not running:
+                    state = 'failed'
+            if state in ('failed', 'needs_sign_in') and current['state'] != state:
+                self.states[name] = {'state': state, 'error':
+                                    'MCP connection failed' if state == 'failed' else 'Sign in from the app'}
         return dict(self.states.get(name, current))
 
+    def _ensure_started(self, name: str) -> None:
+        with self._start_lock:
+            if not self._started:
+                raise McpError('MCP pool is closed')
+            state = self.status(name)
+            if state['state'] == 'failed':
+                self.start(name)
+                state = self.status(name)
+            if state['state'] != 'started':
+                raise McpError(state['error'] or 'MCP server is not running')
+
     def _started_clients(self, capability: str) -> dict[str, McpClient]:
-        return {name: client for name, client in tuple(self.clients.items())
-                if self.status(name)['state'] == 'started' and capability in client.capabilities}
+        clients = {}
+        for name, client in tuple(self.clients.items()):
+            if capability not in client.capabilities:
+                continue
+            try:
+                self._ensure_started(name)
+            except McpError:
+                continue
+            clients[name] = self.clients[name]
+        return clients
 
     @property
     def resource_tools(self) -> dict[str, LocalTool]:
@@ -162,3 +189,38 @@ class McpPool:
     @property
     def instructions(self) -> tuple[tuple[str, str], ...]:
         return self._instructions
+
+
+class _PoolTool(LocalTool):
+    """Keep already-published tools usable after their server reconnects."""
+
+    def __init__(self, pool: McpPool, server: str, tool: LocalTool):
+        self._pool, self._server, self._tool = pool, server, tool
+        self.deferrable = tool.deferrable
+
+    @property
+    def name(self):
+        return self._tool.name
+
+    @property
+    def description(self):
+        return self._tool.description
+
+    @property
+    def parameters(self):
+        return self._tool.parameters
+
+    def metadata(self, arguments):
+        return self._tool.metadata(arguments)
+
+    def _execute(self, tool_call, policy, cancel=None):
+        from symphonai_api.models import ToolResult
+        try:
+            self._pool._ensure_started(self._server)
+            tool = next((tool for tool in self._pool._server_tools.get(self._server, ())
+                         if tool.name == self.name), None)
+            if tool is None:
+                raise McpError('MCP tool is unavailable after reconnecting')
+        except McpError as exc:
+            return ToolResult(tool_call.id, ok=False, error=str(exc))
+        return tool.execute(tool_call, policy, cancel=cancel)

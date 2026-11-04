@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+import http.client
 import json
 import math
 import os
 from pathlib import Path
 import queue
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -390,6 +392,7 @@ class McpClient:
             }
             from symphonai_api.mcp_auth import AuthError
             oauth = self.oauth
+            deadline = time.monotonic() + timeout
             for attempt in range(2):
                 if oauth is not None:
                     try:
@@ -400,14 +403,86 @@ class McpClient:
                     data=json.dumps(message, separators=(",", ":")).encode("utf-8"),
                     headers=self._http_headers(), method="POST")
                 try:
-                    with _http_open(request, timeout=timeout) as response:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    with _http_open(request, timeout=remaining) as response:
                         status = response.status
                         content_type = response.headers.get_content_type()
-                        body = response.read()
                         if method == "initialize":
                             session_id = response.headers.get("Mcp-Session-Id")
                             if session_id:
                                 self._http_session_id = session_id
+                        body = bytearray()
+                        event = bytearray()
+                        pending = bytearray()
+                        byte_cap = 8 * 1024 * 1024
+                        # read1 returns available bytes rather than waiting for EOF
+                        # or a whole line from a server that keeps its SSE stream open.
+                        raw = getattr(getattr(response, "fp", None), "raw", None)
+                        sock = getattr(raw, "_sock", None)
+                        watchdog = None
+                        if sock is not None:
+                            def expire_response():
+                                try:
+                                    sock.shutdown(socket.SHUT_RDWR)
+                                except OSError:
+                                    pass
+                            watchdog = threading.Timer(max(0, deadline - time.monotonic()), expire_response)
+                            watchdog.daemon = True
+                            watchdog.start()
+                        try:
+                            while True:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise TimeoutError
+                                if sock is not None:
+                                    sock.settimeout(remaining)
+                                try:
+                                    chunk = response.read1(min(65536, byte_cap - len(body) + 1))
+                                except (OSError, http.client.HTTPException):
+                                    if time.monotonic() >= deadline:
+                                        raise TimeoutError from None
+                                    raise
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError
+                                if not chunk:
+                                    if content_type == "text/event-stream" and pending:
+                                        event.extend(pending)
+                                        body = event
+                                    break
+                                body.extend(chunk)
+                                if len(body) > byte_cap:
+                                    raise ValueError("MCP HTTP response exceeds byte limit")
+                                if content_type != "text/event-stream":
+                                    continue
+                                pending.extend(chunk)
+                                while b"\n" in pending:
+                                    line, _, pending = pending.partition(b"\n")
+                                    line = line.rstrip(b"\r")
+                                    if line:
+                                        event.extend(line + b"\n")
+                                        continue
+                                    if event:
+                                        data = b"\n".join(
+                                            part[5:].lstrip(b" ") for part in event.splitlines()
+                                            if part.startswith(b"data:")
+                                        )
+                                        try:
+                                            frame = json.loads(data)
+                                        except (ValueError, UnicodeError):
+                                            frame = None
+                                        if isinstance(frame, Mapping) and frame.get("id") == request_id:
+                                            body = event + b"\n"
+                                            break
+                                        event.clear()
+                                else:
+                                    continue
+                                break
+                        finally:
+                            if watchdog is not None:
+                                watchdog.cancel()
+                        body = bytes(body)
                 except HTTPError as exc:
                     if exc.code == 401 and oauth is not None:
                         oauth.challenge = exc.headers.get("WWW-Authenticate", "")
@@ -415,7 +490,20 @@ class McpClient:
                             continue
                         self._fail("needs_sign_in", f"MCP server {self.spec.name!r} needs sign-in from the app")
                     self._fail("failed", f"MCP server {self.spec.name!r} returned HTTP {exc.code} during {phase}")
-                except (TimeoutError, URLError, OSError, ValueError):
+                except TimeoutError:
+                    if method == "initialize":
+                        self._fail("failed", f"MCP server {self.spec.name!r} timed out during {phase}")
+                    cancellation = Request(self.spec.url,
+                        data=json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                         "params": {"requestId": request_id, "reason": "Call timed out"}}).encode("utf-8"),
+                        headers=self._http_headers(), method="POST")
+                    try:
+                        with _http_open(cancellation, timeout=_CLEANUP_TIMEOUT_SECONDS):
+                            pass
+                    except (McpError, URLError, OSError):
+                        pass
+                    raise McpError(f"MCP server {self.spec.name!r} {phase} timed out after {timeout:g} seconds") from None
+                except (URLError, OSError, ValueError, http.client.HTTPException):
                     self._fail("failed", f"MCP server {self.spec.name!r} connection failed during {phase}")
                 try:
                     result = self._decode_http_response(body, content_type=content_type,
@@ -574,6 +662,8 @@ class McpClient:
         if self.spec.url is not None:
             return self._http_request(method, params, timeout=timeout, phase=phase)
         with self._request_lock:
+            if not hasattr(self, "_cancelled_ids"):
+                self._cancelled_ids: set[int] = set()
             request_id = self._next_id
             self._next_id += 1
             self._write_message(
@@ -587,16 +677,15 @@ class McpClient:
             deadline = time.monotonic() + timeout
             while True:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.close()
-                    raise McpError(
-                        f"MCP server {self.spec.name!r} {phase} timed out "
-                        f"after {timeout:g} seconds"
-                    )
                 try:
+                    if remaining <= 0:
+                        raise queue.Empty
                     frame = self._frames.get(timeout=remaining)
                 except queue.Empty:
-                    self.close()
+                    self._cancelled_ids.add(request_id)
+                    self._notify("notifications/cancelled", {
+                        "requestId": request_id, "reason": "Call timed out",
+                    })
                     raise McpError(
                         f"MCP server {self.spec.name!r} {phase} timed out "
                         f"after {timeout:g} seconds"
@@ -625,13 +714,23 @@ class McpClient:
                     raise McpError(
                         f"MCP server {self.spec.name!r} sent a malformed JSON-RPC frame"
                     )
+                if isinstance(message.get("method"), str):
+                    if "id" in message:
+                        reply = {"jsonrpc": "2.0", "id": message["id"]}
+                        if message["method"] == "ping":
+                            reply["result"] = {}
+                        else:
+                            reply["error"] = {"code": -32601, "message": "Method not found"}
+                        self._write_message(reply)
+                    continue
                 if "id" not in message:
-                    if isinstance(message.get("method"), str):
-                        continue
                     self.close()
                     raise McpError(
                         f"MCP server {self.spec.name!r} sent a response without an id"
                     )
+                if isinstance(message["id"], (int, str)) and message["id"] in self._cancelled_ids:
+                    self._cancelled_ids.discard(message["id"])
+                    continue
                 if message["id"] != request_id:
                     unknown_id = message["id"]
                     self.close()

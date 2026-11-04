@@ -30,7 +30,6 @@ from symphonai_api.tools.shell_classify import classify
 from symphonai_api.tools.shell_parse import commands_for_argv, parse_command_line
 
 CANCEL_POLL_SECONDS = 0.05
-CLEANUP_TIMEOUT_SECONDS = 1.0
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 BWRAP_EXEC = "bwrap"
 
@@ -342,7 +341,10 @@ def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None =
     unreadable = tuple(pattern for pattern in patterns if pattern not in policy.sandbox_readable)
 
     def walk_error(error: OSError) -> None:
-        raise error
+        if error.filename is None:
+            raise ValueError(f"cannot mask unreadable sandbox directory: {error}")
+        path = str(Path(error.filename).resolve())
+        command.extend(("--tmpfs", path, "--remount-ro", path))
 
     roots = {Path(root), *(Path(path) for path in writable)}
     for directory_root in sorted(roots):
@@ -406,6 +408,20 @@ def sandbox_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None 
             return _bwrap_command(policy, argv, cwd)
         return [SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *argv]
     return argv
+
+
+def _shell_output(stdout: str, stderr: str, limit: int) -> str:
+    def bounded(text: str, budget: int) -> str:
+        if len(text) <= budget:
+            return text
+        head = (budget + 1) // 2
+        tail = budget // 2
+        return (text[:head] + f"\n[omitted {len(text) - budget} characters]\n"
+                + (text[-tail:] if tail else ""))
+
+    stdout_budget = limit - min(len(stderr), limit // 2)
+    stderr_budget = limit - min(len(stdout), stdout_budget)
+    return bounded(stdout, stdout_budget) + bounded(stderr, stderr_budget)
 
 
 class RunShellTool(LocalTool):
@@ -564,33 +580,55 @@ class RunShellTool(LocalTool):
                 start_new_session=True,
             )
             deadline = time.monotonic() + timeout_seconds
+            drain_deadline = None
+            timed_out = cancelled = killed = False
+            stdout = stderr = ""
             while True:
-                if cancel is not None and cancel.cancelled:
-                    _terminate_process_group(proc)
+                now = time.monotonic()
+                cancelled = cancelled or (cancel is not None and cancel.cancelled)
+                timed_out = timed_out or now >= deadline
+                if proc.poll() is not None and drain_deadline is None:
+                    drain_deadline = now + 2.0
+                if (cancelled or timed_out) and not killed:
                     try:
-                        proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
-                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        _terminate_process_group(proc)
+                    killed = True
+                    drain_deadline = min(drain_deadline or now + 2.0, now + 2.0)
+                if drain_deadline is not None and now >= drain_deadline:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
                         pass
-                    raise OperationCancelled
-                if proc.poll() is not None:
-                    stdout, stderr = proc.communicate()
+                    for pipe in (proc.stdout, proc.stderr):
+                        if pipe is not None:
+                            pipe.close()
+                    try:
+                        proc.wait(timeout=0.1)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _terminate_process_group(proc)
-                    try:
-                        proc.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    raise subprocess.TimeoutExpired(command, timeout_seconds)
-                delay = min(CANCEL_POLL_SECONDS, remaining)
+                remaining = (drain_deadline if killed else min(deadline, drain_deadline or deadline)) - now
                 try:
-                    stdout, stderr = proc.communicate(timeout=delay)
+                    stdout, stderr = proc.communicate(timeout=min(CANCEL_POLL_SECONDS, remaining))
                     break
-                except subprocess.TimeoutExpired:
-                    continue
+                except subprocess.TimeoutExpired as exc:
+                    # TimeoutExpired carries bytes even for text-mode Popen.
+                    stdout = exc.output.decode(errors="replace") if isinstance(exc.output, bytes) else exc.output or ""
+                    stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+            if cancelled:
+                raise OperationCancelled
+            if timed_out:
+                raise subprocess.TimeoutExpired(command, timeout_seconds, output=stdout, stderr=stderr)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=f"error running command: {exc}")
+            return ToolResult(
+                tool_call_id=tool_call.id, ok=False,
+                content=(_shell_output(exc.output or "", exc.stderr or "", policy.shell_output_limit_chars)
+                         if isinstance(exc, subprocess.TimeoutExpired) else ""),
+                error=(f"timed out after {exc.timeout:g}s" if isinstance(exc, subprocess.TimeoutExpired)
+                       else f"error running command: {exc}"),
+            )
         stdout = stdout or ""
         if isinstance(command_line, str):
             marker_at = stdout.rfind(cwd_marker)
@@ -606,16 +644,10 @@ class RunShellTool(LocalTool):
         if not self._cwd.is_dir() or not self._cwd.is_relative_to(root):
             self._cwd = root
             reset_message = "Shell working directory reset to the project root."
-        output = stdout + (stderr or "")
-        denial = _mac_sandbox_denial(output, proc.pid, policy=policy, cwd=cwd) if sandboxed and proc.returncode != 0 else None
+        denial = _mac_sandbox_denial(stdout + (stderr or ""), proc.pid, policy=policy, cwd=cwd) if sandboxed and proc.returncode != 0 else None
+        output = _shell_output(stdout, stderr or "", policy.shell_output_limit_chars)
         if self._cwd != root:
             output = f"(in {self._cwd.relative_to(root)})\n" + output
-        limit = policy.shell_output_limit_chars
-        if len(output) > limit:
-            output = (
-                output[:limit]
-                + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
-            )
         if reset_message:
             output = (output + "\n" if output else "") + reset_message
         error = None

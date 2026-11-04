@@ -69,45 +69,45 @@ def create_worktree(repo_root: Path, path: Path, start: str = "HEAD") -> Path:
             except WorktreeError:
                 pass
         raise
-    worktree_root = path / relative_root
-    git_dir = Path(os.fsdecode(_git(path, "rev-parse", "--git-dir").stdout.strip()))
-    if not git_dir.is_absolute():
-        git_dir = (path / git_dir).resolve()
-    (git_dir / _PROJECT_ROOT_METADATA).write_text(relative_root.as_posix(), encoding="utf-8")
-    config = load_config(repo_root=repo_root)
-    configured = config.get(
-        "worktree.symlink", ["node_modules", ".venv", "venv"],
-    )
-    for entry in configured if isinstance(configured, list) else ():
-        source = repo_root / entry
-        target = worktree_root / entry
-        if source.exists() and not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.symlink_to(source, target_is_directory=source.is_dir())
-    setup = config.get("worktree.setup")
-    if isinstance(setup, str):
-        from symphonai_api.tools.shell import shell_environment
-
-        from symphonai_api.process import run_process
-        result = run_process(
-            ["/bin/sh", "-c", setup], worktree_root,
-            env=shell_environment(worktree_root, for_agent=True),
-            timeout=WORKTREE_SETUP_TIMEOUT_SECONDS, output_limit=None,
+    try:
+        worktree_root = path / relative_root
+        git_dir = Path(os.fsdecode(_git(path, "rev-parse", "--git-dir").stdout.strip()))
+        if not git_dir.is_absolute():
+            git_dir = (path / git_dir).resolve()
+        (git_dir / _PROJECT_ROOT_METADATA).write_text(relative_root.as_posix(), encoding="utf-8")
+        config = load_config(repo_root=repo_root)
+        configured = config.get(
+            "worktree.symlink", ["node_modules", ".venv", "venv"],
         )
-        output = result.stdout.decode("utf-8", errors="replace")
-        if result.error is not None or result.timed_out or result.exit_code != 0:
-            if result.error is not None:
-                message = f"worktree setup command {setup!r} could not start: {result.error}"
-            elif result.timed_out:
-                message = f"worktree setup command {setup!r} timed out after 1800 seconds; output: {output[-4000:]}"
-            else:
-                message = f"worktree setup command {setup!r} exited with code {result.exit_code}; output: {output[-4000:]}"
-            try:
-                remove_worktree(repo_root, path)
-            except WorktreeError as cleanup_error:
-                raise WorktreeError(f"{message}; cleanup failed: {cleanup_error}") from result.error
-            raise WorktreeError(message) from result.error
-    return worktree_root
+        for entry in configured if isinstance(configured, list) else ():
+            source = repo_root / entry
+            target = worktree_root / entry
+            if source.exists() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(source, target_is_directory=source.is_dir())
+        setup = config.get("worktree.setup")
+        if isinstance(setup, str):
+            from symphonai_api.tools.shell import shell_environment
+
+            from symphonai_api.process import run_process
+            result = run_process(
+                ["/bin/sh", "-c", setup], worktree_root,
+                env=shell_environment(worktree_root, for_agent=True),
+                timeout=WORKTREE_SETUP_TIMEOUT_SECONDS, output_limit=None,
+            )
+            output = result.stdout.decode("utf-8", errors="replace")
+            if result.error is not None or result.timed_out or result.exit_code != 0:
+                if result.error is not None:
+                    message = f"worktree setup command {setup!r} could not start: {result.error}"
+                elif result.timed_out:
+                    message = f"worktree setup command {setup!r} timed out after 1800 seconds; output: {output[-4000:]}"
+                else:
+                    message = f"worktree setup command {setup!r} exited with code {result.exit_code}; output: {output[-4000:]}"
+                raise WorktreeError(message) from result.error
+        return worktree_root
+    except BaseException:
+        remove_worktree(repo_root, path)
+        raise
 
 
 def _linked_paths(path: Path) -> tuple[str, ...]:

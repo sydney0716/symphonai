@@ -86,6 +86,12 @@ export function createApprovals({ client }) {
       }
     }
     for (const value of pending) {
+      const existing = questions.get(value.approval_id);
+      const pendingQuestion = questionOf(value);
+      if (existing && pendingQuestion && existing.state !== "answering") {
+        questions.set(value.approval_id, { ...pendingQuestion, reason: existing.reason });
+        continue;
+      }
       open(value);
     }
   }
@@ -114,9 +120,14 @@ export function createApprovals({ client }) {
     let reply;
     try {
       reply = await client.approve(id, allowed, reason, remember, answerText);
+      if (reply?.status !== 404 && reply?.resolved !== true) {
+        throw new Error("approval reply was not resolved");
+      }
     } catch (error) {
       if (!isNotFound(error)) {
-        throw error;
+        const reason = String(error?.message ?? error);
+        questions.set(id, { ...question, state: "open", reason });
+        return;
       }
       questions.set(id, {
         ...questions.get(id),
@@ -133,16 +144,16 @@ export function createApprovals({ client }) {
       });
       return;
     }
-    if (reply?.resolved !== true) {
-      throw new Error("approval reply was not resolved");
-    }
     questions.set(id, { ...questions.get(id), state: "resolved" });
   }
 
   return {
     get state() {
       return new Map(
-        [...questions].map(([id, question]) => [id, { ...question }]),
+        [...questions].map(([id, question]) => [id, { ...question,
+          details: question.reason && question.state === "open"
+            ? `${question.details}\nCould not answer: ${question.reason}` : question.details,
+        }]),
       );
     },
     onFrame,

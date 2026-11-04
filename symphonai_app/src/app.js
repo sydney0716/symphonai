@@ -4106,9 +4106,34 @@ export async function start({ global, document, client }) {
     }
   }
 
+  const promptDrafts = new Map();
+  let submittingPrompt = false;
+
+  function finishPromptDraft(action, accepted) {
+    const draft = promptDrafts.get(action.id);
+    promptDrafts.delete(action.id);
+    if (!draft) return;
+    if (draft.sessionId !== currentSessionId || draft.root !== project.repo_root) return;
+    if (accepted && input.value === draft.text
+        && pendingFiles.length === draft.files.length
+        && pendingFiles.every((file, index) => file === draft.files[index])) {
+      input.value = "";
+      clearDraft();
+      pendingFiles.length = 0;
+      pastedTextChips.length = 0;
+    } else if (!accepted && input.value === "" && pendingFiles.length === 0) {
+      input.value = draft.text;
+      pendingFiles.push(...draft.files);
+      pastedTextChips.splice(0, pastedTextChips.length, ...draft.pastes);
+      saveDraft();
+    }
+    showPendingAttachments();
+  }
+
   async function perform(actions) {
     updateWindowTitle();
     for (const action of actions) {
+      if (action.kind === "withdrawn") promptDrafts.delete(action.id);
       if (action.kind === "prompt") {
         const presentation = {
           text: action.text,
@@ -4123,6 +4148,7 @@ export async function start({ global, document, client }) {
             (action.attachments ?? []).map(({ data, filename }) => ({ data, ...(filename ? { filename } : {}) })),
           );
           if (reply?.conflict === true) {
+            finishPromptDraft(action, false);
             if (pendingNewChat === startingChat) pendingNewChat = null;
             const pendingIndex = promptAttachments.indexOf(presentation);
             if (pendingIndex !== -1) promptAttachments.splice(pendingIndex, 1);
@@ -4134,7 +4160,9 @@ export async function start({ global, document, client }) {
               turn.rejected("the host refused a prompt it is no longer running");
               promptFailure = "The message was not sent. Send it again.";
             }
+            turn.withdraw(action.id);
           } else {
+            finishPromptDraft(action, true);
             let previewClearError = "";
             const delivery = previewDeliveries.get(action.text);
             if (delivery) {
@@ -4172,7 +4200,9 @@ export async function start({ global, document, client }) {
           const pendingIndex = promptAttachments.indexOf(presentation);
           if (pendingIndex !== -1) promptAttachments.splice(pendingIndex, 1);
           turn.rejected(String(error));
-          promptFailure = "Prompt failed.";
+          turn.withdraw(action.id);
+          finishPromptDraft(action, false);
+          promptFailure = `Prompt failed: ${errorText(error)}`;
         }
       }
       if (action.kind === "stop") {
@@ -4308,26 +4338,36 @@ export async function start({ global, document, client }) {
     }
     if (text === "" && pendingFiles.length === 0 && selectedMarks.length === 0) return;
     let attachments = [];
+    if (submittingPrompt) return;
+    const draft = { text: input.value, files: [...pendingFiles], pastes: [...pastedTextChips],
+      sessionId: currentSessionId, root: project.repo_root };
+    submittingPrompt = true;
     if (pendingFiles.length > 0) {
       try {
         attachments = await encodePendingFiles();
       } catch {
+        submittingPrompt = false;
         promptFailure = "Could not read the attached file.";
         showPromptError();
         return;
       }
     }
-    input.value = "";
-    clearDraft();
-    pendingFiles.length = 0;
-    pastedTextChips.length = 0;
-    showPendingAttachments();
     promptFailure = "";
     rememberPrompt(text);
     if (selectedMarks.length) previewDeliveries.set(wireText, { ids: selectedMarks.map((mark) => mark.id), sessionId: previewMarkSession });
     const actions = turn.submit(wireText, attachments);
+    const message = actions[0] ?? turn.queue.at(-1);
+    if (message) promptDrafts.set(message.id, draft);
+    if (actions.length === 0) {
+      input.value = "";
+      clearDraft();
+      pendingFiles.length = 0;
+      pastedTextChips.length = 0;
+      showPendingAttachments();
+    }
     showPromptError();
-    return perform(actions);
+    try { return await perform(actions); }
+    finally { submittingPrompt = false; }
   });
 
   listen(input, "input", () => {

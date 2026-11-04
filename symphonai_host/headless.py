@@ -393,7 +393,13 @@ def _wait_for_terminal(
             run.stop()
             continue
         if event is None:
-            continue
+            if run.active:
+                continue
+            # Drain a terminal event queued just before the active flag cleared.
+            event = subscription.get(timeout=0)
+            if event is None:
+                event = RunFailed(agent_id="", run_id="", agent_name="leader",
+                                  error="host run ended without a terminal event")
         if stream_json:
             encoded = encode_event(event)
             if isinstance(event, RunFailed) and provider is not None and provider.key_error_status in (401, 403):
@@ -824,16 +830,22 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                     label = f"{stage} card {card_id}" if card_id else stage
                     print(f"retrying {label}: {reason}", file=sys.stderr, flush=True)
                     if stage == "planner":
-                        (store.path(loop["id"], "plan.json")).unlink(missing_ok=True)
-                        specs_folder = store.path(loop["id"], "specs")
-                        for path in specs_folder.iterdir():
-                            if path.is_dir():
-                                shutil.rmtree(path)
-                            else:
-                                path.unlink()
-                        store.set_state(current, "planning", "")
+                        from symphonai_host.spec_loop import Loop
                         try:
-                            runtime.run._start_loop_planner(current, "state")
+                            with runtime.run._lock:
+                                planning = Loop.from_payload(current)
+                                planning.state = "planning"
+                                planning.reason = ""
+                                runtime.run._loops._start_loop_planner(planning, "state")
+                                # The new planner's event sink waits on this lock, so it
+                                # cannot reach its model/tools before old artifacts go.
+                                store.path(loop["id"], "plan.json").unlink(missing_ok=True)
+                                specs_folder = store.path(loop["id"], "specs")
+                                for path in specs_folder.iterdir():
+                                    if path.is_dir():
+                                        shutil.rmtree(path)
+                                    else:
+                                        path.unlink()
                         except Exception as exc:
                             store.set_state(current, "needs_attention", f"planner failed: {exc}")
                     else:

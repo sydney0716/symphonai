@@ -38,22 +38,49 @@ def run_process(
         on_start(process)
     deadline = time.monotonic() + timeout
     timed_out = cancelled = False
+    drain_deadline = None
+    stdout = stderr = b""
+    killed = False
     while True:
-        cancelled = cancel is not None and cancel()
-        remaining = deadline - time.monotonic()
-        timed_out = remaining <= 0
-        if cancelled or timed_out:
+        now = time.monotonic()
+        cancelled = cancelled or (cancel is not None and cancel())
+        timed_out = timed_out or now >= deadline
+        if process.poll() is not None and drain_deadline is None:
+            drain_deadline = now + 2.0
+        if (cancelled or timed_out) and not killed:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                process.kill()
-            stdout, stderr = process.communicate()
+            except OSError:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            killed = True
+            drain_deadline = min(drain_deadline or now + 2.0, now + 2.0)
+        if drain_deadline is not None and now >= drain_deadline:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
             break
+        remaining = (drain_deadline if killed else min(deadline, drain_deadline or deadline)) - now
         try:
             stdout, stderr = process.communicate(input=input, timeout=min(0.05, remaining))
-            cancelled = cancel is not None and cancel()
+            cancelled = cancelled or (cancel is not None and cancel())
             break
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = exc.output or b"", exc.stderr or b""
             input = None
     stdout, stderr = stdout or b"", stderr or b""
     if output_limit is not None:

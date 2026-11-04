@@ -389,9 +389,11 @@ function renderModels(section, context) {
     const remove = makeButton(document, "Remove");
     const notice = element(document, "span");
     async function write(value) {
-      input.value = "";
+      save.disabled = true;
+      remove.disabled = true;
       try {
         await boundary.storeCredential(envVar, value);
+        if (input.value === value) input.value = "";
         table.children[index + 1].children[2].textContent = value ? "present" : "absent";
         const providerRow = providerRows.find((item) => item.env_var === envVar);
         if (providerRow) providerRow.key_present = Boolean(value);
@@ -399,9 +401,12 @@ function renderModels(section, context) {
       } catch (error) {
         const detail = errorText(error).trim();
         notice.textContent = detail ? `Could not save the key: ${detail}` : "Could not save the key.";
+      } finally {
+        save.disabled = false;
+        remove.disabled = false;
       }
     }
-    listen(save, "click", () => write(input.value));
+    listen(save, "click", () => input.value ? write(input.value) : undefined);
     listen(remove, "click", () => write(""));
     append(label, input);
     append(row, label, save, remove, notice);

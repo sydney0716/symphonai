@@ -307,7 +307,7 @@ class HookRunner:
         event_name = type(event).__name__
         payload = {"type": event_name, **asdict(event)}
         for hook in self._hooks:
-            if hook.blocking or event_name not in hook.events:
+            if hook.blocking or (event_name not in hook.events and "Event" not in hook.events):
                 continue
             outcome, problem = self._run(hook, payload)
             if problem is not None or not outcome.ok:
@@ -339,7 +339,16 @@ class HookRunner:
                 text = outcome.stdout.strip()
                 if text.startswith("```json\n") and text.endswith("\n```"):
                     text = text[len("```json\n"):-len("\n```")]
-                reply = json.loads(text)
+                try:
+                    reply = json.loads(text)
+                except ValueError:
+                    if hook.command:
+                        notes.append(outcome.stdout.strip())
+                        continue
+                    raise
+                if not isinstance(reply, dict) and hook.command:
+                    notes.append(outcome.stdout.strip())
+                    continue
                 if not isinstance(reply, dict) or reply.get("decision") not in ("allow", "deny"):
                     raise ValueError()
                 if reply["decision"] == "deny":
@@ -373,9 +382,9 @@ class HookRunner:
             try:
                 outcome, problem = self._run(hook, payload, ask_model=ask_model, cancel=cancel)
             except Exception:
-                return None
+                continue
             if problem is not None or not outcome.ok:
-                return None
+                continue
             try:
                 text = outcome.stdout.strip()
                 if text.startswith("```json\n") and text.endswith("\n```"):
@@ -383,8 +392,8 @@ class HookRunner:
                 reply = json.loads(text)
                 if (not isinstance(reply, dict) or reply.get("decision") != "continue"
                     or not isinstance(reply.get("reason"), str) or not reply["reason"].strip()):
-                    return None
+                    continue
                 reasons.append(reply["reason"])
             except (ValueError, TypeError):
-                return None
+                continue
         return "\n".join(reasons) if reasons else None

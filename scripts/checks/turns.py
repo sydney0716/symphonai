@@ -48,6 +48,67 @@ def answer(text="finished", *calls, usage=None):
     return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)), usage=usage or Usage())
 
 
+@check("turns.compaction_keeps_one_summary_and_fits_long_turns")
+def compaction_keeps_one_summary_and_fits_long_turns():
+    from symphonai_api.compaction import compact_messages_for_budget, render_dropped_messages
+    from symphonai_api.models import ModelRequest
+
+    messages = [Message(Role.SYSTEM, 'Fixed instruction'), Message(Role.USER, 'Original goal'),
+                Message(Role.ASSISTANT, 'Older answer')]
+    previous = None
+    for index in range(40):
+        messages.extend([Message(Role.USER, f'Question {index}'), Message(Role.ASSISTANT, 'Recent answer')])
+        provider = Script([answer(f'Running summary {index}'), answer('Continued')])
+
+        def summarize(dropped):
+            response = provider.create_response(ModelRequest(
+                messages=[Message(Role.USER, render_dropped_messages(dropped))], tools=[]))
+            if previous is not None:
+                assert previous in provider.requests[-1].messages[0].text
+            return response.message.text
+
+        messages = compact_messages_for_budget(messages, budget=2000, recent_turns=1,
+                                               force=True, summarize=summarize).messages
+        provider.create_response(ModelRequest(messages=messages, tools=[]))
+        received = provider.requests[-1].messages
+        assert sum(message.role == Role.SYSTEM for message in received) == 2
+        previous = f'Running summary {index}'
+        assert sum(previous in message.text for message in received) == 1
+
+    class ResultTool(LocalTool):
+        name = 'fixture_result'
+        description = 'Return a large result'
+        parameters = {'type': 'object', 'properties': {}}
+
+        def metadata(self, arguments):
+            return ToolMetadata(ToolEffect.READ_ONLY, False, ())
+
+        def _execute(self, tool_call, policy, cancel=None):
+            return ToolResult(tool_call.id, ok=True, content='x' * 6000)
+
+    with workspace() as ws:
+        messages = []
+        for index in range(4):
+            messages.extend([Message(Role.USER, f'Old question {index}'), Message(Role.ASSISTANT, 'Old answer')])
+        messages.append(Message(Role.USER, 'Current long turn'))
+        provider = Script([*[answer('', ToolCall(f'call-{index}', 'fixture_result', {})) for index in range(8)],
+                           answer('Finished')])
+        result = ApiAgent(provider, {'fixture_result': ResultTool()}, ws.policy,
+                          context_budget=lambda model: 2300).run(messages)
+        assert result.final_response.message.text == 'Finished'
+        assert any(message.role == Role.SYSTEM for request in provider.requests for message in request.messages)
+
+        class BrokenTool(ResultTool):
+            def _execute(self, tool_call, policy, cancel=None):
+                raise RuntimeError('tool bug')
+
+        provider = Script([answer('', ToolCall('broken', 'fixture_result', {})), answer('Recovered')])
+        result = ApiAgent(provider, {'fixture_result': BrokenTool()}, ws.policy).run([Message(Role.USER, 'Work')])
+        errors = [message.tool_result for message in provider.requests[-1].messages if message.tool_result]
+        assert errors and not errors[-1].ok and errors[-1].error == 'RuntimeError: tool bug'
+        assert result.final_response.message.text == 'Recovered'
+
+
 @check("turns.memory_consolidation_preserves_unnamed_entries_and_rejects_invalid_results")
 def memory_consolidation_preserves_unnamed_entries_and_rejects_invalid_results():
     import json

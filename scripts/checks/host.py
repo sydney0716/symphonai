@@ -757,3 +757,42 @@ def opening_another_project_preserves_provider_selection():
         finally:
             release.set()
             host.close()
+
+
+@check('host.a_run_that_fails_early_still_ends')
+def a_run_that_fails_early_still_ends():
+    from symphonai_api.events import RunFailed
+
+    with workspace() as ws:
+        broker = EventBroker()
+        subscription = broker.subscribe()
+        run = HostRun(FakeModelProvider([reply()]), ws.policy, broker,
+                      sessions_root=ws.outside/'sessions', memory_root=ws.outside/'memory',
+                      memory_extraction_enabled=False, project_grants_root=ws.outside/'permissions')
+        original_open = Path.open
+
+        def open_path(path, mode='r', *args, **kwargs):
+            if path.name == 'manifest.jsonl' and mode == 'a':
+                raise PermissionError('fixture checkpoint manifest is unwritable')
+            return original_open(path, mode, *args, **kwargs)
+
+        try:
+            with mock.patch.object(Path, 'open', open_path), redirect_stderr(io.StringIO()) as errors:
+                run.start('fixture prompt')
+                deadline = time.monotonic() + 5
+                terminal = []
+                while time.monotonic() < deadline:
+                    event = subscription.get(timeout=0.05)
+                    if isinstance(event, RunFailed) and event.agent_name == 'leader':
+                        terminal.append(event)
+                    if terminal and not run.active:
+                        break
+                assert len(terminal) == 1, terminal
+                assert 'fixture checkpoint manifest is unwritable' in terminal[0].error
+                assert not run.active
+                # Wait for stderr finalization before restoring the capture.
+                wait_for(errors.getvalue, lambda text: 'PermissionError: fixture checkpoint manifest is unwritable' in text)
+                assert 'Traceback' in errors.getvalue()
+        finally:
+            run.close()
+            subscription.close()

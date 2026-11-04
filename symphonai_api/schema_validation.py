@@ -20,11 +20,19 @@ def validate_schema(value: object, schema: Mapping[str, object], path: str) -> s
         exclusive = schema.get("exclusiveMinimum")
         if exclusive is not None and not value > exclusive:
             return f"{path} must be > {exclusive}"
+        maximum = schema.get("maximum")
+        if maximum is not None and value > maximum:
+            return f"{path} must be <= {maximum}"
+        exclusive = schema.get("exclusiveMaximum")
+        if exclusive is not None and not value < exclusive:
+            return f"{path} must be < {exclusive}"
     for kind, keyword in (("array", "minItems"), ("string", "minLength")):
         if expected == kind and keyword in schema and len(value) < schema[keyword]:
             return f"{path} must have at least {schema[keyword]} {'items' if kind == 'array' else 'characters'}"
     if expected == "string" and "maxLength" in schema and len(value) > schema["maxLength"]:
         return f"{path} exceeds maxLength {schema['maxLength']}; actual length is {len(value)}"
+    if expected == "array" and "maxItems" in schema and len(value) > schema["maxItems"]:
+        return f"{path} must have at most {schema['maxItems']} items"
     enum = schema.get("enum")
     if isinstance(enum, (list, tuple)) and value not in enum:
         return f"{path} must be one of the allowed enum values"
@@ -36,6 +44,10 @@ def validate_schema(value: object, schema: Mapping[str, object], path: str) -> s
                     return f"{path} is missing required property {key!r}"
         properties = schema.get("properties", {})
         if isinstance(properties, Mapping):
+            if schema.get("additionalProperties") is False:
+                for key in value:
+                    if key not in properties:
+                        return f"{path} has unexpected property {key!r}"
             for key, child in properties.items():
                 if key in value and isinstance(child, Mapping):
                     error = validate_schema(value[key], child, f"{path}.{key}")

@@ -185,7 +185,7 @@ def offload_tool_result(
     if (
         not result.ok
         or result.cancelled
-        or tool_name == "read_file"
+        or tool_name in {"read_file", "read_tool_result"}
         or len(result.content) <= OFFLOAD_THRESHOLD_CHARS
     ):
         return result

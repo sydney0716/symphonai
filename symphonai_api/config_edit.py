@@ -109,20 +109,38 @@ def set_config_value(key: str, value: object, scope: str, *, repo_root: Path, ho
             (project, staged / "repo" / ".symphonai" / "config.toml"),
             (project.with_name("config.local.toml"), staged / "repo" / ".symphonai" / "config.local.toml"),
         )
-        for source, destination in mappings:
-            if source != target and not source.exists():
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(candidate if source == target else source.read_text(encoding="utf-8"), encoding="utf-8")
+        def validate(text):
+            for source, destination in mappings:
+                if source != target and not source.exists():
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(text if source == target else source.read_text(encoding="utf-8"), encoding="utf-8")
+            user_file = mappings[0][1]
+            user_values = tomllib.loads(user_file.read_text(encoding="utf-8")) if user_file.exists() else {}
+            trust = user_values.get("trust", {})
+            grants = trust.get("repositories", []) if isinstance(trust, dict) else []
+            # A grant for the real repository applies to its validation copy.
+            grants = [
+                {**grant, "root": str(staged / "repo")}
+                if isinstance(grant, dict) and isinstance(grant.get("root"), str)
+                and Path(grant["root"]).expanduser().resolve() == Path(repo_root).resolve()
+                else grant for grant in grants
+            ] if isinstance(grants, list) else grants
+            config = load_config(repo_root=staged / "repo", home=staged / "home",
+                                 session={"trust": {"repositories": grants}})
+            return set(config.warnings)
+
         try:
-            config = load_config(repo_root=staged / "repo", home=staged / "home")
-            if config.warnings:
-                raise ValueError("; ".join(config.warnings))
+            before = validate(original)
+            introduced = validate(candidate) - before
+            if introduced:
+                raise ValueError("; ".join(sorted(introduced)))
         except ValueError as exc:
             message = str(exc)
             for source, destination in mappings:
                 message = message.replace(str(destination), str(source))
             raise ValueError(message) from exc
-    ensure_private_directory(target.parent)
-    write_atomic(target, candidate)
+    destination = target.resolve()
+    ensure_private_directory(destination.parent)
+    write_atomic(destination, candidate)
     return target

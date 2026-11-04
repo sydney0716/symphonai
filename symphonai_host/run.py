@@ -1668,7 +1668,7 @@ class HostRun:
                 approvals = self.approvals
                 goal = None if detached else self._goal
                 goal_session_id = None if detached else self._goal_session_id
-            if self._user_command is not None:
+            if self._user_command is not None and not detached:
                 raise CommandActiveError("wait for the command to finish")
             if not detached and self._active is not None:
                 raise RunActiveError(self._active.run_id)
@@ -2350,6 +2350,8 @@ class HostRun:
                 self._effort,
                 self._provider_choice,
             )
+            previous_policy = self._policy
+            previous_approvals = self.approvals
             previous_mode = self._policy.mode
             provider, model, effort, provider_choice = previous_provider
             if isinstance(choice, dict) and self._provider_factory is not None:
@@ -2396,6 +2398,8 @@ class HostRun:
                     store.update_meta(lambda meta: meta.update({"goal": goal.payload()}))
             except Exception:
                 self._provider, self._model, self._effort, self._provider_choice = previous_provider
+                self._policy = previous_policy
+                self.approvals = previous_approvals
                 self._policy.mode = previous_mode
                 store.close()
                 raise
@@ -3083,48 +3087,68 @@ class HostRun:
             self._context_by_session[session_id] = context_report
 
     def compact(self, instructions: str | None = None) -> CompactionResult:
-        """Force compact the current conversation and publish its new usage."""
+        """Force compact the current conversation without locking other sessions."""
         with self._lock:
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
             if self._conversation is None:
                 raise NoConversationError("no conversation to compact")
-            leader = self._conversation[0]
-            result, summary_usage = leader.force_compact_chat(instructions)
-            agent_id = leader.agent_ref.agent_id
-            name, current_usage = self._usage_by_agent.get(
-                agent_id, (leader.agent_ref.name, {})
-            )
-            self._usage_by_agent[agent_id] = (
-                name,
-                self._merge_usage(current_usage, summary_usage),
-            )
-            self._context_report = account_context(
-                leader._chat_messages,
-                budget=leader.chat_token_budget,
-            )
-            session_id = self._conversation[1].run_id
-            session = self._conversation[1]
-            for model, usage in summary_usage.items():
-                session.writer_for(agent_id, is_root=True).append(
-                    "usage",
-                    run_id=session_id,
-                    agent_id=agent_id,
-                    turn_id=None,
-                    data={
-                        "model": model,
-                        "agent_name": name,
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "calls": usage.calls,
-                        "cache_read_tokens": usage.cache_read_tokens,
-                        "cache_write_tokens": usage.cache_write_tokens,
-                        "cache_write_1h_tokens": usage.cache_write_1h_tokens,
-                    },
+            conversation = self._conversation
+            leader, session = conversation
+            session_id = session.run_id
+            cancel = CancellationToken()
+            active = _ActiveRun(new_id("run"), cancel, threading.current_thread(), leader.agent_ref.agent_id)
+            self._active_by_session[session_id] = active
+            self._active = active
+        try:
+            result, summary_usage = leader.force_compact_chat(instructions, cancel=cancel)
+            with self._lock:
+                usage_by_agent = dict(self._usage_by_session.get(session_id, {}))
+                agent_id = leader.agent_ref.agent_id
+                name, current_usage = usage_by_agent.get(
+                    agent_id, (leader.agent_ref.name, {})
                 )
-            self._context_by_session[session_id] = self._context_report
-            self._usage_by_session[session_id] = dict(self._usage_by_agent)
-            return result
+                usage_by_agent[agent_id] = (
+                    name,
+                    self._merge_usage(current_usage, summary_usage),
+                )
+                context_report = account_context(
+                    leader._chat_messages,
+                    budget=leader.chat_token_budget,
+                )
+                for model, usage in summary_usage.items():
+                    session.writer_for(agent_id, is_root=True).append(
+                        "usage",
+                        run_id=session_id,
+                        agent_id=agent_id,
+                        turn_id=None,
+                        data={
+                            "model": model,
+                            "agent_name": name,
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "calls": usage.calls,
+                            "cache_read_tokens": usage.cache_read_tokens,
+                            "cache_write_tokens": usage.cache_write_tokens,
+                            "cache_write_1h_tokens": usage.cache_write_1h_tokens,
+                        },
+                    )
+                self._context_by_session[session_id] = context_report
+                self._usage_by_session[session_id] = dict(usage_by_agent)
+                if self._conversation is conversation:
+                    self._usage_by_agent = dict(usage_by_agent)
+                    self._context_report = context_report
+                return result
+        finally:
+            cancel.close()
+            with self._lock:
+                if self._active_by_session.get(session_id) is active:
+                    self._active_by_session.pop(session_id, None)
+                if self._active is active:
+                    self._active = None
+                for event in active.deferred_memory_events:
+                    self._publish(getattr(event, "run_id", active.run_id), event, session_id=session_id)
+                active.deferred_memory_events.clear()
 
     def conversation_stats(self) -> dict | None:
         with self._lock:
@@ -3701,6 +3725,7 @@ class HostRun:
     ) -> None:
         terminal_event = None
         failure_published = False
+        synthesized_failure = False
         active_to_finish = None
         failure: Exception | None = None
         try:
@@ -3716,6 +3741,13 @@ class HostRun:
                 if active is not None and active.run_id == run_id:
                     terminal_event = active.terminal_event
                     active_to_finish = active
+                    if terminal_event is None:
+                        synthesized_failure = True
+                        terminal_event = RunFailed(
+                            agent_id=leader.agent_ref.agent_id, run_id=run_id,
+                            agent_name="leader",
+                            error=str(failure) if failure is not None else "host run ended without a terminal event",
+                        )
                 if (
                     active_to_finish is not None
                     and self._active_by_session.get(session_id) is active_to_finish
@@ -3733,9 +3765,12 @@ class HostRun:
                 if self._closing and self._conversation is not None and self._conversation[1].run_id == session_id:
                     self._conversation = None
                     self._active = None
-        if failure_published:
+        if failure_published and not synthesized_failure:
             error = " ".join(terminal_event.error.splitlines())
             print(f"run {run_id} failed: {error}", file=sys.stderr, flush=True)
+        elif synthesized_failure and failure is not None:
+            import traceback
+            traceback.print_exception(failure, file=sys.stderr)
         if not goal_round:
             self._loops._finish_spec_review(session_id, leader, terminal_event)
             self._loops._finish_loop_plan(session_id, terminal_event, error=failure)

@@ -103,7 +103,31 @@ export function createClient({
     return value;
   }
 
-  async function request(method, path, body, read = readReply, { detailOnError = false } = {}) {
+  async function requestFailure(response, detailOnError = true) {
+    let detail = "";
+    let failureReply = null;
+    if (detailOnError) {
+      try {
+        const value = await response.json();
+        if (isObject(value)) {
+          failureReply = value;
+          if (typeof value.error === "string") {
+            detail = value.error;
+          }
+        }
+      } catch {
+        // Keep the status error when the host did not return JSON.
+      }
+    }
+    const error = new Error(detail || `host request failed with status ${response.status}`);
+    error.status = response.status;
+    if (Array.isArray(failureReply?.paths)) {
+      error.paths = failureReply.paths;
+    }
+    return error;
+  }
+
+  async function request(method, path, body, read = readReply, { detailOnError = true } = {}) {
     const options = { method, headers: headers() };
     if (body !== undefined) {
       options.headers = headers({ "Content-Type": "application/json" });
@@ -120,27 +144,7 @@ export function createClient({
       throw new ProtocolError("host returned a malformed response");
     }
     if (response.status < 200 || response.status >= 300) {
-      let detail = "";
-      let failureReply = null;
-      if (detailOnError) {
-        try {
-          const value = await response.json();
-          if (isObject(value)) {
-            failureReply = value;
-            if (typeof value.error === "string") {
-              detail = value.error;
-            }
-          }
-        } catch {
-          // Keep the status error when the host did not return JSON.
-        }
-      }
-      const error = new Error(detail || `host request failed with status ${response.status}`);
-      error.status = response.status;
-      if (Array.isArray(failureReply?.paths)) {
-        error.paths = failureReply.paths;
-      }
-      throw error;
+      throw await requestFailure(response, detailOnError);
     }
     return read(response);
   }
@@ -188,9 +192,7 @@ export function createClient({
           throw new ProtocolError("host returned a malformed response");
         }
         if (response.status < 200 || response.status >= 300) {
-          throw new Error(
-            `host event stream failed with status ${response.status}`,
-          );
+          throw await requestFailure(response);
         }
         return response;
       })();
@@ -228,31 +230,7 @@ export function createClient({
         prompt: text,
         ...(attachments.length > 0 ? { attachments } : {}),
       });
-      const options = {
-        method: "POST",
-        headers: headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify(encoded.body),
-      };
-      let response;
-      try {
-        response = await fetchImplementation(`${origin}${encoded.path}`, options);
-      } catch {
-        throw new Error("network request failed");
-      }
-      if (!response || typeof response.status !== "number") {
-        throw new ProtocolError("host returned a malformed response");
-      }
-      if (response.status === 409) {
-        const conflict = await readReply(response);
-        if (typeof conflict.run_id !== "string") {
-          throw new ProtocolError("prompt conflict omitted its run id");
-        }
-        return { accepted: false, conflict: true, run_id: conflict.run_id };
-      }
-      if (response.status < 200 || response.status >= 300) {
-        throw new Error(`host request failed with status ${response.status}`);
-      }
-      return readReply(response);
+      return request("POST", encoded.path, encoded.body);
     },
 
     stop(reason = "") {
@@ -636,26 +614,7 @@ export function createClient({
 
     async file(path) {
       const query = new URLSearchParams({ path });
-      let response;
-      try {
-        response = await fetchImplementation(`${origin}/file?${query}`, {
-          method: "GET",
-          headers: headers(),
-        });
-      } catch {
-        throw new Error("network request failed");
-      }
-      if (!response || typeof response.status !== "number") {
-        throw new ProtocolError("host returned a malformed response");
-      }
-      if (response.status < 200 || response.status >= 300) {
-        const error = new ProtocolError(
-          `host file request failed with status ${response.status}`,
-        );
-        error.status = response.status;
-        throw error;
-      }
-      return readReply(response);
+      return request("GET", `/file?${query}`);
     },
 
     get droppedFrames() {

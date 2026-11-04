@@ -71,6 +71,7 @@ from symphonai_host.usage import UsageReport
 from symphonai_host.projects import ProjectRuntime, record_recent_project, recent_projects
 from symphonai_host.loops import LoopStore
 from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
+from symphonai_api.worktree import WorktreeError
 
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -2164,7 +2165,7 @@ class HostServer:
             _Route('POST', '/loop/cancel', Handler._post_loop_cancel,
                 match='exact',
                 payload=_Payload({'loop_id': str}, ('loop_id',), extra=False),
-                errors=(((ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run')),),
+                errors=(((ProtocolError, 'bad_request'), (KeyError, 'not_found'), (RunActiveError, 'active_run'), (WorktreeError, 'bad_request')),),
             ),
             _Route('POST', '/loop/commit', Handler._post_loop_commit,
                 match='exact',

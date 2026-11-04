@@ -91,12 +91,23 @@ class ReadLedger:
                 record is None
                 or record.partial_view
                 or record.content is None
-                or record.offset != offset
-                or record.limit != limit
+                or (not record.full and (record.offset != offset or record.limit != limit))
                 or resolved.stat().st_mtime_ns != record.mtime_ns
             ):
                 return None
             self._records.move_to_end(resolved)
+            if record.full:
+                parts = record.content.split("\n") if record.content else []
+                if record.content.endswith("\n"):
+                    parts.pop()
+                start = offset - 1
+                end = len(parts) if limit == 0 else start + limit
+                selected = parts[start:end]
+                content = "\n".join(selected)
+                if selected and (end < len(parts) or record.content.endswith("\n")):
+                    content += "\n"
+                return replace(record, content=content, offset=offset, limit=limit,
+                               more_follows=end < len(parts), last_line_seen=len(parts))
             return record
 
     def check(self, resolved: Path) -> str | None:

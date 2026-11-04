@@ -896,24 +896,6 @@ class DispatchSubagentTool(LocalTool):
                         f"{spec.model.provider}, which is not configured"
                     ),
                 )
-        if self._search_backend is None and "web_search" in (spec.tool_names or ()):
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error=f"subagent {subagent_name!r} cannot use web_search: search is not configured",
-            )
-        if not self._skills and "use_skill" in (spec.tool_names or ()):
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error=f"subagent {subagent_name!r} cannot use use_skill: no skills are available",
-            )
-        if (self._lsp is None or not self._lsp.has_enabled_servers) and "lsp" in (spec.tool_names or ()):
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=False,
-                error=f"subagent {subagent_name!r} cannot use lsp: no language server is configured",
-            )
         try:
             effective_policy = self._leader_policy.narrowed(spec.policy_ceiling)
         except ValueError as exc:
@@ -983,497 +965,540 @@ class DispatchSubagentTool(LocalTool):
                 self._reserved_names.add(subagent_name)
             else:
                 record.running = True
-                if record.worktree_path is not None:
-                    effective_policy = effective_policy.rerooted(record.worktree_path)
-                    record.agent._policy = effective_policy
 
-        resumed_messages = None
-        resumed_agent_id = None
-        if record is None and self._session is not None:
-            forgotten = self._session.read_meta().get("forgotten_subagents", {})
-            forgotten_ids = set(
-                forgotten.get(subagent_name, ())
-                if isinstance(forgotten, dict)
-                else ()
-            )
-            candidates = [
-                (started_at, agent_id, path)
-                for started_at, agent_id, path
-                in _session_subagent_transcripts(self._session).get(subagent_name, ())
-                if agent_id not in forgotten_ids
-            ]
-            if candidates:
-                _, resumed_agent_id, _ = max(candidates, key=lambda item: item[0])
-                resumed_messages = load_run(
-                    self._session, agent_id=resumed_agent_id
-                ).messages
-
-        worktree_admin_path = None
-        worktree_root = None
-        if record is None and self._session is not None:
-            candidate_path = self._session.directory / "worktrees" / subagent_name
-            if candidate_path.is_dir():
-                from symphonai_api.worktree import _top_level
-
-                relative_root = effective_policy.repo_root.resolve().relative_to(
-                    _top_level(effective_policy.repo_root)
+        worker_started = False
+        token = None
+        lease = None
+        try:
+            if record is not None and record.worktree_path is not None:
+                effective_policy = effective_policy.rerooted(record.worktree_path)
+                record.agent._policy = effective_policy
+            resumed_messages = None
+            resumed_agent_id = None
+            if record is None and self._session is not None:
+                forgotten = self._session.read_meta().get("forgotten_subagents", {})
+                forgotten_ids = set(
+                    forgotten.get(subagent_name, ())
+                    if isinstance(forgotten, dict)
+                    else ()
                 )
-                worktree_admin_path = candidate_path
-                worktree_root = candidate_path / relative_root
-                effective_policy = effective_policy.rerooted(worktree_root)
-            elif wants_worktree:
-                worktree_admin_path = candidate_path
-                try:
-                    worktree_root = create_worktree(
-                        effective_policy.repo_root, worktree_admin_path
+                candidates = [
+                    (started_at, agent_id, path)
+                    for started_at, agent_id, path
+                    in _session_subagent_transcripts(self._session).get(subagent_name, ())
+                    if agent_id not in forgotten_ids
+                ]
+                if candidates:
+                    _, resumed_agent_id, _ = max(candidates, key=lambda item: item[0])
+                    resumed_messages = load_run(
+                        self._session, agent_id=resumed_agent_id
+                    ).messages
+
+            worktree_admin_path = None
+            worktree_root = None
+            if record is None and self._session is not None:
+                candidate_path = self._session.directory / "worktrees" / subagent_name
+                if candidate_path.is_dir():
+                    from symphonai_api.worktree import _top_level
+
+                    relative_root = effective_policy.repo_root.resolve().relative_to(
+                        _top_level(effective_policy.repo_root)
                     )
-                except WorktreeError as exc:
-                    with self._pool_lock:
-                        self._reserved_names.discard(subagent_name)
+                    worktree_admin_path = candidate_path
+                    worktree_root = candidate_path / relative_root
+                    effective_policy = effective_policy.rerooted(worktree_root)
+                elif wants_worktree:
+                    worktree_admin_path = candidate_path
+                    try:
+                        worktree_root = create_worktree(
+                            effective_policy.repo_root, worktree_admin_path
+                        )
+                    except WorktreeError as exc:
+                        with self._pool_lock:
+                            self._reserved_names.discard(subagent_name)
+                        return ToolResult(
+                            tool_call_id=tool_call.id,
+                            ok=False,
+                            error=str(exc),
+                        )
+                    effective_policy = effective_policy.rerooted(worktree_root)
+
+            if record is None:
+                tool_names = selected_tool_names
+                if tool_names is not None and self._result_store is not None:
+                    tool_names = (*tool_names, "read_tool_result")
+                child_jobs = self._jobs if not document_role and (
+                    tool_names is None or "job_output" in tool_names
+                ) else None
+                optional_tools = {
+                    "web_search": self._search_backend is not None,
+                    "use_skill": bool(self._skills),
+                    "lsp": self._lsp is not None and self._lsp.has_enabled_servers,
+                    "read_tool_result": self._result_store is not None,
+                    "job_output": child_jobs is not None,
+                    "job_stop": child_jobs is not None,
+                }
+                if tool_names is not None:
+                    tool_names = tuple(name for name in tool_names if optional_tools.get(name, True))
+                agent_ref = AgentRef(
+                    resumed_agent_id or new_agent_ref(
+                        subagent_name, self._parent_agent_id
+                    ).agent_id,
+                    subagent_name,
+                    self._parent_agent_id,
+                )
+                memory_tool = (
+                    MemoryTool(
+                        self._memory,
+                        spec.name,
+                        lambda agent_id=agent_ref.agent_id: self._active_run_id(agent_id),
+                    )
+                    if spec.memory.enabled and self._memory is not None
+                    else None
+                )
+                read_ledger = ReadLedger()
+                standard_tools = (
+                    standard_tool_registry(
+                        tool_names,
+                        wire_format=child_provider.wire_format,
+                        ledger=read_ledger,
+                        result_store=self._result_store,
+                        search_backend=self._search_backend,
+                        memory_tool=memory_tool,
+                        skills=self._skills,
+                        lsp=self._lsp,
+                        jobs=child_jobs,
+                        checkpoints=(
+                            None if worktree_root is not None else self._checkpoints
+                        ),
+                    )
+                    if tool_names is None or tool_names
+                    else (
+                        {
+                            memory_tool.name: memory_tool,
+                            memory_tool.forget_tool.name: memory_tool.forget_tool,
+                        }
+                        if memory_tool is not None
+                        else {}
+                    )
+                )
+                subagent_tools = merge_tool_registry(
+                    standard_tools,
+                    selected_extra,
+                )
+                if document_role:
+                    # Opaque tools and jobs must not bypass the document write boundary.
+                    document_tools = set(EXPLORER_TOOL_NAMES) | FILE_EDIT_TOOLS | {
+                        "run_shell", "web_search", "use_skill", "read_tool_result",
+                    }
+                    subagent_tools = {name: tool for name, tool in subagent_tools.items() if name in document_tools}
+                    for name, tool in tuple(subagent_tools.items()):
+                        if name in FILE_EDIT_TOOLS or name == "run_shell":
+                            subagent_tools[name] = _DocumentRoleTool(tool, subagent_name)
+                subagent_tools["message_leader"] = _MessageLeaderTool(self, subagent_name)
+                record = SubagentRecord(
+                    agent=ApiAgent(
+                        provider=child_provider,
+                        tools=subagent_tools,
+                        policy=effective_policy,
+                        max_turns=self._subagent_max_turns,
+                        tool_schemas=tool_registry_schemas(subagent_tools, child_provider.wire_format),
+                        agent_ref=agent_ref,
+                        events=self._events,
+                        stream=self._stream,
+                        result_store=self._result_store,
+                        read_ledger=read_ledger,
+                        budget=spec.budget,
+                        call_class=spec.call_class,
+                        model_summary=self._model_summary,
+                        context_budget=lambda model: budget_for_model(
+                            child_provider.wire_format, model, self._compaction_limit,
+                        ),
+                        transcript=(
+                            None
+                            if self._session is None
+                            else self._session.writer_for(agent_ref.agent_id)
+                        ),
+                    ),
+                    agent_ref=agent_ref,
+                    breaker=ConsecutiveFailureBreaker(
+                        f"subagent {subagent_name}",
+                        max_consecutive_failures=self._max_consecutive_subagent_failures,
+                    ),
+                    worktree_path=worktree_root,
+                    worktree_admin_path=worktree_admin_path,
+                    running=True,
+                )
+                if resumed_messages is not None:
+                    if self._session.read_meta().get("provider_state_reset") is True:
+                        record.messages = _without_vendor_state(resumed_messages)
+                    else:
+                        record.messages = resumed_messages
+                with self._pool_lock:
+                    self.pool[subagent_name] = record
+                    self._reserved_names.discard(subagent_name)
+            else:
+                # The ceiling is mutable even though AgentSpec is frozen, so take
+                # the meet again for every dispatch instead of retaining authority.
+                record.agent._policy = effective_policy
+
+            with self._changed:
+                if background and len(self._background_names) >= 4:
+                    record.running = False
+                    return ToolResult(tool_call.id, ok=False, error=(
+                        "at most 4 background subagents; running: "
+                        + ", ".join(sorted(self._background_names))))
+                # Keep a previous dispatch's deferred delivery attached to that dispatch.
+                if record.background:
+                    record = replace(record)
+                    self.pool[subagent_name] = record
+                record.background = background
+                record.state = "running"
+                record.result = None
+                record.delivered = False
+                if background:
+                    self._background_names.add(subagent_name)
+
+            event_run_id = self._event_run_id
+            event_agent_id = self._event_agent_id
+            event_turn_id = self._event_turn_id
+
+            def new_child_run() -> AgentRun:
+                child_run = self._new_run(spec, record.agent_ref)
+                record.runs.append(child_run)
+                record.current_run = child_run
+                return child_run
+
+            def prepare_child() -> None:
+                if record.messages:
+                    record.messages.append(Message(role=Role.USER, content=task))
+                else:
+                    memory, unreadable_memory = _memory_seed(self._memory, spec)
+                    record.messages = seed_messages(
+                        spec,
+                        task,
+                        parent_messages=self._parent_messages,
+                        memory=memory,
+                        memory_available=self._memory is not None,
+                        unreadable_memory=unreadable_memory,
+                    )
+                if self._events is not None:
+                    if event_run_id is None:
+                        raise RuntimeError("dispatch event context was never set")
+                    emit(
+                        self._events,
+                        SubagentSpawned(
+                            agent_id=event_agent_id,
+                            run_id=event_run_id,
+                            turn_id=event_turn_id,
+                            subagent_name=subagent_name,
+                            subagent_agent_id=record.agent_ref.agent_id,
+                        ),
+                    )
+
+            def run_child(
+                child_run: AgentRun, *, initial: bool = False,
+            ) -> tuple[AgentRunResult | None, str | None, Exception | None]:
+                round_token = token.child()
+                result = None
+                failure = None
+                execution_error = None
+                with self._active_runs_lock:
+                    self._active_runs[record.agent_ref.agent_id] = child_run
+                try:
+                    child_run.start(round_token)
+                    if initial and not background:
+                        prepare_child()
+                    lease = (
+                        nullcontext() if record.worktree_path is not None or background
+                        else self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix)
+                    )
+                    with lease:
+                        result = record.agent.run(
+                            record.messages, model=spec.model.model, effort=spec.model.effort,
+                            parent_run_id=None if self._parent_run is None else self._parent_run.run.run_id,
+                            cancel=round_token, run=child_run, hooks=self._hooks,
+                        )
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    failure = str(exc)
+                    execution_error = exc
+                finally:
+                    with self._active_runs_lock:
+                        if self._active_runs.get(record.agent_ref.agent_id) is child_run:
+                            self._active_runs.pop(record.agent_ref.agent_id, None)
+                    if child_run.phase is RunPhase.RUNNING:
+                        if result is None:
+                            if token.cancelled:
+                                child_run.cancel()
+                            else:
+                                child_run.fail(failure or "subagent dispatch failed")
+                        elif result.stopped_reason == "cancelled":
+                            child_run.cancel()
+                        else:
+                            child_run.finish(result)
+                    round_token.close()
+                    if initial and event_run_id is not None:
+                        emit(self._events, SubagentStopped(
+                            agent_id=event_agent_id, run_id=event_run_id,
+                            turn_id=event_turn_id, subagent_name=subagent_name,
+                            subagent_agent_id=record.agent_ref.agent_id,
+                        ))
+                return result, failure, execution_error
+
+            def record_child_result(result: AgentRunResult) -> None:
+                record.messages = result.messages
+                record.turns_used += result.turns_used
+                for model, usage in result.usage_by_model.items():
+                    record.usage_by_model[model] = record.usage_by_model.get(
+                        model, UsageTotals()
+                    ).merged(usage)
+
+            child_run = new_child_run()
+            token = (
+                cancel.child(deadline_seconds=spec.deadline_seconds)
+                if cancel is not None
+                else CancellationToken(deadline_seconds=spec.deadline_seconds)
+            )
+            record.token = token
+
+            def dispatch_result() -> ToolResult:
+                nonlocal child_run
+                document_shell = record.agent._tools.get("run_shell") if document_role else None
+                if isinstance(document_shell, _DocumentRoleTool):
+                    document_shell.changed_paths.clear()
+                run_result, failure, execution_error = run_child(child_run, initial=True)
+                if isinstance(execution_error, LeaseConflict):
+                    return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
+                if run_result is None:
+                    try:
+                        content, payload = self._worktree_output(subagent_name, record, "")
+                    finally:
+                        with self._pool_lock:
+                            record.running = False
                     return ToolResult(
                         tool_call_id=tool_call.id,
                         ok=False,
-                        error=str(exc),
+                        content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
+                        error=failure or str(execution_error) or "subagent dispatch failed",
+                        payload=payload,
                     )
-                effective_policy = effective_policy.rerooted(worktree_root)
-
-        if record is None:
-            tool_names = spec.tool_names
-            if tool_names is not None and self._result_store is not None:
-                tool_names = (*tool_names, "read_tool_result")
-            agent_ref = AgentRef(
-                resumed_agent_id or new_agent_ref(
-                    subagent_name, self._parent_agent_id
-                ).agent_id,
-                subagent_name,
-                self._parent_agent_id,
-            )
-            memory_tool = (
-                MemoryTool(
-                    self._memory,
-                    spec.name,
-                    lambda agent_id=agent_ref.agent_id: self._active_run_id(agent_id),
-                )
-                if spec.memory.enabled and self._memory is not None
-                else None
-            )
-            read_ledger = ReadLedger()
-            standard_tools = (
-                standard_tool_registry(
-                    tool_names,
-                    wire_format=child_provider.wire_format,
-                    ledger=read_ledger,
-                    result_store=self._result_store,
-                    search_backend=self._search_backend,
-                    memory_tool=memory_tool,
-                    skills=self._skills,
-                    lsp=self._lsp,
-                    jobs=self._jobs,
-                    checkpoints=(
-                        None if worktree_root is not None else self._checkpoints
-                    ),
-                )
-                if tool_names is None or tool_names
-                else (
-                    {
-                        memory_tool.name: memory_tool,
-                        memory_tool.forget_tool.name: memory_tool.forget_tool,
-                    }
-                    if memory_tool is not None
-                    else {}
-                )
-            )
-            subagent_tools = merge_tool_registry(
-                standard_tools,
-                selected_extra,
-            )
-            if document_role:
-                # Opaque tools and jobs must not bypass the document write boundary.
-                document_tools = set(EXPLORER_TOOL_NAMES) | FILE_EDIT_TOOLS | {
-                    "run_shell", "web_search", "use_skill", "read_tool_result",
-                }
-                subagent_tools = {name: tool for name, tool in subagent_tools.items() if name in document_tools}
-                for name, tool in tuple(subagent_tools.items()):
-                    if name in FILE_EDIT_TOOLS or name == "run_shell":
-                        subagent_tools[name] = _DocumentRoleTool(tool, subagent_name)
-            subagent_tools["message_leader"] = _MessageLeaderTool(self, subagent_name)
-            record = SubagentRecord(
-                agent=ApiAgent(
-                    provider=child_provider,
-                    tools=subagent_tools,
-                    policy=effective_policy,
-                    max_turns=self._subagent_max_turns,
-                    tool_schemas=tool_registry_schemas(subagent_tools, child_provider.wire_format),
-                    agent_ref=agent_ref,
-                    events=self._events,
-                    stream=self._stream,
-                    result_store=self._result_store,
-                    read_ledger=read_ledger,
-                    budget=spec.budget,
-                    call_class=spec.call_class,
-                    model_summary=self._model_summary,
-                    context_budget=lambda model: budget_for_model(
-                        child_provider.wire_format, model, self._compaction_limit,
-                    ),
-                    transcript=(
-                        None
-                        if self._session is None
-                        else self._session.writer_for(agent_ref.agent_id)
-                    ),
-                ),
-                agent_ref=agent_ref,
-                breaker=ConsecutiveFailureBreaker(
-                    f"subagent {subagent_name}",
-                    max_consecutive_failures=self._max_consecutive_subagent_failures,
-                ),
-                worktree_path=worktree_root,
-                worktree_admin_path=worktree_admin_path,
-                running=True,
-            )
-            if resumed_messages is not None:
-                if self._session.read_meta().get("provider_state_reset") is True:
-                    record.messages = _without_vendor_state(resumed_messages)
-                else:
-                    record.messages = resumed_messages
-            with self._pool_lock:
-                self.pool[subagent_name] = record
-                self._reserved_names.discard(subagent_name)
-        else:
-            # The ceiling is mutable even though AgentSpec is frozen, so take
-            # the meet again for every dispatch instead of retaining authority.
-            record.agent._policy = effective_policy
-
-        with self._changed:
-            if background and len(self._background_names) >= 4:
-                record.running = False
-                return ToolResult(tool_call.id, ok=False, error=(
-                    "at most 4 background subagents; running: "
-                    + ", ".join(sorted(self._background_names))))
-            # Keep a previous dispatch's deferred delivery attached to that dispatch.
-            if record.background:
-                record = replace(record)
-                self.pool[subagent_name] = record
-            record.background = background
-            record.state = "running"
-            record.result = None
-            record.delivered = False
-            if background:
-                self._background_names.add(subagent_name)
-
-        event_run_id = self._event_run_id
-        event_agent_id = self._event_agent_id
-        event_turn_id = self._event_turn_id
-
-        def new_child_run() -> AgentRun:
-            child_run = self._new_run(spec, record.agent_ref)
-            record.runs.append(child_run)
-            record.current_run = child_run
-            return child_run
-
-        def prepare_child() -> None:
-            if record.messages:
-                record.messages.append(Message(role=Role.USER, content=task))
-            else:
-                memory, unreadable_memory = _memory_seed(self._memory, spec)
-                record.messages = seed_messages(
-                    spec,
-                    task,
-                    parent_messages=self._parent_messages,
-                    memory=memory,
-                    memory_available=self._memory is not None,
-                    unreadable_memory=unreadable_memory,
-                )
-            if self._events is not None:
-                if event_run_id is None:
-                    raise RuntimeError("dispatch event context was never set")
-                emit(
-                    self._events,
-                    SubagentSpawned(
-                        agent_id=event_agent_id,
-                        run_id=event_run_id,
-                        turn_id=event_turn_id,
-                        subagent_name=subagent_name,
-                        subagent_agent_id=record.agent_ref.agent_id,
-                    ),
-                )
-
-        def run_child(
-            child_run: AgentRun, *, initial: bool = False,
-        ) -> tuple[AgentRunResult | None, str | None, Exception | None]:
-            child_run.start(token)
-            if initial and not background:
-                prepare_child()
-            result = None
-            failure = None
-            execution_error = None
-            with self._active_runs_lock:
-                self._active_runs[record.agent_ref.agent_id] = child_run
-            try:
-                lease = (
-                    nullcontext() if record.worktree_path is not None or background
-                    else self._leases.held(child_run.run.run_id, spec.isolation.workspace_prefix)
-                )
-                with lease:
-                    result = record.agent.run(
-                        record.messages, model=spec.model.model, effort=spec.model.effort,
-                        parent_run_id=None if self._parent_run is None else self._parent_run.run.run_id,
-                        cancel=token, run=child_run, hooks=self._hooks,
-                    )
-            except LeaseConflict as exc:
-                failure = str(exc)
-                if not initial and record.worktree_path is None:
-                    raise
-                execution_error = exc
-            except Exception as exc:
-                failure = str(exc)
-                if record.worktree_path is None:
-                    raise
-                execution_error = exc
-            finally:
-                with self._active_runs_lock:
-                    if self._active_runs.get(record.agent_ref.agent_id) is child_run:
-                        self._active_runs.pop(record.agent_ref.agent_id, None)
-                if initial and record.worktree_path is None and not validation_commands:
-                    with self._pool_lock:
-                        record.running = False
-                if child_run.phase is RunPhase.RUNNING:
-                    if result is None:
-                        if token.cancelled:
-                            child_run.cancel()
-                        else:
-                            child_run.fail(failure or "subagent dispatch failed")
-                    elif result.stopped_reason == "cancelled":
-                        child_run.cancel()
-                    else:
-                        child_run.finish(result)
-                if initial and event_run_id is not None:
-                    emit(self._events, SubagentStopped(
-                        agent_id=event_agent_id, run_id=event_run_id,
-                        turn_id=event_turn_id, subagent_name=subagent_name,
-                        subagent_agent_id=record.agent_ref.agent_id,
-                    ))
-            return result, failure, execution_error
-
-        def record_child_result(result: AgentRunResult) -> None:
-            record.messages = result.messages
-            record.turns_used += result.turns_used
-            for model, usage in result.usage_by_model.items():
-                record.usage_by_model[model] = record.usage_by_model.get(
-                    model, UsageTotals()
-                ).merged(usage)
-
-        child_run = new_child_run()
-        token = (
-            cancel.child(deadline_seconds=spec.deadline_seconds)
-            if cancel is not None
-            else CancellationToken(deadline_seconds=spec.deadline_seconds)
-        )
-        record.token = token
-
-        def execute_dispatch() -> ToolResult:
-            nonlocal child_run
-            document_shell = record.agent._tools.get("run_shell") if document_role else None
-            if isinstance(document_shell, _DocumentRoleTool):
-                document_shell.changed_paths.clear()
-            run_result, failure, execution_error = run_child(child_run, initial=True)
-            if isinstance(execution_error, LeaseConflict):
-                return ToolResult(tool_call_id=tool_call.id, ok=False, error=failure)
-            if run_result is None:
-                try:
-                    content, payload = self._worktree_output(subagent_name, record, "")
-                finally:
-                    with self._pool_lock:
-                        record.running = False
-                return ToolResult(
-                    tool_call_id=tool_call.id,
-                    ok=False,
-                    content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
-                    error=failure or str(execution_error) or "subagent dispatch failed",
-                    payload=payload,
-                )
-            record_child_result(run_result)
-            validation_passed = not validation_commands
-            validation_evidence: list[dict[str, object]] = []
-            validation_round = 1
-            while (
-                validation_commands
-                and run_result.stopped_reason == "final_response"
-            ):
-                validation_evidence = _run_handoff_validation(
-                    validation_commands, effective_policy
-                )
-                failed_check = next(
-                    (item for item in validation_evidence if item["exit"] != 0), None
-                )
-                if failed_check is None:
-                    validation_passed = True
-                    break
-                if failed_check.get("broken") or validation_round == 5:
-                    break
-                record.messages.append(Message(
-                    role=Role.USER,
-                    content=(
-                        f"Validation failed (round {validation_round} of 5): "
-                        f"{failed_check['command']} exited {failed_check['exit']}\n"
-                        f"{str(failed_check['output'])[-4000:]}\n"
-                        "Fix the cause and finish again; do not edit the spec."
-                    ),
-                ))
-                validation_round += 1
-                child_run = new_child_run()
-                retry_result, retry_failure, _ = run_child(child_run)
-                if retry_result is None:
-                    failure = retry_failure or "validation retry failed"
-                    break
-                run_result = retry_result
                 record_child_result(run_result)
-            with self._pool_lock:
-                record.running = False
-            if run_result.stopped_reason == "cancelled":
-                if token.reason is CancelReason.PARENT:
-                    with self._pool_lock:
-                        record.running = False
-                    raise OperationCancelled
-                record.breaker.record_failure()
-                if token.reason is CancelReason.DEADLINE:
-                    error = "subagent deadline elapsed before a final answer"
+                validation_passed = not validation_commands
+                validation_evidence: list[dict[str, object]] = []
+                validation_round = 1
+                while (
+                    validation_commands
+                    and not token.cancelled
+                    and run_result.stopped_reason == "final_response"
+                ):
+                    validation_evidence = _run_handoff_validation(
+                        validation_commands, self._leader_policy.rerooted(effective_policy.repo_root)
+                    )
+                    failed_check = next(
+                        (item for item in validation_evidence if item["exit"] != 0), None
+                    )
+                    if failed_check is None:
+                        validation_passed = True
+                        break
+                    if token.cancelled or failed_check.get("broken") or validation_round == 5:
+                        break
+                    record.messages.append(Message(
+                        role=Role.USER,
+                        content=(
+                            f"Validation failed (round {validation_round} of 5): "
+                            f"{failed_check['command']} exited {failed_check['exit']}\n"
+                            f"{str(failed_check['output'])[-4000:]}\n"
+                            "Fix the cause and finish again; do not edit the spec."
+                        ),
+                    ))
+                    validation_round += 1
+                    child_run = new_child_run()
+                    retry_result, retry_failure, _ = run_child(child_run)
+                    if retry_result is None:
+                        failure = retry_failure or "validation retry failed"
+                        break
+                    run_result = retry_result
+                    record_child_result(run_result)
+                with self._pool_lock:
+                    record.running = False
+                if token.cancelled or run_result.stopped_reason == "cancelled":
+                    if token.reason is CancelReason.PARENT:
+                        with self._pool_lock:
+                            record.running = False
+                        raise OperationCancelled
+                    if token.reason is CancelReason.DEADLINE:
+                        error = "subagent deadline elapsed before a final answer"
+                    else:
+                        error = "subagent was cancelled explicitly before a final answer"
+                    try:
+                        content, payload = self._worktree_output(
+                            subagent_name, record, run_result.final_response.message.text
+                        )
+                    finally:
+                        with self._pool_lock:
+                            record.running = False
+                    return ToolResult(
+                        tool_call_id=tool_call.id,
+                        ok=False,
+                        content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
+                        error=error,
+                        payload=payload,
+                    )
+
+                succeeded = run_result.stopped_reason == "final_response" and validation_passed
+                output_error = None
+                if succeeded and spec.io.output_schema is not None:
+                    _, output_error = validate_output(
+                        spec.io,
+                        run_result.final_response.message.text,
+                    )
+                    succeeded = output_error is None
+                if output_error is not None:
+                    error = output_error
+                elif succeeded:
+                    error = None
+                elif run_result.stopped_reason == "refused":
+                    category = run_result.final_response.refusal_category
+                    error = (f"subagent was refused ({category}) before a final answer"
+                             if category else "subagent was refused before a final answer")
+                elif run_result.stopped_reason != "final_response":
+                    error = f"subagent stopped because {run_result.stopped_reason} before a final answer"
+                elif validation_commands and not validation_passed:
+                    last_failure = next(
+                        (item for item in validation_evidence if item["exit"] != 0), None
+                    )
+                    error = (
+                        f"Validation is broken: {last_failure['command']}\n{last_failure['output']}"
+                        if last_failure is not None and last_failure.get("broken")
+                        else "validation failed after 5 rounds"
+                        if last_failure is not None and validation_round == 5
+                        else failure or "validation retry failed"
+                    )
                 else:
-                    error = "subagent was cancelled explicitly before a final answer"
+                    error = (
+                        f"subagent stopped because {run_result.stopped_reason} "
+                        "before a final answer"
+                    )
                 try:
                     content, payload = self._worktree_output(
                         subagent_name, record, run_result.final_response.message.text
                     )
                 finally:
-                    with self._pool_lock:
-                        record.running = False
+                    if record.worktree_path is not None:
+                        with self._pool_lock:
+                            record.running = False
+                if validation_commands:
+                    evidence_text = "\n".join(
+                        f"{item['command']} exited {item['exit']}\n{item['output']}"
+                        for item in validation_evidence
+                    )
+                    content = f"{content}\n\nValidation:\n{evidence_text}"
+                    if succeeded:
+                        content += (
+                            "\nThe host ran these Validation commands after the subagent "
+                            "finished, and all passed. Do not run them again, or any "
+                            "equivalent of them; read the diff instead."
+                        )
                 return ToolResult(
                     tool_call_id=tool_call.id,
-                    ok=False,
+                    ok=succeeded,
                     content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
                     error=error,
                     payload=payload,
                 )
 
-            succeeded = run_result.stopped_reason == "final_response" and validation_passed
-            output_error = None
-            if succeeded and spec.io.output_schema is not None:
-                _, output_error = validate_output(
-                    spec.io,
-                    run_result.final_response.message.text,
-                )
-                succeeded = output_error is None
-            if succeeded:
-                record.breaker.record_success()
-            else:
-                record.breaker.record_failure()
-            if output_error is not None:
-                error = output_error
-            elif succeeded:
-                error = None
-            elif run_result.stopped_reason == "refused":
-                category = run_result.final_response.refusal_category
-                error = (f"subagent was refused ({category}) before a final answer"
-                         if category else "subagent was refused before a final answer")
-            elif validation_commands and not validation_passed:
-                last_failure = next(
-                    (item for item in validation_evidence if item["exit"] != 0), None
-                )
-                error = (
-                    f"Validation is broken: {last_failure['command']}\n{last_failure['output']}"
-                    if last_failure is not None and last_failure.get("broken")
-                    else "validation failed after 5 rounds"
-                    if last_failure is not None and validation_round == 5
-                    else failure or "validation retry failed"
-                )
-            elif run_result.stopped_reason == "max_turns":
-                error = "subagent reached max_turns without a final answer"
-            else:
-                error = (
-                    f"subagent stopped because {run_result.stopped_reason} "
-                    "before a final answer"
-                )
-            try:
-                content, payload = self._worktree_output(
-                    subagent_name, record, run_result.final_response.message.text
-                )
-            finally:
-                if record.worktree_path is not None:
-                    with self._pool_lock:
-                        record.running = False
-            if validation_commands:
-                evidence_text = "\n".join(
-                    f"{item['command']} exited {item['exit']}\n{item['output']}"
-                    for item in validation_evidence
-                )
-                content = f"{content}\n\nValidation:\n{evidence_text}"
-                if succeeded:
-                    content += (
-                        "\nThe host ran these Validation commands after the subagent "
-                        "finished, and all passed. Do not run them again, or any "
-                        "equivalent of them; read the diff instead."
-                    )
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                ok=succeeded,
-                content=document_shell.report(content) if isinstance(document_shell, _DocumentRoleTool) else content,
-                error=error,
-                payload=payload,
-            )
-
-        if not background:
-            try:
-                outcome = execute_dispatch()
-                record.state = "idle" if outcome.ok else "failed"
+            def execute_dispatch() -> ToolResult:
+                try:
+                    outcome = dispatch_result()
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    outcome = ToolResult(tool_call.id, ok=False, error=str(exc))
+                if token.cancelled and token.reason is CancelReason.PARENT:
+                    raise OperationCancelled
+                if outcome.ok:
+                    record.breaker.record_success()
+                else:
+                    record.breaker.record_failure()
                 return outcome
-            except Exception:
-                record.state = "failed"
-                raise
-            finally:
-                record.running = False
 
-        # Acquire the shared-tree lease before acknowledging the background start.
-        lease = None
-        try:
-            if record.worktree_path is None:
-                lease = self._leases.acquire(child_run.run.run_id, spec.isolation.workspace_prefix)
-            prepare_child()
-        except Exception as exc:
-            if lease is not None:
-                self._leases.release(lease)
-            token.close()
-            with self._changed:
-                record.running = False
-                record.state = "failed"
-                self._background_names.discard(subagent_name)
-                self._changed.notify_all()
-            return ToolResult(tool_call.id, ok=False, error=str(exc))
+            if not background:
+                try:
+                    outcome = execute_dispatch()
+                    record.state = "idle" if outcome.ok else "failed"
+                    return outcome
+                except Exception:
+                    record.state = "failed"
+                    raise
+                finally:
+                    record.running = False
 
-        def worker() -> None:
+            # Acquire the shared-tree lease before acknowledging the background start.
+            lease = None
             try:
-                outcome = execute_dispatch()
+                if record.worktree_path is None:
+                    lease = self._leases.acquire(child_run.run.run_id, spec.isolation.workspace_prefix)
+                prepare_child()
             except OperationCancelled:
-                outcome = ToolResult(tool_call.id, ok=False, cancelled=True, error="subagent was cancelled")
+                raise
             except Exception as exc:
-                outcome = ToolResult(tool_call.id, ok=False, error=str(exc))
-            finally:
-                if lease is not None:
-                    self._leases.release(lease)
+                record.breaker.record_failure()
                 token.close()
-            with self._changed:
-                record.running = False
-                if record.state != "closed":
-                    record.result = outcome
-                    record.state = "finished" if outcome.ok else "failed"
-                    if self._parent_run is not None:
-                        self._parent_run.redirect_deferred(
-                            lambda: self._deliver_result(subagent_name, record))
-                self._background_names.discard(subagent_name)
-                self._changed.notify_all()
+                with self._changed:
+                    record.running = False
+                    record.state = "failed"
+                    self._background_names.discard(subagent_name)
+                    self._changed.notify_all()
+                return ToolResult(tool_call.id, ok=False, error=str(exc))
 
-        record.thread = threading.Thread(target=worker, name=f"subagent-{subagent_name}", daemon=True)
-        record.thread.start()
-        return ToolResult(tool_call.id, ok=True, content=f"subagent {subagent_name} is running",
-                          payload={"name": subagent_name, "state": "running", "background": True})
+            def worker() -> None:
+                try:
+                    outcome = execute_dispatch()
+                except OperationCancelled:
+                    outcome = ToolResult(tool_call.id, ok=False, cancelled=True, error="subagent was cancelled")
+                except Exception as exc:
+                    outcome = ToolResult(tool_call.id, ok=False, error=str(exc))
+                finally:
+                    if lease is not None:
+                        self._leases.release(lease)
+                    token.close()
+                with self._changed:
+                    record.running = False
+                    if record.state != "closed":
+                        record.result = outcome
+                        record.state = "finished" if outcome.ok else "failed"
+                        if self._parent_run is not None:
+                            self._parent_run.redirect_deferred(
+                                lambda: self._deliver_result(subagent_name, record))
+                    self._background_names.discard(subagent_name)
+                    self._changed.notify_all()
+
+            record.thread = threading.Thread(target=worker, name=f"subagent-{subagent_name}", daemon=True)
+            record.thread.start()
+            worker_started = True
+            return ToolResult(tool_call.id, ok=True, content=f"subagent {subagent_name} is running",
+                              payload={"name": subagent_name, "state": "running", "background": True})
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            if record is not None:
+                record.state = "failed"
+                record.breaker.record_failure()
+            return ToolResult(tool_call.id, ok=False, error=str(exc))
+        finally:
+            with self._changed:
+                self._reserved_names.discard(subagent_name)
+                if not worker_started:
+                    self._background_names.discard(subagent_name)
+                    if record is not None:
+                        record.running = False
+                self._changed.notify_all()
+            if token is not None and not worker_started:
+                token.close()
+            if lease is not None and not worker_started:
+                self._leases.release(lease)
 
     @staticmethod
     def _worktree_output(
@@ -2232,6 +2257,9 @@ class Leader:
     def _run_messages(
         self, messages: list[Message], *, cancel: CancellationToken | None = None
     ) -> LeaderRunResult:
+        with self._dispatch_tool._pool_lock:
+            for record in self._dispatch_tool.pool.values():
+                record.breaker.reset()
         leader_run = new_agent_run(self._leader_spec)
         leader_run.agent = self._agent_ref
         leader_run.run = RunRef(

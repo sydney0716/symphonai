@@ -165,19 +165,35 @@ class JobManager:
         if job is None:
             return None
         process = job.process
-        if process is not None and process.poll() is None:
-            with job.lock:
+        with job.lock:
+            stopping = job.status == "running"
+            if stopping:
                 job.stopped = True
+        if process is not None and stopping:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                # start_new_session records the group id even after its leader exits.
+                os.killpg(process.pid, signal.SIGKILL)
             except (OSError, ProcessLookupError, PermissionError):
-                try:
-                    process.kill()
-                except (OSError, ProcessLookupError):
-                    pass
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except (OSError, ProcessLookupError):
+                        pass
         reader = job.reader
         if reader is not None and reader is not threading.current_thread():
-            reader.join(timeout=1.0)
+            reader.join(timeout=2.0)
+        if process is not None and stopping:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
+            if process.stdout is not None:
+                process.stdout.close()
+            with job.lock:
+                job.status = "stopped"
+                job.exit_code = process.poll()
+                job.ended_at = time.time()
+            self._notify(job)
         return self.read(job_id)
 
     def close(self) -> None:

@@ -12,7 +12,7 @@ from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata, p
 
 
 def parse_patch(text):
-    lines = text.strip().splitlines()
+    lines = text.strip().replace("\r\n", "\n").split("\n")
     if not lines or lines[0].strip() != "*** Begin Patch" or lines[-1].strip() != "*** End Patch":
         raise ValueError("patch must start with *** Begin Patch and end with *** End Patch")
     operations = []
@@ -22,13 +22,13 @@ def parse_patch(text):
         kind = next((kind for kind in ("Add", "Delete", "Update") if header.startswith(f"*** {kind} File: ")), None)
         if kind is None:
             raise ValueError(f"invalid patch header: {header}")
-        path = header.split(": ", 1)[1]
+        path = header.split(": ", 1)[1].strip()
         if not path.strip():
             raise ValueError("patch path is blank")
         index += 1
         move = None
         if kind == "Update" and lines[index].startswith("*** Move to: "):
-            move = lines[index][13:]
+            move = lines[index][13:].strip()
             if not move.strip():
                 raise ValueError(f"{path}: move destination is blank")
             index += 1
@@ -38,6 +38,8 @@ def parse_patch(text):
             index += 1
         if kind == "Delete" and body:
             raise ValueError(f"{path}: delete takes no hunks")
+        if kind == "Update" and not body and move is None:
+            raise ValueError(f"{path}: update has no hunks or move destination")
         if kind == "Add" and any(not line.startswith("+") for line in body):
             raise ValueError(f"{path}: added lines must start with +")
         operations.append((kind, path, move, body))
@@ -52,7 +54,7 @@ _PUNCTUATION = str.maketrans({**dict.fromkeys("‐‑‒–—―−", "-"), **d
 
 def _seek(lines, pattern, start, eof=False):
     if not pattern:
-        return len(lines) if eof else start
+        return len(lines)
     positions = range(max(start, len(lines) - len(pattern)) if eof else start, len(lines) - len(pattern) + 1)
     for normalize in (lambda value: value, str.rstrip, str.strip, lambda value: value.strip().translate(_PUNCTUATION)):
         expected = [normalize(value) for value in pattern]
@@ -64,7 +66,13 @@ def _seek(lines, pattern, start, eof=False):
 
 
 def update_text(path, text, body):
-    lines = text.splitlines()
+    parts = text.split("\n")
+    lines = [part[:-1] if part.endswith("\r") else part for part in parts[:-1]]
+    endings = ["\r\n" if part.endswith("\r") else "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+        endings.append("")
+    ending = next((value for value in endings if value), "\n")
     cursor = 0
     index = 0
     while index < len(body):
@@ -78,7 +86,7 @@ def update_text(path, text, body):
             if found is None:
                 raise ValueError(f"{path}: context not found: {context}")
             cursor = found + 1
-        old, new = [], []
+        old, new, sources = [], [], []
         eof = False
         while index < len(body) and not body[index].startswith("@@"):
             line = body[index]
@@ -94,14 +102,23 @@ def update_text(path, text, body):
                 old.append(line[1:])
             if line[0] in " +":
                 new.append(line[1:])
+                sources.append(len(old) - 1 if line[0] == " " else None)
         if not old and not new:
             raise ValueError(f"{path}: empty hunk")
         found = _seek(lines, old, cursor, eof)
         if found is None:
             raise ValueError(f"{path}: context not found:\n" + "\n".join(old))
+        retained = set(sources)
+        removed_endings = iter(endings[found + offset] for offset in range(len(old)) if offset not in retained)
+        new_endings = [endings[found + source] if source is not None else next(removed_endings, ending) for source in sources]
+        new = [lines[found + source] if source is not None else line for line, source in zip(new, sources)]
         lines[found:found + len(old)] = new
+        endings[found:found + len(old)] = new_endings
         cursor = found + len(new)
-    return "\n".join(lines) + ("\n" if lines else "")
+    if not lines:
+        return ""
+    endings[-1] = (endings[-1] or ending) if text.endswith("\n") else ""
+    return "".join(line + (value or ending) for line, value in zip(lines[:-1], endings[:-1])) + lines[-1] + endings[-1]
 
 
 class ApplyPatchTool(LocalTool):

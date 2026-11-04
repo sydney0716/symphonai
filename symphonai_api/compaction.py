@@ -14,6 +14,12 @@ from symphonai_api.models import DocumentBlock, ImageBlock, Message, Role, TextB
 from symphonai_api.providers.base import tool_result_text
 
 _RESTORE_PREFIX = "Restored after compaction:\n"
+_SUMMARY_PREFIX = "Summary of the earlier conversation, written when it was compacted:\n\n"
+_COMPACTED_PREFIX = "Earlier conversation compacted before this request. "
+
+
+def _is_compaction_summary(message: Message) -> bool:
+    return message.role == Role.SYSTEM and message.text.startswith((_SUMMARY_PREFIX, "Earlier conversation compacted"))
 
 
 def is_restore_message(message: Message) -> bool:
@@ -300,7 +306,10 @@ def compact_messages_for_budget(
             prefix_indices = _preserved_prefix_indices(
                 compacted, recent_start, assistant_window,
             )
-            recent_indices = set(range(recent_start, len(compacted)))
+            recent_indices = {
+                index for index in range(recent_start, len(compacted))
+                if not _is_compaction_summary(compacted[index])
+            }
             dropped_indices = [
                 index for index in range(len(compacted))
                 if index not in prefix_indices and index not in recent_indices
@@ -310,7 +319,7 @@ def compact_messages_for_budget(
                     raise _impossible_error(before_tokens, budget, recent_turns)
             else:
                 prefix = [compacted[index] for index in sorted(prefix_indices)]
-                recent = [compacted[index] for index in range(recent_start, len(compacted))]
+                recent = [compacted[index] for index in sorted(recent_indices)]
                 # Summaries retain the original content, before microcompaction clears it.
                 dropped = [original[index] for index in dropped_indices]
                 # Replace the prior restoration rather than accumulating stale file bodies.
@@ -353,7 +362,7 @@ def compact_messages_for_budget(
                             Message(
                                 role=Role.SYSTEM,
                                 content=(
-                                    "Summary of the earlier conversation, written when it was compacted:\n\n"
+                                    _SUMMARY_PREFIX
                                     + summary_text
                                 ),
                             ),
@@ -366,16 +375,15 @@ def compact_messages_for_budget(
                 if selected is None:
                     for max_summary_chars in (800, 320, 120, 0):
                         candidate = list(prefix)
-                        if max_summary_chars > 0 or mandatory or recent_files:
-                            candidate.append(Message(
-                                role=Role.SYSTEM,
-                                content=_summarize_dropped_messages(dropped, max_chars=max_summary_chars or 40),
-                            ))
+                        candidate.append(Message(
+                            role=Role.SYSTEM,
+                            content=_summarize_dropped_messages(dropped, max_chars=max_summary_chars or 40),
+                        ))
                         candidate.extend(mandatory)
                         candidate.extend(recent)
                         if estimate_messages_tokens(candidate) <= budget:
                             selected = candidate
-                            summary_messages = int(max_summary_chars > 0 or bool(mandatory) or bool(recent_files))
+                            summary_messages = 1
                             break
                 if selected is None:
                     raise _impossible_error(before_tokens, budget, recent_turns)
@@ -504,7 +512,7 @@ def _preserved_prefix_indices(
     prefix_indices = {
         index
         for index, message in enumerate(messages[:recent_start])
-        if message.role == Role.SYSTEM
+        if message.role == Role.SYSTEM and not _is_compaction_summary(message)
     }
     user_indices = [
         index for index, message in enumerate(messages) if message.role == Role.USER
@@ -522,7 +530,7 @@ def _summarize_dropped_messages(messages: list[Message], *, max_chars: int) -> s
         role_counts[message.role.value] = role_counts.get(message.role.value, 0) + 1
     counts = ", ".join(f"{role}={count}" for role, count in sorted(role_counts.items()))
     text = (
-        "Earlier conversation compacted before this request. "
+        _COMPACTED_PREFIX +
         f"Removed {len(messages)} messages"
         f"{f' ({counts})' if counts else ''}. "
         "System instructions, the first user goal, and recent turns are preserved."

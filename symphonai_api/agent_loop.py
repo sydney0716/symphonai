@@ -478,8 +478,6 @@ class ApiAgent:
         run_id: str,
         turn_id: str,
         hooks: HookRunner | None,
-        *,
-        catch_exceptions: bool = True,
     ) -> ToolResult:
         tool = self._tools.get(tool_call.name)
         if tool is None:
@@ -523,8 +521,6 @@ class ApiAgent:
         except OperationCancelled:
             raise
         except Exception as exc:
-            if not catch_exceptions:
-                raise
             return ToolResult(
                 tool_call_id=tool_call.id,
                 ok=False,
@@ -678,20 +674,24 @@ class ApiAgent:
             assistant_turn_window = sum(
                 message.role == Role.USER for message in conversation
             ) < recent_turns
-            for keep_turns in range(recent_turns, 0, -1):
-                try:
-                    result = compact_messages_for_budget(
-                        conversation,
-                        budget=budget,
-                        recent_turns=keep_turns,
-                        assistant_turn_window=assistant_turn_window,
-                        cancel=cancel,
-                        recent_files=recent_files,
-                        summarize=summarize if self._model_summary or self._notes_path is not None else None,
-                    )
+            windows = (True,) if assistant_turn_window else (False, True)
+            for window in windows:
+                for keep_turns in range(recent_turns, 0, -1):
+                    try:
+                        result = compact_messages_for_budget(
+                            conversation,
+                            budget=budget,
+                            recent_turns=keep_turns,
+                            assistant_turn_window=window,
+                            cancel=cancel,
+                            recent_files=recent_files,
+                            summarize=summarize if self._model_summary or self._notes_path is not None else None,
+                        )
+                        break
+                    except ContextCompactionError as exc:
+                        errors.append(exc)
+                if result is not None:
                     break
-                except ContextCompactionError as exc:
-                    errors.append(exc)
             if result is None:
                 raise errors[-1]
             if not result.changed:
@@ -751,9 +751,12 @@ class ApiAgent:
             ]
             if not changed:
                 return
-            changed.sort(key=lambda item: item[0].relative_to(self._policy.repo_root).as_posix())
+            root = self._policy.repo_root.resolve()
+            def label(path: Path) -> str:
+                return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
+            changed.sort(key=lambda item: label(item[0]))
             paths = [
-                path.relative_to(self._policy.repo_root).as_posix()
+                label(path)
                 + (" (deleted)" if version is None else "")
                 for path, version in changed
             ]
@@ -1073,7 +1076,6 @@ class ApiAgent:
                         run_ref.run_id,
                         turn_ref.turn_id,
                         hooks,
-                        catch_exceptions=False,
                     )
                 else:
                     executor = ThreadPoolExecutor(
