@@ -149,6 +149,30 @@ function browser() {
   };
 }
 
+function replayPage(replayId, history = [], offset = 0, total = history.length) {
+  const end = offset + history.length;
+  return { replay_id: replayId, history_frames: total, offset, history,
+    next_offset: end < total ? end : null };
+}
+
+function historyFrame(fields) {
+  return { kind: "event", payload: { type: "HistoryMessage", agent_id: "core-agent",
+    agent_name: "leader", run_id: "core-run", ...fields } };
+}
+
+function animationFrames(global, afterFrame = () => {}) {
+  const pending = [];
+  global.requestAnimationFrame = callback => pending.push(callback);
+  return async () => {
+    const callbacks = pending.splice(0);
+    await Promise.all(callbacks.map(callback => {
+      const result = callback();
+      afterFrame();
+      return result;
+    }));
+  };
+}
+
 function scriptedClient() {
   let receive;
   const prompts = [];
@@ -156,7 +180,7 @@ function scriptedClient() {
   const client = {
     project: async () => ({ repo_root: "/core-project", name: "Core project" }),
     sessions: async () => [],
-    openSession: async () => ({ replay_id: "empty", history_frames: 0 }),
+    openSession: async () => (replayPage("empty")),
     sessionViewed: async () => ({ viewed_at: "2026-11-02T00:00:00+00:00" }),
     roadmap: async () => ({ goals: [] }),
     settings: async () => ({ settings: { mode: "allow", providers: [{ name: "openai", key_present: true }] } }),
@@ -567,15 +591,34 @@ test("saved history waits for its exact replay count, paints once, then reconcil
   const document = new Document();
   const script = scriptedClient();
   const global = browser();
-  const paints = [];
-  global.requestAnimationFrame = callback => paints.push(callback);
+  const chat = document.getElementById("chat");
+  const rendered = [];
+  let observedText = "";
+  const frame = animationFrames(global, () => {
+    if (chat.textContent !== observedText) {
+      observedText = chat.textContent;
+      if (observedText) rendered.push(observedText);
+    }
+  });
   script.client.sessions = async (_limit, _query, archived) => archived ? [] : [
     { run_id: "saved", title: "Saved", repo_root: "/core-project" },
   ];
-  let opened = false;
+  const history = Array.from({ length: 40 }, (_, i) => historyFrame({
+    session_id: "saved", replay_id: "batch", role: "user", text: `Message ${i}`,
+    ...(i < 3 ? { checkpoint_key: `edit-${i}`, edits: [{ path: `file-${i}.txt`, added: 1, removed: 0 }],
+      turn_ended_at: "2026-11-03T00:00:00Z", turn_outcome: "final_response" } : {}),
+  }));
+  let opened = false, finishPage, pageRequested;
+  const requested = new Promise(resolve => { pageRequested = resolve; });
   script.client.openSession = async () => {
     opened = true;
-    return { replay_id: "batch", history_frames: 40 };
+    return replayPage("batch", history.slice(0, 20), 0, 40);
+  };
+  script.client.historyPage = (id, offset) => {
+    assert.equal(id, "batch");
+    assert.equal(offset, 20);
+    pageRequested();
+    return new Promise(resolve => { finishPage = resolve; });
   };
   script.client.conversationStats = async () => ({ conversation: opened ? { session_id: "saved", agents: [
     { agent_id: "core-agent", parent_agent_id: null },
@@ -586,35 +629,31 @@ test("saved history waits for its exact replay count, paints once, then reconcil
     return new Promise(resolve => { finishChanges = resolve; });
   };
   const app = await start({ global, document, client: script.client });
-  const chat = document.getElementById("chat");
-  const rendered = [];
-  const replace = chat.replaceChildren.bind(chat);
-  chat.replaceChildren = (...nodes) => { replace(...nodes); if (chat.textContent) rendered.push(chat.textContent); };
+  await frame();
   const opening = find(document.body, node => node.className === "session-link" && node.textContent === "Saved").click();
-  await script.emit("HistoryMessage", { session_id: "saved", replay_id: "stale", role: "user", text: "STALE" });
-  for (let i = 0; i < 40; i += 1) {
-    await script.emit("HistoryMessage", { session_id: "saved", replay_id: "batch", role: "user", text: `Message ${i}`,
-      ...(i < 3 ? { checkpoint_key: `edit-${i}`, edits: [{ path: `file-${i}.txt`, added: 1, removed: 0 }],
-        turn_ended_at: "2026-11-03T00:00:00Z", turn_outcome: "final_response" } : {}),
-    });
-    if (i < 39) assert.equal(chat.textContent, "");
-  }
+  await requested;
+  await frame();
+  assert.equal(chat.textContent, "", "the first page must not paint a partial conversation");
+  finishPage(replayPage("batch", history.slice(20), 20, 40));
   await opening;
+  assert.equal(chat.textContent, "", "painting waits for an animation frame");
+  await frame();
   assert.equal(rendered.length, 1);
-  assert.ok(!chat.textContent.includes("STALE"));
   for (let i = 0; i < 40; i += 1) assert.ok(chat.textContent.includes(`Message ${i}`));
   assert.equal(app.transcript.model.filter(entry => entry.type === "edit-card").length, 3);
   assert.equal(chat.scrollTop, chat.scrollHeight);
   assert.equal(changesCalls, 0);
-  paints.shift()();
-  const reconciliation = paints.shift()();
+  const reconciliation = frame();
   assert.equal(changesCalls, 1);
   await script.emit("AssistantTextDelta", { session_id: "saved", text: "LIVE FIRST" });
+  await frame();
   assert.match(chat.textContent, /LIVE FIRST/);
   await script.emit("AssistantTextDelta", { session_id: "saved", text: " SECOND" });
+  await frame();
   assert.match(chat.textContent, /LIVE FIRST SECOND/);
   finishChanges({ turns: [0, 1, 2].map(i => ({ key: `edit-${i}`, paths: [`file-${i}.txt`] })) });
   await reconciliation;
+  await frame();
   assert.equal(changesCalls, 1);
   app.subscription.close();
 });
@@ -622,36 +661,55 @@ test("saved history waits for its exact replay count, paints once, then reconcil
 test("switched and failed opens never expose partial history", async () => {
   const document = new Document();
   const script = scriptedClient();
+  const global = browser();
+  const frame = animationFrames(global);
   script.client.sessions = async (_limit, _query, archived) => archived ? [] : ["A", "B"].map(id => ({
     run_id: id, title: id, repo_root: "/core-project",
   }));
-  const app = await start({ global: browser(), document, client: script.client });
+  let hostSession = null;
+  script.client.conversationStats = async () => ({ conversation: hostSession ? {
+    session_id: hostSession, agents: [{ agent_id: "core-agent", parent_agent_id: null }],
+  } : null });
+  const app = await start({ global, document, client: script.client });
   await script.emit("PromptSubmitted", { text: "Original conversation" });
-  const replies = [];
-  script.client.openSession = id => new Promise((resolve, reject) => replies.push({ id, resolve, reject }));
+  await frame();
+  const replies = [], pages = new Map();
+  script.client.openSession = id => {
+    hostSession = id;
+    return new Promise((resolve, reject) => replies.push({ id, resolve, reject }));
+  };
+  script.client.historyPage = id => new Promise(resolve => pages.set(id, resolve));
   const open = id => find(document.body, node => node.className === "session-link" && node.textContent === id).click();
   const first = open("A");
-  await script.emit("HistoryMessage", { session_id: "A", replay_id: "old-A", role: "user", text: "Partial A" });
-  const second = open("B");
-  replies[0].resolve({ replay_id: "old-A", history_frames: 1 });
-  await first;
-  await script.emit("HistoryMessage", { session_id: "B", replay_id: "B", role: "user", text: "Partial B" });
-  const third = open("A");
-  replies[1].resolve({ replay_id: "B", history_frames: 1 });
-  await second;
-  await script.emit("HistoryMessage", { session_id: "A", replay_id: "old-A", role: "user", text: "Stale A" });
+  replies[0].resolve(replayPage("old-A", [historyFrame({ session_id: "A", role: "user", text: "Partial A" })], 0, 2));
+  await Promise.resolve();
+  assert.ok(pages.has("old-A"));
+  await frame();
   assert.equal(document.getElementById("chat").textContent, "");
-  await script.emit("HistoryMessage", { session_id: "A", replay_id: "new-A", role: "user", text: "Partial new A" });
+  const second = open("B");
+  pages.get("old-A")(replayPage("old-A", [historyFrame({ session_id: "A", role: "assistant", text: "Rest A" })], 1, 2));
+  await first;
+  replies[1].resolve(replayPage("B", [historyFrame({ session_id: "B", role: "user", text: "Partial B" })], 0, 2));
+  await Promise.resolve();
+  assert.ok(pages.has("B"));
+  const third = open("A");
+  pages.get("B")(replayPage("B", [historyFrame({ session_id: "B", role: "assistant", text: "Rest B" })], 1, 2));
+  await second;
+  await frame();
+  assert.equal(document.getElementById("chat").textContent, "");
   replies[2].reject(new Error("Open failed"));
-  await assert.rejects(third, /Open failed/);
-  assert.match(document.getElementById("chat").textContent, /Original conversation/);
-  assert.ok(!document.getElementById("chat").textContent.includes("Partial"));
+  await third;
+  await frame();
+  assert.equal(app.transcript.snapshot().sessionId, "A");
+  assert.equal(document.getElementById("chat").textContent, "");
+  assert.match(document.getElementById("run-notice").textContent, /Open failed/);
+  assert.ok(find(document.getElementById("run-notice"), node => node.textContent === "Retry" && node.tagName === "BUTTON"));
   app.subscription.close();
 });
 
 test("leader row returns from an agent view by click or Enter and preserves scroll", async () => {
   const script = scriptedClient();
-  script.client.openSession = async () => ({ replay_id: "empty", history_frames: 0 });
+  script.client.openSession = async () => (replayPage("empty"));
   script.client.conversationStats = async () => ({ conversation: {
     session_id: "session", agents: [
       { agent_id: "root", name: "leader", parent_agent_id: null, state: "finished" },
@@ -685,7 +743,7 @@ test("Usage defaults on, explains missing prices, migrates once and keeps new ch
   const global = browser();
   global.localStorage.setItem("symphonai.status-line", JSON.stringify({ usage: false, model: false }));
   const script = scriptedClient();
-  script.client.openSession = async () => ({ replay_id: "empty", history_frames: 0 });
+  script.client.openSession = async () => (replayPage("empty"));
   const usage = { total_tokens: 182340, cost: { amount: "0.42", currency: "USD", estimated: true } };
   script.client.conversationStats = async () => ({ conversation: { session_id: "session", usage } });
   const document = new Document();
@@ -727,7 +785,7 @@ test("conversation costs use standard decimals and a below-cent indicator", asyn
     ["1.234567", true, "credits", "~credits 1.234567"],
   ]) {
     const script = scriptedClient();
-    script.client.openSession = async () => ({ replay_id: "empty", history_frames: 0 });
+    script.client.openSession = async () => (replayPage("empty"));
     script.client.conversationStats = async () => ({ conversation: {
       session_id: "session", usage: { total_tokens: 10, cost: { amount, currency, estimated } },
     } });
@@ -980,7 +1038,7 @@ test("sidebar unread and waiting marks persist on reload and opening records vie
   script.client.sessions = async (_limit, _query, archived) => archived ? [] : sessions;
   let opened = null;
   const viewed = [];
-  script.client.openSession = async (id) => { opened = id; return { replay_id: "empty", history_frames: 0 }; };
+  script.client.openSession = async (id) => { opened = id; return replayPage("empty"); };
   script.client.conversationStats = async () => ({ conversation: opened ? { session_id: opened, agents: [] } : null });
   script.client.sessionViewed = async (id) => {
     viewed.push(id);
@@ -1252,6 +1310,8 @@ test("transcript waits for explicit leader and session facts rather than the fir
 test("new chat holds early frames, pins the recorded leader and replays the same exchanges", async () => {
   const document = new Document();
   const script = scriptedClient();
+  const global = browser();
+  const frame = animationFrames(global);
   let serverConversation = null;
   let reply;
   let requestStarted;
@@ -1261,10 +1321,13 @@ test("new chat holds early frames, pins the recorded leader and replays the same
     { agent_id: "child", name: "worker", parent_agent_id: "root", state: "running" },
     { agent_id: "root", name: "leader", parent_agent_id: null, state: "running" },
   ];
-  const emit = (type, agent, fields = {}) => script.emit(type, {
-    agent_id: agent, agent_name: agent === "root" ? "leader" : "worker",
-    run_id: `${agent}-run`, session_id: "new-session", ...fields,
-  });
+  const emit = async (type, agent, fields = {}) => {
+    await script.emit(type, {
+      agent_id: agent, agent_name: agent === "root" ? "leader" : "worker",
+      run_id: `${agent}-run`, session_id: "new-session", ...fields,
+    });
+    await frame();
+  };
   script.client.conversationStats = async () => ({ conversation: serverConversation });
   script.client.sessions = async (_limit, _query, archived) => archived ? [] : [{
     run_id: "new-session", title: "Test conversation", repo_root: "/core-project", activity: "idle",
@@ -1287,17 +1350,20 @@ test("new chat holds early frames, pins the recorded leader and replays the same
   script.client.agentHistory = async () => ({ messages: [
     { role: "assistant", text: "", tool_calls: [{ id: "read", name: "read_file", target: "in.txt", ok: true, output: "PRIVATE READ" }] },
   ] });
-  const app = await start({ global: browser(), document, client: script.client });
+  const app = await start({ global, document, client: script.client });
+  await frame();
   const sending = submit(document, "Please work");
   await started;
   assert.ok(!document.getElementById("chat").textContent.includes("PRIVATE READ"));
   reply({ accepted: true, run_id: "new-session" });
   await sending;
+  await frame();
   const chat = document.getElementById("chat");
   assert.match(chat.textContent, /Please work/);
   assert.match(chat.textContent, /LEADER-TEXT delegating/);
   assert.ok(app.transcript.model.some((entry) => entry.type === "question" && !entry.resolved));
   await find(document.body, (node) => node.getAttribute?.("aria-label") === "Open worker's conversation").click();
+  await frame();
   assert.match(chat.textContent, /in.txt/);
   await emit("ToolCallStarted", "child", { tool_call_id: "write", tool_name: "write_file", target: "out.txt" });
   await emit("ToolCallFinished", "child", { tool_call_id: "write", tool_name: "write_file", ok: true,
@@ -1310,6 +1376,7 @@ test("new chat holds early frames, pins the recorded leader and replays the same
     output: "Worker finished [REDACTED_SECRET]", output_truncated: false });
   await emit("AssistantTextDelta", "root", { text: "LEADER-FINAL all done" });
   await find(document.body, (node) => node.getAttribute?.("aria-label") === "Back to the conversation").click();
+  await frame();
   assert.match(chat.textContent, /Dispatched worker \(finished\)/);
   assert.match(chat.textContent, /LEADER-FINAL all done/);
   assert.ok(!chat.textContent.includes("PRIVATE"));
@@ -1317,16 +1384,16 @@ test("new chat holds early frames, pins the recorded leader and replays the same
   assert.ok(chat.textContent.indexOf("Please work") < chat.textContent.indexOf("LEADER-TEXT"));
   assert.ok(chat.textContent.indexOf("LEADER-TEXT") < chat.textContent.indexOf("Dispatched worker"));
   assert.ok(chat.textContent.indexOf("Dispatched worker") < chat.textContent.indexOf("LEADER-FINAL"));
-  script.client.openSession = async () => {
-    await emit("HistoryMessage", "root", { replay_id: "saved", role: "user", text: "Please work" });
-    await emit("HistoryMessage", "root", { replay_id: "saved", role: "assistant", text: "LEADER-TEXT delegating", tool_calls: [{
+  script.client.openSession = async () => replayPage("saved", [
+    historyFrame({ session_id: "new-session", replay_id: "saved", agent_id: "root", role: "user", text: "Please work" }),
+    historyFrame({ session_id: "new-session", replay_id: "saved", agent_id: "root", role: "assistant", text: "LEADER-TEXT delegating", tool_calls: [{
       id: "dispatch", name: "dispatch_subagent", subagent_name: "worker", ok: true,
       output: "Worker finished [REDACTED_SECRET]", output_truncated: false,
-    }] });
-    await emit("HistoryMessage", "root", { replay_id: "saved", role: "assistant", text: "LEADER-FINAL all done", tool_calls: [] });
-    return { replay_id: "saved", history_frames: 3 };
-  };
+    }] }),
+    historyFrame({ session_id: "new-session", replay_id: "saved", agent_id: "root", role: "assistant", text: "LEADER-FINAL all done", tool_calls: [] }),
+  ]);
   await find(document.body, (node) => node.className === "session-link" && node.textContent === "Test conversation").click();
+  await frame();
   assert.match(chat.textContent, /Please work/);
   assert.match(chat.textContent, /LEADER-TEXT delegating/);
   assert.match(chat.textContent, /Dispatched worker \(finished\)/);
@@ -1466,10 +1533,11 @@ with tempfile.TemporaryDirectory() as temporary:
                 assert type(event).__name__ == 'RunFinished'
                 leader = event.agent_id
                 break
-        run.open_session(session)
-        replay = []
-        while (event := subscription.get(timeout=0.01)) is not None:
-            replay.append(encode(event))
+        page = run.open_session(session)
+        replay = [frame['payload'] for frame in page['history']]
+        while page['next_offset'] is not None:
+            page = run.history_page(page['replay_id'], page['next_offset'])
+            replay.extend(frame['payload'] for frame in page['history'])
         changes = run.changes()
         undone = run.revert_changes(key=changes['turns'][-1]['key'])
         assert not (root / 'a.txt').exists() and not (root / 'b.txt').exists()
@@ -1490,9 +1558,57 @@ with tempfile.TemporaryDirectory() as temporary:
     assert.deepEqual(edits[0].files, [{ path: "a.txt", added: 1, removed: 0 }, { path: "b.txt", added: 1, removed: 0 }]);
     assert.ok(fixture.changes.turns.some((turn) => turn.key === edits[0].checkpointKey && turn.paths.includes("a.txt") && turn.paths.includes("b.txt")));
     assert.ok(!transcript.model.some((entry) => entry.type === "activity" && entry.calls.some((call) => call.name === "write_file")));
+    const document = new Document();
+    const chat = document.getElementById("chat");
+    const pending = [];
+    renderTranscript(document, chat, transcript.model, parseMarkdown, {}, {
+      requestAnimationFrame: callback => pending.push(callback),
+    });
+    assert.equal(chat.textContent, "", "edit-card DOM is frame-batched");
+    pending.splice(0).forEach(callback => callback());
+    assert.equal(chat.children.filter(node => node.className === "edit-card").length, 1);
+    const card = find(chat, node => node.className === "edit-card");
+    assert.match(card.textContent, /a.txt/);
+    assert.match(card.textContent, /b.txt/);
     cards.push(edits[0]);
   }
   assert.equal(cards[0].checkpointKey, cards[1].checkpointKey);
   assert.equal(cards[0].canUndo, true);
   assert.deepEqual(fixture.undone.reverted.sort(), ["a.txt", "b.txt"]);
+});
+
+
+test("a steered replay keeps the original turn's edit card at the end", () => {
+  const files = [{ path: "out.txt", added: 2, removed: 0 }];
+  for (const steering of [false, true]) {
+    const transcript = createTranscript({ rootAgentId: "root" });
+    transcript.setSessionId("saved");
+    const apply = fields => transcript.apply(historyFrame({
+      session_id: "saved", agent_id: "root", ...fields,
+    }));
+    apply({ role: "user", text: "Original request", checkpoint_key: "prompt-key", edits: files });
+    apply({ role: "assistant", text: "Writing", tool_calls: [{
+      id: "write", name: "write_file", target: "out.txt", ok: true,
+    }] });
+    if (steering) apply({ role: "user", text: "Keep both lines" });
+    assert.equal(transcript.model.filter(entry => entry.type === "edit-card").length, 0);
+    apply({ role: "assistant", text: "Final answer", tool_calls: [] });
+    const cards = transcript.model.filter(entry => entry.type === "edit-card");
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0].checkpointKey, "prompt-key");
+    assert.deepEqual(cards[0].files, files);
+    assert.ok(transcript.model.indexOf(cards[0]) > transcript.model.findIndex(entry => entry.text === "Final answer"));
+    const prompts = transcript.model.filter(entry => entry.type === "prompt");
+    assert.deepEqual(prompts.map(entry => entry.text), steering
+      ? ["Original request", "Keep both lines"] : ["Original request"]);
+    const document = new Document();
+    const chat = document.getElementById("chat");
+    const pending = [];
+    renderTranscript(document, chat, transcript.model, parseMarkdown, {}, {
+      requestAnimationFrame: callback => pending.push(callback),
+    });
+    pending.splice(0).forEach(callback => callback());
+    assert.equal(chat.children.filter(node => node.className === "edit-card").length, 1);
+    assert.match(find(chat, node => node.className === "edit-card").textContent, /out.txt/);
+  }
 });

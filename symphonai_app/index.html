@@ -27,11 +27,12 @@
       <div id="page">
         <main id="chat-pane" class="chat-pane" aria-label="Chat pane">
           <p id="run-notice" class="run-notice" aria-live="polite"></p>
-          <div id="chat" class="chat-log" aria-live="polite"></div>
+          <div id="chat" class="chat-log"></div>
           <div id="approvals" class="approvals" aria-live="polite"></div>
           <button id="jump-latest" class="jump-latest" type="button" hidden>Jump to latest</button>
           <form id="prompt-form" class="prompt-form">
             <textarea id="prompt" rows="3" aria-label="Message" placeholder="Describe a task, or type / for commands"></textarea>
+            <button id="prompt-action" class="primary composer-action" type="submit" title="Send message">Send</button>
             <div id="prompt-attachments" class="prompt-attachments"></div>
             <p id="prompt-error" class="prompt-error" aria-live="polite"></p>
           </form>

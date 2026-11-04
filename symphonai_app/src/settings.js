@@ -541,6 +541,12 @@ function renderGeneral(section, context) {
       append(cell, element(document, "span", { text: " Open file to edit this table or list." }));
       return;
     }
+    if (scope === "private" || scope === "session") {
+      append(cell, element(document, "span", {
+        text: ` Set in ${scope} scope. Edit that scope's source; this host supports saving only user and project settings.`,
+      }));
+      return;
+    }
     const input = document.createElement("input");
     input.type = typeof value === "boolean" ? "checkbox" : typeof value === "number" ? "number" : "text";
     input.setAttribute("aria-label", key);
@@ -681,6 +687,13 @@ function renderGeneral(section, context) {
     notificationNotice.textContent = context.notificationMessage;
   });
   append(notificationGroup, append(element(document, "label"), notificationCheckbox, element(document, "span", { text: "Notifications" })), notificationNotice);
+  const keymapNotice = element(document, "section");
+  if (context.keymapRejected?.length) {
+    append(keymapNotice, element(document, "h3", { text: "Rejected keyboard shortcuts" }));
+    for (const binding of context.keymapRejected) {
+      append(keymapNotice, element(document, "p", { text: `${binding.chord}: ${binding.action} — ${binding.reason}` }));
+    }
+  }
   replace(
     settingsContent,
     element(document, "h2", { text: "General" }),
@@ -690,6 +703,7 @@ function renderGeneral(section, context) {
     editorSelect,
     statusGroup,
     notificationGroup,
+    keymapNotice,
     configTable,
   );
 }

@@ -346,7 +346,10 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
           }
         }
         model.push(entry);
-        if (commandEntry === null && !otherAgent(fields.agent_id)) {
+        // A checkpoint-less user message while a checkpointed prompt is open
+        // steers that turn; its edits still belong to the original prompt.
+        const steering = typeof fields.checkpoint_key !== "string" && currentPrompt?.checkpointKey;
+        if (commandEntry === null && !otherAgent(fields.agent_id) && !steering) {
           currentPrompt = entry;
         }
         if (commandEntry === null && fields.turn_ended_at) {
@@ -487,10 +490,12 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
     }
     if (type === "AssistantTextDelta") {
       const previous = model.at(-1);
+      const key = turnKey(fields);
       if (
         previous?.type === "text"
         && previous.agentId === fields.agent_id
         && previous.runId === fields.run_id
+        && previous.turnKey === key
       ) {
         previous.text += fields.text;
       } else {
@@ -498,6 +503,7 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
           type: "text",
           agentId: fields.agent_id,
           runId: fields.run_id,
+          turnKey: key,
           text: fields.text,
         });
       }
@@ -520,6 +526,7 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
           item.type === "text"
           && item.agentId === fields.agent_id
           && item.runId === fields.run_id
+          && item.turnKey === key
         ));
         if (answerIndex === -1) model.push(entry);
         else model.splice(answerIndex, 0, entry);

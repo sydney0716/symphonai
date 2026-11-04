@@ -126,7 +126,12 @@ function heading(line) {
 }
 
 function fence(line) {
-  return line.match(/^```([A-Za-z0-9_-]*)\s*$/);
+  return line.match(/^ {0,3}(`{3,})(.*)$/);
+}
+
+function closesFence(line, opening) {
+  const closing = line.match(/^ {0,3}(`{3,})[ \t]*$/);
+  return closing !== null && closing[1].length >= opening[1].length;
 }
 
 function lineIndent(line) {
@@ -259,7 +264,7 @@ function parseList(lines, start) {
           flushParagraph();
           const codeLines = [];
           index += 1;
-          while (index < lines.length && !/^```\s*$/.test(lines[index].trim())) {
+          while (index < lines.length && !closesFence(lines[index].trim(), openingFence)) {
             const codeLine = lines[index];
             const prefixLength = codeLine.match(/^[ \t]*/)?.[0].length ?? 0;
             const content = codeLine.slice(Math.min(marker.textIndent, prefixLength));
@@ -269,7 +274,7 @@ function parseList(lines, start) {
           index += Number(index < lines.length);
           item.blocks.push({
             type: "code-block",
-            language: openingFence[1] || null,
+            language: openingFence[2].trim().split(/\s+/, 1)[0] || null,
             text: codeLines.join("\n"),
           });
           continue;
@@ -338,14 +343,14 @@ export function parseMarkdown(text) {
     } else if (openingFence) {
       const codeLines = [];
       index += 1;
-      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+      while (index < lines.length && !closesFence(lines[index], openingFence)) {
         codeLines.push(lines[index]);
         index += 1;
       }
       index += Number(index < lines.length);
       blocks.push({
         type: "code-block",
-        language: openingFence[1] || null,
+        language: openingFence[2].trim().split(/\s+/, 1)[0] || null,
         text: codeLines.join("\n"),
       });
     } else if (heading(line)) {

@@ -9,10 +9,11 @@ export function errorText(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function element(document, tagName, { className = "", text = "" } = {}) {
+export function element(document, tagName, { className = "", text = "", attributes = {} } = {}) {
   const value = document.createElement(tagName);
   value.className = className;
   value.textContent = text;
+  for (const [name, attribute] of Object.entries(attributes)) value.setAttribute(name, attribute);
   return value;
 }
 
@@ -323,12 +324,25 @@ export function renderMarkdownBlocks(document, value, parseMarkdown, actions) {
 
 export function renderDiff(document, value) {
   const pre = element(document, "pre", { className: "diff" });
+  let inHunk = false;
+  let remaining = null;
   for (const line of String(value ?? "").split("\n")) {
+    if (line.startsWith("diff --git ")) { inHunk = false; remaining = null; }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      const header = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+      remaining = header ? [Number(header[1] ?? 1), Number(header[2] ?? 1)] : null;
+    }
     const span = element(document, "span", { text: line });
-    span.className = line.startsWith("+") && !line.startsWith("+++") ? "diff-add"
-      : line.startsWith("-") && !line.startsWith("---") ? "diff-remove"
+    span.className = line.startsWith("+") && (inHunk || !line.startsWith("+++")) ? "diff-add"
+      : line.startsWith("-") && (inHunk || !line.startsWith("---")) ? "diff-remove"
         : line.startsWith("@@") ? "diff-hunk" : "";
     append(pre, span);
+    if (inHunk && remaining && !line.startsWith("@@")) {
+      if (line[0] === " " || line[0] === "-") remaining[0] -= 1;
+      if (line[0] === " " || line[0] === "+") remaining[1] -= 1;
+      if (remaining[0] <= 0 && remaining[1] <= 0) inHunk = false;
+    }
   }
   return pre;
 }
@@ -759,11 +773,108 @@ const TRANSCRIPT_RENDERERS = Object.freeze({
   }),
 });
 
-export function renderTranscript(document, root, model, parseMarkdown, actions) {
-  return replace(
-    root,
-    ...model.map((entry) => (
-      TRANSCRIPT_RENDERERS[entry.type] ?? renderUnknown
-    )(document, entry, parseMarkdown, actions)),
-  );
+const transcriptRoots = new WeakMap();
+
+function entrySnapshot(value) {
+  if (Array.isArray(value)) return value.map(entrySnapshot);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, entrySnapshot(item)]));
+  }
+  return value;
+}
+
+function entryMatches(value, snapshot) {
+  if (value === snapshot) return true;
+  if (!value || !snapshot || typeof value !== "object" || typeof snapshot !== "object") return false;
+  const keys = Object.keys(value);
+  return keys.length === Object.keys(snapshot).length
+    && keys.every(key => Object.hasOwn(snapshot, key) && entryMatches(value[key], snapshot[key]));
+}
+
+function updateTranscriptNode(node, next) {
+  if (node.nodeType !== next.nodeType || node.tagName !== next.tagName
+      || ["BUTTON", "INPUT", "TEXTAREA", "A"].includes(node.tagName)) {
+    node.parentNode.replaceChild(next, node);
+    return next;
+  }
+  if (node.nodeType === 3) {
+    if (node.data !== next.data) {
+      if (node.appendData && next.data.startsWith(node.data)) node.appendData(next.data.slice(node.data.length));
+      else node.data = next.data;
+    }
+    return node;
+  }
+  const names = element => Array.from(element.attributes, attribute => attribute.name ?? attribute[0]);
+  for (const name of names(node)) {
+    if (name === "open" && node.tagName === "DETAILS") continue;
+    if (next.getAttribute(name) === null) node.removeAttribute(name);
+  }
+  for (const name of names(next)) {
+    if (name === "open" && node.tagName === "DETAILS") continue;
+    if (node.getAttribute(name) !== next.getAttribute(name)) node.setAttribute(name, next.getAttribute(name));
+  }
+  if (node.className !== next.className) node.className = next.className;
+  if (node.hidden !== next.hidden) node.hidden = next.hidden;
+  const children = Array.from(next.childNodes);
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index];
+    if (node.childNodes[index]) updateTranscriptNode(node.childNodes[index], child);
+    else node.append(child);
+  }
+  while (node.childNodes.length > children.length) node.childNodes[node.childNodes.length - 1].remove();
+  return node;
+}
+
+export function renderTranscript(document, root, model, parseMarkdown, actions, options = {}) {
+  let state = transcriptRoots.get(root);
+  if (!state) {
+    state = { records: new Map(), scheduled: false, pending: null, editing: null, viewKey: null };
+    transcriptRoots.set(root, state);
+  }
+  state.pending = { model, parseMarkdown, actions, options };
+  const paint = () => {
+    state.scheduled = false;
+    const pending = state.pending;
+    if (!pending) return;
+    state.pending = null;
+    if (pending.options.isCurrent && !pending.options.isCurrent()) return;
+    const records = new Map();
+    const retained = new Set(pending.model);
+    for (const [entry, record] of state.records) {
+      if (!retained.has(entry)) record.node.remove();
+    }
+    pending.model.forEach((entry, index) => {
+      let record = state.records.get(entry);
+      if (!record || !entryMatches(entry, record.snapshot)) {
+        const next = (TRANSCRIPT_RENDERERS[entry.type] ?? renderUnknown)(document, entry, pending.parseMarkdown, pending.actions);
+        const node = record?.node.parentNode === root ? updateTranscriptNode(record.node, next) : next;
+        record = { node, snapshot: entrySnapshot(entry) };
+      }
+      const current = root.childNodes[index];
+      if (current !== record.node) {
+        if (current) current.before(record.node);
+        else root.append(record.node);
+      }
+      records.set(entry, record);
+    });
+    while (root.childNodes.length > pending.model.length) root.childNodes[root.childNodes.length - 1].remove();
+    state.records = records;
+    const editing = records.get(pending.options.editingEntry)?.node ?? null;
+    if (state.editing && state.editing !== editing) {
+      state.editing.className = state.editing.className.replace(/\s*editing-previous-prompt\b/g, "");
+    }
+    if (editing && !editing.className.includes("editing-previous-prompt")) editing.className += " editing-previous-prompt";
+    state.editing = editing;
+    if (state.viewKey != null && pending.options.viewKey == null) root.scrollTop = state.returnScrollTop;
+    state.viewKey = pending.options.viewKey ?? null;
+    if (pending.options.returnScrollTop !== undefined) state.returnScrollTop = pending.options.returnScrollTop;
+    pending.options.afterRender?.();
+  };
+  if (options.requestAnimationFrame) {
+    if (!state.scheduled) {
+      state.scheduled = true;
+      options.requestAnimationFrame(paint);
+    }
+  } else paint();
+  return root;
 }

@@ -81,6 +81,7 @@ export function parseKeymap(text) {
 
   const bindings = new Map();
   const sourceChords = new Map();
+  bindings.rejected = [];
   for (const [rawChord, action] of Object.entries(parsed)) {
     if (typeof action !== "string" && action !== null) {
       throw new KeymapError(
@@ -93,9 +94,9 @@ export function parseKeymap(text) {
     ));
     if (conflict) {
       const [existing, previous] = conflict;
-      throw new KeymapError(
-        `chords ${JSON.stringify(sourceChords.get(existing))} and ${JSON.stringify(rawChord)} bind both ${JSON.stringify(previous)} and ${JSON.stringify(action)}`,
-      );
+      bindings.rejected.push({ chord: rawChord, action,
+        reason: `conflicts with ${sourceChords.get(existing)}, bound to ${previous}` });
+      continue;
     }
     bindings.set(chord, action);
     sourceChords.set(chord, rawChord);
@@ -106,7 +107,7 @@ export function parseKeymap(text) {
 
 export function mergeKeymap(defaults, user) {
   const bindings = new Map(defaults);
-  const rejected = [];
+  const rejected = [...(user.rejected ?? [])];
   for (const [rawChord, action] of user) {
     const chord = normalizeChord(rawChord);
     const reserved = RESERVED.find((candidate) => chordsConflict(candidate, chord));
@@ -156,15 +157,17 @@ function resolvedChord(chord, platform) {
 
 
 function eventChord(event) {
-  if (!event || typeof event.key !== "string" || event.key === "") {
-    return null;
-  }
+  if (!event) return null;
+  const key = /^Key[A-Z]$/.test(event.code) ? event.code.slice(3).toLowerCase()
+    : /^Digit[0-9]$/.test(event.code) ? event.code.slice(5)
+    : event.code === "Space" || event.key === " " ? "space" : event.key?.toLowerCase();
+  if (!key) return null;
   const modifiers = [];
   if (event.ctrlKey) modifiers.push("ctrl");
   if (event.metaKey) modifiers.push("meta");
   if (event.altKey) modifiers.push("alt");
   if (event.shiftKey) modifiers.push("shift");
-  return [...modifiers, event.key.toLowerCase()].join("+");
+  return [...modifiers, key].join("+");
 }
 
 

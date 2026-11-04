@@ -1843,8 +1843,9 @@ button.session-link {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * {
-    transition: none;
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
   }
 }
 
@@ -2053,6 +2054,7 @@ button.session-link {
 #chat > .activity-edit::before,
 #chat > .activity-shell::before,
 #chat > .activity-web::before,
+#chat > .activity-memory::before,
 #chat > .edit::before {
   top: calc(var(--agent-dot-center) - 0.5rem);
   left: calc(0px - var(--space-6) + 0.25rem);
@@ -2777,3 +2779,8 @@ button.session-link {
 .usage-project { overflow-wrap: anywhere; }
 
 .preview-mark-chip { max-width: 100%; overflow-wrap: anywhere; }
+
+.composer-action { justify-self: end; min-height: 2rem; padding: var(--space-1) var(--space-3); }
+.composer-stop { align-self: flex-end; margin: var(--space-2) var(--space-3); min-height: 2rem; }
+.composer-stop-status { justify-content: flex-end; flex-shrink: 0; }
+.composer-stop-status[hidden] { display: none; }

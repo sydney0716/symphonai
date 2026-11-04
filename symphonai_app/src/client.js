@@ -161,6 +161,14 @@ export function createClient({
       }
       const controller = new AbortController();
       let closed = false;
+      let callbacks = Promise.resolve();
+      let callbackError = null;
+      const deliver = frame => {
+        callbacks = callbacks.then(() => onFrame(frame)).catch(error => {
+          callbackError = error;
+          controller.abort();
+        });
+      };
       const receive = (data) => {
         const frame = decodeFrame(data);
         if (
@@ -169,10 +177,10 @@ export function createClient({
           frame.payload.dropped > 0
         ) {
           droppedFrames += frame.payload.dropped;
-          onFrame({ kind: "error", dropped: frame.payload.dropped });
+          deliver({ kind: "error", dropped: frame.payload.dropped });
           return;
         }
-        onFrame(frame);
+        deliver(frame);
       };
       const responseReady = (async () => {
         let response;
@@ -202,6 +210,8 @@ export function createClient({
         const response = await responseReady;
         try {
           await readEventStream(response.body, receive);
+          await callbacks;
+          if (!closed) throw callbackError ?? new Error("event stream disconnected");
         } catch (error) {
           if (closed) {
             return;
@@ -265,6 +275,9 @@ export function createClient({
 
     openSession(runId) {
       return post("session/open", { run_id: runId });
+    },
+    historyPage(replayId, offset) {
+      return request("POST", "/session/history", { replay_id: replayId, offset });
     },
 
     mcpPrompts() { return request("GET", "/mcp/prompts"); },

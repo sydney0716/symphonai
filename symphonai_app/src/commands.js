@@ -416,6 +416,35 @@ async function handleCompact(context, { args, command, typedName, usage }) {
   return;
 }
 
+function splitCheck(text) {
+  const argv = [];
+  let word = "", quote = "", active = false;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (quote === "'") {
+      if (char === "'") quote = "";
+      else word += char;
+    } else if (char === "\\") {
+      if (index + 1 >= text.length) throw new Error("Goal check has an unfinished escape.");
+      const next = text[index + 1];
+      if (!quote || ['"', "\\", "$", "`", "\n"].includes(next)) {
+        index++;
+        if (next !== "\n") word += next;
+      } else word += char;
+      if (next !== "\n" || quote) active = true;
+    } else if (quote) {
+      if (char === quote) quote = "";
+      else word += char;
+    } else if (char === "'" || char === '"') { quote = char; active = true; }
+    else if (/\s/.test(char)) {
+      if (active) { argv.push(word); word = ""; active = false; }
+    } else { word += char; active = true; }
+  }
+  if (quote) throw new Error("Goal check has an unfinished quote.");
+  if (active) argv.push(word);
+  return argv;
+}
+
 async function handleGoal(context, { args, command, typedName, usage }) {
   const { boundary, answerCommand, showConversationUsage } = context;
   if (args.length === 0) {
@@ -474,7 +503,7 @@ async function handleGoal(context, { args, command, typedName, usage }) {
     return;
   }
   try {
-    const reply = await boundary.setGoal(objective, checkText ? checkText.split(/\s+/) : []);
+    const reply = await boundary.setGoal(objective, checkText ? splitCheck(checkText) : []);
     context.conversation = { ...(context.conversation ?? {}), goal: reply.goal };
     showConversationUsage();
     answerCommand(`Goal set. Round 1 of ${reply.goal?.max_rounds ?? 10} started.`);

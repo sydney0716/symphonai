@@ -22,29 +22,30 @@ export function createPicker({
   const status = element(document, "p", { className: "picker-message", text: message });
   let focused = rows.length === 0 ? -1 : Math.max(0, Math.min(initialIndex, rows.length - 1));
 
+  const buttons = rows.map((row, index) => {
+    const button = element(document, "button");
+    button.type = "button";
+    button.setAttribute?.("role", "option");
+    append(button, element(document, "span", { className: "picker-row-label", text: row.label }),
+      element(document, "span", { className: "picker-row-description", text: row.current ? "Current" : "" }));
+    listen(button, "click", () => onChoose(row, index));
+    listen(button, "focus", () => { focused = index; renderRows(); });
+    return button;
+  });
+  replace(list, ...buttons);
   function renderRows() {
-    const buttons = rows.map((row, index) => {
-      const button = element(document, "button", {
-        className: `picker-row${index === focused ? " focused" : ""}${row.current ? " current" : ""}`,
-      });
-      button.type = "button";
-      button.setAttribute?.("role", "option");
+    buttons.forEach((button, index) => {
+      button.className = `picker-row${index === focused ? " focused" : ""}${rows[index].current ? " current" : ""}`;
+      button.tabIndex = index === focused ? 0 : -1;
       button.setAttribute?.("aria-selected", String(index === focused));
-      append(
-        button,
-        element(document, "span", { className: "picker-row-label", text: row.label }),
-        element(document, "span", { className: "picker-row-description", text: row.current ? "Current" : "" }),
-      );
-      listen(button, "click", () => onChoose(row, index));
-      return button;
     });
-    replace(list, ...buttons);
   }
 
   function move(amount) {
     if (rows.length === 0) return;
     focused = (focused + amount + rows.length) % rows.length;
     renderRows();
+    buttons[focused].focus();
   }
 
   listen(root, "keydown", (event) => {

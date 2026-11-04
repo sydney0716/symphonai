@@ -2288,12 +2288,23 @@ class HostRun:
 
         replay_id = new_id("replay")
         history_frames = 0
+        frames = []
+
+        def history_reply(reply):
+            with self._lock:
+                if not hasattr(self, "_history_replays"):
+                    self._history_replays = {}
+                self._history_replays[replay_id] = tuple(frames)
+                while len(self._history_replays) > 8:
+                    self._history_replays.pop(next(iter(self._history_replays)))
+                return {**reply, **self.history_page(replay_id, 0)}
 
         def publish_history(message):
             nonlocal history_frames
             values = asdict(message)
             values.setdefault("record_id", None)
-            self._broker.publish(ReplayedHistoryMessage(**values, replay_id=replay_id))
+            message = ReplayedHistoryMessage(**values, replay_id=replay_id)
+            frames.append({"kind": "event", "payload": message.payload()})
             history_frames += 1
 
         with self._lock:
@@ -2397,12 +2408,12 @@ class HostRun:
                     for notice in self._waited_subagent_notices(message, wait_ids, run_id):
                         publish_history(notice)
                 self._close_idle_conversations_locked()
-                return {
+                return history_reply({
                     "run_id": loaded.run_id, "state": diagnosis.state.value,
                     "replayed": len(loaded.record_ids), "repaired_ids": repaired_ids,
                     "dropped_bytes": loaded.dropped_bytes,
                     "replay_id": replay_id, "history_frames": history_frames,
-                }
+                })
             previous_provider = (
                 self._provider,
                 self._model,
@@ -2518,14 +2529,27 @@ class HostRun:
             ))
             for notice in self._waited_subagent_notices(message, wait_ids, run_id):
                 publish_history(notice)
-        return {
+        return history_reply({
             "run_id": loaded.run_id,
             "state": diagnosis.state.value,
             "replayed": len(loaded.record_ids),
             "repaired_ids": repaired_ids,
             "dropped_bytes": loaded.dropped_bytes,
             "replay_id": replay_id, "history_frames": history_frames,
-        }
+        })
+
+    def history_page(self, replay_id: str, offset: int = 0) -> dict:
+        """Return one bounded page from an immutable display-only replay snapshot."""
+        with self._lock:
+            frames = getattr(self, "_history_replays", {}).get(replay_id)
+            if frames is None:
+                raise KeyError(replay_id)
+            if type(offset) is not int or not 0 <= offset <= len(frames):
+                raise ValueError("invalid history offset")
+            end = min(offset + 250, len(frames))
+            return {"replay_id": replay_id, "history_frames": len(frames),
+                    "history": list(frames[offset:end]), "offset": offset,
+                    "next_offset": end if end < len(frames) else None}
 
     def session_notes(self, session_id: str) -> dict:
         """Read a session's notes without changing the session or publishing events."""

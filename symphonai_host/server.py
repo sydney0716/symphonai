@@ -1941,6 +1941,11 @@ class HostServer:
                     reply = host.run.open_session(request.run_id)
                 return _Reply(HTTPStatus.OK, reply)
 
+            def _post_session_history(self, payload):
+                with self._errors(0):
+                    reply = host.run.history_page(payload["replay_id"], payload.get("offset", 0))
+                return _Reply(HTTPStatus.OK, reply)
+
             def _post_stop(self, payload):
                 kind = 'stop'
                 with self._errors(0):
@@ -2303,6 +2308,11 @@ class HostServer:
                 match='exact',
                 payload=_Payload({'run_id': str}, ('run_id',), extra=True),
                 errors=(((ProtocolError, 'bad_request'),), ((RunActiveError, 'active_run'), (SessionError, 'session_not_found'), (TranscriptError, 'bad_request'), (ProviderSelectionError, 'bad_request'))),
+            ),
+            _Route('POST', '/session/history', Handler._post_session_history,
+                match='exact',
+                payload=_Payload({'replay_id': str, 'offset': int}, ('replay_id',), extra=False),
+                errors=(((KeyError, 'not_found'), (ValueError, 'bad_request')),),
             ),
             _Route('POST', '/stop', Handler._post_stop,
                 match='exact',

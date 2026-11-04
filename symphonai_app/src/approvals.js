@@ -64,6 +64,7 @@ export function createApprovals({ client }) {
   }
 
   async function resync() {
+    const known = new Set(questions.keys());
     const reply = await client.approvals();
     const pending = Array.isArray(reply?.pending) ? reply.pending : [];
     const outstanding = new Set(
@@ -73,7 +74,7 @@ export function createApprovals({ client }) {
     );
     for (const [id, question] of questions) {
       if (
-        !outstanding.has(id) &&
+        known.has(id) && !outstanding.has(id) &&
         question.state !== "resolved" &&
         question.state !== "stale" &&
         question.state !== "answering"

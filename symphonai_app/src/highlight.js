@@ -58,15 +58,28 @@ function stringEnd(text, start, quote, language) {
 
 function highlightDiff(text) {
   const tokens = [];
+  let inHunk = false;
+  let remaining = null;
   for (const line of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
-    if (line.startsWith("+") && !line.startsWith("+++")) {
+    if (line.startsWith("diff --git ")) { inHunk = false; remaining = null; }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      const header = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+      remaining = header ? [Number(header[1] ?? 1), Number(header[2] ?? 1)] : null;
+    }
+    if (line.startsWith("+") && (inHunk || !line.startsWith("+++"))) {
       add(tokens, "keyword", "+");
       for (const token of highlight("javascript", line.slice(1))) add(tokens, token.kind, token.text);
-    } else if (line.startsWith("-") && !line.startsWith("---")) {
+    } else if (line.startsWith("-") && (inHunk || !line.startsWith("---"))) {
       add(tokens, "comment", "-");
       for (const token of highlight("javascript", line.slice(1))) add(tokens, token.kind, token.text);
     } else {
       add(tokens, "plain", line);
+    }
+    if (inHunk && remaining && !line.startsWith("@@")) {
+      if (line[0] === " " || line[0] === "-") remaining[0] -= 1;
+      if (line[0] === " " || line[0] === "+") remaining[1] -= 1;
+      if (remaining[0] <= 0 && remaining[1] <= 0) inHunk = false;
     }
   }
   return tokens;

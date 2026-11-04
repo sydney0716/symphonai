@@ -302,6 +302,20 @@ export async function start({ global, document, client }) {
   let fileFragment = null;
   let fileSearchSerial = 0;
   const turn = createTurnState();
+  const promptAction = document.getElementById("prompt-action") ?? makeButton(document, "Send", null, { type: "submit", className: "primary composer-action" });
+  if (!promptAction.parentNode) append(form, promptAction);
+  const stopMirror = makeButton(document, "Stop", () => userCommandPending ? boundary.stop("") : perform(turn.stop()), { className: "primary composer-stop" });
+  stopMirror.title = "Stop the running turn";
+  const stopStatus = append(element(document, "div", { className: "conversation-usage composer-stop-status" }),
+    element(document, "span", { text: "Running" }), stopMirror);
+  stopStatus.hidden = true;
+  listen(promptAction, "click", async event => {
+    if (turn.state === RUNNING || turn.state === DISPATCHING || userCommandPending) {
+      event.preventDefault();
+      if (userCommandPending) await boundary.stop("");
+      else await perform(turn.stop());
+    }
+  });
   let historyPrompts = null;
   const pagePrompts = [];
   let historyIndex = -1;
@@ -421,10 +435,13 @@ export async function start({ global, document, client }) {
   let mcpCommands = getMcpCommands(mcpReply);
   const defaultKeymap = parseKeymap(JSON.stringify(keymapDefaults));
   const userKeymap = global.__symphonai?.keys ?? global.keymap ?? userKeymapFile;
-  const keymap = mergeKeymap(
-    defaultKeymap,
-    parseKeymap(JSON.stringify(userKeymap)),
-  ).bindings;
+  let userBindings;
+  try { userBindings = parseKeymap(JSON.stringify(userKeymap)); }
+  catch (error) {
+    userBindings = new Map();
+    userBindings.rejected = [{ chord: "User keymap", action: "", reason: errorText(error) }];
+  }
+  const { bindings: keymap, rejected: keymapRejected } = mergeKeymap(defaultKeymap, userBindings);
   const platform = /mac/i.test(global.navigator?.platform ?? "") ? "darwin" : "other";
   const allModes = ["ask", "plan", "auto", "allow"];
   const ceilingModes = settingsReply?.settings?.ceiling?.modes;
@@ -680,6 +697,7 @@ export async function start({ global, document, client }) {
       refreshSettings,
       statusFields,
       saveStatusFields,
+      keymapRejected,
       showConversationUsage,
       get settingsReply() { return settingsReply; },
       set settingsReply(value) { settingsReply = value; },
@@ -753,7 +771,14 @@ export async function start({ global, document, client }) {
     return 1;
   }
 
+  let changesSequence = 0, jobsSequence = 0, sourceSequence = 0, loopSequence = 0, cardSequence = 0;
+  let jobsForm = null, jobsList = null, jobsNotice = null;
+  const jobRows = new Map();
+  const approvalAnswers = new Map();
+  const approvalFeedback = new Map();
   async function showChanges() {
+    const sequence = ++changesSequence;
+    const sessionId = currentSessionId;
     replace(
       changesRoot,
       element(document, "h1", { text: "Changes" }),
@@ -763,6 +788,7 @@ export async function start({ global, document, client }) {
       boundary.changes(),
       boundary.gitStatus(),
     ]);
+    if (sequence !== changesSequence || sessionId !== currentSessionId) return;
     const reply = conversationResult.status === "fulfilled" ? conversationResult.value : null;
     const gitReply = gitResult.status === "fulfilled" ? gitResult.value : null;
 
@@ -1313,94 +1339,70 @@ export async function start({ global, document, client }) {
   terminalToggle.setAttribute("aria-expanded", String(terminalOpen));
 
   async function showJobs() {
-    if (!jobsPaneVisible()) {
-      updateJobsPolling([]);
-      return;
-    }
-    replace(jobsRoot, element(document, "h1", { text: "Jobs" }));
-    let jobs;
-    try {
-      const reply = await boundary.jobs();
-      jobs = Array.isArray(reply?.jobs) ? reply.jobs : [];
-    } catch (error) {
-      updateJobsPolling([]);
-      append(jobsRoot, element(document, "p", {
-        className: "error",
-        text: errorText(error),
-      }));
-      return;
-    }
-
-    const command = document.createElement("input");
-    command.type = "text";
-    command.className = "jobs-command";
-    command.setAttribute("placeholder", "Command to run in the background");
-    command.value = jobsCommandDraft;
-    command.setAttribute("aria-label", "Background command");
-    const run = makeButton(document, "Run in background");
-    run.disabled = !command.value.trim();
-    listen(command, "input", () => {
-      jobsCommandDraft = command.value;
+    const sequence = ++jobsSequence;
+    if (!jobsPaneVisible()) { updateJobsPolling([]); return; }
+    if (!jobsForm) {
+      jobsForm = element(document, "div", { className: "jobs-command-form" });
+      jobsList = element(document, "div");
+      jobsNotice = element(document, "p");
+      const command = element(document, "input", { className: "jobs-command" });
+      command.type = "text";
+      command.placeholder = "Command to run in the background";
+      command.setAttribute("aria-label", "Background command");
+      command.value = jobsCommandDraft;
+      const run = makeButton(document, "Run in background");
       run.disabled = !command.value.trim();
-    });
-    listen(run, "click", async () => {
-      const value = command.value;
-      if (!value.trim()) return;
-      run.disabled = true;
-      try {
-        await boundary.startJob(value);
-        jobsCommandDraft = "";
-        await showJobs();
-      } catch (error) {
-        run.disabled = false;
-        append(jobsRoot, element(document, "p", {
-          className: "error",
-          text: errorText(error),
-        }));
-      }
-    });
-    append(jobsRoot, append(element(document, "div", { className: "jobs-command-form" }), command, run));
-
-    if (jobs.length === 0) {
-      append(jobsRoot, element(document, "p", { text: "No background jobs." }));
+      listen(command, "input", () => { jobsCommandDraft = command.value; run.disabled = !command.value.trim(); });
+      listen(run, "click", async () => {
+        const value = command.value;
+        if (!value.trim()) return;
+        run.disabled = true;
+        try {
+          await boundary.startJob(value);
+          if (command.value === value) { command.value = ""; jobsCommandDraft = ""; }
+          await showJobs();
+        } catch (error) { jobsNotice.textContent = errorText(error); }
+        finally { run.disabled = !command.value.trim(); }
+      });
+      append(jobsForm, command, run);
+      replace(jobsRoot, element(document, "h1", { text: "Jobs" }), jobsForm, jobsNotice, jobsList);
     }
+    let jobs;
+    try { const reply = await boundary.jobs(); jobs = Array.isArray(reply?.jobs) ? reply.jobs : []; }
+    catch (error) {
+      if (sequence !== jobsSequence) return;
+      jobsNotice.textContent = errorText(error);
+      updateJobsPolling([]);
+      return;
+    }
+    if (sequence !== jobsSequence || !jobsPaneVisible()) return;
+    jobsNotice.textContent = jobs.length ? "" : "No background jobs.";
+    const ids = new Set(jobs.map(job => job.id));
+    for (const [id, row] of jobRows) if (!ids.has(id)) { row.root.remove(); jobRows.delete(id); }
     const now = global.Date?.now?.() ?? Date.now();
     for (const job of jobs) {
-      const row = element(document, "details", { className: "jobs-row" });
-      const summary = element(document, "summary");
-      const startedAt = Date.parse(job.started_at);
-      const endedAt = job.ended_at ? Date.parse(job.ended_at) : now;
-      const elapsed = Number.isFinite(startedAt) && Number.isFinite(endedAt)
-        ? `${Math.max(0, Math.floor((endedAt - startedAt) / 1000))}s`
-        : "time unavailable";
-      const status = job.status === "exited" ? `exited (exit code ${job.exit_code})` : job.status;
-      append(
-        summary,
-        element(document, "span", { text: job.label }),
-        element(document, "span", { text: job.owner === "person" ? "you" : "agent" }),
-        element(document, "span", { className: "jobs-status", text: status }),
-        element(document, "span", { text: elapsed }),
-      );
-      if (job.status === "running") {
-        const stop = makeButton(document, "Stop", async () => {
-          try {
-            await boundary.stopJob(job.id);
-            await showJobs();
-          } catch (error) {
-            append(row, element(document, "p", {
-              className: "error",
-              text: errorText(error),
-            }));
-          }
+      let row = jobRows.get(job.id);
+      if (!row) {
+        row = { root: element(document, "details", { className: "jobs-row" }),
+          label: element(document, "span"), owner: element(document, "span"),
+          status: element(document, "span", { className: "jobs-status" }), elapsed: element(document, "span"),
+          output: element(document, "pre", { className: "jobs-output" }), dropped: element(document, "p") };
+        row.stop = makeButton(document, "Stop", async () => {
+          try { await boundary.stopJob(job.id); await showJobs(); }
+          catch (error) { jobsNotice.textContent = errorText(error); }
         });
-        append(summary, stop);
+        append(row.root, append(element(document, "summary"), row.label, row.owner, row.status, row.elapsed, row.stop), row.dropped, row.output);
+        jobRows.set(job.id, row);
+        append(jobsList, row.root);
       }
-      const output = element(document, "pre", { className: "jobs-output", text: job.output_tail ?? "" });
-      if (job.output_dropped) {
-        append(row, element(document, "p", { text: "Earlier output was dropped." }));
-      }
-      append(row, summary, output);
-      append(jobsRoot, row);
+      row.label.textContent = job.label;
+      row.owner.textContent = job.owner === "person" ? "you" : "agent";
+      row.status.textContent = job.status === "exited" ? `exited (exit code ${job.exit_code})` : job.status;
+      const start = Date.parse(job.started_at), end = job.ended_at ? Date.parse(job.ended_at) : now;
+      row.elapsed.textContent = Number.isFinite(start) && Number.isFinite(end) ? `${Math.max(0, Math.floor((end - start) / 1000))}s` : "time unavailable";
+      row.stop.hidden = job.status !== "running";
+      if (row.output.textContent !== (job.output_tail ?? "")) row.output.textContent = job.output_tail ?? "";
+      row.dropped.textContent = job.output_dropped ? "Earlier output was dropped." : "";
     }
     updateJobsPolling(jobs);
   }
@@ -1430,7 +1432,8 @@ export async function start({ global, document, client }) {
       showSettings(route.section);
     }
     const pane = route.page === "usage" ? usagePane : route.page === "settings" ? settingsPane : chatPane;
-    replace(pageRoot, pane, terminalPanel);
+    replace(pageRoot, pane, stopStatus, terminalPanel);
+    showPromptError();
     terminalPanel.hidden = !terminalOpen;
     if (!terminalPanel.hidden) fitTerminal();
     if (route.page === "chat") {
@@ -1680,14 +1683,28 @@ export async function start({ global, document, client }) {
     replace(pageRoot, projectStartScreen);
   }
 
-  listen(document, "keydown", (event) => {
-    if (folderPicker && event.key === "Escape") {
-      event.preventDefault();
-      closeFolderPicker();
-    } else if (selectedCardId && selectedRailTool === "Loop" && event.key === "Escape") {
+  function dismissTopLayer() {
+    if (folderPicker) closeFolderPicker();
+    else if (quickOpenState) closeQuickOpen();
+    else if (!shortcutHelpPanel.hidden) shortcutHelpPanel.hidden = true;
+    else if (!historySearchBar.hidden) closeHistorySearch(true);
+    else if (fileFragment !== null) closeFileMenu();
+    else if (commandMatches.length) closeCommandMenu();
+    else if (!findBar.hidden) closeFind();
+    else if (selectedCardId && selectedRailTool === "Loop") returnToLoopBoard();
+    else if (agentView) closeAgentView();
+    else return false;
+    return true;
+  }
+  listen(document, "keydown", event => {
+    if (event.defaultPrevented || event.key !== "Escape") return;
+    if (dismissTopLayer()) {
       event.preventDefault();
       event.stopPropagation?.();
-      returnToLoopBoard();
+    } else if (event.target !== input && (turn.state === RUNNING || turn.state === DISPATCHING || userCommandPending)) {
+      event.preventDefault();
+      event.stopPropagation?.();
+      void (userCommandPending ? boundary.stop("") : perform(turn.stop()));
     }
   });
 
@@ -1889,6 +1906,20 @@ export async function start({ global, document, client }) {
         agentView ? agentTranscript.model : transcript.model,
         parseMarkdown,
         agentView ? { copyText: actions.copyText } : actions,
+        {
+          requestAnimationFrame: global.requestAnimationFrame?.bind(global),
+          isCurrent: () => !agentView?.loading && !agentView?.error,
+          editingEntry: agentView ? null : editingPreviousPrompt,
+          viewKey: agentView?.agentId ?? null,
+          returnScrollTop: agentView?.returnScrollTop,
+          afterRender: () => {
+            if (!findBar.hidden && findInput.value) highlightFindMatches();
+            if (route.page === "chat" && !preserveChatScroll && following) {
+              chatRoot.scrollTop = chatRoot.scrollHeight;
+              jumpLatest.hidden = true;
+            }
+          },
+        },
       );
     }
     if (editingPreviousPrompt && !agentView) {
@@ -1917,6 +1948,7 @@ export async function start({ global, document, client }) {
       agentViewHeader.hidden = true;
       replace(agentViewHeader);
       form.hidden = false;
+      showPromptError();
       return;
     }
     replace(
@@ -1925,6 +1957,7 @@ export async function start({ global, document, client }) {
     );
     agentViewHeader.hidden = false;
     form.hidden = true;
+    showPromptError();
   }
 
   async function openAgentView(rowData) {
@@ -2037,7 +2070,7 @@ export async function start({ global, document, client }) {
 
   async function openSession(runId) {
     pendingNewChat = null;
-    const preceding = sessionReplay?.sessionId === currentSessionId ? sessionReplay : null;
+    if (runNotice.textContent.startsWith("Could not open conversation history")) runNotice.textContent = "";
     sessionReplay?.cancel();
     sessionReplay = null;
     const serial = ++sessionOpenSerial;
@@ -2047,23 +2080,7 @@ export async function start({ global, document, client }) {
       return openProjectAt(targetSession.repo_root, runId);
     }
     saveDraft();
-    const previous = preceding?.previous ?? transcript.snapshot();
-    const previousId = preceding ? preceding.previousId : currentSessionId;
-    let resolveReplay;
-    const done = new Promise(resolve => { resolveReplay = resolve; });
-    const replay = {
-      sessionId: runId, previous, previousId, batches: new Map(), live: [],
-      replayId: null, expected: null, error: null,
-      cancel: () => resolveReplay(false),
-      check: () => {
-        if (replay.expected === null) return;
-        const count = replay.batches.get(replay.replayId)?.length ?? 0;
-        if (count > replay.expected) {
-          replay.error = new Error("The host sent an invalid history frame count.");
-          resolveReplay(false);
-        } else if (count === replay.expected) resolveReplay(true);
-      },
-    };
+    const replay = { sessionId: runId, live: [], cancelled: false, cancel() { this.cancelled = true; } };
     sessionReplay = replay;
     const root = project.repo_root;
     const current = () => serial === sessionOpenSerial && currentSessionId === runId && project.repo_root === root;
@@ -2076,22 +2093,31 @@ export async function start({ global, document, client }) {
     showTranscript();
     clearConversationAgents();
     try {
-      const reply = await boundary.openSession(runId);
+      let page = await boundary.openSession(runId);
       if (!current()) return;
-      if (typeof reply?.replay_id !== "string" || !Number.isInteger(reply?.history_frames) || reply.history_frames < 0) {
+      const replayId = page?.replay_id, expected = page?.history_frames;
+      if (typeof replayId !== "string" || !Number.isInteger(expected) || expected < 0) {
         throw new Error("The host did not report a complete history replay.");
       }
-      replay.replayId = reply.replay_id;
-      replay.expected = reply.history_frames;
-      replay.check();
-      const complete = await done;
-      if (replay.error) throw replay.error;
-      if (!complete || !current()) return;
+      const history = [];
+      while (true) {
+        if (!current() || replay.cancelled) return;
+        if (page.replay_id !== replayId || page.history_frames !== expected || !Array.isArray(page.history) || page.offset !== history.length) {
+          throw new Error("The host sent an invalid history page.");
+        }
+        history.push(...page.history);
+        if (page.next_offset === null) break;
+        if (page.next_offset !== history.length || page.history.length === 0 || history.length >= expected) {
+          throw new Error("The host sent an invalid history offset.");
+        }
+        page = await boundary.historyPage(replayId, page.next_offset);
+      }
+      if (history.length !== expected) throw new Error("The host sent an incomplete history replay.");
       const stats = await boundary.conversationStats();
       if (!current()) return;
       conversation = stats?.conversation ?? null;
       bindTranscriptLeader();
-      for (const frame of replay.batches.get(replay.replayId) ?? []) {
+      for (const frame of history) {
         if (!current()) return;
         await onFrame(frame, true, true);
       }
@@ -2130,10 +2156,7 @@ export async function start({ global, document, client }) {
               const paths = new Set(turn.paths.filter(path => typeof path === "string"));
               const files = card.files.filter(file => paths.has(file.path));
               const canUndo = files.length > 0 && paths.size > 0;
-              changed ||= files.length !== card.files.length || canUndo !== card.canUndo;
-              card.files = files;
-              card.added = files.reduce((sum, file) => sum + file.added, 0);
-              card.removed = files.reduce((sum, file) => sum + file.removed, 0);
+              changed ||= canUndo !== card.canUndo;
               card.canUndo = canUndo;
             }
             if (changed) showTranscript();
@@ -2151,19 +2174,29 @@ export async function start({ global, document, client }) {
       showConversationUsage();
       showAgents();
       await markSessionViewed(runId);
-      if (current() && !cards.length) await refreshSelectedChanges();
+      if (current()) await refreshSelectedChanges();
     } catch (error) {
       if (!current()) return;
       sessionReplay = null;
-      transcript.restore(previous);
-      currentSessionId = previousId;
-      void refreshOpenNotes();
+      try {
+        const stats = await boundary.conversationStats();
+        if (serial !== sessionOpenSerial || project.repo_root !== root) return;
+        conversation = stats?.conversation ?? null;
+        currentSessionId = conversation?.session_id ?? null;
+      } catch { /* Keep the attempted session selected while the host is unreachable. */ }
+      transcript.reset();
       transcript.setSessionId(currentSessionId);
       restoreDraft();
+      bindTranscriptLeader();
+      if (permittedModes.includes(conversation?.mode)) currentMode = conversation.mode;
+      navigate({ page: "chat", section: "" });
       showProjects();
       showTranscript();
-      await refreshConversation();
-      throw error;
+      showConversationUsage();
+      showAgents();
+      runNotice.textContent = `Could not open conversation history: ${errorText(error)} `;
+      append(runNotice, makeButton(document, "Retry", () => openSession(runId)));
+      try { await approvals.resync(); showApprovals(); } catch { /* Reconnect will retry. */ }
     } finally {
       replay.cancel();
       if (sessionReplay === replay) sessionReplay = null;
@@ -2528,6 +2561,11 @@ export async function start({ global, document, client }) {
   }
 
   function showPromptError() {
+    const busy = turn.state === RUNNING || turn.state === DISPATCHING || userCommandPending;
+    promptAction.textContent = busy ? "Stop" : "Send";
+    promptAction.title = busy ? "Stop the running turn" : "Send message";
+    promptAction.setAttribute("aria-label", promptAction.textContent);
+    stopStatus.hidden = !busy || (route?.page === "chat" && !form.hidden);
     promptError.textContent = promptFailure;
     if (promptFailure === "Add an API key in Settings before sending a message.") {
       append(promptError, element(document, "span", { text: " " }), modelsLink());
@@ -3105,6 +3143,7 @@ export async function start({ global, document, client }) {
   }
 
   async function openSourceFile(path) {
+    const sequence = ++sourceSequence;
     selectedFilePath = path;
     fileSourceText = null;
     fileSourceError = null;
@@ -3112,10 +3151,13 @@ export async function start({ global, document, client }) {
     renderFiles();
     try {
       const reply = await boundary.source(path);
+      if (sequence !== sourceSequence || selectedFilePath !== path) return;
       fileSourceText = reply.text;
     } catch (error) {
+      if (sequence !== sourceSequence) return;
       fileSourceError = error;
     } finally {
+      if (sequence !== sourceSequence) return;
       fileSourceLoading = false;
       renderFiles();
     }
@@ -3289,16 +3331,22 @@ export async function start({ global, document, client }) {
   }
 
   async function loadLoopCard(cardId) {
+    const sequence = ++cardSequence, loopId = selectedLoopId;
+    const current = () => sequence === cardSequence && loopId === selectedLoopId && cardId === selectedCardId;
     selectedCardId = cardId;
     cardDetail = null;
     cardDetailLoading = true;
     cardDetailError = "";
     renderLoops();
     try {
-      cardDetail = await boundary.loopCard(selectedLoopId, cardId);
+      const reply = await boundary.loopCard(loopId, cardId);
+      if (!current()) return;
+      cardDetail = reply;
     } catch (error) {
+      if (!current()) return;
       cardDetailError = errorText(error);
     } finally {
+      if (!current()) return;
       cardDetailLoading = false;
       renderLoops();
     }
@@ -3451,6 +3499,7 @@ export async function start({ global, document, client }) {
   }
 
   async function loadLoop(id) {
+    const sequence = ++loopSequence;
     if (typeof id !== "string" || !id) return;
     if (selectedLoopId !== id) {
       loopActionError = "";
@@ -3471,8 +3520,10 @@ export async function start({ global, document, client }) {
     renderLoops();
     try {
       const reply = await boundary.loop(id);
+      if (sequence !== loopSequence) return;
       selectedLoop = reply.loop;
     } catch (error) {
+      if (sequence !== loopSequence) return;
       loopError = errorText(error);
     }
     renderLoops();
@@ -3874,6 +3925,9 @@ export async function start({ global, document, client }) {
 
   function showApprovals() {
     const children = [];
+    for (const drafts of [approvalAnswers, approvalFeedback]) {
+      for (const id of drafts.keys()) if (!["open", "answering"].includes(approvals.state.get(id)?.state)) drafts.delete(id);
+    }
     for (const id of approvalDenyNotes.keys()) {
       if (approvals.state.get(id)?.state !== "open") approvalDenyNotes.delete(id);
     }
@@ -3927,6 +3981,8 @@ export async function start({ global, document, client }) {
           }
           const answerInput = element(document, "textarea");
           answerInput.setAttribute("aria-label", "Your answer");
+          answerInput.value = approvalAnswers.get(id) ?? "";
+          listen(answerInput, "input", () => approvalAnswers.set(id, answerInput.value));
           const answerButton = makeButton(document, "Answer", () => {
             const answer = answerInput.value.trim();
             if (answer) void recordAnswer(true, answer);
@@ -3971,6 +4027,8 @@ export async function start({ global, document, client }) {
           }
           const feedback = element(document, "textarea");
           feedback.setAttribute("aria-label", "Feedback");
+          feedback.value = approvalFeedback.get(id) ?? "";
+          listen(feedback, "input", () => approvalFeedback.set(id, feedback.value));
           const feedbackLabel = element(document, "label", { text: "Feedback" });
           append(feedbackLabel, feedback);
           const keep = makeButton(document, "Keep planning", async () => {
@@ -4214,6 +4272,7 @@ export async function start({ global, document, client }) {
   }
   if (typeof global.addEventListener === "function") {
     global.addEventListener("keydown", async (event) => {
+      if (event.defaultPrevented) return;
       if (lookup(keymap, event, { platform }) === "toggle-terminal") {
         event.preventDefault();
         await toggleTerminal();
@@ -5132,6 +5191,11 @@ export async function start({ global, document, client }) {
 
   async function handleComposerKeydown(event) {
     if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === "Escape" && dismissTopLayer()) {
+      event.preventDefault();
+      event.stopPropagation?.();
+      return;
+    }
     if (!shortcutHelpPanel.hidden) {
       shortcutHelpPanel.hidden = true;
       if (event.key === "Escape") {
@@ -5213,6 +5277,7 @@ export async function start({ global, document, client }) {
         }
         lastIdleEscapeAt = 0;
         event.preventDefault();
+        event.stopPropagation?.();
         await perform(turn.stop());
         return;
       }
@@ -5431,26 +5496,19 @@ export async function start({ global, document, client }) {
   }
 
   async function onFrame(frame, held = false, replaying = false) {
+    if (!replaying && frame.kind === "error" && (frame.dropped ?? frame.payload?.dropped) > 0) {
+      runNotice.textContent = "State unknown — reconciling after an event gap…";
+      await approvals.onFrame(frame);
+      showApprovals();
+      await reconcileConnection(false);
+      return;
+    }
     if (!held && pendingNewChat && typeof frame.payload?.session_id === "string") {
       pendingNewChat.frames.push(frame);
       return;
     }
     if (!replaying) {
-      if (frame.kind === "event" && frame.payload?.type === "HistoryMessage" && typeof frame.payload.replay_id === "string") {
-        if (sessionReplay && frame.payload.session_id === sessionReplay.sessionId) {
-          const id = frame.payload.replay_id;
-          const batch = sessionReplay.batches.get(id) ?? [];
-          batch.push(frame);
-          sessionReplay.batches.set(id, batch);
-          sessionReplay.check();
-        }
-        return;
-      }
-      if (sessionReplay && frame.kind === "error" && (frame.dropped ?? frame.payload?.dropped) > 0) {
-        sessionReplay.error = new Error("History replay was interrupted. Open the conversation again.");
-        sessionReplay.cancel();
-        return;
-      }
+      if (frame.kind === "event" && frame.payload?.type === "HistoryMessage" && typeof frame.payload.replay_id === "string") return;
       if (sessionReplay && frame.payload?.session_id === sessionReplay.sessionId) {
         sessionReplay.live.push(frame);
         return;
@@ -5628,31 +5686,73 @@ export async function start({ global, document, client }) {
     }
   }
 
+  let subscription = null, reconnectTimer = null, reconnectAttempt = 0;
+  let connectionClosed = false;
+  async function reconcileConnection(reopen = true) {
+    healthReply = await boundary.health();
+    const stats = await boundary.conversationStats();
+    conversation = stats?.conversation ?? null;
+    const sessionId = conversation?.session_id ?? null;
+    if (reopen && sessionId) await openSession(sessionId);
+    else if (sessionId !== currentSessionId) {
+      currentSessionId = sessionId;
+      transcript.reset();
+      transcript.setSessionId(sessionId);
+      showProjects();
+      showTranscript();
+    }
+    await approvals.resync();
+    showApprovals();
+    if (healthReply?.state === "active") {
+      if (turn.state !== RUNNING && turn.state !== DISPATCHING) { turn.submit(""); turn.accepted(); }
+      if (healthReply.runtime_run_id) turn.event({ type: "RunStarted", run_id: healthReply.runtime_run_id });
+    } else if (turn.state === RUNNING || turn.state === DISPATCHING) {
+      if (!turn.activeRunId) turn.event({ type: "RunStarted", run_id: "reconciled" });
+      await perform(turn.event({ type: "RunFinished", run_id: turn.activeRunId }));
+    }
+    if (runNotice.textContent.startsWith("Disconnected") || runNotice.textContent.startsWith("State unknown")) runNotice.textContent = "";
+    showConversationUsage();
+    showPromptError();
+    showAgents();
+  }
+  function reconnect() {
+    if (connectionClosed || reconnectTimer !== null) return;
+    runNotice.textContent = "Disconnected — reconnecting…";
+    const delay = Math.min(500 * 2 ** reconnectAttempt++, 10000);
+    reconnectTimer = (global.setTimeout ?? setTimeout)(async () => {
+      reconnectTimer = null;
+      if (connectionClosed) return;
+      try {
+        connect();
+        await subscription.ready;
+        await reconcileConnection();
+        reconnectAttempt = 0;
+      } catch { reconnect(); }
+    }, delay);
+  }
+  function connect() {
+    subscription?.close();
+    const stream = boundary.events(frame => onFrame(frame));
+    subscription = stream;
+    const ended = () => { if (!connectionClosed && subscription === stream) reconnect(); };
+    stream.done?.then(ended, ended);
+  }
   await refreshPreviewMarks();
-  const subscription = boundary.events((frame) => onFrame(frame));
-  if (currentSessionId && route.page === "chat" && !document.hidden) {
-    await markSessionViewed(currentSessionId);
-  }
-  if (subscription.ready) {
+  connect();
+  try {
     await subscription.ready;
-    if (currentSessionId) {
-      const leader = conversation?.agents?.find((agent) => agent.parent_agent_id == null);
-      if (leader?.state === "running") {
-        turn.submit("");
-        turn.accepted();
-        if (typeof healthReply?.runtime_run_id === "string") {
-          turn.event({ type: "RunStarted", run_id: healthReply.runtime_run_id });
-        }
-      }
-      await openSession(currentSessionId);
-    }
-    try {
-      await approvals.resync();
-      showApprovals();
-    } catch {
-      // A failed refresh must not prevent the conversation from opening.
-    }
-  }
+    if (currentSessionId) await openSession(currentSessionId);
+    await reconcileConnection(false);
+  } catch { reconnect(); }
+  const connection = {
+    close() {
+      connectionClosed = true;
+      if (reconnectTimer !== null) (global.clearTimeout ?? clearTimeout)(reconnectTimer);
+      subscription?.close();
+    },
+    get ready() { return subscription?.ready; },
+    get done() { return subscription?.done; },
+  };
   if (terminalOpen && !projectless) await openTerminalPanel();
   updateWindowTitle();
   showPromptError();
@@ -5663,7 +5763,7 @@ export async function start({ global, document, client }) {
     openTool: openRailTool,
     route: () => route,
     sidebar,
-    subscription,
+    subscription: connection,
     transcript,
     turn,
   };
