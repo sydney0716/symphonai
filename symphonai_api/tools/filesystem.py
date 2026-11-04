@@ -307,7 +307,7 @@ class WriteFileTool(LocalTool):
         path = tool_call.arguments.get("path")
         content = tool_call.arguments.get("content")
         current = None
-        if policy.mode == "ask":
+        if policy.mode in ("ask", "auto"):
             read_decision = policy.check_read(path)
             if not read_decision.allowed:
                 return ToolResult(tool_call_id=tool_call.id, ok=False, error=read_decision.reason)
@@ -318,12 +318,12 @@ class WriteFileTool(LocalTool):
         resolved = policy._resolve_within_root(path)
         try:
             if resolved.exists():
-                if policy.mode == "ask":
+                if policy.mode in ("ask", "auto"):
                     current = resolved.read_text(encoding="utf-8")
                 stale_error = self._ledger.check(resolved)
                 if stale_error is not None:
                     return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
-            if policy.mode == "ask":
+            if policy.mode in ("ask", "auto"):
                 decision = policy.check_write(
                     path, diff=approval_diff(current, content, str(path))
                 )

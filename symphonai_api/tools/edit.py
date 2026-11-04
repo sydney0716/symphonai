@@ -156,7 +156,7 @@ class EditFileTool(LocalTool):
         old_string = tool_call.arguments["old_string"]
         new_string = tool_call.arguments["new_string"]
         replace_all = tool_call.arguments.get("replace_all", False)
-        if policy.mode == "ask":
+        if policy.mode in ("ask", "auto"):
             decision = policy.check_read(path)
         else:
             decision = policy.check_write(path)
@@ -192,7 +192,7 @@ class EditFileTool(LocalTool):
         updated = content.replace(old_string, new_string) if replace_all else content.replace(
             old_string, new_string, 1
         )
-        if policy.mode == "ask":
+        if policy.mode in ("ask", "auto"):
             decision = policy.check_write(
                 path, diff=approval_diff(content, updated, str(path))
             )
@@ -273,7 +273,7 @@ class MultiEditFileTool(EditFileTool):
         path = tool_call.arguments["path"]
         decision = (
             policy.check_read(path)
-            if policy.mode == "ask"
+            if policy.mode in ("ask", "auto")
             else policy.check_write(path)
         )
         if not decision.allowed:
@@ -314,7 +314,7 @@ class MultiEditFileTool(EditFileTool):
                 if edit.get("replace_all", False)
                 else updated.replace(old_string, edit["new_string"], 1)
             )
-        if policy.mode == "ask":
+        if policy.mode in ("ask", "auto"):
             decision = policy.check_write(
                 path, diff=approval_diff(original, updated, str(path))
             )

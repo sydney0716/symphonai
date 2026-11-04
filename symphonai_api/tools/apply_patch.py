@@ -131,7 +131,7 @@ class ApplyPatchTool(LocalTool):
             # Deny every forbidden path before even reading another patch file.
             for _, path, move, _ in operations:
                 for name in (path, move) if move else (path,):
-                    decision = policy.check_read(name) if policy.mode == "ask" else policy.check_write(name)
+                    decision = policy.check_read(name) if policy.mode in ("ask", "auto") else policy.check_write(name)
                     if not decision.allowed:
                         return ToolResult(tool_call.id, ok=False, error=f"{name}: {decision.reason}")
             for kind, path, move, body in operations:
@@ -163,7 +163,7 @@ class ApplyPatchTool(LocalTool):
                     changes[resolved] = None
                 changes[destination] = updated.encode("utf-8") if updated is not None else None
                 labels.append(f"{'move' if move else kind.lower()} {path}" + (f" -> {move}" if move else ""))
-            if policy.mode == "ask":
+            if policy.mode in ("ask", "auto"):
                 for path, content in changes.items():
                     old = originals[path]
                     decision = policy.check_write(str(path), diff=approval_diff(

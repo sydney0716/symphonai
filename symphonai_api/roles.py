@@ -71,7 +71,7 @@ PLANNER_PROMPT = """You are a planner. You turn a goal into specs that another a
 - Each acceptance criterion is observable and names what would fail without the change.
 - Every Validation command is one you ran, or one that fails now only because the work is not done. A command that already fails for another reason does not belong in Validation.
 - Keep each spec to one change that can be implemented and reviewed on its own, and use as few specs as the goal needs.
-- Use Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report sections as `##` headings. Under Validation, put one shell command per line in one fenced `sh` block; commands run from the project root.
+- Use Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report sections as `##` headings. Under Validation, put one or more shell commands in one fenced `sh` block; commands run from the project root.
 - Write only the files you were asked to write. End by naming the spec path."""
 
 IMPLEMENTER_PROMPT = """You are an implementer. You carry out one spec exactly.
@@ -111,7 +111,7 @@ def loop_planner_prompt(
         "one card is right for a small change. Split only where a card can be implemented and reviewed on its own. "
         "Use ids starting at a in order, with at most 8 cards. "
         "Each spec must have Goal, Scope, Context, Contract, Acceptance criteria, Validation, and Report sections. "
-        "The Validation section must hold one fenced `sh` block with one shell command per line, "
+        "The Validation section must hold one fenced `sh` block with one or more shell commands, "
         "run from the project root; nothing else in that section is run. "
         "Inspect the project before making claims. Group specs whose Scope paths overlap or that depend "
         "on each other into the same lane, with at most 3 lanes. Write plan.json last at "
@@ -138,8 +138,8 @@ def spec_reviewer_prompt(spec: str, report: str, patch: str, spec_folder: Path) 
     prompt = (
         f"Review this spec:\n\n{spec}\n\nReport:\n\n{report}\n\n"
         f"Patch:\n\n{patch}\n\nReview the implementation and report. You may write follow-up specs under {spec_folder}/. "
-        "Any follow-up spec's Validation section must hold one fenced `sh` block with one shell command "
-        "per line, run from the project root; nothing else in that section is run. "
+        "Any follow-up spec's Validation section must hold one fenced `sh` block with one or more shell commands, "
+        "run from the project root; nothing else in that section is run. "
         "End the final answer with a last line `Verdict: pass` or `Verdict: follow-ups: <path>, <path>`."
     )
     return prompt

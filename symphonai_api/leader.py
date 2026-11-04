@@ -83,12 +83,12 @@ from symphonai_api.leases import LeaseConflict, WorkspaceLeases
 from symphonai_api.lsp import LspManager
 from symphonai_api.models import ContentInput, Message, ModelRequest, Role, ToolCall, ToolResult
 from symphonai_api.memory_extract import MemoryExtractor
-from symphonai_api.permissions import ApprovalCallback, PermissionMode, PermissionPolicy
+from symphonai_api.permissions import ApprovalCallback, DenialReason, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
 from symphonai_api.model_table import model_capabilities
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.spec_text import spec_validation
-from symphonai_api.tools.shell import RunShellTool
+from symphonai_api.tools.shell import RunShellTool, shell_executable
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
     IMPLEMENTER_PROMPT,
@@ -118,6 +118,19 @@ def _run_handoff_validation(
     tool = RunShellTool()
     results: list[dict[str, object]] = []
     for index, command in enumerate(commands):
+        # Check unconditional refusals without requesting approval twice. The
+        # real tool still enforces the original policy before running anything.
+        decision = replace(policy, mode="allow").check_shell(
+            [shell_executable(), "-c", command], cwd=policy.repo_root,
+        )
+        if not decision.allowed and decision.denial in (
+            DenialReason.UNCHECKABLE_COMMAND, DenialReason.ALWAYS_DENY,
+        ):
+            results.append({
+                "command": command, "exit": 126, "output": decision.reason,
+                "broken": True,
+            })
+            break
         result = tool.execute(ToolCall(
             id=f"handoff-validation-{index}",
             name="run_shell",
@@ -126,8 +139,11 @@ def _run_handoff_validation(
         error = result.error or ""
         match = re.search(r"exit code (\d+)", error)
         code = 0 if result.ok else int(match.group(1)) if match else 126
-        output = result.content or error
-        results.append({"command": command, "exit": code, "output": output[-4000:]})
+        output = "\n".join(part for part in (result.content, error) if part)
+        results.append({
+            "command": command, "exit": code, "output": output[-4000:],
+            "broken": code == 127,
+        })
         if code != 0:
             break
     return results
@@ -831,7 +847,14 @@ class DispatchSubagentTool(LocalTool):
             editable_tools.intersection(selected_tool_names)
         )
         document_role = subagent_name in ("planner", "reviewer")
-        validation_commands = spec_validation(task) if can_edit and not document_role else []
+        try:
+            validation_commands = spec_validation(task) if can_edit and not document_role else []
+        except ValueError as exc:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                ok=False,
+                error=f"subagent {subagent_name}: {exc}",
+            )
         if can_edit and not document_role and not validation_commands:
             defect = ("the task has no ## Validation heading" if not re.search(
                 r"(?im)^##[ \t]+Validation[ \t]*(?:#+[ \t]*)?$", task,
@@ -1285,7 +1308,7 @@ class DispatchSubagentTool(LocalTool):
                 if failed_check is None:
                     validation_passed = True
                     break
-                if validation_round == 5:
+                if failed_check.get("broken") or validation_round == 5:
                     break
                 record.messages.append(Message(
                     role=Role.USER,
@@ -1356,7 +1379,9 @@ class DispatchSubagentTool(LocalTool):
                     (item for item in validation_evidence if item["exit"] != 0), None
                 )
                 error = (
-                    "validation failed after 5 rounds"
+                    f"Validation is broken: {last_failure['command']}\n{last_failure['output']}"
+                    if last_failure is not None and last_failure.get("broken")
+                    else "validation failed after 5 rounds"
                     if last_failure is not None and validation_round == 5
                     else failure or "validation retry failed"
                 )

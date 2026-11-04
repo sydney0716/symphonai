@@ -15,6 +15,8 @@ from unittest import mock
 from scripts.checks.harness import check, skip
 from scripts.checks.workspace import handoff_spec, workspace
 from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.agent_file import load_agent_file
+from symphonai_api.config import CapabilityCeiling
 from symphonai_api.extensions import load_extensions
 from symphonai_api.leader import DispatchSubagentTool
 from symphonai_api.models import Message, ModelResponse, ModelRequest, Role, ToolCall
@@ -53,6 +55,63 @@ def configured_policy(ws, home):
         return replace(run.policy, mode='allow')
     finally:
         run.close()
+
+
+@check('access.owner_limits_hold_before_approval')
+def owner_limits_hold_before_approval():
+    with workspace() as ws:
+        docs = ws.root/'docs'; docs.mkdir()
+        requests = []
+
+        def approve(request):
+            requests.append(request)
+            return True
+
+        base = replace(ws.policy, shell_enabled=True, shell_allowlist=[()],
+                       fetch_enabled=True, approval_callback=approve)
+        for mode in ('plan', 'ask', 'auto', 'allow'):
+            policy = replace(base, mode=mode)
+            bounded = CapabilityCeiling(allowed_write_scope=(docs,)).bound(policy)
+            for copied in (bounded, replace(bounded), policy.narrowed(bounded), bounded.narrowed(policy),
+                           CapabilityCeiling().bound(bounded)):
+                assert not copied.check_write('src/a.py').allowed
+            assert not CapabilityCeiling(shell_enabled=False).bound(policy).check_shell(['echo', 'hello']).allowed
+            assert not CapabilityCeiling(fetch_enabled=False).bound(policy).check_fetch('https://8.8.8.8').allowed
+            assert not CapabilityCeiling(shell_allowlist=(('git', 'status'),)).bound(policy).check_shell(['echo', 'hello']).allowed
+            assert not CapabilityCeiling(fetch_allowlist=('allowed.example',)).bound(policy).check_fetch('https://8.8.8.8').allowed
+        assert requests == []
+
+        agent = ws.root/'worker.toml'
+        agent.write_text('prompt = "Work"\n[model]\nprovider = "fake"\n[policy]\nshell_enabled = false\nfetch_enabled = false\n')
+        disabled = load_agent_file(agent, repo_root=ws.root).policy_ceiling
+        for mode in ('ask', 'auto'):
+            policy = replace(base.narrowed(disabled), mode=mode)
+            for copied in (policy, replace(policy), CapabilityCeiling().bound(policy)):
+                assert not copied.check_shell(['echo', 'hello']).allowed
+                assert not copied.check_fetch('https://8.8.8.8').allowed
+        assert requests == []
+
+        agent.write_text('prompt = "Work"\n[model]\nprovider = "fake"\n[policy]\n')
+        omitted = load_agent_file(agent, repo_root=ws.root).policy_ceiling
+        assert replace(base.narrowed(omitted), mode='ask').check_shell(['echo', 'hello']).allowed
+        assert len(requests) == 1
+        requests.clear()
+        soft = replace(base, mode='ask', allowed_write_scope=[docs])
+        assert soft.check_write('src/a.py').allowed
+        assert len(requests) == 1 and "outside this agent's write scope" in requests[0].details
+        requests.clear()
+        assert not replace(soft, mode='allow').check_write('src/a.py').allowed
+        assert requests == []
+
+        diffs = []
+        for mode in ('ask', 'auto'):
+            path = ws.root/'diff.txt'; path.write_text('before\n')
+            policy = replace(base, mode=mode)
+            assert execute(ws, 'read_file', {'path': 'diff.txt'}, policy).ok
+            assert execute(ws, 'edit_file', {'path': 'diff.txt', 'old_string': 'before', 'new_string': 'after'}, policy).ok
+            assert len(requests) == 1 and requests[0].diff
+            diffs.append(requests.pop().diff)
+        assert diffs[0] == diffs[1]
 
 
 @check('access.file_writes_stay_in_scope')
@@ -482,3 +541,181 @@ def auto_fixed_rules_refuse_before_review():
             assert not result.ok, name
         assert requests == [] and reviewer.call_count == 0
         assert not broker.pending()
+
+
+@check('access.shell_strings_are_judged_as_the_shell_runs_them')
+def shell_strings_are_judged_as_the_shell_runs_them():
+    from symphonai_api.permissions import DenialReason, PermissionDecision
+    from symphonai_host.approvals import ApprovalBroker
+
+    with workspace() as ws:
+        policy = PermissionPolicy(repo_root=ws.root, allowed_write_scope=[ws.root],
+                                  shell_enabled=True, shell_allowlist=[()],
+                                  shell_sandbox=False, sandbox_network=False, fetch_enabled=True)
+        denied = (
+            ('plan', "echo ok # it's\nrm f.txt\n# that's it"),
+            ('plan', "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0='touch pwned' git status"),
+            ('plan', 'env A=value git status'),
+            ('plan', 'cat < .env'),
+            ('allow', 'cat 0< .env'),
+            ('allow', 'git -C . reset --hard'),
+            ('allow', 'A=value git -C . reset --hard'),
+            ('allow', 'env A=value git -c x=y commit'),
+            ('allow', 'git --no-pager -c a=b commit'),
+            ('allow', 'git -C . push'),
+            ('allow', 'find . -delete'),
+        )
+        for mode, text in denied:
+            assert not replace(policy, mode=mode).check_shell([shell.shell_executable(), '-c', text]).allowed, text
+        for text in ('git status', 'git -C sub log -5', 'grep -n x file',
+                     'cat file # note', 'ls | head', 'echo a#b', "echo '# literal'"):
+            assert replace(policy, mode='plan').check_shell([shell.shell_executable(), '-c', text]).allowed, text
+        broker = ApprovalBroker(lambda request: False, shell_grants=(('git', 'status'),))
+        asking = replace(policy, mode='ask', approval_callback=broker.callback)
+        assert asking.check_shell([shell.shell_executable(), '-c', 'git status']).allowed
+        for text in ('A=value git status', 'env A=value git status'):
+            assert not asking.check_shell([shell.shell_executable(), '-c', text]).allowed, text
+        assert replace(policy, mode='plan').check_shell(
+            [shell.shell_executable(), '-c', 'cat < .env']).denial == DenialReason.FORBIDDEN_PATTERN
+
+
+@check('access.fetch_and_mcp_never_reach_another_host')
+def fetch_and_mcp_never_reach_another_host():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from symphonai_api.mcp import McpClient, McpError, McpServerSpec
+    from symphonai_api.permissions import DenialReason
+
+    with workspace() as ws:
+        policy = replace(ws.policy, fetch_enabled=True, mode='ask',
+                         approval_callback=lambda request: True)
+        for host in ('2130706433', '127.1', '0x7f000001', '0177.0.0.1',
+                     '2852039166', '127.0.0.1', 'localhost', '169.254.169.254',
+                     '[::ffff:127.0.0.1]'):
+            assert policy.check_fetch(f'http://{host}/').denial == DenialReason.BLOCKED_HOST, host
+        received = []
+
+        class Destination(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.headers.get('Authorization'))
+                self.send_response(200)
+                self.end_headers()
+            do_POST = do_GET
+            def log_message(self, *args):
+                pass
+
+        destination = ThreadingHTTPServer(('127.0.0.1', 0), Destination)
+        target = f'http://127.0.0.1:{destination.server_port}/'
+
+        class Redirect(Destination):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header('Location', target)
+                self.end_headers()
+
+        source = ThreadingHTTPServer(('127.0.0.1', 0), Redirect)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True)
+                   for server in (source, destination)]
+        for thread in threads:
+            thread.start()
+        client = McpClient(McpServerSpec('redirect', (), enabled=True,
+                           url=f'http://127.0.0.1:{source.server_port}/',
+                           bearer_token_env_var='SYMPHONAI_CHECK_MCP_TOKEN'), cwd=ws.root)
+        try:
+            with mock.patch.dict(os.environ, {'SYMPHONAI_CHECK_MCP_TOKEN': 'fixture-token'}):
+                try:
+                    client.start()
+                except McpError as exc:
+                    assert target.rstrip('/') in str(exc), str(exc)
+                else:
+                    raise AssertionError('cross-origin MCP redirect was accepted')
+            assert received == [], received
+        finally:
+            client.close()
+            for server in (source, destination):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
+
+
+@check('access.sandbox_blocks_writes_to_git_config_and_secrets')
+def sandbox_blocks_writes_to_git_config_and_secrets():
+    import shutil
+    import subprocess
+
+    if not shell.sandbox_available():
+        skip('platform shell sandbox is unavailable')
+    git = shutil.which('git')
+    if git is None:
+        skip('git is unavailable')
+    with tempfile.TemporaryDirectory() as fixture:
+        base = Path(fixture).resolve()
+        roots = [base/'repo', base/'extra']
+        environment = shell.shell_environment()
+        environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_OPTIONAL_LOCKS='0')
+        for root in roots:
+            root.mkdir()
+            subprocess.run([git, 'init', '-q', str(root)], env=environment,
+                           check=True, capture_output=True, timeout=10)
+            (root/'.git/hooks/post-commit').write_text('fixture hook\n')
+            (root/'.symphonai').mkdir()
+            (root/'.symphonai/config.toml').write_text('# fixture config\n')
+            (root/'.env').write_text('FIXTURE_ONLY=value\n')
+            (root/'private.pem').write_text('fixture private value\n')
+            (root/'readable.key').write_text('fixture readable value\n')
+            (root/'.ssh').mkdir()
+            (root/'.ssh/marker.txt').write_text('fixture directory value\n')
+            (root/'src').mkdir()
+        policy = PermissionPolicy(repo_root=roots[0], allowed_write_scope=roots,
+                                  sandbox_write_scope=roots, shell_sandbox=True,
+                                  sandbox_readable=('*.key',))
+
+        def run(root, command):
+            argv = shell.sandbox_command(policy, [shell.shell_executable(), '-c', command], root)
+            return subprocess.run(argv, cwd=root, env=environment, capture_output=True,
+                                  text=True, timeout=10)
+
+        def unchanged(root, command, path):
+            before = path.stat()
+            result = run(root, command)
+            assert result.returncode != 0, (command, result.stdout, result.stderr)
+            after = path.stat()
+            assert (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (
+                after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), path
+
+        for root in roots:
+            for command, path in (
+                ('printf x > .git/hooks/post-commit', root/'.git/hooks/post-commit'),
+                ('git config core.fsmonitor x', root/'.git/config'),
+                ('echo x > .symphonai/config.toml', root/'.symphonai/config.toml'),
+                ('echo x > .env', root/'.env'),
+                ('echo x > private.pem', root/'private.pem'),
+                ('echo x > readable.key', root/'readable.key'),
+                ('echo x > .ssh/marker.txt', root/'.ssh/marker.txt'),
+            ):
+                unchanged(root, command, path)
+            for command in ('git status --porcelain', 'git diff', 'echo x > src/a.txt',
+                            'echo x > src/new.txt'):
+                result = run(root, command)
+                assert result.returncode == 0, (command, result.stderr)
+            assert (root/'src/new.txt').read_text() == 'x\n'
+            assert 'fixture readable value' in run(root, 'cat readable.key').stdout
+            assert 'fixture private value' not in run(root, 'cat private.pem').stdout
+            assert 'fixture directory value' not in run(root, 'cat .ssh/marker.txt').stdout
+            if sys.platform == 'darwin':
+                assert run(root, 'echo x > new.key').returncode != 0
+                assert not (root/'new.key').exists()
+
+        # A gitdir outside the writable root remains protected even though temp is writable.
+        target = base/'gitdir'
+        (roots[0]/'.git').rename(target)
+        (roots[0]/'.git').write_text('gitdir: ../gitdir\n')
+        unchanged(roots[0], 'git config core.fsmonitor x', target/'config')
+        unchanged(roots[0], 'echo x > ../gitdir/hooks/post-commit', target/'hooks/post-commit')
+        unchanged(roots[0], 'echo x > .git', roots[0]/'.git')
+        assert run(roots[0], 'git status --porcelain').returncode == 0
+        temporary = base/'ordinary-temp.txt'
+        assert run(roots[0], f'echo x > "{temporary}"').returncode == 0
+        assert temporary.read_text() == 'x\n'

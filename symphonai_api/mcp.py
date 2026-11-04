@@ -15,7 +15,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.parse import urlsplit
 
 from symphonai_api.process import stop_process_group
 from symphonai_api.web import valid_service_url
@@ -49,6 +50,24 @@ _EOF = object()
 
 class McpError(RuntimeError):
     """A server that failed to start, answer, or speak the protocol."""
+
+
+def _http_open(request: Request, *, timeout: float):
+    def origin(url):
+        parsed = urlsplit(url)
+        return (parsed.scheme.casefold(), (parsed.hostname or '').casefold(),
+                parsed.port or (443 if parsed.scheme == 'https' else 80))
+
+    original = origin(request.full_url)
+
+    class ServerRedirects(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            target = origin(newurl)
+            if target != original:
+                raise McpError(f"MCP redirect to another origin refused: {target[0]}://{target[1]}:{target[2]}")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return build_opener(ServerRedirects()).open(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -381,7 +400,7 @@ class McpClient:
                     data=json.dumps(message, separators=(",", ":")).encode("utf-8"),
                     headers=self._http_headers(), method="POST")
                 try:
-                    with urlopen(request, timeout=timeout) as response:
+                    with _http_open(request, timeout=timeout) as response:
                         status = response.status
                         content_type = response.headers.get_content_type()
                         body = response.read()
@@ -478,7 +497,7 @@ class McpClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.spec.startup_timeout_seconds) as response:
+            with _http_open(request, timeout=self.spec.startup_timeout_seconds) as response:
                 status = response.status
         except HTTPError as exc:
             self.close()
@@ -762,7 +781,7 @@ class McpClient:
                         headers=self._http_headers(),
                         method="DELETE",
                     )
-                    with urlopen(request, timeout=_CLEANUP_TIMEOUT_SECONDS):
+                    with _http_open(request, timeout=_CLEANUP_TIMEOUT_SECONDS):
                         pass
                 except Exception:  # noqa: BLE001
                     pass

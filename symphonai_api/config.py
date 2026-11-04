@@ -370,6 +370,11 @@ def load_config(
         if scope in {Scope.PROJECT, Scope.PRIVATE}:
             safe_values: dict[str, object] = {}
             for section, value in values.items():
+                if section == "sessions":
+                    warnings.append(
+                        f"{source}: sessions: accepted only from user config; section skipped"
+                    )
+                    continue
                 if section == "permissions":
                     warnings.append(
                         f"{source}: permissions: grants are refused from project and private config scopes; section skipped"
@@ -390,6 +395,19 @@ def load_config(
                         f"{source}: sandbox.readable: accepted only from user config; key skipped"
                     )
                     value = {key: item for key, item in value.items() if key != "readable"}
+                if section == "sandbox" and isinstance(value, Mapping):
+                    value = dict(value)
+                    for key, allowed in (("shell", True), ("network", False)):
+                        if key in value and value[key] is not allowed:
+                            warnings.append(
+                                f"{source}: sandbox.{key}: project and private config may only set {str(allowed).lower()}; key skipped"
+                            )
+                            del value[key]
+                if section == "budgets" and isinstance(value, Mapping) and "price_table" in value:
+                    warnings.append(
+                        f"{source}: budgets.price_table: accepted only from user config; key skipped"
+                    )
+                    value = {key: item for key, item in value.items() if key != "price_table"}
                 try:
                     _validate(source, {section: value})
                 except ConfigError as exc:
@@ -525,21 +543,38 @@ class CapabilityCeiling:
         """Return a copy of a conversation policy limited by this ceiling."""
         bounded = replace(policy)
         if self.allowed_write_scope is not None:
+            scope = tuple(Path(path).resolve() for path in self.allowed_write_scope)
+            bounded.owner_write_scope = (
+                tuple(_intersect_write_scopes(list(policy.owner_write_scope), list(scope)))
+                if policy.owner_write_scope is not None else scope
+            )
             bounded.allowed_write_scope = _intersect_write_scopes(
                 policy.allowed_write_scope,
                 [Path(path).resolve() for path in self.allowed_write_scope],
             )
         if self.shell_enabled is False:
+            bounded.owner_shell_disabled = True
             bounded.shell_enabled = False
         if self.shell_allowlist is not None:
+            bounded.owner_shell_allowlist = (
+                tuple(_intersect_shell_allowlists(list(policy.owner_shell_allowlist), list(self.shell_allowlist)))
+                if policy.owner_shell_allowlist is not None else self.shell_allowlist
+            )
             bounded.shell_allowlist = _intersect_shell_allowlists(
                 policy.shell_allowlist,
                 list(self.shell_allowlist),
             )
         if self.fetch_enabled is False:
+            bounded.owner_fetch_disabled = True
             bounded.fetch_enabled = False
             bounded.fetch_allowlist = []
-        elif self.fetch_allowlist is not None:
+        if self.fetch_allowlist is not None:
+            hosts = tuple(host.casefold().rstrip(".") for host in self.fetch_allowlist)
+            bounded.owner_fetch_allowlist = (
+                tuple(host for host in policy.owner_fetch_allowlist if host in hosts)
+                if policy.owner_fetch_allowlist is not None else hosts
+            )
+        if self.fetch_enabled is not False and self.fetch_allowlist is not None:
             reachable = (
                 set(self.fetch_allowlist)
                 if policy.fetch_enabled

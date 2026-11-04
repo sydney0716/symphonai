@@ -135,14 +135,33 @@ def _seatbelt_profile(policy: PermissionPolicy) -> str:
     def regex_filter(expression: str) -> str:
         return f"(regex {quote_path(expression)})"
 
-    prefix = "^" + re.escape(str(policy.repo_root.resolve()).rstrip("/")) + "/([^/]+/)*"
-    skipped = "|".join(re.escape(name) for name in sorted(DEFAULT_SKIP_DIRECTORIES))
-    excluded = regex_filter(prefix + "(" + skipped + r"|[^/]*\.egg-info|\.[gG][iI][tT])(/|$)")
-    for pattern in policy.forbidden_patterns:
-        if pattern.rstrip("/").casefold() == ".git" or pattern in policy.sandbox_readable:
-            continue
-        denied = regex_filter(prefix + component_regex(pattern) + "(/|$)")
-        rules.append(f"(deny file-read* (require-all {denied} (require-not {excluded})))")
+    roots = {policy.repo_root.resolve(), *(
+        path.resolve() for path in (policy.sandbox_write_scope or ())
+    )}
+    for root in sorted(roots):
+        for name in (".git", ".symphonai"):
+            path = root / name
+            rules.append(f"(deny file-write* (subpath {quote_path(str(path))}))")
+            if path.is_symlink():
+                rules.append(f"(deny file-write* (subpath {quote_path(str(path.resolve()))}))")
+        git = root / ".git"
+        if git.is_file():
+            pointer = git.read_text(encoding="utf-8").strip()
+            if not pointer.startswith("gitdir: ") or not pointer[8:].strip():
+                raise ValueError(f"invalid gitdir pointer: {git}")
+            target = (root / pointer[8:].strip()).resolve()
+            rules.append(f"(deny file-write* (subpath {quote_path(str(target))}))")
+        prefix = "^" + re.escape(str(root).rstrip("/")) + "/([^/]+/)*"
+        skipped = "|".join(re.escape(name) for name in sorted(DEFAULT_SKIP_DIRECTORIES))
+        excluded = regex_filter(prefix + "(" + skipped + r"|[^/]*\.egg-info)(/|$)")
+        for pattern in policy.forbidden_patterns:
+            if pattern.rstrip("/").casefold() == ".git":
+                continue  # Git metadata stays readable, but never writable.
+            matched = regex_filter(prefix + component_regex(pattern) + "(/|$)")
+            denied = f"(require-all {matched} (require-not {excluded}))"
+            rules.append(f"(deny file-write* {denied})")
+            if pattern not in policy.sandbox_readable:
+                rules.append(f"(deny file-read* {denied})")
     rules.extend(f"(deny file-read* file-write* (subpath {quote_path(str(folder))}))"
                  for folder in policy.protected_paths)
     return "\n".join(rules)
@@ -318,25 +337,48 @@ def _bwrap_command(policy: PermissionPolicy, argv: list[str], cwd: Path | None =
     command.extend(("--bind", temporary, temporary, "--bind", "/tmp", "/tmp"))
     patterns = tuple(
         pattern for pattern in policy.forbidden_patterns
-        if pattern.rstrip("/").casefold() != ".git" and pattern not in policy.sandbox_readable
+        if pattern.rstrip("/").casefold() != ".git"
     )
+    unreadable = tuple(pattern for pattern in patterns if pattern not in policy.sandbox_readable)
 
     def walk_error(error: OSError) -> None:
         raise error
 
-    if Path(root).is_dir():
-        for directory, directories, files in os.walk(root, onerror=walk_error):
+    roots = {Path(root), *(Path(path) for path in writable)}
+    for directory_root in sorted(roots):
+        for name in (".git", ".symphonai"):
+            path = directory_root / name
+            if path.exists():
+                resolved = str(path.resolve())
+                command.extend(("--ro-bind", resolved, resolved))
+        git = directory_root / ".git"
+        if git.is_file():
+            pointer = git.read_text(encoding="utf-8").strip()
+            if not pointer.startswith("gitdir: ") or not pointer[8:].strip():
+                raise ValueError(f"invalid gitdir pointer: {git}")
+            target = (directory_root / pointer[8:].strip()).resolve()
+            if target.exists():
+                command.extend(("--ro-bind", str(target), str(target)))
+        for directory, directories, files in os.walk(directory_root, onerror=walk_error):
             for name in list(directories):
                 path = Path(directory) / name
-                if name.casefold() == ".git" or _default_skipped_directory(name) or path.is_symlink():
+                if _default_skipped_directory(name):
                     directories.remove(name)
                 elif _matching_forbidden_component(name, patterns):
-                    command.extend(("--tmpfs", str(path)))
+                    resolved = str(path.resolve())
+                    if _matching_forbidden_component(name, unreadable):
+                        command.extend(("--tmpfs", resolved, "--remount-ro", resolved))
+                        directories.remove(name)
+                    else:
+                        command.extend(("--ro-bind", resolved, resolved))
+                elif path.is_symlink():
                     directories.remove(name)
             for name in files:
                 path = Path(directory) / name
-                if not path.is_symlink() and _matching_forbidden_component(name, patterns):
-                    command.extend(("--ro-bind", "/dev/null", str(path)))
+                if _matching_forbidden_component(name, patterns) and path.exists():
+                    resolved = str(path.resolve())
+                    source = "/dev/null" if _matching_forbidden_component(name, unreadable) else resolved
+                    command.extend(("--ro-bind", source, resolved))
     from symphonai_api.paths import ensure_private_directory
     for folder in policy.protected_paths:
         # Mount before a sign-in can create the first token during this shell.

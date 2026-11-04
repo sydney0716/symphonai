@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+import http.client
+import ipaddress
+import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -79,6 +82,71 @@ _BLOCK_TAGS = frozenset(
 
 class WebFetchError(Exception):
     """A fetch failed. Never carries a header value or a query string."""
+
+
+def public_addresses(host: str, port: int) -> list[tuple]:
+    """Resolve once, rejecting the entire answer if any address is non-public."""
+    try:
+        try:
+            host = socket.inet_ntoa(socket.inet_aton(host))
+        except OSError:
+            pass
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        if not addresses:
+            raise ValueError("no addresses")
+        for _, _, _, _, sockaddr in addresses:
+            address = ipaddress.ip_address(sockaddr[0].split('%', 1)[0])
+            address = getattr(address, 'ipv4_mapped', None) or address
+            if (address.is_loopback or address.is_private or address.is_link_local
+                    or address.is_reserved or address.is_unspecified or address.is_multicast):
+                raise ValueError("non-public address")
+        return addresses
+    except (OSError, ValueError):
+        raise WebFetchError("web_fetch blocks an unresolved or non-public host") from None
+
+
+def _public_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                       source_address=None):
+    # Connect directly to the checked sockaddr: no second name lookup by create_connection.
+    host, port = address
+    addresses = public_addresses(host, port)
+    last_error = None
+    for family, kind, protocol, _, sockaddr in addresses:
+        connection = socket.socket(family, kind, protocol)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                connection.settimeout(timeout)
+            if source_address:
+                connection.bind(source_address)
+            connection.connect(sockaddr)
+            return connection
+        except OSError as exc:
+            last_error = exc
+            connection.close()
+    raise last_error
+
+
+def _pinned_http(host, **kwargs):
+    connection = http.client.HTTPConnection(host, **kwargs)
+    connection._create_connection = _public_connection
+    return connection
+
+
+def _pinned_https(host, **kwargs):
+    # HTTPSConnection still wraps the socket using its original hostname for TLS.
+    connection = http.client.HTTPSConnection(host, **kwargs)
+    connection._create_connection = _public_connection
+    return connection
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(_pinned_http, request)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(_pinned_https, request, context=self._context)
 
 
 class _RedirectBlocked(WebFetchError):
@@ -204,7 +272,10 @@ def fetch_url(
 
     current_url = url
     redirects = 0
-    opener = urllib.request.build_opener(RedirectBlocker())
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), RedirectBlocker(),
+        _PublicHTTPHandler(), _PublicHTTPSHandler(),
+    )
 
     while True:
         if cancel is not None:

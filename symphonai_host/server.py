@@ -942,7 +942,17 @@ class HostServer:
 
             def _read_object(self) -> dict:
                 try:
-                    length = int(self.headers.get("Content-Length", "0"))
+                    # Ten 5 MB attachments expand to ~66.7 MB of base64; leave
+                    # headroom for prompt text and JSON metadata (80 MiB total).
+                    maximum = 80 * 1024 * 1024
+                    lengths = self.headers.get_all("Content-Length", [])
+                    if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal():
+                        self.close_connection = True
+                        raise ProtocolError("a non-negative Content-Length is required")
+                    length = int(lengths[0])
+                    if length > maximum:
+                        self.close_connection = True
+                        raise ProtocolError(f"request body exceeds {maximum} bytes")
                     data = json.loads(self.rfile.read(length).decode("utf-8"))
                 except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise ProtocolError(f"invalid JSON payload: {exc}") from None

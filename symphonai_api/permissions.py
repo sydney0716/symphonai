@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import fnmatch
 import difflib
-import ipaddress
 import math
 import os
 import re
@@ -125,9 +124,29 @@ def _loopback_download(argv: tuple[str, ...]) -> bool:
     return bool(urls)
 
 
+def _git_command(argv: tuple[str, ...]) -> tuple[str, ...]:
+    """Remove git's global options so every shell rule sees its subcommand."""
+    if not argv or os.path.basename(argv[0]) != "git":
+        return argv
+    index = 1
+    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+    while index < len(argv):
+        word = argv[index]
+        if word in value_options:
+            index += 2
+        elif word.startswith("--") or word in {"-p", "-P"}:
+            index += 1
+        elif word.startswith(("-C", "-c")):
+            index += 1
+        else:
+            break
+    return ("git", *argv[index:])
+
+
 def _discards_work(
     argv: tuple[str, ...], root: Path, cwd: Path | None, *, indirect: bool = False,
 ) -> str | None:
+    argv = _git_command(argv)
     if len(argv) < 2 or os.path.basename(argv[0]) != "git":
         return None
     subcommand, *arguments = argv[1:]
@@ -173,6 +192,7 @@ def _discards_work(
 
 
 def _plan_read_only_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
+    argv = _git_command(argv)
     normalized = list(argv)
     program = os.path.basename(argv[0]) if argv else ""
     git_subcommand = os.path.basename(argv[1]) if program == "git" and len(argv) > 1 else ""
@@ -188,6 +208,14 @@ def _plan_read_only_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
 def _plan_path_arguments(argv: tuple[str, ...]) -> tuple[str, ...]:
     if not argv:
         return ()
+    global_paths = []
+    if os.path.basename(argv[0]) == "git":
+        for index, word in enumerate(argv[:-1]):
+            if word in {"-C", "--git-dir", "--work-tree"}:
+                global_paths.append(argv[index + 1])
+            elif word.startswith(("--git-dir=", "--work-tree=")):
+                global_paths.append(word.split("=", 1)[1])
+    argv = _git_command(argv)
     program = os.path.basename(argv[0])
     command_start = 2 if program == "git" and len(argv) > 1 else 1
     option_command = (
@@ -200,7 +228,7 @@ def _plan_path_arguments(argv: tuple[str, ...]) -> tuple[str, ...]:
         ("head",): {"-n", "-c"},
         ("tail",): {"-n", "-c"},
     }.get(option_command, set())
-    paths = []
+    paths = global_paths
     index = command_start
     while index < len(argv):
         word = argv[index]
@@ -510,6 +538,14 @@ class PermissionPolicy:
     allow_uncheckable_shell: bool = False
     allow_discarding_work: bool = False
     sandbox_readable: tuple[str, ...] = ()
+    # Provenance for limits that approval must never override.
+    shell_explicitly_disabled: bool = field(default=False, kw_only=True)
+    fetch_explicitly_disabled: bool = field(default=False, kw_only=True)
+    owner_write_scope: tuple[Path, ...] | None = field(default=None, kw_only=True)
+    owner_shell_disabled: bool = field(default=False, kw_only=True)
+    owner_shell_allowlist: tuple[tuple[str, ...], ...] | None = field(default=None, kw_only=True)
+    owner_fetch_disabled: bool = field(default=False, kw_only=True)
+    owner_fetch_allowlist: tuple[str, ...] | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
@@ -645,6 +681,25 @@ class PermissionPolicy:
                 )
         return PermissionPolicy(
             repo_root=ceiling.repo_root,
+            shell_explicitly_disabled=self.shell_explicitly_disabled or ceiling.shell_explicitly_disabled,
+            fetch_explicitly_disabled=self.fetch_explicitly_disabled or ceiling.fetch_explicitly_disabled,
+            owner_write_scope=(
+                tuple(_intersect_write_scopes(list(self.owner_write_scope), list(ceiling.owner_write_scope)))
+                if self.owner_write_scope is not None and ceiling.owner_write_scope is not None
+                else self.owner_write_scope if self.owner_write_scope is not None else ceiling.owner_write_scope
+            ),
+            owner_shell_disabled=self.owner_shell_disabled or ceiling.owner_shell_disabled,
+            owner_shell_allowlist=(
+                tuple(_intersect_shell_allowlists(list(self.owner_shell_allowlist), list(ceiling.owner_shell_allowlist)))
+                if self.owner_shell_allowlist is not None and ceiling.owner_shell_allowlist is not None
+                else self.owner_shell_allowlist if self.owner_shell_allowlist is not None else ceiling.owner_shell_allowlist
+            ),
+            owner_fetch_disabled=self.owner_fetch_disabled or ceiling.owner_fetch_disabled,
+            owner_fetch_allowlist=(
+                tuple(host for host in self.owner_fetch_allowlist if host in ceiling.owner_fetch_allowlist)
+                if self.owner_fetch_allowlist is not None and ceiling.owner_fetch_allowlist is not None
+                else self.owner_fetch_allowlist if self.owner_fetch_allowlist is not None else ceiling.owner_fetch_allowlist
+            ),
             allowed_write_scope=_intersect_write_scopes(
                 self.allowed_write_scope, ceiling.allowed_write_scope
             ),
@@ -774,6 +829,14 @@ class PermissionPolicy:
         resolved, decision = self._check_path(path, "write_file")
         if not decision.allowed:
             return decision
+        if self.owner_write_scope is not None and not any(
+            resolved == root or root in resolved.parents for root in self.owner_write_scope
+        ):
+            return self._deny(
+                "the owner's write scope refuses this path",
+                denial=DenialReason.OUTSIDE_WRITE_SCOPE,
+                tool_name="write_file",
+            )
         if self.mode == "plan":
             return self._deny(
                 "plan mode allows reads only; this call would change the world",
@@ -784,7 +847,11 @@ class PermissionPolicy:
             return self._ask_approval(
                 operation="write_file",
                 target=str(path),
-                details=f"write inside repo root: {resolved}",
+                details=f"write inside repo root: {resolved}" + (
+                    "; outside this agent's write scope" if not any(
+                        resolved == root or root in resolved.parents for root in self.allowed_write_scope
+                    ) else ""
+                ),
                 diff=diff,
             )
         for allowed_root in self.allowed_write_scope:
@@ -816,25 +883,28 @@ class PermissionPolicy:
             host = (parsed.hostname or "").casefold().rstrip(".")
         except ValueError:
             host = ""
+        if self.owner_fetch_disabled or self.fetch_explicitly_disabled:
+            return self._deny(
+                "web_fetch is disabled by the owner's limit" if self.owner_fetch_disabled
+                else "web_fetch is explicitly disabled by this policy",
+                denial=DenialReason.DOMAIN_NOT_APPROVED,
+                tool_name="web_fetch",
+            )
+        if self.owner_fetch_allowlist is not None and host not in self.owner_fetch_allowlist:
+            return self._deny(
+                "the owner's fetch allowlist refuses this host",
+                denial=DenialReason.DOMAIN_NOT_APPROVED,
+                tool_name="web_fetch",
+            )
         blocked = not host or host == "localhost" or host.endswith(
             (".localhost", ".local")
         )
         if not blocked:
             try:
-                address = ipaddress.ip_address(host)
-            except ValueError:
-                address = None
-            if address is not None:
-                blocked = any(
-                    (
-                        address.is_loopback,
-                        address.is_private,
-                        address.is_link_local,
-                        address.is_reserved,
-                        address.is_unspecified,
-                        address.is_multicast,
-                    )
-                )
+                from symphonai_api.web import public_addresses, WebFetchError
+                public_addresses(host, parsed.port or (443 if scheme == "https" else 80))
+            except (ValueError, WebFetchError):
+                blocked = True
         if blocked:
             return self._deny(
                 f"web_fetch blocks host {host or '[missing]'}",
@@ -844,11 +914,14 @@ class PermissionPolicy:
 
         if host in preapproved_domains() or host in self.fetch_allowlist:
             return PermissionDecision.allow()
+        outside_allowlist = bool(self.fetch_allowlist) and host not in self.fetch_allowlist
         if self.mode in ("ask", "auto"):
             return self._ask_approval(
                 operation="web_fetch",
                 target=url,
-                details=f"HTTP GET from {host}",
+                details=f"HTTP GET from {host}" + (
+                    "; outside this agent's fetch allowlist" if outside_allowlist else ""
+                ),
             )
         if self.fetch_enabled:
             return PermissionDecision.allow()
@@ -882,6 +955,13 @@ class PermissionPolicy:
             current_directory = self.repo_root if cwd is None else Path(cwd).resolve()
             for command in commands:
                 words = command.argv
+                for path in command.input_paths:
+                    candidate_path = Path(path)
+                    if not candidate_path.is_absolute():
+                        candidate_path = (current_directory or self.repo_root) / candidate_path
+                    decision = self.check_read(candidate_path)
+                    if decision.denial == DenialReason.FORBIDDEN_PATTERN:
+                        return decision
                 if words[0] == "cd":
                     destination = words[-1] if len(words) > 1 else ""
                     if current_directory is not None and destination and not destination.startswith("-"):
@@ -910,6 +990,12 @@ class PermissionPolicy:
                         continue
                     if program == "find":
                         find_words = candidate
+                        if "-delete" in find_words and ("rm",) in self.always_deny_commands:
+                            return self._deny(
+                                "command matches always-deny rule: 'rm' (find -delete)",
+                                denial=DenialReason.ALWAYS_DENY,
+                                tool_name="run_shell",
+                            )
                         exec_index = next(
                             (
                                 index for index, word in enumerate(find_words)
@@ -938,6 +1024,7 @@ class PermissionPolicy:
                             denial=DenialReason.ALWAYS_DENY,
                             tool_name="run_shell",
                         )
+                    candidate = _git_command(candidate)
                     for denied_prefix in self.always_deny_commands:
                         if (
                             candidate
@@ -951,6 +1038,25 @@ class PermissionPolicy:
                                 denial=DenialReason.ALWAYS_DENY,
                                 tool_name="run_shell",
                             )
+        if self.owner_shell_disabled or self.shell_explicitly_disabled:
+            return self._deny(
+                "run_shell is disabled by the owner's limit" if self.owner_shell_disabled
+                else "run_shell is explicitly disabled by this policy",
+                denial=DenialReason.SHELL_DISABLED,
+                tool_name="run_shell",
+            )
+        if self.owner_shell_allowlist is not None and not (
+            () in self.owner_shell_allowlist or (commands is not None and all(
+                not command.writes and any(
+                    command.argv[:len(prefix)] == prefix for prefix in self.owner_shell_allowlist
+                ) for command in commands
+            ))
+        ):
+            return self._deny(
+                "the owner's shell allowlist refuses this command",
+                denial=DenialReason.NOT_ALLOWLISTED,
+                tool_name="run_shell",
+            )
         if self.mode == "plan":
             if commands is None:
                 return self._deny(
@@ -962,10 +1068,20 @@ class PermissionPolicy:
                 )
             current_directory = self.repo_root if cwd is None else Path(cwd).resolve()
             for command in commands:
-                if command.writes or classify(_plan_read_only_argv(command.argv)) is None:
+                read_only = classify(_plan_read_only_argv(command.argv)) is not None
+                if command.argv[0] == "git" and any(
+                    word == "-c" or word.startswith(("-c", "--config-env", "--exec-path"))
+                    for word in command.argv[1:]
+                ):
+                    read_only = False
+                # grep is absent from the shared table; permit its plain search form.
+                if command.argv[0] == "grep":
+                    read_only = all(not word.startswith("-") or word in {"-n", "--"}
+                                    for word in command.argv[1:])
+                if command.writes or not read_only:
                     break
                 unsafe_path = False
-                for argument in _plan_path_arguments(command.argv):
+                for argument in (*_plan_path_arguments(command.argv), *command.input_paths):
                     if "$" in argument or any(char in argument for char in "*?["):
                         unsafe_path = True
                         break
@@ -997,7 +1113,14 @@ class PermissionPolicy:
             return self._ask_approval(
                 operation="run_shell",
                 target=argv[2] if nested else " ".join(argv),
-                details=f"run in repo root: {self.repo_root}",
+                details=f"run in repo root: {self.repo_root}" + (
+                    "; outside this agent's shell allowlist" if () not in self.shell_allowlist and (commands is None or not all(
+                        not command.writes and any(
+                            command.argv[:len(prefix)] == prefix for prefix in self.shell_allowlist
+                        )
+                        for command in commands
+                    )) else ""
+                ),
                 command=argv_tuple,
                 commands=(
                     () if commands is None

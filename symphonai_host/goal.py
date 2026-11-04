@@ -222,6 +222,7 @@ def run_check(
 ) -> dict:
     """Run one configured argv and return its bounded result."""
     from symphonai_api.process import run_process
+    from symphonai_api.tools.shell import shell_environment
     command = list(argv)
     if sandboxed and policy is not None:
         from symphonai_api.tools.shell import sandbox_command
@@ -232,6 +233,7 @@ def run_check(
     try:
         result = run_process(
             command, cwd, timeout=GOAL_CHECK_TIMEOUT_SECONDS if timeout is None else timeout,
+            env=shell_environment(cwd, for_agent=True),
             cancel=cancelled.is_set, output_limit=None, on_start=set_process,
         )
     finally:

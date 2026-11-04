@@ -295,6 +295,7 @@ def _policy(
     for key in ("shell_enabled", "fetch_enabled"):
         if key in table:
             values[key] = parser.boolean(key, table[key])
+            values[key.removesuffix("_enabled") + "_explicitly_disabled"] = values[key] is False
     if "shell_allowlist" in table:
         values["shell_allowlist"] = parser.commands("shell_allowlist", table["shell_allowlist"])
     if "fetch_allowlist" in table:

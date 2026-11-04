@@ -12,6 +12,7 @@ class ShellCommand:
     argv: tuple[str, ...]
     writes: bool = False
     stdin_scripts: tuple[str, ...] = ()
+    input_paths: tuple[str, ...] = ()
 
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
@@ -163,6 +164,10 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
             index += 1
             continue
 
+        if char == "#" and not active:
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+            continue
         if char in " \t\r":
             flush_word()
             index += 1
@@ -254,7 +259,7 @@ def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
                 current.append(("redir", f"{fd}{redir}", False, False, False))
                 index += width
                 continue
-            if not flush_segment():
+            if not flush_segment() and char != "\n":
                 return None
             index += width
             if char == "\n" and pending_heredocs:
@@ -381,7 +386,8 @@ def _expand(command: ShellCommand, depth: int) -> tuple[ShellCommand, ...] | Non
         parsed_commands.extend(parsed)
     prefix = command.argv[:shell_index]
     return tuple(
-        ShellCommand(prefix + item.argv, item.writes or command.writes)
+        ShellCommand(prefix + item.argv, item.writes or command.writes,
+                     input_paths=command.input_paths + item.input_paths)
         for item in parsed_commands
     )
 
@@ -392,6 +398,7 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
     pattern_words: list[bool] = []
     brace_words: list[bool] = []
     stdin_scripts: list[str] = []
+    input_paths: list[str] = []
     writes = False
     index = 0
     while index < len(tokens):
@@ -415,18 +422,23 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
         target = tokens[index + 1][1]
         if operator == "<<<":
             stdin_scripts.append(target)
+        if operator == "<":
+            input_paths.append(target)
         if operator.startswith(">") or operator.startswith("&>"):
             duplicate = operator.endswith("&") and target.isdigit()
             if target != "/dev/null" and not duplicate:
                 writes = True
         index += 2
     while argv and _ASSIGNMENT.fullmatch(argv[0]):
+        writes = True  # Environment overrides can make a nominal read execute code.
         argv.pop(0)
         dollar_words.pop(0)
         pattern_words.pop(0)
         brace_words.pop(0)
     if not argv:
         return None
+    if os.path.basename(argv[0]) == "env" and any(_ASSIGNMENT.fullmatch(word) for word in argv[1:]):
+        writes = True
     keywords = {"if", "then", "elif", "else", "do", "while", "until", "!"}
     while argv and argv[0] in keywords:
         argv.pop(0)
@@ -443,7 +455,7 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
         or (os.path.basename(argv[0]) in _WRAPPERS and any(dollar_words[1:]))
     ):
         return None
-    return ShellCommand(tuple(argv), writes, tuple(stdin_scripts))
+    return ShellCommand(tuple(argv), writes, tuple(stdin_scripts), tuple(input_paths))
 
 
 def _parse_command_line(text: str, depth: int) -> tuple[ShellCommand, ...] | None:

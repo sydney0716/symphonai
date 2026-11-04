@@ -175,8 +175,21 @@ class Preview:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _own_origin(self):
+                hosts = {f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}'}
+                host = self.headers.get('Host', '')
+                origins = self.headers.get_all('Origin', [])
+                if (len(self.headers.get_all('Host', [])) != 1 or host not in hosts
+                        or (origins and origins != [f'http://{host}'])):
+                    self.close_connection = True
+                    self._reply(403, {'error': 'Preview origin required'})
+                    return False
+                return True
+
             def do_POST(self):
                 if urlsplit(self.path).path == '/preview/mark':
+                    if not self._own_origin():
+                        return
                     try:
                         length = int(self.headers.get('Content-Length', '0'))
                         if not 0 < length <= 16000:
@@ -191,6 +204,8 @@ class Preview:
                 self.proxy()
 
             def proxy(self):
+                if not self._own_origin():
+                    return
                 if not self.path.startswith('/') or self.path.startswith('//'):
                     self._reply(400, {'error': 'Origin-relative paths required'})
                     return
