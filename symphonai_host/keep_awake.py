@@ -36,8 +36,8 @@ def _commands() -> list[list[str]]:
     if sys.platform.startswith('linux'):
         result = []
         for name, arguments in (
-            ('systemd-inhibit', ['--what=idle', '--who=SymphonAI', '--why=agents are working', 'sleep', 'infinity']),
-            ('gnome-session-inhibit', ['--inhibit', 'idle', 'sleep', 'infinity']),
+            ('systemd-inhibit', ['--what=idle', '--who=SymphonAI', '--why=agents are working', 'sleep', '300']),
+            ('gnome-session-inhibit', ['--inhibit', 'idle', 'sleep', '300']),
         ):
             command = shutil.which(name)
             if command and command not in _linux_failed:
@@ -58,7 +58,7 @@ def _update(token: object, active: bool) -> None:
             return
         if _process is not None:
             status = _process.poll()
-            if status is None and not (sys.platform == 'darwin' and time.monotonic() - _started >= 240):
+            if status is None and time.monotonic() - _started < 240:
                 return
             if status not in (None, 0) and sys.platform.startswith('linux'):
                 _linux_failed.add(_process.args[0])

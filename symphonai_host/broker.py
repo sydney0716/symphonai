@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 
 from symphonai_api.events import Event
@@ -18,12 +19,23 @@ class Subscription:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _dropped: int = 0
     _closed: bool = False
+    _terminal: deque = field(default_factory=deque)
+    _terminal_bytes: int = 0
+
+    def __post_init__(self):
+        self._ready = threading.Condition(self._lock)
 
     def get(self, timeout: float | None = None) -> Event | None:
         """Return an event, None on timeout, or None after broker closure."""
-        try:
-            return self._queue.get(timeout=timeout)
-        except queue.Empty:
+        with self._ready:
+            if not self._ready.wait_for(lambda: not self._queue.empty() or self._terminal or self._closed, timeout):
+                return None
+            if not self._queue.empty():
+                return self._queue.get_nowait()
+            if self._terminal:
+                event, size = self._terminal.popleft()
+                self._terminal_bytes -= size
+                return event
             return None
 
     def take_dropped(self) -> int:
@@ -76,13 +88,31 @@ class EventBroker:
                 self._subscriptions.remove(subscription)
             with subscription._lock:
                 subscription._closed = True
+                subscription._ready.notify_all()
 
     def publish(self, event: Event) -> None:
+        terminal = type(event).__name__ == "TerminalOutput"
+        size = len(event.data.encode("utf-8")) if terminal else 0
         with self._lock:
             subscriptions = tuple(self._subscriptions)
         for subscription in subscriptions:
             with subscription._lock:
                 if subscription._closed:
+                    continue
+                if terminal:
+                    if size > 65536:
+                        subscription._dropped += 1
+                        continue
+                    while subscription._terminal and (
+                        subscription._terminal_bytes + size > 256 * 1024
+                        or len(subscription._terminal) >= min(64, self._max_queued_events)
+                    ):
+                        _, removed = subscription._terminal.popleft()
+                        subscription._terminal_bytes -= removed
+                        subscription._dropped += 1
+                    subscription._terminal.append((event, size))
+                    subscription._terminal_bytes += size
+                    subscription._ready.notify()
                     continue
                 try:
                     subscription._queue.put_nowait(event)
@@ -92,6 +122,7 @@ class EventBroker:
                     subscription._queue.get_nowait()
                     subscription._dropped += 1
                     subscription._queue.put_nowait(event)
+                subscription._ready.notify()
 
     def close(self) -> None:
         with self._lock:
@@ -106,3 +137,4 @@ class EventBroker:
                 except queue.Full:
                     subscription._queue.get_nowait()
                     subscription._queue.put_nowait(None)
+                subscription._ready.notify_all()

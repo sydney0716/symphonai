@@ -26,7 +26,6 @@ from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.paths import symphonai_home
 from symphonai_api.role_prompts import load_role_additions
-from symphonai_api.providers.base import ProviderError
 from symphonai_api.roles import REVIEW_PROMPT, review_command_prompt
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
@@ -57,33 +56,12 @@ class _HeadlessKeyError(ValueError):
     pass
 
 
-class _StatusCapturingProvider:
-    def __init__(self, provider) -> None:  # noqa: ANN001
-        self._provider = provider
-        self.key_error_status: int | None = None
-
-    def __getattr__(self, name: str):  # noqa: ANN204
-        return getattr(self._provider, name)
-
-    def create_response(self, request, *, cancel=None):  # noqa: ANN001
-        try:
-            return self._provider.create_response(request, cancel=cancel)
-        except ProviderError as exc:
-            self._capture_status(exc)
-            raise
-
-
-    def create_response_stream(self, request, *, cancel=None):  # noqa: ANN001
-        try:
-            yield from self._provider.create_response_stream(request, cancel=cancel)
-        except ProviderError as exc:
-            self._capture_status(exc)
-            raise
-
-    def _capture_status(self, error: ProviderError) -> None:
-        status = getattr(error, "status", None)
-        if self.key_error_status is None and status in (401, 403):
-            self.key_error_status = status
+def _key_error_status(error) -> int | None:  # noqa: ANN001
+    status = getattr(error, "status", None)
+    if status in (401, 403):
+        return status
+    match = re.search(r"\bHTTP\s+(401|403)\b", str(error))
+    return int(match.group(1)) if match else None
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -337,10 +315,21 @@ def _tool_list(value: str | None) -> tuple[str, ...] | None:
     return names
 
 
-def _select_provider(arguments):  # noqa: ANN001
+def _select_provider(arguments, saved_choice=None):  # noqa: ANN001
+    if isinstance(saved_choice, dict):
+        arguments = argparse.Namespace(**vars(arguments))
+        if arguments.provider is None:
+            arguments.provider = saved_choice.get("name")
+        if arguments.provider == saved_choice.get("name"):
+            if arguments.model is None:
+                arguments.model = saved_choice.get("model")
+            if arguments.effort is None:
+                arguments.effort = saved_choice.get("effort")
     if arguments.provider is not None:
         try:
-            provider = _provider(arguments.provider, arguments.model)
+            base_url = (saved_choice.get("base_url") if isinstance(saved_choice, dict)
+                        and arguments.provider == saved_choice.get("name") else None)
+            provider = _provider(arguments.provider, arguments.model, base_url)
         except MissingAPIKeyError:
             env_var = next((variable for name, variable, _ in PROVIDERS if name == arguments.provider), None)
             if env_var is not None:
@@ -349,6 +338,8 @@ def _select_provider(arguments):  # noqa: ANN001
                 ) from None
             raise
         choice = {"name": arguments.provider}
+        if base_url is not None:
+            choice["base_url"] = base_url
     else:
         provider, choice = _provider_for_start(_provider)
         if provider is not None and arguments.model is not None:
@@ -369,7 +360,7 @@ def _select_provider(arguments):  # noqa: ANN001
     effort = arguments.effort if arguments.effort is not None else choice.get("effort")
     if effort is not None:
         choice["effort"] = effort
-    return _StatusCapturingProvider(provider), model, effort, choice
+    return provider, model, effort, choice
 
 
 def _rejected_key_message(provider_name: str, status: int) -> str:
@@ -401,9 +392,13 @@ def _wait_for_terminal(
                 event = RunFailed(agent_id="", run_id="", agent_name="leader",
                                   error="host run ended without a terminal event")
         if stream_json:
+            dropped = subscription.take_dropped()
+            if dropped:
+                print(json.dumps({"type": "dropped", "count": dropped}), flush=True)
             encoded = encode_event(event)
-            if isinstance(event, RunFailed) and provider is not None and provider.key_error_status in (401, 403):
-                encoded["error"] = _rejected_key_message(provider_name or provider.name, provider.key_error_status)
+            key_status = _key_error_status(event.error) if isinstance(event, RunFailed) else None
+            if key_status is not None and provider is not None:
+                encoded["error"] = _rejected_key_message(provider_name or provider.name, key_status)
             if encoded["type"] != "SessionStarted":
                 print(json.dumps(encoded, ensure_ascii=False), flush=True)
         if isinstance(event, PersonNotice):
@@ -509,11 +504,20 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             selected_tools = (set(allowed_tools) if allowed_tools is not None else valid_tools)
             selected_tools.difference_update(disallowed_tools)
             runtime.run.restrict_tool_names(selected_tools)
-        provider, model, effort, choice = _select_provider(arguments)
+        saved_choice = None
+        if arguments.resume:
+            session = SessionStore.open(runtime.run.sessions_root, arguments.resume)
+            try:
+                saved_choice = session.read_meta().get("provider_choice")
+            finally:
+                session.close()
+        provider, model, effort, choice = _select_provider(arguments, saved_choice)
+        runtime.run.select_provider(provider, model, effort, choice)
         previous_keys: set[str] = set()
         before_message_count = 0
         if arguments.resume:
-            runtime.run.open_session(arguments.resume)
+            runtime.run.open_session(arguments.resume, provider_choice_override=choice)
+            provider = runtime.run.provider
             previous = runtime.run.changes()
             previous_keys = {turn["key"] for turn in previous.get("turns", [])}
             session = SessionStore.open(runtime.run.sessions_root, arguments.resume)
@@ -528,7 +532,6 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
                 before_message_count = len(load_run(loaded_session).messages)
             finally:
                 loaded_session.close()
-        runtime.run.select_provider(provider, model, effort, choice)
         runtime.run.select_mode(arguments.mode)
 
         subscription = broker.subscribe()
@@ -582,7 +585,7 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
             if output_error is not None:
                 status = "failed"
                 error = f"final answer did not match the output schema: {output_error}"
-        key_error_status = provider.key_error_status
+        key_error_status = _key_error_status(terminal.error) if isinstance(terminal, RunFailed) else None
         if error is not None and key_error_status in (401, 403):
             selected_name = choice.get("name", provider.name)
             error = _rejected_key_message(selected_name, key_error_status)
@@ -772,10 +775,13 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                     goal, runner_pid=os.getpid(), runner_lock=True,
                 )
         except KeyError:
-            print(f"loop {arguments.resume} is unknown", file=sys.stderr, flush=True)
+            target = f"loop {arguments.resume}" if arguments.resume is not None else f"loop for {goal!r}"
+            print(f"{target} is unknown", file=sys.stderr, flush=True)
             return 1
         except RunActiveError as exc:
-            print(f"loop {arguments.resume} is {exc}; cannot resume", file=sys.stderr, flush=True)
+            target = f"loop {arguments.resume}" if arguments.resume is not None else f"loop for {goal!r}"
+            action = "resume" if arguments.resume is not None else "start"
+            print(f"{target} is {exc}; cannot {action}", file=sys.stderr, flush=True)
             return 1
         store = LoopStore(root)
         approved = False

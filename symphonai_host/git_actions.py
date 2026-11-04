@@ -191,13 +191,18 @@ def git_commit(root: Path, message: str, paths: list[str]) -> dict[str, Any]:
         if path not in changed:
             raise ValueError(f"no uncommitted change for path: {path}")
 
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=root,
+        capture_output=True, check=False,
+    )
+    has_head = head.returncode == 0
     descriptor, index_name = tempfile.mkstemp(prefix="symphonai-git-index-")
     os.close(descriptor)
     os.unlink(index_name)
     environment = {**os.environ, "GIT_INDEX_FILE": index_name}
     try:
         initialized = subprocess.run(
-            ["git", "read-tree", "HEAD"], cwd=root, env=environment,
+            ["git", "read-tree", "HEAD" if has_head else "--empty"], cwd=root, env=environment,
             capture_output=True, check=False,
         )
         if initialized.returncode:
@@ -224,7 +229,7 @@ def git_commit(root: Path, message: str, paths: list[str]) -> dict[str, Any]:
             output = (commit.stderr or commit.stdout).decode("utf-8", errors="replace")
             raise RuntimeError(output[-4000:] or "could not read the new commit")
         reset = subprocess.run(
-            ["git", "reset", "--quiet", "HEAD", "--", *selected], cwd=root,
+            ["git", "reset", "--quiet", "HEAD", *(["--", *selected] if has_head else [])], cwd=root,
             capture_output=True, check=False,
         )
         if reset.returncode:

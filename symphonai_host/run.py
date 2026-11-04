@@ -12,6 +12,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import time
 import threading
 from datetime import datetime, timezone
 from collections.abc import Callable, Mapping
@@ -1259,8 +1260,7 @@ class HostRun:
                     edits[key].append(edit)
                 edit["added"] += payload["lines_added"]
                 edit["removed"] += payload["lines_removed"]
-        if checkpoints is not None:
-            edits.update(HostRun._checkpoint_edit_totals(checkpoints))
+        edits = {key: sorted(rows, key=lambda row: row["path"]) for key, rows in edits.items()}
         edits.update(recorded_edits)
         return keys, edits
 
@@ -1689,170 +1689,211 @@ class HostRun:
                 raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
             run_id = new_id("run")
             cancel = CancellationToken()
-            if conversation is None:
-                if not detached and self._next_policy is not None:
-                    policy = self._next_policy
-                if self._provider is None and self._provider_factory is not None:
-                    self._provider = self._provider_factory(None, None, None)
-                    if self._provider is not None:
-                        self._provider_choice = {"name": self._provider.name}
-                if self._provider is None:
-                    raise ProviderSelectionError("no configured provider; add an API key in Settings")
-                policy = replace(policy)
-                spec_info = None if not _session_meta else _session_meta.get("spec_run")
-                if isinstance(spec_info, dict) and spec_info.get("kind") == "implement":
-                    worktree_admin = self._sessions_root / run_id / "worktree"
-                    start_ref = spec_info.get("start_ref", "HEAD")
-                    if not isinstance(start_ref, str) or not start_ref:
-                        raise ValueError("spec run start_ref must be a non-blank string")
-                    worktree_root = create_worktree(self._repo_root, worktree_admin, start=start_ref)
-                    policy = policy.rerooted(worktree_root)
-                    policy.mode = "allow"
-                approvals = self._new_approval_broker(run_id)
-                policy.approval_callback = approvals.callback
-                session = SessionStore(
-                    self._sessions_root,
-                    run_id,
-                    repo_root=self._repo_root if _session_meta and "spec_run" in _session_meta else policy.repo_root,
-                    events=fan_out(
-                        lambda event, sid=run_id: self._publish_session(event, sid),
-                        self._hooks,
-                    ),
-                )
-                if _session_meta:
-                    def change(meta):
-                        meta.update(_session_meta)
-                    session.update_meta(change)
-                try:
-                    leader = self._new_leader(session, policy=policy, approvals=approvals, tool_restriction=tool_restriction)
-                except Exception:
-                    session.close()
-                    raise
-                seeded = []
-                if self._system_prompt:
-                    seeded.append(Message(role=Role.SYSTEM, content=self._system_prompt))
-                instruction_policy = policy
-                if _session_meta and "spec_run" in _session_meta:
-                    instruction_policy = replace(policy, repo_root=self._repo_root)
-                instructions = load_instructions(instruction_policy, working_dir=self._working_dir)
-                for warning in instructions.warnings:
-                    print(f"instruction warning: {warning}", file=sys.stderr)
-                self._instruction_warnings_by_session[run_id] = list(instructions.warnings)
-                rendered = instructions.render()
-                if rendered:
-                    seeded.append(Message(role=Role.SYSTEM, content=rendered))
-                seeded.append(Message(
-                    role=Role.SYSTEM,
-                    content=(
-                        capture_environment(
-                            working_dir=self._working_dir,
-                            repo_root=policy.repo_root,
-                            provider=leader._config.leader_provider.name,
-                            model=leader._leader_spec.model.model,
-                        )
-                        + "\n\nIn the person's messages, @<path> names a file in this repository. "
-                        "Read it with read_file before relying on its contents."
-                    ),
-                ))
-                if self._mcp_instructions:
-                    sections = "\n\n".join(
-                        f"## {name}\n{instructions}"
-                        for name, instructions in self._mcp_instructions
-                    )
-                    seeded.append(Message(
-                        role=Role.SYSTEM,
-                        content=f"MCP servers' instructions:\n\n{sections}",
-                    ))
-                leader.seed_chat(seeded)
-                def change(meta):
-                    attachment_title = (
-                        attachments[0].filename
-                        if attachments and isinstance(attachments[0], DocumentBlock)
-                        else None
-                    )
-                    meta["title"] = _title or _conversation_title(prompt) or attachment_title or (
-                        "Attachment" if attachments else ""
+            creating_conversation = conversation is None
+            session = None
+            leader = None
+            worktree_admin = None
+            previous_conversation = self._conversation
+            previous_policy, previous_approvals = self._policy, self.approvals
+            previous_context, previous_usage = self._context_report, dict(self._usage_by_agent)
+            previous_goal, previous_goal_session = self._goal, self._goal_session_id
+            pending_context = list(self._pending_user_context)
+            try:
+                if conversation is None:
+                    if not detached and self._next_policy is not None:
+                        policy = self._next_policy
+                    if self._provider is None and self._provider_factory is not None:
+                        self._provider = self._provider_factory(None, None, None)
+                        if self._provider is not None:
+                            self._provider_choice = {"name": self._provider.name}
+                    if self._provider is None:
+                        raise ProviderSelectionError("no configured provider; add an API key in Settings")
+                    policy = replace(policy)
+                    spec_info = None if not _session_meta else _session_meta.get("spec_run")
+                    if isinstance(spec_info, dict) and spec_info.get("kind") == "implement":
+                        worktree_admin = self._sessions_root / run_id / "worktree"
+                        start_ref = spec_info.get("start_ref", "HEAD")
+                        if not isinstance(start_ref, str) or not start_ref:
+                            raise ValueError("spec run start_ref must be a non-blank string")
+                        worktree_root = create_worktree(self._repo_root, worktree_admin, start=start_ref)
+                        policy = policy.rerooted(worktree_root)
+                        policy.mode = "allow"
+                    approvals = self._new_approval_broker(run_id)
+                    policy.approval_callback = approvals.callback
+                    session = SessionStore(
+                        self._sessions_root,
+                        run_id,
+                        repo_root=self._repo_root if _session_meta and "spec_run" in _session_meta else policy.repo_root,
+                        events=fan_out(
+                            lambda event, sid=run_id: self._publish_session(event, sid),
+                            self._hooks,
+                        ),
                     )
                     if _session_meta:
-                        meta.update(_session_meta)
-                    if self._provider_choice is not None:
-                        meta["provider_choice"] = self._provider_choice
-                session.update_meta(change)
-                conversation = (leader, session)
-                self._open_conversations[session.run_id] = conversation
-                self._policy_by_session[session.run_id] = policy
-                self._approvals_by_session[session.run_id] = approvals
-                self._session_by_root_agent[leader.agent_ref.agent_id] = session.run_id
-                if not detached:
-                    self._conversation = conversation
-                    self._policy = policy
-                    self.approvals = approvals
-                    self._context_report = None
-                    self._usage_by_agent.clear()
-                self._context_by_session[session.run_id] = None
-                self._usage_by_session[session.run_id] = {}
-            else:
-                leader, _ = conversation
-            session_id = conversation[1].run_id
-            chat_message: ContentInput = prompt
-            if attachments:
-                chat_message = ([TextBlock(prompt)] if prompt else []) + list(attachments)
-            previous_rounds = None
-            if _new_goal is not None:
-                _new_goal.rounds = 1
-                goal = _new_goal
-                goal_session_id = session_id
-                self._goals_by_session[session_id] = _new_goal
-                self._save_goal(session_id, _new_goal)
-                self._goal_event("set", _new_goal, agent_id=leader.agent_ref.agent_id)
-            elif _goal_round and goal is not None and goal_session_id == session_id:
-                previous_rounds = goal.rounds
-                goal.rounds += 1
-                self._goals_by_session[session_id] = goal
-                self._save_goal(session_id, goal)
-            elif not _goal_round:
-                context = self._goal_checks_by_session.get(session_id)
-                if context is not None:
-                    context.interrupted = "interrupted"
-            is_goal_round = _goal_round or _new_goal is not None
-            if not detached and self._pending_user_context:
-                for context in self._pending_user_context:
-                    leader.add_context(context)
-                self._pending_user_context.clear()
-            thread = threading.Thread(
-                target=self._run,
-                args=(run_id, leader, chat_message, cancel, is_goal_round, session_id),
-                name=f"symphonai-host-{run_id}",
-                daemon=True,
-            )
-            active = _ActiveRun(
-                run_id, cancel, thread, leader.agent_ref.agent_id, goal_round=is_goal_round,
-            )
-            if not detached:
-                self._active = active
-                self._goal = goal
-                self._goal_session_id = goal_session_id
-            self._active_by_session[session_id] = active
-            try:
-                thread.start()
-            except Exception:
-                if not detached:
-                    self._active = None
-                self._active_by_session.pop(session_id, None)
+                        def change(meta):
+                            meta.update(_session_meta)
+                        session.update_meta(change)
+                    leader = self._new_leader(session, policy=policy, approvals=approvals, tool_restriction=tool_restriction)
+                    seeded = []
+                    if self._system_prompt:
+                        seeded.append(Message(role=Role.SYSTEM, content=self._system_prompt))
+                    instruction_policy = policy
+                    if _session_meta and "spec_run" in _session_meta:
+                        instruction_policy = replace(policy, repo_root=self._repo_root)
+                    instructions = load_instructions(instruction_policy, working_dir=self._working_dir)
+                    for warning in instructions.warnings:
+                        print(f"instruction warning: {warning}", file=sys.stderr)
+                    self._instruction_warnings_by_session[run_id] = list(instructions.warnings)
+                    rendered = instructions.render()
+                    if rendered:
+                        seeded.append(Message(role=Role.SYSTEM, content=rendered))
+                    seeded.append(Message(
+                        role=Role.SYSTEM,
+                        content=(
+                            capture_environment(
+                                working_dir=self._working_dir,
+                                repo_root=policy.repo_root,
+                                provider=leader._config.leader_provider.name,
+                                model=leader._leader_spec.model.model,
+                            )
+                            + "\n\nIn the person's messages, @<path> names a file in this repository. "
+                            "Read it with read_file before relying on its contents."
+                        ),
+                    ))
+                    if self._mcp_instructions:
+                        sections = "\n\n".join(
+                            f"## {name}\n{instructions}"
+                            for name, instructions in self._mcp_instructions
+                        )
+                        seeded.append(Message(
+                            role=Role.SYSTEM,
+                            content=f"MCP servers' instructions:\n\n{sections}",
+                        ))
+                    leader.seed_chat(seeded)
+                    def change(meta):
+                        attachment_title = (
+                            attachments[0].filename
+                            if attachments and isinstance(attachments[0], DocumentBlock)
+                            else None
+                        )
+                        meta["title"] = _title or _conversation_title(prompt) or attachment_title or (
+                            "Attachment" if attachments else ""
+                        )
+                        if _session_meta:
+                            meta.update(_session_meta)
+                        if self._provider_choice is not None:
+                            meta["provider_choice"] = self._provider_choice
+                    session.update_meta(change)
+                    conversation = (leader, session)
+                    self._open_conversations[session.run_id] = conversation
+                    self._policy_by_session[session.run_id] = policy
+                    self._approvals_by_session[session.run_id] = approvals
+                    self._session_by_root_agent[leader.agent_ref.agent_id] = session.run_id
+                    if not detached:
+                        self._conversation = conversation
+                        self._policy = policy
+                        self.approvals = approvals
+                        self._context_report = None
+                        self._usage_by_agent.clear()
+                    self._context_by_session[session.run_id] = None
+                    self._usage_by_session[session.run_id] = {}
+                else:
+                    leader, _ = conversation
+                session_id = conversation[1].run_id
+                chat_message: ContentInput = prompt
+                if attachments:
+                    chat_message = ([TextBlock(prompt)] if prompt else []) + list(attachments)
+                previous_rounds = None
                 if _new_goal is not None:
-                    self._save_goal(session_id, None)
-                    self._goals_by_session.pop(session_id, None)
-                    goal = None
-                    goal_session_id = None
-                    self._goal_event("clear", None, agent_id=leader.agent_ref.agent_id, session_id=session_id)
-                elif previous_rounds is not None and goal is not None:
-                    goal.rounds = previous_rounds
+                    _new_goal.rounds = 1
+                    goal = _new_goal
+                    goal_session_id = session_id
+                    self._goals_by_session[session_id] = _new_goal
+                    self._save_goal(session_id, _new_goal)
+                    self._goal_event("set", _new_goal, agent_id=leader.agent_ref.agent_id)
+                elif _goal_round and goal is not None and goal_session_id == session_id:
+                    previous_rounds = goal.rounds
+                    goal.rounds += 1
+                    self._goals_by_session[session_id] = goal
                     self._save_goal(session_id, goal)
+                elif not _goal_round:
+                    context = self._goal_checks_by_session.get(session_id)
+                    if context is not None:
+                        context.interrupted = "interrupted"
+                is_goal_round = _goal_round or _new_goal is not None
+                if not detached and self._pending_user_context:
+                    for context in self._pending_user_context:
+                        leader.add_context(context)
+                    self._pending_user_context.clear()
+                thread = threading.Thread(
+                    target=self._run,
+                    args=(run_id, leader, chat_message, cancel, is_goal_round, session_id),
+                    name=f"symphonai-host-{run_id}",
+                    daemon=True,
+                )
+                active = _ActiveRun(
+                    run_id, cancel, thread, leader.agent_ref.agent_id, goal_round=is_goal_round,
+                )
                 if not detached:
+                    self._active = active
                     self._goal = goal
                     self._goal_session_id = goal_session_id
+                self._active_by_session[session_id] = active
+                try:
+                    thread.start()
+                except Exception:
+                    if not detached:
+                        self._active = None
+                    self._active_by_session.pop(session_id, None)
+                    if _new_goal is not None:
+                        self._save_goal(session_id, None)
+                        self._goals_by_session.pop(session_id, None)
+                        goal = None
+                        goal_session_id = None
+                        self._goal_event("clear", None, agent_id=leader.agent_ref.agent_id, session_id=session_id)
+                    elif previous_rounds is not None and goal is not None:
+                        goal.rounds = previous_rounds
+                        self._save_goal(session_id, goal)
+                    if not detached:
+                        self._goal = goal
+                        self._goal_session_id = goal_session_id
+                    raise
+                return run_id
+            except BaseException:
+                cancel.close()
+                if creating_conversation:
+                    self._active_by_session.pop(run_id, None)
+                    self._open_conversations.pop(run_id, None)
+                    self._policy_by_session.pop(run_id, None)
+                    self._approvals_by_session.pop(run_id, None)
+                    self._context_by_session.pop(run_id, None)
+                    self._usage_by_session.pop(run_id, None)
+                    self._instruction_warnings_by_session.pop(run_id, None)
+                    self._goals_by_session.pop(run_id, None)
+                    if leader is not None:
+                        self._session_by_root_agent.pop(leader.agent_ref.agent_id, None)
+                    if not detached:
+                        self._conversation = previous_conversation
+                        self._policy, self.approvals = previous_policy, previous_approvals
+                        self._context_report, self._usage_by_agent = previous_context, previous_usage
+                        self._goal, self._goal_session_id = previous_goal, previous_goal_session
+                        self._pending_user_context = pending_context
+                        self._active = (None if previous_conversation is None else
+                                        self._active_by_session.get(previous_conversation[1].run_id))
+                    try:
+                        if leader is not None:
+                            leader.close()
+                    finally:
+                        try:
+                            if session is not None:
+                                session.close()
+                        finally:
+                            if worktree_admin is not None and worktree_admin.exists():
+                                remove_worktree(self._repo_root, worktree_admin)
+                            directory = self._sessions_root / run_id
+                            if directory.exists():
+                                shutil.rmtree(directory)
                 raise
-            return run_id
 
     def memory_store(self) -> AgentMemory | None:
         """Return the shared project and global memory store if it opens."""
@@ -2230,7 +2271,7 @@ class HostRun:
                 tool_calls=[], turn_id=message.turn_id, session_id=session_id,
             )
 
-    def open_session(self, run_id: str) -> dict:
+    def open_session(self, run_id: str, *, provider_choice_override: dict | None = None) -> dict:
         """Load and replay a finished transcript without ever rewriting it."""
         from dataclasses import asdict
 
@@ -2282,18 +2323,23 @@ class HostRun:
                         persisted_usage[agent_id] = (name, updated)
                 auto_reviews = self._saved_auto_reviews(records)
                 metadata = reader.read_meta()
-                checkpoint_directory = reader.directory / "checkpoints"
                 checkpoint_keys, replay_edits = self._checkpoint_replay_data(
                     records, subagent_records,
-                    CheckpointStore(checkpoint_directory, self._repo_root)
-                    if (checkpoint_directory / "manifest.jsonl").is_file() else None,
                 )
                 replay_turns = self._turn_replay_data(records)
                 undone_keys = metadata.get("undone_checkpoint_keys", [])
                 if not isinstance(undone_keys, list):
                     undone_keys = []
-                choice = metadata.get("provider_choice")
+                choice = (metadata.get("provider_choice") if provider_choice_override is None
+                          else dict(provider_choice_override))
                 provider_state_reset = metadata.get("provider_state_reset") is True
+                if provider_choice_override is not None:
+                    saved_choice = metadata.get("provider_choice")
+                    if not isinstance(saved_choice, dict):
+                        saved_choice = {}
+                    provider_state_reset = provider_state_reset or any(
+                        saved_choice.get(key) != choice.get(key) for key in ("name", "base_url")
+                    )
                 goal = Goal.from_payload(metadata.get("goal"))
                 saved_plan = metadata.get("plan")
                 if (
@@ -2397,6 +2443,12 @@ class HostRun:
                 self._policy.mode = self._starting_mode
                 self.approvals = self._new_approval_broker(run_id)
                 self._policy.approval_callback = self.approvals.callback
+                if provider_choice_override is not None:
+                    def save_choice(meta):
+                        meta["provider_choice"] = dict(provider_choice_override)
+                        if provider_state_reset:
+                            meta["provider_state_reset"] = True
+                    store.update_meta(save_choice)
                 leader = self._new_leader(store)
                 messages = (
                     _without_vendor_state(loaded.messages)
@@ -2669,6 +2721,16 @@ class HostRun:
         with self._lock:
             conversation = self._conversation
             session_id = None if conversation is None else conversation[1].run_id
+            context = (
+                None if session_id is None else self._goal_checks_by_session.get(session_id)
+            )
+            if context is not None:
+                context.interrupted = "interrupted"
+                context.cancel.set()
+                if context.process is not None:
+                    self._kill_user_command(context.process)
+            self._goal_check = None
+            self._goal_check_thread = None
             if session_id is not None and session_id in self._active_by_session:
                 self._conversation = None
 
@@ -2683,11 +2745,6 @@ class HostRun:
                 self._context_report = None
                 self._usage_by_agent.clear()
                 return
-            context = (
-                None if session_id is None else self._goal_checks_by_session.get(session_id)
-            )
-            if context is not None:
-                context.interrupted = "interrupted"
             self._goal = None
             self._goal_session_id = None
             self._conversation = None
@@ -2865,6 +2922,15 @@ class HostRun:
             approval_brokers = tuple(dict.fromkeys(self._approvals_by_session.values()))
             validations = tuple(self._loops._loop_validation_cancel.values())
             validation_processes = tuple(self._loops._loop_validation_processes.values())
+            goal_checks = tuple(self._goal_checks_by_session.values())
+            self._goal_check = None
+            self._goal_check_thread = None
+            for context in goal_checks:
+                context.interrupted = "cancelled"
+                context.cancel.set()
+        for context in goal_checks:
+            if context.process is not None:
+                self._kill_user_command(context.process)
         for active_run in active_runs:
             active_run.cancel.cancel()
         for cancelled in validations:
@@ -2879,11 +2945,22 @@ class HostRun:
         self.stop()
         with self._lock:
             active = tuple(self._active_by_session.values())
-            goal_check_thread = self._goal_check_thread
         for active_run in active:
-            active_run.thread.join(timeout=2)
-        if goal_check_thread is not None and goal_check_thread is not threading.current_thread():
-            goal_check_thread.join(timeout=2)
+            if active_run.thread is not threading.current_thread():
+                active_run.thread.join(timeout=2)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            with self._lock:
+                remaining = tuple(self._goal_checks_by_session.values())
+                for context in remaining:
+                    context.interrupted = "cancelled"
+                    context.cancel.set()
+            if not remaining:
+                break
+            for context in remaining:
+                if context.process is not None:
+                    self._kill_user_command(context.process)
+            time.sleep(0.01)
         with self._lock:
             conversations = tuple(self._open_conversations.values())
             self._open_conversations.clear()
@@ -2920,6 +2997,8 @@ class HostRun:
         if goal_check is not None:
             goal_check.interrupted = "cancelled"
             goal_check.cancel.set()
+            if goal_check.process is not None:
+                self._kill_user_command(goal_check.process)
         self.approvals.cancel_all(reason="stopped")
 
 

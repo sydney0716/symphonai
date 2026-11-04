@@ -78,7 +78,7 @@ symphonai review                                   # review the uncommitted chan
 ```
 
 Exit codes: `0` final answer, `1` failed run, `2` usage or configuration error,
-`3` stopped by a turn limit or budget, `130` interrupted. In CI, the exit code
+`3` refused or stopped by a turn limit or budget, `130` interrupted. In CI, the exit code
 decides the step.
 
 ### Desktop shell

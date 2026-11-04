@@ -28,8 +28,8 @@ class Terminal:
         self._chunks = deque()
         self._length = 0
         self.end = 0
-        self._pending = []
-        self._published_end = 0
+        self._pending = deque()
+        self._pending_length = 0
         self._last_publish = 0.0
         self._publish = publish
         self._lock = threading.Lock()
@@ -64,6 +64,13 @@ class Terminal:
                     self._chunks.appendleft(first[removed:])
                 self._length -= removed
             self._pending.append(text)
+            self._pending_length += len(text)
+            while self._pending_length > 65536:
+                first = self._pending.popleft()
+                removed = min(self._pending_length - 65536, len(first))
+                if removed < len(first):
+                    self._pending.appendleft(first[removed:])
+                self._pending_length -= removed
 
     def _flush(self, exited=False):
         delay = 0.03 - (time.monotonic() - self._last_publish)
@@ -72,14 +79,18 @@ class Terminal:
         with self._lock:
             text = ''.join(self._pending)
             self._pending.clear()
-            offset = self._published_end
-            self._published_end += len(text)
+            self._pending_length = 0
+            offset = self.end - len(text)
             code = self.exit_code
         if not text and not exited:
             return
         self._last_publish = time.monotonic()
         try:
-            self._publish(self.id, text, exited, code if exited else None, offset)
+            # Even JSON's worst-case surrogate escaping stays below 64 KiB.
+            for start in range(0, len(text), 4096) if text else (0,):
+                last = start + 4096 >= len(text)
+                self._publish(self.id, text[start:start + 4096], exited and last,
+                              code if exited and last else None, offset + start)
         except Exception:
             logging.getLogger(__name__).exception("Could not publish terminal output")
 

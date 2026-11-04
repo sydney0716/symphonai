@@ -188,25 +188,38 @@ def _local(root, start, end):
 class UsageReport:
     def __init__(self):
         self._cache = {}
+        self._inflight = {}
         self._lock = threading.Lock()
 
     def _vendor(self, provider, kind, key, start, end):
         period = (start.date(), end.date()) if kind == "cost" else None
         identity = (provider, kind, period, hashlib.sha256(key.encode()).digest())
-        with self._lock:
-            now = time.monotonic()
-            self._cache = {item: entry for item, entry in self._cache.items() if entry[0] > now}
-            cached = self._cache.get(identity)
-            if cached is not None:
-                return cached[1]
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._cache = {item: entry for item, entry in self._cache.items() if entry[0] > now}
+                cached = self._cache.get(identity)
+                if cached is not None:
+                    return cached[1]
+                pending = self._inflight.get(identity)
+                if pending is None:
+                    pending = threading.Event()
+                    self._inflight[identity] = pending
+                    break
+            pending.wait()
+        try:
             try:
                 result = {kind: _cost(provider, key, start, end) if kind == "cost" else _balance(provider, key)}
             except urllib.error.HTTPError as exc:
                 result = {"error": f"Vendor {kind} request returned HTTP {exc.code}."}
             except (OSError, http.client.HTTPException, ValueError, TypeError, KeyError, AttributeError, InvalidOperation, WebFetchError):
                 result = {"error": f"Vendor {kind} report is unavailable."}
-            self._cache[identity] = (time.monotonic() + 900, result)
+            with self._lock:
+                self._cache[identity] = (time.monotonic() + 900, result)
             return result
+        finally:
+            with self._lock:
+                self._inflight.pop(identity).set()
 
     def read(self, root, *, days=30, price_table=None, now=None):
         if type(days) is not int or not 1 <= days <= 90:

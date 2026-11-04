@@ -41,7 +41,7 @@ from symphonai_host.git_actions import git_status, git_diff, git_commit, git_pul
 from symphonai_host.providers import PROVIDERS, provider as build_provider, save_provider_selection, app_root as web_app_root
 from symphonai_host.broker import EventBroker, Subscription
 from symphonai_host.approvals import InvalidApprovalAnswer, PermissionGrantError
-from symphonai_host.credentials import CredentialError, apply_to_environment, store
+from symphonai_host.credentials import CredentialError, store
 from symphonai_host.files import repository_files, repository_tree
 from symphonai_host.protocol import (
     ApprovalReply,
@@ -360,27 +360,31 @@ class HostServer:
         if self._project_factory is None:
             raise RuntimeError("this host cannot open other projects")
         with self._runtimes_lock:
+            if self._closed:
+                raise RuntimeError("host is closing")
             runtime = self._runtimes.get(resolved)
-        if runtime is None:
-            current = self.run
-            selection = current.selection() if current is not None else {
-                "model": self._provider_selection.get("model"),
-                "effort": self._provider_selection.get("effort"),
-            }
-            provider = current.provider if current is not None else self._default_provider
-            runtime = self._project_factory(resolved, self.broker, self._publish_approval)
-            runtime.run._roadmap_tools_enabled = True
-            with self._runtimes_lock:
+            created = runtime is None
+            if runtime is None:
+                current = self.run
+                selection = current.selection() if current is not None else {
+                    "model": self._provider_selection.get("model"),
+                    "effort": self._provider_selection.get("effort"),
+                }
+                provider = current.provider if current is not None else self._default_provider
+                runtime = self._project_factory(resolved, self.broker, self._publish_approval)
+                try:
+                    runtime.run._roadmap_tools_enabled = True
+                    if provider is not None:
+                        runtime.run.select_provider(
+                            provider, selection.get("model"), selection.get("effort"),
+                        )
+                    runtime.run.recover_loops()
+                    if self._closed:
+                        raise RuntimeError("host is closing")
+                except BaseException:
+                    runtime.close()
+                    raise
                 self._runtimes[resolved] = runtime
-            if provider is not None:
-                runtime.run.select_provider(
-                    provider, selection.get("model"), selection.get("effort"),
-                )
-            runtime.run.recover_loops()
-            created = True
-        else:
-            created = False
-        with self._runtimes_lock:
             previous = self._current_root
             self._current_root = resolved
             self._repo_root = resolved
@@ -675,7 +679,7 @@ class HostServer:
             ) -> bool:
                 supplied = self.headers.get("Authorization", "")
                 expected = f"Bearer {host.token}"
-                if secrets.compare_digest(supplied, expected):
+                if secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
                     return True
                 if allow_app_query:
                     values = parse_qs(
@@ -683,7 +687,7 @@ class HostServer:
                         keep_blank_values=True,
                     ).get("token", [])
                     if len(values) == 1 and secrets.compare_digest(
-                        values[0], host.token
+                        values[0].encode("utf-8"), host.token.encode("utf-8")
                     ):
                         return True
                 if allow_app_cookie:
@@ -694,7 +698,7 @@ class HostServer:
                         cookie.clear()
                     credential = cookie.get(APP_COOKIE_NAME)
                     if credential is not None and secrets.compare_digest(
-                        credential.value, host.token
+                        credential.value.encode("utf-8"), host.token.encode("utf-8")
                     ):
                         return True
                 self.send_response(HTTPStatus.UNAUTHORIZED)
@@ -1773,12 +1777,16 @@ class HostServer:
                 value = payload.get('value')
                 if name not in (ANTHROPIC_KEY_ENV_VAR, GEMINI_KEY_ENV_VAR, OPENAI_KEY_ENV_VAR, *(variable for _, variable, _ in PROVIDERS[3:]), *(endpoint.api_key_env_var for endpoint in search_endpoints())):
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'unknown credential name'})
-                with self._errors(0, name=name):
-                    store(name, value)
-                if value:
-                    apply_to_environment(os.environ, {name: value})
-                else:
-                    os.environ.pop(name, None)
+                providers = {provider for provider, variable, _ in PROVIDERS if variable == name}
+                with host._model_cache_lock:
+                    with self._errors(0, name=name):
+                        store(name, value)
+                    if value:
+                        os.environ[name] = value
+                    else:
+                        os.environ.pop(name, None)
+                    host._model_cache = {key: models for key, models in host._model_cache.items()
+                                         if key[0] not in providers}
                 return _Reply(HTTPStatus.OK, {'stored': True, 'name': name})
 
             def _post_session_new(self, payload):

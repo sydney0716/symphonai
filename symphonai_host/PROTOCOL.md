@@ -127,11 +127,15 @@ error. An empty prompt is allowed when an attachment is present. Replay
 text (empty when none was returned), and `attachments`, an array of `{kind, media_type,
 filename}` metadata for non-text blocks; attachment data is never included.
 They also include `checkpoint_key: str | null`, `edits: [{path: str, added: int,
-removed: int}]`, and `undone: bool`. For a user message these identify its prompt
-checkpoint and the distinct edited paths with summed line counts, in first-edit
-order. `undone` is true when that checkpoint was reverted, including when a
-later checkpoint was reverted and therefore undid this one. Other message roles
-carry a null key, an empty edits list, and false. These fields contain
+removed: int}]`, and `undone: bool`. On replay, a user message identifies its prompt
+checkpoint and the turn's recorded distinct edited paths, sorted by path, with net
+line counts. If the turn has no recorded totals, its own transcript's tool-result
+counts are used instead; replay never recalculates totals from today's working tree.
+Live, an empty assistant `HistoryMessage` carries that checkpoint key and the same
+recorded edit list before the leader's terminal event, updating the existing turn's
+card. `undone` is true on replay when that checkpoint was reverted, including when a
+later checkpoint was reverted and therefore undid this one. Other messages carry a
+null key, an empty edits list, and false. These fields contain
 repository-relative paths only; they do not include file contents or diffs.
 Replayed tool calls carry `id` and `name`; `dispatch_subagent` calls also carry
 their `subagent_name` and `task` so clients can show the dispatch after reopen.

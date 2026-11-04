@@ -312,7 +312,7 @@ class LoopController:
             prior_review = source_meta.get("review")
             if isinstance(prior_review, dict) and prior_review.get("session_id") in self.host._active_by_session:
                 raise RunActiveError("review is already running")
-            worktree = self.host._sessions_root / session_id / "worktree"
+            worktree = self._worktree_project_root(self.host._sessions_root / session_id / "worktree")
             diff = worktree_diff(worktree)
             baseline_files = {}
             for name in diff.files:
@@ -795,8 +795,8 @@ class LoopController:
 
 
 
-    @staticmethod
-    def _loop_card_diff(loop_id: str, worktree: Path) -> WorktreeDiff:
+    def _loop_card_diff(self, loop_id: str, worktree: Path) -> WorktreeDiff:
+        worktree = self._worktree_project_root(worktree)
         stage_worktree(worktree)
         loop_files = f":(exclude).symphonai/loops/{loop_id}/**"
         files = _loop_git(
@@ -812,13 +812,17 @@ class LoopController:
         )
 
 
+    def _worktree_project_root(self, worktree: Path) -> Path:
+        if not hasattr(self, "_project_relative_root"):
+            top = Path(os.fsdecode(_loop_git(
+                self.host._repo_root, "rev-parse", "--show-toplevel",
+            ).stdout.strip())).resolve()
+            self._project_relative_root = self.host._repo_root.resolve().relative_to(top)
+        return worktree / self._project_relative_root
+
     def _loop_integration_root(self, loop_id: str) -> Path:
         self.store.validate_id(loop_id)
-        top = Path(os.fsdecode(_loop_git(
-            self.host._repo_root, "rev-parse", "--show-toplevel",
-        ).stdout.strip())).resolve()
-        relative_root = self.host._repo_root.resolve().relative_to(top)
-        return self.host._sessions_root / "loops" / loop_id / "integration" / relative_root
+        return self._worktree_project_root(self.host._sessions_root / "loops" / loop_id / "integration")
 
 
     def _loop_card_changed(self, loop: Loop, card: Card) -> None:
@@ -1004,6 +1008,10 @@ class LoopController:
             if failure is not None and verdict != "follow-ups":
                 self._loop_attention(loop, f"card {card_id} failure review passed a failed card", card)
                 return
+            if verdict == "follow-ups" and not result.get("follow_ups"):
+                missing = ", ".join(result.get("not_copied", [])) or "no specs supplied"
+                self._loop_attention(loop, f"card {card_id} review supplied no usable follow-up; specs not copied: {missing}", card)
+                return
             card_worktree = self.host._sessions_root / review_info["of"] / "worktree"
             commit = ""
             if failure is None:
@@ -1060,8 +1068,9 @@ class LoopController:
                     self._loop_card_changed(loop, follow)
                     added = True
                     break
-                if failure is not None and not added:
-                    self._loop_attention(loop, f"card {card_id} failure review supplied no usable follow-up")
+                if not added:
+                    missing = ", ".join([*result.get("not_copied", []), *follow_ups]) or "no specs supplied"
+                    self._loop_attention(loop, f"card {card_id} review supplied no usable follow-up; specs not copied: {missing}", card)
                     return
             self._advance_loop(loop_id)
 
@@ -1725,7 +1734,7 @@ class LoopController:
                             f"validation still failing after {rounds} rounds "
                             f"(exit {last_check['exit']}): {commands}"
                         )
-                root = self.host._sessions_root / session_id / "worktree"
+                root = self._worktree_project_root(self.host._sessions_root / session_id / "worktree")
                 report = info.get("report")
                 copied = False
                 if isinstance(report, str):
