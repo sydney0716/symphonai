@@ -3336,18 +3336,14 @@ class HostRun:
             fields = {**totals.to_record(), "total_tokens": totals.total_tokens}
             cost = total_cost(by_model, price_table)
             if price_table is not None:
-                unpriced = next((model for model in by_model if model not in price_table.prices), None)
+                unpriced = next((model for model in by_model if price_table.price_for_model(model) is None), None)
                 if unpriced is not None:
                     fields["unpriced_model"] = unpriced
             if cost is not None and price_table is not None:
                 fields["cost"] = {
                     "amount": str(cost),
                     "currency": price_table.currency,
-                    "estimated": any(
-                        price_table.long_context_is_estimated(model, usage)
-                        or price_table.cache_write_1h_is_estimated(model, usage)
-                        for model, usage in by_model.items()
-                    ),
+                    "estimated": True,
                 }
             return fields
 

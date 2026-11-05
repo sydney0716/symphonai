@@ -11,7 +11,7 @@ from types import MappingProxyType
 import tomllib
 
 from symphonai_api.budgets import RunBudget
-from symphonai_api.cost import PriceTable, load_price_table
+from symphonai_api.cost import PriceTable, load_price_table, shipped_price_table
 from symphonai_api.model_table import model_capabilities, resolve_effort
 from symphonai_api.permissions import (
     ALWAYS_DENY_COMMANDS,
@@ -489,23 +489,31 @@ def resolve_run_budgets(
     price_table: PriceTable | None,
 ) -> tuple[RunBudget | None, RunBudget | None, PriceTable | None]:
     """Resolve configured limits before a conversation can start."""
+    def overlay(base: PriceTable, layer: PriceTable) -> PriceTable:
+        if base.currency != layer.currency:
+            return layer
+        return PriceTable({**base.prices, **layer.prices}, base.currency)
+
+    table = shipped_price_table()
+    if price_table is not None:
+        table = overlay(table, price_table)
     table_key = "budgets.price_table"
+    path = symphonai_home() / "prices.json"
+    if path.exists():
+        try:
+            table = overlay(table, load_price_table(path))
+        except ValueError as exc:
+            _raise(path, table_key, str(exc))
     if table_key in config.values:
         origin = config.provenance[table_key].source
         path = Path(config.values[table_key]).expanduser()
         if not path.is_absolute():
             path = (origin.parent if origin is not None else Path(repo_root)) / path
         try:
-            price_table = load_price_table(path)
+            table = overlay(table, load_price_table(path))
         except ValueError as exc:
-            _raise(origin, table_key, str(exc))
-    else:
-        path = symphonai_home() / "prices.json"
-        if path.exists():
-            try:
-                price_table = load_price_table(path)
-            except ValueError as exc:
-                _raise(path, table_key, str(exc))
+            _raise(origin, table_key, f"{path}: {exc}")
+    price_table = table
 
     def budget_for(role: str, default_turns: int) -> RunBudget | None:
         prefix = f"budgets.{role}."

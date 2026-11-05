@@ -401,12 +401,17 @@ Each role may set any subset of the four limit keys. Turn and token limits are
 positive integers, wall time is a positive finite number of seconds, and cost
 is a quoted non-negative decimal. `price_table` names a version-1 JSON price
 table, relative to the config file containing that key (or the repository root
-for a session override). When no path is configured, the host loads
-`~/.symphonai/prices.json` if present (respecting `SYMPHONAI_HOME`); invalid
-default files report their path. A named table wins over this default. A
-host-supplied table is used if neither path is present. Conversation usage
-includes leader and subagent totals, with `unpriced_model` naming the first
-model missing from a loaded table when no complete cost is available.
+for a session override). The host always loads its shipped USD estimates
+(`symphonai_api/data/model_prices.json`, read 2026-11-05), then overlays
+`~/.symphonai/prices.json` if present (respecting `SYMPHONAI_HOME`), then a
+configured `budgets.price_table`. Later layers replace earlier prices per model;
+a different currency replaces the entire table, so currencies never mix.
+A host-supplied table overlays the shipped prices before file overrides.
+Invalid override files report their path. Lookup tries exact model names first,
+then a `-preview` or eight-digit dated suffix, as for model capabilities.
+Conversation usage includes leader and subagent totals, with `unpriced_model`
+naming the first unresolved model when no complete cost is available. Shipped
+rates are estimates; the table includes its read date and sources.
 A cost limit with no price for the requested model stops before
 the first request with `budget_cost_unpriced`. A subagent definition's own budget is narrowed by the configured subagent
 ceiling. There is no turn limit unless one is configured. The leader budget's
@@ -518,7 +523,10 @@ accounted in this process.
 `plan` is the latest leader plan (`steps` and `explanation`), or `null` when
 none has been set.
 When every used model has a configured price, usage objects also contain
-`cost` with decimal-string `amount` and `currency`; `cost` is omitted when no
+`cost` with decimal-string `amount`, `currency`, and `estimated: true`.
+Every conversation cost is an estimate computed from token usage and a price
+table, whether shipped, user-supplied, or configured; it is not a vendor bill.
+Vendor-reported Usage figures remain separate. `cost` is omitted when no
 price table exists or any used model is unpriced. The payload contains no
 repository paths, credentials, or model request content.
 

@@ -458,14 +458,12 @@ export async function start({ global, document, client }) {
   let rememberedPlanMode = null;
   let sessions = initialSessions;
   let archivedSessions = initialArchivedSessions;
-  let sessionQuery = "";
   let editingSessionId = null;
   let editingSessionTitle = "";
   let focusSessionRename = false;
   let sessionRowError = "";
   let sessionArchiveError = "";
   let confirmingSessionId = null;
-  let sessionSearchSequence = 0;
   let currentSessionId = conversationReply?.conversation?.session_id ?? null;
   transcript.setSessionId(currentSessionId);
   let conversation = conversationReply?.conversation ?? null;
@@ -480,8 +478,8 @@ export async function start({ global, document, client }) {
 
   async function refreshSessionLists() {
     const [active, archived] = await Promise.all([
-      boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery),
-      boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery, true),
+      boundary.sessions(SIDEBAR_SESSION_LIMIT),
+      boundary.sessions(SIDEBAR_SESSION_LIMIT, undefined, true),
     ]);
     sessions = active;
     archivedSessions = archived;
@@ -2220,13 +2218,6 @@ export async function start({ global, document, client }) {
 
   function showProjects() {
     const groups = [];
-    const activeSearch = document.activeElement?.className === "session-search"
-      ? document.activeElement
-      : null;
-    const searchSelection = activeSearch === null
-      ? null
-      : [activeSearch.selectionStart, activeSearch.selectionEnd];
-    let nextSearch = null;
     let nextRename = null;
     const openFolder = makeButton(document, "Open folder…", showFolderPicker, { className: "project-open-folder" });
     groups.push(openFolder);
@@ -2249,30 +2240,6 @@ export async function start({ global, document, client }) {
           openProjectAt(group.root);
         }, { className: "project-open-action" });
         append(heading, openProject);
-      }
-      if (current) {
-        const search = element(document, "input", { className: "session-search" });
-        nextSearch = search;
-        search.type = "search";
-        search.setAttribute("placeholder", "Search conversations");
-        search.setAttribute("aria-label", "Search conversations");
-        search.value = sessionQuery;
-        listen(search, "input", async () => {
-          sessionQuery = search.value;
-          const sequence = ++sessionSearchSequence;
-          try {
-            const results = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery);
-            const archivedResults = await boundary.sessions(SIDEBAR_SESSION_LIMIT, sessionQuery, true);
-            if (sequence !== sessionSearchSequence) return;
-            sessions = results;
-            archivedSessions = archivedResults;
-            showProjects();
-          } catch (error) {
-            sessionRowError = errorText(error);
-            showProjects();
-          }
-        });
-        append(section, search);
       }
       if (!current && !group.root) {
         append(section, element(document, "p", {
@@ -2439,11 +2406,6 @@ export async function start({ global, document, client }) {
       focusSessionRename = false;
       nextRename.focus();
       nextRename.setSelectionRange?.(0, nextRename.value.length);
-    } else if (activeSearch && nextSearch) {
-      nextSearch.focus();
-      if (searchSelection && searchSelection.every(Number.isInteger)) {
-        nextSearch.setSelectionRange?.(...searchSelection);
-      }
     }
   }
   async function saveSessionTitle(runId, title) {

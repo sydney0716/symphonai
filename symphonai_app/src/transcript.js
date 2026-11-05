@@ -67,7 +67,6 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
   const heldFrames = [];
   let currentPrompt = null;
   const activityTurns = new Map();
-  const thoughtTurns = new Map();
   const promptEdits = new Map();
   const promptUndone = new Map();
   const promptStarts = new Map();
@@ -360,15 +359,6 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
           if (currentPrompt === entry) currentPrompt = null;
         }
       } else if (fields.role === "assistant") {
-        if (typeof fields.reasoning === "string" && fields.reasoning.length > 0) {
-          model.push({
-            type: "thought",
-            agentId: fields.agent_id,
-            runId: fields.run_id,
-            turnId: fields.turn_id,
-            text: fields.reasoning,
-          });
-        }
         if (fields.text) model.push({
           type: "text",
           agentId: fields.agent_id,
@@ -509,31 +499,7 @@ export function createTranscript({ now = () => Date.now(), rootAgentId: initialR
       }
       return;
     }
-    if (type === "AssistantReasoningDelta") {
-      if (typeof fields.text !== "string" || fields.text.length === 0) return;
-      const key = turnKey(fields);
-      let entry = thoughtTurns.get(key);
-      if (entry === undefined) {
-        entry = {
-          type: "thought",
-          agentId: fields.agent_id,
-          runId: fields.run_id,
-          turnId: fields.turn_id ?? activeTurn,
-          text: "",
-        };
-        thoughtTurns.set(key, entry);
-        const answerIndex = model.findIndex((item) => (
-          item.type === "text"
-          && item.agentId === fields.agent_id
-          && item.runId === fields.run_id
-          && item.turnKey === key
-        ));
-        if (answerIndex === -1) model.push(entry);
-        else model.splice(answerIndex, 0, entry);
-      }
-      entry.text += fields.text;
-      return;
-    }
+    if (type === "AssistantReasoningDelta") return;
     if (type === "ToolCallStarted") {
       if (fields.tool_name === "notify_person" || fields.tool_name === "update_plan" || fields.tool_name === "ask_user" || fields.tool_name === "propose_plan") return;
       if (!endedRuns.has(fields.run_id) && !calls.has(fields.tool_call_id)) {

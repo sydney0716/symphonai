@@ -824,7 +824,7 @@ test("main transcript hides child work but retains exchanges, pending approvals 
   assert.deepEqual(main.model.find(entry => entry.type === "edit-card").files, [{ path: "worker.txt", added: 3, removed: 1 }]);
   assert.ok(worker.model.some(entry => entry.type === "edit" && entry.path === "worker.txt"));
   assert.ok(worker.model.some(entry => entry.type === "text" && entry.text === "Private worker answer"));
-  assert.ok(worker.model.some(entry => entry.type === "thought" && entry.text === "Private worker thought"));
+  assert.ok(!worker.model.some(entry => entry.type === "thought" || entry.text === "Private worker thought"));
   assert.ok(worker.model.some(entry => entry.type === "activity" && entry.calls.some(call => call.name === "read_file")));
 });
 

@@ -1,4 +1,4 @@
-"""Token-usage aggregation and user-supplied model pricing."""
+"""Token-usage aggregation and layered model pricing."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 
 from symphonai_api.models import Usage
@@ -69,8 +71,20 @@ class PriceTable:
     prices: Mapping[str, ModelPrice]
     currency: str
 
-    def cost(self, model: str, totals: UsageTotals) -> Decimal | None:
+    def price_for_model(self, model: str) -> ModelPrice | None:
         price = self.prices.get(model)
+        if price is not None:
+            return price
+        for name, price in self.prices.items():
+            prefix = f"{name}-"
+            if model.startswith(prefix):
+                suffix = model[len(prefix):]
+                if suffix == "preview" or (len(suffix) == 8 and suffix.isascii() and suffix.isdigit()):
+                    return price
+        return None
+
+    def cost(self, model: str, totals: UsageTotals) -> Decimal | None:
+        price = self.price_for_model(model)
         if price is None:
             return None
         million = Decimal(1_000_000)
@@ -111,15 +125,6 @@ class PriceTable:
                            totals.cache_read_tokens, totals.cache_write_tokens,
                            totals.cache_write_1h_tokens) / million
 
-    def long_context_is_estimated(self, model: str, totals: UsageTotals) -> bool:
-        price = self.prices.get(model)
-        return totals.long_context_input_tokens > 0 and price is not None and price.long_context is None
-
-    def cache_write_1h_is_estimated(self, model: str, totals: UsageTotals) -> bool:
-        price = self.prices.get(model)
-        return (totals.cache_write_1h_tokens > 0 and price is not None
-                and price.cache_write_1h_per_million is None)
-
 
 def _rate(value: object, *, model: str, kind: str) -> Decimal:
     if isinstance(value, bool):
@@ -151,6 +156,16 @@ def load_price_table(path: str | Path) -> PriceTable:
         detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
         raise ValueError(f"price table is not valid JSON: {detail}") from None
 
+    return _price_table_from_json(data)
+
+
+@lru_cache(maxsize=1)
+def shipped_price_table() -> PriceTable:
+    data = json.loads(resources.files("symphonai_api.data").joinpath("model_prices.json").read_text(encoding="utf-8"))
+    return _price_table_from_json(data)
+
+
+def _price_table_from_json(data: object) -> PriceTable:
     if not isinstance(data, dict):
         raise ValueError("price table must be a JSON object")
     if type(data.get("version")) is not int or data["version"] != 1:

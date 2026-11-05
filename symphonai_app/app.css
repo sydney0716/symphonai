@@ -586,14 +586,6 @@ pre:focus-within > .code-copy {
   text-align: left;
 }
 
-.session-search {
-  display: block;
-  width: calc(100% - 1rem);
-  min-height: 2rem;
-  margin: var(--space-2) 0 0 var(--space-4);
-  padding: 0 var(--space-2);
-}
-
 .session-row {
   display: flex;
   align-items: center;
@@ -2009,19 +2001,19 @@ button.session-link {
   overflow-wrap: anywhere;
 }
 
-#chat > :is(.prompt, .assistant, .thought, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event) {
+#chat > :is(.prompt, .assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event) {
   margin-top: 0;
   margin-bottom: 0;
 }
 
-#chat > :is(.assistant, .thought, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event) {
+#chat > :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event) {
   --agent-dot-top: calc(0.775em - 0.25rem);
   --agent-dot-center: calc(var(--agent-dot-top) + 0.25rem);
   position: relative;
   margin-left: var(--space-6);
 }
 
-#chat > :is(.assistant, .thought, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event)::before {
+#chat > :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event)::before {
   position: absolute;
   z-index: 1;
   top: var(--agent-dot-top);
@@ -2033,7 +2025,7 @@ button.session-link {
   content: "";
 }
 
-#chat > :is(.assistant, .thought, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event):has(+ :is(.assistant, .thought, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event))::after {
+#chat > :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event):has(+ :is(.assistant, .activity, .edit, .question, .plan-entry, .user-question, .compaction, .gap, .unknown-event))::after {
   position: absolute;
   z-index: 0;
   top: var(--agent-dot-center);
@@ -2095,16 +2087,6 @@ button.session-link {
 
 .assistant > * {
   margin: 0.45em 0;
-}
-
-.thought summary {
-  color: var(--ui-text-secondary);
-  cursor: pointer;
-  font-size: 0.8125rem;
-}
-
-.thought-content {
-  margin-top: var(--space-2);
 }
 
 .assistant > :first-child {
