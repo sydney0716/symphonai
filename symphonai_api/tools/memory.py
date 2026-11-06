@@ -12,7 +12,7 @@ from symphonai_api.agent_memory import (
 )
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 if TYPE_CHECKING:
     from symphonai_api.cancellation import CancellationToken
@@ -74,11 +74,7 @@ class MemoryTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(
-            effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=False,
-            paths=None,
-        )
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(
         self,
@@ -168,7 +164,7 @@ class ForgetMemoryTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.DESTRUCTIVE, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(self, tool_call: ToolCall, policy: "PermissionPolicy", cancel=None) -> ToolResult:
         if self._store is None:

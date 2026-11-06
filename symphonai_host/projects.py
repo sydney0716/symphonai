@@ -7,7 +7,7 @@ import json
 import hashlib
 import threading
 from pathlib import Path
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 from symphonai_api.extensions import load_extensions
 from symphonai_api.lsp import LspManager
@@ -118,13 +118,10 @@ def build_project(
     memory_root: Path | None = None,
     provider_factory: Callable | None = None,
     extensions_loader=load_extensions,
-    pool_factory=McpPool,
-    lsp_factory=LspManager,
-    policy_factory=PermissionPolicy,
 ) -> ProjectRuntime:
     root = root.resolve()
     extensions = extensions_loader(repo_root=root)
-    pool = pool_factory(
+    pool = McpPool(
         extensions.mcp_servers, cwd=root,
         reserved_names=set(standard_tool_registry()),
     )
@@ -132,8 +129,8 @@ def build_project(
     try:
         mcp_tools = pool.start()
         mcp_tools.update(pool.resource_tools)
-        lsp = lsp_factory(extensions.lsp_servers, root=root)
-        policy = policy_factory(
+        lsp = LspManager(extensions.lsp_servers, root=root)
+        policy = PermissionPolicy(
             repo_root=root,
             allowed_write_scope=[root],
             shell_enabled=True,

@@ -8,9 +8,9 @@ from urllib.parse import unquote, urlsplit
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.lsp import LspError, LspManager
 from symphonai_api.models import ToolCall, ToolResult
-from symphonai_api.permissions import PermissionPolicy
+from symphonai_api.permissions import PermissionPolicy, display_path
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 _OPERATIONS = {"definition", "references", "hover", "document_symbols", "workspace_symbols"}
 _KINDS = (
@@ -60,13 +60,7 @@ class LspTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        operation = arguments.get("operation")
-        path = arguments.get("path")
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=(path,) if operation != "workspace_symbols" and isinstance(path, str) else (),
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(self, tool_call: ToolCall, policy: PermissionPolicy, cancel: CancellationToken | None = None) -> ToolResult:
         args = tool_call.arguments
@@ -162,10 +156,7 @@ def _utf16_to_column(path: Path, line: int, character: int) -> int:
 
 
 def _display_path(path: Path, policy: PermissionPolicy) -> str:
-    resolved = path.resolve()
-    if resolved.is_relative_to(policy.repo_root):
-        return resolved.relative_to(policy.repo_root).as_posix()
-    return str(resolved)
+    return display_path(path, policy.repo_root)
 
 
 def _format_locations(locations: list, policy: PermissionPolicy) -> str:

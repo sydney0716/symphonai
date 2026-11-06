@@ -35,7 +35,7 @@ from symphonai_api.events import (
     emit,
 )
 from symphonai_api.web_domains import preapproved_domains
-from symphonai_api.tools.shell_parse import commands_for_argv
+from symphonai_api.tools.shell_parse import WRAPPERS, commands_for_argv
 from symphonai_api.tools.shell_classify import classify
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
@@ -272,34 +272,6 @@ class DenialReason(str, Enum):
     DOMAIN_NOT_APPROVED = "domain_not_approved"
 
 
-class ApprovalOutcome(str, Enum):
-    """How an approval or policy decision ended."""
-
-    ALLOWED = "allowed"
-    REJECTED = "rejected"
-    CANCELLED = "cancelled"
-    UNAVAILABLE = "unavailable"
-
-
-DENIAL_OUTCOMES: dict[DenialReason, ApprovalOutcome] = {
-    DenialReason.OUTSIDE_ROOT: ApprovalOutcome.REJECTED,
-    DenialReason.FORBIDDEN_PATTERN: ApprovalOutcome.REJECTED,
-    DenialReason.OUTSIDE_WRITE_SCOPE: ApprovalOutcome.REJECTED,
-    DenialReason.EMPTY_COMMAND: ApprovalOutcome.REJECTED,
-    DenialReason.ALWAYS_DENY: ApprovalOutcome.REJECTED,
-    DenialReason.UNCHECKABLE_COMMAND: ApprovalOutcome.REJECTED,
-    DenialReason.SHELL_DISABLED: ApprovalOutcome.REJECTED,
-    DenialReason.NOT_ALLOWLISTED: ApprovalOutcome.REJECTED,
-    DenialReason.NO_APPROVAL_CALLBACK: ApprovalOutcome.UNAVAILABLE,
-    DenialReason.APPROVAL_FAILED: ApprovalOutcome.UNAVAILABLE,
-    DenialReason.DENIED_BY_USER: ApprovalOutcome.REJECTED,
-    DenialReason.INVALID_APPROVAL: ApprovalOutcome.UNAVAILABLE,
-    DenialReason.APPROVAL_CANCELLED: ApprovalOutcome.CANCELLED,
-    DenialReason.PLAN_MODE: ApprovalOutcome.REJECTED,
-    DenialReason.UNSUPPORTED_SCHEME: ApprovalOutcome.REJECTED,
-    DenialReason.BLOCKED_HOST: ApprovalOutcome.REJECTED,
-    DenialReason.DOMAIN_NOT_APPROVED: ApprovalOutcome.REJECTED,
-}
 
 
 @dataclass(frozen=True)
@@ -309,15 +281,7 @@ class PermissionDecision:
     allowed: bool
     reason: str = ""
     denial: DenialReason | None = None
-    outcome: ApprovalOutcome = field(init=False)
 
-    def __post_init__(self) -> None:
-        outcome = (
-            ApprovalOutcome.ALLOWED
-            if self.allowed
-            else DENIAL_OUTCOMES.get(self.denial, ApprovalOutcome.UNAVAILABLE)
-        )
-        object.__setattr__(self, "outcome", outcome)
 
     @classmethod
     def allow(cls) -> "PermissionDecision":
@@ -962,7 +926,7 @@ class PermissionPolicy:
                 denial=DenialReason.UNCHECKABLE_COMMAND,
                 tool_name="run_shell",
             )
-        wrappers = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
+        wrappers = WRAPPERS
         if commands is not None:
             current_directory = self.repo_root if cwd is None else Path(cwd).resolve()
             for command in commands:
@@ -1264,7 +1228,23 @@ class PermissionPolicy:
 
 
 def _contains_path(parent: Path, child: Path) -> bool:
-    return child == parent or parent in child.parents
+    return child.is_relative_to(parent)
+
+
+def display_path(path: Path, root: Path | None) -> str:
+    path = path.resolve()
+    return path.relative_to(root.resolve()).as_posix() if root is not None and path.is_relative_to(root.resolve()) else str(path)
+
+
+def check_home_read(path: Path, home: Path, policy: PermissionPolicy) -> str | None:
+    resolved, home = path.resolve(), home.resolve()
+    if not resolved.is_relative_to(home):
+        return f"path is outside user_home: {resolved!r}"
+    for part in resolved.relative_to(home).parts:
+        forbidden = _matching_forbidden_component(part, policy.forbidden_patterns)
+        if forbidden is not None:
+            return f"path matches forbidden pattern {forbidden!r}: {resolved!r}"
+    return None
 
 
 def _matching_forbidden_component(

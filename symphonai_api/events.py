@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -198,22 +197,6 @@ def fan_out(*sinks: EventSink | None) -> EventSink | None:
             emit(sink, event)
 
     return deliver
-
-
-class CollectingSink:
-    """An event sink that records events in order for tests and debugging."""
-
-    def __init__(self) -> None:
-        self.events: list[Event] = []
-        self._lock = threading.Lock()
-
-    def __call__(self, event: Event) -> None:
-        with self._lock:
-            self.events.append(event)
-
-    def of_type(self, event_type: type) -> list[Event]:
-        with self._lock:
-            return [event for event in self.events if isinstance(event, event_type)]
 
 
 @dataclass(frozen=True)

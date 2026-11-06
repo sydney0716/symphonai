@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
+from symphonai_api.providers.base import parse_json_reply, bounded_call
+
 import json
 import logging
 import math
-import queue
-import threading
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -15,7 +17,6 @@ from pathlib import Path
 from symphonai_api.web import RedirectBlocker, valid_service_url
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.events import Event
-from symphonai_api.cancellation import CancellationToken
 from symphonai_api.secrets import mask_secrets
 from symphonai_api.trust import TrustList
 
@@ -88,8 +89,7 @@ def _config_error(
     field: str,
     detail: str,
 ) -> ConfigError:
-    location = str(source) if source is not None else "<session>"
-    return ConfigError(f"{location}: hooks[{index}].{field}: {detail}")
+    return ConfigSource(source).exception(f"hooks[{index}].{field}", detail)
 
 
 def hooks_from_config(
@@ -233,10 +233,8 @@ class HookRunner:
     ) -> tuple[HookOutcome, str | None]:
         if hook.url is not None or hook.prompt is not None:
             masked = json.dumps(_mask_payload(payload), separators=(",", ":"))
-            completed = queue.Queue(maxsize=1)
-            token = cancel.child(deadline_seconds=hook.timeout_seconds) if cancel is not None else CancellationToken(deadline_seconds=hook.timeout_seconds)
 
-            def invoke():
+            def invoke(token):
                 try:
                     if hook.url is not None:
                         if not valid_service_url(hook.url):
@@ -264,25 +262,19 @@ class HookRunner:
                         )
                         if response.stop_reason == "refusal" or response.refusal_category:
                             raise ValueError("hook model refused")
-                        text = response.message.text.strip().replace("\r\n", "\n")
-                        lines = text.split("\n")
-                        if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
-                            text = "\n".join(lines[1:-1])
-                        if not isinstance(json.loads(text), dict):
+                        value = parse_json_reply(response.message.text)
+                        text = json.dumps(value)
+                        if not isinstance(value, dict):
                             raise ValueError("hook model must reply with a JSON object")
-                    completed.put((text, None))
+                    return text, None
                 except Exception as exc:
-                    completed.put(("", "unparseable output" if isinstance(exc, (json.JSONDecodeError, UnicodeError)) else "hook request failed"))
+                    return "", "unparseable output" if isinstance(exc, (json.JSONDecodeError, UnicodeError)) else "hook request failed"
 
-            threading.Thread(target=invoke, name="symphonai-hook", daemon=True).start()
             try:
-                text, problem = completed.get(timeout=hook.timeout_seconds)
+                text, problem = bounded_call(invoke, timeout=hook.timeout_seconds, cancel=cancel, name="symphonai-hook")
                 return HookOutcome(problem is None, 0 if problem is None else None, False, text, ""), problem
-            except queue.Empty:
-                token.cancel()
+            except TimeoutError:
                 return HookOutcome(False, None, True, "", ""), "timeout"
-            finally:
-                token.close()
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         from symphonai_api.process import run_process
         result = run_process(
@@ -338,10 +330,8 @@ class HookRunner:
                 continue
             try:
                 text = outcome.stdout.strip()
-                if text.startswith("```json\n") and text.endswith("\n```"):
-                    text = text[len("```json\n"):-len("\n```")]
                 try:
-                    reply = json.loads(text)
+                    reply = parse_json_reply(text)
                 except ValueError:
                     if hook.command:
                         notes.append(outcome.stdout.strip())
@@ -388,9 +378,7 @@ class HookRunner:
                 continue
             try:
                 text = outcome.stdout.strip()
-                if text.startswith("```json\n") and text.endswith("\n```"):
-                    text = text[len("```json\n"):-len("\n```")]
-                reply = json.loads(text)
+                reply = parse_json_reply(text)
                 if (not isinstance(reply, dict) or reply.get("decision") != "continue"
                     or not isinstance(reply.get("reason"), str) or not reply["reason"].strip()):
                     continue

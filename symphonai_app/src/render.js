@@ -119,26 +119,13 @@ function renderInline(document, node, actions) {
 }
 
 function renderInlineBlock(document, tagName, children, actions) {
-  const renderer = children.length === 1 && children[0].type === "text"
-    ? INLINE_BLOCK_RENDERERS.plain
-    : INLINE_BLOCK_RENDERERS.rich;
-  return renderer(document, tagName, children, actions);
-}
-
-function renderPlainInlineBlock(document, tagName, children) {
-  return element(document, tagName, { text: children[0].text });
-}
-
-function renderRichInlineBlock(document, tagName, children, actions) {
+  if (children.length === 1 && children[0].type === "text") {
+    return element(document, tagName, { text: children[0].text });
+  }
   const block = element(document, tagName);
-  append(block, ...children.map((child) => renderInline(document, child, actions)));
+  append(block, ...children.map(child => renderInline(document, child, actions)));
   return block;
 }
-
-const INLINE_BLOCK_RENDERERS = Object.freeze({
-  plain: renderPlainInlineBlock,
-  rich: renderRichInlineBlock,
-});
 
 function renderText(document, entry, parseMarkdown, actions) {
   const assistant = element(document, "div", { className: "assistant" });

@@ -17,10 +17,11 @@ Subagent pool state lives only in memory for the duration of one
 
 from __future__ import annotations
 
+from symphonai_api.models import _without_vendor_state
+
 import json
 from contextlib import nullcontext
 import math
-import os
 import re
 import threading
 import time
@@ -28,7 +29,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from symphonai_api.agent_loop import ApiAgent, _message_digest
+from symphonai_api.agent_loop import ApiAgent
+from symphonai_api.serialization import message_digest
 from symphonai_api.agent_memory import AgentMemory, MemoryEntry, MemorySettings
 from symphonai_api.agent_run import (
     AgentRun,
@@ -85,10 +87,10 @@ from symphonai_api.models import ContentInput, Message, ModelRequest, Role, Tool
 from symphonai_api.memory_extract import MemoryExtractor
 from symphonai_api.permissions import ApprovalCallback, DenialReason, PermissionMode, PermissionPolicy
 from symphonai_api.providers.base import ContextLengthExceededError, ModelProvider
-from symphonai_api.model_table import capability_for_model, model_capabilities
+from symphonai_api.model_table import capability_for_model, capability_for_provider, accepts_effort
 from symphonai_api.runner import merge_tool_registry, standard_tool_registry
 from symphonai_api.spec_text import spec_validation
-from symphonai_api.tools.shell import RunShellTool, shell_executable
+from symphonai_api.tools.shell import shell_executable
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
     IMPLEMENTER_PROMPT,
@@ -106,7 +108,7 @@ from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
 from symphonai_api.tools.memory import MemoryTool
-from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, ToolEffect, ToolMetadata, changed_paths
+from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, ToolMetadata, changed_paths
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_api.web_search import SearchBackend
 from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
@@ -115,7 +117,7 @@ from symphonai_api.worktree import WorktreeError, create_worktree, worktree_diff
 def _run_handoff_validation(
     commands: Sequence[str], policy: PermissionPolicy,
 ) -> list[dict[str, object]]:
-    tool = RunShellTool()
+    from symphonai_api.process import run_check_command
     results: list[dict[str, object]] = []
     for index, command in enumerate(commands):
         # Check unconditional refusals without requesting approval twice. The
@@ -131,15 +133,11 @@ def _run_handoff_validation(
                 "broken": True,
             })
             break
-        result = tool.execute(ToolCall(
-            id=f"handoff-validation-{index}",
-            name="run_shell",
-            arguments={"command": command},
-        ), policy)
-        error = result.error or ""
-        match = re.search(r"exit code (\d+)", error)
-        code = 0 if result.ok else int(match.group(1)) if match else 126
-        output = "\n".join(part for part in (result.content, error) if part)
+        result = run_check_command([shell_executable(), "-c", command], policy.repo_root,
+                                   policy=policy, enforce_policy=True, sandboxed=True,
+                                   timeout=min(120, policy.shell_timeout_seconds), output_limit=4000)
+        code = result["exit"] if result["exit"] is not None else 126
+        output = result["output"]
         results.append({
             "command": command, "exit": code, "output": output[-4000:],
             "broken": code == 127,
@@ -157,19 +155,6 @@ class AgentControlError(RuntimeError):
         self.status = status
 
 
-def _without_vendor_state(messages: list[Message]) -> list[Message]:
-    return [
-        replace(
-            message,
-            tool_calls=[
-                replace(call, provider_metadata={}, vendor_id=None)
-                for call in message.tool_calls
-            ],
-        )
-        if message.tool_calls
-        else message
-        for message in messages
-    ]
 
 
 def _session_subagent_transcripts(
@@ -199,13 +184,6 @@ def _session_subagent_transcripts(
 DISPATCH_TOOL_NAME = "dispatch_subagent"
 DEFAULT_MAX_SUBAGENTS = 5
 EXPLORER_TOOL_NAMES = ("read_file", "glob", "grep", "list_files", "web_fetch")
-
-
-def _memory_entries(
-    store: AgentMemory | None,
-    spec: AgentSpec,
-) -> tuple[MemoryEntry, ...]:
-    return _memory_seed(store, spec)[0]
 
 
 def _memory_seed(
@@ -309,14 +287,10 @@ def builtin_subagent_specs(
 
 def _default_effort(provider: ModelProvider, model: str | None, level: str,
                     *, provider_name: str | None = None) -> str | None:
-    candidates = None
-    wire_format = provider.wire_format
-    if provider_name is not None and provider_name != provider.name:
-        candidates = tuple(item for item in model_capabilities() if item.provider == provider_name)
-        if candidates:
-            wire_format = candidates[0].wire_format
-    capability = capability_for_model(wire_format, model, candidates)
-    return level if capability is not None and any(option.id == level for option in capability.efforts) else None
+    capability = (capability_for_provider(provider_name, model)
+                  if provider_name is not None and provider_name != provider.name
+                  else capability_for_model(provider.wire_format, model))
+    return level if accepts_effort(capability, level) else None
 
 
 class _LeaderEventSink:
@@ -753,18 +727,11 @@ class DispatchSubagentTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        name = arguments.get("subagent_name")
+        name = arguments.get('subagent_name')
         with self._pool_lock:
             record = self.pool.get(name) if isinstance(name, str) else None
-            isolated = (
-                arguments.get("isolation") == "worktree"
-                or (record is not None and record.worktree_path is not None)
-            )
-        return ToolMetadata(
-            effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=isolated,
-            paths=None,
-        )
+            isolated = arguments.get('isolation') == 'worktree' or (record is not None and record.worktree_path is not None)
+        return ToolMetadata(concurrency_safe=isolated)
 
 
     def _spec_for(self, subagent_name: str) -> AgentSpec | None:
@@ -1601,7 +1568,6 @@ class LeaderRunResult:
     run: RunRef
     agent: AgentRef
     usage_by_agent: dict[str, dict[str, UsageTotals]]
-    stopped_repairs: tuple[str, ...] = ()
 
 
 class _LeaderTranscript:
@@ -1647,22 +1613,21 @@ class _LeaderTranscript:
 
 def _project_snapshot(root: Path) -> dict[str, tuple[int, int]] | None:
     """Capture file size and mtime for a reasonably sized project tree."""
-    from symphonai_api.tools.search import DEFAULT_SKIP_DIRECTORIES
+    from symphonai_api.tools.search import _walk_candidates
 
     snapshot: dict[str, tuple[int, int]] = {}
-    entries = 0
-    for directory, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if name not in DEFAULT_SKIP_DIRECTORIES and not name.endswith(".egg-info")]
-        entries += len(dirnames) + len(filenames)
-        if entries > 50_000:
+    root = root.resolve()
+    policy = PermissionPolicy(repo_root=root)
+    for index, candidate in enumerate(_walk_candidates(root, policy, include_directories=True, include_gitignored=True), 1):
+        if index > 50_000:
             return None
-        for filename in filenames:
-            path = Path(directory) / filename
-            try:
-                info = path.lstat()
-            except OSError:
-                continue
-            snapshot[path.relative_to(root).as_posix()] = (info.st_size, info.st_mtime_ns)
+        if candidate.is_directory:
+            continue
+        try:
+            info = candidate.path.lstat()
+        except OSError:
+            continue
+        snapshot[candidate.repo_relative] = (info.st_size, info.st_mtime_ns)
     return snapshot
 
 
@@ -1803,7 +1768,7 @@ class _SubagentControlTool(LocalTool):
     parameters = property(lambda self: self._parameters)
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(self, tool_call, policy, cancel=None):
         try:
@@ -1851,7 +1816,7 @@ class _NotifyPersonTool(LocalTool):
         self.leader = leader
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def validate(self, arguments):
         return None if arguments["text"].strip() else "note text must not be blank"
@@ -1880,7 +1845,7 @@ class _MessageLeaderTool(LocalTool):
         self.subagent_name = name
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(self, tool_call, policy, cancel=None):
         text, kind = tool_call.arguments["text"], tool_call.arguments["kind"]
@@ -2206,17 +2171,6 @@ class Leader:
                 self._token_ratio, actual_tokens / request_tokens
             )
 
-    def _stopped_repairs(self) -> tuple[str, ...]:
-        with self._dispatch_tool._pool_lock:
-            subagent_breakers = [
-                record.breaker for record in self._dispatch_tool.pool.values()
-            ]
-        breakers = [
-            self._automatic_compaction_breaker,
-            *subagent_breakers,
-        ]
-        return tuple(sorted(breaker.name for breaker in breakers if breaker.is_open))
-
     def _leader_run_id(self) -> str | None:
         return None if self._leader_run is None else self._leader_run.run.run_id
 
@@ -2314,7 +2268,6 @@ class Leader:
             run=result.run,
             agent=result.agent,
             usage_by_agent=usage_by_agent,
-            stopped_repairs=self._stopped_repairs(),
         )
 
     def _begin_checkpoint(self) -> None:
@@ -2372,7 +2325,7 @@ class Leader:
         )
         if persisted:
             self._agent._persisted_digests = [
-                _message_digest(message) for message in messages
+                message_digest(message) for message in messages
             ]
         if self._memory_extractor is not None:
             self._memory_extractor.set_cursor(self._chat_messages)
@@ -2636,7 +2589,6 @@ class Leader:
         for model, usage in self._compaction_usage_by_model.items():
             leader_usage[model] = leader_usage.get(model, UsageTotals()).merged(usage)
         self._compaction_usage_by_model.clear()
-        result.stopped_repairs = self._stopped_repairs()
         return result
 
     def add_context(self, text: str) -> None:

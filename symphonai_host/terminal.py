@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.process import stop_process_group
+
 import codecs
 from collections import deque
 import logging
@@ -10,7 +12,6 @@ import os
 from pathlib import Path
 import pty
 import select
-import signal
 import struct
 import subprocess
 import termios
@@ -164,18 +165,7 @@ class Terminal:
         self._stopping.set()
         if groups is None:
             groups = _process_groups([self])[self.pid]
-        for number in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.kill(self.pid, number)
-            except ProcessLookupError:
-                pass
-            for group in groups:
-                try:
-                    os.killpg(group, number)
-                except ProcessLookupError:
-                    pass
-            if wait and number == signal.SIGTERM:
-                self._reader.join(timeout=0.3)
+        stop_process_group(None, tuple(set(groups) | {self.pid}), grace=0.3 if wait else 0)
         if wait:
             self._reader.join(timeout=0.3)
 

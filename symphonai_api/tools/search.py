@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from symphonai_api.git import git as _git, WorktreeError
+
 import fnmatch
+from collections import deque
 import os
 import re
 import subprocess
@@ -15,7 +18,7 @@ from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
-from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 DEFAULT_HEAD_LIMIT = 250
 CANCEL_CHECK_INTERVAL_FILES = 64
@@ -46,6 +49,7 @@ class _Candidate:
     repo_relative: str
     search_relative: str
     mtime: float
+    is_directory: bool = False
 
 
 def _matches_path(pattern: str, relative_path: str) -> bool:
@@ -73,15 +77,8 @@ def _matches_path(pattern: str, relative_path: str) -> bool:
 
 def _git_ignored_paths(search_root: Path, policy: PermissionPolicy) -> set[str]:
     try:
-        result = subprocess.run(
-            ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
-            cwd=policy.repo_root,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        result = _git(policy.repo_root, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z', stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired, WorktreeError):
         return set()
     if result.returncode != 0:
         return set()
@@ -89,15 +86,8 @@ def _git_ignored_paths(search_root: Path, policy: PermissionPolicy) -> set[str]:
     if search_root != policy.repo_root:
         relative_root = search_root.relative_to(policy.repo_root).as_posix()
         try:
-            explicitly_named = subprocess.run(
-                ["git", "check-ignore", "-q", "--no-index", relative_root],
-                cwd=policy.repo_root,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            explicitly_named = _git(policy.repo_root, 'check-ignore', '-q', '--no-index', relative_root, stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired, WorktreeError):
             return ignored
         if explicitly_named.returncode == 0:
             return set()
@@ -110,56 +100,39 @@ def _is_git_ignored(relative_path: str, ignored: set[str]) -> bool:
 
 
 def _walk_candidates(
-    search_root: Path,
-    policy: PermissionPolicy,
-    cancel: CancellationToken | None,
-    *,
-    include_skipped: bool = False,
+    search_root: Path, policy: PermissionPolicy, cancel: CancellationToken | None = None,
+    *, include_skipped: bool = False, breadth_first: bool = False,
+    include_directories: bool = False, include_gitignored: bool = False,
 ):
-    if search_root.is_file():
-        if cancel is not None:
-            cancel.raise_if_cancelled()
-        if policy.check_read(search_root).allowed:
-            yield _Candidate(search_root, search_root.relative_to(policy.repo_root).as_posix(),
-                             search_root.name, search_root.stat().st_mtime)
-        return
-    files_seen = 0
-    ignored = _git_ignored_paths(search_root, policy)
-    for directory, dirnames, filenames in os.walk(
-        search_root, topdown=True, followlinks=False
-    ):
-        directory_path = Path(directory)
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if (include_skipped or not _default_skipped_directory(name))
-            if not (directory_path / name).is_symlink()
-            and not _is_git_ignored(
-                (directory_path / name).relative_to(policy.repo_root).as_posix(), ignored
-            )
-            and policy.check_read(directory_path / name).allowed
-        ]
-        for filename in filenames:
-            if cancel is not None and files_seen % CANCEL_CHECK_INTERVAL_FILES == 0:
-                cancel.raise_if_cancelled()
-            files_seen += 1
-            path = directory_path / filename
-            if _is_git_ignored(path.relative_to(policy.repo_root).as_posix(), ignored):
-                continue
-            if not policy.check_read(path).allowed:
-                continue
+    ignored = set() if include_gitignored else _git_ignored_paths(search_root, policy)
+    pending = deque([search_root])
+    while pending:
+        directory = pending.popleft() if breadth_first else pending.pop()
+        try:
+            entries = [directory] if directory.is_file() else sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError:
+            continue
+        children = []
+        for path in entries:
             if cancel is not None:
                 cancel.raise_if_cancelled()
+            relative = path.relative_to(policy.repo_root).as_posix()
+            if _is_git_ignored(relative, ignored) or not policy.check_read(path).allowed:
+                continue
+            is_directory = path.is_dir()
+            if is_directory:
+                if path.is_symlink() or (not include_skipped and _default_skipped_directory(path.name)):
+                    continue
+                children.append(path)
+                if not include_directories:
+                    continue
             try:
                 mtime = path.stat().st_mtime
             except OSError:
                 mtime = 0
-            yield _Candidate(
-                path=path,
-                repo_relative=path.relative_to(policy.repo_root).as_posix(),
-                search_relative=path.relative_to(search_root).as_posix(),
-                mtime=mtime,
-            )
+            yield _Candidate(path, relative, path.name if path == search_root else path.relative_to(search_root).as_posix(),
+                             mtime, is_directory)
+        pending.extend(children if breadth_first else reversed(children))
 
 
 def _bounded_content(items: list[str], limit: int | None, offset: int) -> str:
@@ -216,13 +189,7 @@ class GlobTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        path = arguments.get("path", ".")
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=(path,) if isinstance(path, str) else None,
-            result_hint=ResultHint.FILE_LIST,
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(
         self,
@@ -315,18 +282,7 @@ class GrepTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        path = arguments.get("path", ".")
-        output_mode = arguments.get("output_mode", "files_with_matches")
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=(path,) if isinstance(path, str) else None,
-            result_hint=(
-                ResultHint.FILE_LIST
-                if output_mode == "files_with_matches"
-                else ResultHint.TEXT
-            ),
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def validate(self, arguments: dict) -> str | None:
         flags = re.IGNORECASE if arguments.get("case_insensitive", False) else 0

@@ -10,6 +10,8 @@ and never raises just because `max_turns` was hit.
 
 from __future__ import annotations
 
+from symphonai_api.serialization import message_digest
+
 import hashlib
 import json
 import time
@@ -98,11 +100,6 @@ _CUT_TOOL_CALL_ERROR = (
 )
 
 
-def _message_digest(message: Message) -> str:
-    canonical = json.dumps(
-        message_to_json(message), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.blake2b(canonical, digest_size=16).hexdigest()
 
 
 def _limit_images(messages, keep=5):
@@ -292,11 +289,11 @@ class ApiAgent:
         self._tool_schemas = [schema for schema in self._tool_schemas if schema_name(schema) in selected]
 
     def _ask_hook_model(self, prompt, cancel):
-        from symphonai_api.model_table import capability_for_model
+        from symphonai_api.model_table import capability_for_model, accepts_effort
 
         model = self._previous_answering_model or self._provider.model
         capability = capability_for_model(self._provider.wire_format, model)
-        effort = "low" if capability is not None and any(option.id == "low" for option in capability.efforts) else None
+        effort = "low" if accepts_effort(capability, "low") else None
         return self._provider.create_response(ModelRequest(
             messages=[Message(Role.USER, prompt)],
             model=model, effort=effort,
@@ -385,7 +382,7 @@ class ApiAgent:
                         if token.cancelled:
                             logger.warning("Session notes update failed: cancellation")
                             return
-                        coverage = tuple(_message_digest(message) for message in snapshot)
+                        coverage = tuple(message_digest(message) for message in snapshot)
                         # A hash mismatch after an interrupted pair of atomic writes fails closed.
                         self._write_notes_coverage(text, coverage, tokens)
                         write_atomic(path, text)
@@ -444,7 +441,7 @@ class ApiAgent:
             with self._notes_lock:
                 covered = set()
                 for digest, message in zip(self._notes_coverage, conversation):
-                    if digest != _message_digest(message):
+                    if digest != message_digest(message):
                         break
                     covered.add(id(message))
                 if self._notes_text and all(id(message) in covered for message in dropped):
@@ -458,7 +455,7 @@ class ApiAgent:
                 if notes_summary is not None and notes_summary == self._notes_text and any(message.text == (
                     "Summary of the earlier conversation, written when it was compacted:\n\n" + notes_summary
                 ) for message in messages):
-                    self._notes_coverage = tuple(_message_digest(message) for message in messages)
+                    self._notes_coverage = tuple(message_digest(message) for message in messages)
                 self._notes_tokens = max(0, self._notes_tokens - (before_tokens - after_tokens))
                 try:
                     self._write_notes_coverage(self._notes_text, self._notes_coverage, self._notes_tokens)
@@ -579,14 +576,14 @@ class ApiAgent:
 
         def persist_message(message: Message, *, turn_id: str | None) -> None:
             record_message(message, turn_id=turn_id)
-            self._persisted_digests.append(_message_digest(message))
+            self._persisted_digests.append(message_digest(message))
 
         def append_message(message: Message) -> None:
             conversation.append(message)
             persist_message(message, turn_id=message.turn_id)
 
         def persist_messages(items: list[Message], *, rewritten: bool = False) -> None:
-            digests = [_message_digest(message) for message in items]
+            digests = [message_digest(message) for message in items]
             kept = 0
             for old, new in zip(self._persisted_digests, digests):
                 if old != new:
@@ -860,13 +857,11 @@ class ApiAgent:
                                 ) if message.tool_calls else message
                                 for message in request.messages
                             ]
-                            from symphonai_api.model_table import capability_for_model
+                            from symphonai_api.model_table import capability_for_model, accepts_effort
 
                             capability = capability_for_model(self._provider.wire_format, candidate_model)
                             effort = request.effort
-                            if capability is None or not any(
-                                option.id == effort for option in capability.efforts
-                            ):
+                            if not accepts_effort(capability, effort):
                                 effort = None
                             candidate_request = replace(
                                 request,

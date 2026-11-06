@@ -51,6 +51,15 @@ class UsageTotals:
                 values[name] = getattr(usage, name, 0)
         return cls(**values)
 
+    @classmethod
+    def from_record(cls, data: Mapping) -> "UsageTotals":
+        if not isinstance(data, Mapping):
+            raise ValueError("usage record must be an object")
+        values = {field.name: data.get(field.name, 0) for field in fields(cls)}
+        if any(type(value) is not int or value < 0 for value in values.values()):
+            raise ValueError("invalid usage counters")
+        return cls(**values)
+
     def to_record(self) -> dict[str, int]:
         """Return the usage counters written to transcripts and stats replies."""
         return {field.name: getattr(self, field.name) for field in fields(self)}
@@ -218,3 +227,13 @@ def total_cost(
             return None
         total += model_cost
     return total
+
+
+def usage_records(records, *, forked: bool = False):
+    """Exclude copied fork-prefix usage before the fork's own run starts."""
+    starts = 0
+    for record in records:
+        if record.get("type") == "run_started":
+            starts += 1
+        if record.get("type") == "usage" and (not forked or starts >= 2):
+            yield record

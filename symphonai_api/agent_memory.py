@@ -14,7 +14,7 @@ import uuid
 from typing import Literal
 
 from symphonai_api.identity import SCHEMA_VERSION
-from symphonai_api.paths import write_atomic
+from symphonai_api.paths import TranscriptError, append_record, read_records, utc_iso, write_atomic
 
 
 MAX_ENTRIES = 32
@@ -255,20 +255,17 @@ class AgentMemory:
     def last_consolidation(self, scope: MemoryScope) -> dict | None:
         self._path(scope)
         with self._lock:
+            path = self._root / "consolidation.jsonl"
             try:
-                lines = (self._root / "consolidation.jsonl").read_bytes().splitlines(keepends=True)
-            except FileNotFoundError:
-                return None
+                records, _ = read_records(path)
+            except TranscriptError as exc:
+                if isinstance(exc.__cause__, FileNotFoundError):
+                    return None
+                if isinstance(exc.__cause__, OSError):
+                    raise exc.__cause__
+                raise ValueError(str(exc)) from exc
             last = None
-            for index, line in enumerate(lines):
-                try:
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError("invalid consolidation history record")
-                except (UnicodeError, json.JSONDecodeError, ValueError):
-                    if index == len(lines) - 1:
-                        break
-                    raise ValueError(f"invalid consolidation history line {index + 1}") from None
+            for record in records:
                 if record.get("scope") != scope or record.get("project") != (str(self._repo_root) if scope == "project" else None):
                     continue
                 if record.get("action") == "restore":
@@ -289,20 +286,14 @@ class AgentMemory:
 
     def _append_consolidation(self, scope: MemoryScope, record: dict) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
-        record.update(time=datetime.now(timezone.utc).isoformat(), scope=scope,
+        record.update(time=utc_iso(), scope=scope,
                       project=str(self._repo_root) if scope == "project" else None)
-        descriptor = os.open(self._root / "consolidation.jsonl", os.O_CREAT | os.O_RDWR, 0o600)
-        with os.fdopen(descriptor, "r+", encoding="utf-8") as output:
-            output.seek(0, os.SEEK_END)
-            previous = output.tell()
-            try:
-                output.write(json.dumps(record) + "\n")
-                output.flush()
-                os.fsync(output.fileno())
-            except Exception:
-                output.seek(previous)
-                output.truncate()
-                raise
+        path = self._root / "consolidation.jsonl"
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(descriptor, "a+b") as output:
+            _, torn = read_records(path)
+            append_record(output, (json.dumps(record) + "\n").encode("utf-8"),
+                          torn_bytes=torn, fsync=True)
 
     def consolidate(self, scope: MemoryScope, expected: tuple[MemoryEntry, ...],
                     merges: list[dict], removals: list[dict]) -> dict:

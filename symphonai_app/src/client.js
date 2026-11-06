@@ -598,9 +598,6 @@ export function createClient({
       return request("POST", "/credentials", { name, value });
     },
 
-    survey() {
-      return request("GET", "/survey");
-    },
 
     health() {
       return request("GET", "/health");
@@ -623,11 +620,6 @@ export function createClient({
 
     history(limit = 100) {
       return request("GET", `/history?limit=${encodeURIComponent(String(limit))}`);
-    },
-
-    async file(path) {
-      const query = new URLSearchParams({ path });
-      return request("GET", `/file?${query}`);
     },
 
     get droppedFrames() {

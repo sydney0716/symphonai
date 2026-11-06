@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 
-from symphonai_api.models import ToolCall, ToolResult
-from symphonai_api.permissions import approval_diff
+from symphonai_api.models import ToolResult
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.edit import _diff_result
+from symphonai_api.tools.edit import _diff_result, approve_and_write
 from symphonai_api.tools.diagnostics import DiagnosticsAfterWrite
-from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata, patch_paths
+from symphonai_api.tools.metadata import ToolMetadata, patch_paths
 
 
 def parse_patch(text):
@@ -131,8 +130,7 @@ class ApplyPatchTool(LocalTool):
         self._checkpoints = checkpoints
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.DESTRUCTIVE, concurrency_safe=False,
-                            paths=tuple(patch_paths(arguments.get("input"))) or None, result_hint=ResultHint.DIFF)
+        return ToolMetadata(concurrency_safe=False)
 
     def validate(self, arguments):
         try:
@@ -180,46 +178,14 @@ class ApplyPatchTool(LocalTool):
                     changes[resolved] = None
                 changes[destination] = updated.encode("utf-8") if updated is not None else None
                 labels.append(f"{'move' if move else kind.lower()} {path}" + (f" -> {move}" if move else ""))
-            if policy.mode in ("ask", "auto"):
-                for path, content in changes.items():
-                    old = originals[path]
-                    decision = policy.check_write(str(path), diff=approval_diff(
-                        old[0].decode("utf-8") if old else None,
-                        content.decode("utf-8") if content is not None else "", str(path)))
-                    if not decision.allowed:
-                        return ToolResult(tool_call.id, ok=False, error=f"{path}: {decision.reason}")
-                    if old is not None:
-                        stale = self._ledger.check(path)
-                        if stale:
-                            raise ValueError(f"{path}: {stale}")
-            if cancel is not None:
-                cancel.raise_if_cancelled()
-            # All hunks, permissions and read guards passed. Checkpoint every path
-            # before the first mutation, so additions, deletions and moves undo too.
-            if self._checkpoints is not None:
-                for path in changes:
-                    self._checkpoints.before_write(path)
-            written = []
-            try:
-                for path, content in changes.items():
-                    written.append(path)
-                    if content is None:
-                        path.unlink()
-                    else:
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(content)
-                if self._checkpoints is not None:
-                    for path in changes:
-                        self._checkpoints.after_write(path)
-            except OSError:
-                for path in reversed(written):
-                    original = originals[path]
-                    if original is None:
-                        path.unlink(missing_ok=True)
-                    else:
-                        path.write_bytes(original[0])
-                        path.chmod(original[1])
-                raise
+            error = approve_and_write([
+                (path, str(path), originals[path][0].decode("utf-8") if originals[path] else None,
+                 content.decode("utf-8") if content is not None else None,
+                 content.decode("utf-8") if content is not None else None)
+                for path, content in changes.items()
+            ], policy, self._ledger, self._checkpoints, cancel)
+            if error is not None:
+                return ToolResult(tool_call.id, ok=False, error=error)
             results = []
             for path, content in changes.items():
                 original = originals[path]
@@ -227,8 +193,6 @@ class ApplyPatchTool(LocalTool):
                 new = content.decode("utf-8") if content is not None else ""
                 relative = path.relative_to(policy.repo_root.resolve()).as_posix()
                 results.append(_diff_result(tool_call.id, relative, old, new))
-                if content is not None:
-                    self._ledger.record(path, full=True, content=new)
             return ToolResult(tool_call.id, ok=True, content="\n".join(labels), payload={
                 "kind": "file_diff", "path": ", ".join(result.payload["path"] for result in results),
                 "diff": "\n".join(result.content for result in results),
@@ -241,28 +205,48 @@ class ApplyPatchTool(LocalTool):
             return ToolResult(tool_call.id, ok=False, error=str(exc))
 
 
-class _CompletedWrite(LocalTool):
-    name = "completed_patch"
-    description = "An already applied file change."
-    parameters = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
-
-    def __init__(self, result):
-        self.result = result
-
-    def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=False, paths=(arguments["path"],))
-
-    def _execute(self, tool_call, policy, cancel=None):
-        return self.result
-
-
 class DiagnosticsAfterPatch(DiagnosticsAfterWrite):
     def _execute(self, tool_call, policy, cancel=None):
+        from dataclasses import replace
+        from symphonai_api.lsp import LspError
+        from symphonai_api.tools.diagnostics import _utf16_to_column
+
         result = self._tool.execute(tool_call, policy, cancel=cancel)
-        if result.ok:
-            for path in patch_paths(tool_call.arguments["input"]):
-                resolved = policy._resolve_within_root(path)
-                if resolved.is_file():
-                    result = DiagnosticsAfterWrite(_CompletedWrite(result), self._manager).execute(
-                        ToolCall(tool_call.id, "completed_patch", {"path": path}), policy, cancel=cancel)
+        if not result.ok:
+            return result
+        for relative in patch_paths(tool_call.arguments["input"]):
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            path = policy._resolve_within_root(relative)
+            if not path.is_file():
+                continue
+            try:
+                client = self._manager.client_for(path)
+                if client is None:
+                    continue
+                diagnostics = client.wait_diagnostics(path, client.sync(path), 3.0)
+                if not isinstance(diagnostics, list):
+                    continue
+                errors = [item for item in diagnostics if isinstance(item, dict)
+                          and type(item.get("severity")) is int and item["severity"] == 1]
+                if not errors:
+                    continue
+                errors.sort(key=lambda item: (item.get("range", {}).get("start", {}).get("line", 0),
+                                              item.get("range", {}).get("start", {}).get("character", 0)))
+                lines = []
+                for item in errors[:20]:
+                    start = item.get("range", {}).get("start", {})
+                    line = int(start.get("line", 0))
+                    column = _utf16_to_column(path, line, int(start.get("character", 0)))
+                    lines.append(f"{path.relative_to(policy.repo_root).as_posix()}:{line + 1}:{column}: {item.get('message', '')}")
+                if len(errors) > 20:
+                    lines.append(f"… {len(errors) - 20} more")
+                appended = f"\n\nErrors reported by {client.spec.name} after this write ({len(errors)}):\n" + "\n".join(lines)
+                payload = result.payload
+                if isinstance(payload, dict) and payload.get("kind") == "file_diff":
+                    payload = dict(payload)
+                    payload.setdefault("diff", result.content)
+                result = replace(result, content=result.content + appended, payload=payload)
+            except (LspError, OSError, UnicodeError, TypeError, ValueError, KeyError, AttributeError):
+                continue
         return result

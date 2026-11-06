@@ -121,23 +121,10 @@ def read_with_retry(
                     limit_tokens=limit_tokens,
                 ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            if exc.code == 429:
-                retry_after = rate_limit_retry_after(retry_after, detail)
-            overloaded = exc.code in OVERLOAD_STATUS_CODES or (
-                exc.code == 503 and re.search(r"overloaded|unavailable", detail, re.IGNORECASE)
+            retryable_status, retry_attempts, retry_after = retry_decision(
+                exc.code, detail, retry_after, attempt, call_class, fallback_configured,
+                max_attempts=max_attempts, operation=operation,
             )
-            if overloaded and call_class is CallClass.BACKGROUND:
-                attempt_text = (
-                    "the first attempt" if attempt == 1 else f"attempt {attempt}"
-                )
-                raise ProviderError(
-                    f"{operation} returned HTTP {exc.code} on {attempt_text} "
-                    "and did not retry: background calls do not retry provider overload"
-                ) from None
-            retryable_status = is_retryable_status(exc.code)
-            retry_attempts = max_attempts
-            if fallback_configured and exc.code in (429, 529):
-                retry_attempts = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
             if retryable_status and wait_before_retry(
                 attempt=attempt,
                 max_attempts=retry_attempts,
@@ -333,3 +320,21 @@ def _exponential_delay(attempt: int) -> float:
 
 def _attempt_label(attempt: int) -> str:
     return f"{attempt} attempt" if attempt == 1 else f"{attempt} attempts"
+
+
+def retry_decision(status, detail, retry_after, attempt, call_class, fallback_configured,
+                   *, max_attempts, operation):
+    """Share overload policy, fallback caps and rate-limit delay selection."""
+    if status == 429:
+        retry_after = rate_limit_retry_after(retry_after, detail)
+    overloaded = status in OVERLOAD_STATUS_CODES or (
+        status == 503 and re.search(r"overloaded|unavailable", detail, re.IGNORECASE)
+    )
+    if overloaded and call_class is CallClass.BACKGROUND:
+        attempt_text = "the first attempt" if attempt == 1 else f"attempt {attempt}"
+        raise ProviderError(
+            f"{operation} returned HTTP {status} on {attempt_text} "
+            "and did not retry: background calls do not retry provider overload"
+        ) from None
+    limit = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS) if fallback_configured and status in (429, 529) else max_attempts
+    return status is None or is_retryable_status(status), limit, retry_after

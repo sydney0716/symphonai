@@ -23,16 +23,16 @@ Standard library only (`urllib.request`), no new dependency.
 
 from __future__ import annotations
 
+from symphonai_api.providers.base import _usage_count, _synthesize_tool_call_id, RememberedRejections
+
 import json
 import os
-import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
 from symphonai_api.gemini_schema import sanitize_for_gemini
-from symphonai_api.identity import new_id
 from symphonai_api.model_table import resolve_effort
 from symphonai_api.models import (
     DocumentBlock,
@@ -70,35 +70,20 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 #
 # The leader plans and delegates, so use the pro alias by default.
 DEFAULT_MODEL = "gemini-pro-latest"
-_THOUGHTS_DISABLED: set[tuple[str, str]] = set()
-_THOUGHTS_LOCK = threading.Lock()
+_THOUGHTS_DISABLED = RememberedRejections()
 
 
 def _thoughts_key(base_url: str, model: str) -> tuple[str, str]:
     return base_url, model
 
 
-def _thoughts_disabled(key: tuple[str, str]) -> bool:
-    with _THOUGHTS_LOCK:
-        return key in _THOUGHTS_DISABLED
 
 
 def _thoughts_rejected(error: ProviderError) -> bool:
     return "includethoughts" in str(error).casefold()
 
-def _synthesize_tool_call_id() -> str:
-    """Build a fallback canonical id for Gemini functionCalls that omit one.
-
-    Position-based ids (`gemini-{index}-{name}`) collided across turns: the
-    same function at the same part index in a later turn produced the same
-    id, so two distinct calls in one conversation shared a `tool_call_id`.
-    A fresh id per call keeps `ToolResult.tool_call_id` unambiguous.
-    """
-    return new_id("call")
 
 
-def _usage_count(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _tool_call_names(messages: list[Message]) -> dict[str, str]:
@@ -458,7 +443,7 @@ class GeminiProvider(ModelProvider):
 
         model = request.model if request.model is not None else self.model
         key = _thoughts_key(self.base_url, model)
-        include_thoughts = not _thoughts_disabled(key)
+        include_thoughts = not (key in _THOUGHTS_DISABLED)
 
         def send(include: bool) -> ModelResponse:
             body = _build_request_body(request, model, include_thoughts=include)
@@ -486,10 +471,8 @@ class GeminiProvider(ModelProvider):
         try:
             return send(include_thoughts)
         except ProviderError as exc:
-            if not include_thoughts or not _thoughts_rejected(exc):
+            if not include_thoughts or not _THOUGHTS_DISABLED.remember(key, exc, _thoughts_rejected):
                 raise
-            with _THOUGHTS_LOCK:
-                _THOUGHTS_DISABLED.add(key)
             return send(False)
 
     def create_response_stream(
@@ -501,7 +484,7 @@ class GeminiProvider(ModelProvider):
 
         model = request.model if request.model is not None else self.model
         key = _thoughts_key(self.base_url, model)
-        include_thoughts = not _thoughts_disabled(key)
+        include_thoughts = not (key in _THOUGHTS_DISABLED)
 
         def stream(include: bool) -> Iterator[StreamChunk]:
             body = _build_request_body(request, model, include_thoughts=include)
@@ -536,8 +519,6 @@ class GeminiProvider(ModelProvider):
                 emitted = True
                 yield chunk
         except ProviderError as exc:
-            if emitted or not _thoughts_rejected(exc):
+            if emitted or not _THOUGHTS_DISABLED.remember(key, exc, _thoughts_rejected):
                 raise
-            with _THOUGHTS_LOCK:
-                _THOUGHTS_DISABLED.add(key)
             yield from stream(False)

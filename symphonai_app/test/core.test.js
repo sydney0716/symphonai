@@ -159,7 +159,7 @@ class Document {
     make("div", "prompt-error", form);
     make("section", "terminal-panel", page).hidden = true;
     const rail = make("aside", "status-rail", shell);
-    for (const id of ["rail-tabs", "agents", "roadmap", "changes", "spec", "files", "rail-tools"]) make("div", id, rail);
+    for (const id of ["rail-tabs", "agents", "roadmap", "changes", "files", "rail-tools"]) make("div", id, rail);
     make("button", "rail-toggle", shell);
   }
   createElement(tag) { return new Node(this, tag); }
@@ -1178,7 +1178,7 @@ from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolRes
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 class ResultTool(LocalTool):
     name = "fixture"
@@ -1187,7 +1187,7 @@ class ResultTool(LocalTool):
     def __init__(self, name, text):
         self.name, self.text = name, text
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=True, paths=None)
+        return ToolMetadata(concurrency_safe=True)
     def _execute(self, call, policy, cancel=None):
         return ToolResult(call.id, True, content=self.text)
 

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import io
 import json
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
-from unittest import mock
 
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.compaction import compact_messages_for_budget
@@ -20,7 +17,6 @@ from symphonai_api.models import (
     ToolCall, ToolResult,
 )
 from symphonai_api.providers.anthropic_provider import AnthropicProvider
-from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.providers.gemini_provider import GeminiProvider
 from symphonai_api.providers.openai_provider import OpenAIProvider
 from symphonai_api.runner import resume_task, run_task
@@ -30,26 +26,12 @@ from symphonai_api.session import (
 )
 from symphonai_api.tool_results import ToolResultStore
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_api.tools.stored_result import ReadToolResultTool
 from symphonai_host.broker import EventBroker
 from symphonai_host.run import HostRun
 from scripts.checks.harness import check
-from scripts.checks.workspace import handoff_spec, workspace
-
-
-class Script(FakeModelProvider):
-    def __init__(self, responses):
-        super().__init__(responses)
-        self.requests = []
-
-    def create_response(self, request, *, cancel=None):
-        self.requests.append(request)
-        return super().create_response(request, cancel=cancel)
-
-
-def answer(text="finished", calls=()):
-    return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)))
+from scripts.checks.workspace import Script, answer, exchange, handoff_spec, workspace
 
 
 def run_agent(ws, store, provider, messages, **options):
@@ -73,15 +55,7 @@ def assert_complete(messages):
 
 
 def provider_body(provider, messages, response):
-    def respond(request, **kwargs):
-        bodies.append(json.loads(request.data))
-        return io.BytesIO(json.dumps(response).encode())
-
-    bodies = []
-    with mock.patch.dict(os.environ, {
-        "ANTHROPIC_API_KEY": "fixture-key", "OPENAI_API_KEY": "fixture-key",
-        "GEMINI_API_KEY": "fixture-key",
-    }), mock.patch("urllib.request.urlopen", side_effect=respond):
+    with exchange(response) as (bodies, _, _):
         provider.create_response(ModelRequest(messages=messages))
     assert len(bodies) == 1
     return bodies[0]
@@ -275,7 +249,7 @@ class LargeResult(LocalTool):
     parameters = {"type": "object", "properties": {}}
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=True, paths=())
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(self, tool_call, policy, cancel=None):
         return ToolResult(tool_call.id, ok=True, content="0123456789" * 1000)

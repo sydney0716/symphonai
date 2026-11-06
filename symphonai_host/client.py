@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.streaming import sse_events
+
 import http.client
 import json
 from dataclasses import dataclass
@@ -59,12 +61,6 @@ class HostClient:
     def health(self) -> dict:
         return self._request("GET", "/health")
 
-    def pending_approvals(self) -> list[dict]:
-        """Approvals still waiting for a decision, per 17i's reconciliation."""
-        response = self._request("GET", "/approvals")
-        if not isinstance(response, dict) or not isinstance(response.get("pending"), list):
-            raise HostClientError("/approvals returned an invalid response")
-        return response["pending"]
 
     def list_sessions(self, limit: int | None = None) -> list[dict]:
         path = "/sessions" if limit is None else f"/sessions?limit={limit}"
@@ -97,16 +93,8 @@ class HostClient:
     @staticmethod
     def _decode_sse(lines) -> Iterator[tuple[str, dict]]:
         """Decode one SSE response while keeping protocol parsing centralized."""
-        data: list[str] = []
-        for raw in lines:
-            line = raw.decode("utf-8").rstrip("\r\n")
-            if line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                data.append(line.removeprefix("data:").lstrip())
-            elif not line and data:
-                yield decode_frame("\n".join(data))
-                data.clear()
+        for _, data in sse_events(lines):
+            yield decode_frame(data)
 
     def send_prompt(self, prompt: str) -> dict:
         return self._request("POST", "/prompt", {"prompt": prompt})

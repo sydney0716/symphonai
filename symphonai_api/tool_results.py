@@ -96,40 +96,6 @@ class ToolResultStore:
             self._enforce_bounds()
             return stored
 
-    def prune(self, max_bytes: int) -> None:
-        """Remove oldest primary backing files until their total fits the cap."""
-
-        if max_bytes < 0:
-            raise ValueError("max_bytes must be >= 0")
-        if self._directory is None:
-            return
-        with self._lock:
-            try:
-                files = [path for path in self._directory.iterdir() if path.is_file()]
-                entries = []
-                for path in files:
-                    file_stat = path.stat()
-                    entries.append((file_stat.st_mtime_ns, file_stat.st_size, path))
-            except OSError as exc:
-                raise TranscriptError(
-                    f"cannot inspect tool-result directory {self._directory}: {exc}"
-                ) from exc
-            total = sum(size for _, size, _ in entries)
-            ordered = sorted(entries, key=lambda entry: (entry[0], entry[2].name))
-            for _, size, path in ordered:
-                if total <= max_bytes:
-                    break
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    total -= size
-                    continue
-                except OSError as exc:
-                    raise TranscriptError(
-                        f"cannot prune tool result {path.name}: {exc}"
-                    ) from exc
-                total -= size
-
     def __len__(self) -> int:
         with self._lock:
             return len(self._results)

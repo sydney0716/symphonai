@@ -183,7 +183,7 @@ def _require_loopback_base_url(base_url: str) -> None:
         raise RuntimeError(f"local-only guard failed: {base_url!r} is not a 127.0.0.1 URL")
 
 
-def _read_binary_handshake(child: subprocess.Popen[str]) -> HostAddress:
+def _read_binary_handshake(child: subprocess.Popen[str], timeout: float = 5.0) -> HostAddress:
     if child.stdout is None:
         raise RuntimeError("handshake failed: binary has no stdout pipe")
     line: list[str] = []
@@ -194,8 +194,8 @@ def _read_binary_handshake(child: subprocess.Popen[str]) -> HostAddress:
         ready.set()
 
     threading.Thread(target=read, daemon=True).start()
-    if not ready.wait(5):
-        raise RuntimeError("handshake failed: binary did not emit a line within 5 seconds")
+    if not ready.wait(timeout):
+        raise RuntimeError(f"handshake failed: binary did not emit a line within {timeout:g} seconds")
     try:
         return HostAddress.from_handshake(line[0])
     except HostClientError as exc:

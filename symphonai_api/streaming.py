@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from symphonai_api.retry import retry_decision
+
 import http.client
 import json
-import re
 import time
 import urllib.error
 import urllib.request
@@ -20,18 +21,7 @@ from symphonai_api.providers.base import (
     ProviderError,
     ProviderUnavailableError,
 )
-from symphonai_api.retry import (
-    FALLBACK_OVERLOAD_MAX_ATTEMPTS,
-    OVERLOAD_STATUS_CODES,
-    context_token_counts,
-    is_context_length_error,
-    is_retryable_status,
-    is_retryable_url_error,
-    redacted_error_detail,
-    rate_limit_retry_after,
-    wait_before_retry,
-    redact_secret,
-)
+from symphonai_api.retry import context_token_counts, is_context_length_error, is_retryable_status, is_retryable_url_error, redacted_error_detail, wait_before_retry, redact_secret
 
 
 @dataclass(frozen=True)
@@ -137,20 +127,10 @@ def retry_stream_chunks(
                 yield from chunks
                 raise ProviderError(str(exc)) from None
             retry_after = getattr(exc, "retry_after", None)
-            if exc.status == 429:
-                retry_after = rate_limit_retry_after(retry_after, str(exc))
-            overloaded = exc.status in OVERLOAD_STATUS_CODES or (
-                exc.status == 503 and re.search(r"overloaded|unavailable", str(exc), re.IGNORECASE)
+            _, attempt_limit, retry_after = retry_decision(
+                exc.status, str(exc), retry_after, attempt, call_class, fallback_configured,
+                max_attempts=max_attempts, operation=operation,
             )
-            if overloaded and call_class is CallClass.BACKGROUND:
-                attempt_text = "the first attempt" if attempt == 1 else f"attempt {attempt}"
-                raise ProviderError(
-                    f"{operation} returned HTTP {exc.status} on {attempt_text} "
-                    "and did not retry: background calls do not retry provider overload"
-                ) from None
-            attempt_limit = max_attempts
-            if fallback_configured and exc.status in (429, 529):
-                attempt_limit = min(max_attempts, FALLBACK_OVERLOAD_MAX_ATTEMPTS)
             if wait_before_retry(attempt=attempt, max_attempts=attempt_limit,
                                  deadline=deadline, retry_after=retry_after,
                                  cancel=cancel):

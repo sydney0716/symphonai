@@ -13,9 +13,9 @@ from symphonai_api.cancellation import CancellationToken
 from symphonai_api.checkpoints import CheckpointStore
 from symphonai_api.compaction import estimate_text_tokens
 from symphonai_api.models import ToolCall, ToolResult
-from symphonai_api.permissions import PermissionPolicy, approval_diff
+from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_api.tools.read_ledger import DEFAULT_READ_LIMIT, ReadLedger
 
 MAX_READ_BYTES = 1_000_000  # 1 MB safety cap on a single read_file call
@@ -124,12 +124,7 @@ class ReadFileTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        path = arguments.get("path")
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=(path,) if isinstance(path, str) else None,
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(
         self,
@@ -290,13 +285,7 @@ class WriteFileTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        path = arguments.get("path")
-        # Full replacement can discard contents that were never read.
-        return ToolMetadata(
-            effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=False,
-            paths=(path,) if isinstance(path, str) else None,
-        )
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(
         self,
@@ -323,23 +312,10 @@ class WriteFileTool(LocalTool):
                 stale_error = self._ledger.check(resolved)
                 if stale_error is not None:
                     return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
-            if policy.mode in ("ask", "auto"):
-                decision = policy.check_write(
-                    path, diff=approval_diff(current, content, str(path))
-                )
-                if not decision.allowed:
-                    return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
-                if resolved.exists():
-                    stale_error = self._ledger.check(resolved)
-                    if stale_error is not None:
-                        return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            if self._checkpoints is not None:
-                self._checkpoints.before_write(resolved)
-            resolved.write_text(content, encoding="utf-8")
-            if self._checkpoints is not None:
-                self._checkpoints.after_write(resolved)
-            self._ledger.record(resolved, full=True, content=content)
+            from symphonai_api.tools.edit import approve_and_write
+            error = approve_and_write([(resolved, path, current, content, content)], policy, self._ledger, self._checkpoints, cancel)
+            if error is not None:
+                return ToolResult(tool_call.id, ok=False, error=error)
         except UnicodeDecodeError:
             return ToolResult(tool_call_id=tool_call.id, ok=False, error="file is not valid UTF-8 text")
         except OSError as exc:
@@ -374,13 +350,7 @@ class ListFilesTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        path = arguments.get("path", ".")
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=(path,) if isinstance(path, str) else None,
-            result_hint=ResultHint.FILE_LIST,
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(
         self,

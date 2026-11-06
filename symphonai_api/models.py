@@ -10,7 +10,7 @@ implement the runtime provider interface -- see
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -33,7 +33,7 @@ class ImageBlock:
     """Standard base64 of the raw image bytes: no `data:` URI prefix, no
     newlines. Providers add whatever framing their wire format wants."""
     media_type: str
-    """One of `content.SUPPORTED_IMAGE_MEDIA_TYPES`."""
+    """The image media type, for example `image/png`."""
     schema_version: int = SCHEMA_VERSION
 
 
@@ -247,3 +247,18 @@ class ModelResponse:
     @property
     def has_tool_calls(self) -> bool:
         return bool(self.message.tool_calls)
+
+
+def _without_vendor_state(messages: list[Message]) -> list[Message]:
+    return [
+        replace(
+            message,
+            tool_calls=[
+                replace(call, provider_metadata={}, vendor_id=None)
+                for call in message.tool_calls
+            ],
+        )
+        if message.tool_calls
+        else message
+        for message in messages
+    ]

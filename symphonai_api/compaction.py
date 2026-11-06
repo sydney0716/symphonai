@@ -102,10 +102,6 @@ class CompactionResult:
     cleared_tool_results: int = 0
     recent_turns: int = DEFAULT_RECENT_TURNS
 
-    @property
-    def reclaimed_tokens(self) -> int:
-        return max(0, self.before_tokens - self.after_tokens)
-
 
 MicrocompactionResult = CompactionResult
 

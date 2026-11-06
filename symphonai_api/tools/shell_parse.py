@@ -19,7 +19,7 @@ _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _SHELL = {"sh", "bash", "zsh", "dash"}
 _SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 _SEPARATORS = {"|", "||", "&&", ";", "\n"}
-_WRAPPERS = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
+WRAPPERS = {"env", "nohup", "time", "command", "exec", "nice", "timeout", "xargs", "stdbuf", "find"}
 
 
 def _lex(text: str) -> list[list[tuple[str, str, bool, bool, bool]]] | None:
@@ -329,7 +329,7 @@ def _nested_script(argv: tuple[str, ...]) -> tuple[int, str | None] | None:
     program = os.path.basename(argv[0])
     if program in _SHELL:
         shell_index = 0
-    elif program in _WRAPPERS:
+    elif program in WRAPPERS:
         if program == "command" and len(argv) > 1 and argv[1] in {"-v", "-V"}:
             return None
         candidates = range(1, len(argv))
@@ -452,7 +452,7 @@ def _parse_segment(tokens: list[tuple[str, str, bool, bool, bool]]) -> ShellComm
         or dollar_words[0]
         or (pattern_words[0] and argv[0] not in {"[", "[["})
         or brace_words[0]
-        or (os.path.basename(argv[0]) in _WRAPPERS and any(dollar_words[1:]))
+        or (os.path.basename(argv[0]) in WRAPPERS and any(dollar_words[1:]))
     ):
         return None
     return ShellCommand(tuple(argv), writes, tuple(stdin_scripts), tuple(input_paths))

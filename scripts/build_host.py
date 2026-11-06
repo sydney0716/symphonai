@@ -4,14 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import platform
 import statistics
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -57,6 +55,9 @@ def target_triple() -> str:
 
 def verify_handshake_without_python(binary: Path) -> float:
     """Prove the executable starts in an isolated home without inherited keys."""
+    sys.path.insert(0, str(ROOT))
+    from scripts.smoke_host import _read_binary_handshake
+
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory) / "home"
         app_home = home / ".symphonai"
@@ -79,26 +80,7 @@ def verify_handshake_without_python(binary: Path) -> float:
             env=environment,
         )
         try:
-            if process.stdout is None:
-                raise RuntimeError("sidecar did not expose stdout")
-            line: list[str] = []
-            ready = threading.Event()
-
-            def read_handshake() -> None:
-                line.append(process.stdout.readline())
-                ready.set()
-
-            threading.Thread(target=read_handshake, daemon=True).start()
-            if not ready.wait(HANDSHAKE_TIMEOUT_SECONDS):
-                elapsed = time.monotonic() - started
-                raise RuntimeError(
-                    f"sidecar did not emit its handshake within {elapsed:.2f}s"
-                )
-            handshake = json.loads(line[0])
-            if not isinstance(handshake.get("port"), int) or not isinstance(
-                handshake.get("token"), str
-            ):
-                raise RuntimeError(f"sidecar emitted an invalid handshake: {line[0]!r}")
+            _read_binary_handshake(process, timeout=HANDSHAKE_TIMEOUT_SECONDS)
             return time.monotonic() - started
         finally:
             process.terminate()

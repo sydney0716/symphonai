@@ -9,7 +9,7 @@ from symphonai_api.models import ToolResult
 from symphonai_api.session import read_records
 from symphonai_api.tool_schema import to_provider_tool_schema
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 
 def schema_name(schema):
@@ -104,7 +104,7 @@ class SearchTools(LocalTool):
         return self._cached_schemas
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=False, paths=())
+        return ToolMetadata(concurrency_safe=False)
 
     def validate(self, arguments):
         return None if arguments["query"].strip() else "query must be non-blank"

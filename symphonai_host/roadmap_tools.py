@@ -4,7 +4,7 @@ import json
 
 from symphonai_api.models import ToolResult
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_host.roadmap import RoadmapStore
 
 
@@ -41,9 +41,8 @@ class RoadmapTool(LocalTool):
         return None
 
     def metadata(self, arguments):
-        listing = self.name == "list_roadmap"
-        return ToolMetadata(ToolEffect.READ_ONLY if listing else ToolEffect.MUTATING,
-                            concurrency_safe=listing, paths=None)
+        listing = self.name == 'list_roadmap'
+        return ToolMetadata(concurrency_safe=listing)
 
     def _execute(self, tool_call, policy, cancel=None):
         from symphonai_host.run import LoopChanged
@@ -52,8 +51,8 @@ class RoadmapTool(LocalTool):
             with self.host._lock:
                 store = RoadmapStore(self.host._repo_root)
                 if self.name == "start_roadmap_goal":
-                    reply, loop = self.host.start_roadmap_goal(tool_call.arguments["goal_id"])
-                    reply["loop_id"] = loop["id"]
+                    reply, loop = self.host.loops.start_roadmap_goal(tool_call.arguments["goal_id"])
+                    reply["loop_id"] = loop.id
                 else:
                     roadmap = store.load()
                     if self.name == "add_roadmap_goal":

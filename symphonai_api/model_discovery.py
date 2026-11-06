@@ -8,7 +8,8 @@ and sent only in request headers.
 
 from __future__ import annotations
 
-import json
+from symphonai_api.providers.base import parse_json_object
+
 import os
 import urllib.request
 from datetime import date
@@ -214,12 +215,5 @@ def _get_json(
         api_key=api_key,
         operation=f"{provider.name} model listing",
         call_class=CallClass.BACKGROUND,
-    ).decode("utf-8")
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ProviderError(f"{provider.name} model listing returned invalid JSON: {exc.msg}") from None
-    if not isinstance(data, dict):
-        raise ProviderError(f"{provider.name} model listing returned a non-object JSON response")
-    return data
+    )
+    return parse_json_object(raw, f"{provider.name} model listing")

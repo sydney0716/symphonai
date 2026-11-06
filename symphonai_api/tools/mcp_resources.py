@@ -7,7 +7,7 @@ import json
 from symphonai_api.mcp import McpError
 from symphonai_api.models import ToolResult
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 
 class ListMcpResourcesTool(LocalTool):
@@ -19,7 +19,7 @@ class ListMcpResourcesTool(LocalTool):
         self.clients = dict(clients)
 
     def metadata(self, arguments):
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=True, paths=())
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(self, tool_call, policy, cancel=None):
         arguments = tool_call.arguments
@@ -77,7 +77,7 @@ class ReadMcpResourceTool(LocalTool):
         self.clients = dict(clients)
 
     def metadata(self, arguments):
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=True, paths=())
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(self, tool_call, policy, cancel=None):
         client = self.clients.get(tool_call.arguments['server'])

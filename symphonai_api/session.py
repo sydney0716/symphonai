@@ -7,14 +7,16 @@ import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from symphonai_api.events import EventSink, SessionEnded, SessionStarted, emit
 from symphonai_api.identity import SCHEMA_VERSION, new_id
-from symphonai_api.paths import ensure_private_directory, symphonai_home, write_atomic
+from symphonai_api.paths import (
+    TranscriptError, append_record, ensure_private_directory, read_records,
+    symphonai_home, utc_iso, write_atomic,
+)
 
 if TYPE_CHECKING:
     from symphonai_api.models import Message
@@ -44,10 +46,6 @@ _RECORD_TYPES = frozenset(
         "run_failed",
     }
 )
-
-
-class TranscriptError(RuntimeError):
-    """A transcript cannot be serialized, persisted, or safely read."""
 
 
 class SessionError(TranscriptError):
@@ -92,14 +90,6 @@ class RunDiagnosis:
     dropped_bytes: int
 
 
-def _timestamp() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
-
-
 def default_sessions_root() -> Path:
     """The user-level directory runs are written under.
 
@@ -140,11 +130,16 @@ class TranscriptWriter:
             self.path.parent.chmod(0o700)
             descriptor = os.open(
                 self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                os.O_RDWR | os.O_CREAT | os.O_APPEND,
                 0o600,
             )
             os.chmod(self.path, 0o600)
-            self._file = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
+            self._file = os.fdopen(descriptor, "a+b")
+            try:
+                _, self._torn_bytes = read_records(self.path)
+            except Exception:
+                self._file.close()
+                raise
         except OSError as exc:
             raise TranscriptError(f"cannot open transcript {self.path}: {exc}") from exc
 
@@ -163,7 +158,7 @@ class TranscriptWriter:
         record = {
             "schema_version": SCHEMA_VERSION,
             "record_id": record_id,
-            "ts": _timestamp(),
+            "ts": utc_iso(),
             "type": record_type,
             "run_id": run_id,
             "agent_id": agent_id,
@@ -171,7 +166,7 @@ class TranscriptWriter:
             "data": data,
         }
         try:
-            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         except (TypeError, ValueError) as exc:
             raise TranscriptError(
                 f"cannot serialize {record_type!r} transcript record: {exc}"
@@ -180,8 +175,8 @@ class TranscriptWriter:
             if self._closed:
                 raise TranscriptError(f"transcript is closed: {self.path}")
             try:
-                self._file.write(line)
-                self._file.flush()
+                append_record(self._file, line, torn_bytes=self._torn_bytes)
+                self._torn_bytes = 0
             except (OSError, UnicodeError) as exc:
                 raise TranscriptError(
                     f"cannot append transcript record to {self.path}: {exc}"
@@ -221,7 +216,6 @@ class SessionStore:
         self._closed = False
         self._writers: dict[Path, TranscriptWriter] = {}
         self._writers_lock = threading.Lock()
-        self._meta_lock = threading.Lock()
         self._run_start_times_lock = threading.Lock()
         self._run_start_times: dict[str, str] = {}
         self._run_start_times_loaded = create
@@ -239,7 +233,7 @@ class SessionStore:
                     f"cannot create session directory {self._directory}: {exc}"
                 ) from exc
         if create and not (self._directory / "meta.json").exists():
-            now = _timestamp()
+            now = utc_iso()
             self.write_meta(
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -317,7 +311,7 @@ class SessionStore:
 
         def change(meta):
             meta["parent_session_id"] = parent_session_id
-            meta["updated_at"] = _timestamp()
+            meta["updated_at"] = utc_iso()
         self.update_meta(change)
 
     def _record_appended(self, record: dict) -> None:
@@ -331,7 +325,7 @@ class SessionStore:
                 meta["stopped_reason"] = record["data"]["stopped_reason"]
             else:
                 meta["stopped_reason"] = "failed"
-            meta["updated_at"] = _timestamp()
+            meta["updated_at"] = utc_iso()
         self.update_meta(change)
 
     def _remember_run_start(self, record: dict) -> None:
@@ -430,29 +424,21 @@ class SessionStore:
         )
 
 
-def read_records(path: Path) -> tuple[list[dict], int]:
-    """Return every complete record and the number of trailing bytes dropped."""
-
-    transcript_path = Path(path)
-    try:
-        raw = transcript_path.read_bytes()
-    except OSError as exc:
-        raise TranscriptError(f"cannot read transcript {transcript_path}: {exc}") from exc
-    lines = raw.splitlines(keepends=True)
-    records: list[dict] = []
-    for index, line in enumerate(lines):
+def iter_session_meta(root: Path):
+    """Yield session directories and metadata; damaged metadata is returned as None."""
+    root = Path(root)
+    if not root.is_dir():
+        return
+    for directory in root.iterdir():
+        if not directory.is_dir() or directory.name == "loops":
+            continue
         try:
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValueError("record is not a JSON object")
-        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
-            if index == len(lines) - 1:
-                return records, len(line)
-            raise TranscriptError(
-                f"malformed transcript record at line {index + 1}: {exc}"
-            ) from exc
-        records.append(value)
-    return records, 0
+            meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+            if not isinstance(meta, dict):
+                meta = None
+        except (OSError, ValueError, UnicodeError):
+            meta = None
+        yield directory, meta
 
 
 def _transcript_path(store: SessionStore, agent_id: str | None) -> Path:
@@ -546,15 +532,6 @@ def load_run(
         dropped_bytes=dropped_bytes,
         meta=store.read_meta(),
     )
-
-
-def resume_run(
-    store: SessionStore, *, agent_id: str | None = None
-) -> tuple[list[Message], str]:
-    """Return the loaded conversation and the run id it continues."""
-
-    loaded = load_run(store, agent_id=agent_id)
-    return loaded.messages, loaded.run_id
 
 
 def classify_run(loaded: LoadedRun, records: Sequence[dict]) -> RunDiagnosis:

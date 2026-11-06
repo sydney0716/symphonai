@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from symphonai_api.paths import utc_iso
+
 import json
 from pathlib import Path
 import re
 import secrets
+from typing import TYPE_CHECKING
 from symphonai_api.paths import write_atomic
 
 
+if TYPE_CHECKING:
+    from symphonai_host.spec_loop import Loop
+
+
 _ID_PATTERN = re.compile(r"loop_[0-9a-f]{12}\Z")
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _slug(goal: str, loop_id: str) -> str:
@@ -36,7 +38,8 @@ class LoopStore:
         self.validate_id(loop_id)
         return self.loops_root / loop_id
 
-    def create(self, goal: str) -> dict:
+    def create(self, goal: str) -> Loop:
+        from symphonai_host.spec_loop import Loop
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must not be blank")
         self.loops_root.mkdir(parents=True, exist_ok=True)
@@ -48,11 +51,11 @@ class LoopStore:
                 break
             except FileExistsError:
                 continue
-        now = _timestamp()
+        now = utc_iso()
         (folder / ".gitignore").write_text("*\n", encoding="utf-8")
         (folder / "specs").mkdir()
         (folder / "reports").mkdir()
-        loop = {
+        loop = Loop.from_payload({
             "schema_version": 1,
             "id": loop_id,
             "goal": goal,
@@ -65,7 +68,7 @@ class LoopStore:
             "planner_session_id": None,
             "lanes": [],
             "cards": [],
-        }
+        })
         self.save(loop)
         return loop
 
@@ -109,16 +112,12 @@ class LoopStore:
     def list(self) -> list[dict]:
         return [loop.to_payload() for loop in self.records()]
 
-    def save(self, loop) -> None:
+    def save(self, loop: Loop) -> None:
         from symphonai_host.spec_loop import Loop
-        if isinstance(loop, Loop):
-            loop.updated_at = _timestamp()
-            payload = loop.to_payload()
-        elif isinstance(loop, dict):
-            loop["updated_at"] = _timestamp()
-            payload = loop
-        else:
-            raise ValueError("loop must be an object")
+        if not isinstance(loop, Loop):
+            raise ValueError("loop must be a Loop")
+        loop.updated_at = utc_iso()
+        payload = loop.to_payload()
         folder = self._folder(payload.get("id"))
         folder.mkdir(parents=True, exist_ok=True)
         write_atomic(
@@ -126,16 +125,17 @@ class LoopStore:
             mode=0o600, fsync=True,
         )
 
-    def set_state(self, loop, state: str, reason: str = ""):
+    def set_state(self, loop: Loop, state: str, reason: str = "") -> Loop:
         from symphonai_host.spec_loop import LoopState, STATE_RULES
-        current = loop.get("state")
+        current = loop.state
         allowed = STATE_RULES["loop"].get(current, (set(), set()))[0]
         if not isinstance(state, str) or state not in allowed:
             raise ValueError(f"invalid loop state transition: {str(current) if isinstance(current, LoopState) else current!r} -> {state!r}")
         if state != "needs_attention":
-            loop.pop("failure_stage", None)
-        loop["state"] = LoopState(state) if not isinstance(loop, dict) else state
-        loop["reason"] = reason
+            loop.failure_stage = None
+            loop._present.discard("failure_stage")
+        loop.state = LoopState(state)
+        loop.reason = reason
         self.save(loop)
         return loop
 

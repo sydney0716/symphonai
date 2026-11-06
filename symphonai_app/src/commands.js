@@ -235,20 +235,8 @@ async function handleModel(context, { args, command, typedName, usage }) {
       answerCommand(errorText(error));
       return;
     }
-    if (listing?.state === "unknown") {
-      await chooseTypedModel(provider, model);
-      return;
-    }
-    if (
-      listing?.state === "available"
-      && Array.isArray(listing.models)
-      && !listing.models.some((row) => row.id === model)
-    ) {
-      await chooseTypedModel(provider, model);
-      return;
-    }
-    if (listing?.state === "available" && Array.isArray(listing.models)) {
-      await chooseTypedModel(provider, model, listing.models.find((row) => row.id === model)?.efforts);
+    if (listing?.state === "unknown" || (listing?.state === "available" && Array.isArray(listing.models))) {
+      await chooseTypedModel(provider, model, listing.models?.find((row) => row.id === model)?.efforts);
     } else {
       await openModelPicker(provider, model);
     }

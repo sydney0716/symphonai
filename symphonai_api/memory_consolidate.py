@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.providers.base import parse_json_reply
+
 import json
 import logging
 import time
@@ -15,7 +17,7 @@ from symphonai_api.secrets import mask_secrets
 
 def apply_result(store, scope, snapshot, reply: str) -> dict:
     """Reject the entire reply before applying any operation if it is malformed."""
-    result = json.loads(reply)
+    result = parse_json_reply(reply)
     if not isinstance(result, dict) or set(result) != {"merge", "remove"}:
         raise ValueError("consolidation must contain exactly merge and remove")
     merges, removals = result["merge"], result["remove"]

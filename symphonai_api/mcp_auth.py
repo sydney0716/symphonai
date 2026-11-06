@@ -1,6 +1,8 @@
 """MCP OAuth discovery, PKCE and atomic storage in the guarded credentials folder."""
 from __future__ import annotations
 
+from symphonai_api.providers.base import read_json
+
 import base64
 import hashlib
 import json
@@ -34,10 +36,7 @@ def _json_request(url, data=None, *, form=False):
         headers = {'Accept': 'application/json'}
         if body is not None:
             headers['Content-Type'] = 'application/x-www-form-urlencoded' if form else 'application/json'
-        with build_opener(RedirectBlocker()).open(Request(url, data=body, headers=headers), timeout=10) as reply:
-            result = json.loads(reply.read(1_000_001))
-        if not isinstance(result, dict):
-            raise ValueError()
+        result = read_json(build_opener(RedirectBlocker()), Request(url, data=body, headers=headers), 1_000_000)
         return result
     except AuthError:
         raise

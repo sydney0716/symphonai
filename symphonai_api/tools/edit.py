@@ -11,8 +11,57 @@ from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy, approval_diff
 from symphonai_api.tools import filesystem as filesystem_tools
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ResultHint, ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_api.tools.read_ledger import ReadLedger
+
+
+def approve_and_write(changes, policy, ledger, checkpoints=None, cancel=None):
+    """Approve all prepared changes before any writes, keeping their raw bytes."""
+    try:
+        if policy.mode in ("ask", "auto"):
+            for path, label, old, new, _ in changes:
+                decision = policy.check_write(label, diff=approval_diff(old, new or "", str(label)))
+                if not decision.allowed:
+                    return decision.reason
+            for path, _, old, _, _ in changes:
+                if old is not None or path.exists():
+                    stale = ledger.check(path)
+                    if stale:
+                        return stale
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        originals = {path: (path.read_bytes(), path.stat().st_mode) if path.exists() else None
+                     for path, _, _, _, _ in changes}
+        if checkpoints is not None:
+            for path in originals:
+                checkpoints.before_write(path)
+        written = []
+        try:
+            for path, _, _, content, _ in changes:
+                written.append(path)
+                if content is None:
+                    path.unlink()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content.encode("utf-8"))
+            if checkpoints is not None:
+                for path in originals:
+                    checkpoints.after_write(path)
+        except OSError:
+            for path in reversed(written):
+                original = originals[path]
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(original[0])
+                    path.chmod(original[1])
+            raise
+        for path, _, _, content, recorded in changes:
+            if content is not None:
+                ledger.record(path, full=True, content=recorded)
+    except (OSError, UnicodeError) as exc:
+        return str(exc)
+    return None
 
 
 def _replace_with_endings(original: str, old: str, new: str, *, replace_all: bool) -> str:
@@ -147,13 +196,7 @@ class EditFileTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        path = arguments.get("path")
-        return ToolMetadata(
-            effect=ToolEffect.MUTATING,
-            concurrency_safe=False,
-            paths=(path,) if isinstance(path, str) else None,
-            result_hint=ResultHint.DIFF,
-        )
+        return ToolMetadata(concurrency_safe=False)
 
     def validate(self, arguments: dict) -> str | None:
         return _edit_validation_error(arguments)
@@ -204,24 +247,9 @@ class EditFileTool(LocalTool):
             )
         raw_updated = _replace_with_endings(raw, old_string, new_string, replace_all=replace_all)
         updated = raw_updated.replace("\r\n", "\n")
-        if policy.mode in ("ask", "auto"):
-            decision = policy.check_write(
-                path, diff=approval_diff(content, updated, str(path))
-            )
-            if not decision.allowed:
-                return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
-            stale_error = self._ledger.check(resolved)
-            if stale_error is not None:
-                return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
-        try:
-            if self._checkpoints is not None:
-                self._checkpoints.before_write(resolved)
-            resolved.write_bytes(raw_updated.encode("utf-8"))
-            if self._checkpoints is not None:
-                self._checkpoints.after_write(resolved)
-            self._ledger.record(resolved, full=True, content=updated)
-        except OSError as exc:
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
+        error = approve_and_write([(resolved, path, content, raw_updated, updated)], policy, self._ledger, self._checkpoints, cancel)
+        if error is not None:
+            return ToolResult(tool_call.id, ok=False, error=error)
         return _diff_result(tool_call.id, path, content, updated)
 
 
@@ -326,22 +354,7 @@ class MultiEditFileTool(EditFileTool):
                 raw_updated, old_string, edit["new_string"], replace_all=edit.get("replace_all", False)
             )
             updated = raw_updated.replace("\r\n", "\n")
-        if policy.mode in ("ask", "auto"):
-            decision = policy.check_write(
-                path, diff=approval_diff(original, updated, str(path))
-            )
-            if not decision.allowed:
-                return ToolResult(tool_call_id=tool_call.id, ok=False, error=decision.reason)
-            stale_error = self._ledger.check(resolved)
-            if stale_error is not None:
-                return ToolResult(tool_call_id=tool_call.id, ok=False, error=stale_error)
-        try:
-            if self._checkpoints is not None:
-                self._checkpoints.before_write(resolved)
-            resolved.write_bytes(raw_updated.encode("utf-8"))
-            if self._checkpoints is not None:
-                self._checkpoints.after_write(resolved)
-            self._ledger.record(resolved, full=True, content=updated)
-        except OSError as exc:
-            return ToolResult(tool_call_id=tool_call.id, ok=False, error=str(exc))
+        error = approve_and_write([(resolved, path, original, raw_updated, updated)], policy, self._ledger, self._checkpoints, cancel)
+        if error is not None:
+            return ToolResult(tool_call.id, ok=False, error=error)
         return _diff_result(tool_call.id, path, original, updated)

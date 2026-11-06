@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
+from symphonai_api.streaming import sse_events
+
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 import http.client
@@ -25,7 +29,7 @@ from symphonai_api.web import valid_service_url
 from symphonai_api.config import ConfigError, ResolvedConfig, Scope
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_api.trust import TrustList
 
 if TYPE_CHECKING:
@@ -85,8 +89,7 @@ class McpServerSpec:
 
 
 def _config_error(source: Path | None, key: str, detail: str) -> ConfigError:
-    location = str(source) if source is not None else "<session>"
-    return ConfigError(f"{location}: {key}: {detail}")
+    return ConfigSource(source).exception(key, detail)
 
 
 def _positive_timeout(
@@ -464,11 +467,8 @@ class McpClient:
                                         event.extend(line + b"\n")
                                         continue
                                     if event:
-                                        data = b"\n".join(
-                                            part[5:].lstrip(b" ") for part in event.splitlines()
-                                            if part.startswith(b"data:")
-                                        )
                                         try:
+                                            data = next((data for _, data in sse_events(event.splitlines(keepends=True))), "")
                                             frame = json.loads(data)
                                         except (ValueError, UnicodeError):
                                             frame = None
@@ -537,14 +537,7 @@ class McpClient:
 
         candidates: list[object] = []
         if content_type == "text/event-stream":
-            data_lines: list[str] = []
-            for line in (*text.splitlines(), ""):
-                if not line:
-                    if data_lines:
-                        candidates.append("\n".join(data_lines))
-                        data_lines = []
-                elif line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip(" "))
+            candidates.extend(data for _, data in sse_events(body.splitlines(keepends=True)))
         else:
             candidates.append(text)
 
@@ -968,11 +961,7 @@ class McpTool(LocalTool):
         return self._parameters.copy()
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(
-            effect=ToolEffect.DESTRUCTIVE,
-            concurrency_safe=False,
-            paths=None,
-        )
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(
         self,

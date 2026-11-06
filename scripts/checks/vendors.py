@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import os
-from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -14,7 +13,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from scripts.checks.harness import check, fail
-from scripts.checks.workspace import workspace
+from scripts.checks.workspace import Response, exchange, workspace
 from symphonai_api.agent_loop import ApiAgent
 from symphonai_api.call_class import CallClass
 from symphonai_api.cost import ModelPrice, PriceTable, UsageTotals, total_cost
@@ -28,16 +27,7 @@ from symphonai_api.streaming import StreamAssembler
 from symphonai_api.runner import run_task
 
 KEY = "core-vendor-inert-key"
-ENV = {name: KEY for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "CORE_CHAT_KEY")}
 USER = Message(Role.USER, "core vendor task")
-
-
-class Response(io.BytesIO):
-    status = 200
-    headers = {}
-
-    def __init__(self, value):
-        super().__init__(value if isinstance(value, bytes) else json.dumps(value).encode())
 
 
 def sse(*events):
@@ -48,24 +38,6 @@ def sse(*events):
 def error(status, message):
     return HTTPError("https://core.invalid", status, "scripted rejection", {},
                      io.BytesIO(json.dumps({"error": {"message": message}}).encode()))
-
-
-@contextmanager
-def exchange(*responses):
-    bodies, requests, timeouts = [], [], []
-    pending = iter(responses)
-
-    def send(request, **options):
-        requests.append(request)
-        bodies.append(json.loads(request.data))
-        timeouts.append(options["timeout"])
-        response = next(pending)
-        if isinstance(response, Exception):
-            raise response
-        return Response(response)
-
-    with mock.patch.dict(os.environ, ENV), mock.patch("urllib.request.urlopen", side_effect=send), mock.patch("time.sleep"):
-        yield bodies, requests, timeouts
 
 
 def provider(kind, **options):

@@ -19,7 +19,7 @@ from unittest import mock
 from urllib.error import HTTPError
 
 from symphonai_api.extensions import load_extensions
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall, Usage
+from symphonai_api.models import Message, Role, Usage
 from symphonai_api.providers.base import ProviderError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_host.headless import main as headless_main
@@ -30,15 +30,11 @@ from symphonai_host.projects import ProjectRuntime
 from symphonai_host.broker import EventBroker
 from symphonai_host.providers import provider as build_provider
 from scripts.checks.harness import check
-from scripts.checks.workspace import handoff_spec, workspace
+from scripts.checks.workspace import answer, call as tool, Response, exchange, git, init_repository, handoff_spec, workspace
 
 
 def reply(text="core reply", *calls):
-    return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)), usage=Usage(5, 2))
-
-
-def tool(name, **arguments):
-    return ToolCall(f"core-{os.urandom(5).hex()}", name, arguments)
+    return answer(text, *calls, usage=Usage(5, 2))
 
 
 def request(host, path, body=None, *, authenticated=True, headers=None):
@@ -356,18 +352,6 @@ def session_from_another_project_is_refused():
                 assert not tools["read_session"].execute(tool("read_session", session_id=session_id), first.policy).ok
 
 
-def git(root, *arguments):
-    return subprocess.run(["git", *arguments], cwd=root, check=True, capture_output=True).stdout
-
-
-def init_git(ws):
-    git(ws.root, "init", "--quiet")
-    git(ws.root, "config", "user.email", "core@example.invalid")
-    git(ws.root, "config", "user.name", "Core checks")
-    git(ws.root, "add", "existing.txt")
-    git(ws.root, "commit", "--quiet", "-m", "fixture")
-
-
 def editing_provider():
     return FakeModelProvider([
         reply("", tool("dispatch_subagent", subagent_name="implementer", task=handoff_spec("create changed.txt", "test -f changed.txt"))),
@@ -379,7 +363,7 @@ def editing_provider():
 @check("host.changes_show_the_agent_edit_and_diff")
 def changes_show_the_agent_edit_and_diff():
     with workspace() as ws:
-        init_git(ws)
+        init_repository(ws.root)
         with running_host(ws, editing_provider()) as host:
             prompt(host)
             changes = get(host, "/changes")
@@ -390,7 +374,7 @@ def changes_show_the_agent_edit_and_diff():
 @check("host.commit_includes_only_selected_paths")
 def commit_includes_only_selected_paths():
     with workspace() as ws:
-        init_git(ws)
+        init_repository(ws.root)
         (ws.root / "selected.txt").write_text("selected")
         (ws.root / "other.txt").write_text("leave this alone")
         with running_host(ws) as host:
@@ -402,7 +386,7 @@ def commit_includes_only_selected_paths():
 @check("host.revert_restores_the_turn_files")
 def revert_restores_the_turn_files():
     with workspace() as ws:
-        init_git(ws)
+        init_repository(ws.root)
         with running_host(ws, editing_provider()) as host:
             prompt(host)
             (ws.root / "outside.txt").write_text("outside change")
@@ -467,7 +451,7 @@ class LoopScript(FakeModelProvider):
 
 @contextmanager
 def loop_host(ws, **options):
-    init_git(ws)
+    init_repository(ws.root)
     home = ws.outside / "home"
     config = home / ".symphonai" / "config.toml"
     config.parent.mkdir(parents=True)
@@ -531,14 +515,6 @@ def cancelling_a_loop_removes_its_worktrees_and_branch():
         assert branch not in git(ws.root, "branch", "--format=%(refname:short)").decode().splitlines()
 
 
-class HTTPFixture(io.BytesIO):
-    status = 200
-    headers = {}
-
-    def __init__(self, response):
-        super().__init__(("event: response.completed\ndata: " + json.dumps({"type": "response.completed", "response": response}) + "\n\n").encode())
-
-
 def headless_case(kind):
     with workspace() as ws:
         home = ws.outside / "home"
@@ -552,13 +528,12 @@ def headless_case(kind):
             base_response["output"] = [{"type": "function_call", "call_id": "call-core", "name": "list_files", "arguments": "{}"}]
         elif kind == "refused":
             base_response["output"][0]["content"] = [{"type": "refusal", "refusal": "fixture refusal"}]
-        def respond(request, **options):
-            if kind == "failed":
-                raise HTTPError(request.full_url, 400, "fixture", {}, io.BytesIO(b'{"error":{"message":"fixture error"}}'))
-            return HTTPFixture(base_response)
+        response = ("event: response.completed\ndata: " + json.dumps({"type": "response.completed", "response": base_response}) + "\n\n").encode()
+        if kind == "failed":
+            response = HTTPError("https://core.invalid", 400, "fixture", {}, Response({"error": {"message": "fixture error"}}))
         output = io.StringIO()
         environment = {"SYMPHONAI_HOME": str(home), "SYMPHONAI_SESSIONS_DIR": str(ws.outside / "cli-sessions"), "OPENAI_API_KEY": "core-inert-key"}
-        with mock.patch.dict(os.environ, environment), mock.patch("urllib.request.urlopen", side_effect=respond), redirect_stdout(output), redirect_stderr(io.StringIO()):
+        with exchange(response, environment=environment), redirect_stdout(output), redirect_stderr(io.StringIO()):
             code = headless_main(["run", "core task", "--repo-root", str(ws.root), "--provider", "openai", "--model", "core-model", "--mode", "allow", "--max-turns", "1", "--json"])
         result = json.loads(output.getvalue().splitlines()[-1])
         assert {"status", "stopped_reason", "error", "usage", "files_changed"} <= result.keys()

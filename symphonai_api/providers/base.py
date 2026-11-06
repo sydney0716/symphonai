@@ -9,6 +9,7 @@ wire-format split each one uses.
 from __future__ import annotations
 
 import json
+import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -111,3 +112,85 @@ class ModelProvider(ABC):
 
         response = self.create_response(request, cancel=cancel)
         yield StreamCompleted(response)
+
+
+def _usage_count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _synthesize_tool_call_id() -> str:
+    from symphonai_api.identity import new_id
+    return new_id("call")
+
+
+class RememberedRejections:
+    def __init__(self):
+        self._values = set()
+        self._lock = threading.Lock()
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._values
+
+    def remember(self, key, error, rejected):
+        if not rejected(error):
+            return False
+        with self._lock:
+            self._values.add(key)
+        return True
+
+
+def parse_json_reply(text: str):
+    source = text.strip().replace("\r\n", "\n")
+    lines = source.split("\n")
+    if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
+        source = "\n".join(lines[1:-1])
+    return json.loads(source)
+
+
+def bounded_call(function, *, timeout: float, cancel=None, name="symphonai-model-call"):
+    import queue
+    import time
+    token = cancel.child(deadline_seconds=timeout) if cancel is not None else CancellationToken(deadline_seconds=timeout)
+    completed = queue.Queue(maxsize=1)
+    def invoke():
+        try:
+            completed.put((True, function(token)))
+        except Exception as exc:
+            completed.put((False, exc))
+    deadline = time.monotonic() + timeout
+    threading.Thread(target=invoke, name=name, daemon=True).start()
+    try:
+        while True:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("model call deadline exceeded")
+            try:
+                success, value = completed.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if not success:
+                raise value
+            return value
+    finally:
+        token.cancel()
+        token.close()
+
+
+def read_json(opener, request, limit: int, *, timeout=10, **json_options):
+    """Read one size-bounded JSON object through the caller's guarded opener."""
+    with opener.open(request, timeout=timeout) as response:
+        if not 200 <= response.status < 300:
+            raise ValueError("unsuccessful JSON response")
+        raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("JSON response exceeds size limit")
+    try:
+        value = json.loads(raw.decode("utf-8"), **json_options)
+    except (UnicodeError, json.JSONDecodeError):
+        raise ValueError("invalid JSON response") from None
+    if not isinstance(value, dict):
+        raise ValueError("invalid JSON response")
+    return value

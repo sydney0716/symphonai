@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.git import git as _git
+
 import os
 import shutil
 import stat
@@ -16,10 +18,13 @@ PULL_REQUEST_TIMEOUT_SECONDS = 120
 UNTRACKED_DIFF_READ_LIMIT = 1024 * 1024
 
 
-def pull_request_command(args: list[str], root: Path, name: str) -> subprocess.CompletedProcess:
+def pull_request_command(args: list[str], root: Path, name: str, *, git_command: bool = False) -> subprocess.CompletedProcess:
     environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     environment.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
     try:
+        if git_command:
+            return _git(root, *args, stdin=subprocess.DEVNULL, env=environment,
+                        check=False, timeout=PULL_REQUEST_TIMEOUT_SECONDS)
         return subprocess.run(
             args, cwd=root, stdin=subprocess.DEVNULL, env=environment,
             capture_output=True, check=False, timeout=PULL_REQUEST_TIMEOUT_SECONDS,
@@ -34,10 +39,7 @@ def git_status(root: Path, *, diff_limit: int = 200) -> dict[str, Any]:
     if snapshot is None:
         return {"repo": False}
     root = snapshot.root
-    branch_result = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=root,
-        capture_output=True, check=False,
-    )
+    branch_result = _git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD', capture_output=True, check=False)
     branch = os.fsdecode(branch_result.stdout.strip()) if branch_result.returncode == 0 else None
     records = []
     for entry in snapshot.entries:
@@ -135,10 +137,7 @@ def git_diff_text(root: Path, record: dict[str, Any]) -> tuple[str, bool]:
         return diff, input_truncated or len(diff) > 20_000
     else:
         paths = [path, *([record["old_path"]] if isinstance(record.get("old_path"), str) else [])]
-        result = subprocess.run(
-            ["git", "diff", "--no-ext-diff", "--no-color", "HEAD", "--", *paths],
-            cwd=root, capture_output=True, check=False,
-        )
+        result = _git(root, 'diff', '--no-ext-diff', '--no-color', 'HEAD', '--', *paths, capture_output=True, check=False)
         diff = os.fsdecode(result.stdout)
         if b"GIT binary patch" in result.stdout or b"Binary files " in result.stdout:
             diff = "Binary file; diff omitted."
@@ -191,47 +190,30 @@ def git_commit(root: Path, message: str, paths: list[str]) -> dict[str, Any]:
         if path not in changed:
             raise ValueError(f"no uncommitted change for path: {path}")
 
-    head = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=root,
-        capture_output=True, check=False,
-    )
+    head = _git(root, 'rev-parse', '--verify', '--quiet', 'HEAD', capture_output=True, check=False)
     has_head = head.returncode == 0
     descriptor, index_name = tempfile.mkstemp(prefix="symphonai-git-index-")
     os.close(descriptor)
     os.unlink(index_name)
     environment = {**os.environ, "GIT_INDEX_FILE": index_name}
     try:
-        initialized = subprocess.run(
-            ["git", "read-tree", "HEAD" if has_head else "--empty"], cwd=root, env=environment,
-            capture_output=True, check=False,
-        )
+        initialized = _git(root, 'read-tree', 'HEAD' if has_head else '--empty', env=environment, capture_output=True, check=False)
         if initialized.returncode:
             output = (initialized.stderr or initialized.stdout).decode("utf-8", errors="replace")
             raise RuntimeError(output[-4000:] or "could not prepare a temporary Git index")
-        added = subprocess.run(
-            ["git", "add", "--", *selected], cwd=root, env=environment,
-            capture_output=True, check=False,
-        )
+        added = _git(root, 'add', '--', *selected, env=environment, capture_output=True, check=False)
         if added.returncode:
             output = (added.stderr or added.stdout).decode("utf-8", errors="replace")
             raise RuntimeError(output[-4000:] or "git add failed")
-        committed = subprocess.run(
-            ["git", "commit", "-m", message], cwd=root, env=environment,
-            capture_output=True, check=False,
-        )
+        committed = _git(root, 'commit', '-m', message, env=environment, capture_output=True, check=False)
         if committed.returncode:
             output = committed.stdout + committed.stderr
             raise RuntimeError(output.decode("utf-8", errors="replace")[-4000:] or "git commit failed")
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, check=False,
-        )
+        commit = _git(root, 'rev-parse', 'HEAD', capture_output=True, check=False)
         if commit.returncode:
             output = (commit.stderr or commit.stdout).decode("utf-8", errors="replace")
             raise RuntimeError(output[-4000:] or "could not read the new commit")
-        reset = subprocess.run(
-            ["git", "reset", "--quiet", "HEAD", *(["--", *selected] if has_head else [])], cwd=root,
-            capture_output=True, check=False,
-        )
+        reset = _git(root, 'reset', '--quiet', 'HEAD', *(['--', *selected] if has_head else []), capture_output=True, check=False)
         if reset.returncode:
             output = (reset.stderr or reset.stdout).decode("utf-8", errors="replace")
             raise RuntimeError(output[-4000:] or "could not update the selected paths in the index")
@@ -253,20 +235,16 @@ def git_pull_request_info(root: Path) -> dict[str, Any]:
     if auth.returncode:
         return {"branch": None, "base": None, "title": "", "ahead": 0,
                 "problem": "gh is not signed in. Run gh auth login."}
-    origin = pull_request_command(["git", "remote", "get-url", "origin"], root, "git remote get-url")
+    origin = pull_request_command(['remote', 'get-url', 'origin'], root, 'git remote get-url', git_command=True)
     if origin.returncode:
         return {"branch": None, "base": None, "title": "", "ahead": 0,
                 "problem": "This repository has no origin remote."}
-    current = pull_request_command(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], root, "git symbolic-ref",
-    )
+    current = pull_request_command(['symbolic-ref', '--quiet', '--short', 'HEAD'], root, 'git symbolic-ref', git_command=True)
     if current.returncode:
         return {"branch": None, "base": None, "title": "", "ahead": 0,
                 "problem": "Check out a branch first."}
     branch = os.fsdecode(current.stdout.strip())
-    remote_head = pull_request_command(
-        ["git", "ls-remote", "--symref", "origin", "HEAD"], root, "git ls-remote",
-    )
+    remote_head = pull_request_command(['ls-remote', '--symref', 'origin', 'HEAD'], root, 'git ls-remote', git_command=True)
     base = None
     if remote_head.returncode == 0:
         for line in remote_head.stdout.splitlines():
@@ -276,16 +254,12 @@ def git_pull_request_info(root: Path) -> dict[str, Any]:
     if not base:
         return {"branch": branch, "base": None, "title": "", "ahead": 0,
                 "problem": "Could not determine origin's default branch."}
-    title_result = pull_request_command(
-        ["git", "log", "-1", "--format=%s", "HEAD"], root, "git log",
-    )
+    title_result = pull_request_command(['log', '-1', '--format=%s', 'HEAD'], root, 'git log', git_command=True)
     title = os.fsdecode(title_result.stdout.rstrip(b"\r\n")) if title_result.returncode == 0 else ""
     if branch == base:
         problem = f"Create a branch first; a pull request comes from a branch other than {base}."
         return {"branch": branch, "base": base, "title": title, "ahead": 0, "problem": problem}
-    ahead_result = pull_request_command(
-        ["git", "rev-list", "--count", f"origin/{base}..HEAD"], root, "git rev-list",
-    )
+    ahead_result = pull_request_command(['rev-list', '--count', f'origin/{base}..HEAD'], root, 'git rev-list', git_command=True)
     if ahead_result.returncode:
         return {"branch": branch, "base": base, "title": title, "ahead": 0,
                 "problem": f"Could not compare {branch} with {base}."}
@@ -299,9 +273,7 @@ def create_pull_request(root: Path, title: str, body: str) -> dict[str, str]:
     info = git_pull_request_info(root)
     if info["problem"]:
         raise RuntimeError(info["problem"])
-    push = pull_request_command(
-        ["git", "push", "-u", "origin", info["branch"]], root, "git push",
-    )
+    push = pull_request_command(['push', '-u', 'origin', info['branch']], root, 'git push', git_command=True)
     if push.returncode:
         output = (push.stdout + push.stderr).decode("utf-8", errors="replace")
         raise RuntimeError(output[-4000:] or "git push failed")

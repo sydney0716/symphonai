@@ -8,7 +8,7 @@ from symphonai_api.secrets import mask_secrets
 from symphonai_api.serialization import message_from_json
 from symphonai_api.session import SessionStore, TranscriptError, read_records
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_host.sessions import list_sessions, matching_snippets
 
 
@@ -19,7 +19,7 @@ class SessionTool(LocalTool):
         self.current_session = current_session
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=True, paths=None)
+        return ToolMetadata(concurrency_safe=True)
 
     def store(self, session_id):
         directory = (self.root / session_id).resolve()

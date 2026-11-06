@@ -6,7 +6,6 @@ rather than mutating it. This module deliberately contains no runtime wiring.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -91,34 +90,25 @@ class IOContract:
             object.__setattr__(self, field_name, _frozen(schema))
 
 
-def validate_output(contract: IOContract, text: str) -> tuple[object | None, str | None]:
-    """Parse and check output, returning an actionable error instead of raising."""
-    if contract.output_schema is None:
+def _validate_text(contract: IOContract, text: str, direction: str) -> tuple[object | None, str | None]:
+    from symphonai_api.providers.base import parse_json_reply
+    schema = getattr(contract, direction + "_schema")
+    if schema is None:
         return text, None
     try:
-        source = text.strip()
-        if source.startswith("```json") and source.endswith("```"):
-            source = source[7:-3].strip()
-        value = json.loads(source)
-        error = _validate(value, contract.output_schema, "output")
+        value = parse_json_reply(text)
+        error = _validate(value, schema, direction)
         return (value, None) if error is None else (None, error)
     except Exception as exc:
-        return None, f"output must be valid JSON matching the contract: {exc}"
+        return None, f"{direction} must be valid JSON matching the contract: {exc}"
+
+
+def validate_output(contract: IOContract, text: str) -> tuple[object | None, str | None]:
+    return _validate_text(contract, text, "output")
 
 
 def validate_input(contract: IOContract, text: str) -> tuple[object | None, str | None]:
-    """Parse and check dispatch input, returning an actionable error."""
-    if contract.input_schema is None:
-        return text, None
-    try:
-        source = text.strip()
-        if source.startswith("```json") and source.endswith("```"):
-            source = source[7:-3].strip()
-        value = json.loads(source)
-        error = _validate(value, contract.input_schema, "input")
-        return (value, None) if error is None else (None, error)
-    except Exception as exc:
-        return None, f"input must be valid JSON matching the contract: {exc}"
+    return _validate_text(contract, text, "input")
 
 @dataclass(frozen=True)
 class AgentSpec:

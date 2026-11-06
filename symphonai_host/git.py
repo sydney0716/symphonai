@@ -1,8 +1,9 @@
 """Read repository roots and NUL-delimited working-tree status."""
 from __future__ import annotations
 
+from symphonai_api.git import git as _git, WorktreeError
+
 import os
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,21 +23,18 @@ class GitStatus:
 
 def read_git_status(root: Path, *, all_untracked: bool = True) -> GitStatus | None:
     try:
-        top = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], cwd=root,
-            capture_output=True, check=False,
-        )
+        top = _git(root, 'rev-parse', '--show-toplevel', capture_output=True, check=False)
         if top.returncode:
             return None
         repository = Path(os.fsdecode(top.stdout.strip())).resolve()
-        command = ["git", "status", "--porcelain=v1", "-z"]
+        command = ["status", "--porcelain=v1", "-z"]
         if all_untracked:
             command.append("--untracked-files=all")
-        result = subprocess.run(
-            command, cwd=repository, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        result = _git(
+            repository, *command, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             capture_output=True, check=False,
         )
-    except OSError:
+    except (OSError, WorktreeError):
         return None
     if result.returncode:
         return None

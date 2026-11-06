@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from types import MappingProxyType
-import tomllib
+import warnings
 
 from symphonai_api import config as config_module
 from symphonai_api.agent_file import AgentFileError, load_agent_directory
@@ -16,6 +18,10 @@ from symphonai_api.config import ConfigError, Provenance, ResolvedConfig, Scope
 from symphonai_api.hooks import HookSpec, hooks_from_config
 from symphonai_api.mcp import McpServerSpec, mcp_servers_from_config
 from symphonai_api.skills import Skill, SkillError, load_skill_directory
+
+
+class PluginWarning(UserWarning):
+    """A malformed plugin was skipped while loading a project."""
 
 
 class PluginError(ValueError):
@@ -39,20 +45,12 @@ _PLUGIN_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _raise(path: Path, member: str, detail: str) -> None:
-    raise PluginError(f"plugin {path.name!r} at {path}: {member}: {detail}")
+    ConfigSource(path, PluginError, location=f"plugin {path.name!r} at {path}").error(member, detail)
 
 
 def _load_manifest(path: Path) -> Mapping[str, object]:
-    manifest = path / "plugin.toml"
-    try:
-        values = tomllib.loads(manifest.read_text(encoding="utf-8"))
-    except OSError as exc:
-        _raise(path, "plugin.toml", f"could not be read: {exc}")
-    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
-        _raise(path, "plugin.toml", f"could not be parsed: {exc}")
-    unknown = values.keys() - _MANIFEST_KEYS
-    if unknown:
-        _raise(path, str(sorted(unknown)[0]), "unknown key")
+    values = ConfigSource(path, PluginError, location=f"plugin {path.name!r} at {path}").read_toml(path=path / "plugin.toml", read_key="plugin.toml", parse_key="plugin.toml")
+    ConfigSource(path, PluginError, location=f"plugin {path.name!r} at {path}").unknown_keys("", values, _MANIFEST_KEYS)
     return values
 
 
@@ -61,14 +59,7 @@ def _required_text(
     manifest: Mapping[str, object],
     key: str,
 ) -> str:
-    if key not in manifest:
-        _raise(path, key, "is required")
-    value = manifest[key]
-    if not isinstance(value, str):
-        _raise(path, key, "must be a string")
-    if not value.strip():
-        _raise(path, key, "must not be blank")
-    return value
+    return ConfigSource(path, PluginError, location=f"plugin {path.name!r} at {path}").required_text(manifest, key)
 
 
 def _member_config(path: Path) -> ResolvedConfig:
@@ -173,12 +164,12 @@ def load_plugin_directory(
     directory = Path(path)
     if not directory.exists():
         return {}
-    return {
-        child.name: load_plugin(
-            child,
-            repo_root=repo_root,
-            **loader_kwargs,
-        )
-        for child in sorted(directory.iterdir())
-        if child.is_dir()
-    }
+    plugins = {}
+    for child in sorted(directory.iterdir()):
+        if not child.is_dir():
+            continue
+        try:
+            plugins[child.name] = load_plugin(child, repo_root=repo_root, **loader_kwargs)
+        except PluginError as exc:
+            warnings.warn(str(exc), PluginWarning, stacklevel=2)
+    return plugins

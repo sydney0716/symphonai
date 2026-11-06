@@ -12,15 +12,15 @@ available to OpenAI-compatible vendors.
 
 from __future__ import annotations
 
+from symphonai_api.providers.base import _usage_count, _synthesize_tool_call_id, RememberedRejections
+
 import json
 import os
-import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.identity import new_id
 from symphonai_api.model_table import resolve_effort
 from symphonai_api.models import (
     DocumentBlock,
@@ -61,17 +61,13 @@ _ROLE_TO_OPENAI = {
     Role.TOOL: "tool",
 }
 _RESPONSES_REASONING_KEY = "responses_reasoning_items"
-_REASONING_SUMMARY_DISABLED: set[tuple[str, str]] = set()
-_REASONING_SUMMARY_LOCK = threading.Lock()
+_REASONING_SUMMARY_DISABLED = RememberedRejections()
 
 
 def _reasoning_summary_key(base_url: str, model: str) -> tuple[str, str]:
     return base_url, model
 
 
-def _reasoning_summary_disabled(key: tuple[str, str]) -> bool:
-    with _REASONING_SUMMARY_LOCK:
-        return key in _REASONING_SUMMARY_DISABLED
 
 
 def _reasoning_summary_rejected(error: ProviderError) -> bool:
@@ -243,17 +239,8 @@ def _build_responses_request_body(
     return body
 
 
-def _synthesize_tool_call_id() -> str:
-    """Build a fallback canonical id for tool calls that arrive without one.
-
-    Must not be position-based: the same index in a later turn would reuse
-    the id, leaving two distinct calls sharing a `tool_call_id`.
-    """
-    return new_id("call")
 
 
-def _usage_count(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _cached_prompt_tokens(usage: dict[str, Any]) -> int:
@@ -577,7 +564,7 @@ class OpenAIProvider(ModelProvider):
 
         model = request.model if request.model is not None else self.model
         key = _reasoning_summary_key(self.base_url, model)
-        include_summary = not _reasoning_summary_disabled(key)
+        include_summary = not (key in _REASONING_SUMMARY_DISABLED)
 
         def send(include_reasoning_summary: bool) -> ModelResponse:
             body = _build_responses_request_body(
@@ -607,10 +594,8 @@ class OpenAIProvider(ModelProvider):
         try:
             return send(include_summary)
         except ProviderError as exc:
-            if not include_summary or not _reasoning_summary_rejected(exc):
+            if not include_summary or not _REASONING_SUMMARY_DISABLED.remember(key, exc, _reasoning_summary_rejected):
                 raise
-            with _REASONING_SUMMARY_LOCK:
-                _REASONING_SUMMARY_DISABLED.add(key)
             return send(False)
 
     def create_response_stream(
@@ -622,7 +607,7 @@ class OpenAIProvider(ModelProvider):
 
         model = request.model if request.model is not None else self.model
         key = _reasoning_summary_key(self.base_url, model)
-        include_summary = not _reasoning_summary_disabled(key)
+        include_summary = not (key in _REASONING_SUMMARY_DISABLED)
 
         def stream(include_reasoning_summary: bool) -> Iterator[StreamChunk]:
             body = _build_responses_request_body(
@@ -660,8 +645,6 @@ class OpenAIProvider(ModelProvider):
                 emitted = True
                 yield chunk
         except ProviderError as exc:
-            if emitted or not _reasoning_summary_rejected(exc):
+            if emitted or not _REASONING_SUMMARY_DISABLED.remember(key, exc, _reasoning_summary_rejected):
                 raise
-            with _REASONING_SUMMARY_LOCK:
-                _REASONING_SUMMARY_DISABLED.add(key)
             yield from stream(False)

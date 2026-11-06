@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import warnings
 from pathlib import Path
 from types import MappingProxyType
 
@@ -16,7 +17,7 @@ from symphonai_api.discovery import Offered, discover
 from symphonai_api.hooks import HookRunner, HookSpec, hooks_from_config
 from symphonai_api.mcp import McpServerSpec, mcp_servers_from_config
 from symphonai_api.lsp import LspServerSpec, lsp_servers_from_config
-from symphonai_api.plugins import Plugin
+from symphonai_api.plugins import Plugin, PluginWarning
 from symphonai_api.skills import Skill
 from symphonai_api.trust import TrustList, trust_from_config
 
@@ -113,12 +114,15 @@ def load_extensions(
                 trust=trust,
             )
             lsp_servers = lsp_servers_from_config(config, repo_root=repo_root, trust=trust)
-            discovered = discover(
-                repo_root=repo_root,
-                home=home,
-                trust=trust,
-                ceiling=ceiling,
-            )
+            with warnings.catch_warnings(record=True) as plugin_warnings:
+                warnings.simplefilter("always", PluginWarning)
+                discovered = discover(
+                    repo_root=repo_root,
+                    home=home,
+                    trust=trust,
+                    ceiling=ceiling,
+                )
+            config = replace(config, warnings=(*config.warnings, *(str(item.message) for item in plugin_warnings)))
             return Extensions(
                 config,
                 trust,

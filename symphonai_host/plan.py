@@ -9,7 +9,7 @@ from symphonai_api.events import Event
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 
 PLAN_STEP_LIMIT = 20
@@ -86,7 +86,7 @@ class UpdatePlanTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(
         self,

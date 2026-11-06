@@ -57,7 +57,6 @@ class OpenAICompatibleProvider(ModelProvider):
     provider_label: str = "openai-compatible"
     timeout_seconds: float = 600.0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
-    stream_usage: bool = True
 
     @property
     def name(self) -> str:
@@ -113,8 +112,7 @@ class OpenAICompatibleProvider(ModelProvider):
         model = request.model if request.model is not None else self.model
         body = _build_request_body(request, model)
         body["stream"] = True
-        if self.stream_usage:
-            body["stream_options"] = {"include_usage": True}
+        body["stream_options"] = {"include_usage": True}
         http_request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(body).encode("utf-8"),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -18,34 +17,17 @@ from symphonai_api.cost import ModelPrice, PriceTable
 from symphonai_api.hooks import HookRunner, HookSpec
 from symphonai_api.jobs import JobManager
 from symphonai_api.leader import Leader, LeaderConfig
-from symphonai_api.models import Message, ModelResponse, Role, ToolCall, ToolResult, Usage
+from symphonai_api.models import Message, Role, ToolCall, ToolResult, Usage
 from symphonai_api.providers.base import ProviderUnavailableError
 from symphonai_api.providers.fake import FakeModelProvider
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_api.tools.read_ledger import ReadLedger
 from symphonai_host.broker import EventBroker
 from symphonai_host.run import HostRun
 from scripts.checks.harness import check
-from scripts.checks.workspace import handoff_spec, workspace
-
-
-class Script(FakeModelProvider):
-    def __init__(self, responses=None, before=None):
-        super().__init__(responses)
-        self.requests = []
-        self.before = before
-
-    def create_response(self, request, *, cancel=None):
-        self.requests.append(request)
-        if self.before is not None:
-            self.before(request, len(self.requests))
-        return super().create_response(request, cancel=cancel)
-
-
-def answer(text="finished", *calls, usage=None):
-    return ModelResponse(Message(Role.ASSISTANT, text, tool_calls=list(calls)), usage=usage or Usage())
+from scripts.checks.workspace import Script, answer, call, git, init_repository, handoff_spec, workspace
 
 
 @check("turns.compaction_keeps_one_summary_and_fits_long_turns")
@@ -81,7 +63,7 @@ def compaction_keeps_one_summary_and_fits_long_turns():
         parameters = {'type': 'object', 'properties': {}}
 
         def metadata(self, arguments):
-            return ToolMetadata(ToolEffect.READ_ONLY, False, ())
+            return ToolMetadata(concurrency_safe=False)
 
         def _execute(self, tool_call, policy, cancel=None):
             return ToolResult(tool_call.id, ok=True, content='x' * 6000)
@@ -111,10 +93,6 @@ def compaction_keeps_one_summary_and_fits_long_turns():
 
 
 
-def call(tool_name, /, **arguments):
-    return ToolCall(f"{tool_name}-{os.urandom(4).hex()}", tool_name, arguments)
-
-
 def results(run):
     messages = run.leader_messages if hasattr(run, "leader_messages") else run.messages
     return [message.tool_result for message in messages if message.tool_result is not None]
@@ -139,7 +117,7 @@ class Action(LocalTool):
     parameters = {"type": "object", "properties": {}}
 
     def metadata(self, arguments):
-        return ToolMetadata(ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(self, tool_call, policy, cancel=None):
         self.action(cancel)
@@ -312,18 +290,6 @@ def failed_validation_stops_after_five_rounds():
         run = leader(ws, parent, child).run("delegate")
         assert child.call_count == 5 and not results(run)[0].ok
         assert "false" in results(run)[0].content
-
-
-def git(root, *arguments):
-    return subprocess.run(["git", *arguments], cwd=root, check=True, capture_output=True).stdout
-
-
-def init_repository(root):
-    git(root, "init", "--quiet")
-    git(root, "config", "user.email", "core@example.invalid")
-    git(root, "config", "user.name", "Core checks")
-    git(root, "add", "existing.txt")
-    git(root, "commit", "--quiet", "-m", "fixture")
 
 
 def worktree_run(ws, validation):
@@ -991,7 +957,7 @@ def deferred_mcp_tools_load_execute_and_survive_compaction():
             return self._description
 
         def metadata(self, arguments):
-            return ToolMetadata(ToolEffect.READ_ONLY, concurrency_safe=True, paths=())
+            return ToolMetadata(concurrency_safe=True)
 
         def _execute(self, tool_call, policy, cancel=None):
             self.calls += 1

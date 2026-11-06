@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.paths import utc_iso
+
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -14,7 +16,6 @@ import time
 import tempfile
 import tomllib
 import re
-from datetime import datetime, timezone
 from collections.abc import Mapping
 from collections.abc import Callable
 from http.cookies import CookieError, SimpleCookie
@@ -28,15 +29,11 @@ from symphonai_api.agent_memory import MemoryUnavailable
 from symphonai_api.agent_file import AgentFileError, load_agent_file
 from symphonai_api.events import Event
 from symphonai_api.model_discovery import list_models
-from symphonai_api.model_table import model_capabilities
-from symphonai_api.permissions import _contains_path
+from symphonai_api.model_table import capability_for_provider
+from symphonai_api.permissions import _contains_path, display_path
 from symphonai_api.providers.base import ModelProvider, ProviderError
-from symphonai_api.providers.anthropic_provider import API_KEY_ENV_VAR as ANTHROPIC_KEY_ENV_VAR
-from symphonai_api.providers.gemini_provider import API_KEY_ENV_VAR as GEMINI_KEY_ENV_VAR
-from symphonai_api.providers.openai_provider import API_KEY_ENV_VAR as OPENAI_KEY_ENV_VAR
 from symphonai_api.session import SessionError, SessionStore, TranscriptError
 from symphonai_api.paths import symphonai_home, write_atomic
-from symphonai_api.survey import survey_repository
 from symphonai_api.web_search import search_endpoint, search_endpoints
 from symphonai_host.git import read_git_status
 from symphonai_host.git_actions import git_status, git_diff, git_commit, git_pull_request_info, create_pull_request
@@ -112,15 +109,9 @@ def _working_tree_fingerprint(root: Path) -> dict[str, tuple[str, int, int, int,
 
 
 def _models_with_efforts(provider: str, models: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
-    efforts = {
-        capability.model: [option.id for option in capability.efforts]
-        for capability in model_capabilities()
-        if capability.provider == provider
-    }
-    return [
-        {"id": model, "efforts": efforts.get(model)}
-        for model in models
-    ]
+    return [{"id": model, "efforts": [option.id for option in capability.efforts] if
+             (capability := capability_for_provider(provider, model)) is not None else None}
+            for model in models]
 
 
 def _model_listing(
@@ -141,11 +132,7 @@ def _model_listing(
 
 
 def _memory_entry_reply(entry) -> dict[str, str]:  # noqa: ANN001
-    written_at = (
-        datetime.fromtimestamp(entry.written_at, timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
+    written_at = utc_iso(entry.written_at)
     return {
         "id": entry.id,
         "text": entry.text,
@@ -257,7 +244,7 @@ class HostServer:
         self._runtimes_lock = threading.RLock()
         self._event_session_ids: dict[str, str] = {}
         if initial_runtime is not None and self._current_root is not None:
-            initial_runtime.run._roadmap_tools_enabled = True
+            initial_runtime.run.enable_roadmap_tools()
             self._runtimes[self._current_root] = initial_runtime
         self._watch_stop = threading.Event()
         self._event_watch: threading.Thread | None = None
@@ -278,7 +265,7 @@ class HostServer:
         self._file_watch = threading.Thread(target=self._watch_files, daemon=True)
         self._file_watch.start()
         if initial_run is not None:
-            initial_run.recover_loops()
+            initial_run.loops.recover_loops()
 
     @property
     def port(self) -> int:
@@ -375,12 +362,12 @@ class HostServer:
                 provider = current.provider if current is not None else self._default_provider
                 runtime = self._project_factory(resolved, self.broker, self._publish_approval)
                 try:
-                    runtime.run._roadmap_tools_enabled = True
+                    runtime.run.enable_roadmap_tools()
                     if provider is not None:
                         runtime.run.select_provider(
                             provider, selection.get("model"), selection.get("effort"),
                         )
-                    runtime.run.recover_loops()
+                    runtime.run.loops.recover_loops()
                     if self._closed:
                         raise RuntimeError("host is closing")
                 except BaseException:
@@ -844,29 +831,23 @@ class HostServer:
                 self,
                 name: object,
                 scope: object,
-            ) -> tuple[str, str, Path] | tuple[None, None, None]:
+            ) -> tuple[str, str, Path]:
                 if not isinstance(name, str) or not name:
                     raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must be a non-empty string'}))
-                    return None, None, None
                 if not isinstance(scope, str) or scope not in ("project", "user"):
                     raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': "scope must be 'project' or 'user'"}))
-                    return None, None, None
                 if any(separator in name for separator in ("/", "\\")):
                     raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must be a single segment'}))
-                    return None, None, None
                 if name in (".", ".."):
                     raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must not be a parent reference'}))
-                    return None, None, None
                 if name.endswith(".toml"):
                     stem = name[:-5]
                 elif Path(name).suffix:
                     raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must use the .toml extension'}))
-                    return None, None, None
                 else:
                     stem = name
                 if not stem or stem in (".", "..") or Path(stem).name != stem:
                     raise _ReplyReady(_Reply(HTTPStatus.BAD_REQUEST, {'error': 'name must be a single segment'}))
-                    return None, None, None
                 filename = f"{stem}.toml"
                 directory = (
                     host._repo_root / ".symphonai" / "agents"
@@ -883,7 +864,6 @@ class HostServer:
                     target = (root / filename).resolve(strict=False)
                 if not _contains_path(base, root) or not _contains_path(root, target):
                     raise _ReplyReady(_Reply(HTTPStatus.FORBIDDEN, None))
-                    return None, None, None
                 return stem, scope, target
 
             def _definition_trusted(self, scope: str) -> bool:
@@ -1033,8 +1013,6 @@ class HostServer:
                 stem, scope, target = self._definition_target(
                     values["name"][0], values["scope"][0]
                 )
-                if target is None:
-                    return
                 if not self._definition_trusted(scope):
                     self._json(
                         HTTPStatus.FORBIDDEN,
@@ -1213,7 +1191,7 @@ class HostServer:
                 except ValueError:
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'days must be an integer from 1 to 90'})
                 report = host._usage_report.read(
-                    host.run.sessions_root, days=days, price_table=host.run._price_table,
+                    host.run.sessions_root, days=days, price_table=host.run.price_table,
                 )
                 return _Reply(HTTPStatus.OK, report)
 
@@ -1263,8 +1241,8 @@ class HostServer:
 
             def _get_roadmap(self, payload):
                 with self._errors(0):
-                    roadmap = RoadmapStore(host.run._repo_root).load()
-                    reply = RoadmapStore(host.run._repo_root).reply(roadmap)
+                    roadmap = RoadmapStore(host.run.repo_root).load()
+                    reply = RoadmapStore(host.run.repo_root).reply(roadmap)
                 return _Reply(HTTPStatus.OK, reply)
 
             def _get_models(self, payload):
@@ -1357,10 +1335,6 @@ class HostServer:
                     reply = host.run.agent_history(session_ids[0], agent_ids[0])
                 return _Reply(HTTPStatus.OK, reply)
 
-            def _get_survey(self, payload):
-                survey = survey_repository(policy=host.run.policy)
-                relative = lambda path: path.relative_to(survey.root).as_posix()
-                return _Reply(HTTPStatus.OK, {'survey': {'root': '.', 'languages': survey.languages, 'by_directory': survey.by_directory, 'entry_points': [relative(path) for path in survey.entry_points], 'docs': [relative(path) for path in survey.docs], 'tests': [relative(path) for path in survey.tests], 'tree_summary': survey.tree_summary, 'truncated_directories': survey.truncated_directories, 'stopped': survey.stopped, 'file_count': survey.file_count}})
 
             def _get_project(self, payload):
                 if host._current_root is None:
@@ -1478,8 +1452,7 @@ class HostServer:
                 root = host.run.policy.repo_root.resolve()
 
                 def display_directory(directory: Path) -> str:
-                    resolved = directory.resolve()
-                    return resolved.relative_to(root).as_posix() if resolved.is_relative_to(root) else str(resolved)
+                    return display_path(directory, root)
 
                 def roster(kind: str) -> list[dict[str, str]]:
                     from symphonai_api import data
@@ -1564,8 +1537,9 @@ class HostServer:
                 if len(values) != 1:
                     return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
                 with self._errors(0):
-                    loop = LoopStore(host._repo_root).load(values[0])
-                loop['usage'] = host.run.loop_usage(loop)
+                    record = LoopStore(host._repo_root).load_record(values[0])
+                loop = record.to_payload()
+                loop['usage'] = host.run.loops.loop_usage(record)
                 return _Reply(HTTPStatus.OK, {'loop': loop})
 
             def _get_loop_card(self, payload):
@@ -1575,7 +1549,7 @@ class HostServer:
                 if len(loop_ids) != 1 or len(card_ids) != 1:
                     return _Reply(HTTPStatus.NOT_FOUND, {'error': 'not found'})
                 with self._errors(0):
-                    detail = host.run.loop_card_details(loop_ids[0], card_ids[0])
+                    detail = host.run.loops.loop_card_details(loop_ids[0], card_ids[0])
                 return _Reply(HTTPStatus.OK, detail)
 
             def _get_history(self, payload):
@@ -1739,23 +1713,23 @@ class HostServer:
 
             def _post_loop_start(self, payload):
                 with self._errors(0):
-                    loop = host.run.start_loop(payload['goal'])
+                    loop = host.run.loops.start_loop(payload['goal']).to_payload()
                 return _Reply(HTTPStatus.OK, {'loop': loop, 'session_id': loop['planner_session_id']})
 
             def _post_loop_plan(self, payload):
                 with self._errors(0):
                     loop_id, action = (payload.get('loop_id'), payload.get('action'))
                     if action == 'approve' and set(payload) == {'loop_id', 'action'}:
-                        loop = host.run.approve_loop_plan(loop_id)
+                        loop = host.run.loops.approve_loop_plan(loop_id).to_payload()
                         reply = {'loop': loop}
                     elif action == 'drop' and set(payload) == {'loop_id', 'action', 'cards'}:
                         cards = payload['cards']
                         if not all((isinstance(card, str) for card in cards)):
                             raise ProtocolError('loop/plan drop requires cards as string ids')
-                        loop = host.run.drop_loop_cards(loop_id, cards)
+                        loop = host.run.loops.drop_loop_cards(loop_id, cards).to_payload()
                         reply = {'loop': loop}
                     elif action == 'revise' and set(payload) == {'loop_id', 'action', 'note'}:
-                        loop = host.run.revise_loop_plan(loop_id, payload['note'])
+                        loop = host.run.loops.revise_loop_plan(loop_id, payload['note']).to_payload()
                         reply = {'loop': loop, 'session_id': loop['planner_session_id']}
                     else:
                         raise ProtocolError('loop/plan has an invalid action or body')
@@ -1763,17 +1737,17 @@ class HostServer:
 
             def _post_loop_cancel(self, payload):
                 with self._errors(0):
-                    loop = host.run.cancel_loop(payload['loop_id'])
+                    loop = host.run.loops.cancel_loop(payload['loop_id']).to_payload()
                 return _Reply(HTTPStatus.OK, {'loop': loop})
 
             def _post_loop_commit(self, payload):
                 with self._errors(0):
-                    loop = host.run.commit_loop(payload['loop_id'], payload['action'])
+                    loop = host.run.loops.commit_loop(payload['loop_id'], payload['action']).to_payload()
                 return _Reply(HTTPStatus.OK, {'loop': loop, 'branch': loop.get('branch'), 'commits': loop.get('summary', {}).get('commits', [])})
 
             def _post_loop_resume(self, payload):
                 with self._errors(0):
-                    loop = host.run.resume_loop(payload['loop_id'])
+                    loop = host.run.loops.resume_loop(payload['loop_id']).to_payload()
                 return _Reply(HTTPStatus.OK, {'loop': loop})
 
             def _post_goal(self, payload):
@@ -1834,8 +1808,6 @@ class HostServer:
 
             def _post_agent(self, payload):
                 stem, scope, target = self._definition_target(payload['name'], payload['scope'])
-                if target is None:
-                    return
                 if not self._definition_trusted(scope):
                     return _Reply(HTTPStatus.FORBIDDEN, {'error': 'repository not trusted for agents'})
                 if ('text' in payload) == ('fields' in payload):
@@ -1894,7 +1866,7 @@ class HostServer:
             def _post_credentials(self, payload):
                 name = payload.get('name')
                 value = payload.get('value')
-                if name not in (ANTHROPIC_KEY_ENV_VAR, GEMINI_KEY_ENV_VAR, OPENAI_KEY_ENV_VAR, *(variable for _, variable, _ in PROVIDERS[3:]), *(endpoint.api_key_env_var for endpoint in search_endpoints())):
+                if name not in ({variable for _, variable, _ in PROVIDERS} | {endpoint.api_key_env_var for endpoint in search_endpoints()}):
                     return _Reply(HTTPStatus.BAD_REQUEST, {'error': 'unknown credential name'})
                 providers = {provider for provider, variable, _ in PROVIDERS if variable == name}
                 with host._model_cache_lock:
@@ -1922,15 +1894,8 @@ class HostServer:
                     return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown session'})
                 if not host._session_belongs_here(session_id):
                     return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
-                with host.run._lock:
-                    opened = host.run._open_conversations.get(session_id)
-                    store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, session_id)
-                    try:
-                        viewed_at = datetime.now(timezone.utc).isoformat()
-                        store.update_meta(lambda meta: meta.update(viewed_at=viewed_at))
-                    finally:
-                        if opened is None:
-                            store.close()
+                viewed_at = utc_iso()
+                host.run.update_session_meta(session_id, lambda meta: meta.update(viewed_at=viewed_at))
                 return _Reply(HTTPStatus.OK, {'session_id': session_id, 'viewed_at': viewed_at})
 
             def _post_session_rename(self, payload):
@@ -1939,22 +1904,11 @@ class HostServer:
                     title = payload['title'].strip()
                     if not run_id or run_id in ('.', '..') or Path(run_id).name != run_id or (not title) or (len(title) > 200):
                         raise ProtocolError('title must be non-blank and at most 200 characters')
-                from symphonai_api.session import SessionStore
                 if not (host.run.sessions_root / run_id).is_dir():
                     return _Reply(HTTPStatus.NOT_FOUND, {'error': 'unknown session'})
                 if not host._session_belongs_here(run_id):
                     return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
-                with host.run._lock:
-                    opened = host.run._open_conversations.get(run_id)
-                    session_store = opened[1] if opened is not None else SessionStore.open(host.run.sessions_root, run_id)
-                    try:
-
-                        def change(meta):
-                            meta['title'] = title
-                        session_store.update_meta(change)
-                    finally:
-                        if opened is None:
-                            session_store.close()
+                host.run.update_session_meta(run_id, lambda meta: meta.update(title=title))
                 return _Reply(HTTPStatus.OK, {'renamed': True})
 
             def _post_session_archive(self, payload):
@@ -2018,14 +1972,8 @@ class HostServer:
                 return _Reply(HTTPStatus.OK, {'changed': result.changed, 'before_tokens': result.before_tokens, 'after_tokens': result.after_tokens, 'dropped_messages': result.dropped_messages})
 
             def _post_prompt(self, payload):
-                kind = 'prompt'
                 with self._errors(0):
-                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
-                    if remember_project:
-                        payload = {**payload, 'remember': False}
-                    request = decode_request(kind, payload)
-                    if remember_project:
-                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
+                    request = decode_request('prompt', payload)
                 with self._errors(1):
                     run_id = host.run.start(request.prompt, attachments=request.attachments)
                 return _Reply(HTTPStatus.OK, {'accepted': True, 'run_id': run_id})
@@ -2046,14 +1994,8 @@ class HostServer:
                 return _Reply(HTTPStatus.OK, {'resolved': True})
 
             def _post_session_open(self, payload):
-                kind = 'session/open'
                 with self._errors(0):
-                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
-                    if remember_project:
-                        payload = {**payload, 'remember': False}
-                    request = decode_request(kind, payload)
-                    if remember_project:
-                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
+                    request = decode_request('session/open', payload)
                 if not host._session_belongs_here(request.run_id):
                     return _Reply(HTTPStatus.CONFLICT, {'error': 'that conversation belongs to another project'})
                 with self._errors(1):
@@ -2066,14 +2008,8 @@ class HostServer:
                 return _Reply(HTTPStatus.OK, reply)
 
             def _post_stop(self, payload):
-                kind = 'stop'
                 with self._errors(0):
-                    remember_project = kind == 'approval' and payload.get('remember') == 'project'
-                    if remember_project:
-                        payload = {**payload, 'remember': False}
-                    request = decode_request(kind, payload)
-                    if remember_project:
-                        request = ApprovalReply(request.approval_id, request.allowed, request.reason, 'project', request.answer)
+                    decode_request('stop', payload)
                 host.run.stop()
                 return _Reply(HTTPStatus.OK, {'accepted': True})
 
@@ -2171,8 +2107,6 @@ class HostServer:
             ),
             _Route('GET', '/session/agent', Handler._get_session_agent,
                 errors=(((TranscriptError, 'not_found'),),),
-            ),
-            _Route('GET', '/survey', Handler._get_survey,
             ),
             _Route('GET', '/project', Handler._get_project,
                 project_free=True,
@@ -2365,7 +2299,6 @@ class HostServer:
                 project_free=True,
                 payload=_Payload({'name': str, 'value': str}, ('name', 'value'), extra=True),
                 errors=(((CredentialError, 'credential_unavailable'),),),
-                action='credentials',
             ),
             _Route('POST', '/session/new', Handler._post_session_new,
                 match='exact',

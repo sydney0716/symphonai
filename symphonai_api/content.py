@@ -7,7 +7,6 @@ import base64
 from symphonai_api.models import DocumentBlock, ImageBlock
 
 MAX_ATTACHMENT_BYTES = 5_000_000
-SUPPORTED_IMAGE_MEDIA_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 DOCUMENT_MEDIA_TYPE = "application/pdf"
 
 

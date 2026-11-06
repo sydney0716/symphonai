@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import threading
 
+from symphonai_api.permissions import _contains_path
+
 
 class LeaseConflict(RuntimeError):
     """Raised when a prefix is already leased by another holder."""
@@ -24,10 +26,6 @@ class _HeldLease:
     lease: Lease
     path: Path
     count: int = 1
-
-
-def _contains_path(parent: Path, child: Path) -> bool:
-    return parent == child or parent in child.parents
 
 
 class WorkspaceLeases:
@@ -81,19 +79,6 @@ class WorkspaceLeases:
                 if held.count == 0:
                     self._held.pop(index)
                 return
-
-    def holder_for(self, path: str | Path) -> str | None:
-        candidate = Path(path)
-        if not candidate.is_absolute():
-            candidate = self._root / candidate
-        resolved = candidate.resolve()
-        if not _contains_path(self._root, resolved):
-            return None
-        with self._lock:
-            containing = [held for held in self._held if _contains_path(held.path, resolved)]
-            if not containing:
-                return None
-            return max(containing, key=lambda held: len(held.path.parts)).lease.holder
 
     @contextmanager
     def held(self, holder: str, prefix: str | None):

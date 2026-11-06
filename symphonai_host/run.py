@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+from symphonai_api.models import _without_vendor_state
+
+from symphonai_api.paths import utc_iso
+
+from symphonai_api.process import stop_process_group
+
+from symphonai_api.worktree import apply_patch, WorktreeApplyConflict, _top_level
+
+
 import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
-import signal
 import shutil
 import subprocess
 import sys
 import time
 import threading
-from datetime import datetime, timezone
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -27,7 +34,7 @@ from symphonai_api.cancellation import CancellationToken
 from symphonai_api.compaction import CompactionResult, DEFAULT_RECENT_TURNS
 from symphonai_api.config import permission_grants, restrict_permission_grants, resolve_run_budgets
 from symphonai_api.context_report import ContextReport, account_context
-from symphonai_api.cost import PriceTable, UsageTotals, total_cost
+from symphonai_api.cost import usage_records, PriceTable, UsageTotals, total_cost
 from symphonai_api.events import AutoReviewed, PreviewMarkAdded, Event, JobChanged, PromptSubmitted, RunFailed, RunFinished, RunStarted, SessionNotesUpdated, SubagentSpawned, fan_out
 from symphonai_api.extensions import Extensions
 from symphonai_api.environment import capture_environment
@@ -84,7 +91,6 @@ from symphonai_host.plan import PlanChanged, plan_tools
 from symphonai_host.questions import plan_proposal_tools, question_tools
 from symphonai_host.protocol import HistoryMessage
 from symphonai_host.loops import LoopStore
-from symphonai_host.spec_loop import Loop
 
 
 def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
@@ -93,23 +99,15 @@ def _usage_record(record: dict) -> tuple[str, str, UsageTotals] | None:
     data = record.get("data")
     if not isinstance(data, dict) or not isinstance(data.get("model"), str):
         return None
-    fields = (
-        "input_tokens", "output_tokens", "calls",
-        "cache_read_tokens", "cache_write_tokens",
-    )
-    values = [data.get(field) for field in fields]
-    values.extend(data.get(field, 0) for field in (
-        "long_context_input_tokens", "long_context_output_tokens",
-        "long_context_cache_read_tokens", "long_context_cache_write_tokens",
-    ))
-    values.append(data.get("cache_write_1h_tokens", 0))
-    if any(type(value) is not int or value < 0 for value in values):
+    try:
+        totals = UsageTotals.from_record(data)
+    except ValueError:
         return None
     agent_id = record.get("agent_id")
     if not isinstance(agent_id, str):
         return None
     name = data.get("agent_name")
-    return agent_id, name if isinstance(name, str) else agent_id, UsageTotals(*values)
+    return agent_id, name if isinstance(name, str) else agent_id, totals
 
 
 MAX_ACTIVE_CONVERSATIONS = 4
@@ -154,8 +152,6 @@ class CommandActiveError(RuntimeError):
     """A user command is already running in this host."""
 
 
-class WorktreeApplyConflict(RuntimeError):
-    """A worktree patch no longer applies to the main repository."""
 
 
 @dataclass(frozen=True)
@@ -226,11 +222,6 @@ PERMISSION_MODES = ("ask", "plan", "auto", "allow")
 _LOG = logging.getLogger(__name__)
 
 
-def _schema_tool_name(schema: dict) -> str | None:
-    function = schema.get("function")
-    return function.get("name") if isinstance(function, dict) else schema.get("name")
-
-
 @dataclass(frozen=True)
 class ForkableHistoryMessage(HistoryMessage):
     record_id: str
@@ -250,19 +241,6 @@ def _provider_identity(provider: ModelProvider) -> tuple[str, int, str | None]:
     )
 
 
-def _without_vendor_state(messages: list[Message]) -> list[Message]:
-    return [
-        replace(
-            message,
-            tool_calls=[
-                replace(call, provider_metadata={}, vendor_id=None)
-                for call in message.tool_calls
-            ],
-        )
-        if message.tool_calls
-        else message
-        for message in messages
-    ]
 
 
 def _conversation_title(prompt: str) -> str:
@@ -515,7 +493,6 @@ class HostRun:
         self._session_by_runtime_run: dict[str, str] = {}
         self._goal: Goal | None = None
         self._goal_session_id: str | None = None
-        self._goal_check: GoalCheck | None = None
         self._goal_check_thread: threading.Thread | None = None
         self._goals_by_session: dict[str, Goal] = {}
         self._goal_checks_by_session: dict[str, GoalCheck] = {}
@@ -844,39 +821,20 @@ class HostRun:
             self._policy.mode = mode
             return mode
 
-    def start_loop(self, goal: str, *, runner_pid: int | None=None, runner_lock: bool=False) -> dict:
-        return self._loops.start_loop(goal, runner_pid=runner_pid, runner_lock=runner_lock).to_payload()
+    @property
+    def loops(self):
+        return self._loops
 
-    def start_roadmap_goal(self, goal_id: str) -> tuple[dict, dict]:
-        roadmap, loop = self._loops.start_roadmap_goal(goal_id)
-        return roadmap, loop.to_payload()
+    @property
+    def price_table(self):
+        return self._price_table
 
-    def approve_loop_plan(self, loop_id: str) -> dict:
-        return self._loops.approve_loop_plan(loop_id).to_payload()
+    @property
+    def repo_root(self):
+        return self._repo_root
 
-    def drop_loop_cards(self, loop_id: str, card_ids: list[str]) -> dict:
-        return self._loops.drop_loop_cards(loop_id, card_ids).to_payload()
-
-    def revise_loop_plan(self, loop_id: str, note: str) -> dict:
-        return self._loops.revise_loop_plan(loop_id, note).to_payload()
-
-    def cancel_loop(self, loop_id: str) -> dict:
-        return self._loops.cancel_loop(loop_id).to_payload()
-
-    def commit_loop(self, loop_id: str, action: str) -> dict:
-        return self._loops.commit_loop(loop_id, action).to_payload()
-
-    def resume_loop(self, loop_id: str, *, runner_pid: int | None=None, runner_lock: bool=False) -> dict:
-        return self._loops.resume_loop(loop_id, runner_pid=runner_pid, runner_lock=runner_lock).to_payload()
-
-    def loop_card_details(self, loop_id: str, card_id: str) -> dict:
-        return self._loops.loop_card_details(loop_id, card_id)
-
-    def recover_loops(self) -> None:
-        return self._loops.recover_loops()
-
-    def loop_usage(self, loop: dict) -> dict:
-        return self._loops.loop_usage(Loop.from_payload(loop))
+    def enable_roadmap_tools(self) -> None:
+        self._roadmap_tools_enabled = True
 
     def _save_goal(self, session_id: str, goal: Goal | None) -> None:
         current = self._conversation
@@ -1062,7 +1020,6 @@ class HostRun:
                 return goal.payload()
             leader = self._open_conversations[session_id][0]
             context = GoalCheck(goal, session_id, threading.Event(), leader.agent_ref.agent_id)
-            self._goal_check = context
             self._goal_checks_by_session[session_id] = context
             thread = threading.Thread(
                 target=self._perform_goal_check,
@@ -1132,38 +1089,63 @@ class HostRun:
         ))
 
     @staticmethod
-    def _checkpoint_replay_data(
-        records: list[dict], subagent_records: list[list[dict]] | None = None, checkpoints=None,
-    ) -> tuple[dict[str, str], dict[str, list[dict[str, str | int]]]]:
-        keys: dict[str, str] = {}
-        root_run_keys: dict[str, str] = {}
-        edits: dict[str, list[dict[str, str | int]]] = {}
-        pending_key: str | None = None
-        current_root_run: str | None = None
+    def _checkpoint_records(records):
+        """Parse prompt/checkpoint associations, saved edits and root-run keys once."""
+        prompts = []
+        root_run_keys = {}
         recorded_edits = {}
-        for record in records:
-            if record.get("type") == "run_started":
-                data = record.get("data")
-                if isinstance(data, dict) and data.get("parent_run_id") is None:
+        pending_key = None
+        current_root_run = None
+        for index, record in enumerate(records):
+            data = record.get("data")
+            if record.get("type") == "run_started" and isinstance(data, dict):
+                if data.get("parent_run_id") is None:
                     current_root_run = record.get("run_id")
-            elif record.get("type") == "checkpoint":
-                key = record.get("data", {}).get("key")
-                if isinstance(key, str) and isinstance(record.get("data", {}).get("edits"), list):
-                    recorded_edits[key] = record["data"]["edits"]
+            elif record.get("type") == "checkpoint" and isinstance(data, dict):
+                key = data.get("key")
+                if isinstance(key, str) and isinstance(data.get("edits"), list):
+                    recorded_edits[key] = data["edits"]
                     continue
                 pending_key = key if isinstance(key, str) else None
                 if current_root_run is not None and pending_key is not None:
                     root_run_keys[current_root_run] = pending_key
             elif pending_key is not None and record.get("type") == "message":
                 try:
-                    message = message_from_json(record.get("data", {}))
+                    message = message_from_json(data)
                 except (KeyError, TypeError, ValueError):
                     continue
                 if message.role is Role.USER:
-                    record_id = record.get("record_id")
-                    if isinstance(record_id, str):
-                        keys[record_id] = pending_key
+                    prompts.append((pending_key, index, record.get("record_id"), message.text))
                     pending_key = None
+        return prompts, root_run_keys, recorded_edits
+
+    def _history_frame(
+        self, message, record_id, tool_results, auto_reviews, session_id,
+        *, checkpoint_keys=None, replay_edits=None, undone_keys=(), turn=None,
+    ):
+        key = (checkpoint_keys or {}).get(record_id)
+        return ForkableHistoryMessage(
+            role=message.role.value, text=message.text,
+            notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
+            reasoning=message.reasoning,
+            tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
+            turn_id=message.turn_id, record_id=record_id,
+            attachments=[{
+                "kind": "image" if isinstance(block, ImageBlock) else "document",
+                "media_type": block.media_type,
+                "filename": block.filename if isinstance(block, DocumentBlock) else None,
+            } for block in message.content if isinstance(block, (ImageBlock, DocumentBlock))],
+            checkpoint_key=key, edits=(replay_edits or {}).get(key, []),
+            undone=key in undone_keys, session_id=session_id, **(turn or {}),
+        )
+
+    @staticmethod
+    def _checkpoint_replay_data(
+        records: list[dict], subagent_records: list[list[dict]] | None = None, checkpoints=None,
+    ) -> tuple[dict[str, str], dict[str, list[dict[str, str | int]]]]:
+        prompts, root_run_keys, recorded_edits = HostRun._checkpoint_records(records)
+        keys = {record_id: key for key, _, record_id, _ in prompts if isinstance(record_id, str)}
+        edits: dict[str, list[dict[str, str | int]]] = {}
 
         transcripts = [records, *(subagent_records or [])]
         runs: dict[str, dict[str, str | None]] = {}
@@ -1494,8 +1476,8 @@ class HostRun:
                     "label": job.label,
                     "status": job.status,
                     "exit_code": job.exit_code,
-                    "started_at": datetime.fromtimestamp(job.started_at, timezone.utc).isoformat(),
-                    "ended_at": None if job.ended_at is None else datetime.fromtimestamp(job.ended_at, timezone.utc).isoformat(),
+                    "started_at": utc_iso(job.started_at),
+                    "ended_at": None if job.ended_at is None else utc_iso(job.ended_at),
                     "output_tail": job.output[-4000:],
                     "output_dropped": job.total_chars > 4000,
                 })
@@ -2320,9 +2302,10 @@ class HostRun:
                     except (OSError, TranscriptError):
                         continue
                     subagent_records.append(agent_records)
+                metadata = reader.read_meta()
                 persisted_usage: dict[str, tuple[str, dict[str, UsageTotals]]] = {}
-                for transcript in (records, *subagent_records):
-                    for record in transcript:
+                for index, transcript in enumerate((records, *subagent_records)):
+                    for record in usage_records(transcript, forked=index == 0 and bool(metadata.get("parent_session_id"))):
                         entry = _usage_record(record)
                         if entry is None:
                             continue
@@ -2333,7 +2316,6 @@ class HostRun:
                         updated[model] = updated.get(model, UsageTotals()).merged(totals)
                         persisted_usage[agent_id] = (name, updated)
                 auto_reviews = self._saved_auto_reviews(records)
-                metadata = reader.read_meta()
                 checkpoint_keys, replay_edits = self._checkpoint_replay_data(
                     records, subagent_records,
                 )
@@ -2382,28 +2364,10 @@ class HostRun:
                 wait_ids = {call.id for saved in loaded.messages for call in saved.tool_calls
                             if call.name == "wait_subagents"}
                 for message, record_id in zip(loaded.messages, loaded.record_ids):
-                    checkpoint_key = checkpoint_keys.get(record_id)
-                    publish_history(ForkableHistoryMessage(
-                        role=message.role.value,
-                        text=message.text,
-                        notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
-                        reasoning=message.reasoning,
-                        tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
-                        turn_id=message.turn_id, record_id=record_id,
-                        attachments=[
-                            {
-                                "kind": "image" if isinstance(block, ImageBlock) else "document",
-                                "media_type": block.media_type,
-                                "filename": block.filename if isinstance(block, DocumentBlock) else None,
-                            }
-                            for block in message.content
-                            if isinstance(block, (ImageBlock, DocumentBlock))
-                        ],
-                        checkpoint_key=checkpoint_key,
-                        edits=[] if checkpoint_key is None else replay_edits.get(checkpoint_key, []),
-                        undone=checkpoint_key in undone_keys,
-                        session_id=run_id,
-                        **replay_turns.get(record_id, {}),
+                    publish_history(self._history_frame(
+                        message, record_id, tool_results, auto_reviews, run_id,
+                        checkpoint_keys=checkpoint_keys, replay_edits=replay_edits,
+                        undone_keys=undone_keys, turn=replay_turns.get(record_id),
                     ))
                     for notice in self._waited_subagent_notices(message, wait_ids, run_id):
                         publish_history(notice)
@@ -2503,29 +2467,10 @@ class HostRun:
         wait_ids = {call.id for saved in loaded.messages for call in saved.tool_calls
                     if call.name == "wait_subagents"}
         for message, record_id in zip(loaded.messages, loaded.record_ids):
-            checkpoint_key = checkpoint_keys.get(record_id)
-            publish_history(ForkableHistoryMessage(
-                role=message.role.value,
-                text=message.text,
-                notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
-                reasoning=message.reasoning,
-                tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
-                turn_id=message.turn_id,
-                record_id=record_id,
-                attachments=[
-                    {
-                        "kind": "image" if isinstance(block, ImageBlock) else "document",
-                        "media_type": block.media_type,
-                        "filename": block.filename if isinstance(block, DocumentBlock) else None,
-                    }
-                    for block in message.content
-                    if isinstance(block, (ImageBlock, DocumentBlock))
-                ],
-                checkpoint_key=checkpoint_key,
-                edits=[] if checkpoint_key is None else replay_edits.get(checkpoint_key, []),
-                undone=checkpoint_key in undone_keys,
-                session_id=run_id,
-                **replay_turns.get(record_id, {}),
+            publish_history(self._history_frame(
+                message, record_id, tool_results, auto_reviews, run_id,
+                checkpoint_keys=checkpoint_keys, replay_edits=replay_edits,
+                undone_keys=undone_keys, turn=replay_turns.get(record_id),
             ))
             for notice in self._waited_subagent_notices(message, wait_ids, run_id):
                 publish_history(notice)
@@ -2563,7 +2508,7 @@ class HostRun:
             try:
                 with path.open(encoding="utf-8") as source:
                     text = source.read()
-                    updated_at = datetime.fromtimestamp(os.fstat(source.fileno()).st_mtime, timezone.utc).isoformat()
+                    updated_at = utc_iso(os.fstat(source.fileno()).st_mtime)
             except FileNotFoundError:
                 return {"text": "", "updated_at": None}
             except (OSError, UnicodeError) as exc:
@@ -2592,27 +2537,13 @@ class HostRun:
                         if call.name == "wait_subagents"}
             for message, record_id in zip(loaded.messages, loaded.record_ids):
                 turn = replay_turns.get(record_id, {})
-                messages.append(HistoryMessage(
-                    role=message.role.value,
-                    text=message.text,
-                    notice=message.role is Role.USER and SUBAGENT_NOTICE_PATTERN.match(message.text) is not None,
-                    reasoning=message.reasoning,
-                    tool_calls=self._replay_tool_calls(message, tool_results, auto_reviews),
-                    turn_id=message.turn_id,
-                    attachments=[
-                        {
-                            "kind": "image" if isinstance(block, ImageBlock) else "document",
-                            "media_type": block.media_type,
-                            "filename": block.filename if isinstance(block, DocumentBlock) else None,
-                        }
-                        for block in message.content
-                        if isinstance(block, (ImageBlock, DocumentBlock))
-                    ],
-                    session_id=session_id,
-                    turn_started_at=turn.get("turn_started_at"),
-                    turn_ended_at=turn.get("turn_ended_at"),
-                    turn_outcome=turn.get("turn_outcome"),
-                ).payload())
+                frame = self._history_frame(
+                    message, None, tool_results, auto_reviews, session_id,
+                    turn={key: turn.get(key) for key in
+                          ("turn_started_at", "turn_ended_at", "turn_outcome")},
+                ).payload()
+                frame.pop("record_id", None)
+                messages.append(frame)
                 messages.extend(notice.payload() for notice in
                                 self._waited_subagent_notices(message, wait_ids, session_id))
             return {
@@ -2650,18 +2581,10 @@ class HostRun:
                         index for index, record in enumerate(records)
                         if record.get("record_id") == record_id
                     )
-                    prompt_records: dict[str, int] = {}
-                    pending_key = None
-                    for index, record in enumerate(records):
-                        if record.get("type") == "checkpoint":
-                            key = record.get("data", {}).get("key")
-                            if isinstance(key, str):
-                                pending_key = key
-                        elif pending_key is not None and record.get("type") == "message":
-                            message = message_from_json(record["data"])
-                            if message.role is Role.USER:
-                                prompt_records.setdefault(pending_key, index)
-                                pending_key = None
+                    prompts, _, _ = self._checkpoint_records(records)
+                    prompt_records = {}
+                    for key, index, _, _ in prompts:
+                        prompt_records.setdefault(key, index)
                     kept_keys = [
                         key for key in checkpoints.keys()
                         if prompt_records.get(key, len(records)) < cutoff
@@ -2752,8 +2675,7 @@ class HostRun:
                 context.interrupted = "interrupted"
                 context.cancel.set()
                 if context.process is not None:
-                    self._kill_user_command(context.process)
-            self._goal_check = None
+                    stop_process_group(context.process, context.process.pid, grace=0, timeout=0.1)
             self._goal_check_thread = None
             if session_id is not None and session_id in self._active_by_session:
                 self._conversation = None
@@ -2761,7 +2683,6 @@ class HostRun:
                 self._active = None
                 self._goal = None
                 self._goal_session_id = None
-                self._goal_check = None
                 self._goal_check_thread = None
                 self._policy = replace(self._next_policy or self._policy)
                 self._policy.mode = self._starting_mode
@@ -2862,24 +2783,24 @@ class HostRun:
         finally:
             store.close()
 
-    def archive_session(self, session_id: str, archived: bool) -> bool:
-        """Set a session's archived metadata flag without closing it."""
+    def update_session_meta(self, session_id: str, change) -> bool:
+        """Update an open or persisted session under the host lock."""
         if session_id in (".", "..") or Path(session_id).name != session_id:
             return False
-        directory = self._sessions_root / session_id
-        if not directory.is_dir():
+        if not (self._sessions_root / session_id).is_dir():
             return False
         with self._lock:
             opened = self._open_conversations.get(session_id)
             store = opened[1] if opened is not None else SessionStore.open(self._sessions_root, session_id)
             try:
-                def change(meta):
-                    meta["archived"] = archived
                 store.update_meta(change)
             finally:
                 if opened is None:
                     store.close()
         return True
+
+    def archive_session(self, session_id: str, archived: bool) -> bool:
+        return self.update_session_meta(session_id, lambda meta: meta.update(archived=archived))
 
     def start_preview(self, url: str = "") -> dict:
         from symphonai_host.preview import Preview, target_url
@@ -2947,23 +2868,19 @@ class HostRun:
             validations = tuple(self._loops._loop_validation_cancel.values())
             validation_processes = tuple(self._loops._loop_validation_processes.values())
             goal_checks = tuple(self._goal_checks_by_session.values())
-            self._goal_check = None
             self._goal_check_thread = None
             for context in goal_checks:
                 context.interrupted = "cancelled"
                 context.cancel.set()
         for context in goal_checks:
             if context.process is not None:
-                self._kill_user_command(context.process)
+                stop_process_group(context.process, context.process.pid, grace=0, timeout=0.1)
         for active_run in active_runs:
             active_run.cancel.cancel()
         for cancelled in validations:
             cancelled.set()
         for process in validation_processes:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                process.kill()
+            stop_process_group(process, process.pid, grace=0, timeout=0.1)
         for broker in approval_brokers:
             broker.cancel_all(reason="host closing")
         self.stop()
@@ -2983,7 +2900,7 @@ class HostRun:
                 break
             for context in remaining:
                 if context.process is not None:
-                    self._kill_user_command(context.process)
+                    stop_process_group(context.process, context.process.pid, grace=0, timeout=0.1)
             time.sleep(0.01)
         with self._lock:
             conversations = tuple(self._open_conversations.values())
@@ -3017,12 +2934,12 @@ class HostRun:
         if active is not None:
             active.cancel.cancel()
         if process is not None:
-            self._kill_user_command(process)
+            stop_process_group(process, process.pid, grace=0, timeout=0.1)
         if goal_check is not None:
             goal_check.interrupted = "cancelled"
             goal_check.cancel.set()
             if goal_check.process is not None:
-                self._kill_user_command(goal_check.process)
+                stop_process_group(goal_check.process, goal_check.process.pid, grace=0, timeout=0.1)
         self.approvals.cancel_all(reason="stopped")
 
 
@@ -3055,21 +2972,21 @@ class HostRun:
             running = _UserCommand(session_id=session_id, next=self._user_command)
             self._user_command = running
         try:
-            from symphonai_api.process import run_process
+            from symphonai_api.process import run_check_command
             def started(process):
                 with self._lock:
                     running.process = process
                     should_stop = running.stop_requested
                 if should_stop:
-                    self._kill_user_command(process)
-            result = run_process(
-                [shell_executable(), "-c", command], repo_root, env=shell_environment(repo_root),
+                    stop_process_group(process, process.pid, grace=0, timeout=0.1)
+            result = run_check_command(
+                [shell_executable(), "-c", command], repo_root, for_agent=False,
                 timeout=120, cancel=lambda: running.stop_requested, output_limit=None, on_start=started,
             )
-            if result.error is not None:
-                raise result.error
-            output = result.stdout.decode("utf-8", errors="replace")
-            timed_out, stopped, exit_code = result.timed_out, result.cancelled, result.exit_code
+            if result.get("error") is not None:
+                raise result["error"]
+            output = result["output"]
+            timed_out, stopped, exit_code = result["timed_out"], result["cancelled"], result["exit"]
             if len(output) > limit:
                 output = output[:limit] + f"\n[output truncated: {len(output)} chars, over the {limit} char limit]"
             outcome = "stopped" if stopped else "timed out after 120 s" if timed_out else f"exit code {exit_code}"
@@ -3099,15 +3016,6 @@ class HostRun:
                     if previous is not None:
                         previous.next = running.next
 
-    @staticmethod
-    def _kill_user_command(process: subprocess.Popen) -> None:
-        try:
-            if hasattr(os, "killpg"):
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except (OSError, ProcessLookupError, PermissionError):
-            pass
 
     @staticmethod
     def _merge_usage(
@@ -3121,6 +3029,14 @@ class HostRun:
     def _session_usage(self, session_id: str) -> UsageTotals:
         directory = self._sessions_root / session_id
         paths = [directory / "run.jsonl", *sorted(directory.glob("agent-*.jsonl"))]
+        try:
+            store = SessionStore.open(self._sessions_root, session_id)
+            try:
+                forked = bool(store.read_meta().get("parent_session_id"))
+            finally:
+                store.close()
+        except (OSError, TranscriptError):
+            forked = False
         totals = UsageTotals()
         for path in paths:
             if not path.is_file():
@@ -3129,7 +3045,7 @@ class HostRun:
                 records, _ = read_records(path)
             except (OSError, TranscriptError):
                 continue
-            for record in records:
+            for record in usage_records(records, forked=forked and path.name == "run.jsonl"):
                 entry = _usage_record(record)
                 if entry is not None:
                     totals = totals.merged(entry[2])
@@ -3491,19 +3407,8 @@ class HostRun:
             entries = checkpoints.entries()
             records, _ = read_records(session.directory / "run.jsonl")
 
-            prompts: dict[str, str] = {}
-            pending_key: str | None = None
-            for record in records:
-                if record.get("type") == "checkpoint":
-                    key = record.get("data", {}).get("key")
-                    if isinstance(key, str):
-                        prompts.setdefault(key, "")
-                        pending_key = key
-                elif pending_key is not None and record.get("type") == "message":
-                    message = message_from_json(record["data"])
-                    if message.role is Role.USER:
-                        prompts[pending_key] = message.text[:80]
-                        pending_key = None
+            prompt_records, _, _ = self._checkpoint_records(records)
+            prompts = {key: text[:80] for key, _, _, text in prompt_records}
 
             paths_by_key: dict[str, list[str]] = {
                 key: [] for key in checkpoints.keys()
@@ -3581,32 +3486,22 @@ class HostRun:
                     })
             return {"turns": turns, "files": files, "worktrees": worktrees}
 
-    def apply_worktree(
-        self, name: str, *, directory: Path | None = None,
-        checkpoints_override: CheckpointStore | None = None,
-    ) -> dict:
+    def apply_worktree(self, name: str) -> dict:
         with self._lock:
             if self._active is not None:
                 raise RunActiveError(self._active.run_id)
             if self._conversation is None:
                 raise KeyError(name)
             leader, session = self._conversation
-            directory = (session.directory / "worktrees" / name) if directory is None else Path(directory)
+            directory = session.directory / "worktrees" / name
             if not directory.is_dir():
                 raise KeyError(name)
-            checkpoints = checkpoints_override or leader._config.checkpoints
+            checkpoints = leader._config.checkpoints
             if checkpoints is None:
                 raise RuntimeError("checkpoint store is unavailable")
             diff = worktree_diff(directory)
             root = checkpoints.repo_root
-            top_result = subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"], cwd=root, capture_output=True,
-                check=False,
-            )
-            if top_result.returncode:
-                message = top_result.stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(message or "could not locate git repository root")
-            git_root = Path(os.fsdecode(top_result.stdout.strip())).resolve()
+            git_root = _top_level(root)
             checkpoint_paths: list[tuple[str, Path]] = []
             for path in diff.files:
                 target = (git_root / path).resolve()
@@ -3615,29 +3510,15 @@ class HostRun:
                 except ValueError:
                     continue
                 checkpoint_paths.append((path, target))
-            checked = subprocess.run(
-                ["git", "apply", "--check", "--binary"],
-                input=diff.patch.encode("utf-8", errors="surrogateescape"), cwd=git_root, capture_output=True,
-                check=False,
-            )
-            if checked.returncode:
-                message = checked.stderr.decode("utf-8", errors="replace").strip()
-                raise WorktreeApplyConflict(message or "git apply --check failed")
-            checkpoints.begin(new_id("chk"), label=f"Applied worktree {name}")
-            for _, target in checkpoint_paths:
-                checkpoints.before_write(target)
-            applied = subprocess.run(
-                ["git", "apply", "--binary"], input=diff.patch.encode("utf-8", errors="surrogateescape"),
-                cwd=git_root, capture_output=True, check=False,
-            )
-            if applied.returncode:
-                message = applied.stderr.decode("utf-8", errors="replace").strip()
-                raise WorktreeApplyConflict(message or "git apply failed")
+            def before_apply():
+                checkpoints.begin(new_id("chk"), label=f"Applied worktree {name}")
+                for _, target in checkpoint_paths:
+                    checkpoints.before_write(target)
+            apply_patch(git_root, diff.patch, on_checked=before_apply)
             for _, target in checkpoint_paths:
                 checkpoints.after_write(target)
             remove_worktree(git_root, directory)
-            if checkpoints_override is None:
-                leader.forget_subagent(name)
+            leader.forget_subagent(name)
             return {"applied": list(diff.files)}
 
     def discard_worktree(self, name: str) -> dict:
@@ -3778,8 +3659,7 @@ class HostRun:
         with self._lock:
             goal = context.goal
             if context.cleared:
-                if self._goal_check is context:
-                    self._goal_check = None
+                if self._goal_check_thread is threading.current_thread():
                     self._goal_check_thread = None
                 self._goal_checks_by_session.pop(context.session_id, None)
                 self._close_idle_conversations_locked()
@@ -3814,8 +3694,7 @@ class HostRun:
             self._goals_by_session[context.session_id] = goal
             if self._goal is goal and self._goal_session_id == context.session_id:
                 self._goal = goal
-            if self._goal_check is context:
-                self._goal_check = None
+            if self._goal_check_thread is threading.current_thread():
                 self._goal_check_thread = None
             self._goal_checks_by_session.pop(context.session_id, None)
             self._goal_event("check", goal, run_id, context.agent_id)
@@ -3912,7 +3791,6 @@ class HostRun:
                         goal, session_id, threading.Event(), leader.agent_ref.agent_id,
                     )
                     if self._conversation is not None and self._conversation[1].run_id == session_id:
-                        self._goal_check = context
                         self._goal_check_thread = threading.current_thread()
                     self._goal_checks_by_session[session_id] = context
                     run_check_now = True

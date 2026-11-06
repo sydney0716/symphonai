@@ -6,9 +6,9 @@ from typing import Callable
 
 from symphonai_api.identity import new_id
 from symphonai_api.models import ToolCall, ToolResult
-from symphonai_api.permissions import ApprovalOutcome, DenialReason, PermissionPolicy
+from symphonai_api.permissions import DenialReason, PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_host.approvals import PendingApproval
 
 
@@ -70,7 +70,7 @@ class AskUserTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(
         self,
@@ -92,7 +92,7 @@ class AskUserTool(LocalTool):
             return ToolResult(tool_call_id=tool_call.id, ok=True, content="The person skipped the question.")
         reason = (
             "the question was stopped"
-            if decision.outcome is ApprovalOutcome.CANCELLED
+            if decision.denial is DenialReason.APPROVAL_CANCELLED
             else "the question timed out"
             if decision.denial is DenialReason.APPROVAL_FAILED
             else "no client is connected to answer the question"
@@ -144,7 +144,7 @@ class ProposePlanTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(self, tool_call: ToolCall, policy: PermissionPolicy, cancel=None) -> ToolResult:
         if policy.mode != "plan":
@@ -183,7 +183,7 @@ class ProposePlanTool(LocalTool):
             )
         reason = (
             "the plan approval was stopped"
-            if decision.outcome is ApprovalOutcome.CANCELLED
+            if decision.denial is DenialReason.APPROVAL_CANCELLED
             else "the plan approval timed out"
             if decision.denial is DenialReason.APPROVAL_FAILED
             else "no client is connected to approve the plan"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,13 +49,12 @@ def _config_error(
     field: str,
     detail: str,
 ) -> ConfigError:
-    location = str(source) if source is not None else "<session>"
     prefix = "trust.repositories"
     if index is not None:
         prefix += f"[{index}]"
     if field:
         prefix += f".{field}"
-    return ConfigError(f"{location}: {prefix}: {detail}")
+    return ConfigSource(source).exception(prefix, detail)
 
 
 def trust_from_config(config: ResolvedConfig) -> TrustList:

@@ -21,52 +21,21 @@ def _is_subsequence(query: str, value: str) -> bool:
     return all(any(character == candidate for candidate in position) for character in query)
 
 
-def _walk_candidates(policy: PermissionPolicy, root: Path) -> tuple[tuple[str, ...], bool]:
-    from symphonai_api.tools.search import DEFAULT_SKIP_DIRECTORIES
-
-    paths: list[str] = []
-    visited = 0
-    truncated = False
-    level = [root]
-    while level:
-        next_level: list[Path] = []
-        for directory in sorted(level, key=lambda path: path.relative_to(root).as_posix()):
-            try:
-                entries = sorted(directory.iterdir(), key=lambda path: path.name)
-            except OSError:
-                continue
-            for path in entries:
-                if path.is_dir() and not path.is_symlink():
-                    if path.name in DEFAULT_SKIP_DIRECTORIES or path.name.endswith(".egg-info"):
-                        continue
-                    if policy.check_read(path).allowed:
-                        visited += 1
-                        if visited > MAX_SEARCH_FILES:
-                            truncated = True
-                            break
-                        paths.append(path.relative_to(root).as_posix() + "/")
-                        next_level.append(path)
-                elif path.is_file() and policy.check_read(path).allowed:
-                    visited += 1
-                    if visited > MAX_SEARCH_FILES:
-                        truncated = True
-                        break
-                    paths.append(path.relative_to(root).as_posix())
-            if truncated:
-                break
-        if truncated:
-            break
-        level = next_level
-    return tuple(paths), truncated
-
-
 def _candidate_paths(policy: PermissionPolicy, root: Path) -> tuple[tuple[str, ...], bool]:
     now = time.monotonic()
     with _CACHE_LOCK:
         cached = _CANDIDATE_CACHE.get(root)
         if cached is not None and now - cached[0] < _CACHE_SECONDS:
             return cached[1], cached[2]
-    paths, truncated = _walk_candidates(policy, root)
+    from symphonai_api.tools.search import _walk_candidates
+    paths_list = []
+    truncated = False
+    for candidate in _walk_candidates(root, policy, breadth_first=True, include_directories=True):
+        if len(paths_list) == MAX_SEARCH_FILES:
+            truncated = True
+            break
+        paths_list.append(candidate.repo_relative + ("/" if candidate.is_directory else ""))
+    paths = tuple(paths_list)
     with _CACHE_LOCK:
         _CANDIDATE_CACHE[root] = (time.monotonic(), paths, truncated)
     return paths, truncated

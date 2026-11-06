@@ -12,7 +12,7 @@ import tomllib
 
 from symphonai_api.budgets import RunBudget
 from symphonai_api.cost import PriceTable, load_price_table, shipped_price_table
-from symphonai_api.model_table import model_capabilities, resolve_effort
+from symphonai_api.model_table import capability_for_provider, resolve_effort
 from symphonai_api.permissions import (
     ALWAYS_DENY_COMMANDS,
     BUDGET_KEYS, RENAMED_MODES, SettingsParser,
@@ -29,6 +29,60 @@ from symphonai_api.web_search import search_endpoint
 
 class ConfigError(ValueError):
     """A malformed or invalid config file, naming the file and the key."""
+
+
+class ConfigSource:
+    """Common source-aware errors and validation, retaining each file format's labels."""
+    def __init__(self, source, error_class=ConfigError, *, location=None):
+        self.source = source
+        self.error_class = error_class
+        self.location = location if location is not None else str(source) if source is not None else "<session>"
+
+    def exception(self, key, detail):
+        return self.error_class(f"{self.location}: {key}: {detail}")
+
+    def error(self, key, detail):
+        raise self.exception(key, detail)
+
+    def unknown_keys(self, key, values, allowed, *, prefix=True, restricted=()):
+        unknown = values.keys() - allowed
+        if unknown:
+            name = sorted(unknown)[0]
+            detail = "cannot come from an agent file" if name in restricted else "unknown key"
+            self.error(f"{key}.{name}".lstrip(".") if prefix else name, detail)
+
+    def table(self, values, key, *, none_is_missing=False):
+        if key not in values or (none_is_missing and values[key] is None):
+            return None
+        value = values[key]
+        if not isinstance(value, Mapping):
+            self.error(key, "must be a table")
+        return value
+
+    def read_toml(self, *, missing_ok=False, read_key="file", parse_key="toml", path=None):
+        try:
+            return tomllib.loads((self.source if path is None else path).read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            if missing_ok:
+                return None
+            self.error(read_key, f"could not be read: {exc}")
+        except OSError as exc:
+            self.error(read_key, f"could not be read: {exc}")
+        except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+            self.error(parse_key, f"could not be parsed: {exc}")
+
+    def field(self, kind, key, value):
+        return getattr(SettingsParser(self.error), kind)(key, value)
+
+    def required_text(self, values, key):
+        if key not in values:
+            self.error(key, "is required")
+        value = values[key]
+        if not isinstance(value, str):
+            self.error(key, "must be a string")
+        if not value.strip():
+            self.error(key, "must not be blank")
+        return value
 
 
 class Scope(str, Enum):
@@ -84,8 +138,7 @@ _BUILTIN_ROLES = {"planner", "implementer", "reviewer", "worker", "explorer"}
 
 
 def _raise(source: Path | None, key: str, detail: str) -> None:
-    location = str(source) if source is not None else "<session>"
-    raise ConfigError(f"{location}: {key}: {detail}")
+    ConfigSource(source, ConfigError).error(key, detail)
 
 
 def _unknown_keys(
@@ -94,9 +147,7 @@ def _unknown_keys(
     values: Mapping[str, object],
     allowed: set[str],
 ) -> None:
-    unknown = values.keys() - allowed
-    if unknown:
-        _raise(source, f"{key}.{sorted(unknown)[0]}".lstrip("."), "unknown key")
+    ConfigSource(source, ConfigError).unknown_keys(key, values, allowed)
 
 
 def _table(
@@ -104,22 +155,17 @@ def _table(
     values: Mapping[str, object],
     key: str,
 ) -> Mapping[str, object] | None:
-    if key not in values:
-        return None
-    value = values[key]
-    if not isinstance(value, Mapping):
-        _raise(source, key, "must be a table")
-    return value
+    return ConfigSource(source, ConfigError).table(values, key)
 
 
 def _string(source: Path | None, key: str, value: object) -> str:
-    return SettingsParser(lambda field, detail: _raise(source, field, detail)).string(key, value)
+    return ConfigSource(source, ConfigError).field("string", key, value)
 
 def _boolean(source: Path | None, key: str, value: object) -> bool:
-    return SettingsParser(lambda field, detail: _raise(source, field, detail)).boolean(key, value)
+    return ConfigSource(source, ConfigError).field("boolean", key, value)
 
 def _strings(source: Path | None, key: str, value: object) -> list[str]:
-    return SettingsParser(lambda field, detail: _raise(source, field, detail)).strings(key, value)
+    return ConfigSource(source, ConfigError).field("strings", key, value)
 
 def _validate(source: Path | None, values: Mapping[str, object]) -> None:
     _unknown_keys(source, "", values, set(_SECTIONS))
@@ -201,10 +247,7 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
                 effort = _string(source, f"{key}.effort", raw["effort"])
                 if not effort.strip():
                     _raise(source, f"{key}.effort", "must be a non-empty string")
-                capability = next((
-                    item for item in model_capabilities()
-                    if item.provider == provider and item.model == raw["model"]
-                ), None)
+                capability = capability_for_provider(provider, raw["model"])
                 if capability is not None:
                     try:
                         resolve_effort(capability.wire_format, raw["model"], effort)
@@ -296,14 +339,7 @@ def _validate(source: Path | None, values: Mapping[str, object]) -> None:
 
 
 def _read_toml(path: Path) -> Mapping[str, object] | None:
-    try:
-        return tomllib.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        _raise(path, "file", f"could not be read: {exc}")
-    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
-        _raise(path, "toml", f"could not be parsed: {exc}")
+    return ConfigSource(path, ConfigError).read_toml(missing_ok=True)
 
 
 def _flatten(values: Mapping[str, object], prefix: str = "") -> dict[str, object]:

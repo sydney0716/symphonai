@@ -13,13 +13,6 @@ from decimal import Decimal
 
 from symphonai_api.cost import PriceTable, UsageTotals, total_cost
 
-BUDGET_STOPPED_REASONS = (
-    "budget_wall_time",
-    "budget_tokens",
-    "budget_cost",
-    "budget_cost_unpriced",
-)
-
 
 @dataclass(frozen=True)
 class RunBudget:

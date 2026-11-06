@@ -4,7 +4,7 @@ import { createClient } from "./client.js";
 import { parseMarkdown } from "./markdown.js";
 import { highlight } from "./highlight.js";
 import { resolveHost } from "./host_handle.js";
-import { decodeEvent, FILES_CHANGED_EVENT_TYPE } from "./protocol.js";
+import { decodeEvent } from "./protocol.js";
 import { button as makeButton, errorText, append, element, listen, renderDiff, renderMarkdownBlocks, renderSplitDiff, renderTranscript, replace } from "./render.js";
 import { splitDiff } from "./diff_split.js";
 import { DEFAULT_ROUTE, formatRoute, PAGES, parseRoute } from "./route.js";
@@ -328,24 +328,7 @@ export async function start({ global, document, client }) {
   let lastIdleEscapeAt = 0;
   let suppressEditUntil = 0;
   let escapeStopRequested = false;
-  const approvalDiffs = new Map();
-  const approvalClient = new Proxy(boundary, {
-    get(target, property, receiver) {
-      if (property === "approvals") {
-        return async (...args) => {
-          const reply = await boundary.approvals(...args);
-          for (const approval of reply?.pending ?? []) {
-            if (typeof approval.approval_id === "string" && typeof approval.diff === "string") {
-              approvalDiffs.set(approval.approval_id, approval.diff);
-            }
-          }
-          return reply;
-        };
-      }
-      return Reflect.get(target, property, receiver);
-    },
-  });
-  const approvals = createApprovals({ client: approvalClient });
+  const approvals = createApprovals({ client: boundary });
   const approvalDenyNotes = new Map();
   const transcript = createTranscript();
   const agentTranscript = createTranscript();
@@ -1463,23 +1446,6 @@ export async function start({ global, document, client }) {
       append(content, element(document, "p", { className: "usage-scope", text:
         "Tokens and estimates cover saved calls across projects. Vendor costs cover the organization and may lag recent calls." }));
       const counts = new Intl.NumberFormat();
-      const balanceNumbers = new Intl.NumberFormat(undefined, { maximumFractionDigits: 20 });
-      const amountText = (value) => {
-        if (!value) return "unavailable";
-        if (!value.currency) return `${balanceNumbers.format(Number(value.amount))} balance`;
-        try {
-          const money = new Intl.NumberFormat(undefined, {
-            style: "currency", currency: value.currency, minimumFractionDigits: 2, maximumFractionDigits: 2,
-          });
-          const exact = Number(value.exact_amount ?? value.amount);
-          if (exact !== 0 && Math.abs(exact) < 0.01) {
-            return exact < 0 ? `>-${money.format(0.01)}` : `<${money.format(0.01)}`;
-          }
-          return money.format(Number(value.amount));
-        } catch {
-          return `${balanceNumbers.format(Number(value.exact_amount ?? value.amount))} ${value.currency}`;
-        }
-      };
       const vendorNames = {
         anthropic: "Anthropic", openai: "OpenAI", gemini: "Google Gemini", deepseek: "DeepSeek",
         kimi: "Moonshot (Kimi)", grok: "xAI (Grok)", openrouter: "OpenRouter",
@@ -1509,8 +1475,8 @@ export async function start({ global, document, client }) {
           addRow(model.model, model.input_tokens, (model.cache_read_tokens ?? 0) + (model.cache_write_tokens ?? 0), model.output_tokens);
         }
         addRow("Total", provider.input_tokens ?? 0, (provider.cache_read_tokens ?? 0) + (provider.cache_write_tokens ?? 0),
-          provider.output_tokens ?? 0, provider.cost ? `${amountText(provider.cost)} · ${provider.cost.source}` : "unavailable",
-          provider.balance?.map(amountText).join("; ") || "unavailable");
+          provider.output_tokens ?? 0, provider.cost ? `${costText(provider.cost)} · ${provider.cost.source}` : "unavailable",
+          provider.balance?.map(costText).join("; ") || "unavailable");
         append(table, head, body);
         append(section, table);
         if (provider.cost?.data_refreshed_at) append(section, element(document, "p", { className: "usage-refreshed", text: `Vendor data refreshed at ${provider.cost.data_refreshed_at}` }));
@@ -1748,7 +1714,7 @@ export async function start({ global, document, client }) {
     const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(escaped, "gi");
     function visit(node) {
-      if (node.nodeType === 3 || (node.nodeType === 1 && !(node.childNodes?.length) && node._textContent)) {
+      if (node.nodeType === 3) {
         const source = node.textContent;
         pattern.lastIndex = 0;
         const matches = [...source.matchAll(pattern)];
@@ -3635,16 +3601,19 @@ export async function start({ global, document, client }) {
   if (selectedRailTool === "Notes") void showNotes();
 
   function costText(cost) {
-    if (!cost || typeof cost.amount !== "string" || typeof cost.currency !== "string") return "";
-    let money = `${cost.currency} ${cost.amount}`;
-    const amount = Number(cost.amount);
-    const belowCent = amount > 0 && amount < 0.01;
+    if (!cost) return "";
+    const amount = Number(cost.exact_amount ?? cost.amount);
+    const numbers = new Intl.NumberFormat(undefined, { maximumFractionDigits: 20 });
+    if (!cost.currency) return `${numbers.format(amount)} balance`;
+    let money = `${cost.currency} ${numbers.format(amount)}`;
     if (Number.isFinite(amount)) {
       try {
-        money = new Intl.NumberFormat(undefined, {
-          style: "currency", currency: cost.currency,
-        }).format(belowCent ? 0.01 : amount);
-        if (belowCent) money = `<${money}`;
+        const formatter = new Intl.NumberFormat(undefined, {
+          style: "currency", currency: cost.currency, minimumFractionDigits: 2, maximumFractionDigits: 2,
+        });
+        money = amount !== 0 && Math.abs(amount) < 0.01
+          ? amount < 0 ? `>-${formatter.format(0.01)}` : `<${formatter.format(0.01)}`
+          : formatter.format(Number(cost.amount));
       } catch { /* Keep the currency code when Intl cannot format it. */ }
     }
     return `${cost.estimated ? "~" : ""}${money}`;
@@ -3908,9 +3877,6 @@ export async function start({ global, document, client }) {
     for (const id of approvalDenyNotes.keys()) {
       if (approvals.state.get(id)?.state !== "open") approvalDenyNotes.delete(id);
     }
-    for (const id of approvalDiffs.keys()) {
-      if (approvals.state.get(id)?.state !== "open") approvalDiffs.delete(id);
-    }
     const recordDecisionAtCurrentPosition = (entry, question) => {
       const toolCallId = !question.session_id || question.session_id === currentSessionId
         ? question.tool_call_id : undefined;
@@ -4035,28 +4001,13 @@ export async function start({ global, document, client }) {
           text: `${question.operation}: ${question.target} — ${question.details}`,
         }),
       );
-      const approvalDiff = question.diff ?? approvalDiffs.get(id) ?? "";
+      const approvalDiff = question.diff ?? "";
       if (approvalDiff) {
         const lines = approvalDiff.split("\n");
         const diffRoot = element(document, "div", { className: "approval-diff" });
-        const renderDiff = (visibleLines) => {
-          const pre = element(document, "pre", { className: "diff" });
-          for (const line of visibleLines) {
-            const span = element(document, "span", { text: `${line}\n` });
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              span.className = "diff-add";
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              span.className = "diff-remove";
-            } else if (line.startsWith("@@")) {
-              span.className = "diff-hunk";
-            }
-            append(pre, span);
-          }
-          return pre;
-        };
-        append(diffRoot, renderDiff(lines.slice(0, 20)));
+        append(diffRoot, renderDiff(document, lines.slice(0, 20).join("\n")));
         if (lines.length > 20) {
-          const expand = makeButton(document, `Show all ${lines.length} lines`, () => replace(diffRoot, renderDiff(lines)));
+          const expand = makeButton(document, `Show all ${lines.length} lines`, () => replace(diffRoot, renderDiff(document, lines.join("\n"))));
           append(diffRoot, expand);
         }
         append(row, diffRoot);
@@ -4790,33 +4741,6 @@ export async function start({ global, document, client }) {
     });
   }
 
-  async function chooseModel(provider, row, efforts) {
-    const existingEffort = conversation?.effort ?? selection.effort;
-    const choice = { name: provider, model: row.id };
-    const keepEffort = Boolean(existingEffort && Array.isArray(efforts) && efforts.includes(existingEffort));
-    if (keepEffort) choice.effort = existingEffort;
-    try {
-      await boundary.selectProvider(choice);
-      selection = { provider, model: row.id, effort: keepEffort ? existingEffort : null };
-      if (conversation) {
-        conversation = { ...conversation, provider, model: row.id };
-        if (keepEffort) conversation.effort = existingEffort;
-        else delete conversation.effort;
-      }
-      closePicker();
-      showConversationUsage();
-      answerCommand(keepEffort
-        ? `Model set to ${provider} / ${row.id} · effort ${existingEffort}.`
-        : existingEffort
-          ? `Model set to ${provider} / ${row.id} · effort reset to the model's default.`
-          : `Model set to ${provider} / ${row.id}.`);
-      await refreshConversation();
-    } catch (error) {
-      closePicker();
-      answerCommand(errorText(error));
-    }
-  }
-
   async function chooseTypedModel(provider, model, efforts = null) {
     const existingEffort = conversation?.effort ?? selection.effort;
     const choice = { name: provider, model };
@@ -4839,6 +4763,7 @@ export async function start({ global, document, client }) {
           : `Model set to ${provider} / ${model}.`);
       await refreshConversation();
     } catch (error) {
+      closePicker();
       answerCommand(errorText(error));
     }
   }
@@ -4947,7 +4872,7 @@ export async function start({ global, document, client }) {
         title: `Models · ${provider}`,
         rows,
         initialIndex: selected >= 0 ? selected : Math.max(0, current),
-        onChoose: (row) => chooseModel(provider, row, effortsByModel.get(row.id)),
+        onChoose: (row) => chooseTypedModel(provider, row.id, effortsByModel.get(row.id)),
         onCancel: cancel,
       });
     } catch (error) {
@@ -5362,7 +5287,6 @@ export async function start({ global, document, client }) {
     }
     await entry.handler({
       refreshSettings,
-      closePicker,
       openModePicker,
       openDefaultModelPicker,
       openModelPicker,
@@ -5390,19 +5314,15 @@ export async function start({ global, document, client }) {
       document,
       refreshConversation,
       get currentSessionId() { return currentSessionId; },
-      set currentSessionId(value) { currentSessionId = value; void refreshOpenNotes(); },
       get specMode() { return specMode; },
       set specMode(value) { specMode = value; },
       get conversation() { return conversation; },
       set conversation(value) { conversation = value; },
       get currentMode() { return currentMode; },
-      set currentMode(value) { currentMode = value; },
       get promptFailure() { return promptFailure; },
       set promptFailure(value) { promptFailure = value; },
       get commandEntry() { return commandEntry; },
-      set commandEntry(value) { commandEntry = value; },
       get skillCommands() { return skillCommands; },
-      set skillCommands(value) { skillCommands = value; },
     }, { args, command, typedName, usage });
   }
 
@@ -5493,9 +5413,6 @@ export async function start({ global, document, client }) {
     }
     if (frame.kind === "approval_requested") {
       const payload = frame.payload ?? {};
-      if (typeof payload.approval_id === "string" && typeof payload.diff === "string") {
-        approvalDiffs.set(payload.approval_id, payload.diff);
-      }
       const sessionId = payload.session_id;
       const operation = payload.kind === "question" ? "Question"
         : payload.kind === "plan" ? "Plan" : payload.operation;
@@ -5550,7 +5467,7 @@ export async function start({ global, document, client }) {
       await refreshRoadmap();
       return;
     }
-    if (frame.kind === "event" && frame.payload?.type === FILES_CHANGED_EVENT_TYPE) {
+    if (frame.kind === "event" && frame.payload?.type === "FilesChanged") {
       if (selectedRailTool === "Changes" && !changesRoot.hidden) void showChanges();
       else changesDirty = true;
       if (selectedRailTool === "Files" && !filesRoot.hidden) void refreshFiles();

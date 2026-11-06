@@ -14,6 +14,8 @@ standard runtime call sites prepare that shape via
 
 from __future__ import annotations
 
+from symphonai_api.providers.base import _usage_count, _synthesize_tool_call_id, RememberedRejections
+
 import json
 import os
 import re
@@ -23,7 +25,6 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from symphonai_api.cancellation import CancellationToken
-from symphonai_api.identity import new_id
 from symphonai_api.model_table import resolve_effort, server_fallback_for_model
 from symphonai_api.models import (
     DocumentBlock,
@@ -66,8 +67,8 @@ _MAX_TOKENS_LIMIT_PATTERNS = (
     re.compile(r"\b(?:limit|maximum)(?:\s+output)?\s+tokens?\s*(?:is|of|:|=)?\s*(\d+)", re.IGNORECASE),
     re.compile(r"\blimit\s+(?:is|of|:|=)\s*(\d+)", re.IGNORECASE),
 )
-_FALLBACK_DISABLED: set[tuple[str, str]] = set()
-_THINKING_DISABLED: set[tuple[str, str]] = set()
+_FALLBACK_DISABLED = RememberedRejections()
+_THINKING_DISABLED = RememberedRejections()
 _MAX_TOKENS_LIMITS: dict[tuple[str, str], int] = {}
 _ANTHROPIC_CAPABILITIES_LOCK = threading.Lock()
 
@@ -81,9 +82,6 @@ def _cached_max_tokens(key: tuple[str, str]) -> int | None:
         return _MAX_TOKENS_LIMITS.get(key)
 
 
-def _thinking_disabled(key: tuple[str, str]) -> bool:
-    with _ANTHROPIC_CAPABILITIES_LOCK:
-        return key in _THINKING_DISABLED
 
 
 def _max_tokens_limit(error: ProviderError) -> int | None:
@@ -106,13 +104,6 @@ def _thinking_parameter_rejected(error: ProviderError) -> bool:
     )
     return parameter and rejection
 
-def _synthesize_tool_call_id() -> str:
-    """Build a fallback canonical id for tool calls that arrive without one.
-
-    Must not be position-based: the same index in a later turn would reuse
-    the id, leaving two distinct calls sharing a `tool_call_id`.
-    """
-    return new_id("call")
 
 
 def _anthropic_blocks(message: Message) -> list[dict[str, Any]]:
@@ -217,8 +208,6 @@ def _anthropic_messages(
     return wire_messages
 
 
-def _usage_count(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _build_request_body(
@@ -507,7 +496,7 @@ class _AnthropicRequest:
         self.include_thinking = (
             effort is not None
             and request.temperature is None
-            and not _thinking_disabled(self.key)
+            and not (self.key in _THINKING_DISABLED)
         )
         with _ANTHROPIC_CAPABILITIES_LOCK:
             self.include_fallback = self.key not in _FALLBACK_DISABLED
@@ -539,10 +528,11 @@ class _AnthropicRequest:
         return body, http_request
 
     def resend(self, exc: ProviderError, body: dict[str, Any]) -> bool:
-        if ("fallbacks" in body and "400" in str(exc)
-                and any(name in str(exc).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback"))):
-            with _ANTHROPIC_CAPABILITIES_LOCK:
-                _FALLBACK_DISABLED.add(self.key)
+        if "fallbacks" in body and _FALLBACK_DISABLED.remember(
+            self.key, exc, lambda error: "400" in str(error) and any(
+                name in str(error).casefold() for name in ("fallback", "anthropic-beta", "server-side-fallback")
+            ),
+        ):
             self.include_fallback = False
             return True
         limit = _max_tokens_limit(exc)
@@ -557,9 +547,7 @@ class _AnthropicRequest:
             self.max_tokens_override = limit
             self.retried_max_tokens = True
             return True
-        if self.include_thinking and _thinking_parameter_rejected(exc):
-            with _ANTHROPIC_CAPABILITIES_LOCK:
-                _THINKING_DISABLED.add(self.key)
+        if self.include_thinking and _THINKING_DISABLED.remember(self.key, exc, _thinking_parameter_rejected):
             self.include_thinking = False
             return True
         return False

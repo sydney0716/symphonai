@@ -170,7 +170,6 @@ def review_command_prompt(base_ref: str | None = None, focus: str | None = None)
     return prompt
 
 
-REVIEW_PROMPT = review_command_prompt()
 
 
 def agent_drafting_prompt(description: str, tool_names: list[str]) -> str:

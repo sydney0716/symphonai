@@ -6,7 +6,7 @@ from symphonai_api.cancellation import CancellationToken
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 from symphonai_api.web import WebFetchError, fetch_url
 
 
@@ -34,11 +34,7 @@ class WebFetchTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=(),
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(
         self,

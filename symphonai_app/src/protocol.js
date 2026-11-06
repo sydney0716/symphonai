@@ -1,7 +1,6 @@
 import { isObject } from "./json.js";
 
 export const PROTOCOL_VERSION = 1;
-export const FILES_CHANGED_EVENT_TYPE = "FilesChanged";
 
 export const KNOWN_EVENT_TYPES = Object.freeze([
   "RunStarted",

@@ -20,6 +20,7 @@ function questionOf(value) {
     operation: value.operation,
     target: value.target,
     details: value.details,
+    ...(typeof value.diff === "string" ? { diff: value.diff } : {}),
     ...(typeof value.kind === "string" && value.kind !== "approval"
       ? { kind: value.kind }
       : {}),

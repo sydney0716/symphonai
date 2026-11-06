@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 from symphonai_api.models import (
     DocumentBlock,
@@ -190,3 +191,8 @@ def message_from_json(data: dict) -> Message:
         schema_version=data.get("schema_version", 1),
         reasoning=data.get("reasoning", ""),
     )
+
+
+def message_digest(message: Message) -> str:
+    payload = json.dumps(message_to_json(message), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()

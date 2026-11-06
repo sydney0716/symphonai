@@ -8,10 +8,11 @@ A denied command returns `ToolResult(ok=False, ...)` without ever touching
 
 from __future__ import annotations
 
+from symphonai_api.process import stop_process_group
+
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from symphonai_api.jobs import JobManager
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata, call_target
+from symphonai_api.tools.metadata import ToolMetadata, call_target
 from symphonai_api.tools.shell_classify import classify
 from symphonai_api.tools.shell_parse import commands_for_argv, parse_command_line
 
@@ -261,18 +262,6 @@ def _mac_sandbox_denial(
     return None
 
 
-def _terminate_process_group(proc: subprocess.Popen) -> None:
-    try:
-        if hasattr(os, "killpg"):
-            pgid = os.getpgid(proc.pid)
-            if pgid != os.getpgid(0):
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                proc.kill()
-        else:
-            proc.kill()
-    except (OSError, ProcessLookupError, PermissionError):
-        pass
 
 
 @lru_cache(maxsize=1)
@@ -476,29 +465,12 @@ class RunShellTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        argv = arguments.get("argv")
-        commands = (
-            parse_command_line(arguments["command"])
-            if "command" in arguments and isinstance(arguments["command"], str)
-            else commands_for_argv(argv)
-            if isinstance(argv, (list, tuple))
-            else None
-        )
-        entries = None if commands is None else [
-            classify(command.argv) if not command.writes else None
-            for command in commands
-        ]
-        if not entries or any(entry is None for entry in entries):
-            return ToolMetadata(
-                effect=ToolEffect.DESTRUCTIVE,
-                concurrency_safe=False,
-                paths=None,
-            )
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=all(entry.concurrency_safe for entry in entries if entry is not None),
-            paths=None,
-        )
+        argv = arguments.get('argv')
+        commands = parse_command_line(arguments['command']) if 'command' in arguments and isinstance(arguments['command'], str) else commands_for_argv(argv) if isinstance(argv, (list, tuple)) else None
+        entries = None if commands is None else [classify(command.argv) if not command.writes else None for command in commands]
+        if not entries or any((entry is None for entry in entries)):
+            return ToolMetadata(concurrency_safe=False)
+        return ToolMetadata(concurrency_safe=all((entry.concurrency_safe for entry in entries if entry is not None)))
 
     def validate(self, arguments: dict) -> str | None:
         if "argv" in arguments and "command" in arguments:
@@ -590,17 +562,11 @@ class RunShellTool(LocalTool):
                 if proc.poll() is not None and drain_deadline is None:
                     drain_deadline = now + 2.0
                 if (cancelled or timed_out) and not killed:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except OSError:
-                        _terminate_process_group(proc)
+                    stop_process_group(proc, proc.pid, grace=0, timeout=0.1)
                     killed = True
                     drain_deadline = min(drain_deadline or now + 2.0, now + 2.0)
                 if drain_deadline is not None and now >= drain_deadline:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except OSError:
-                        pass
+                    stop_process_group(proc, proc.pid, grace=0, timeout=0.1)
                     for pipe in (proc.stdout, proc.stderr):
                         if pipe is not None:
                             pipe.close()

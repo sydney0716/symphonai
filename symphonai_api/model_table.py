@@ -127,23 +127,14 @@ def model_capabilities() -> tuple[ModelCapability, ...]:
         return ()
 
 
-def capability_for_model(
-    wire_format: int, model: str | None,
-    capabilities: tuple[ModelCapability, ...] | None = None,
-) -> ModelCapability | None:
-    """Find a model capability, including dated and preview aliases."""
+def capability_for_model(wire_format: int | None, model: str | None,
+                         capabilities: tuple[ModelCapability, ...] | None = None) -> ModelCapability | None:
+    """Find an exact model or its dated/preview alias."""
     if model is None:
         return None
-    return _capability_for_model(wire_format, model, model_capabilities() if capabilities is None else capabilities)
-
-
-def _capability_for_model(
-    wire_format: int,
-    model: str,
-    capabilities: tuple[ModelCapability, ...],
-) -> ModelCapability | None:
     matching_format = [
-        item for item in capabilities if item.wire_format == wire_format
+        item for item in (model_capabilities() if capabilities is None else capabilities)
+        if wire_format is None or item.wire_format == wire_format
     ]
     exact = next((item for item in matching_format if item.model == model), None)
     if exact is not None:
@@ -161,6 +152,15 @@ def _capability_for_model(
     return None
 
 
+
+def capability_for_provider(provider: str, model: str | None) -> ModelCapability | None:
+    return capability_for_model(None, model, tuple(item for item in model_capabilities() if item.provider == provider))
+
+
+def accepts_effort(capability: ModelCapability | None, effort: str | None) -> bool:
+    return capability is not None and any(option.id == effort for option in capability.efforts)
+
+
 def resolve_effort(
     wire_format: int,
     model: str,
@@ -172,7 +172,7 @@ def resolve_effort(
         return None
     if not isinstance(effort, str) or not effort:
         raise ValueError("effort must be a non-empty string or None")
-    capability = _capability_for_model(wire_format, model, model_capabilities())
+    capability = capability_for_model(wire_format, model)
     if capability is None:
         return effort
     for option in capability.efforts:
@@ -189,7 +189,7 @@ def context_window_for_model(wire_format: int, model: str | None) -> int | None:
     """Return the listed context window for a model, if the table knows it."""
     if model is None:
         return None
-    capability = _capability_for_model(wire_format, model, model_capabilities())
+    capability = capability_for_model(wire_format, model)
     return None if capability is None else capability.context_window
 
 
@@ -197,7 +197,7 @@ def long_context_threshold(wire_format: int, model: str | None) -> int | None:
     """Return the listed long-context billing threshold, if known."""
     if model is None:
         return None
-    capability = _capability_for_model(wire_format, model, model_capabilities())
+    capability = capability_for_model(wire_format, model)
     return None if capability is None else capability.long_context_above
 
 
@@ -205,11 +205,11 @@ def compact_at_for_model(wire_format: int, model: str | None) -> int | None:
     """Return a model's optional compaction limit, if listed."""
     if model is None:
         return None
-    capability = _capability_for_model(wire_format, model, model_capabilities())
+    capability = capability_for_model(wire_format, model)
     return None if capability is None else capability.compact_at
 
 
 def server_fallback_for_model(wire_format: int, model: str) -> bool:
     """Whether the model accepts the vendor's default server fallback."""
-    capability = _capability_for_model(wire_format, model, model_capabilities())
+    capability = capability_for_model(wire_format, model)
     return capability is not None and capability.server_fallback

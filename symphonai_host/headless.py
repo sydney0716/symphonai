@@ -20,13 +20,11 @@ from symphonai_api.agent_spec import IOContract, validate_output
 from symphonai_api.config import ConfigError
 from symphonai_api.events import PersonNotice, ModelFallback, RunFailed, RunFinished
 from symphonai_api.extensions import load_extensions
-from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
-from symphonai_api.mcp_pool import McpPool
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.paths import symphonai_home
 from symphonai_api.role_prompts import load_role_additions
-from symphonai_api.roles import REVIEW_PROMPT, review_command_prompt
+from symphonai_api.roles import review_command_prompt
 from symphonai_api.roles import (
     EXPLORER_PROMPT,
     IMPLEMENTER_PROMPT, LEADER_BASE_PROMPT, PLANNER_PROMPT, REVIEWER_PROMPT,
@@ -488,9 +486,6 @@ def _execute(arguments, task: str) -> int:  # noqa: ANN001
                 name, selected_model, base_url
             ),
             extensions_loader=lambda **_: extensions,
-            pool_factory=McpPool,
-            lsp_factory=LspManager,
-            policy_factory=PermissionPolicy,
         )
         valid_tools = runtime.run.available_tool_names()
         requested_tools = set(allowed_tools or ()) | set(disallowed_tools)
@@ -714,8 +709,8 @@ def _unanswered_loop_question(root: Path, approval) -> bool:
     if info.get("failure") is None or not info.get("loop_id"):
         return False
     store = LoopStore(root)
-    current = store.load(info["loop_id"])
-    if current["state"] == "running":
+    current = store.load_record(info["loop_id"])
+    if current.state == "running":
         store.set_state(current, "needs_attention", approval.target)
     return True
 
@@ -758,20 +753,17 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                 name, selected_model, base_url
             ),
             extensions_loader=lambda **_: extensions,
-            pool_factory=McpPool,
-            lsp_factory=LspManager,
-            policy_factory=PermissionPolicy,
         )
         provider, model, effort, choice = _select_provider(arguments)
         runtime.run.select_provider(provider, model, effort, choice)
         subscription = broker.subscribe()
         try:
             if arguments.resume is not None:
-                loop = runtime.run.resume_loop(
+                loop = runtime.run.loops.resume_loop(
                     arguments.resume, runner_pid=os.getpid(), runner_lock=True,
                 )
             else:
-                loop = runtime.run.start_loop(
+                loop = runtime.run.loops.start_loop(
                     goal, runner_pid=os.getpid(), runner_lock=True,
                 )
         except KeyError:
@@ -791,42 +783,42 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
             try:
                 event = subscription.get(timeout=0.1)
             except KeyboardInterrupt:
-                runtime.run.cancel_loop(loop["id"])
-                print(f"loop {loop['id']} cancelled", file=sys.stderr, flush=True)
+                runtime.run.loops.cancel_loop(loop.id)
+                print(f"loop {loop.id} cancelled", file=sys.stderr, flush=True)
                 return 130
             if event is not None and (
-                not isinstance(event, LoopChanged) or event.loop_id != loop["id"]
+                not isinstance(event, LoopChanged) or event.loop_id != loop.id
             ):
                 continue
-            current = store.load(loop["id"])
+            current = store.load_record(loop.id)
             if isinstance(event, LoopChanged):
                 if event.change == "card":
                     card = next(
-                        (item for item in current.get("cards", []) if item.get("id") == event.card_id),
+                        (item for item in current.cards if item.id == event.card_id),
                         None,
                     )
                     if card is not None:
-                        print(f"card {event.card_id} {card.get('state', 'unknown')}", file=sys.stderr, flush=True)
+                        print(f"card {event.card_id} {card.state}", file=sys.stderr, flush=True)
                 elif event.state != last_reported_state:
-                    print(f"loop {loop['id']} {event.state}", file=sys.stderr, flush=True)
+                    print(f"loop {loop.id} {event.state}", file=sys.stderr, flush=True)
                     last_reported_state = event.state
             else:
-                if current.get("state") != last_reported_state:
-                    print(f"loop {loop['id']} {current.get('state', 'unknown')}", file=sys.stderr, flush=True)
-                    last_reported_state = current.get("state")
-            if current.get("state") == "awaiting_plan" and not approved:
+                if current.state != last_reported_state:
+                    print(f"loop {loop.id} {current.state}", file=sys.stderr, flush=True)
+                    last_reported_state = current.state
+            if current.state == "awaiting_plan" and not approved:
                 approved = True
                 try:
-                    runtime.run.approve_loop_plan(loop["id"])
+                    runtime.run.loops.approve_loop_plan(loop.id)
                 except (RunActiveError, ValueError) as exc:
                     approval_error = str(exc)
                     loop = current
                     break
-            elif current.get("state") == "needs_attention":
+            elif current.state == "needs_attention":
                 if unanswered_failure_question:
                     loop = current
                     break
-                reason = str(current.get("reason", ""))
+                reason = str(current.reason)
                 stage, card_id = _loop_retry_target(reason)
                 key = ("planner", None) if stage == "planner" else ("card", card_id)
                 if stage is not None and key not in retried_stages:
@@ -836,17 +828,16 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                     label = f"{stage} card {card_id}" if card_id else stage
                     print(f"retrying {label}: {reason}", file=sys.stderr, flush=True)
                     if stage == "planner":
-                        from symphonai_host.spec_loop import Loop
                         try:
                             with runtime.run._lock:
-                                planning = Loop.from_payload(current)
+                                planning = current
                                 planning.state = "planning"
                                 planning.reason = ""
-                                runtime.run._loops._start_loop_planner(planning, "state")
+                                runtime.run.loops._start_loop_planner(planning, "state")
                                 # The new planner's event sink waits on this lock, so it
                                 # cannot reach its model/tools before old artifacts go.
-                                store.path(loop["id"], "plan.json").unlink(missing_ok=True)
-                                specs_folder = store.path(loop["id"], "specs")
+                                store.path(loop.id, "plan.json").unlink(missing_ok=True)
+                                specs_folder = store.path(loop.id, "specs")
                                 for path in specs_folder.iterdir():
                                     if path.is_dir():
                                         shutil.rmtree(path)
@@ -855,28 +846,29 @@ def _run_loop(arguments, goal: str | None) -> int:  # noqa: ANN001
                         except Exception as exc:
                             store.set_state(current, "needs_attention", f"planner failed: {exc}")
                     else:
-                        runtime.run.resume_loop(loop["id"])
+                        runtime.run.loops.resume_loop(loop.id)
                     continue
                 loop = current
                 break
             elif (
-                current.get("state") in terminal_states
-                and (event is None or event.state == current.get("state"))
+                current.state in terminal_states
+                and (event is None or event.state == current.state)
             ):
                 loop = current
                 break
-        loop = store.load(loop["id"])
-        loop["retries"] = retries
-        loop["usage"] = runtime.run.loop_usage(loop)
-        _print_loop_result(loop, arguments.json, approval_error)
-        return 1 if approval_error or loop.get("state") in ("needs_attention", "cancelled") else 0
+        loop = store.load_record(loop.id)
+        result = loop.to_payload()
+        result["retries"] = retries
+        result["usage"] = runtime.run.loops.loop_usage(loop)
+        _print_loop_result(result, arguments.json, approval_error)
+        return 1 if approval_error or loop.state in ("needs_attention", "cancelled") else 0
     except KeyboardInterrupt:
         if runtime is not None and loop is not None:
             try:
-                runtime.run.cancel_loop(loop["id"])
+                runtime.run.loops.cancel_loop(loop.id)
             except (KeyError, OSError, RunActiveError, ValueError):
                 pass
-            print(f"loop {loop['id']} cancelled", file=sys.stderr, flush=True)
+            print(f"loop {loop.id} cancelled", file=sys.stderr, flush=True)
         return 130
     finally:
         try:

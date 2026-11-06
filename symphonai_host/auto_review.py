@@ -1,14 +1,12 @@
 """Bounded, fail-closed model review of calls that need approval."""
 
 import json
-import queue
-import re
-import threading
+
+from symphonai_api.providers.base import parse_json_reply, bounded_call
 
 from symphonai_api.call_class import CallClass
-from symphonai_api.cancellation import CancellationToken
 from symphonai_api.cost import UsageTotals
-from symphonai_api.model_table import capability_for_model
+from symphonai_api.model_table import capability_for_model, accepts_effort
 from symphonai_api.models import Message, ModelRequest, Role
 from symphonai_api.secrets import mask_secrets
 
@@ -28,12 +26,8 @@ def review_call(provider, model, request, *, user_text, agent_text, repo_root, o
                "command": list(request.command), "commands": request.commands, "diff": request.diff,
                "person_message": user_text, "agent_text": agent_text, "project_root": str(repo_root)}
     capability = capability_for_model(provider.wire_format, model)
-    effort = "low" if capability is not None and any(item.id == "low" for item in capability.efforts) else None
-    token = (cancel.child(deadline_seconds=REVIEW_TIMEOUT_SECONDS) if cancel is not None
-             else CancellationToken(deadline_seconds=REVIEW_TIMEOUT_SECONDS))
-    completed = queue.Queue(maxsize=1)
-
-    def invoke():
+    effort = "low" if accepts_effort(capability, "low") else None
+    def invoke(token):
         try:
             response = provider.create_response(ModelRequest(
                 messages=[Message(Role.SYSTEM, instruction), Message(Role.USER, mask_secrets(json.dumps(context)))],
@@ -42,11 +36,7 @@ def review_call(provider, model, request, *, user_text, agent_text, repo_root, o
             on_usage(model, UsageTotals.from_usage(response.usage))
             if response.stop_reason == 'refusal' or response.refusal_category:
                 raise ValueError('Reviewer refused')
-            text = response.message.text.strip()
-            fenced = re.fullmatch(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
-            if fenced:
-                text = fenced.group(1)
-            reply = json.loads(text)
+            reply = parse_json_reply(response.message.text)
             if not isinstance(reply, dict) or reply.get('decision') not in ('approve', 'deny'):
                 raise ValueError('Invalid reviewer decision')
             reason = reply.get('reason')
@@ -54,18 +44,14 @@ def review_call(provider, model, request, *, user_text, agent_text, repo_root, o
                 reason = 'No reason supplied.'
             if not isinstance(reason, str) or not reason.strip():
                 raise ValueError('Invalid reviewer reason')
-            completed.put((reply['decision'], mask_secrets(reason.strip())))
+            return reply['decision'], mask_secrets(reason.strip())
         except Exception:
-            completed.put(None)
+            return None
 
-    threading.Thread(target=invoke, daemon=True, name='symphonai-auto-review').start()
     try:
-        result = completed.get(timeout=REVIEW_TIMEOUT_SECONDS)
-        if result is None or token.cancelled:
+        result = bounded_call(invoke, timeout=REVIEW_TIMEOUT_SECONDS, cancel=cancel, name="symphonai-auto-review")
+        if result is None:
             raise ValueError('Auto reviewer failed')
         return result
-    except queue.Empty:
+    except TimeoutError:
         raise ValueError('Auto reviewer timed out') from None
-    finally:
-        token.cancel()
-        token.close()

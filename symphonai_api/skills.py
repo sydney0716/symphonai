@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +20,7 @@ _FRONTMATTER_KEYS = {"name", "description", "when_to_use"}
 
 
 def _raise(path: Path, key: str, detail: str) -> None:
-    raise SkillError(f"{path}: {key}: {detail}")
+    ConfigSource(path, SkillError).error(key, detail)
 
 
 def _read_text(path: Path) -> str:
@@ -65,14 +67,7 @@ def _required_text(
     frontmatter: Mapping[str, object],
     key: str,
 ) -> str:
-    if key not in frontmatter:
-        _raise(path, key, "is required")
-    value = frontmatter[key]
-    if not isinstance(value, str):
-        _raise(path, key, "must be a string")
-    if not value.strip():
-        _raise(path, key, "must not be blank")
-    return value
+    return ConfigSource(path, SkillError).required_text(frontmatter, key)
 
 
 def _discoverability_text(name: str, description: str, when_to_use: str) -> str:

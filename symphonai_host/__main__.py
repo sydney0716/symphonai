@@ -17,10 +17,7 @@ from pathlib import Path
 
 from symphonai_api.config import ConfigError
 from symphonai_api.extensions import load_extensions
-from symphonai_api.lsp import LspManager
 from symphonai_api.mcp import McpError
-from symphonai_api.mcp_pool import McpPool
-from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.runner import standard_tool_registry
 from symphonai_api.roles import LEADER_BASE_PROMPT, SUBAGENT_BASE_PROMPT
 from symphonai_api.session import default_sessions_root
@@ -109,9 +106,6 @@ def main(
                 sessions_root=sessions_root,
                 provider_factory=lambda name, model, base_url: _provider(name, model, base_url),
                 extensions_loader=load_extensions,
-                pool_factory=McpPool,
-                lsp_factory=LspManager,
-                policy_factory=PermissionPolicy,
             )
             try:
                 period = runtime.run.extensions.config.values.get(
@@ -136,9 +130,6 @@ def main(
                 sessions_root=sessions_root,
                 provider_factory=lambda name, model, base_url: _provider(name, model, base_url),
                 extensions_loader=load_extensions,
-                pool_factory=McpPool,
-                lsp_factory=LspManager,
-                policy_factory=PermissionPolicy,
             ),
         )
         host_holder["host"] = host

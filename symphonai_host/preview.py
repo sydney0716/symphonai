@@ -5,7 +5,6 @@ from __future__ import annotations
 import gzip
 import http.client
 import json
-import os
 import re
 import secrets
 import select
@@ -13,7 +12,6 @@ import socket
 import threading
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import urlsplit
 
 from symphonai_api.identity import new_id
@@ -127,28 +125,25 @@ def source_guess(policy, text, html):
         return ''
     best, score = '', 0
     scanned = 0
-    for folder, directories, files in os.walk(policy.repo_root, followlinks=False):
-        directories[:] = [name for name in directories if name not in ('.git', 'node_modules', '.venv', 'dist', 'build', '__pycache__')
-                          and policy.check_read(Path(folder) / name).allowed]
-        for name in files:
-            path = Path(folder) / name
-            if path.suffix.lower() not in ('.html', '.htm', '.jsx', '.tsx', '.js', '.ts', '.vue', '.svelte', '.css'):
+    from symphonai_api.tools.search import _walk_candidates
+    for candidate in _walk_candidates(policy.repo_root, policy):
+        path = candidate.path
+        if path.suffix.lower() not in ('.html', '.htm', '.jsx', '.tsx', '.js', '.ts', '.vue', '.svelte', '.css'):
+            continue
+        scanned += 1
+        if scanned > 5000:
+            return best
+        try:
+            if path.stat().st_size > 200000:
                 continue
-            if not policy.check_read(path).allowed:
-                continue
-            scanned += 1
-            if scanned > 5000:
-                return best
-            try:
-                if path.stat().st_size > 200000:
-                    continue
-                body = path.read_text(encoding='utf-8')
-            except (OSError, UnicodeError):
-                continue
-            matched = sum(len(needle) for needle in needles if needle in body)
-            if matched > score:
-                best, score = str(path.relative_to(policy.repo_root)), matched
+            body = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeError):
+            continue
+        matched = sum(len(needle) for needle in needles if needle in body)
+        if matched > score:
+            best, score = candidate.repo_relative, matched
     return best
+
 
 
 class Preview:

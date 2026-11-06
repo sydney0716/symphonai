@@ -30,8 +30,6 @@ class AgentRun:
     run: RunRef
     phase: RunPhase = RunPhase.PENDING
     started_monotonic: float | None = None
-    finished_monotonic: float | None = None
-    last_heartbeat_monotonic: float | None = None
     turns_used: int = 0
     usage_by_model: dict[str, UsageTotals] = field(default_factory=dict)
     stopped_reason: str | None = None
@@ -65,15 +63,6 @@ class AgentRun:
         with self._control_lock:
             return self._budget
 
-    @property
-    def quiet_seconds(self) -> float | None:
-        if (
-            self.phase is not RunPhase.RUNNING
-            or self.last_heartbeat_monotonic is None
-        ):
-            return None
-        return time.monotonic() - self.last_heartbeat_monotonic
-
     def _require(self, method: str, *phases: RunPhase) -> None:
         if self.phase not in phases:
             expected = " or ".join(phase.value for phase in phases)
@@ -84,29 +73,7 @@ class AgentRun:
         now = time.monotonic()
         self.phase = RunPhase.RUNNING
         self.started_monotonic = now
-        self.last_heartbeat_monotonic = now
         self.token = token
-
-    def heartbeat(self) -> None:
-        self._require("heartbeat", RunPhase.RUNNING)
-        self.last_heartbeat_monotonic = time.monotonic()
-
-
-
-    def cap_budget(self, **changes: object) -> None:
-        self._require(
-            "cap_budget",
-            RunPhase.PENDING,
-            RunPhase.RUNNING,
-        )
-        while True:
-            with self._control_lock:
-                current = self._budget
-            lowered = current.lowered(**changes)
-            with self._control_lock:
-                if self._budget is current:
-                    self._budget = lowered
-                    return
 
     def redirect(self, text: str) -> None:
         if not isinstance(text, str) or not text.strip():
@@ -159,7 +126,6 @@ class AgentRun:
                 self.turns_used = result.turns_used
                 self.usage_by_model = dict(result.usage_by_model)
                 self.stopped_reason = result.stopped_reason
-                self.finished_monotonic = time.monotonic()
                 self.phase = RunPhase.FINISHED
         finally:
             if self.token is not None:
@@ -171,7 +137,6 @@ class AgentRun:
                 self._require("fail", RunPhase.RUNNING)
                 self._redirects_closed = True
                 self.error = error
-                self.finished_monotonic = time.monotonic()
                 self.phase = RunPhase.FAILED
         finally:
             if self.token is not None:
@@ -184,7 +149,6 @@ class AgentRun:
                 self._redirects_closed = True
                 if self.token is not None:
                     self.token.cancel()
-                self.finished_monotonic = time.monotonic()
                 self.phase = RunPhase.CANCELLED
         finally:
             if self.token is not None:

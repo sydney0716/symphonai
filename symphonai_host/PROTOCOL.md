@@ -617,13 +617,6 @@ sends it, `HttpOnly` prevents app JavaScript from reading it, and
 authentication exception is confined to exact `/app/`; the cookie is the only
 subresource exception.
 
-An authenticated `GET /survey` returns a bounded, permission-gated repository
-survey under the `survey` key. Its fields are `root`, `languages`,
-`by_directory`, `entry_points`, `docs`, `tests`, `tree_summary`,
-`truncated_directories`, `stopped`, and `file_count`; paths are
-repository-relative strings. The route accepts only the
-ordinary bearer header; query tokens and app cookies do not authorize it.
-
 An authenticated `GET /project` returns the host repository's absolute,
 resolved path as `repo_root` and its basename as `name`. It accepts only the
 ordinary bearer header; an app query token or app cookie does not authorize it.

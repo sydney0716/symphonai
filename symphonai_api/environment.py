@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from symphonai_api.git import git as _git, WorktreeError
+
 import platform as platform_module
 import subprocess
 import sys
@@ -77,15 +79,8 @@ def render_environment(
 def _capture_git_snapshot(repo_root: Path) -> GitSnapshot | None:
     def run_git(*command: str) -> str | None:
         try:
-            completed = subprocess.run(
-                ["git", "--no-optional-locks", *command],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=True,
-            )
-        except (OSError, subprocess.SubprocessError, UnicodeError):
+            completed = _git(repo_root, '--no-optional-locks', *command, capture_output=True, text=True, timeout=5, check=True)
+        except (OSError, subprocess.SubprocessError, UnicodeError, WorktreeError):
             return None
         return completed.stdout.rstrip("\r\n")
 

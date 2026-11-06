@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -13,7 +13,7 @@ from symphonai_api.events import Event
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 
 GOAL_CHECK_TIMEOUT_SECONDS = 600
@@ -111,7 +111,7 @@ class GetGoalTool(LocalTool):
         return None if not arguments else "get_goal takes no arguments"
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=True, paths=None)
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(
         self,
@@ -168,7 +168,7 @@ class UpdateGoalTool(LocalTool):
         return None
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.MUTATING, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(
         self,
@@ -221,22 +221,12 @@ def run_check(
     sandboxed: bool = False,
 ) -> dict:
     """Run one configured argv and return its bounded result."""
-    from symphonai_api.process import run_process
-    from symphonai_api.tools.shell import shell_environment
-    command = list(argv)
-    if sandboxed and policy is not None:
-        from symphonai_api.tools.shell import sandbox_command
-        try:
-            command = sandbox_command(replace(policy, mode="allow"), command, cwd)
-        except ValueError as exc:
-            return {"exit": None, "ok": False, "output": str(exc)}
+    from symphonai_api.process import run_check_command
     try:
-        result = run_process(
-            command, cwd, timeout=GOAL_CHECK_TIMEOUT_SECONDS if timeout is None else timeout,
-            env=shell_environment(cwd, for_agent=True),
-            cancel=cancelled.is_set, output_limit=None, on_start=set_process,
-        )
+        result = run_check_command(argv, cwd, policy=policy, sandboxed=sandboxed,
+                                   timeout=GOAL_CHECK_TIMEOUT_SECONDS if timeout is None else timeout,
+                                   cancel=cancelled.is_set, on_start=set_process,
+                                   output_limit=GOAL_OUTPUT_LIMIT)
     finally:
         set_process(None)
-    output = str(result.error) if result.error is not None else result.stdout.decode("utf-8", errors="replace")
-    return {"exit": result.exit_code, "ok": result.exit_code == 0, "output": output[-GOAL_OUTPUT_LIMIT:]}
+    return {"exit": result["exit"], "ok": result["exit"] == 0, "output": result["output"]}

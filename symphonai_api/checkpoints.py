@@ -8,6 +8,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from symphonai_api.paths import TranscriptError, append_record, read_records
+
 
 @dataclass(frozen=True)
 class CheckpointEntry:
@@ -36,17 +38,13 @@ class CheckpointStore:
     def _reload(self) -> None:
         if not self._manifest.exists():
             return
-        lines = self._manifest.read_bytes().splitlines(keepends=True)
-        for index, line in enumerate(lines):
-            try:
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise ValueError("record is not an object")
-            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
-                if index == len(lines) - 1:
-                    self._torn_bytes = len(line)
-                    break
-                raise ValueError(f"invalid checkpoint manifest line {index + 1}") from exc
+        try:
+            records, self._torn_bytes = read_records(self._manifest)
+        except TranscriptError as exc:
+            if isinstance(exc.__cause__, OSError):
+                raise exc.__cause__
+            raise ValueError(str(exc)) from exc
+        for record in records:
             kind = record.get("type") if isinstance(record, dict) else None
             if kind == "begin" and isinstance(record.get("key"), str):
                 self._key = record["key"]
@@ -87,19 +85,8 @@ class CheckpointStore:
 
     def _append(self, record: dict) -> None:
         with self._manifest.open("a+b") as handle:
-            handle.seek(0, 2)
-            torn = getattr(self, "_torn_bytes", 0)
-            if torn:
-                handle.truncate(handle.tell() - torn)
-            handle.seek(0, 2)
-            separator = b""
-            if handle.tell():
-                handle.seek(-1, 2)
-                if handle.read(1) != b"\n":
-                    separator = b"\n"
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
-            handle.write(separator + line)
-            handle.flush()
+            append_record(handle, line, torn_bytes=getattr(self, "_torn_bytes", 0))
             self._torn_bytes = 0
 
     def _relative_path(self, path: Path) -> tuple[Path, str]:

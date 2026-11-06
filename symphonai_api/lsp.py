@@ -6,6 +6,8 @@ for language_id = "python" and extensions = [".py", ".pyi"].
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
@@ -38,7 +40,7 @@ class LspServerSpec:
 
 
 def _config_error(source: Path | None, key: str, detail: str) -> ConfigError:
-    return ConfigError(f"{source if source is not None else '<session>'}: {key}: {detail}")
+    return ConfigSource(source).exception(key, detail)
 
 
 def lsp_servers_from_config(

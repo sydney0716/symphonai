@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from symphonai_api.permissions import PermissionPolicy, _matching_forbidden_component
+from symphonai_api.permissions import PermissionPolicy, check_home_read, display_path
 from symphonai_api.paths import symphonai_home
 from symphonai_api.tools.read_ledger import ReadLedger
 
@@ -42,12 +42,7 @@ class InstructionSet:
     _repo_root: Path | None = field(default=None, repr=False, compare=False)
 
     def display_path(self, path: Path) -> str:
-        if self._repo_root is not None:
-            try:
-                return str(path.relative_to(self._repo_root))
-            except ValueError:
-                pass
-        return str(path)
+        return display_path(path, self._repo_root)
 
     def render_entry(self, entry: LoadedInstruction) -> str:
         """Render one entry's block exactly as `render()` includes it.
@@ -175,30 +170,9 @@ def load_instructions(
     ) -> None:
         resolved = path.resolve()
         if included and include_root is not None:
-            if resolved != include_root and include_root not in resolved.parents:
-                warnings.append(
-                    f"instruction file {resolved} was denied: "
-                    f"path is outside user_home: {resolved!r}"
-                )
-                return
-            # Reuse the policy's pattern list so it cannot drift, but match
-            # relative to user_home because the policy's base is repo_root.
-            relative_parts = resolved.relative_to(include_root).parts
-            forbidden = next(
-                (
-                    match
-                    for part in relative_parts
-                    if (match := _matching_forbidden_component(
-                        part, policy.forbidden_patterns
-                    )) is not None
-                ),
-                None,
-            )
-            if forbidden is not None:
-                warnings.append(
-                    f"instruction file {resolved} was denied: path matches forbidden "
-                    f"pattern {forbidden!r}: {resolved!r}"
-                )
+            reason = check_home_read(resolved, include_root, policy)
+            if reason is not None:
+                warnings.append(f"instruction file {resolved} was denied: {reason}")
                 return
         elif policy_gated:
             decision = policy.check_read(resolved)

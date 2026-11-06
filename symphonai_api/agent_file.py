@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from symphonai_api.config import ConfigSource
+
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-import tomllib
 
 from symphonai_api.tools.metadata import FILE_EDIT_TOOLS, edit_tool_names
 from symphonai_api.agent_spec import (
@@ -78,20 +79,12 @@ def _is_mcp_tool_name(name: str) -> bool:
 
 
 def _raise(path: Path, key: str, detail: str) -> None:
-    raise AgentFileError(f"{path}: {key}: {detail}")
+    ConfigSource(path, AgentFileError).error(key, detail)
 
 
 def _unknown_keys(path: Path, key: str, values: Mapping[str, object]) -> None:
     allowed = _TOP_LEVEL_KEYS if key == "file" else _TABLE_KEYS[key]
-    unknown = values.keys() - allowed
-    if unknown:
-        unknown_key = sorted(unknown)[0]
-        detail = (
-            "cannot come from an agent file"
-            if unknown_key in {"approval_callback", "price_table"}
-            else "unknown key"
-        )
-        _raise(path, unknown_key, detail)
+    ConfigSource(path, AgentFileError).unknown_keys(key, values, allowed, prefix=False, restricted={"approval_callback", "price_table"})
 
 
 def _table(
@@ -99,38 +92,30 @@ def _table(
     values: Mapping[str, object],
     key: str,
 ) -> Mapping[str, object] | None:
-    value = values.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        _raise(path, key, "must be a table")
-    _unknown_keys(path, key, value)
+    value = ConfigSource(path, AgentFileError).table(values, key, none_is_missing=True)
+    if value is not None:
+        _unknown_keys(path, key, value)
     return value
 
 
 def _read_toml(path: Path) -> dict[str, object]:
-    try:
-        return tomllib.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        _raise(path, "file", f"could not be read: {exc}")
-    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
-        _raise(path, "toml", f"could not be parsed: {exc}")
+    return ConfigSource(path, AgentFileError).read_toml(missing_ok=False)
 
 
 def _string(path: Path, key: str, value: object) -> str:
-    return SettingsParser(lambda field, detail: _raise(path, field, detail)).string(key, value)
+    return ConfigSource(path, AgentFileError).field("string", key, value)
 
 def _integer(path: Path, key: str, value: object) -> int:
-    return SettingsParser(lambda field, detail: _raise(path, field, detail)).integer(key, value)
+    return ConfigSource(path, AgentFileError).field("integer", key, value)
 
 def _number(path: Path, key: str, value: object) -> float:
-    return SettingsParser(lambda field, detail: _raise(path, field, detail)).number(key, value)
+    return ConfigSource(path, AgentFileError).field("number", key, value)
 
 def _boolean(path: Path, key: str, value: object) -> bool:
-    return SettingsParser(lambda field, detail: _raise(path, field, detail)).boolean(key, value)
+    return ConfigSource(path, AgentFileError).field("boolean", key, value)
 
 def _strings(path: Path, key: str, value: object) -> list[str]:
-    return SettingsParser(lambda field, detail: _raise(path, field, detail)).strings(key, value)
+    return ConfigSource(path, AgentFileError).field("strings", key, value)
 
 def _tool_names(path: Path, values: Mapping[str, object]) -> tuple[str, ...] | None:
     tools_present = "tools" in values

@@ -48,21 +48,11 @@ def run_process(
         if process.poll() is not None and drain_deadline is None:
             drain_deadline = now + 2.0
         if (cancelled or timed_out) and not killed:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
+            stop_process_group(process, process.pid, grace=0, timeout=0.1)
             killed = True
             drain_deadline = min(drain_deadline or now + 2.0, now + 2.0)
         if drain_deadline is not None and now >= drain_deadline:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
+            stop_process_group(process, process.pid, grace=0, timeout=0.1)
             for pipe in (process.stdin, process.stdout, process.stderr):
                 if pipe is not None:
                     pipe.close()
@@ -90,31 +80,67 @@ def run_process(
                          stdout, stderr, timed_out, cancelled)
 
 
-def stop_process_group(proc: subprocess.Popen, pgid: int, *, timeout: float = 0.2) -> None:
-    if proc.poll() is None:
-        try:
-            if hasattr(os, "killpg"):
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                proc.terminate()
-        except (OSError, ProcessLookupError, PermissionError):
-            pass
+
+
+def stop_process_group(proc, pgid, *, grace: float | None = None, timeout: float = 0.2) -> None:
+    """Stop child groups without signalling the host's own group; waits stay bounded."""
+    if proc is not None and proc.pid == os.getpid():
+        return
+    groups = (pgid,) if isinstance(pgid, int) else tuple(pgid)
+    own_group = os.getpgrp() if hasattr(os, "getpgrp") else None
+    groups = tuple(group for group in groups if group != own_group)
+    grace = timeout if grace is None else grace
+    def send(number):
+        if hasattr(os, "killpg"):
+            for group in groups:
+                try:
+                    os.killpg(group, number)
+                except OSError:
+                    pass
+        if proc is not None and proc.poll() is None and (not groups or not hasattr(os, "killpg")):
+            try:
+                proc.terminate() if number == signal.SIGTERM else proc.kill()
+            except OSError:
+                pass
+    if grace > 0:
+        send(signal.SIGTERM)
+        if proc is None:
+            time.sleep(grace)
+        else:
+            try:
+                proc.wait(timeout=grace)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    send(signal.SIGKILL)
+    if proc is not None:
         try:
             proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            pass
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(pgid, signal.SIGKILL)
-        elif proc.poll() is None:
-            proc.kill()
-    except (OSError, ProcessLookupError, PermissionError):
-        pass
-    try:
-        proc.wait(timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        if proc.poll() is None:
+        except (OSError, subprocess.TimeoutExpired):
             try:
                 proc.kill()
             except OSError:
                 pass
+
+
+def run_check_command(argv, cwd: Path, *, policy=None, sandboxed=False, enforce_policy=False,
+                      timeout: float, cancel=None, on_start=None, output_limit=4000,
+                      for_agent=True) -> dict:
+    """Run validation/check argv with bounded waits and structured exit status."""
+    from dataclasses import replace
+    from symphonai_api.tools.shell import sandbox_command, shell_environment
+    if enforce_policy and policy is not None:
+        decision = policy.check_shell(argv, cwd=cwd)
+        if not decision.allowed:
+            return {"exit": 126, "output": decision.reason}
+    if sandboxed and policy is not None:
+        try:
+            argv = sandbox_command(replace(policy, mode="allow"), list(argv), cwd)
+        except ValueError as exc:
+            return {"exit": None, "output": str(exc)}
+    result = run_process(argv, cwd, env=shell_environment(cwd, for_agent=for_agent),
+                         timeout=timeout, cancel=cancel, on_start=on_start, output_limit=None)
+    output = str(result.error) if result.error is not None else result.stdout.decode("utf-8", errors="replace")
+    if output_limit is not None:
+        output = output[-output_limit:] if output_limit else ""
+    return {"exit": result.exit_code, "output": output, "timed_out": result.timed_out,
+            "cancelled": result.cancelled, "error": result.error}

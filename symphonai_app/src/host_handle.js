@@ -22,22 +22,12 @@ function validatedHost(value, source) {
 }
 
 
-export function hostFromShell(bridge) {
-  return validatedHost(bridge, "shell bridge");
-}
-
-
-export function hostFromPage(global) {
-  return validatedHost(global?.__symphonai, "page handshake");
-}
-
-
 export function resolveHost(env) {
   if (env?.__symphonaiShell !== undefined) {
-    return hostFromShell(env.__symphonaiShell);
+    return validatedHost(env.__symphonaiShell, "shell bridge");
   }
   if (env?.__symphonai !== undefined) {
-    return hostFromPage(env);
+    return validatedHost(env.__symphonai, "page handshake");
   }
   throw new HostError("no host handshake is available");
 }

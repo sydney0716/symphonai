@@ -11,15 +11,14 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
-from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from urllib.parse import urlencode
 
-from symphonai_api.cost import UsageTotals, total_cost
+from symphonai_api.cost import UsageTotals, total_cost, usage_records
 from symphonai_api.secrets import mask_secrets
-from symphonai_api.session import TranscriptError, read_records
+from symphonai_api.session import TranscriptError, iter_session_meta, read_records
 from symphonai_api.web import RedirectBlocker, WebFetchError
 
 
@@ -51,12 +50,8 @@ def _get(url, headers, params=None):
     if params:
         url += "?" + urlencode(params, doseq=True)
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.build_opener(RedirectBlocker()).open(request, timeout=10) as response:
-        if not 200 <= response.status < 300:
-            raise ValueError("unsuccessful vendor response")
-        value = json.loads(response.read(), parse_float=Decimal)
-    if not isinstance(value, dict):
-        raise ValueError("invalid vendor response")
+    from symphonai_api.providers.base import read_json
+    value = read_json(urllib.request.build_opener(RedirectBlocker()), request, 1_000_000, parse_float=Decimal)
     return value
 
 
@@ -135,11 +130,10 @@ def _local(root, start, end):
     root = Path(root)
     if not root.is_dir():
         return buckets, warnings
-    for directory in sorted(root.iterdir()):
-        if not directory.is_dir() or directory.name == "loops":
-            continue
+    for directory, meta in sorted(iter_session_meta(root), key=lambda item: item[0]):
         try:
-            meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+            if meta is None:
+                raise ValueError("session metadata is unreadable")
             project = meta.get("repo_root", "")
             choice = meta.get("provider_choice") or {}
             provider = choice.get("name", "unknown")
@@ -155,15 +149,7 @@ def _local(root, start, end):
             except (OSError, TranscriptError, ValueError):
                 warnings.append("Some session usage could not be read.")
                 continue
-            starts = 0
-            for record in records:
-                if record.get("type") == "run_started":
-                    starts += 1
-                if record.get("type") != "usage":
-                    continue
-                # Fork prefixes copy old usage; their first real run starts later.
-                if path.name == "run.jsonl" and meta.get("parent_session_id") and starts < 2:
-                    continue
+            for record in usage_records(records, forked=path.name == "run.jsonl" and bool(meta.get("parent_session_id"))):
                 try:
                     at = datetime.fromisoformat(record["ts"])
                     if at.tzinfo is None:
@@ -175,11 +161,9 @@ def _local(root, start, end):
                     vendor = data.get("provider", provider)
                     if not all(isinstance(item, str) for item in (model, vendor, project)):
                         raise ValueError("invalid usage identity")
-                    values = {field.name: data.get(field.name, 0) for field in fields(UsageTotals)}
-                    if any(type(value) is not int or value < 0 for value in values.values()):
-                        raise ValueError("invalid usage counters")
+                    totals = UsageTotals.from_record(data)
                     key = (at.astimezone(timezone.utc).date().isoformat(), vendor, model, project)
-                    buckets[key] = buckets[key].merged(UsageTotals(**values))
+                    buckets[key] = buckets[key].merged(totals)
                 except (KeyError, TypeError, ValueError):
                     warnings.append("Some saved usage records were invalid.")
     return buckets, warnings

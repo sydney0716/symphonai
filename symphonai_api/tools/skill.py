@@ -9,7 +9,7 @@ from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.skills import Skill, SkillError, roster_text
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 
 class UseSkillTool(LocalTool):
@@ -37,11 +37,7 @@ class UseSkillTool(LocalTool):
         }
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(
-            effect=ToolEffect.READ_ONLY,
-            concurrency_safe=True,
-            paths=None,
-        )
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(
         self,

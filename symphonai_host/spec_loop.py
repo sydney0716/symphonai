@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from symphonai_api.process import stop_process_group
+
+from symphonai_api.worktree import apply_patch
+
+from symphonai_api.git import git as _git
+
 import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -24,8 +29,8 @@ from symphonai_api.models import Role
 from symphonai_api.roles import failure_reviewer_prompt, loop_planner_prompt, spec_reviewer_prompt
 from symphonai_api.session import SessionError, SessionStore, TranscriptError, load_run
 from symphonai_api.tools.filesystem import MAX_READ_BYTES
-from symphonai_api.tools.shell import shell_environment, shell_executable
-from symphonai_api.worktree import WorktreeDiff, WorktreeError, _linked_paths, create_worktree, remove_worktree, stage_worktree, worktree_diff
+from symphonai_api.tools.shell import shell_executable
+from symphonai_api.worktree import WorktreeError, _linked_paths, create_worktree, remove_worktree, stage_worktree, worktree_diff
 from symphonai_host.loops import LoopStore
 from symphonai_host.goal import Goal
 from symphonai_host.roadmap import InvalidRoadmap, RoadmapStore
@@ -154,42 +159,6 @@ class Record:
             result[item.name] = value
         return result
 
-    def get(self, key, default=None):
-        if key in self._present:
-            return getattr(self, key) if hasattr(self, key) else self._extra[key]
-        value = getattr(self, key, None)
-        return value if isinstance(value, list) and value else default
-
-    def __getitem__(self, key):
-        if hasattr(self, key):
-            return getattr(self, key)
-        return self._extra[key]
-
-    def __setitem__(self, key, value):
-        if hasattr(self, key):
-            setattr(self, key, value)
-        else:
-            self._extra[key] = value
-
-    def __contains__(self, key):
-        return key in self._present or key in self._extra
-
-    def setdefault(self, key, default):
-        if key not in self:
-            self[key] = default
-        return self[key]
-
-    def pop(self, key, default=None):
-        result = self.get(key, default)
-        self._present.discard(key)
-        if hasattr(self, key):
-            object.__setattr__(self, key, None)
-        self._extra.pop(key, None)
-        return result
-
-    def update(self, **values):
-        for key, value in values.items():
-            self[key] = value
 
 
 @dataclass
@@ -206,6 +175,8 @@ class Card(Record):
     session_id: str | None = None
     previous_session_ids: list[str] = field(default_factory=list)
     commit: str | None = None
+    failure: str | None = None
+    reason: str | None = None
 
 
 @dataclass
@@ -238,17 +209,6 @@ class Loop(Record):
             raise LoopStateError(self.id, self.state.value, expected)
 
 
-def _loop_git(cwd: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    try:
-        result = subprocess.run(
-            ["git", *arguments], cwd=cwd, capture_output=True, check=False, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(str(exc)) from exc
-    if check and result.returncode:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(detail or f"git {' '.join(arguments)} failed")
-    return result
 
 
 class LoopController:
@@ -259,7 +219,7 @@ class LoopController:
         self._loop_validation_processes: dict[str, subprocess.Popen] = {}
         self._loop_runner_lock_fds: dict[str, int] = {}
 
-    def start_spec_run(self, spec: dict) -> tuple[str, str]:
+    def start_spec_run(self, spec: dict) -> str:
         """Start an isolated implementation conversation for a parsed spec."""
         from symphonai_host.run import MAX_ACTIVE_CONVERSATIONS, RunActiveError
 
@@ -268,10 +228,7 @@ class LoopController:
                 raise RunActiveError(description=f"{MAX_ACTIVE_CONVERSATIONS} conversations are already running")
             policy = replace(self.host._base_policy, repo_root=self.host._repo_root, mode="allow")
             objective = f"{spec['text']}\n\nWrite your report at {spec['report']}."
-            if spec["validation"]:
-                check = ("/bin/sh", "-c", "set -e\n" + "\n".join(spec["validation"]))
-            else:
-                check = ()
+            check = ("/bin/sh", "-c", "set -e\n" + "\n".join(spec["validation"]))
             goal = Goal(objective, check, max_rounds=5)
             run_id = self.host.start(
                 objective, _new_goal=goal, session_policy=policy,
@@ -284,13 +241,11 @@ class LoopController:
                 }},
                 _title=f"Run {Path(spec['path']).name}",
             )
-            return run_id, run_id
+            return run_id
 
 
-    def start_spec_review(self, session_id: str, *, failure: str | None = None) -> tuple[str, str]:
+    def start_spec_review(self, session_id: str, *, failure: str | None = None) -> str:
         from symphonai_host.run import RunActiveError
-
-        from symphonai_host.spec_run import patch_digest
 
         with self.host._lock:
             source = SessionStore.open(self.host._sessions_root, session_id)
@@ -344,7 +299,7 @@ class LoopController:
             meta = {
                 "spec": info["spec"], "report": info["report"], "kind": "review",
                 "of": session_id, "worktree_path": str(worktree),
-                "baseline": patch_digest(diff.patch), "baseline_files": baseline_files,
+                "baseline_files": baseline_files,
                 "role": "reviewer",
                 **({"failure": failure} if failure is not None else {}),
                 **({"loop_id": info["loop_id"], "card_id": info.get("card_id")}
@@ -354,15 +309,14 @@ class LoopController:
                 prompt, session_policy=policy, _session_meta={"spec_run": meta},
                 _title=f"Review {Path(info['spec']).name}",
             )
-            review_id = run_id
             source = SessionStore.open(self.host._sessions_root, session_id)
             try:
                 def change(source_meta):
-                    source_meta["review"] = {"session_id": review_id, "verdict": "running", "follow_ups": [], "not_copied": []}
+                    source_meta["review"] = {"session_id": run_id, "verdict": "running", "follow_ups": [], "not_copied": []}
                 source.update_meta(change)
             finally:
                 source.close()
-            return review_id, run_id
+            return run_id
 
 
     def _acquire_loop_runner_lock(self, loop_id: str) -> int | None:
@@ -416,7 +370,7 @@ class LoopController:
                 if roadmap_goal_id is not None and roadmap_store.find(roadmap, roadmap_goal_id) is None:
                     raise KeyError(roadmap_goal_id)
             store = self.store
-            loop = Loop.from_payload(store.create(goal))
+            loop = store.create(goal)
             try:
                 if runner_pid is not None:
                     loop.runner_pid = runner_pid
@@ -506,7 +460,7 @@ class LoopController:
                     }},
                     _title=f"Plan: {loop.goal[:60]}",
                 )
-                previous_sessions = loop.setdefault("previous_planner_session_ids", [])
+                previous_sessions = loop.previous_planner_session_ids
                 previous_session_id = loop.planner_session_id
                 if isinstance(previous_session_id, str) and previous_session_id not in previous_sessions:
                     previous_sessions.append(previous_session_id)
@@ -543,27 +497,27 @@ class LoopController:
             integration_created = False
             branch = branch_prefix
             try:
-                _loop_git(self.host._repo_root, "rev-parse", "--show-toplevel")
+                _git(self.host._repo_root, "rev-parse", "--show-toplevel")
                 suffix = 1
                 while True:
                     branch = branch_prefix if suffix == 1 else f"{branch_prefix}-{suffix}"
-                    result = _loop_git(
+                    result = _git(
                         self.host._repo_root, "show-ref", "--verify", "--quiet",
                         f"refs/heads/{branch}", check=False,
                     )
                     if result.returncode != 0:
                         break
                     suffix += 1
-                _loop_git(self.host._repo_root, "branch", branch)
+                _git(self.host._repo_root, "branch", branch)
                 branch_created = True
                 loop.base_commit = os.fsdecode(
-                    _loop_git(self.host._repo_root, "rev-parse", "HEAD").stdout.strip(),
+                    _git(self.host._repo_root, "rev-parse", "HEAD").stdout.strip(),
                 )
                 integration_root = create_worktree(
                     self.host._repo_root, integration_admin, start=branch,
                 )
                 integration_created = True
-                _loop_git(integration_root, "switch", branch)
+                _git(integration_root, "switch", branch)
                 loop.branch = branch
                 store.set_state(loop, "running")
             except Exception as exc:
@@ -573,7 +527,7 @@ class LoopController:
                     except (OSError, WorktreeError):
                         shutil.rmtree(integration_admin, ignore_errors=True)
                         try:
-                            _loop_git(self.host._repo_root, "worktree", "prune")
+                            _git(self.host._repo_root, "worktree", "prune")
                         except RuntimeError:
                             pass
                 for directory in (integration_admin.parent, integration_admin.parent.parent):
@@ -583,7 +537,7 @@ class LoopController:
                         pass
                 if branch_created:
                     try:
-                        _loop_git(self.host._repo_root, "branch", "-D", branch)
+                        _git(self.host._repo_root, "branch", "-D", branch)
                     except RuntimeError:
                         pass
                 try:
@@ -628,7 +582,7 @@ class LoopController:
 
 
     def revise_loop_plan(self, loop_id: str, note: str) -> Loop:
-        from symphonai_host.run import LoopStateError, MAX_ACTIVE_CONVERSATIONS, RunActiveError
+        from symphonai_host.run import MAX_ACTIVE_CONVERSATIONS, RunActiveError
 
         with self.host._lock:
             store = self.store
@@ -654,6 +608,31 @@ class LoopController:
                 raise
 
 
+    def _card_review(self, session_id: str):
+        source = SessionStore.open(self.host._sessions_root, session_id)
+        try:
+            return source.read_meta().get("review", {})
+        finally:
+            source.close()
+
+    def _reset_card(self, card: Card, *, clear_reason: bool = False, persist=None) -> None:
+        session_id = card.session_id
+        worktree = None if not isinstance(session_id, str) else self.host._sessions_root / session_id / "worktree"
+        # Recovery removes before saving; resume preserves its save-before-remove order.
+        if persist is None and worktree is not None and worktree.exists():
+            remove_worktree(self.host._repo_root, worktree)
+        if isinstance(session_id, str) and session_id not in card.previous_session_ids:
+            card.previous_session_ids.append(session_id)
+        if clear_reason:
+            card.reason = None
+            card._present.discard("reason")
+        card.state = "planned"
+        card.session_id = None
+        if persist is not None:
+            persist()
+            if worktree is not None and worktree.exists():
+                remove_worktree(self.host._repo_root, worktree)
+
     def cancel_loop(self, loop_id: str) -> Loop:
         worktree_ids = set()
         session_ids = set()
@@ -669,13 +648,9 @@ class LoopController:
                     session_ids.add(session_id)
                     worktree_ids.add(session_id)
                     try:
-                        source = SessionStore.open(self.host._sessions_root, session_id)
-                        try:
-                            review_id = source.read_meta().get("review", {}).get("session_id")
-                            if isinstance(review_id, str):
-                                session_ids.add(review_id)
-                        finally:
-                            source.close()
+                        review_id = self._card_review(session_id).get("session_id")
+                        if isinstance(review_id, str):
+                            session_ids.add(review_id)
                     except (OSError, SessionError, AttributeError):
                         pass
             for session_id in session_ids:
@@ -693,10 +668,7 @@ class LoopController:
                 validation_cancel.set()
             process = self._loop_validation_processes.get(loop_id)
             if process is not None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    process.kill()
+                stop_process_group(process, process.pid, grace=0, timeout=0.1)
             if loop.state in ("running", "validating"):
                 store.set_state(loop, "needs_attention", "cancelling")
                 self._loop_changed(loop, "state")
@@ -726,9 +698,9 @@ class LoopController:
                 remove_worktree(self.host._repo_root, integration_admin)
             branch = loop.branch
             if isinstance(branch, str):
-                branches = _loop_git(self.host._repo_root, "branch", "--list", branch).stdout
+                branches = _git(self.host._repo_root, "branch", "--list", branch).stdout
                 if branches.strip():
-                    _loop_git(self.host._repo_root, "branch", "-D", branch)
+                    _git(self.host._repo_root, "branch", "-D", branch)
         except (OSError, RuntimeError) as exc:
             with self.host._lock:
                 loop = store.load_record(loop_id)
@@ -745,76 +717,52 @@ class LoopController:
 
 
     def integrate(self, loop: Loop, card: Card, worktree: Path) -> str:
-        from symphonai_host.run import WorktreeApplyConflict
 
         loop_id = loop.id
         self.store.validate_id(loop_id)
         integration_root = self._loop_integration_root(loop_id)
-        diff = self._loop_card_diff(loop_id, Path(worktree))
+        diff = worktree_diff(self._worktree_project_root(Path(worktree)), exclude=(f".symphonai/loops/{loop_id}/**",))
         if not diff.patch:
             return ""
         linked = _linked_paths(integration_root.resolve())
-        status = _loop_git(
+        status = _git(
             integration_root, "status", "--porcelain", "--untracked-files=all", "--", ".",
             *(f":(exclude){path}" for path in linked),
         ).stdout
         if status:
             raise RuntimeError("integration worktree has uncommitted changes")
-        patch = diff.patch.encode("utf-8", errors="surrogateescape")
-        checked = subprocess.run(
-            ["git", "apply", "--check", "--binary"], cwd=integration_root,
-            input=patch, capture_output=True, check=False,
-        )
-        if checked.returncode:
-            message = checked.stderr.decode("utf-8", errors="replace").strip()
-            raise WorktreeApplyConflict(message or "git apply --check failed")
+        checked = False
+        def on_checked():
+            nonlocal checked
+            checked = True
         try:
-            applied = subprocess.run(
-                ["git", "apply", "--binary"], cwd=integration_root,
-                input=patch, capture_output=True, check=False,
-            )
-            if applied.returncode:
-                message = applied.stderr.decode("utf-8", errors="replace").strip()
-                raise WorktreeApplyConflict(message or "git apply failed")
+            apply_patch(integration_root, diff.patch, on_checked=on_checked)
             stage_worktree(integration_root)
-            _loop_git(integration_root, "commit", "-m", f"{card.id}: {card.title}")
-            return os.fsdecode(_loop_git(integration_root, "rev-parse", "HEAD").stdout.strip())
+            _git(integration_root, "commit", "-m", f"{card.id}: {card.title}")
+            return os.fsdecode(_git(integration_root, "rev-parse", "HEAD").stdout.strip())
         except (OSError, RuntimeError) as exc:
+            if not checked:
+                raise
             reason = str(exc)
             try:
-                _loop_git(integration_root, "reset", "--hard", "HEAD")
-                _loop_git(integration_root, "clean", "-fd", "--", ".",
+                _git(integration_root, "reset", "--hard", "HEAD")
+                _git(integration_root, "clean", "-fd", "--", ".",
                           *(f":(exclude){path}" for path in linked))
             except (OSError, RuntimeError) as cleanup_error:
                 reason = f"{reason}; integration cleanup failed: {cleanup_error}"
-            card["failure"] = reason
-            card["reason"] = reason
+            card.failure = reason
+            card.reason = reason
             loop.failure_stage = "integration"
             self._loop_attention(loop, f"card {card.id} integration failed: {reason}", card)
             raise RuntimeError(reason) from exc
 
 
 
-    def _loop_card_diff(self, loop_id: str, worktree: Path) -> WorktreeDiff:
-        worktree = self._worktree_project_root(worktree)
-        stage_worktree(worktree)
-        loop_files = f":(exclude).symphonai/loops/{loop_id}/**"
-        files = _loop_git(
-            worktree, "diff", "--cached", "--name-only", "--relative", "-z", "HEAD",
-            "--", ".", loop_files,
-        ).stdout
-        patch = _loop_git(
-            worktree, "diff", "--cached", "--binary", "HEAD", "--", ".", loop_files,
-        ).stdout
-        return WorktreeDiff(
-            patch=os.fsdecode(patch),
-            files=tuple(os.fsdecode(item) for item in files.split(b"\0") if item),
-        )
 
 
     def _worktree_project_root(self, worktree: Path) -> Path:
         if not hasattr(self, "_project_relative_root"):
-            top = Path(os.fsdecode(_loop_git(
+            top = Path(os.fsdecode(_git(
                 self.host._repo_root, "rev-parse", "--show-toplevel",
             ).stdout.strip())).resolve()
             self._project_relative_root = self.host._repo_root.resolve().relative_to(top)
@@ -866,14 +814,10 @@ class LoopController:
                 if card.state != "review" or not card.session_id:
                     continue
                 try:
-                    source = SessionStore.open(self.host._sessions_root, card.session_id)
-                    try:
-                        review = source.read_meta().get("review")
-                    finally:
-                        source.close()
+                    review = self._card_review(card.session_id)
                     if isinstance(review, dict) and review.get("session_id"):
                         continue
-                    self.start_spec_review(card.session_id, failure=card.to_payload().get("failure"))
+                    self.start_spec_review(card.session_id, failure=card.failure)
                     active_count += 1
                 except RunActiveError:
                     break
@@ -910,13 +854,13 @@ class LoopController:
                     validation = spec_validation(source)
                     if not validation:
                         raise ValueError(f"card {card.id} has no Validation commands")
-                    tip = os.fsdecode(_loop_git(integration, "rev-parse", "HEAD").stdout.strip())
+                    tip = os.fsdecode(_git(integration, "rev-parse", "HEAD").stdout.strip())
                     card_spec_path = spec_path.relative_to(self.host._repo_root).as_posix()
                     report_path = store.path(
-                        loop_id, card.get("report", f"reports/{card.id}-report.md"),
+                        loop_id, (card.report if "report" in card._present else f"reports/{card.id}-report.md"),
                     )
                     relative_report = report_path.relative_to(self.host._repo_root).as_posix()
-                    _, session_id = self.start_spec_run({
+                    session_id = self.start_spec_run({
                         "text": source, "validation": validation,
                         "path": card_spec_path, "report": relative_report,
                         "loop_id": loop_id, "card_id": card.id, "start_ref": tip,
@@ -955,15 +899,16 @@ class LoopController:
                 loop = store.load_record(loop_id)
                 if loop.state == "cancelled":
                     return
-                card = next(item for item in loop.cards if item.get("id") == card_id)
+                card = next(item for item in loop.cards if item.id == card_id)
                 if state == "finished":
-                    card.pop("failure", None)
+                    card.failure = None
+                    card._present.discard("failure")
                     card.state = "review"
                     self._loop_card_changed(loop, card)
                     self._advance_loop(loop_id)
                     return
                 cause = error or goal_reason or state
-                card["failure"] = f"card {card_id} could not finish: {cause}"
+                card.failure = f"card {card_id} could not finish: {cause}"
                 card.state = "review"
                 self._loop_card_changed(loop, card)
                 self._advance_loop(loop_id)
@@ -985,12 +930,8 @@ class LoopController:
                 return
             if review_info.get("failure") is not None and loop.state == "needs_attention":
                 return
-            card = next(item for item in loop.cards if item.get("id") == card_id)
-            source = SessionStore.open(self.host._sessions_root, review_info["of"])
-            try:
-                result = source.read_meta().get("review", {})
-            finally:
-                source.close()
+            card = next(item for item in loop.cards if item.id == card_id)
+            result = self._card_review(review_info["of"])
             verdict = result.get("verdict")
             if verdict not in ("passed", "follow-ups"):
                 error = result.get("error")
@@ -1018,7 +959,7 @@ class LoopController:
                 try:
                     commit = self.integrate(loop, card, card_worktree)
                 except (OSError, RuntimeError) as exc:
-                    card["failure"] = str(exc)
+                    card.failure = str(exc)
                     self._loop_card_changed(loop, card)
                     try:
                         self.start_spec_review(review_info["of"], failure=str(exc))
@@ -1056,7 +997,7 @@ class LoopController:
                     suffix = "F" if rounds == 1 else "F2"
                     follow_id = f"{original_id}{suffix}"
                     relative_spec = relative.relative_to(prefix).as_posix()
-                    if any(item.get("id") == follow_id for item in loop.cards):
+                    if any(item.id == follow_id for item in loop.cards):
                         continue
                     follow = Card.from_payload({
                         "id": follow_id, "title": f"Follow up: {card.title}",
@@ -1098,24 +1039,16 @@ class LoopController:
     def _run_loop_validation_command(
         self, loop_id: str, command: str, cwd: Path, cancelled: threading.Event,
     ) -> dict:
-        from symphonai_api.process import run_process
-        from symphonai_api.tools.shell import sandbox_command
-        policy = replace(self.host._base_policy, repo_root=cwd)
-        policy.mode = "allow"
-        try:
-            argv = sandbox_command(policy, [shell_executable(), "-c", command], cwd)
-        except ValueError as exc:
-            return {"command": command, "exit": None, "output": str(exc)}
+        from symphonai_api.process import run_check_command
+        policy = replace(self.host._base_policy, repo_root=cwd, mode="allow")
         def started(process):
             with self.host._lock:
                 self._loop_validation_processes[loop_id] = process
         try:
-            result = run_process(
-                argv, cwd, env=shell_environment(cwd, for_agent=True), timeout=600,
-                cancel=cancelled.is_set, output_limit=4000, on_start=started,
-            )
-            output = str(result.error) if result.error is not None else result.stdout.decode("utf-8", errors="replace")
-            return {"command": command, "exit": result.exit_code, "output": output[-4000:]}
+            result = run_check_command([shell_executable(), "-c", command], cwd,
+                                       policy=policy, sandboxed=True, timeout=600,
+                                       cancel=cancelled.is_set, on_start=started, output_limit=4000)
+            return {"command": command, "exit": result["exit"], "output": result["output"]}
         finally:
             with self.host._lock:
                 self._loop_validation_processes.pop(loop_id, None)
@@ -1153,8 +1086,8 @@ class LoopController:
                 if card.commit
             ]
             base_commit = loop.base_commit
-            head = os.fsdecode(_loop_git(integration, "rev-parse", "HEAD").stdout.strip())
-            files = _loop_git(integration, "diff", "--name-only", f"{base_commit}..{head}").stdout
+            head = os.fsdecode(_git(integration, "rev-parse", "HEAD").stdout.strip())
+            files = _git(integration, "diff", "--name-only", f"{base_commit}..{head}").stdout
             summary = {
                 "commits": commits,
                 "files": sorted(item for item in os.fsdecode(files).splitlines() if item),
@@ -1206,7 +1139,7 @@ class LoopController:
                         if card_worktree.exists():
                             remove_worktree(self.host._repo_root, card_worktree)
                 if action == "decline" and isinstance(branch, str):
-                    _loop_git(self.host._repo_root, "branch", "-D", branch)
+                    _git(self.host._repo_root, "branch", "-D", branch)
             except (OSError, WorktreeError, RuntimeError) as exc:
                 raise ValueError(str(exc)) from exc
             if action == "approve":
@@ -1224,7 +1157,7 @@ class LoopController:
     def resume_loop(
         self, loop_id: str, *, runner_pid: int | None = None, runner_lock: bool = False,
     ) -> Loop:
-        from symphonai_host.run import LoopStateError, RunActiveError
+        from symphonai_host.run import RunActiveError
 
         with self.host._lock:
             store = self.store
@@ -1266,11 +1199,7 @@ class LoopController:
                 session_id = card.session_id
                 if isinstance(session_id, str):
                     try:
-                        source = SessionStore.open(self.host._sessions_root, session_id)
-                        try:
-                            review = source.read_meta().get("review", {})
-                        finally:
-                            source.close()
+                        review = self._card_review(session_id)
                     except (OSError, SessionError, TranscriptError):
                         review = {}
                     review_id = review.get("session_id") if isinstance(review, dict) else None
@@ -1280,17 +1209,10 @@ class LoopController:
                     approvals = self.host._approvals_by_session.get(review_id)
                     if approvals is not None:
                         approvals.cancel_all(reason="loop resumed")
-                    worktree = self.host._sessions_root / session_id / "worktree"
-                    previous_sessions = card.setdefault("previous_session_ids", [])
-                    if session_id not in previous_sessions:
-                        previous_sessions.append(session_id)
-                card.pop("reason", None)
-                card.update(state="planned", session_id=None)
-                self._loop_card_changed(loop, card)
-                if isinstance(session_id, str) and worktree.exists():
-                    remove_worktree(self.host._repo_root, worktree)
+                self._reset_card(card, clear_reason=True,
+                                 persist=lambda: self._loop_card_changed(loop, card))
             validation_failed = loop.failure_stage == "validation"
-            if "failure_stage" not in loop:
+            if "failure_stage" not in loop._present:
                 validation_failed = str(loop.reason).startswith("validation failed:")
             if validation_failed:
                 store.set_state(loop, "validating", "")
@@ -1306,7 +1228,7 @@ class LoopController:
     def loop_card_details(self, loop_id: str, card_id: str) -> dict:
         store = self.store
         loop = store.load_record(loop_id)
-        card = next((item for item in loop.cards if item.get("id") == card_id), None)
+        card = next((item for item in loop.cards if item.id == card_id), None)
         if card is None:
             raise KeyError(card_id)
 
@@ -1319,7 +1241,7 @@ class LoopController:
                 return ""
 
         spec = read_text(card.spec)
-        report = read_text(card.get("report", ""))
+        report = read_text(card.report or "")
         diff_bytes = b""
         commit = card.commit
         if not isinstance(commit, str):
@@ -1331,11 +1253,11 @@ class LoopController:
         valid_branch = isinstance(branch, str) and re.fullmatch(r"symphonai/[a-z0-9-]+", branch)
         if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40,64}", commit)
                 and valid_branch):
-            ancestry = _loop_git(
+            ancestry = _git(
                 self.host._repo_root, "merge-base", "--is-ancestor", commit, branch, check=False,
             )
             if ancestry.returncode == 0:
-                diff_bytes = _loop_git(
+                diff_bytes = _git(
                     self.host._repo_root, "show", "--format=", "--binary", commit,
                 ).stdout
         elif isinstance(card.session_id, str):
@@ -1352,11 +1274,7 @@ class LoopController:
         session_id = card.session_id if isinstance(card.session_id, str) else None
         if session_id is not None:
             try:
-                source = SessionStore.open(self.host._sessions_root, session_id)
-                try:
-                    review_meta = source.read_meta().get("review", {})
-                finally:
-                    source.close()
+                review_meta = self._card_review(session_id)
             except (OSError, SessionError, AttributeError):
                 review_meta = {}
         verdict = review_meta.get("verdict", "") if isinstance(review_meta, dict) else ""
@@ -1378,8 +1296,8 @@ class LoopController:
             except (OSError, SessionError):
                 review_text = ""
         follow_up_ids = [
-            item["id"] for item in loop.cards
-            if card_id in item.get("after", []) and item.get("follow_up_of")
+            item.id for item in loop.cards
+            if card_id in item.after and item.follow_up_of
         ]
         return {
             "card": card.to_payload(),
@@ -1434,24 +1352,12 @@ class LoopController:
                         continue
                     if card.state == "review" and isinstance(session_id, str):
                         try:
-                            source = SessionStore.open(self.host._sessions_root, session_id)
-                            try:
-                                review_id = source.read_meta().get("review", {}).get("session_id")
-                            finally:
-                                source.close()
+                            review_id = self._card_review(session_id).get("session_id")
                         except (OSError, SessionError, AttributeError):
                             review_id = None
                         if isinstance(review_id, str) and review_id in self.host._active_by_session:
                             continue
-                    if isinstance(session_id, str):
-                        worktree = self.host._sessions_root / session_id / "worktree"
-                        if worktree.exists():
-                            remove_worktree(self.host._repo_root, worktree)
-                    if isinstance(session_id, str):
-                        previous_sessions = card.setdefault("previous_session_ids", [])
-                        if session_id not in previous_sessions:
-                            previous_sessions.append(session_id)
-                    card.update(state="planned", session_id=None)
+                    self._reset_card(card)
                     changed_cards.append(card.id)
                     changed = True
                 if changed:
@@ -1679,11 +1585,7 @@ class LoopController:
             review_ids = []
             for session_id in session_ids:
                 try:
-                    source = SessionStore.open(self.host._sessions_root, session_id)
-                    try:
-                        review = source.read_meta().get("review")
-                    finally:
-                        source.close()
+                    review = self._card_review(session_id)
                 except (OSError, SessionError, TranscriptError):
                     review = None
                 review_id = review.get("session_id") if isinstance(review, dict) else None
@@ -1739,10 +1641,7 @@ class LoopController:
                 copied = False
                 if isinstance(report, str):
                     source = root / report
-                    ignored = subprocess.run(
-                        ["git", "check-ignore", "-q", "--", report], cwd=self.host._repo_root,
-                        capture_output=True, check=False,
-                    ).returncode == 0
+                    ignored = _git(self.host._repo_root, 'check-ignore', '-q', '--', report, capture_output=True, check=False).returncode == 0
                     if source.is_file() and ignored and ".env" not in Path(report).parts:
                         target = self.host._repo_root / report
                         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1768,7 +1667,7 @@ class LoopController:
 
 
     def _finish_spec_review(self, session_id: str, leader: Leader, terminal_event: RunFinished | RunFailed | None) -> None:
-        from symphonai_host.spec_run import patch_digest, review_verdict
+        from symphonai_host.spec_run import review_verdict
 
         with self.host._lock:
             review_store = SessionStore.open(self.host._sessions_root, session_id)
@@ -1809,7 +1708,7 @@ class LoopController:
                         "follow_ups": [], "not_copied": [],
                     }}))
                     if loop_id and card_id:
-                        card["reason"] = reason
+                        card.reason = reason
                         self._loop_card_changed(loop, card)
                     self._finish_loop_card_review(review_info)
                     return

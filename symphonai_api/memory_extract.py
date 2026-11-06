@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from symphonai_api.serialization import message_digest
+
 from dataclasses import dataclass
-import hashlib
 import json
 import sys
 import threading
@@ -25,11 +26,10 @@ from symphonai_api.events import (
 from symphonai_api.identity import new_id
 from symphonai_api.memory_prompt import MEMORY_GUIDE, memory_age
 from symphonai_api.models import DocumentBlock, ImageBlock, Message, ModelRequest, Role, ToolResult
-from symphonai_api.model_table import capability_for_model
+from symphonai_api.model_table import capability_for_model, accepts_effort
 from symphonai_api.permissions import PermissionPolicy
 from symphonai_api.providers.base import ModelProvider, tool_result_text
 from symphonai_api.secrets import mask_secrets as redact_secrets
-from symphonai_api.serialization import message_to_json
 from symphonai_api.tool_schema import tool_registry_schemas
 from symphonai_api.tools.memory import MemoryTool
 from symphonai_api.tools.metadata import call_target
@@ -146,11 +146,6 @@ def serialize_tiered_input(
     return "\n".join(rendered)
 
 
-def _cursor_digest(message: Message) -> str:
-    payload = json.dumps(
-        message_to_json(message), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
 def _messages_after_cursor(
@@ -163,7 +158,7 @@ def _messages_after_cursor(
         return list(messages)
     if position == 0:
         return list(messages)
-    if _cursor_digest(messages[position - 1]) == digest:
+    if message_digest(messages[position - 1]) == digest:
         return list(messages[position:])
     return list(messages)
 
@@ -243,7 +238,7 @@ class MemoryExtractor:
         with self._lock:
             self._cursor = (
                 len(messages),
-                _cursor_digest(messages[-1]) if messages else None,
+                message_digest(messages[-1]) if messages else None,
             )
 
     def submit(
@@ -309,7 +304,7 @@ class MemoryExtractor:
                 if success and context[0]:
                     self._cursor = (
                         len(context[0]),
-                        _cursor_digest(context[0][-1]) if context[0] else None,
+                        message_digest(context[0][-1]) if context[0] else None,
                     )
                 self._cancel = None
                 if self._closed:
@@ -372,8 +367,7 @@ class MemoryExtractor:
             capabilities = capability_for_model(provider.wire_format, model)
             effort = (
                 "low"
-                if capabilities is not None
-                and any(option.id == "low" for option in capabilities.efforts)
+                if accepts_effort(capabilities, "low")
                 else None
             )
             schemas = tool_registry_schemas(tools, provider.wire_format)

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from symphonai_api.session import (
     SessionStore,
+    iter_session_meta,
     TranscriptError,
     classify_run,
     load_run,
@@ -28,17 +28,11 @@ def prompt_history(root: Path, repo_root: Path, *, limit: int = DEFAULT_HISTORY_
     if not root.is_dir():
         return []
     sessions = []
-    for directory in root.iterdir():
-        if not directory.is_dir():
+    for directory, meta in iter_session_meta(root):
+        if meta is None or meta.get("repo_root") != str(repo_root):
             continue
-        try:
-            meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
-            if not isinstance(meta, dict) or meta.get("repo_root") != str(repo_root):
-                continue
-            updated_at = meta.get("updated_at")
-            sessions.append((updated_at if isinstance(updated_at, str) else "", directory))
-        except (OSError, ValueError, TypeError, UnicodeError):
-            continue
+        updated_at = meta.get("updated_at")
+        sessions.append((updated_at if isinstance(updated_at, str) else "", directory))
     sessions.sort(key=lambda item: item[0], reverse=True)
 
     prompts = []
@@ -87,15 +81,12 @@ def prune_sessions(root: Path, *, period_days: int, now: datetime) -> int:
     if cutoff.tzinfo is None:
         cutoff = cutoff.replace(tzinfo=timezone.utc)
     try:
-        directories = list(root.iterdir())
+        metadata = list(iter_session_meta(root))
     except OSError:
         return 0
     removed = 0
-    for directory in directories:
+    for directory, meta in metadata:
         try:
-            if not directory.is_dir():
-                continue
-            meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
             updated_at = meta.get("updated_at") if isinstance(meta, dict) else None
             if not isinstance(updated_at, str):
                 continue
@@ -119,11 +110,7 @@ def list_sessions(
     if not root.is_dir():
         return []
     sessions: list[tuple[dict, SessionStore | None]] = []
-    for directory in root.iterdir():
-        if not directory.is_dir():
-            continue
-        if directory.name == "loops":
-            continue
+    for directory, meta in iter_session_meta(root):
         item = {
             "run_id": directory.name,
             "title": None,
@@ -142,7 +129,8 @@ def list_sessions(
         store = None
         try:
             store = SessionStore.open(root, directory.name)
-            meta = store.read_meta()
+            if meta is None:
+                raise ValueError("session metadata is unreadable")
             item.update({
                 key: meta.get(key)
                 for key in ("run_id", "title", "created_at", "updated_at", "stopped_reason", "parent_run_id", "parent_session_id")

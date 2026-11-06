@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from symphonai_api.config import load_config
+from symphonai_api.git import git as _git, WorktreeError
 
 
 _PROJECT_ROOT_METADATA = "symphonai-project-root"
 WORKTREE_SETUP_TIMEOUT_SECONDS = 30 * 60
 
 
-class WorktreeError(RuntimeError):
-    """A git worktree could not be created, inspected, or removed."""
 
 
 @dataclass(frozen=True)
@@ -24,21 +22,6 @@ class WorktreeDiff:
     files: tuple[str, ...]
 
 
-def _git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
-    try:
-        result = subprocess.run(
-            ["git", *arguments],
-            cwd=cwd,
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise WorktreeError(str(exc)) from exc
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise WorktreeError(detail or f"git {' '.join(arguments)} failed")
-    return result
 
 
 def _top_level(repo_root: Path) -> Path:
@@ -146,10 +129,11 @@ def stage_worktree(path: Path) -> None:
         _git(path, "reset", "--quiet", "HEAD", "--", *linked)
 
 
-def worktree_diff(path: Path) -> WorktreeDiff:
+def worktree_diff(path: Path, *, exclude: tuple[str, ...] = ()) -> WorktreeDiff:
     """Stage worktree changes in its own index and return paths plus patch."""
     path = Path(path).resolve()
     stage_worktree(path)
+    paths = ("--", ".", *(f":(exclude){item}" for item in exclude)) if exclude else ()
     files = _git(
         path,
         "diff",
@@ -158,8 +142,9 @@ def worktree_diff(path: Path) -> WorktreeDiff:
         "--relative",
         "-z",
         "HEAD",
+        *paths,
     ).stdout
-    patch = _git(path, "diff", "--cached", "--binary", "HEAD").stdout
+    patch = _git(path, "diff", "--cached", "--binary", "HEAD", *paths).stdout
     return WorktreeDiff(
         patch=os.fsdecode(patch),
         files=tuple(os.fsdecode(item) for item in files.split(b"\0") if item),
@@ -172,3 +157,22 @@ def remove_worktree(repo_root: Path, path: Path) -> None:
     path = Path(path).resolve()
     _git(top_level, "worktree", "remove", "--force", str(path))
     _git(top_level, "worktree", "prune")
+
+
+class WorktreeApplyConflict(RuntimeError):
+    """A worktree patch could not be applied cleanly."""
+
+
+def apply_patch(root: Path, patch: str, *, on_checked=None) -> None:
+    data = patch.encode("utf-8", errors="surrogateescape")
+    for checking in (True, False):
+        try:
+            result = _git(root, "apply", *(("--check",) if checking else ()), "--binary",
+                          input=data, check=False)
+        except WorktreeError as exc:
+            raise WorktreeApplyConflict(str(exc)) from exc
+        if result.returncode:
+            message = result.stderr.decode("utf-8", errors="replace").strip()
+            raise WorktreeApplyConflict(message or ("git apply --check failed" if checking else "git apply failed"))
+        if checking and on_checked is not None:
+            on_checked()

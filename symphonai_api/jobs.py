@@ -2,28 +2,24 @@
 
 from __future__ import annotations
 
+from symphonai_api.process import stop_process_group
+
 import os
-import signal
 import subprocess
 import threading
 import time
 import codecs
 import locale
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from collections.abc import Callable
 
 from symphonai_api.models import ToolCall, ToolResult
 from symphonai_api.permissions import DEFAULT_SHELL_OUTPUT_CHARS, PermissionPolicy
 from symphonai_api.tools.base import LocalTool
-from symphonai_api.tools.metadata import ToolEffect, ToolMetadata
+from symphonai_api.tools.metadata import ToolMetadata
 
 MAX_RUNNING_JOBS = 8
 MAX_OUTPUT_CHARS = 100_000
-
-
-def _timestamp(value: float | None) -> str | None:
-    return None if value is None else datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
 @dataclass
@@ -170,23 +166,12 @@ class JobManager:
             if stopping:
                 job.stopped = True
         if process is not None and stopping:
-            try:
-                # start_new_session records the group id even after its leader exits.
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError, PermissionError):
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                    except (OSError, ProcessLookupError):
-                        pass
+            stop_process_group(process, process.pid, grace=0, timeout=0.1)
         reader = job.reader
         if reader is not None and reader is not threading.current_thread():
             reader.join(timeout=2.0)
         if process is not None and stopping:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError, PermissionError):
-                pass
+            stop_process_group(process, process.pid, grace=0, timeout=0.1)
             if process.stdout is not None:
                 process.stdout.close()
             with job.lock:
@@ -233,7 +218,7 @@ class JobOutputTool(LocalTool):
         }, "required": ["job_id"], "additionalProperties": False}
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=True, paths=None)
+        return ToolMetadata(concurrency_safe=True)
 
     def _execute(self, tool_call: ToolCall, policy: PermissionPolicy, cancel=None) -> ToolResult:
         result = self._manager.read(
@@ -273,7 +258,7 @@ class JobStopTool(LocalTool):
         }, "required": ["job_id"], "additionalProperties": False}
 
     def metadata(self, arguments: dict) -> ToolMetadata:
-        return ToolMetadata(effect=ToolEffect.READ_ONLY, concurrency_safe=False, paths=None)
+        return ToolMetadata(concurrency_safe=False)
 
     def _execute(self, tool_call: ToolCall, policy: PermissionPolicy, cancel=None) -> ToolResult:
         result = self._manager.stop(tool_call.arguments["job_id"])

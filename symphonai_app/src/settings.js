@@ -48,11 +48,6 @@ export function modelRows(reply) {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-export function serverRows(reply) {
-  return section(reply, "mcp_servers")
-    .map(({ name, command, started }) => ({ name, command, started }));
-}
-
 export function rosterRows(reply, kind) {
   if (!["skills", "plugins", "agents"].includes(kind)) {
     return [];

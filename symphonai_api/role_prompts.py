@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from symphonai_api.permissions import PermissionPolicy, _matching_forbidden_component
+from symphonai_api.permissions import PermissionPolicy, check_home_read
 from symphonai_api.paths import symphonai_home
 
 MAX_ROLE_PROMPT_CHARS = 40_000
@@ -31,17 +31,9 @@ def load_role_additions(
             continue
         resolved = path.resolve()
         if scope == "user":
-            try:
-                parts = resolved.relative_to(home).parts
-            except ValueError:
-                warnings.append(f"role prompt file was denied: {resolved}")
-                continue
-            forbidden = next((
-                match for part in parts
-                if (match := _matching_forbidden_component(part, policy.forbidden_patterns))
-            ), None)
-            if forbidden is not None:
-                warnings.append(f"role prompt file {resolved} was denied: path matches forbidden pattern {forbidden!r}")
+            reason = check_home_read(resolved, home, policy)
+            if reason is not None:
+                warnings.append(f"role prompt file {resolved} was denied: {reason}")
                 continue
         else:
             decision = policy.check_read(resolved)
